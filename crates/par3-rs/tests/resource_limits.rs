@@ -334,9 +334,10 @@ impl SourceAccess for Watched {
 
 struct Run<T> {
     result: Result<T, EngineError>,
-    /// Snapshots and reads during the measured operation alone.
+    /// Snapshots, reads and opens during the measured operation alone.
     snapshots: usize,
     reads: usize,
+    opens: u64,
     output: common::TempTree,
     inputs: common::TempTree,
 }
@@ -350,6 +351,8 @@ fn repair_watched(
     change: Option<(usize, usize, bool)>,
 ) -> Run<u64> {
     use par3_rs::session::{Par3RepairSession, RepairStatus};
+    // Leases the host holds on a shared budget stay held throughout.
+    let host = options.handles.used();
     let inputs = common::TempTree::new("disk-repair-input");
     let mut disk = DiskSourceAccess::with_options(options.clone());
     for (index, (name, bytes)) in set.contents.iter().enumerate() {
@@ -377,18 +380,29 @@ fn repair_watched(
         change
             .map(|(file, at, truncate)| (at, inputs.path().join(&set.contents[file].0), truncate)),
     );
+    let opened = options.diagnostics.file_opens();
     let result = session
         .repair(output.path(), false)
         .map(|report| report.reconstructed_blocks);
+    let opens = options.diagnostics.file_opens() - opened;
     let (snapshots, reads) = watched.counts();
     drop(session);
     drop(watched);
-    assert!(options.handles.peak() <= options.open_handles.min(options.handles.limit()));
-    assert_eq!(options.handles.used(), 0);
+    // The session keeps to its own ceiling beside the host's leases, and the
+    // budget's limit binds them both.
+    assert!(
+        options.handles.peak() <= (host + options.open_handles).min(options.handles.limit()),
+        "peak {} with {host} host leases, {} open handles, limit {}",
+        options.handles.peak(),
+        options.open_handles,
+        options.handles.limit()
+    );
+    assert_eq!(options.handles.used(), host);
     Run {
         result,
         snapshots,
         reads,
+        opens,
         output,
         inputs,
     }
@@ -469,6 +483,7 @@ fn create_watched(
         result,
         snapshots,
         reads,
+        opens: options.execution.diagnostics.file_opens(),
         output,
         inputs,
     }
@@ -643,6 +658,83 @@ fn disk_repair_completes_at_the_minimum_handle_budget() {
     options.open_handles = 5;
     options.handles = HandleBudget::new(5);
     repair_from_disk(&set, &[(1, 70), (4, 3)], &options);
+}
+
+/// With a pool, the Cauchy walk hands the group it folds to the workers to
+/// write and hash while the calling thread reads the next group, which puts
+/// a writer's handle beside the reader's. A writer opened on a worker at the
+/// budget's ceiling could neither close the reader being switched nor wait
+/// for it, and a repair that completes on one thread failed at random under
+/// a shared budget on which the host holds a lease. So the outputs are held
+/// open ahead of such a walk, or the walk writes on the calling thread; a
+/// worker never opens. Either way the repair completes and opens exactly what
+/// the one-thread walk opens, from a budget at the repair minimum up to the
+/// default, and whether or not the outputs fit the writer capacity. Only the
+/// repair's opens are compared: the assessment before it verifies the files
+/// on the pool, and under a budget this tight the readers those workers
+/// cache and evict for one another depend on their timing.
+#[test]
+fn a_walk_whose_workers_write_opens_nothing_on_a_worker() {
+    let tree = common::TempTree::new("worker-writes-handles");
+    let block = 4096usize;
+    // Six files of eight blocks and a tail: a group of sixteen surviving
+    // blocks spans files, and four outputs are staged fresh.
+    let set = common::cauchy_files_set(
+        6,
+        8 * block + 777,
+        block as u64,
+        12,
+        b"worker-writes-handles",
+        &tree,
+    );
+    workers_open_nothing(&set, block);
+}
+
+/// Repair `set` with two blocks of four of its files damaged, on one thread
+/// and on eight, across handle budgets that admit and refuse holding the
+/// outputs, and require the same opens either way.
+fn workers_open_nothing(set: &common::ManyBlockSet, block: usize) {
+    let damage: Vec<(usize, usize)> = (1..5)
+        .flat_map(|file| [(file, 5), (file, 3 * block + 9)])
+        .collect();
+    // Four outputs fit a writer capacity of four from sixteen handles: with
+    // headroom they are held and the workers write; at the ceiling the hold
+    // is refused and the calling thread writes.
+    for (open, limit, leases) in [
+        (5, 6, 1),
+        (6, 7, 2),
+        (8, 8, 0),
+        (16, 17, 1),
+        (16, 16, 11),
+        (32, 32, 0),
+    ] {
+        for stripe in [64 << 10, 1024] {
+            let opens = |workers: usize| -> Vec<u64> {
+                (0..4)
+                    .map(|_| {
+                        let mut options = ExecutionOptions::default();
+                        options.workers = workers;
+                        options.stripe_bytes = stripe;
+                        options.open_handles = open;
+                        options.handles = HandleBudget::new(limit);
+                        let held: Vec<_> = (0..leases)
+                            .map(|_| options.handles.acquire().unwrap())
+                            .collect();
+                        let run = repair_from_disk(set, &damage, &options);
+                        drop(held);
+                        run.opens
+                    })
+                    .collect()
+            };
+            let serial = opens(1);
+            let pooled = opens(8);
+            assert!(
+                pooled.iter().all(|count| *count == serial[0]),
+                "handles {open}/{limit} with {leases} held, stripe {stripe}: \
+                 opens on one thread {serial:?}, with workers {pooled:?}"
+            );
+        }
+    }
 }
 
 #[test]

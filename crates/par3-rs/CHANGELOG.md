@@ -127,6 +127,19 @@
   source-change checks keep their order and counts on the calling thread,
   and one worker runs the unchanged alternating walk. Decode on 1 GiB with
   50 lost blocks: 1.06 → 0.62 s at four workers, flat CPU.
+- On that overlapped walk the workers also write the group they fold to the
+  staged outputs and hash it for the staged proof, so the calling thread only
+  reads: the writes take turns on the output handles while the hashing runs
+  in parallel outside the proof's lock. The lost blocks are still written in
+  order after each solve. The outputs are held open ahead of such a walk when
+  they all fit the writer cache and the handle budget keeps two free beyond
+  them, so no worker ever opens a handle; otherwise, and with one worker, the
+  calling thread writes as before, and either way the walk opens the same
+  handles it did. Where the staged outputs are clones nothing changes, since
+  surviving blocks are never written there. Decode on an ext4 stage, 1 GiB,
+  50 lost 1 MiB blocks, eight workers on four Alder Lake P-cores: 1.36 →
+  0.94 s, one worker and CPU time unchanged, read, write and open counts
+  identical, bytes identical.
 - Carrier regeneration reads each source stripe once per group of recovery
   rows the memory budget admits, instead of once per row.
 - Recovery rows that fit the memory budget alongside the codec stay resident

@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use rayon::prelude::*;
@@ -596,6 +596,7 @@ where
         .memory
         .reserve_as(MemoryCategory::CodecTables, coefficient_bytes)?;
     let inverse = crate::cauchy::inverse_coefficients(&field, lost, &rows)?;
+    let rows = rows.as_slice();
     // Recovered rows are produced and scattered a tile at a time. The syndrome
     // bank has to stay whole — every output row reads all of it — but the
     // output bank only has to be as wide as the rows being solved right now,
@@ -769,7 +770,7 @@ where
         None
     };
     // With a pool, a second set of `group` stripes lets the calling thread read
-    // and scatter the next group while the workers fold the last one. It comes
+    // the next group while the workers scatter and fold the last one. It comes
     // out of what is left after the first set, beyond the same slack; without
     // room for it, or without workers to overlap with, the walk alternates
     // between reading and folding as before.
@@ -791,13 +792,20 @@ where
         None
     };
     let sets = 1 + usize::from(_read_ahead.is_some());
-    tracing::debug!(group, sets, "PAR3 Cauchy syndrome group admitted");
+    let writers = StageWriters::new(tree, session, proof);
+    // With both, and every output held open ahead, the workers also scatter
+    // each set they fold: its writes and the proof's hashing of them leave the
+    // calling thread, which then only reads, and the hashing of the set's
+    // blocks runs in parallel (the writes still take turns on the handle
+    // lock). Otherwise the walk reads, writes and folds one block after
+    // another on the calling thread, as before.
+    let deferred = pool.is_some() && sets == 2 && writers.hold(outputs)?;
+    tracing::debug!(group, sets, deferred, "PAR3 Cauchy syndrome group admitted");
     let mut syndromes = vec![vec![0u8; stripe]; n];
     let mut recovered = vec![vec![0u8; stripe]; tile];
     let mut inputs = vec![vec![0u8; stripe]; group * sets];
     let mut covered = vec![0u8; stripe];
     let parallel = pool.as_ref().map(crate::runtime::WorkerPool::pool);
-    let writers = StageWriters::new(tree, session, proof);
     let mut offset = 0;
     while offset < layout.block_size {
         session.options.cancel.check()?;
@@ -813,9 +821,10 @@ where
         for syndrome in &mut syndromes {
             syndrome[..take].fill(0);
         }
-        // The arithmetic for one staged set, which reads and writes nothing:
-        // fold surviving block `members[k]`, held in `held[k]`, into every
-        // syndrome row, or add recovery row `first + k` to its own syndrome.
+        // The work for one staged set, which reads nothing: fold surviving
+        // block `members[k]`, held in `held[k]`, into every syndrome row, or
+        // add recovery row `first + k` to its own syndrome. A deferred set is
+        // also scattered here, its blocks in parallel alongside the fold.
         let work = |syndromes: &mut [Vec<u8>],
                     job: StagedWork,
                     members: &[u64],
@@ -846,15 +855,40 @@ where
                         }
                         Ok(())
                     };
-                    match parallel {
-                        Some(pool) => pool.install(|| {
+                    let Some(pool) = parallel else {
+                        return syndromes.iter_mut().zip(rows.iter()).try_for_each(apply);
+                    };
+                    pool.install(|| {
+                        let mut fold = move || {
                             syndromes
                                 .par_iter_mut()
                                 .zip(rows.par_iter())
                                 .try_for_each(apply)
-                        }),
-                        None => syndromes.iter_mut().zip(rows.iter()).try_for_each(apply),
-                    }
+                        };
+                        if !deferred {
+                            return fold();
+                        }
+                        let (written, folded) = rayon::join(
+                            || {
+                                held[..count]
+                                    .par_iter()
+                                    .zip(members.par_iter())
+                                    .try_for_each(|(bytes, block)| {
+                                        session.options.cancel.check()?;
+                                        scatter(
+                                            &writers,
+                                            layout,
+                                            outputs,
+                                            *block,
+                                            offset,
+                                            &bytes[..take],
+                                        )
+                                    })
+                            },
+                            fold,
+                        );
+                        written.and(folded)
+                    })
                 }
                 StagedWork::Recovery { first, count } => {
                     let add = |(syndrome, payload): (&mut Vec<u8>, &Vec<u8>)| {
@@ -875,10 +909,12 @@ where
                 }
             }
         };
-        // Read and scatter the next set: surviving blocks in order until a
-        // group is held, then the recovery rows a set at a time. Every read and
-        // every write of the pass happens here, on the calling thread, in the
-        // order the walk has always had; only the arithmetic waits for a set.
+        // Read the next set: surviving blocks in order until a group is held,
+        // then the recovery rows a set at a time. Every read of the pass
+        // happens here, on the calling thread, in the order the walk has
+        // always had. So does every write, unless the set is deferred to the
+        // workers, who then write its blocks while this thread reads the
+        // next set; the lost blocks are still written here, after the solve.
         let (mut next_block, mut next_row) = (0u64, 0usize);
         let mut fill = |set: &mut [Vec<u8>],
                         members: &mut [u64; crate::gf::BATCH_SOURCES]|
@@ -904,7 +940,11 @@ where
                     &mut covered[..take],
                     Some(writers.owed()),
                 )?;
-                scatter(&writers, layout, outputs, block, offset, &set[held][..take])?;
+                // A block outside the matrix is held by no set, so it is
+                // written here whether or not the sets are deferred.
+                if !deferred || !coverage.contains(&block) {
+                    scatter(&writers, layout, outputs, block, offset, &set[held][..take])?;
+                }
                 if coverage.contains(&block) {
                     // One code-matrix element per surviving block per recovery
                     // row, recomputed on every stripe pass. Counted here so the
@@ -945,8 +985,8 @@ where
             job = match parallel {
                 // The workers take this set while the calling thread fills the
                 // other; the two meet before the sets trade places. A failed
-                // fold still lets the read in flight finish, and is reported
-                // ahead of anything that read ran into.
+                // fold or write still lets the set being read finish, and is
+                // reported ahead of anything that read ran into.
                 Some(pool) if !spare.is_empty() => {
                     let mut done = Ok(());
                     let next = {
@@ -1202,7 +1242,12 @@ struct StageWriters<'a> {
 }
 
 #[derive(Default)]
-struct OpenWriters(Mutex<WriterSlots>);
+struct OpenWriters {
+    slots: Mutex<WriterSlots>,
+    /// Set by [`StageWriters::hold`]: the slots hold every output of a walk
+    /// whose workers write, and nothing closes them.
+    held: AtomicBool,
+}
 
 #[derive(Default)]
 struct WriterSlots {
@@ -1218,9 +1263,13 @@ impl WriterSlots {
 }
 
 impl crate::runtime::IdleHandles for OpenWriters {
-    // A writer is idle whenever no write holds the lock.
+    // A writer is idle whenever no write holds the lock and the slots are
+    // not held for a walk whose workers write.
     fn close_idle(&self) -> bool {
-        let Ok(mut slots) = self.0.try_lock() else {
+        if self.held.load(Ordering::Acquire) {
+            return false;
+        }
+        let Ok(mut slots) = self.slots.try_lock() else {
             return false;
         };
         let closed = slots.take_lru();
@@ -1259,6 +1308,91 @@ impl<'a> StageWriters<'a> {
         self.owed.settle(self.access)
     }
 
+    /// Hold every output open for a walk whose workers write them, so that no
+    /// worker ever opens a handle: at the budget's ceiling a worker could
+    /// neither close the reader the calling thread is switching nor wait for
+    /// it, and a repair that completes on one thread would fail at random.
+    /// Returns `false` when the outputs do not all fit the writer capacity or
+    /// the budget would not keep two handles free beyond them for the calling
+    /// thread's reads; the walk then writes on the calling thread as before,
+    /// and nothing was opened for the refusal, so that walk opens what it
+    /// always did. Only a budget shared with another user can change between
+    /// the check and the opens; what that leaves open stays as the usual
+    /// cache.
+    fn hold(&self, outputs: &[StagedFile]) -> EngineResult<bool> {
+        if outputs.len() > self.capacity {
+            return Ok(false);
+        }
+        let mut slots = self
+            .open
+            .slots
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let handles = &self.options.handles;
+        let room = |slots: &WriterSlots| {
+            let unopened = outputs
+                .iter()
+                .filter(|target| {
+                    !slots
+                        .files
+                        .iter()
+                        .any(|(index, _, _)| *index == target.index)
+                })
+                .count();
+            handles.used().saturating_add(unopened + 2) <= handles.limit()
+        };
+        if !room(&slots) {
+            return Ok(false);
+        }
+        for target in outputs {
+            match self.position(&mut slots, target, false) {
+                Ok(_) => {}
+                Err(EngineError::ResourceLimit(_)) => return Ok(false),
+                Err(error) => return Err(error),
+            }
+        }
+        if !room(&slots) {
+            return Ok(false);
+        }
+        self.open.held.store(true, Ordering::Release);
+        Ok(true)
+    }
+
+    /// The slot holding `target` open, opened if it is not; the write
+    /// clock has moved on to this use. With `evict`, a slot past the
+    /// capacity, or one the budget needs, closes to make room.
+    fn position(
+        &self,
+        slots: &mut WriterSlots,
+        target: &StagedFile,
+        evict: bool,
+    ) -> EngineResult<usize> {
+        slots.clock += 1;
+        let clock = slots.clock;
+        if let Some(position) = slots
+            .files
+            .iter()
+            .position(|(index, _, _)| *index == target.index)
+        {
+            slots.files[position].2 = clock;
+            return Ok(position);
+        }
+        if evict && slots.files.len() >= self.capacity {
+            drop(slots.take_lru());
+        }
+        let file = loop {
+            match open_staged(self.tree, target, false, true, self.options) {
+                Ok(file) => break file,
+                Err(EngineError::ResourceLimit(_)) if evict && !slots.files.is_empty() => {
+                    drop(slots.take_lru());
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        slots.files.push((target.index, file, clock));
+        Ok(slots.files.len() - 1)
+    }
+
     /// Write `bytes` at `offset` of the staged output in `slot`, the part of
     /// its extent `extent` starting `relative` bytes into that extent.
     fn write(
@@ -1272,38 +1406,17 @@ impl<'a> StageWriters<'a> {
     ) -> EngineResult<()> {
         let mut slots = self
             .open
-            .0
+            .slots
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        slots.clock += 1;
-        let clock = slots.clock;
-        let position = match slots
-            .files
-            .iter()
-            .position(|(index, _, _)| *index == target.index)
-        {
-            Some(position) => position,
-            None => {
-                if slots.files.len() >= self.capacity {
-                    drop(slots.take_lru());
-                }
-                let file = loop {
-                    match open_staged(self.tree, target, false, true, self.options) {
-                        Ok(file) => break file,
-                        Err(EngineError::ResourceLimit(_)) if !slots.files.is_empty() => {
-                            drop(slots.take_lru());
-                        }
-                        Err(error) => return Err(error),
-                    }
-                };
-                slots.files.push((target.index, file, clock));
-                slots.files.len() - 1
-            }
-        };
-        let (_, file, used) = &mut slots.files[position];
-        *used = clock;
-        file.write_all_at(offset, bytes)?;
-        // Recorded while the lock still orders the writes to this output.
+        let position = self.position(&mut slots, target, true)?;
+        slots.files[position].1.write_all_at(offset, bytes)?;
+        drop(slots);
+        // Recorded after the handle lock is released, so the hashing of one
+        // write never holds up another. The proof needs the pieces of an
+        // extent in order, which the walks guarantee themselves: an extent is
+        // written at most once per pass, and a pass joins every write it
+        // handed the workers before the next begins.
         self.proof.record(slot, extent, relative, bytes);
         Ok(())
     }
@@ -1507,11 +1620,39 @@ struct OutputProof {
 
 struct PartialProof {
     next: u64,
-    hasher: crate::FingerprintHasher,
+    /// `None` while [`StagedProof::record`] hashes a piece outside the lock.
+    hasher: Option<crate::FingerprintHasher>,
 }
 
 /// Budget for one open frontier and its map entry.
 const PARTIAL_PROOF_BYTES: usize = 2 * std::mem::size_of::<(usize, PartialProof)>();
+
+/// A write the proof admitted, hashed outside the lock and then closed.
+///
+/// Both carry a hasher by value: it lives on the stack of the one `record`
+/// call that borrows it, and boxing it would cost an allocation per write.
+#[allow(clippy::large_enum_variant)]
+enum Admitted {
+    /// The write covers its whole extent.
+    Whole,
+    /// The write continues a frontier, whose hasher it borrows; `closes` when
+    /// it reaches the end of the extent.
+    Frontier {
+        hasher: crate::FingerprintHasher,
+        closes: bool,
+    },
+}
+
+/// What the hashing of an admitted write found.
+#[allow(clippy::large_enum_variant)]
+enum Hashed {
+    /// A whole write: the extent's fingerprint.
+    Whole(crate::Fingerprint),
+    /// The frontier reached the end of the extent: its fingerprint.
+    Closed(crate::Fingerprint),
+    /// The frontier moved on: the hasher goes back.
+    Frontier(crate::FingerprintHasher),
+}
 
 impl<'a> StagedProof<'a> {
     fn new(layout: &'a BlockLayout, outputs: &[StagedFile], options: &ExecutionOptions) -> Self {
@@ -1570,7 +1711,46 @@ impl<'a> StagedProof<'a> {
 
     /// Record `bytes` written `relative` bytes into extent `extent` of the
     /// output in `slot`.
+    ///
+    /// The bytes are hashed outside the lock, so writes to different extents
+    /// hash in parallel. The pieces of one extent must still arrive in order
+    /// and one at a time: a second piece admitted while the first is being
+    /// hashed finds its frontier's hasher on loan and gives the output up,
+    /// as an out-of-order piece does.
     fn record(&self, slot: usize, extent: usize, relative: u64, bytes: &[u8]) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let admitted = {
+            let ProofState {
+                outputs,
+                reservation,
+            } = &mut *state;
+            let Some(output) = outputs.get_mut(slot) else {
+                return;
+            };
+            if output.doubt {
+                return;
+            }
+            let extents = &self.layout.files[output.index].extents;
+            match output.admit(extents, extent, relative, bytes.len() as u64, reservation) {
+                Some(admitted) => admitted,
+                None => {
+                    output.give_up(reservation);
+                    return;
+                }
+            }
+        };
+        drop(state);
+        let hashed = match admitted {
+            Admitted::Whole => Hashed::Whole(crate::fingerprint(bytes)),
+            Admitted::Frontier { mut hasher, closes } => {
+                hasher.update(bytes);
+                if closes {
+                    Hashed::Closed(hasher.finalize())
+                } else {
+                    Hashed::Frontier(hasher)
+                }
+            }
+        };
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let ProofState {
             outputs,
@@ -1579,11 +1759,12 @@ impl<'a> StagedProof<'a> {
         let Some(output) = outputs.get_mut(slot) else {
             return;
         };
+        // Given up while the piece was hashed: nothing to close.
         if output.doubt {
             return;
         }
         let extents = &self.layout.files[output.index].extents;
-        if !output.prove(extents, extent, relative, bytes, reservation) {
+        if !output.close(extents, extent, bytes.len() as u64, hashed, reservation) {
             output.give_up(reservation);
         }
     }
@@ -1698,66 +1879,97 @@ impl OutputProof {
         self.prepaid = 0;
     }
 
-    /// Fold one write into the proof, or say it cannot be proven.
-    fn prove(
+    /// Admit one write of `len` bytes into the proof, lending it the hasher
+    /// it continues, or say it cannot be proven. A frontier opened here holds
+    /// its budget until [`Self::close`] returns the hasher or finishes it.
+    fn admit(
         &mut self,
         extents: &crate::layout::FileExtents,
         extent: usize,
         relative: u64,
-        bytes: &[u8],
+        len: u64,
         reservation: &mut Option<crate::runtime::Reservation>,
-    ) -> bool {
-        let Some(range) = extents.range(extent) else {
-            return false;
-        };
-        let len = range.end - range.start;
+    ) -> Option<Admitted> {
+        let range = extents.range(extent)?;
+        let extent_len = range.end - range.start;
         let (word, bit) = (extent / 64, 1u64 << (extent % 64));
-        if self.proven[word] & bit != 0
-            || relative
-                .checked_add(bytes.len() as u64)
-                .is_none_or(|end| end > len)
-        {
-            return false;
+        if self.proven[word] & bit != 0 {
+            return None;
         }
-        let actual = match self.partial.get_mut(&extent) {
+        let end = relative.checked_add(len).filter(|&end| end <= extent_len)?;
+        let closes = end == extent_len;
+        match self.partial.get_mut(&extent) {
             Some(partial) => {
                 if partial.next != relative {
-                    return false;
+                    return None;
                 }
-                partial.hasher.update(bytes);
-                partial.next += bytes.len() as u64;
-                if partial.next != len {
-                    return true;
-                }
-                let partial = self.partial.remove(&extent).expect("open frontier");
-                if let Some(reservation) = reservation.as_mut() {
-                    reservation.shrink_to(reservation.bytes() - PARTIAL_PROOF_BYTES);
-                }
-                partial.hasher.finalize()
+                // On loan: another piece of this extent is still being hashed.
+                let hasher = partial.hasher.take()?;
+                Some(Admitted::Frontier { hasher, closes })
             }
-            None if relative != 0 => return false,
-            None if bytes.len() as u64 == len => crate::fingerprint(bytes),
+            None if relative != 0 => None,
+            None if closes => Some(Admitted::Whole),
             None => {
                 if self.prepaid != 0 {
                     self.prepaid -= 1;
                 } else {
-                    let Some(reservation) = reservation.as_mut() else {
-                        return false;
-                    };
-                    if reservation.grow_by(PARTIAL_PROOF_BYTES).is_err() {
-                        return false;
-                    }
+                    reservation.as_mut()?.grow_by(PARTIAL_PROOF_BYTES).ok()?;
                 }
-                let mut hasher = crate::FingerprintHasher::new();
-                hasher.update(bytes);
                 self.partial.insert(
                     extent,
                     PartialProof {
-                        next: bytes.len() as u64,
-                        hasher,
+                        next: 0,
+                        hasher: None,
                     },
                 );
+                Some(Admitted::Frontier {
+                    hasher: crate::FingerprintHasher::new(),
+                    closes,
+                })
+            }
+        }
+    }
+
+    /// Close the write [`Self::admit`] admitted, now hashed: return the
+    /// frontier's hasher, or prove the extent by its fingerprint, or say it
+    /// cannot be proven. An extent proven, or a frontier opened for it, while
+    /// the write was being hashed means the extent was written twice, which
+    /// cannot be proven either.
+    fn close(
+        &mut self,
+        extents: &crate::layout::FileExtents,
+        extent: usize,
+        len: u64,
+        hashed: Hashed,
+        reservation: &mut Option<crate::runtime::Reservation>,
+    ) -> bool {
+        let (word, bit) = (extent / 64, 1u64 << (extent % 64));
+        if self.proven[word] & bit != 0 {
+            return false;
+        }
+        let actual = match hashed {
+            Hashed::Frontier(hasher) => {
+                let Some(partial) = self.partial.get_mut(&extent) else {
+                    return false;
+                };
+                partial.hasher = Some(hasher);
+                partial.next += len;
                 return true;
+            }
+            Hashed::Whole(actual) => {
+                if self.partial.contains_key(&extent) {
+                    return false;
+                }
+                actual
+            }
+            Hashed::Closed(actual) => {
+                if self.partial.remove(&extent).is_none() {
+                    return false;
+                }
+                if let Some(reservation) = reservation.as_mut() {
+                    reservation.shrink_to(reservation.bytes() - PARTIAL_PROOF_BYTES);
+                }
+                actual
             }
         };
         let expected = match extents.get(extent).map(|extent| extent.kind) {
@@ -2644,6 +2856,176 @@ mod proof_tests {
             let pieces = extents.iter().any(|(_, bytes)| bytes.len() > 1);
             assert_eq!(proof.proves(slot), !pieces, "output {slot}");
         }
+    }
+
+    /// The workers of a deferred set record their writes at once: pieces of
+    /// different extents hash outside the lock, in parallel, and the proof
+    /// still proves every output and releases every frontier.
+    #[test]
+    fn concurrent_records_of_different_extents_prove_every_output() {
+        let case = case();
+        for piece in [usize::MAX, 7] {
+            let options = options(1 << 20);
+            let proof = StagedProof::new(&case.layout, &case.staged, &options);
+            let base = options.memory.used();
+            // Every piece of every extent, in order within its extent; the
+            // extents are dealt round-robin to the threads.
+            let threads = 4;
+            std::thread::scope(|scope| {
+                for thread in 0..threads {
+                    let (proof, case) = (&proof, &case);
+                    scope.spawn(move || {
+                        for (slot, extents) in case.extents.iter().enumerate() {
+                            for (extent, bytes) in extents {
+                                if *extent % threads != thread {
+                                    continue;
+                                }
+                                let step = piece.min(bytes.len());
+                                for (at, chunk) in bytes.chunks(step).enumerate() {
+                                    proof.record(slot, *extent, (at * step) as u64, chunk);
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+            assert!(proven(&case, &proof).iter().all(|&ok| ok), "{piece}");
+            assert_eq!(options.memory.used(), base, "{piece}: a frontier leaked");
+        }
+    }
+
+    /// A second piece of an extent admitted while the first is still being
+    /// hashed cannot be ordered behind it, so the output reads back, and the
+    /// late close of the first piece changes nothing.
+    #[test]
+    fn a_piece_admitted_while_its_frontier_is_on_loan_gives_the_output_up() {
+        let case = case();
+        let slot = case
+            .extents
+            .iter()
+            .position(|extents| extents.iter().any(|(_, bytes)| bytes.len() > 1))
+            .expect("an extent longer than a byte");
+        let (extent, bytes) = case.extents[slot]
+            .iter()
+            .find(|(_, bytes)| bytes.len() > 1)
+            .cloned()
+            .unwrap();
+        let options = options(1 << 20);
+        let proof = StagedProof::new(&case.layout, &case.staged, &options);
+        let base = options.memory.used();
+        let half = bytes.len() / 2;
+        let extents = &case.layout.files[case.staged[slot].index].extents;
+        let mut state = proof.state.lock().unwrap();
+        let ProofState {
+            outputs,
+            reservation,
+        } = &mut *state;
+        let output = &mut outputs[slot];
+        let first = output
+            .admit(extents, extent, 0, half as u64, reservation)
+            .expect("the first piece opens a frontier");
+        let Admitted::Frontier {
+            mut hasher,
+            closes: false,
+        } = first
+        else {
+            panic!("the first piece is a frontier that does not close");
+        };
+        assert!(options.memory.used() > base, "the frontier took no budget");
+        assert!(
+            output
+                .admit(
+                    extents,
+                    extent,
+                    half as u64,
+                    (bytes.len() - half) as u64,
+                    reservation
+                )
+                .is_none(),
+            "the second piece was admitted over a lent hasher"
+        );
+        output.give_up(reservation);
+        assert!(output.doubt);
+        hasher.update(&bytes[..half]);
+        assert!(!output.close(
+            extents,
+            extent,
+            half as u64,
+            Hashed::Frontier(hasher),
+            reservation
+        ));
+        drop(state);
+        assert!(!proof.proves(slot));
+        assert_eq!(options.memory.used(), base, "giving up kept the frontier");
+    }
+
+    /// An extent written whole twice at once, or whole while a piece of it is
+    /// in flight, was written twice: whichever write closes second cannot be
+    /// proven, as a repeated write never could.
+    #[test]
+    fn writes_overlapping_in_flight_cannot_prove_their_extent() {
+        let case = case();
+        let slot = case
+            .extents
+            .iter()
+            .position(|extents| extents.iter().any(|(_, bytes)| bytes.len() > 1))
+            .expect("an extent longer than a byte");
+        let (extent, bytes) = case.extents[slot]
+            .iter()
+            .find(|(_, bytes)| bytes.len() > 1)
+            .cloned()
+            .unwrap();
+        let len = bytes.len() as u64;
+        let extents = &case.layout.files[case.staged[slot].index].extents;
+        let digest = crate::fingerprint(&bytes);
+        // Whole twice: the first close proves, the second gives up.
+        let twice = options(1 << 20);
+        let proof = StagedProof::new(&case.layout, &case.staged, &twice);
+        let mut state = proof.state.lock().unwrap();
+        let ProofState {
+            outputs,
+            reservation,
+        } = &mut *state;
+        let output = &mut outputs[slot];
+        for _ in 0..2 {
+            assert!(matches!(
+                output.admit(extents, extent, 0, len, reservation),
+                Some(Admitted::Whole)
+            ));
+        }
+        let unproven = output.unproven;
+        assert!(output.close(extents, extent, len, Hashed::Whole(digest), reservation));
+        assert_eq!(output.unproven, unproven - 1);
+        assert!(!output.close(extents, extent, len, Hashed::Whole(digest), reservation));
+        assert_eq!(output.unproven, unproven - 1);
+        drop(state);
+        drop(proof);
+        // Whole while a piece is in flight: the piece's frontier is there when
+        // the whole write closes, and the whole write closes nothing.
+        let options = options(1 << 20);
+        let proof = StagedProof::new(&case.layout, &case.staged, &options);
+        let base = options.memory.used();
+        let mut state = proof.state.lock().unwrap();
+        let ProofState {
+            outputs,
+            reservation,
+        } = &mut *state;
+        let output = &mut outputs[slot];
+        assert!(matches!(
+            output.admit(extents, extent, 0, len, reservation),
+            Some(Admitted::Whole)
+        ));
+        let Some(Admitted::Frontier { hasher, .. }) =
+            output.admit(extents, extent, 0, len / 2, reservation)
+        else {
+            panic!("the piece opens a frontier");
+        };
+        assert!(!output.close(extents, extent, len, Hashed::Whole(digest), reservation));
+        output.give_up(reservation);
+        drop(hasher);
+        drop(state);
+        assert!(!proof.proves(slot));
+        assert_eq!(options.memory.used(), base, "giving up kept the frontier");
     }
 
     /// A budget holding exactly the proof's bits.

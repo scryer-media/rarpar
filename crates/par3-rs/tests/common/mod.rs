@@ -1652,15 +1652,53 @@ pub fn cauchy_block_set(
     seed: &[u8],
     tree: &TempTree,
 ) -> ManyBlockSet {
+    cauchy_files_set(
+        1,
+        blocks * block_size as usize,
+        block_size,
+        recovery,
+        seed,
+        tree,
+    )
+}
+
+/// A Cauchy-coded set of `files` files of `bytes_per_file` bytes each, one
+/// recovery block per carrier. A file length that is not a multiple of the
+/// block gives every file a tail.
+pub fn cauchy_files_set(
+    files: usize,
+    bytes_per_file: usize,
+    block_size: u64,
+    recovery: u64,
+    seed: &[u8],
+    tree: &TempTree,
+) -> ManyBlockSet {
     use par3_rs::creation::{
         CreationCodec, CreationOptions, CreationPlan, CreationSource, VolumeLayout,
     };
-    let mut bytes = vec![0; blocks * block_size as usize];
-    let mut hash = blake3::Hasher::new();
-    hash.update(seed);
-    hash.finalize_xof().fill(&mut bytes);
     let mut access = MemorySourceAccess::default();
-    access.insert(SourceId(1), 1, bytes.clone().into());
+    let mut contents = Vec::new();
+    let mut sources = Vec::new();
+    for index in 0..files {
+        let mut bytes = vec![0; bytes_per_file];
+        let mut hash = blake3::Hasher::new();
+        hash.update(seed);
+        if index != 0 {
+            hash.update(&(index as u64).to_le_bytes());
+        }
+        hash.finalize_xof().fill(&mut bytes);
+        let name = if files == 1 {
+            "input.bin".to_owned()
+        } else {
+            format!("input{index}.bin")
+        };
+        access.insert(SourceId(index as u64 + 1), 1, bytes.clone().into());
+        sources.push(CreationSource {
+            name: name.clone(),
+            source: SourceId(index as u64 + 1),
+        });
+        contents.push((name, bytes));
+    }
     let mut options = CreationOptions {
         block_size,
         recovery_count: recovery,
@@ -1671,20 +1709,12 @@ pub fn cauchy_block_set(
     options.execution.workers = 1;
     options.execution.memory = MemoryBudget::new(768 << 20);
     options.execution.retained_bytes = 384 << 20;
-    let plan = CreationPlan::build(
-        Arc::new(access),
-        &[CreationSource {
-            name: "input.bin".into(),
-            source: SourceId(1),
-        }],
-        options.clone(),
-    )
-    .unwrap();
+    let plan = CreationPlan::build(Arc::new(access), &sources, options.clone()).unwrap();
     let id = plan.input_set_id();
     let paths = plan.execute(&tree.path().join("set"), tree.path()).unwrap();
     ManyBlockSet {
         id,
-        contents: vec![("input.bin".to_owned(), bytes)],
+        contents,
         paths,
     }
 }

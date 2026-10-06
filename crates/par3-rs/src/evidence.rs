@@ -1202,8 +1202,8 @@ mod order_tests {
 }
 
 #[cfg(test)]
-mod w2review_verify_tests {
-    //! Adversarial probes for W2.1 (whole-file-first disk verification).
+mod whole_file_first_tests {
+    //! Whole-file-first disk verification against the single streaming pass.
     use super::*;
     use crate::runtime::Stage;
     use crate::source::MemorySourceAccess;
@@ -1344,8 +1344,8 @@ mod w2review_verify_tests {
     /// file. Classification must match the single pass, and a length that
     /// cannot match must cost exactly one pass.
     #[test]
-    fn w2review_truncated_and_appended_match_single_pass() {
-        let tree = TempTree::new("w2review-lengths");
+    fn truncated_and_appended_files_match_the_single_pass() {
+        let tree = TempTree::new("whole-first-lengths");
         let (layout, bytes) = many_layout(&tree);
         let mut damaged = bytes.clone();
         damaged[5 * 1024 + 3] ^= 0x40;
@@ -1380,8 +1380,8 @@ mod w2review_verify_tests {
     /// shows the hole, so it is read once, extents and whole hash side by
     /// side, as the single pass read it.
     #[test]
-    fn w2review_hole_rereads_prefix() {
-        let tree = TempTree::new("w2review-hole");
+    fn a_hole_in_a_positioned_source_costs_one_pass() {
+        let tree = TempTree::new("whole-first-hole");
         let (layout, bytes) = many_layout(&tree);
         let len = bytes.len() as u64;
         let hole = (len - 3 * 1024)..(len - 2 * 1024);
@@ -1391,7 +1391,7 @@ mod w2review_verify_tests {
         assert_eq!(found.whole_matches(), expected.whole_matches());
         let available = len - (hole.end - hole.start);
         eprintln!(
-            "W2REVIEW hole: file {len} available {available} read {read} calls {calls} hashed {hashed}"
+            "hole: file {len} available {available} read {read} calls {calls} hashed {hashed}"
         );
         assert_eq!(
             read, available,
@@ -1405,8 +1405,8 @@ mod w2review_verify_tests {
     /// first. Past the hole the extents are hashed as they arrive, and only
     /// the prefix is read again.
     #[test]
-    fn w2review_hole_behind_a_forward_reader_rereads_only_the_prefix() {
-        let tree = TempTree::new("w2review-hole-forward");
+    fn a_hole_behind_a_forward_reader_rereads_only_the_prefix() {
+        let tree = TempTree::new("whole-first-hole-forward");
         let (layout, bytes) = many_layout(&tree);
         let len = bytes.len() as u64;
         for hole in [
@@ -1419,7 +1419,7 @@ mod w2review_verify_tests {
             assert_eq!(found.whole_matches(), expected.whole_matches(), "{hole:?}");
             let available = len - (hole.end - hole.start);
             eprintln!(
-                "W2REVIEW forward hole {hole:?}: available {available} read {read} calls {calls} hashed {hashed}"
+                "forward hole {hole:?}: available {available} read {read} calls {calls} hashed {hashed}"
             );
             assert_eq!(read, available + hole.start, "{hole:?}");
             assert_eq!(hashed, available, "{hole:?}");
@@ -1429,14 +1429,14 @@ mod w2review_verify_tests {
     /// Progress: a damaged file reports its length once as completed Verify
     /// work, though it is read twice.
     #[test]
-    fn w2review_damaged_progress_double_counts() {
-        let tree = TempTree::new("w2review-progress");
+    fn a_damaged_file_reports_its_length_once() {
+        let tree = TempTree::new("whole-first-progress");
         let (layout, mut bytes) = many_layout(&tree);
         bytes[100] ^= 1;
         for forward in [false, true] {
             let (_, read, _, hashed) = run(&layout, 0, &bytes, None, forward);
             eprintln!(
-                "W2REVIEW progress: len {} read {read} verify-completed {hashed}",
+                "progress: len {} read {read} verify-completed {hashed}",
                 bytes.len()
             );
             assert_eq!(read, 2 * bytes.len() as u64, "operator decision D2");
