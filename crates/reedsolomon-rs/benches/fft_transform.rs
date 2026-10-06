@@ -3,6 +3,7 @@
 //! These arithmetic measurements do not establish end-to-end PAR3 parity.
 //! On a GFNI host the `Auto` maps take their affine form; run once more with
 //! `WEAVER_LINEAR_GFNI=0` to measure the AVX2 shuffle form on the same rows.
+//! On an SVE2 host they take their SVE2 form; `WEAVER_SVE2=0` measures NEON.
 #[cfg(not(target_family = "wasm"))]
 fn main() {
     use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
@@ -11,9 +12,10 @@ fn main() {
     use std::hint::black_box;
 
     eprintln!(
-        "linear map kernel: {:?}, GFNI affine form: {}",
+        "linear map kernel: {:?}, GFNI affine form: {}, SVE2 form: {}",
         LinearBackend::Auto.kernel(),
-        reedsolomon_rs::gf_simd::linear_uses_gfni()
+        reedsolomon_rs::gf_simd::linear_uses_gfni(),
+        reedsolomon_rs::gf_simd::uses_sve2()
     );
     let mut criterion = Criterion::default().configure_from_args();
     let mut group = criterion.benchmark_group("cantor_transform_pair");

@@ -2,6 +2,26 @@
 
 ## 0.4.8
 
+- SVE2 tiers on aarch64. On a host that reports SVE2, the NEON kernels hand
+  over to vector-length-agnostic SVE2 loops: GF(2^8) `MulPlan::accumulate`
+  and `gf8::mul_acc_input_batch` (eight sources per pass, table pairs held in
+  registers); the `LinearMap8` and `LinearMap16` multiply-accumulate, map,
+  fused butterfly and radix-4; GF(2^16) `mul_acc_region`; and the lane-major
+  `mul_acc_input_batch` and `mul_acc_input_batch_prepared`, through a nibble
+  table kernel for up to three sources and a carry-less multiply kernel
+  (`pmullb`/`pmullt` Karatsuba products accumulated across every source, one
+  Barrett reduction per vector) above three. Each loop is predicated with
+  `whilelo`, so there is no scalar tail, and the same code runs at any vector
+  length. The interleaved grouped-input layout and `mul_acc_multi_region`
+  stay on NEON. `gf_simd::uses_sve2` reports the tier, `LinearKernel` still
+  reports `Neon`, and `WEAVER_SVE2=0` pins NEON. Output is bit-identical.
+- The SVE2 kernels are inline `asm!` confined to one private module, because
+  the SVE intrinsics are unstable on Rust 1.97 (`stdarch_aarch64_sve`). Each
+  kernel is a whole loop in one `asm!` block, so no scalable register crosses
+  a Rust boundary. The GF(2^8) maps use `tbl` nibble lookups, not `pmul`.
+  A constant multiply by polynomial products costs about twice the
+  instructions of two lookups, and the FFT maps are arbitrary linear maps
+  rather than field products.
 - `gf_simd::LinearMap8` is an 8-bit linear map beside `LinearMap16`: two
   nibble tables built from the caller's basis images, run through the existing
   `gf8` NEON, AVX2, SSSE3 and scalar kernels. `TransformField` gains

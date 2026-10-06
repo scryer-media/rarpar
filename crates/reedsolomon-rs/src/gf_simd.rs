@@ -75,6 +75,19 @@ pub fn linear_uses_gfni() -> bool {
     false
 }
 
+/// Whether the aarch64 kernels take their SVE2 form: the GF(2^8) and
+/// GF(2^16) region and grouped-input kernels and the [`LinearMap8`] and
+/// [`LinearMap16`] maps run as vector-length-agnostic SVE2 loops instead of
+/// NEON. Setting `WEAVER_SVE2=0` pins NEON so an SVE2 host can A/B the two
+/// without a rebuild. The variable is read once and cached; it never enables
+/// a kernel whose features are absent. Always false off aarch64.
+pub fn uses_sve2() -> bool {
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    return crate::sve2::enabled();
+    #[allow(unreachable_code)]
+    false
+}
+
 impl LinearBackend {
     /// Resolve this selection on the executing CPU.
     pub fn kernel(self) -> LinearKernel {
@@ -107,6 +120,9 @@ pub struct LinearMap16 {
     /// the AVX2 kernel takes its GFNI form.
     #[cfg(target_arch = "x86_64")]
     affine: Option<[u64; 4]>,
+    /// Whether the NEON kernel takes its SVE2 form ([`uses_sve2`]).
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    sve2: bool,
 }
 
 impl LinearMap16 {
@@ -130,6 +146,8 @@ impl LinearMap16 {
             #[cfg(target_arch = "x86_64")]
             affine: (kernel == LinearKernel::Avx2 && linear_uses_gfni())
                 .then(|| affine_matrices_from_images(&basis)),
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            sve2: kernel == LinearKernel::Neon && uses_sve2(),
         }
     }
 
@@ -152,6 +170,21 @@ impl LinearMap16 {
     }
 
     fn vector_prefix(&self, source: &[u16], destination: &mut [u16]) -> usize {
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        if self.sve2 {
+            // SAFETY: SVE2 was detected when the map was built; the u16
+            // slices have equal lengths, are distinct borrows and are read as
+            // their in-memory bytes on this little-endian target.
+            unsafe {
+                crate::sve2::map16_acc(
+                    &self.tables.tables,
+                    source.as_ptr().cast(),
+                    destination.as_mut_ptr().cast(),
+                    source.len() * 2,
+                );
+            }
+            return source.len();
+        }
         // Full 32-byte blocks keep all calls out of polynomial-field tails.
         // AVX2 may hand its final 32-byte block to SSSE3, also without a tail.
         #[cfg(any(
@@ -203,6 +236,9 @@ pub struct LinearMap8 {
     /// its GFNI form.
     #[cfg(target_arch = "x86_64")]
     affine: Option<u64>,
+    /// Whether the NEON kernel takes its SVE2 form ([`uses_sve2`]).
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    sve2: bool,
 }
 
 impl LinearMap8 {
@@ -220,6 +256,8 @@ impl LinearMap8 {
         Self {
             #[cfg(target_arch = "x86_64")]
             affine: (kernel == LinearKernel::Avx2 && linear_uses_gfni()).then(|| plan.affine()),
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            sve2: kernel == LinearKernel::Neon && uses_sve2(),
             plan,
             kernel,
         }
@@ -234,6 +272,8 @@ impl LinearMap8 {
             // kernel only after detecting its ISA, an affine matrix is present
             // only after detecting GFNI, and each kernel bounds every load and
             // store by the equal slice lengths asserted above.
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            LinearKernel::Neon if self.sve2 => unsafe { self.plan.sve2(source, destination) },
             #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             LinearKernel::Neon => unsafe { self.plan.neon(source, destination) },
             #[cfg(target_arch = "x86_64")]
@@ -262,6 +302,10 @@ impl LinearMap8 {
         let done = match self.kernel {
             // SAFETY (all three): the kernel's ISA was detected when the map
             // was built, and both rows have the length asserted by the caller.
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            LinearKernel::Neon if self.sve2 => unsafe {
+                self.plan.butterfly_sve2::<INVERSE>(left, right)
+            },
             #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             LinearKernel::Neon => unsafe { self.plan.butterfly_neon::<INVERSE>(left, right) },
             #[cfg(target_arch = "x86_64")]
@@ -294,6 +338,13 @@ impl LinearMap8 {
         let done = match outer.kernel {
             // SAFETY (all three): as in `butterfly_in`; all four rows have
             // the length asserted by the caller.
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            LinearKernel::Neon if outer.sve2 => unsafe {
+                crate::gf8::MulPlan::radix4_sve2::<INVERSE>(
+                    plans,
+                    [&mut *a, &mut *b, &mut *c, &mut *d],
+                )
+            },
             #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             LinearKernel::Neon => unsafe {
                 crate::gf8::MulPlan::radix4_neon::<INVERSE>(
@@ -342,6 +393,8 @@ impl LinearMap8 {
         let done = match self.kernel {
             // SAFETY (all three): the kernel's ISA was detected when the map
             // was built, and each kernel bounds its loads and stores by the row.
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            LinearKernel::Neon if self.sve2 => unsafe { self.plan.map_sve2(row) },
             #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             LinearKernel::Neon => unsafe { self.plan.map_neon(row) },
             #[cfg(target_arch = "x86_64")]
@@ -458,6 +511,16 @@ impl LinearMap16 {
                         fused16_x86::butterfly_ssse3::<INVERSE>(&self.tables, l, r)
                     }
                     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                    LinearKernel::Neon if self.sve2 => {
+                        crate::sve2::map16_butterfly::<INVERSE>(
+                            &self.tables.tables,
+                            l.as_mut_ptr(),
+                            r.as_mut_ptr(),
+                            bytes,
+                        );
+                        bytes
+                    }
+                    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
                     LinearKernel::Neon => fused16_neon::butterfly::<INVERSE>(&self.tables, l, r),
                     _ => 0,
                 }
@@ -521,6 +584,21 @@ impl LinearMap16 {
                     },
                     #[cfg(target_arch = "x86_64")]
                     LinearKernel::Ssse3 => fused16_x86::radix4_ssse3::<INVERSE>(tables, rows),
+                    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                    LinearKernel::Neon if outer.sve2 => {
+                        let [a, b, c, d] = rows;
+                        crate::sve2::map16_radix4::<INVERSE>(
+                            tables.map(|map| &map.tables),
+                            [
+                                a.as_mut_ptr(),
+                                b.as_mut_ptr(),
+                                c.as_mut_ptr(),
+                                d.as_mut_ptr(),
+                            ],
+                            bytes,
+                        );
+                        bytes
+                    }
                     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
                     LinearKernel::Neon => fused16_neon::radix4::<INVERSE>(tables, rows),
                     _ => 0,
@@ -609,6 +687,11 @@ impl LinearMap16 {
                     #[cfg(target_arch = "x86_64")]
                     LinearKernel::Ssse3 => {
                         fused16_x86::map_region_ssse3(&self.tables, source, destination, bytes)
+                    }
+                    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                    LinearKernel::Neon if self.sve2 => {
+                        crate::sve2::map16_map(&self.tables.tables, source, destination, bytes);
+                        bytes
                     }
                     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
                     LinearKernel::Neon => {
@@ -2044,6 +2127,16 @@ pub fn mul_acc_region(factor: u16, src: &[u8], dst: &mut [u8]) {
         }
     }
 
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    if crate::sve2::enabled() {
+        // SAFETY: SVE2 was detected; the slices are distinct, of the asserted
+        // equal and even length.
+        unsafe {
+            crate::sve2::map16_acc(&tables.tables, src.as_ptr(), dst.as_mut_ptr(), src.len())
+        };
+        return;
+    }
+
     #[cfg(target_arch = "aarch64")]
     {
         unsafe { mul_acc_region_neon(&tables, src, dst) };
@@ -2264,6 +2357,23 @@ pub fn mul_acc_input_batch(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
             unsafe { mul_acc_input_batch_avx2(dst, factors_and_srcs) };
             return;
         }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    if crate::sve2::enabled() {
+        let clmul = factors_and_srcs.len() > 3 && clmul_batch_enabled();
+        // SAFETY: SVE2 was detected; every source has the destination's
+        // length and is a shared borrow distinct from it.
+        unsafe {
+            mul_acc_input_batch_sve2(
+                dst,
+                clmul,
+                factors_and_srcs
+                    .iter()
+                    .map(|fs| (fs.factor, None, fs.src.as_ptr())),
+            )
+        };
+        return;
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -3887,6 +3997,22 @@ pub fn mul_acc_input_batch_prepared(dst: &mut [u8], factors_and_srcs: &[Prepared
             unsafe { mul_acc_input_batch_avx2_prepared(dst, factors_and_srcs) };
             return;
         }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    if crate::sve2::enabled() {
+        let clmul = factors_and_srcs.len() > 3 && clmul_batch_enabled();
+        // SAFETY: as in `mul_acc_input_batch`.
+        unsafe {
+            mul_acc_input_batch_sve2(
+                dst,
+                clmul,
+                factors_and_srcs
+                    .iter()
+                    .map(|fs| (fs.prepared.factor, Some(fs.prepared), fs.src.as_ptr())),
+            )
+        };
+        return;
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -7602,6 +7728,69 @@ unsafe fn mul_acc_multi_region_neon(factors_and_dsts: &mut [FactorDst<'_>], src:
 // buffers because dispatch hands batches of more than 3 sources to the CLMUL
 // kernels.
 // ---------------------------------------------------------------------------
+
+/// The SVE2 grouped-input kernels over lane-major sources: groups of
+/// [`CLMUL_SRC_GROUP_WIDE`] through the CLMUL kernel when `clmul` holds,
+/// otherwise groups of [`crate::sve2::GF16_TABLE_BATCH`] through the table
+/// kernel. Zero factors are skipped; a prepared factor lends its cached
+/// tables.
+///
+/// # Safety
+/// SVE2 must be available; every source pointer must address `dst.len()`
+/// readable bytes that do not overlap `dst`.
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+unsafe fn mul_acc_input_batch_sve2<'a>(
+    dst: &mut [u8],
+    clmul: bool,
+    inputs: impl Iterator<Item = (u16, Option<&'a PreparedInputFactor>, *const u8)>,
+) {
+    use crate::sve2::GF16_TABLE_BATCH;
+    let width = if clmul {
+        CLMUL_SRC_GROUP_WIDE
+    } else {
+        GF16_TABLE_BATCH
+    };
+    let mut inputs = inputs.filter(|(factor, _, _)| *factor != 0);
+    let mut sources = [std::ptr::null(); CLMUL_SRC_GROUP_WIDE];
+    let mut coeffs = [[0; 4]; CLMUL_SRC_GROUP_WIDE];
+    let mut tables = [[[0; 16]; 8]; GF16_TABLE_BATCH];
+    loop {
+        let mut count = 0;
+        for (factor, prepared, source) in inputs.by_ref().take(width) {
+            sources[count] = source;
+            if clmul {
+                coeffs[count] = crate::sve2::clmul_coeff(factor);
+            } else {
+                tables[count] = match prepared {
+                    Some(prepared) => prepared.arm_tables().tables,
+                    None => precompute_mul_tables(factor).tables,
+                };
+            }
+            count += 1;
+        }
+        if count == 0 {
+            return;
+        }
+        // SAFETY: the caller's contract, for `count` sources.
+        unsafe {
+            if clmul {
+                crate::sve2::gf16_batch_clmul(
+                    dst.as_mut_ptr(),
+                    dst.len(),
+                    &coeffs[..count],
+                    &sources[..count],
+                );
+            } else {
+                crate::sve2::gf16_batch_tables(
+                    dst.as_mut_ptr(),
+                    dst.len(),
+                    &tables[..count],
+                    &sources[..count],
+                );
+            }
+        }
+    }
+}
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn mul_acc_input_batch_neon(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {

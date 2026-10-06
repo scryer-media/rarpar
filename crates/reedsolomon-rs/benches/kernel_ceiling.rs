@@ -102,9 +102,15 @@ mod imp {
                 ("neon", std::arch::is_aarch64_feature_detected!("neon")),
                 ("pmull", std::arch::is_aarch64_feature_detected!("aes")),
                 ("sha3", std::arch::is_aarch64_feature_detected!("sha3")),
+                ("sve2", std::arch::is_aarch64_feature_detected!("sve2")),
             ] {
                 notes.push(format!("{name} {present}"));
             }
+            // `WEAVER_SVE2=0` pins NEON on an SVE2 host.
+            notes.push(format!(
+                "sve2 kernels {}",
+                reedsolomon_rs::gf_simd::uses_sve2()
+            ));
             // The CLMUL grouped-input gate is crate-private; its only input
             // besides the batch width is this override.
             notes.push(format!(
