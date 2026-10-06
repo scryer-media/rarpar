@@ -869,7 +869,8 @@ impl CreationPlan {
                     file,
                     self.id,
                     self.options.execution.clone(),
-                ),
+                )
+                .with_known(&self.metadata),
             );
             self.write_output(number, &mut spool, &mut out)?;
             let out = out
