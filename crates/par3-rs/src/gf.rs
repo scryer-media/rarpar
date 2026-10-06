@@ -518,6 +518,99 @@ impl Field for Gf16 {
     }
 }
 
+/// Most source regions one grouped multiply-accumulate folds into its
+/// destination at once: the widest pass the GF(2^16) grouped-input kernels
+/// make, and the deepest group of source stripes a codec stages for one.
+pub(crate) const BATCH_SOURCES: usize = 16;
+
+/// Several sources folded into one destination by one call, so a codec that
+/// holds a group of source stripes walks each destination once per group
+/// instead of once per source. Addition is exclusive-or, so the bytes are the
+/// ones a [`Field::mul_acc`] per source would leave, in any order.
+pub(crate) trait MulAccBatch: Field {
+    /// `dst[i] ^= factors[k] * sources[k][i]` for every `k`.
+    ///
+    /// # Panics
+    ///
+    /// When `sources` and `factors` differ in length, or under the conditions
+    /// [`Field::mul_acc`] panics for any one source.
+    fn mul_acc_batch(&self, dst: &mut [u8], sources: &[&[u8]], factors: &[Self::Symbol]);
+}
+
+impl MulAccBatch for Gf8 {
+    fn mul_acc_batch(&self, dst: &mut [u8], sources: &[&[u8]], factors: &[u8]) {
+        assert_eq!(sources.len(), factors.len(), "one factor per source");
+        if sources.len() < 2 || self.generator != Self::DEFAULT_GENERATOR || dst.len() < 128 {
+            for (src, factor) in sources.iter().zip(factors) {
+                self.mul_acc(dst, src, *factor);
+            }
+            return;
+        }
+        for src in sources {
+            check_regions(dst, src, 1);
+        }
+        // There is no grouped GF(2^8) kernel, so the group is folded one tile
+        // of the destination at a time: the tile stays in L1 while each
+        // source's matching slice streams past it once.
+        const TILE: usize = 8 << 10;
+        for (sources, factors) in sources
+            .chunks(BATCH_SOURCES)
+            .zip(factors.chunks(BATCH_SOURCES))
+        {
+            let plans: [reedsolomon_rs::gf8::MulPlan; BATCH_SOURCES] = std::array::from_fn(|k| {
+                reedsolomon_rs::gf8::MulPlan::new(factors.get(k).copied().unwrap_or(0))
+            });
+            for (tile, at) in dst.chunks_mut(TILE).zip((0..).step_by(TILE)) {
+                for (plan, src) in plans.iter().zip(sources) {
+                    plan.accumulate(&src[at..at + tile.len()], tile);
+                }
+            }
+        }
+    }
+}
+
+impl MulAccBatch for Gf16 {
+    fn mul_acc_batch(&self, dst: &mut [u8], sources: &[&[u8]], factors: &[u16]) {
+        assert_eq!(sources.len(), factors.len(), "one factor per source");
+        // An unoptimised build lays every temporary of the inlined grouped
+        // kernels out in one frame, measured past the 256 KiB a pool worker's
+        // stack holds (an optimised one fits in 16 KiB), so it folds source by
+        // source instead. The bytes are the same either way.
+        if sources.len() < 2 || self.generator != Self::DEFAULT_GENERATOR || cfg!(debug_assertions)
+        {
+            for (src, factor) in sources.iter().zip(factors) {
+                self.mul_acc(dst, src, *factor);
+            }
+            return;
+        }
+        self.mul_acc_grouped(dst, sources, factors);
+    }
+}
+
+impl Gf16 {
+    /// [`MulAccBatch::mul_acc_batch`] through the grouped-input kernels, for
+    /// the default polynomial they are built for.
+    fn mul_acc_grouped(&self, dst: &mut [u8], sources: &[&[u8]], factors: &[u16]) {
+        debug_assert_eq!(self.generator, Self::DEFAULT_GENERATOR);
+        for src in sources {
+            check_regions(dst, src, 2);
+        }
+        use reedsolomon_rs::gf_simd::{FactorSrc, mul_acc_input_batch};
+        for (sources, factors) in sources
+            .chunks(BATCH_SOURCES)
+            .zip(factors.chunks(BATCH_SOURCES))
+        {
+            // Slots past the group repeat its last pair and are never passed.
+            let last = sources.len() - 1;
+            let pairs: [FactorSrc<'_>; BATCH_SOURCES] = std::array::from_fn(|k| FactorSrc {
+                factor: factors[k.min(last)],
+                src: sources[k.min(last)],
+            });
+            mul_acc_input_batch(dst, &pairs[..sources.len()]);
+        }
+    }
+}
+
 /// Either of the two fields, so that a caller can pick one from a Start packet
 /// and dispatch on it once instead of at every multiplication.
 #[derive(Debug, Clone)]
@@ -830,6 +923,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A grouped multiply-accumulate leaves the bytes one `mul_acc` per source
+    /// would, for every group width either side of the kernels' pass widths,
+    /// lengths either side of the GF(2^8) tile, and a non-default polynomial.
+    fn batch_agrees_with_single_sources<F: MulAccBatch>(
+        field: &F,
+        rng: &mut Rng,
+        batch: impl Fn(&F, &mut [u8], &[&[u8]], &[F::Symbol]),
+    ) where
+        F::Symbol: Into<u64>,
+    {
+        for len in [2usize, 126, 128, 4098, (8 << 10) + 6, 20_000] {
+            let len = len / F::SYMBOL_BYTES * F::SYMBOL_BYTES;
+            for width in [1usize, 2, 3, 4, 8, 9, 16, 17, 33] {
+                let sources: Vec<Vec<u8>> = (0..width).map(|_| random_bytes(rng, len)).collect();
+                let factors: Vec<F::Symbol> = (0..width)
+                    .map(|k| match k {
+                        0 => F::symbol(0).unwrap(),
+                        1 => field.one(),
+                        _ => F::symbol(rng.below(F::MAX + 1)).unwrap(),
+                    })
+                    .collect();
+                let start = random_bytes(rng, len);
+                let mut expected = start.clone();
+                for (src, factor) in sources.iter().zip(&factors) {
+                    field.mul_acc(&mut expected, src, *factor);
+                }
+                let mut batched = start;
+                let views: Vec<&[u8]> = sources.iter().map(Vec::as_slice).collect();
+                batch(field, &mut batched, &views, &factors);
+                assert_eq!(batched, expected, "{len} bytes, {width} sources");
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_multiply_accumulate_agrees_with_single_sources() {
+        let mut rng = Rng(0x2026_1005_0000_0001);
+        let batch = |field: &Gf8, dst: &mut [u8], sources: &[&[u8]], factors: &[u8]| {
+            field.mul_acc_batch(dst, sources, factors);
+        };
+        batch_agrees_with_single_sources(&Gf8::default(), &mut rng, batch);
+        batch_agrees_with_single_sources(&Gf8::new(0x12b).unwrap(), &mut rng, batch);
+        let batch = |field: &Gf16, dst: &mut [u8], sources: &[&[u8]], factors: &[u16]| {
+            field.mul_acc_batch(dst, sources, factors);
+        };
+        batch_agrees_with_single_sources(&Gf16::default(), &mut rng, batch);
+        batch_agrees_with_single_sources(&Gf16::new(0x1_002d).unwrap(), &mut rng, batch);
+        // The grouped kernels themselves, which an unoptimised build only
+        // reaches here, on a thread with a test's stack.
+        batch_agrees_with_single_sources(&Gf16::default(), &mut rng, Gf16::mul_acc_grouped);
     }
 
     #[test]

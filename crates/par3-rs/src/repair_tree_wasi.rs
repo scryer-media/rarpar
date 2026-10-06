@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::runtime::{EngineError, EngineFile, EngineResult, ExecutionOptions};
+use crate::session_repair::RepairDurability;
 
 static STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -127,6 +128,19 @@ impl RepairTree {
         Ok((name.into(), display))
     }
 
+    /// WASI has no file clones; every output is created and written.
+    pub(crate) fn create_stage_from(
+        &self,
+        index: usize,
+        len: u64,
+        options: &ExecutionOptions,
+        outputs: &mut Vec<PathBuf>,
+        _clone_from: Option<(&Destination, crate::source::SourceSnapshot)>,
+    ) -> EngineResult<(OsString, PathBuf, bool)> {
+        let (name, display) = self.create_stage_registered(index, len, options, outputs)?;
+        Ok((name, display, false))
+    }
+
     pub(crate) fn create_stage_file(
         &self,
         index: usize,
@@ -176,7 +190,10 @@ impl RepairTree {
         stage_name: &OsStr,
         destination: &Destination,
         backup: bool,
+        _durability: RepairDurability,
     ) -> EngineResult<Option<PathBuf>> {
+        // A plain rename never copies, so there is no destination-local file
+        // for the policy to synchronize.
         let (parent, filename) = relative_parent(&self.base, &destination.relative, true)?;
         let target = parent.join(&filename);
         let mut saved = None;

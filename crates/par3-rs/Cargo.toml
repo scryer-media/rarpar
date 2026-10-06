@@ -37,6 +37,11 @@ unicode-normalization = { workspace = true }
 [target.'cfg(not(target_os = "wasi"))'.dependencies]
 cap-std = "4.0.3"
 
+# Repair stages a damaged file as a clone of itself where the filesystem can
+# share extents: `fclonefileat` on macOS, the `FICLONE` ioctl on Linux.
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+libc = { workspace = true }
+
 # Process CPU time for the verification timing probe, so its table reports a
 # measured number rather than wall time multiplied by a worker count. The probe
 # is `#![cfg(unix)]`, because `getrusage` has no Windows equivalent here, so

@@ -755,6 +755,12 @@ impl Default for ExecutionOptions {
     }
 }
 
+/// Budget a codec leaves untouched when it stages extra source stripes for
+/// grouped arithmetic: a widest stripe, which covers the small scratch a read
+/// may reserve part-way through a walk. Those stripes only ever come out of
+/// what is left beyond it, so staging them never refuses work that ran before.
+pub(crate) const SOURCE_GROUP_SLACK: usize = 64 << 10;
+
 /// Private pools join their workers before releasing stack reservations.
 pub(crate) struct WorkerPool {
     pool: Option<rayon::ThreadPool>,

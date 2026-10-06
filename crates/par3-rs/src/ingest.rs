@@ -531,6 +531,203 @@ enum Admission {
     Unusable(EngineError),
 }
 
+/// A carrier's packets authenticated from the bytes handed to its file, in the
+/// order they are handed to it.
+///
+/// This makes the checks a [`PacketScanner`] reading the finished file back
+/// would make, without the read: every byte belongs to a packet that starts
+/// where the previous one ended, whose header parses within the scan limits,
+/// names `id` and is long enough for its prefix, whose hash covers its body,
+/// and, for metadata, whose body parses. Packet count and metadata retention
+/// are held to the same limits and charged to the same budget as a scan. Only
+/// bytes the inner writer accepted are authenticated, so what is proven is what
+/// was written; whether storage then keeps them is the synchronization
+/// barrier's contract and a later verification's question.
+pub(crate) struct AuthenticatingWriter<W> {
+    inner: W,
+    id: InputSetId,
+    options: ExecutionOptions,
+    limits: ScanLimits,
+    written: u64,
+    packets: usize,
+    /// Offset of the packet after the last authenticated one.
+    next_packet: u64,
+    header: [u8; HEADER_SIZE],
+    header_len: usize,
+    packet: Option<WrittenPacket>,
+}
+
+struct WrittenPacket {
+    header: PacketHeader,
+    offset: u64,
+    consumed: u64,
+    hash: FingerprintHasher,
+    /// The whole wire packet, for metadata only; payloads are never retained.
+    retained: Option<(Vec<u8>, Reservation)>,
+}
+
+impl<W: std::io::Write> AuthenticatingWriter<W> {
+    pub(crate) fn new(inner: W, id: InputSetId, options: ExecutionOptions) -> Self {
+        Self {
+            inner,
+            id,
+            options,
+            limits: ScanLimits::default(),
+            written: 0,
+            packets: 0,
+            next_packet: 0,
+            header: [0; HEADER_SIZE],
+            header_len: 0,
+            packet: None,
+        }
+    }
+
+    pub(crate) fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Require exactly `expected` bytes written, every one inside an
+    /// authenticated packet.
+    pub(crate) fn finish(&self, expected: u64) -> EngineResult<()> {
+        if self.written != expected {
+            return Err(EngineError::InvalidState("creation size differs from plan"));
+        }
+        if self.packet.is_some() || self.header_len != 0 {
+            return Err(EngineError::InvalidState(
+                "staged carrier authentication is incomplete",
+            ));
+        }
+        Ok(())
+    }
+
+    fn authenticate(&mut self, mut bytes: &[u8]) -> EngineResult<()> {
+        while !bytes.is_empty() {
+            let Some(packet) = self.packet.as_mut() else {
+                let take = (HEADER_SIZE - self.header_len).min(bytes.len());
+                self.header[self.header_len..self.header_len + take]
+                    .copy_from_slice(&bytes[..take]);
+                self.header_len += take;
+                bytes = &bytes[take..];
+                if self.header_len == HEADER_SIZE {
+                    self.header_len = 0;
+                    self.open_packet()?;
+                }
+                continue;
+            };
+            let take = (packet.header.length - packet.consumed).min(bytes.len() as u64) as usize;
+            packet.hash.update(&bytes[..take]);
+            if let Some((retained, _)) = &mut packet.retained {
+                retained.extend_from_slice(&bytes[..take]);
+            }
+            packet.consumed += take as u64;
+            bytes = &bytes[take..];
+            if packet.consumed == packet.header.length {
+                self.close_packet()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn open_packet(&mut self) -> EngineResult<()> {
+        let offset = self.next_packet;
+        let unauthenticated = EngineError::InvalidState("staged carrier has unauthenticated bytes");
+        let header = match PacketHeader::parse(&self.header, offset) {
+            Ok(header)
+                if header.length <= self.limits.max_packet_len
+                    && header.input_set_id == self.id =>
+            {
+                header
+            }
+            _ => return Err(unauthenticated),
+        };
+        let prefix_len = match header.packet_type {
+            PacketType::Data => 8,
+            PacketType::RecoveryData => 40,
+            _ => 0,
+        };
+        if header.length < (HEADER_SIZE + prefix_len) as u64 {
+            return Err(unauthenticated);
+        }
+        let retained = if prefix_len == 0 {
+            // The scanner's charge for the wire copy, doubled for the parsed
+            // body it builds while the copy is still held.
+            let retained_len = usize::try_from(header.length)
+                .map_err(|_| EngineError::resource_limit("metadata packet size"))?;
+            let cost = retained_len
+                .checked_add(PACKET_OVERHEAD_BYTES)
+                .ok_or(EngineError::resource_limit("metadata packet size"))?;
+            let retention_ceiling = self
+                .options
+                .retained_bytes
+                .min(usize::try_from(self.limits.max_retained_bytes).unwrap_or(usize::MAX));
+            if cost > retention_ceiling {
+                return Err(EngineError::budget_limit(
+                    "metadata packet retention",
+                    cost,
+                    retention_ceiling,
+                    retention_ceiling,
+                ));
+            }
+            let reservation = self.options.memory.reserve_as(
+                MemoryCategory::CarrierPackets,
+                cost.checked_mul(2)
+                    .ok_or(EngineError::resource_limit("metadata packet size"))?,
+            )?;
+            let mut retained = Vec::with_capacity(retained_len);
+            retained.extend_from_slice(&self.header);
+            Some((retained, reservation))
+        } else {
+            None
+        };
+        let mut hash = FingerprintHasher::new();
+        hash.update(&self.header[24..]);
+        let empty = header.length == HEADER_SIZE as u64;
+        self.packet = Some(WrittenPacket {
+            header,
+            offset,
+            consumed: HEADER_SIZE as u64,
+            hash,
+            retained,
+        });
+        if empty {
+            self.close_packet()?;
+        }
+        Ok(())
+    }
+
+    fn close_packet(&mut self) -> EngineResult<()> {
+        let packet = self.packet.take().expect("open packet");
+        if packet.hash.finalize() != packet.header.hash {
+            return Err(EngineError::InvalidState(
+                "staged carrier has unauthenticated bytes",
+            ));
+        }
+        if self.packets >= self.limits.max_packets {
+            return Err(EngineError::resource_limit("packet count"));
+        }
+        if let Some((retained, _reservation)) = packet.retained {
+            Packet::parse(&retained, packet.offset, &ParseContext::new())?;
+        }
+        self.packets += 1;
+        self.next_packet = packet.offset + packet.header.length;
+        Ok(())
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for AuthenticatingWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.authenticate(&bytes[..written])
+            .map_err(EngineError::into_io)?;
+        self.written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// A resumable scanner for one carrier and immutable content generation.
 ///
 /// Repeated `poll` calls preserve the packet hash frontier across partial
@@ -1822,6 +2019,100 @@ mod admission_tests {
         assert_eq!(
             seen, remaining,
             "the contended scan lost or repeated a packet"
+        );
+    }
+}
+
+#[cfg(test)]
+mod authenticating_writer_tests {
+    //! Creation authenticates each carrier as it hands the bytes to the file
+    //! instead of scanning the file again. These feed the writer official
+    //! reference carriers, and damage made by flipping bytes of them in memory.
+    use super::AuthenticatingWriter;
+    use crate::InputSetId;
+    use crate::runtime::{EngineError, EngineResult, ExecutionOptions};
+    use crate::test_reference::{
+        SET_ID, SET16_ID, set_par3, set_vol0_par3, set_vol1_par3, set16_par3, set16_vol0_par3,
+        set16_vol1_par3,
+    };
+    use std::io::Write;
+
+    fn written(bytes: &[u8], id: InputSetId, piece: usize, expected: u64) -> EngineResult<()> {
+        let mut writer = AuthenticatingWriter::new(Vec::new(), id, ExecutionOptions::default());
+        for chunk in bytes.chunks(piece) {
+            writer.write_all(chunk).map_err(EngineError::from)?;
+        }
+        assert_eq!(
+            writer.get_ref().as_slice(),
+            bytes,
+            "the inner writer got every byte"
+        );
+        writer.finish(expected)
+    }
+
+    fn carriers() -> [(Vec<u8>, InputSetId); 6] {
+        [
+            (set_par3(), SET_ID),
+            (set_vol0_par3(), SET_ID),
+            (set_vol1_par3(), SET_ID),
+            (set16_par3(), SET16_ID),
+            (set16_vol0_par3(), SET16_ID),
+            (set16_vol1_par3(), SET16_ID),
+        ]
+    }
+
+    #[test]
+    fn reference_carriers_authenticate_however_their_writes_are_split() {
+        for (bytes, id) in carriers() {
+            // Pieces that split headers, prefixes and bodies, and one write.
+            for piece in [1, 7, 48, 49, 4096, bytes.len()] {
+                written(&bytes, id, piece, bytes.len() as u64)
+                    .unwrap_or_else(|error| panic!("{piece}-byte writes: {error:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_flipped_byte_anywhere_in_a_carrier_is_refused() {
+        // Magic, hash, length, set identity, type, prefix and body: the header
+        // parse or the packet hash covers every byte.
+        for (bytes, id) in carriers().into_iter().take(2) {
+            for at in 0..bytes.len() {
+                let mut damaged = bytes.clone();
+                damaged[at] ^= 0x01;
+                assert!(
+                    written(&damaged, id, 4096, bytes.len() as u64).is_err(),
+                    "a flip at byte {at} was accepted"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn another_set_a_short_carrier_or_stray_bytes_are_refused() {
+        let bytes = set_vol0_par3();
+        let len = bytes.len() as u64;
+        assert!(written(&bytes, SET16_ID, 4096, len).is_err(), "another set");
+        assert!(
+            written(&bytes, SET_ID, 4096, len + 1).is_err(),
+            "planned size"
+        );
+        assert!(
+            written(&bytes[..bytes.len() - 1], SET_ID, 4096, len - 1).is_err(),
+            "a packet cut short"
+        );
+        // The first packet's length, header included.
+        let first = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
+        assert!(
+            written(&bytes[..first + 20], SET_ID, 4096, first as u64 + 20).is_err(),
+            "a header cut short"
+        );
+        let mut stray = bytes[..first].to_vec();
+        stray.push(0);
+        stray.extend_from_slice(&bytes[first..]);
+        assert!(
+            written(&stray, SET_ID, 4096, len + 1).is_err(),
+            "a byte between packets"
         );
     }
 }

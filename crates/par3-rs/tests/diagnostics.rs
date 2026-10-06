@@ -615,6 +615,104 @@ fn a_larger_budget_never_refuses_a_repair_a_smaller_one_completed() {
     );
 }
 
+/// Surviving stripes are folded into the syndromes a group at a time, the
+/// group sized from what the stripe bank leaves. At the smallest budget that
+/// still admits the full stripe there is no room for a second stripe, so the
+/// fold is one stripe at a time; with room, it is sixteen. The repaired bytes
+/// must not care, and neither may the reads, the writes or the stripe.
+#[test]
+fn the_syndrome_group_changes_scratch_and_nothing_else() {
+    // Every recovery row is spent, on stripes as wide as a block, so the stripe
+    // bank is the widest thing the repair holds and its minimum is the budget's.
+    let (blocks, block_size, recovery) = (48usize, 64u64 << 10, 16u64);
+    let stripe = block_size as usize;
+    let damage: Vec<usize> = (0..recovery as usize).map(|lost| lost * 3 + 1).collect();
+    let tree = common::TempTree::new("syndrome-groups");
+    let set =
+        common::cauchy_block_set(blocks, block_size, recovery, b"PAR3 syndrome groups", &tree);
+    let (name, bytes) = set.contents[0].clone();
+    let mut damaged = bytes.clone();
+    for block in &damage {
+        damaged[block * stripe + 11] ^= 0x80;
+    }
+    let scanning = ExecutionOptions::default();
+    let carriers: Vec<_> = set
+        .paths
+        .iter()
+        .flat_map(|path| common::scanned_packets(std::fs::read(path).unwrap(), &scanning))
+        .collect();
+    let full = |budget: usize, workers: usize| -> Option<ExecutionOptions> {
+        let mut access = MemorySourceAccess::default();
+        access.insert(SourceId(1), 2, damaged.clone().into());
+        let mut options = ExecutionOptions::default();
+        options.workers = workers;
+        options.stripe_bytes = stripe;
+        options.memory = MemoryBudget::new(budget);
+        let mut session = Par3RepairSession::new(set.id, Arc::new(access), options.clone()).ok()?;
+        session.bind_file(&name, SourceId(1)).ok()?;
+        for packet in &carriers {
+            session.merge(packet.clone()).ok()?;
+        }
+        if session.assess().ok()?.status != RepairStatus::Ready {
+            return None;
+        }
+        let output = common::TempTree::new("syndrome-groups-out");
+        let report = session.repair(output.path(), false).ok()?;
+        assert_eq!(report.reconstructed_blocks, recovery);
+        assert!(
+            std::fs::read(output.path().join(&name)).unwrap() == bytes,
+            "{workers} workers at {budget}: the repair did not reproduce the input"
+        );
+        drop(session);
+        assert_eq!(options.memory.used(), 0, "the session leaked");
+        Some(options)
+            .filter(|options| options.diagnostics.admission().stripe_bytes == stripe as u64)
+    };
+    let scratch = |options: &ExecutionOptions| {
+        options
+            .diagnostics
+            .memory()
+            .unwrap()
+            .category(MemoryCategory::CodecScratch)
+            .peak
+    };
+    let roomy = 32 << 20;
+    for workers in [1, 4] {
+        let wide = full(roomy, workers).expect("the roomy repair");
+        let (mut low, mut high) = (0usize, roomy);
+        while low + 1 < high {
+            let middle = low + (high - low) / 2;
+            if full(middle, workers).is_some() {
+                high = middle;
+            } else {
+                low = middle;
+            }
+        }
+        // Scratch paths are charged too and their names grow with a counter,
+        // so stand a little above the edge: far less than the slack and the
+        // stripe a second source would need.
+        let narrow = full(high + 4096, workers).unwrap();
+        let (narrow_admission, wide_admission) =
+            (narrow.diagnostics.admission(), wide.diagnostics.admission());
+        // Both outputs were already compared with the input.
+        if narrow_admission.output_tile == wide_admission.output_tile {
+            assert_eq!(
+                scratch(&wide) - scratch(&narrow),
+                15 * stripe as u64,
+                "{workers} workers: the roomy fold was not sixteen stripes wide"
+            );
+        }
+        assert_eq!(
+            narrow.diagnostics.source_io(),
+            wide.diagnostics.source_io(),
+            "{workers} workers: the group changed the reads"
+        );
+        let (narrow_io, wide_io) = (narrow.diagnostics.file_io(), wide.diagnostics.file_io());
+        assert_eq!(narrow_io.write_calls, wide_io.write_calls, "{workers}");
+        assert_eq!(narrow_io.write_bytes, wide_io.write_bytes, "{workers}");
+    }
+}
+
 /// PR #73 finding 10. Successive stripe passes walk disjoint slices of every
 /// block, so a repair that cannot hold a whole block reads each source byte
 /// exactly once. `reread_bytes` is what a host uses to see I/O amplification,
@@ -774,4 +872,493 @@ fn a_copy_that_walks_a_block_in_windows_counts_one_pass_per_window() {
     );
     drop(session);
     assert_eq!(options.memory.used(), 0, "the session leaked");
+}
+
+/// A repair proves each staged output from the bytes it writes, whether a
+/// stripe covers a whole block or a block is written over several passes, so
+/// no staged byte is read back. Only `SyncFiles`, the default, synchronizes it.
+#[test]
+fn repair_proves_staged_outputs_and_syncs_only_when_asked() {
+    use par3_rs::session_repair::RepairDurability;
+    let tree = common::TempTree::new("staged-proof");
+    let set = common::cauchy_block_set(64, 4096, 8, b"PAR3 staged proof", &tree);
+    let (name, bytes) = set.contents[0].clone();
+    let mut damaged = bytes.clone();
+    for block in [2usize, 5, 9] {
+        damaged[block * 4096 + 17] ^= 0x80;
+    }
+    for (stripe, durability, syncs) in [
+        (4096, RepairDurability::SyncFiles, 1),
+        (1024, RepairDurability::SyncFiles, 1),
+        (4096, RepairDurability::Buffered, 0),
+        (1024, RepairDurability::Buffered, 0),
+    ] {
+        let case = format!("{stripe}-byte stripes, {durability:?}");
+        let mut access = MemorySourceAccess::default();
+        access.insert(SourceId(1), 1, damaged.clone().into());
+        let mut options = ExecutionOptions::default();
+        options.workers = 1;
+        options.stripe_bytes = stripe;
+        let mut session =
+            Par3RepairSession::new(set.id, Arc::new(access), options.clone()).unwrap();
+        session.bind_file(&name, SourceId(1)).unwrap();
+        for path in &set.paths {
+            for packet in common::scanned_packets(std::fs::read(path).unwrap(), &options) {
+                session.merge(packet).unwrap();
+            }
+        }
+        assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
+        let output = common::TempTree::new("staged-proof-out");
+        let report = session
+            .repair_with_durability(output.path(), false, durability)
+            .unwrap();
+        assert_eq!(report.reconstructed_blocks, 3, "{case}");
+        assert_eq!(
+            std::fs::read(output.path().join(&name)).unwrap(),
+            bytes,
+            "{case}"
+        );
+        let io = options.diagnostics.file_io();
+        assert_eq!(io.read_bytes, 0, "{case}: a staged output was read back");
+        assert_eq!(io.write_bytes, bytes.len() as u64, "{case}");
+        assert_eq!(options.diagnostics.file_sync().calls, syncs, "{case}");
+        drop(session);
+        assert_eq!(options.memory.used(), 0, "{case}: the session leaked");
+    }
+}
+
+// --- Planning hash pool (W2.5) ------------------------------------------------
+
+use par3_rs::source::{SourceAccess, SourceSnapshot};
+
+/// A memory source whose forward reader returns at most 7000 bytes a call and
+/// stops at half the file, so planning reads short and then positionally, and
+/// optionally fails outright at one offset.
+struct Trickle {
+    inner: MemorySourceAccess,
+    fail_at: Option<u64>,
+}
+
+struct TrickleReader {
+    inner: Box<dyn std::io::Read + Send>,
+    at: u64,
+    stop: u64,
+    fail_at: Option<u64>,
+}
+
+impl std::io::Read for TrickleReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self
+            .fail_at
+            .is_some_and(|fail| fail < self.at + out.len() as u64)
+        {
+            return Err(std::io::Error::other("injected source fault"));
+        }
+        let take = out.len().min(7000).min((self.stop - self.at) as usize);
+        let read = self.inner.read(&mut out[..take])?;
+        self.at += read as u64;
+        Ok(read)
+    }
+}
+
+impl SourceAccess for Trickle {
+    fn snapshot(&self, source: SourceId) -> std::io::Result<Option<SourceSnapshot>> {
+        self.inner.snapshot(source)
+    }
+    fn read_at(&self, source: SourceId, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read_at(source, offset, out)
+    }
+    fn next_available(
+        &self,
+        source: SourceId,
+        offset: u64,
+    ) -> std::io::Result<Option<std::ops::Range<u64>>> {
+        self.inner.next_available(source, offset)
+    }
+    fn open_sequential(
+        &self,
+        source: SourceId,
+    ) -> std::io::Result<Option<Box<dyn std::io::Read + Send>>> {
+        let stop = self
+            .inner
+            .snapshot(source)?
+            .map_or(0, |snapshot| snapshot.len / 2);
+        Ok(self.inner.open_sequential(source)?.map(|inner| {
+            Box::new(TrickleReader {
+                inner,
+                at: 0,
+                stop,
+                fail_at: self.fail_at,
+            }) as Box<dyn std::io::Read + Send>
+        }))
+    }
+}
+
+/// A large source plans its hashes on a pool that reads ahead of the walk:
+/// the file hash and chunk hashes run on the workers while the next buffer is
+/// read. The reads must be the serial walk's, call for call and byte for byte,
+/// and the set must be the same set. Only the stacks and the two parallel-hash
+/// buffers may differ. A small source beside it keeps the serial walk.
+#[test]
+fn a_planning_pool_changes_scratch_and_nothing_else() {
+    use par3_rs::creation::{CreationDurability, CreationOptions, CreationPlan, CreationSource};
+    // The smallest source that may start a planning pool.
+    let large = 8usize << 20;
+    let small: Vec<u8> = (0..70_000usize).map(|i| (i * 7 + i / 251) as u8).collect();
+    // Blocks of a buffer, of a stripe, and of neither; tails that are inline,
+    // just inline, just described, and described.
+    for (block_size, tail) in [
+        (1u64 << 20, 17usize),
+        (64 << 10, 3000),
+        (100_000, 39),
+        (100_000, 40),
+    ] {
+        let bytes: Vec<u8> = (0..large + tail)
+            .map(|i| (i * 131 + i / 977) as u8)
+            .collect();
+        let plan = |workers: usize, fail_at: Option<u64>| {
+            let mut inner = MemorySourceAccess::default();
+            inner.insert(SourceId(1), 1, bytes.clone().into());
+            inner.insert(SourceId(2), 1, small.clone().into());
+            let mut options = CreationOptions {
+                block_size,
+                recovery_count: 2,
+                ..CreationOptions::default()
+            };
+            options.execution.workers = workers;
+            let execution = options.execution.clone();
+            let plan = CreationPlan::build(
+                Arc::new(Trickle { inner, fail_at }),
+                &[
+                    CreationSource {
+                        name: "large.bin".into(),
+                        source: SourceId(1),
+                    },
+                    CreationSource {
+                        name: "small.bin".into(),
+                        source: SourceId(2),
+                    },
+                ],
+                options,
+            );
+            (plan, execution)
+        };
+        let run = |workers: usize| {
+            let (plan, execution) = plan(workers, None);
+            let plan = plan.unwrap();
+            let reads = execution.diagnostics.source_io();
+            let verify = execution.diagnostics.stage(Stage::Verify);
+            let ledger = execution.diagnostics.memory().unwrap();
+            let stacks = ledger.category(MemoryCategory::WorkerStacks).peak;
+            let scratch = ledger.category(MemoryCategory::SourceScratch).peak;
+            let tree =
+                common::TempTree::new(&format!("planning-pool-{block_size}-{tail}-{workers}"));
+            let carriers: Vec<Vec<u8>> = plan
+                .execute_with_durability(
+                    &tree.path().join("set"),
+                    tree.path(),
+                    CreationDurability::Buffered,
+                )
+                .unwrap()
+                .iter()
+                .map(|path| std::fs::read(path).unwrap())
+                .collect();
+            (
+                carriers,
+                reads,
+                (verify.calls, verify.completed),
+                stacks,
+                scratch,
+            )
+        };
+        let case = format!("{block_size}-byte blocks, {tail}-byte tail");
+        let (serial, serial_reads, serial_verify, serial_stacks, serial_scratch) = run(1);
+        assert_eq!(serial_stacks, 0, "{case}");
+        let (pooled, pooled_reads, pooled_verify, pooled_stacks, pooled_scratch) = run(4);
+        assert!(pooled_stacks > 0, "{case}: planning started no pool");
+        assert_eq!(
+            pooled_scratch - serial_scratch,
+            2 << 20,
+            "{case}: not two parallel-hash buffers"
+        );
+        assert_eq!(
+            pooled_reads, serial_reads,
+            "{case}: the pool changed the reads"
+        );
+        assert_eq!(
+            pooled_verify, serial_verify,
+            "{case}: chunk hashes or progress"
+        );
+        assert!(pooled == serial, "{case}: the pool changed the set");
+        // A read that fails ahead of the walk fails the plan as the serial walk
+        // does, after the same reads, never sooner or later.
+        let fail_at = Some(large as u64 / 2 - 5000);
+        let (serial_error, serial_execution) = plan(1, fail_at);
+        let (pooled_error, pooled_execution) = plan(4, fail_at);
+        let (serial_error, pooled_error) = (
+            serial_error
+                .err()
+                .expect("the serial plan read past the fault"),
+            pooled_error
+                .err()
+                .expect("the pooled plan read past the fault"),
+        );
+        assert_eq!(pooled_error.to_string(), serial_error.to_string(), "{case}");
+        assert_eq!(
+            pooled_execution.diagnostics.source_io(),
+            serial_execution.diagnostics.source_io(),
+            "{case}: a failed read changed the reads"
+        );
+    }
+    // A set of small sources never starts a planning pool.
+    let mut inner = MemorySourceAccess::default();
+    inner.insert(SourceId(2), 1, small.clone().into());
+    let mut options = CreationOptions::default();
+    options.execution.workers = 4;
+    let execution = options.execution.clone();
+    CreationPlan::build(
+        Arc::new(inner),
+        &[CreationSource {
+            name: "small.bin".into(),
+            source: SourceId(2),
+        }],
+        options,
+    )
+    .unwrap();
+    let ledger = execution.diagnostics.memory().unwrap();
+    assert_eq!(ledger.category(MemoryCategory::WorkerStacks).peak, 0);
+}
+
+// --- Clone staging -----------------------------------------------------------
+
+/// What one disk repair alone did. Every file it reads is a source on disk;
+/// the recovery data comes from memory.
+struct DiskRepair {
+    read_bytes: u64,
+    write_bytes: u64,
+    clones: u64,
+    syncs: u64,
+}
+
+/// Write every file of `set` into `inputs`, file `damaged` holding `on_disk`
+/// under the name `stored` (its own name when that is where it belongs), bind
+/// each to its path, and repair into `output`.
+fn repair_disk_files(
+    set: &common::ManyBlockSet,
+    damaged: usize,
+    on_disk: &[u8],
+    stored: &str,
+    inputs: &common::TempTree,
+    output: &std::path::Path,
+    backup: bool,
+) -> DiskRepair {
+    use par3_rs::source::DiskSourceAccess;
+    let mut options = ExecutionOptions::default();
+    options.workers = 1;
+    let mut access = DiskSourceAccess::with_options(options.clone());
+    for (index, (name, bytes)) in set.contents.iter().enumerate() {
+        let path = if index == damaged {
+            inputs.write(stored, on_disk)
+        } else {
+            inputs.write(name, bytes)
+        };
+        access.insert(SourceId(index as u64 + 1), path);
+    }
+    let mut session = Par3RepairSession::new(set.id, Arc::new(access), options.clone()).unwrap();
+    for (index, (name, _)) in set.contents.iter().enumerate() {
+        session.bind_file(name, SourceId(index as u64 + 1)).unwrap();
+    }
+    for path in &set.paths {
+        for packet in common::scanned_packets(std::fs::read(path).unwrap(), &options) {
+            session.merge(packet).unwrap();
+        }
+    }
+    assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
+    let before = options.diagnostics.file_io();
+    let report = session.repair(output, backup).unwrap();
+    let after = options.diagnostics.file_io();
+    assert_eq!(report.installed.len(), 1, "only the damaged file is staged");
+    let (name, bytes) = &set.contents[damaged];
+    assert_eq!(
+        &std::fs::read(output.join(name)).unwrap(),
+        bytes,
+        "the installed file differs from the input"
+    );
+    let run = DiskRepair {
+        read_bytes: after.read_bytes - before.read_bytes,
+        write_bytes: after.write_bytes - before.write_bytes,
+        clones: options.diagnostics.file_clones(),
+        syncs: options.diagnostics.file_sync().calls,
+    };
+    drop(session);
+    assert_eq!(options.memory.used(), 0, "the session leaked");
+    assert_eq!(options.handles.used(), 0, "a handle leaked");
+    run
+}
+
+/// Whether this target clones a file repaired in place. macOS always can on
+/// APFS; a Linux filesystem without reflink falls back to the copy, which is
+/// what the tests then check instead.
+fn expect_clone(run: &DiskRepair) -> bool {
+    if cfg!(target_os = "macos") {
+        assert_eq!(run.clones, 1, "an in-place repair on APFS must clone");
+    }
+    run.clones == 1
+}
+
+/// A 64 MiB file with one damaged block, repaired in place, writes one block:
+/// the staged clone already holds the other 63, so they are read once for the
+/// syndromes and never written, and nothing is read back. The default numbered
+/// backup keeps the damaged bytes, sharing every extent but the one rewritten.
+#[test]
+fn a_file_repaired_in_place_from_its_clone_writes_only_its_lost_block() {
+    let block = 1u64 << 20;
+    let tree = common::TempTree::new("clone-in-place");
+    let set = common::cauchy_block_set(64, block, 2, b"PAR3 clone staging", &tree);
+    let bytes = &set.contents[0].1;
+    let mut damaged = bytes.clone();
+    damaged[7 * block as usize + 11] ^= 0x80;
+    for backup in [false, true] {
+        let inputs = common::TempTree::new("clone-in-place-inputs");
+        let run = repair_disk_files(
+            &set,
+            0,
+            &damaged,
+            "input.bin",
+            &inputs,
+            inputs.path(),
+            backup,
+        );
+        let len = bytes.len() as u64;
+        // The surviving blocks, read once for the syndromes; no read-back.
+        assert_eq!(run.read_bytes, len - block);
+        assert_eq!(run.syncs, 1);
+        if expect_clone(&run) {
+            assert_eq!(run.write_bytes, block, "backup {backup}");
+        } else {
+            assert_eq!(run.write_bytes, len, "backup {backup}");
+        }
+        if backup {
+            assert_eq!(
+                std::fs::read(inputs.path().join("input.bin.1")).unwrap(),
+                damaged,
+                "the backup holds the damaged file"
+            );
+        }
+    }
+}
+
+/// A file whose every block is intact but whose length is wrong stages on the
+/// copy path. Cloned and cut back, it costs no read and no write at all; one
+/// cut short inside its last block loses that block, and the clone, extended,
+/// writes that one block alone. Copied instead, where the filesystem has no
+/// clones, each reads every block it still holds.
+#[test]
+fn a_clone_cut_or_extended_to_its_length_writes_only_what_it_lacks() {
+    let block = 64u64 << 10;
+    let tree = common::TempTree::new("clone-length");
+    let set = common::cauchy_block_set(16, block, 2, b"PAR3 clone length", &tree);
+    let bytes = &set.contents[0].1;
+    let len = bytes.len() as u64;
+    let mut grown = bytes.clone();
+    grown.extend_from_slice(b"trailing bytes that are not part of the file");
+    let short = bytes[..bytes.len() - 1000].to_vec();
+    for (case, on_disk, written, read, copied) in [
+        ("grown", grown, 0, 0, len),
+        ("short", short, block, len - block, len - block),
+    ] {
+        let inputs = common::TempTree::new("clone-length-inputs");
+        let run = repair_disk_files(
+            &set,
+            0,
+            &on_disk,
+            "input.bin",
+            &inputs,
+            inputs.path(),
+            false,
+        );
+        if expect_clone(&run) {
+            assert_eq!(run.read_bytes, read, "{case}");
+            assert_eq!(run.write_bytes, written, "{case}");
+        } else {
+            assert_eq!(run.read_bytes, copied, "{case}");
+            assert_eq!(run.write_bytes, len, "{case}");
+        }
+    }
+}
+
+/// An FFT-coded set takes the same path: the damaged file of four, repaired in
+/// place, writes the one block it lost.
+#[test]
+fn an_fft_repair_in_place_writes_only_the_lost_block() {
+    let tree = common::TempTree::new("clone-fft");
+    let set = common::many_block_set(4, 16, 0, 4, b"PAR3 clone fft", &tree);
+    let mut damaged = set.contents[1].1.clone();
+    damaged[70] ^= 0x80;
+    let inputs = common::TempTree::new("clone-fft-inputs");
+    let run = repair_disk_files(
+        &set,
+        1,
+        &damaged,
+        "input1.bin",
+        &inputs,
+        inputs.path(),
+        false,
+    );
+    if expect_clone(&run) {
+        assert_eq!(run.write_bytes, 64);
+    } else {
+        assert_eq!(run.write_bytes, damaged.len() as u64);
+    }
+}
+
+/// Only the file the evidence verified is ever cloned. A source found under
+/// another name leaves nothing at the destination, and a destination holding a
+/// different file with the same bytes is not that file: both are copied.
+#[test]
+fn a_moved_source_or_another_file_at_the_destination_is_copied_not_cloned() {
+    let block = 64u64 << 10;
+    let tree = common::TempTree::new("clone-moved");
+    let set = common::cauchy_block_set(16, block, 2, b"PAR3 clone moved", &tree);
+    let bytes = &set.contents[0].1;
+    let mut damaged = bytes.clone();
+    damaged[3 * block as usize] ^= 0x80;
+
+    let inputs = common::TempTree::new("clone-moved-inputs");
+    let run = repair_disk_files(
+        &set,
+        0,
+        &damaged,
+        "moved.bin",
+        &inputs,
+        inputs.path(),
+        false,
+    );
+    assert_eq!(run.clones, 0, "a moved source");
+    assert_eq!(run.write_bytes, bytes.len() as u64);
+    assert_eq!(run.read_bytes, bytes.len() as u64 - block, "no read-back");
+    assert_eq!(
+        std::fs::read(inputs.path().join("moved.bin")).unwrap(),
+        damaged
+    );
+
+    let inputs = common::TempTree::new("clone-other-inputs");
+    let output = common::TempTree::new("clone-other-output");
+    output.write("input.bin", &damaged);
+    let run = repair_disk_files(
+        &set,
+        0,
+        &damaged,
+        "input.bin",
+        &inputs,
+        output.path(),
+        false,
+    );
+    assert_eq!(run.clones, 0, "another file at the destination");
+    assert_eq!(run.write_bytes, bytes.len() as u64);
+    assert_eq!(run.read_bytes, bytes.len() as u64 - block, "no read-back");
+    assert_eq!(
+        std::fs::read(inputs.path().join("input.bin")).unwrap(),
+        damaged
+    );
 }

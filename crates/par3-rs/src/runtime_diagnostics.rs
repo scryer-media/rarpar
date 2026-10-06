@@ -322,6 +322,7 @@ struct State {
     source: IoCounters,
     files: IoCounters,
     opens: AtomicU64,
+    clones: AtomicU64,
     stages: [StageCounters; STAGES],
     sync: StageCounters,
     next: AtomicU64,
@@ -379,6 +380,16 @@ impl ExecutionDiagnostics {
     }
     pub(crate) fn note_open(&self) {
         add(&self.0.opens, 1);
+    }
+    /// Repair outputs staged as a clone of the file at their destination, so
+    /// that only the extents the repair writes are copied. Bytes a clone
+    /// already holds are neither read nor written, and are absent from
+    /// [`Self::file_io`].
+    pub fn file_clones(&self) -> u64 {
+        self.0.clones.load(Ordering::Relaxed)
+    }
+    pub(crate) fn note_clone(&self) {
+        add(&self.0.clones, 1);
     }
     /// File synchronization barriers, including time waiting for storage.
     /// `calls` counts attempts and `completed` counts successes. Durations are

@@ -136,6 +136,10 @@ impl EngineFile {
     pub(crate) fn metadata(&self) -> io::Result<Metadata> {
         self.file.metadata()
     }
+    #[cfg(windows)]
+    pub(crate) fn as_std(&self) -> &File {
+        &self.file
+    }
     pub(crate) fn set_len(&self, len: u64) -> io::Result<()> {
         self.file.set_len(len)
     }
@@ -194,6 +198,12 @@ impl EngineFile {
             }
         }
         Ok(())
+    }
+}
+#[cfg(unix)]
+impl std::os::fd::AsFd for EngineFile {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.file.as_fd()
     }
 }
 impl Read for EngineFile {

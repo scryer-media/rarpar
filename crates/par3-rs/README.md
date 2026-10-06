@@ -298,10 +298,12 @@ resolved set's measured container capacity, which
 — the same packet may hang under many parents, so expansion is charged per
 entry and refused by name rather than by exhaustion.
 
-Windows scanning pins a read-only carrier handle, preventing repeated full-file
-generation hashes after one acquisition hash. Retained packets keep that handle
-alive; drop them before replacing or deleting carriers. All generation hashes
-consume scan-work budget. Use `Par3RepairSession::validate_repair()` to check
+Windows scanning pins a read-only carrier handle. Retained packets keep that
+handle alive; drop them before replacing or deleting carriers. Disk source
+generations come from the file's identity and change time — device, inode and
+ctime on Unix; volume serial number, 128-bit file id and ChangeTime on Windows —
+so a snapshot reads no file bytes. Where a filesystem reports neither, and on
+WASI, generations hash the file instead, consuming scan-work budget. Use `Par3RepairSession::validate_repair()` to check
 dry-run readiness, configured codec limits, and layouts requiring explicit
 self-repair before staging output.
 
@@ -400,7 +402,7 @@ links and concurrent changes according to the selected API's contract.
 
 Unsafe Rust is confined to one Windows filesystem-security module, which
 creates owner-only staging directories through held handles and compares their
-identities. All other targets forbid unsafe Rust. Shared arithmetic dependencies
+identities, and reads file identities and change times. All other targets forbid unsafe Rust. Shared arithmetic dependencies
 use CPU-specific kernels. It is a clean-room implementation of the
 [PAR3 draft](https://parchive.github.io/doc/Parity_Volume_Set_Specification_v3.0.html)
 and format facts established by
