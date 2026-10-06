@@ -292,8 +292,6 @@ fn create_side_commands_are_refused_after_the_argument_checks() {
         (&["i", "bundle.zip"], "(i, ti and d are not supported)"),
         (&["ti", "bundle.zip"], "(i, ti and d are not supported)"),
         (&["d", "bundle.zip"], "(i, ti and d are not supported)"),
-        (&["vs", "bundle.zip"], "(vs and rs are not supported)"),
-        (&["rs", "bundle.zip"], "(vs and rs are not supported)"),
     ] {
         par3.run(root, args).code(3).says(message);
     }
@@ -611,5 +609,186 @@ fn compare_with_par3cmdline() {
         let a = par3.run(ours.path(), args);
         let b = reference_run(&reference, theirs.path(), args);
         assert_eq!(a.code, b.code, "{args:?}");
+    }
+}
+
+/// A ZIP of stored entries holding `size` bytes of invented data.
+fn stored_zip(size: usize, seed: u32) -> Vec<u8> {
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xEDB8_8320 & 0u32.wrapping_sub(crc & 1));
+            }
+        }
+        !crc
+    }
+    // Xorshift bytes: no two blocks alike, as in compressed archive data.
+    let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ u64::from(seed);
+    let data: Vec<u8> = (0..size)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect();
+    let name = b"meadow.bin";
+    let crc = crc32(&data);
+    let mut zip = Vec::new();
+    let fields = |out: &mut Vec<u8>, central: bool| {
+        out.extend_from_slice(&[20, 0]);
+        if central {
+            out.extend_from_slice(&[20, 0]);
+        }
+        out.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0x21]);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(size as u32).to_le_bytes());
+        out.extend_from_slice(&(size as u32).to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&[0, 0]);
+    };
+    zip.extend_from_slice(b"PK\x03\x04");
+    fields(&mut zip, false);
+    zip.extend_from_slice(name);
+    zip.extend_from_slice(&data);
+    let central = zip.len() as u32;
+    zip.extend_from_slice(b"PK\x01\x02");
+    fields(&mut zip, true);
+    zip.extend_from_slice(&[0; 14]);
+    zip.extend_from_slice(name);
+    let central_len = zip.len() as u32 - central;
+    zip.extend_from_slice(b"PK\x05\x06\0\0\0\0\x01\0\x01\0");
+    zip.extend_from_slice(&central_len.to_le_bytes());
+    zip.extend_from_slice(&central.to_le_bytes());
+    zip.extend_from_slice(&[0, 0]);
+    zip
+}
+
+/// `vs` and `rs` against a real par3cmdline: PAR data inserted by par3cmdline
+/// `i` into ZIP files (and 7z files when `SEVENZ_REFERENCE_BIN` names 7-Zip),
+/// damaged in the archive bytes, the packets, both, by truncation and by
+/// growth. Both tools must print the same lines (timings aside), exit alike,
+/// and leave the same files with the same bytes.
+#[test]
+#[ignore = "needs a par3cmdline binary in PAR3_REFERENCE_BIN"]
+fn self_verify_and_repair_match_par3cmdline() {
+    let Some(reference) = std::env::var_os("PAR3_REFERENCE_BIN") else {
+        eprintln!("PAR3_REFERENCE_BIN is not set; nothing to compare");
+        return;
+    };
+    let reference = PathBuf::from(reference);
+    let par3 = Par3::new();
+    let sources = tempfile::tempdir().unwrap();
+    let mut archives = Vec::new();
+    for (size, seed) in [
+        (0usize, 1u32),
+        (39, 2),
+        (900, 3),
+        (5000, 4),
+        (70_000, 5),
+        (400_000, 6),
+    ] {
+        let path = sources.path().join(format!("meadow{size}.zip"));
+        std::fs::write(&path, stored_zip(size, seed)).unwrap();
+        archives.push(path);
+        if let Some(sevenz) = std::env::var_os("SEVENZ_REFERENCE_BIN") {
+            let input = sources.path().join(format!("meadow{size}.bin"));
+            std::fs::write(&input, stored_zip(size, seed + 7)).unwrap();
+            let path = sources.path().join(format!("meadow{size}.7z"));
+            let status = Command::new(sevenz)
+                .current_dir(sources.path())
+                .args(["a", "-bd", "-y"])
+                .arg(&path)
+                .arg(&input)
+                .output()
+                .unwrap()
+                .status;
+            assert!(status.success());
+            archives.push(path);
+        }
+    }
+    let packets = |bytes: &[u8]| -> Vec<usize> {
+        (0..bytes.len().saturating_sub(8))
+            .filter(|&at| &bytes[at..at + 8] == b"PAR3\0PKT")
+            .collect()
+    };
+    type Damage = fn(&mut Vec<u8>, &[usize]);
+    let damages: &[(&str, Damage)] = &[
+        ("intact", |_, _| {}),
+        ("head", |bytes, _| bytes[40..60].fill(0)),
+        ("middle", |bytes, _| {
+            let at = bytes.len() / 3;
+            let end = (at + 700).min(bytes.len());
+            bytes[at..end].fill(0xAA);
+        }),
+        ("packet", |bytes, at| {
+            if let Some(&at) = at.get(2) {
+                bytes[at + 60] ^= 1;
+            }
+        }),
+        ("head and packet", |bytes, at| {
+            if let Some(&at) = at.get(2) {
+                bytes[at + 60] ^= 1;
+            }
+            bytes[40..60].fill(0);
+        }),
+        ("truncated", |bytes, _| {
+            let keep = bytes.len() - 100;
+            bytes.truncate(keep);
+        }),
+        ("grown", |bytes, _| bytes.extend_from_slice(&[0x5A; 200])),
+    ];
+    let timing = |text: &str| -> String {
+        text.lines()
+            .map(|line| {
+                if line.starts_with("done in ") {
+                    "done"
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    for archive in &archives {
+        let name = archive.file_name().unwrap().to_str().unwrap();
+        for redundancy in ["-r0", "-r10", "-r40"] {
+            let protected = tempfile::tempdir().unwrap();
+            std::fs::copy(archive, protected.path().join(name)).unwrap();
+            let inserted = reference_run(&reference, protected.path(), &["i", redundancy, name]);
+            assert_eq!(inserted.code, 0, "{name} {redundancy}: {}", inserted.stdout);
+            let original = std::fs::read(protected.path().join(name)).unwrap();
+            let at = packets(&original);
+            for (label, damage) in damages {
+                let mut damaged = original.clone();
+                damage(&mut damaged, &at);
+                for args in [&["vs", name][..], &["rs", name], &["rs", "-q", name]] {
+                    let ours = tempfile::tempdir().unwrap();
+                    let theirs = tempfile::tempdir().unwrap();
+                    std::fs::write(ours.path().join(name), &damaged).unwrap();
+                    std::fs::write(theirs.path().join(name), &damaged).unwrap();
+                    let a = par3.run(ours.path(), args);
+                    let b = reference_run(&reference, theirs.path(), args);
+                    let context = format!("{name} {redundancy} {label} {args:?}");
+                    assert_eq!(a.code, b.code, "{context}");
+                    assert_eq!(timing(&a.stdout), timing(&b.stdout), "{context}");
+                    let listing = |root: &Path| {
+                        let mut names: Vec<(String, Vec<u8>)> = std::fs::read_dir(root)
+                            .unwrap()
+                            .map(|entry| {
+                                let entry = entry.unwrap();
+                                let bytes = std::fs::read(entry.path()).unwrap();
+                                (entry.file_name().to_string_lossy().into_owned(), bytes)
+                            })
+                            .collect();
+                        names.sort();
+                        names
+                    };
+                    assert!(listing(ours.path()) == listing(theirs.path()), "{context}");
+                }
+            }
+        }
     }
 }
