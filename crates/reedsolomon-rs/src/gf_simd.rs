@@ -156,6 +156,866 @@ impl LinearMap16 {
     }
 }
 
+/// An 8-bit binary linear map, constructed from the images of its eight input
+/// bits. Any such map is two 16-entry nibble tables, so this runs the GF(2^8)
+/// region kernels of [`crate::gf8`] with tables built from the caller's basis
+/// images instead of the 0x11d product. The kernel set matches
+/// [`LinearMap16`], selected by the same [`LinearBackend`].
+pub struct LinearMap8 {
+    plan: crate::gf8::MulPlan,
+    kernel: LinearKernel,
+}
+
+impl LinearMap8 {
+    /// Prepare the two nibble tables without heap allocation.
+    pub fn new(basis: [u8; 8], backend: LinearBackend) -> Self {
+        let table = |nibble: usize| {
+            std::array::from_fn(|value| {
+                (0..4)
+                    .filter(|bit| value & (1 << bit) != 0)
+                    .fold(0, |sum, bit| sum ^ basis[nibble * 4 + bit])
+            })
+        };
+        Self {
+            plan: crate::gf8::MulPlan::from_tables(table(0), table(1)),
+            kernel: backend.kernel(),
+        }
+    }
+
+    /// XOR mapped bytes into an equally sized destination. Vector kernels
+    /// finish their tails with the same tables, so no length is excluded.
+    pub fn accumulate(&self, source: &[u8], destination: &mut [u8]) {
+        assert_eq!(source.len(), destination.len());
+        match self.kernel {
+            // SAFETY (all three): `LinearBackend::kernel` reports a vector
+            // kernel only after detecting its ISA, and each kernel bounds
+            // every load and store by the equal slice lengths asserted above.
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            LinearKernel::Neon => unsafe { self.plan.neon(source, destination) },
+            #[cfg(target_arch = "x86_64")]
+            LinearKernel::Avx2 => unsafe { self.plan.avx2(source, destination) },
+            #[cfg(target_arch = "x86_64")]
+            LinearKernel::Ssse3 => unsafe { self.plan.ssse3(source, destination) },
+            _ => self.plan.scalar(source, destination),
+        }
+    }
+
+    /// [`LinearMap16::butterfly`] on byte rows, through the fused variants of
+    /// the [`crate::gf8`] nibble kernels.
+    pub(crate) fn butterfly(&self, left: &mut [u8], right: &mut [u8], inverse: bool) {
+        assert_eq!(left.len(), right.len());
+        if inverse {
+            self.butterfly_in::<true>(left, right);
+        } else {
+            self.butterfly_in::<false>(left, right);
+        }
+    }
+
+    fn butterfly_in<const INVERSE: bool>(&self, left: &mut [u8], right: &mut [u8]) {
+        let done = match self.kernel {
+            // SAFETY (all three): the kernel's ISA was detected when the map
+            // was built, and both rows have the length asserted by the caller.
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            LinearKernel::Neon => unsafe { self.plan.butterfly_neon::<INVERSE>(left, right) },
+            #[cfg(target_arch = "x86_64")]
+            LinearKernel::Avx2 => unsafe { self.plan.butterfly_avx2::<INVERSE>(left, right) },
+            #[cfg(target_arch = "x86_64")]
+            LinearKernel::Ssse3 => unsafe { self.plan.butterfly_ssse3::<INVERSE>(left, right) },
+            _ => 0,
+        };
+        self.plan
+            .butterfly_scalar::<INVERSE>(&mut left[done..], &mut right[done..]);
+    }
+
+    /// [`LinearMap16::radix4`] on byte rows.
+    pub(crate) fn radix4(outer: &Self, inner: [&Self; 2], rows: [&mut [u8]; 4], inverse: bool) {
+        let width = rows[0].len();
+        assert!(rows.iter().all(|row| row.len() == width));
+        if inverse {
+            Self::radix4_in::<true>(outer, inner, rows);
+        } else {
+            Self::radix4_in::<false>(outer, inner, rows);
+        }
+    }
+
+    fn radix4_in<const INVERSE: bool>(outer: &Self, inner: [&Self; 2], rows: [&mut [u8]; 4]) {
+        let plans = [&outer.plan, &inner[0].plan, &inner[1].plan];
+        let [a, b, c, d] = rows;
+        let done = match outer.kernel {
+            // SAFETY (all three): as in `butterfly_in`; all four rows have
+            // the length asserted by the caller.
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            LinearKernel::Neon => unsafe {
+                crate::gf8::MulPlan::radix4_neon::<INVERSE>(
+                    plans,
+                    [&mut *a, &mut *b, &mut *c, &mut *d],
+                )
+            },
+            #[cfg(target_arch = "x86_64")]
+            LinearKernel::Avx2 => unsafe {
+                crate::gf8::MulPlan::radix4_avx2::<INVERSE>(
+                    plans,
+                    [&mut *a, &mut *b, &mut *c, &mut *d],
+                )
+            },
+            #[cfg(target_arch = "x86_64")]
+            LinearKernel::Ssse3 => unsafe {
+                crate::gf8::MulPlan::radix4_ssse3::<INVERSE>(
+                    plans,
+                    [&mut *a, &mut *b, &mut *c, &mut *d],
+                )
+            },
+            _ => 0,
+        };
+        crate::gf8::MulPlan::radix4_scalar::<INVERSE>(
+            plans,
+            [
+                &mut a[done..],
+                &mut b[done..],
+                &mut c[done..],
+                &mut d[done..],
+            ],
+        );
+    }
+}
+
+/// One additive-FFT butterfly on the values `$l` and `$r` with the prepared
+/// map `$m`: forward `l ^= m(r); r ^= l`, inverse `r ^= l; l ^= m(r)`. `$xor`
+/// and `$map` are the calling tier's value operations, so every tier runs the
+/// same arithmetic in the same order.
+macro_rules! fused_butterfly {
+    ($inverse:expr, $l:ident, $r:ident, $m:expr, $xor:expr, $map:expr) => {
+        if $inverse {
+            $r = $xor($r, $l);
+            $l = $xor($l, $map($m, $r));
+        } else {
+            $l = $xor($l, $map($m, $r));
+            $r = $xor($r, $l);
+        }
+    };
+}
+pub(crate) use fused_butterfly;
+
+/// Two consecutive butterfly stages on the values `[a, b, c, d]` of four rows
+/// spaced `h` apart: the outer stage (stride `2h`) joins (a, c) and (b, d)
+/// with `$outer`, the inner stage (stride `h`) joins (a, b) with `$inner_a`
+/// and (c, d) with `$inner_b`. Forward runs the outer stage first, inverse
+/// the inner one, exactly as two radix-2 sweeps would.
+macro_rules! fused_radix4 {
+    (
+        $inverse:expr, [$a:ident, $b:ident, $c:ident, $d:ident],
+        $outer:expr, $inner_a:expr, $inner_b:expr, $xor:expr, $map:expr
+    ) => {
+        if $inverse {
+            $crate::gf_simd::fused_butterfly!(true, $a, $b, $inner_a, $xor, $map);
+            $crate::gf_simd::fused_butterfly!(true, $c, $d, $inner_b, $xor, $map);
+            $crate::gf_simd::fused_butterfly!(true, $a, $c, $outer, $xor, $map);
+            $crate::gf_simd::fused_butterfly!(true, $b, $d, $outer, $xor, $map);
+        } else {
+            $crate::gf_simd::fused_butterfly!(false, $a, $c, $outer, $xor, $map);
+            $crate::gf_simd::fused_butterfly!(false, $b, $d, $outer, $xor, $map);
+            $crate::gf_simd::fused_butterfly!(false, $a, $b, $inner_a, $xor, $map);
+            $crate::gf_simd::fused_butterfly!(false, $c, $d, $inner_b, $xor, $map);
+        }
+    };
+}
+pub(crate) use fused_radix4;
+
+impl LinearMap16 {
+    /// The image of one symbol, from the same nibble tables as the kernels.
+    fn apply(&self, value: u16) -> u16 {
+        (0..4).fold(0, |product, nibble| {
+            let index = ((value >> (4 * nibble)) & 15) as usize;
+            product
+                ^ u16::from_le_bytes([
+                    self.tables.tables[nibble * 2][index],
+                    self.tables.tables[nibble * 2 + 1][index],
+                ])
+        })
+    }
+
+    /// One additive-FFT butterfly over two equally long rows, each row loaded
+    /// and stored once: forward `left ^= map(right); right ^= left`, inverse
+    /// `right ^= left; left ^= map(right)`. The symbols are exactly those of
+    /// [`Self::accumulate`] followed (or preceded) by a separate XOR pass.
+    pub(crate) fn butterfly(&self, left: &mut [u16], right: &mut [u16], inverse: bool) {
+        assert_eq!(left.len(), right.len());
+        if inverse {
+            self.butterfly_in::<true>(left, right);
+        } else {
+            self.butterfly_in::<false>(left, right);
+        }
+    }
+
+    fn butterfly_in<const INVERSE: bool>(&self, left: &mut [u16], right: &mut [u16]) {
+        let mut done = 0;
+        #[cfg(any(
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_endian = "little")
+        ))]
+        if self.kernel != LinearKernel::Scalar {
+            let bytes = left.len() * 2;
+            // SAFETY: as in `vector_prefix`; both rows have the asserted
+            // length, and only the detected ISA is invoked.
+            done = unsafe {
+                let l = std::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), bytes);
+                let r = std::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), bytes);
+                match self.kernel {
+                    #[cfg(target_arch = "x86_64")]
+                    LinearKernel::Avx2 => {
+                        fused16_x86::butterfly_avx2::<INVERSE>(&self.tables, l, r)
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    LinearKernel::Ssse3 => {
+                        fused16_x86::butterfly_ssse3::<INVERSE>(&self.tables, l, r)
+                    }
+                    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                    LinearKernel::Neon => fused16_neon::butterfly::<INVERSE>(&self.tables, l, r),
+                    _ => 0,
+                }
+            } / 2;
+        }
+        for (l, r) in left[done..].iter_mut().zip(&mut right[done..]) {
+            let (mut x, mut y) = (*l, *r);
+            fused_butterfly!(INVERSE, x, y, self, std::ops::BitXor::bitxor, Self::apply);
+            (*l, *r) = (x, y);
+        }
+    }
+
+    /// Two consecutive butterfly stages over four equally long rows
+    /// `[a, b, c, d]`, each row loaded and stored once: `outer` joins (a, c)
+    /// and (b, d), `inner[0]` joins (a, b) and `inner[1]` joins (c, d).
+    /// Forward runs the outer stage first and inverse the inner stage first,
+    /// each butterfly as in [`Self::butterfly`], so the symbols are exactly
+    /// those of the two radix-2 stages. All maps share one backend.
+    pub(crate) fn radix4(outer: &Self, inner: [&Self; 2], rows: [&mut [u16]; 4], inverse: bool) {
+        let width = rows[0].len();
+        assert!(rows.iter().all(|row| row.len() == width));
+        if inverse {
+            Self::radix4_in::<true>(outer, inner, rows);
+        } else {
+            Self::radix4_in::<false>(outer, inner, rows);
+        }
+    }
+
+    fn radix4_in<const INVERSE: bool>(outer: &Self, inner: [&Self; 2], rows: [&mut [u16]; 4]) {
+        let [inner_a, inner_b] = inner;
+        let [a, b, c, d] = rows;
+        let mut done = 0;
+        #[cfg(any(
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_endian = "little")
+        ))]
+        if outer.kernel != LinearKernel::Scalar {
+            let bytes = a.len() * 2;
+            let tables = [&outer.tables, &inner_a.tables, &inner_b.tables];
+            // SAFETY: as in `butterfly_in`, for four rows of the asserted
+            // length.
+            done = unsafe {
+                let view = |row: &mut [u16]| {
+                    std::slice::from_raw_parts_mut(row.as_mut_ptr().cast::<u8>(), bytes)
+                };
+                let rows = [view(a), view(b), view(c), view(d)];
+                match outer.kernel {
+                    #[cfg(target_arch = "x86_64")]
+                    LinearKernel::Avx2 => fused16_x86::radix4_avx2::<INVERSE>(tables, rows),
+                    #[cfg(target_arch = "x86_64")]
+                    LinearKernel::Ssse3 => fused16_x86::radix4_ssse3::<INVERSE>(tables, rows),
+                    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                    LinearKernel::Neon => fused16_neon::radix4::<INVERSE>(tables, rows),
+                    _ => 0,
+                }
+            } / 2;
+        }
+        for at in done..a.len() {
+            let (mut w, mut x, mut y, mut z) = (a[at], b[at], c[at], d[at]);
+            fused_radix4!(
+                INVERSE,
+                [w, x, y, z],
+                outer,
+                inner_a,
+                inner_b,
+                std::ops::BitXor::bitxor,
+                Self::apply
+            );
+            (a[at], b[at], c[at], d[at]) = (w, x, y, z);
+        }
+    }
+}
+
+/// Fused transform kernels for 16-bit symbols on NEON: `vld2q_u8` splits a
+/// 32-byte block into its low and high byte planes, the butterflies run on
+/// the planes, and `vst2q_u8` reinterleaves them.
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+mod fused16_neon {
+    use super::MulTables;
+    use std::arch::aarch64::*;
+
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn tables(tables: &MulTables) -> [uint8x16_t; 8] {
+        // SAFETY: each load reads exactly one 16-byte table.
+        std::array::from_fn(|at| unsafe { vld1q_u8(tables.tables[at].as_ptr()) })
+    }
+
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn xor(a: uint8x16x2_t, b: uint8x16x2_t) -> uint8x16x2_t {
+        uint8x16x2_t(veorq_u8(a.0, b.0), veorq_u8(a.1, b.1))
+    }
+
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn map(t: &[uint8x16_t; 8], value: uint8x16x2_t) -> uint8x16x2_t {
+        let mask = vdupq_n_u8(0x0f);
+        let lo0 = vandq_u8(value.0, mask);
+        let lo1 = vshrq_n_u8::<4>(value.0);
+        let hi0 = vandq_u8(value.1, mask);
+        let hi1 = vshrq_n_u8::<4>(value.1);
+        uint8x16x2_t(
+            veorq_u8(
+                veorq_u8(vqtbl1q_u8(t[0], lo0), vqtbl1q_u8(t[2], lo1)),
+                veorq_u8(vqtbl1q_u8(t[4], hi0), vqtbl1q_u8(t[6], hi1)),
+            ),
+            veorq_u8(
+                veorq_u8(vqtbl1q_u8(t[1], lo0), vqtbl1q_u8(t[3], lo1)),
+                veorq_u8(vqtbl1q_u8(t[5], hi0), vqtbl1q_u8(t[7], hi1)),
+            ),
+        )
+    }
+
+    /// Returns the bytes processed, a multiple of 32.
+    ///
+    /// # Safety
+    /// `left` and `right` must have equal lengths.
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn butterfly<const INVERSE: bool>(
+        tables: &MulTables,
+        left: &mut [u8],
+        right: &mut [u8],
+    ) -> usize {
+        let t = self::tables(tables);
+        let mut at = 0;
+        while left.len() - at >= 32 {
+            // SAFETY: both rows hold 32 bytes from `at`.
+            unsafe {
+                let mut l = vld2q_u8(left.as_ptr().add(at));
+                let mut r = vld2q_u8(right.as_ptr().add(at));
+                crate::gf_simd::fused_butterfly!(INVERSE, l, r, &t, xor, map);
+                vst2q_u8(left.as_mut_ptr().add(at), l);
+                vst2q_u8(right.as_mut_ptr().add(at), r);
+            }
+            at += 32;
+        }
+        at
+    }
+
+    /// Returns the bytes processed, a multiple of 32.
+    ///
+    /// # Safety
+    /// All four rows must have equal lengths.
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn radix4<const INVERSE: bool>(
+        tables: [&MulTables; 3],
+        rows: [&mut [u8]; 4],
+    ) -> usize {
+        let [outer, inner_a, inner_b] = [
+            self::tables(tables[0]),
+            self::tables(tables[1]),
+            self::tables(tables[2]),
+        ];
+        let [ra, rb, rc, rd] = rows;
+        let mut at = 0;
+        while ra.len() - at >= 32 {
+            // SAFETY: all four rows hold 32 bytes from `at`.
+            unsafe {
+                let mut a = vld2q_u8(ra.as_ptr().add(at));
+                let mut b = vld2q_u8(rb.as_ptr().add(at));
+                let mut c = vld2q_u8(rc.as_ptr().add(at));
+                let mut d = vld2q_u8(rd.as_ptr().add(at));
+                crate::gf_simd::fused_radix4!(
+                    INVERSE,
+                    [a, b, c, d],
+                    &outer,
+                    &inner_a,
+                    &inner_b,
+                    xor,
+                    map
+                );
+                vst2q_u8(ra.as_mut_ptr().add(at), a);
+                vst2q_u8(rb.as_mut_ptr().add(at), b);
+                vst2q_u8(rc.as_mut_ptr().add(at), c);
+                vst2q_u8(rd.as_mut_ptr().add(at), d);
+            }
+            at += 32;
+        }
+        at
+    }
+}
+
+/// Fused transform kernels for 16-bit symbols on x86: the same byte-plane
+/// split as `mul_acc_region_avx2`/`_ssse3` on load, its exact inverse on
+/// store, and the butterflies on the planes in between.
+#[cfg(target_arch = "x86_64")]
+mod fused16_x86 {
+    use super::MulTables;
+    use std::arch::x86_64::*;
+
+    type Planes256 = (__m256i, __m256i);
+    type Planes128 = (__m128i, __m128i);
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn tables256(tables: &MulTables) -> [__m256i; 8] {
+        // SAFETY: each load reads exactly one 16-byte table.
+        std::array::from_fn(|at| unsafe {
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(tables.tables[at].as_ptr().cast()))
+        })
+    }
+
+    /// # Safety
+    /// `at` must address 64 readable bytes.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn load256(at: *const u8) -> Planes256 {
+        let pairs = _mm256_broadcastsi128_si256(_mm_set_epi8(
+            15, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 0,
+        ));
+        // SAFETY: the caller guarantees 64 readable bytes.
+        let (s0, s1) = unsafe {
+            (
+                _mm256_loadu_si256(at.cast()),
+                _mm256_loadu_si256(at.add(32).cast()),
+            )
+        };
+        let a = _mm256_shuffle_epi8(s0, pairs);
+        let b = _mm256_shuffle_epi8(s1, pairs);
+        (_mm256_unpacklo_epi64(a, b), _mm256_unpackhi_epi64(a, b))
+    }
+
+    /// # Safety
+    /// `at` must address 64 writable bytes.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn store256(at: *mut u8, (lo, hi): Planes256) {
+        // SAFETY: the caller guarantees 64 writable bytes.
+        unsafe {
+            _mm256_storeu_si256(at.cast(), _mm256_unpacklo_epi8(lo, hi));
+            _mm256_storeu_si256(at.add(32).cast(), _mm256_unpackhi_epi8(lo, hi));
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn xor256(a: Planes256, b: Planes256) -> Planes256 {
+        (_mm256_xor_si256(a.0, b.0), _mm256_xor_si256(a.1, b.1))
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn map256(t: &[__m256i; 8], (lo, hi): Planes256) -> Planes256 {
+        let mask = _mm256_set1_epi8(0x0f);
+        let lo0 = _mm256_and_si256(lo, mask);
+        let lo1 = _mm256_and_si256(_mm256_srli_epi16::<4>(lo), mask);
+        let hi0 = _mm256_and_si256(hi, mask);
+        let hi1 = _mm256_and_si256(_mm256_srli_epi16::<4>(hi), mask);
+        (
+            _mm256_xor_si256(
+                _mm256_xor_si256(
+                    _mm256_shuffle_epi8(t[0], lo0),
+                    _mm256_shuffle_epi8(t[2], lo1),
+                ),
+                _mm256_xor_si256(
+                    _mm256_shuffle_epi8(t[4], hi0),
+                    _mm256_shuffle_epi8(t[6], hi1),
+                ),
+            ),
+            _mm256_xor_si256(
+                _mm256_xor_si256(
+                    _mm256_shuffle_epi8(t[1], lo0),
+                    _mm256_shuffle_epi8(t[3], lo1),
+                ),
+                _mm256_xor_si256(
+                    _mm256_shuffle_epi8(t[5], hi0),
+                    _mm256_shuffle_epi8(t[7], hi1),
+                ),
+            ),
+        )
+    }
+
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    fn tables128(tables: &MulTables) -> [__m128i; 8] {
+        // SAFETY: each load reads exactly one 16-byte table.
+        std::array::from_fn(|at| unsafe { _mm_loadu_si128(tables.tables[at].as_ptr().cast()) })
+    }
+
+    /// # Safety
+    /// `at` must address 32 readable bytes.
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    unsafe fn load128(at: *const u8) -> Planes128 {
+        let pairs = _mm_set_epi8(15, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 0);
+        // SAFETY: the caller guarantees 32 readable bytes.
+        let (s0, s1) = unsafe {
+            (
+                _mm_loadu_si128(at.cast()),
+                _mm_loadu_si128(at.add(16).cast()),
+            )
+        };
+        let a = _mm_shuffle_epi8(s0, pairs);
+        let b = _mm_shuffle_epi8(s1, pairs);
+        (_mm_unpacklo_epi64(a, b), _mm_unpackhi_epi64(a, b))
+    }
+
+    /// # Safety
+    /// `at` must address 32 writable bytes.
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    unsafe fn store128(at: *mut u8, (lo, hi): Planes128) {
+        // SAFETY: the caller guarantees 32 writable bytes.
+        unsafe {
+            _mm_storeu_si128(at.cast(), _mm_unpacklo_epi8(lo, hi));
+            _mm_storeu_si128(at.add(16).cast(), _mm_unpackhi_epi8(lo, hi));
+        }
+    }
+
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    fn xor128(a: Planes128, b: Planes128) -> Planes128 {
+        (_mm_xor_si128(a.0, b.0), _mm_xor_si128(a.1, b.1))
+    }
+
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    fn map128(t: &[__m128i; 8], (lo, hi): Planes128) -> Planes128 {
+        let mask = _mm_set1_epi8(0x0f);
+        let lo0 = _mm_and_si128(lo, mask);
+        let lo1 = _mm_and_si128(_mm_srli_epi16::<4>(lo), mask);
+        let hi0 = _mm_and_si128(hi, mask);
+        let hi1 = _mm_and_si128(_mm_srli_epi16::<4>(hi), mask);
+        (
+            _mm_xor_si128(
+                _mm_xor_si128(_mm_shuffle_epi8(t[0], lo0), _mm_shuffle_epi8(t[2], lo1)),
+                _mm_xor_si128(_mm_shuffle_epi8(t[4], hi0), _mm_shuffle_epi8(t[6], hi1)),
+            ),
+            _mm_xor_si128(
+                _mm_xor_si128(_mm_shuffle_epi8(t[1], lo0), _mm_shuffle_epi8(t[3], lo1)),
+                _mm_xor_si128(_mm_shuffle_epi8(t[5], hi0), _mm_shuffle_epi8(t[7], hi1)),
+            ),
+        )
+    }
+
+    /// Returns the bytes processed, a multiple of 32.
+    ///
+    /// # Safety
+    /// AVX2 must be available and both rows must have equal lengths.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn butterfly_avx2<const INVERSE: bool>(
+        tables: &MulTables,
+        left: &mut [u8],
+        right: &mut [u8],
+    ) -> usize {
+        let t = tables256(tables);
+        let mut at = 0;
+        while left.len() - at >= 64 {
+            // SAFETY: both rows hold 64 bytes from `at`.
+            unsafe {
+                let mut l = load256(left.as_ptr().add(at));
+                let mut r = load256(right.as_ptr().add(at));
+                crate::gf_simd::fused_butterfly!(INVERSE, l, r, &t, xor256, map256);
+                store256(left.as_mut_ptr().add(at), l);
+                store256(right.as_mut_ptr().add(at), r);
+            }
+            at += 64;
+        }
+        // SAFETY: AVX2 implies SSSE3; the remainders have equal lengths.
+        at + unsafe { butterfly_ssse3::<INVERSE>(tables, &mut left[at..], &mut right[at..]) }
+    }
+
+    /// Returns the bytes processed, a multiple of 32.
+    ///
+    /// # Safety
+    /// SSSE3 must be available and both rows must have equal lengths.
+    #[target_feature(enable = "ssse3")]
+    pub(super) unsafe fn butterfly_ssse3<const INVERSE: bool>(
+        tables: &MulTables,
+        left: &mut [u8],
+        right: &mut [u8],
+    ) -> usize {
+        let t = tables128(tables);
+        let mut at = 0;
+        while left.len() - at >= 32 {
+            // SAFETY: both rows hold 32 bytes from `at`.
+            unsafe {
+                let mut l = load128(left.as_ptr().add(at));
+                let mut r = load128(right.as_ptr().add(at));
+                crate::gf_simd::fused_butterfly!(INVERSE, l, r, &t, xor128, map128);
+                store128(left.as_mut_ptr().add(at), l);
+                store128(right.as_mut_ptr().add(at), r);
+            }
+            at += 32;
+        }
+        at
+    }
+
+    /// Returns the bytes processed, a multiple of 32.
+    ///
+    /// # Safety
+    /// AVX2 must be available and all four rows must have equal lengths.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn radix4_avx2<const INVERSE: bool>(
+        tables: [&MulTables; 3],
+        rows: [&mut [u8]; 4],
+    ) -> usize {
+        let [outer, inner_a, inner_b] = [
+            tables256(tables[0]),
+            tables256(tables[1]),
+            tables256(tables[2]),
+        ];
+        let [ra, rb, rc, rd] = rows;
+        let mut at = 0;
+        while ra.len() - at >= 64 {
+            // SAFETY: all four rows hold 64 bytes from `at`.
+            unsafe {
+                let mut a = load256(ra.as_ptr().add(at));
+                let mut b = load256(rb.as_ptr().add(at));
+                let mut c = load256(rc.as_ptr().add(at));
+                let mut d = load256(rd.as_ptr().add(at));
+                crate::gf_simd::fused_radix4!(
+                    INVERSE,
+                    [a, b, c, d],
+                    &outer,
+                    &inner_a,
+                    &inner_b,
+                    xor256,
+                    map256
+                );
+                store256(ra.as_mut_ptr().add(at), a);
+                store256(rb.as_mut_ptr().add(at), b);
+                store256(rc.as_mut_ptr().add(at), c);
+                store256(rd.as_mut_ptr().add(at), d);
+            }
+            at += 64;
+        }
+        // SAFETY: AVX2 implies SSSE3; the remainders have equal lengths.
+        at + unsafe {
+            radix4_ssse3::<INVERSE>(
+                tables,
+                [&mut ra[at..], &mut rb[at..], &mut rc[at..], &mut rd[at..]],
+            )
+        }
+    }
+
+    /// Returns the bytes processed, a multiple of 32.
+    ///
+    /// # Safety
+    /// SSSE3 must be available and all four rows must have equal lengths.
+    #[target_feature(enable = "ssse3")]
+    pub(super) unsafe fn radix4_ssse3<const INVERSE: bool>(
+        tables: [&MulTables; 3],
+        rows: [&mut [u8]; 4],
+    ) -> usize {
+        let [outer, inner_a, inner_b] = [
+            tables128(tables[0]),
+            tables128(tables[1]),
+            tables128(tables[2]),
+        ];
+        let [ra, rb, rc, rd] = rows;
+        let mut at = 0;
+        while ra.len() - at >= 32 {
+            // SAFETY: all four rows hold 32 bytes from `at`.
+            unsafe {
+                let mut a = load128(ra.as_ptr().add(at));
+                let mut b = load128(rb.as_ptr().add(at));
+                let mut c = load128(rc.as_ptr().add(at));
+                let mut d = load128(rd.as_ptr().add(at));
+                crate::gf_simd::fused_radix4!(
+                    INVERSE,
+                    [a, b, c, d],
+                    &outer,
+                    &inner_a,
+                    &inner_b,
+                    xor128,
+                    map128
+                );
+                store128(ra.as_mut_ptr().add(at), a);
+                store128(rb.as_mut_ptr().add(at), b);
+                store128(rc.as_mut_ptr().add(at), c);
+                store128(rd.as_mut_ptr().add(at), d);
+            }
+            at += 32;
+        }
+        at
+    }
+}
+
+#[cfg(test)]
+mod fused_tests {
+    use super::*;
+
+    fn bytes(count: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        (0..count)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// Every kernel this host can run, scalar included. The vector tiers are
+    /// forced one at a time, so SSSE3 is covered on an AVX2 host too.
+    fn kernels() -> Vec<LinearKernel> {
+        let mut kernels = vec![LinearKernel::Scalar];
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            kernels.push(LinearKernel::Neon);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("ssse3") {
+                kernels.push(LinearKernel::Ssse3);
+            }
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("ssse3") {
+                kernels.push(LinearKernel::Avx2);
+            }
+        }
+        kernels
+    }
+
+    /// The unfused butterfly: one multiply-accumulate pass and one XOR pass.
+    fn unfused<M, T: Copy + std::ops::BitXorAssign>(
+        map: &M,
+        accumulate: fn(&M, &[T], &mut [T]),
+        left: &mut [T],
+        right: &mut [T],
+        inverse: bool,
+    ) {
+        if inverse {
+            right.iter_mut().zip(&*left).for_each(|(r, l)| *r ^= *l);
+            accumulate(map, right, left);
+        } else {
+            accumulate(map, right, left);
+            right.iter_mut().zip(&*left).for_each(|(r, l)| *r ^= *l);
+        }
+    }
+
+    /// Fused radix-2 and radix-4 kernels on every tier, against separate
+    /// accumulate and XOR passes, at lengths either side of each vector width
+    /// and at an unaligned start.
+    #[test]
+    fn fused_butterflies_match_the_unfused_passes_on_every_tier() {
+        let lengths = [
+            0usize, 1, 7, 15, 16, 17, 31, 32, 33, 47, 63, 64, 65, 127, 129, 1000,
+        ];
+        let basis16: [[u16; 16]; 3] = std::array::from_fn(|map| {
+            let seed = bytes(32, map as u64 + 1);
+            std::array::from_fn(|bit| u16::from_le_bytes([seed[bit * 2], seed[bit * 2 + 1]]))
+        });
+        let basis8: [[u8; 8]; 3] =
+            std::array::from_fn(|map| bytes(8, map as u64 + 9).try_into().unwrap());
+        for kernel in kernels() {
+            let maps16 = basis16.map(|basis| LinearMap16 {
+                kernel,
+                ..LinearMap16::new(basis, LinearBackend::Scalar)
+            });
+            let maps8 = basis8.map(|basis| LinearMap8 {
+                kernel,
+                ..LinearMap8::new(basis, LinearBackend::Scalar)
+            });
+            for &length in &lengths {
+                for offset in [0usize, 1] {
+                    for inverse in [false, true] {
+                        let what =
+                            format!("{kernel:?} length {length} offset {offset} inverse {inverse}");
+                        let source =
+                            bytes((length + offset) * 8, length as u64 * 31 + offset as u64);
+                        let words: Vec<u16> = source
+                            .chunks_exact(2)
+                            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                            .collect();
+                        let stride = length + offset;
+                        let rows16: [Vec<u16>; 4] = std::array::from_fn(|row| {
+                            words[row * stride + offset..(row + 1) * stride].to_vec()
+                        });
+                        let rows8: [Vec<u8>; 4] = std::array::from_fn(|row| {
+                            source[row * stride + offset..(row + 1) * stride].to_vec()
+                        });
+
+                        // Radix-2.
+                        let (mut l, mut r) = (rows16[0].clone(), rows16[1].clone());
+                        let (mut el, mut er) = (l.clone(), r.clone());
+                        maps16[0].butterfly(&mut l, &mut r, inverse);
+                        unfused(
+                            &maps16[0],
+                            LinearMap16::accumulate,
+                            &mut el,
+                            &mut er,
+                            inverse,
+                        );
+                        assert_eq!((l, r), (el, er), "16-bit butterfly, {what}");
+                        let (mut l, mut r) = (rows8[0].clone(), rows8[1].clone());
+                        let (mut el, mut er) = (l.clone(), r.clone());
+                        maps8[0].butterfly(&mut l, &mut r, inverse);
+                        unfused(&maps8[0], LinearMap8::accumulate, &mut el, &mut er, inverse);
+                        assert_eq!((l, r), (el, er), "8-bit butterfly, {what}");
+
+                        // Radix-4: outer pairs (a, c), (b, d); inner (a, b), (c, d).
+                        let order: [(usize, usize, usize); 4] = if inverse {
+                            [(0, 1, 1), (2, 3, 2), (0, 2, 0), (1, 3, 0)]
+                        } else {
+                            [(0, 2, 0), (1, 3, 0), (0, 1, 1), (2, 3, 2)]
+                        };
+                        let mut actual = rows16.clone();
+                        let mut expected = rows16.clone();
+                        let [a, b, c, d] = actual.each_mut().map(Vec::as_mut_slice);
+                        LinearMap16::radix4(
+                            &maps16[0],
+                            [&maps16[1], &maps16[2]],
+                            [a, b, c, d],
+                            inverse,
+                        );
+                        for (left, right, map) in order {
+                            let (front, back) = expected.split_at_mut(right);
+                            unfused(
+                                &maps16[map],
+                                LinearMap16::accumulate,
+                                &mut front[left],
+                                &mut back[0],
+                                inverse,
+                            );
+                        }
+                        assert_eq!(actual, expected, "16-bit radix-4, {what}");
+                        let mut actual = rows8.clone();
+                        let mut expected = rows8.clone();
+                        let [a, b, c, d] = actual.each_mut().map(Vec::as_mut_slice);
+                        LinearMap8::radix4(
+                            &maps8[0],
+                            [&maps8[1], &maps8[2]],
+                            [a, b, c, d],
+                            inverse,
+                        );
+                        for (left, right, map) in order {
+                            let (front, back) = expected.split_at_mut(right);
+                            unfused(
+                                &maps8[map],
+                                LinearMap8::accumulate,
+                                &mut front[left],
+                                &mut back[0],
+                                inverse,
+                            );
+                        }
+                        assert_eq!(actual, expected, "8-bit radix-4, {what}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Concurrent source read streams per destination pass in the grouped-input
 /// kernels. Bounded by the line-fill buffers of the smallest supported cores;
 /// larger groups stall on L1 misses instead of computing.

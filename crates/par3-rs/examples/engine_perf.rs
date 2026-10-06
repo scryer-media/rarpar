@@ -280,5 +280,17 @@ fn main() -> Result<()> {
         options.memory.limit(),
         options.workers
     );
+    let source = options.diagnostics.source_io();
+    let admission = options.diagnostics.admission();
+    println!(
+        "{{\"file_read_calls\":{},\"file_write_calls\":{},\"source_read_calls\":{},\"stripe_bytes\":{},\"stripe_buffers\":{},\"stripe_narrowed\":{},\"stripe_passes\":{}}}",
+        io.read_calls,
+        io.write_calls,
+        source.read_calls,
+        admission.stripe_bytes,
+        admission.stripe_buffers,
+        options.diagnostics.waits().stripe_narrowed,
+        options.diagnostics.amplification().stripe_passes,
+    );
     Ok(())
 }

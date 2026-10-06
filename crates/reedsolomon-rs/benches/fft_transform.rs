@@ -1,4 +1,5 @@
-//! Native, one-worker comparisons of Cantor transforms with equal input buffers.
+//! Native comparisons of Cantor transforms with equal input buffers: one
+//! worker, except the `cantor_pool` group.
 //! These arithmetic measurements do not establish end-to-end PAR3 parity.
 #[cfg(not(target_family = "wasm"))]
 fn main() {
@@ -51,6 +52,231 @@ fn main() {
                 assert_eq!(rows, original);
             }
         }
+    }
+    group.finish();
+
+    // The same GF(2^8) problem on zero-extended 16-bit rows and on byte rows.
+    // Throughput counts data bytes (one per symbol), forward plus inverse.
+    let mut group = criterion.benchmark_group("cantor_gf8_lane");
+    let field = TransformField::new(8).unwrap();
+    for (count, width) in [(256usize, 4096usize), (256, 65536)] {
+        let original: Vec<Vec<u8>> = (0..count)
+            .map(|row| {
+                (0..width)
+                    .map(|at| ((row * 7919 + at * 103) % 256) as u8)
+                    .collect()
+            })
+            .collect();
+        group.throughput(Throughput::Bytes((count * width * 2) as u64));
+        let id = format!("{count}x{width}");
+        let mut words: Vec<Vec<u16>> = original
+            .iter()
+            .map(|row| row.iter().map(|&value| value.into()).collect())
+            .collect();
+        group.bench_function(BenchmarkId::new("u16", &id), |b| {
+            b.iter(|| {
+                for inverse in [false, true] {
+                    field
+                        .transform_with_backend(
+                            black_box(&mut words),
+                            0,
+                            inverse,
+                            LinearBackend::Auto,
+                            &|| false,
+                        )
+                        .unwrap();
+                }
+            });
+        });
+        let mut bytes = original.clone();
+        group.bench_function(BenchmarkId::new("u8", &id), |b| {
+            b.iter(|| {
+                for inverse in [false, true] {
+                    field
+                        .transform_u8_with_backend(
+                            black_box(&mut bytes),
+                            0,
+                            inverse,
+                            LinearBackend::Auto,
+                            &|| false,
+                        )
+                        .unwrap();
+                }
+            });
+        });
+        assert_eq!(bytes, original);
+    }
+    group.finish();
+
+    // Pooled transforms at the PAR3 engine's stripe shapes: GF(2^8) byte rows
+    // (encoder and decoder) and GF(2^16) word rows, each 64 KiB wide, forward
+    // plus inverse, in caller-owned pools of one, four and eight workers.
+    let mut group = criterion.benchmark_group("cantor_pool");
+    let byte_field = TransformField::new(8).unwrap();
+    let word_field = TransformField::new(16).unwrap();
+    for threads in [1usize, 4, 8] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        for count in [32usize, 256] {
+            let original: Vec<Vec<u8>> = (0..count)
+                .map(|row| {
+                    (0..65536)
+                        .map(|at| ((row * 7919 + at * 103) % 256) as u8)
+                        .collect()
+                })
+                .collect();
+            let mut rows = original.clone();
+            group.throughput(Throughput::Bytes((count * 65536 * 2) as u64));
+            group.bench_function(
+                BenchmarkId::new(format!("u8_{count}x65536"), format!("t{threads}")),
+                |b| {
+                    b.iter(|| {
+                        for inverse in [false, true] {
+                            byte_field
+                                .transform_u8_in_pool(
+                                    black_box(&mut rows),
+                                    0,
+                                    inverse,
+                                    LinearBackend::Auto,
+                                    &pool,
+                                    &|| false,
+                                )
+                                .unwrap();
+                        }
+                    });
+                },
+            );
+            assert_eq!(rows, original);
+        }
+        for count in [64usize, 512] {
+            let original: Vec<Vec<u16>> = (0..count)
+                .map(|row| {
+                    (0..32768)
+                        .map(|at| ((row * 7919 + at * 103) % 65536) as u16)
+                        .collect()
+                })
+                .collect();
+            let mut rows = original.clone();
+            group.throughput(Throughput::Bytes((count * 65536 * 2) as u64));
+            group.bench_function(
+                BenchmarkId::new(format!("u16_{count}x32768"), format!("t{threads}")),
+                |b| {
+                    b.iter(|| {
+                        for inverse in [false, true] {
+                            word_field
+                                .transform_in_pool(
+                                    black_box(&mut rows),
+                                    0,
+                                    inverse,
+                                    LinearBackend::Auto,
+                                    &pool,
+                                    &|| false,
+                                )
+                                .unwrap();
+                        }
+                    });
+                },
+            );
+            assert_eq!(rows, original);
+        }
+    }
+    group.finish();
+
+    // A PAR3 decoder's inverse transform, one worker, dense and with the rows
+    // the layout leaves zero flagged: unused recovery rows, losses and
+    // padding past the inputs (capacity 32 with 150 inputs and 15 lost in a
+    // 256-row GF(2^8) domain; capacity 64, 300 inputs, 30 lost in 512 rows).
+    let mut group = criterion.benchmark_group("cantor_known_zero");
+    let decoder = |domain: usize, capacity: usize, inputs: usize, lost: usize| -> Vec<bool> {
+        (0..domain)
+            .map(|row| {
+                (lost..capacity).contains(&row)
+                    || (capacity + 45..capacity + 45 + lost).contains(&row)
+                    || row >= capacity + inputs
+            })
+            .collect()
+    };
+    let zero = decoder(256, 32, 150, 15);
+    let mut bytes: Vec<Vec<u8>> = (0..256)
+        .map(|row| {
+            (0..65536)
+                .map(|at| {
+                    if zero[row] {
+                        0
+                    } else {
+                        ((row * 7919 + at * 103) % 256) as u8
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    group.throughput(Throughput::Bytes((256 * 65536) as u64));
+    for known in [false, true] {
+        let original = bytes.clone();
+        group.bench_function(BenchmarkId::new("u8_256x65536", known), |b| {
+            b.iter(|| {
+                bytes.clone_from(&original);
+                let rows = black_box(&mut bytes);
+                if known {
+                    byte_field.transform_u8_known_zero_with_backend(
+                        rows,
+                        &zero,
+                        0,
+                        true,
+                        LinearBackend::Auto,
+                        &|| false,
+                    )
+                } else {
+                    byte_field.transform_u8_with_backend(
+                        rows,
+                        0,
+                        true,
+                        LinearBackend::Auto,
+                        &|| false,
+                    )
+                }
+                .unwrap();
+            });
+        });
+    }
+    let zero = decoder(512, 64, 300, 30);
+    let mut words: Vec<Vec<u16>> = (0..512)
+        .map(|row| {
+            (0..32768)
+                .map(|at| {
+                    if zero[row] {
+                        0
+                    } else {
+                        ((row * 7919 + at * 103) % 65536) as u16
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    group.throughput(Throughput::Bytes((512 * 65536) as u64));
+    for known in [false, true] {
+        let original = words.clone();
+        group.bench_function(BenchmarkId::new("u16_512x32768", known), |b| {
+            b.iter(|| {
+                words.clone_from(&original);
+                let rows = black_box(&mut words);
+                if known {
+                    word_field.transform_known_zero_with_backend(
+                        rows,
+                        &zero,
+                        0,
+                        true,
+                        LinearBackend::Auto,
+                        &|| false,
+                    )
+                } else {
+                    word_field.transform_with_backend(rows, 0, true, LinearBackend::Auto, &|| false)
+                }
+                .unwrap();
+            });
+        });
     }
     group.finish();
     criterion.final_summary();

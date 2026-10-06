@@ -29,6 +29,14 @@ impl MulPlan {
         }
     }
 
+    /// A plan for any GF(2)-linear byte map, given the images of the sixteen
+    /// low and sixteen high nibbles. The kernels never consult the polynomial,
+    /// so other representations, such as the Cantor basis of the FFT
+    /// transforms, run on the same shuffles.
+    pub(crate) fn from_tables(low: [u8; 16], high: [u8; 16]) -> Self {
+        Self { low, high }
+    }
+
     /// Accumulate `source * factor` into `destination`. Buffers must have equal
     /// lengths and may be unaligned; CPU dispatch always has a scalar fallback.
     pub fn accumulate(&self, source: &[u8], destination: &mut [u8]) {
@@ -89,7 +97,7 @@ impl MulPlan {
 
     #[cfg(target_arch = "aarch64")]
     #[target_feature(enable = "neon")]
-    unsafe fn neon(&self, source: &[u8], destination: &mut [u8]) {
+    pub(crate) unsafe fn neon(&self, source: &[u8], destination: &mut [u8]) {
         use std::arch::aarch64::*;
         // SAFETY: the caller checks NEON and equal lengths. The loop stops before
         // each 16-byte load/store could cross either slice, including table loads.
@@ -117,7 +125,7 @@ impl MulPlan {
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[target_feature(enable = "avx2")]
-    unsafe fn avx2(&self, source: &[u8], destination: &mut [u8]) {
+    pub(crate) unsafe fn avx2(&self, source: &[u8], destination: &mut [u8]) {
         #[cfg(target_arch = "x86")]
         use std::arch::x86::*;
         #[cfg(target_arch = "x86_64")]
@@ -149,7 +157,7 @@ impl MulPlan {
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[target_feature(enable = "ssse3")]
-    unsafe fn ssse3(&self, source: &[u8], destination: &mut [u8]) {
+    pub(crate) unsafe fn ssse3(&self, source: &[u8], destination: &mut [u8]) {
         #[cfg(target_arch = "x86")]
         use std::arch::x86::*;
         #[cfg(target_arch = "x86_64")]
@@ -174,6 +182,287 @@ impl MulPlan {
             }
             self.scalar(&source[at..], &mut destination[at..]);
         }
+    }
+
+    /// The image of one byte under this plan's map.
+    fn apply(&self, value: u8) -> u8 {
+        self.low[(value & 15) as usize] ^ self.high[(value >> 4) as usize]
+    }
+
+    /// One additive-FFT butterfly per byte on the portable table walk: forward
+    /// `left ^= map(right); right ^= left`, inverse `right ^= left;
+    /// left ^= map(right)`. Rows must have equal lengths.
+    pub(crate) fn butterfly_scalar<const INVERSE: bool>(&self, left: &mut [u8], right: &mut [u8]) {
+        for (l, r) in left.iter_mut().zip(right) {
+            let (mut x, mut y) = (*l, *r);
+            crate::gf_simd::fused_butterfly!(
+                INVERSE,
+                x,
+                y,
+                self,
+                std::ops::BitXor::bitxor,
+                Self::apply
+            );
+            (*l, *r) = (x, y);
+        }
+    }
+
+    /// Two butterfly stages per byte over four rows on the portable table
+    /// walk; `plans` are the outer map and the two inner maps, in the order
+    /// of `gf_simd::fused_radix4`. Rows must have equal lengths.
+    pub(crate) fn radix4_scalar<const INVERSE: bool>(plans: [&Self; 3], rows: [&mut [u8]; 4]) {
+        let [outer, inner_a, inner_b] = plans;
+        let [a, b, c, d] = rows;
+        for at in 0..a.len() {
+            let (mut w, mut x, mut y, mut z) = (a[at], b[at], c[at], d[at]);
+            crate::gf_simd::fused_radix4!(
+                INVERSE,
+                [w, x, y, z],
+                outer,
+                inner_a,
+                inner_b,
+                std::ops::BitXor::bitxor,
+                Self::apply
+            );
+            (a[at], b[at], c[at], d[at]) = (w, x, y, z);
+        }
+    }
+
+    /// [`Self::butterfly_scalar`] on NEON; returns the bytes processed.
+    ///
+    /// # Safety
+    /// NEON must be available and the rows must have equal lengths.
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    pub(crate) unsafe fn butterfly_neon<const INVERSE: bool>(
+        &self,
+        left: &mut [u8],
+        right: &mut [u8],
+    ) -> usize {
+        use std::arch::aarch64::*;
+        let t = fused_neon::tables(self);
+        let mut at = 0;
+        while left.len() - at >= 16 {
+            // SAFETY: both rows hold 16 bytes from `at`.
+            unsafe {
+                let mut l = vld1q_u8(left.as_ptr().add(at));
+                let mut r = vld1q_u8(right.as_ptr().add(at));
+                crate::gf_simd::fused_butterfly!(INVERSE, l, r, &t, veorq_u8, fused_neon::map);
+                vst1q_u8(left.as_mut_ptr().add(at), l);
+                vst1q_u8(right.as_mut_ptr().add(at), r);
+            }
+            at += 16;
+        }
+        at
+    }
+
+    /// [`Self::radix4_scalar`] on NEON; returns the bytes processed.
+    ///
+    /// # Safety
+    /// NEON must be available and all four rows must have equal lengths.
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    pub(crate) unsafe fn radix4_neon<const INVERSE: bool>(
+        plans: [&Self; 3],
+        rows: [&mut [u8]; 4],
+    ) -> usize {
+        use std::arch::aarch64::*;
+        let [outer, inner_a, inner_b] = [
+            fused_neon::tables(plans[0]),
+            fused_neon::tables(plans[1]),
+            fused_neon::tables(plans[2]),
+        ];
+        let [ra, rb, rc, rd] = rows;
+        let mut at = 0;
+        while ra.len() - at >= 16 {
+            // SAFETY: all four rows hold 16 bytes from `at`.
+            unsafe {
+                let mut a = vld1q_u8(ra.as_ptr().add(at));
+                let mut b = vld1q_u8(rb.as_ptr().add(at));
+                let mut c = vld1q_u8(rc.as_ptr().add(at));
+                let mut d = vld1q_u8(rd.as_ptr().add(at));
+                crate::gf_simd::fused_radix4!(
+                    INVERSE,
+                    [a, b, c, d],
+                    &outer,
+                    &inner_a,
+                    &inner_b,
+                    veorq_u8,
+                    fused_neon::map
+                );
+                vst1q_u8(ra.as_mut_ptr().add(at), a);
+                vst1q_u8(rb.as_mut_ptr().add(at), b);
+                vst1q_u8(rc.as_mut_ptr().add(at), c);
+                vst1q_u8(rd.as_mut_ptr().add(at), d);
+            }
+            at += 16;
+        }
+        at
+    }
+
+    /// [`Self::butterfly_scalar`] on AVX2; returns the bytes processed.
+    ///
+    /// # Safety
+    /// AVX2 must be available and the rows must have equal lengths.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    pub(crate) unsafe fn butterfly_avx2<const INVERSE: bool>(
+        &self,
+        left: &mut [u8],
+        right: &mut [u8],
+    ) -> usize {
+        use std::arch::x86_64::*;
+        let t = fused_x86::tables256(self);
+        let mut at = 0;
+        while left.len() - at >= 32 {
+            // SAFETY: both rows hold 32 bytes from `at`.
+            unsafe {
+                let mut l = _mm256_loadu_si256(left.as_ptr().add(at).cast());
+                let mut r = _mm256_loadu_si256(right.as_ptr().add(at).cast());
+                crate::gf_simd::fused_butterfly!(
+                    INVERSE,
+                    l,
+                    r,
+                    &t,
+                    _mm256_xor_si256,
+                    fused_x86::map256
+                );
+                _mm256_storeu_si256(left.as_mut_ptr().add(at).cast(), l);
+                _mm256_storeu_si256(right.as_mut_ptr().add(at).cast(), r);
+            }
+            at += 32;
+        }
+        // SAFETY: AVX2 implies SSSE3; the remainders have equal lengths.
+        at + unsafe { self.butterfly_ssse3::<INVERSE>(&mut left[at..], &mut right[at..]) }
+    }
+
+    /// [`Self::butterfly_scalar`] on SSSE3; returns the bytes processed.
+    ///
+    /// # Safety
+    /// SSSE3 must be available and the rows must have equal lengths.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "ssse3")]
+    pub(crate) unsafe fn butterfly_ssse3<const INVERSE: bool>(
+        &self,
+        left: &mut [u8],
+        right: &mut [u8],
+    ) -> usize {
+        use std::arch::x86_64::*;
+        let t = fused_x86::tables128(self);
+        let mut at = 0;
+        while left.len() - at >= 16 {
+            // SAFETY: both rows hold 16 bytes from `at`.
+            unsafe {
+                let mut l = _mm_loadu_si128(left.as_ptr().add(at).cast());
+                let mut r = _mm_loadu_si128(right.as_ptr().add(at).cast());
+                crate::gf_simd::fused_butterfly!(
+                    INVERSE,
+                    l,
+                    r,
+                    &t,
+                    _mm_xor_si128,
+                    fused_x86::map128
+                );
+                _mm_storeu_si128(left.as_mut_ptr().add(at).cast(), l);
+                _mm_storeu_si128(right.as_mut_ptr().add(at).cast(), r);
+            }
+            at += 16;
+        }
+        at
+    }
+
+    /// [`Self::radix4_scalar`] on AVX2; returns the bytes processed.
+    ///
+    /// # Safety
+    /// AVX2 must be available and all four rows must have equal lengths.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    pub(crate) unsafe fn radix4_avx2<const INVERSE: bool>(
+        plans: [&Self; 3],
+        rows: [&mut [u8]; 4],
+    ) -> usize {
+        use std::arch::x86_64::*;
+        let [outer, inner_a, inner_b] = [
+            fused_x86::tables256(plans[0]),
+            fused_x86::tables256(plans[1]),
+            fused_x86::tables256(plans[2]),
+        ];
+        let [ra, rb, rc, rd] = rows;
+        let mut at = 0;
+        while ra.len() - at >= 32 {
+            // SAFETY: all four rows hold 32 bytes from `at`.
+            unsafe {
+                let mut a = _mm256_loadu_si256(ra.as_ptr().add(at).cast());
+                let mut b = _mm256_loadu_si256(rb.as_ptr().add(at).cast());
+                let mut c = _mm256_loadu_si256(rc.as_ptr().add(at).cast());
+                let mut d = _mm256_loadu_si256(rd.as_ptr().add(at).cast());
+                crate::gf_simd::fused_radix4!(
+                    INVERSE,
+                    [a, b, c, d],
+                    &outer,
+                    &inner_a,
+                    &inner_b,
+                    _mm256_xor_si256,
+                    fused_x86::map256
+                );
+                _mm256_storeu_si256(ra.as_mut_ptr().add(at).cast(), a);
+                _mm256_storeu_si256(rb.as_mut_ptr().add(at).cast(), b);
+                _mm256_storeu_si256(rc.as_mut_ptr().add(at).cast(), c);
+                _mm256_storeu_si256(rd.as_mut_ptr().add(at).cast(), d);
+            }
+            at += 32;
+        }
+        // SAFETY: AVX2 implies SSSE3; the remainders have equal lengths.
+        at + unsafe {
+            Self::radix4_ssse3::<INVERSE>(
+                plans,
+                [&mut ra[at..], &mut rb[at..], &mut rc[at..], &mut rd[at..]],
+            )
+        }
+    }
+
+    /// [`Self::radix4_scalar`] on SSSE3; returns the bytes processed.
+    ///
+    /// # Safety
+    /// SSSE3 must be available and all four rows must have equal lengths.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "ssse3")]
+    pub(crate) unsafe fn radix4_ssse3<const INVERSE: bool>(
+        plans: [&Self; 3],
+        rows: [&mut [u8]; 4],
+    ) -> usize {
+        use std::arch::x86_64::*;
+        let [outer, inner_a, inner_b] = [
+            fused_x86::tables128(plans[0]),
+            fused_x86::tables128(plans[1]),
+            fused_x86::tables128(plans[2]),
+        ];
+        let [ra, rb, rc, rd] = rows;
+        let mut at = 0;
+        while ra.len() - at >= 16 {
+            // SAFETY: all four rows hold 16 bytes from `at`.
+            unsafe {
+                let mut a = _mm_loadu_si128(ra.as_ptr().add(at).cast());
+                let mut b = _mm_loadu_si128(rb.as_ptr().add(at).cast());
+                let mut c = _mm_loadu_si128(rc.as_ptr().add(at).cast());
+                let mut d = _mm_loadu_si128(rd.as_ptr().add(at).cast());
+                crate::gf_simd::fused_radix4!(
+                    INVERSE,
+                    [a, b, c, d],
+                    &outer,
+                    &inner_a,
+                    &inner_b,
+                    _mm_xor_si128,
+                    fused_x86::map128
+                );
+                _mm_storeu_si128(ra.as_mut_ptr().add(at).cast(), a);
+                _mm_storeu_si128(rb.as_mut_ptr().add(at).cast(), b);
+                _mm_storeu_si128(rc.as_mut_ptr().add(at).cast(), c);
+                _mm_storeu_si128(rd.as_mut_ptr().add(at).cast(), d);
+            }
+            at += 16;
+        }
+        at
     }
 
     /// wasm simd128: 16 bytes per iteration, the same split-nibble shape the
@@ -238,6 +527,83 @@ impl MulPlan {
             }
             self.scalar(&source[at..], &mut destination[at..]);
         }
+    }
+}
+
+/// Table registers and the split-nibble map of the fused NEON kernels.
+#[cfg(target_arch = "aarch64")]
+mod fused_neon {
+    use super::MulPlan;
+    use std::arch::aarch64::*;
+
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(super) fn tables(plan: &MulPlan) -> (uint8x16_t, uint8x16_t) {
+        // SAFETY: each load reads exactly one 16-byte table.
+        unsafe { (vld1q_u8(plan.low.as_ptr()), vld1q_u8(plan.high.as_ptr())) }
+    }
+
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(super) fn map(tables: &(uint8x16_t, uint8x16_t), value: uint8x16_t) -> uint8x16_t {
+        veorq_u8(
+            vqtbl1q_u8(tables.0, vandq_u8(value, vdupq_n_u8(15))),
+            vqtbl1q_u8(tables.1, vshrq_n_u8::<4>(value)),
+        )
+    }
+}
+
+/// Table registers and the split-nibble maps of the fused x86 kernels.
+#[cfg(target_arch = "x86_64")]
+mod fused_x86 {
+    use super::MulPlan;
+    use std::arch::x86_64::*;
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    pub(super) fn tables256(plan: &MulPlan) -> (__m256i, __m256i) {
+        // SAFETY: each load reads exactly one 16-byte table.
+        unsafe {
+            (
+                _mm256_broadcastsi128_si256(_mm_loadu_si128(plan.low.as_ptr().cast())),
+                _mm256_broadcastsi128_si256(_mm_loadu_si128(plan.high.as_ptr().cast())),
+            )
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    pub(super) fn map256(tables: &(__m256i, __m256i), value: __m256i) -> __m256i {
+        let mask = _mm256_set1_epi8(15);
+        _mm256_xor_si256(
+            _mm256_shuffle_epi8(tables.0, _mm256_and_si256(value, mask)),
+            _mm256_shuffle_epi8(
+                tables.1,
+                _mm256_and_si256(_mm256_srli_epi16::<4>(value), mask),
+            ),
+        )
+    }
+
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    pub(super) fn tables128(plan: &MulPlan) -> (__m128i, __m128i) {
+        // SAFETY: each load reads exactly one 16-byte table.
+        unsafe {
+            (
+                _mm_loadu_si128(plan.low.as_ptr().cast()),
+                _mm_loadu_si128(plan.high.as_ptr().cast()),
+            )
+        }
+    }
+
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    pub(super) fn map128(tables: &(__m128i, __m128i), value: __m128i) -> __m128i {
+        let mask = _mm_set1_epi8(15);
+        _mm_xor_si128(
+            _mm_shuffle_epi8(tables.0, _mm_and_si128(value, mask)),
+            _mm_shuffle_epi8(tables.1, _mm_and_si128(_mm_srli_epi16::<4>(value), mask)),
+        )
     }
 }
 

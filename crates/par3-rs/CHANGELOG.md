@@ -36,6 +36,12 @@
 - Native builds add `cap-std` for capability-relative filesystem operations;
   WASI continues to use the runtime's preopened directories as its outer
   capability boundary.
+- The GF(2^8) FFT codec runs on byte rows (`reedsolomon-rs` 0.4.8's 8-bit
+  lane): no widening to `u16` and back, half the row workspace, so a
+  budget-narrowed GF(2^8) cohort gets twice the stripe and fewer stripe I/O
+  calls. The transform uses fused radix-4 butterflies and skips butterflies
+  over rows the layout knows are zero (padding past the inputs, erased rows).
+  Carriers and repaired bytes are identical.
 
 ## 0.4.3
 

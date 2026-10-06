@@ -1,6 +1,7 @@
 //! Low-rate FFT geometry and bounded stripe execution.
 
 use reedsolomon_rs::fft::{TransformError, TransformField};
+use reedsolomon_rs::gf_simd::LinearBackend;
 
 use crate::runtime::{EngineError, EngineResult, ExecutionOptions, MemoryCategory, Reservation};
 
@@ -253,9 +254,196 @@ impl ForwardPlan {
     }
 }
 
+/// Symbol storage for a cohort's transform rows.
+///
+/// GF(2^8) rows are `u8`: a row is the stripe's own bytes, read into and
+/// written from directly. GF(2^16) rows are `u16` and convert from and to the
+/// little-endian pairs on disk through one byte buffer. The `u16` lane also
+/// accepts 8-bit symbols, zero-extended, which is how GF(2^8) used to run; the
+/// tests keep it as the reference the byte lane must match.
+trait Lane: Copy + Default + Send + Sync + std::ops::BitXorAssign + 'static {
+    /// Rows are the stripe's byte image; no conversion buffer is needed.
+    const DIRECT: bool;
+    fn direct(row: &mut [Self]) -> Option<&mut [u8]>;
+    fn direct_ref(row: &[Self]) -> Option<&[u8]>;
+    fn unpack(unit: usize, bytes: &[u8], row: &mut [Self]);
+    fn pack(unit: usize, row: &[Self], bytes: &mut [u8]);
+    /// `zero` flags rows the layout leaves all zero; see
+    /// [`TransformField::transform_known_zero_with_backend`].
+    fn transform(
+        field: &TransformField,
+        rows: &mut [Vec<Self>],
+        zero: Option<&[bool]>,
+        origin: usize,
+        inverse: bool,
+        backend: LinearBackend,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError>;
+    #[allow(clippy::too_many_arguments)]
+    fn transform_in_pool(
+        field: &TransformField,
+        rows: &mut [Vec<Self>],
+        zero: Option<&[bool]>,
+        origin: usize,
+        inverse: bool,
+        backend: LinearBackend,
+        pool: &rayon::ThreadPool,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError>;
+    fn scale(
+        field: &TransformField,
+        row: &mut [Self],
+        factor: u16,
+        backend: LinearBackend,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError>;
+    fn derivative(
+        field: &TransformField,
+        rows: &mut [Vec<Self>],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError>;
+}
+
+impl Lane for u16 {
+    const DIRECT: bool = false;
+    fn direct(_: &mut [Self]) -> Option<&mut [u8]> {
+        None
+    }
+    fn direct_ref(_: &[Self]) -> Option<&[u8]> {
+        None
+    }
+    fn unpack(unit: usize, bytes: &[u8], row: &mut [Self]) {
+        unpack(unit, bytes, row);
+    }
+    fn pack(unit: usize, row: &[Self], bytes: &mut [u8]) {
+        pack(unit, row, bytes);
+    }
+    fn transform(
+        field: &TransformField,
+        rows: &mut [Vec<Self>],
+        zero: Option<&[bool]>,
+        origin: usize,
+        inverse: bool,
+        backend: LinearBackend,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError> {
+        match zero {
+            Some(zero) => field
+                .transform_known_zero_with_backend(rows, zero, origin, inverse, backend, cancelled),
+            None => field.transform_with_backend(rows, origin, inverse, backend, cancelled),
+        }
+    }
+    fn transform_in_pool(
+        field: &TransformField,
+        rows: &mut [Vec<Self>],
+        zero: Option<&[bool]>,
+        origin: usize,
+        inverse: bool,
+        backend: LinearBackend,
+        pool: &rayon::ThreadPool,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError> {
+        match zero {
+            Some(zero) => field.transform_known_zero_in_pool(
+                rows, zero, origin, inverse, backend, pool, cancelled,
+            ),
+            None => field.transform_in_pool(rows, origin, inverse, backend, pool, cancelled),
+        }
+    }
+    fn scale(
+        field: &TransformField,
+        row: &mut [Self],
+        factor: u16,
+        backend: LinearBackend,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError> {
+        field.scale_with_backend(row, factor, backend, cancelled)
+    }
+    fn derivative(
+        field: &TransformField,
+        rows: &mut [Vec<Self>],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError> {
+        field.derivative(rows, cancelled)
+    }
+}
+
+impl Lane for u8 {
+    const DIRECT: bool = true;
+    fn direct(row: &mut [Self]) -> Option<&mut [u8]> {
+        Some(row)
+    }
+    fn direct_ref(row: &[Self]) -> Option<&[u8]> {
+        Some(row)
+    }
+    fn unpack(_: usize, _: &[u8], _: &mut [Self]) {
+        unreachable!("byte rows are read directly")
+    }
+    fn pack(_: usize, _: &[Self], _: &mut [u8]) {
+        unreachable!("byte rows are written directly")
+    }
+    fn transform(
+        field: &TransformField,
+        rows: &mut [Vec<Self>],
+        zero: Option<&[bool]>,
+        origin: usize,
+        inverse: bool,
+        backend: LinearBackend,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError> {
+        match zero {
+            Some(zero) => field.transform_u8_known_zero_with_backend(
+                rows, zero, origin, inverse, backend, cancelled,
+            ),
+            None => field.transform_u8_with_backend(rows, origin, inverse, backend, cancelled),
+        }
+    }
+    fn transform_in_pool(
+        field: &TransformField,
+        rows: &mut [Vec<Self>],
+        zero: Option<&[bool]>,
+        origin: usize,
+        inverse: bool,
+        backend: LinearBackend,
+        pool: &rayon::ThreadPool,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError> {
+        match zero {
+            Some(zero) => field.transform_u8_known_zero_in_pool(
+                rows, zero, origin, inverse, backend, pool, cancelled,
+            ),
+            None => field.transform_u8_in_pool(rows, origin, inverse, backend, pool, cancelled),
+        }
+    }
+    fn scale(
+        field: &TransformField,
+        row: &mut [Self],
+        factor: u16,
+        backend: LinearBackend,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError> {
+        field.scale_u8_with_backend(row, factor, backend, cancelled)
+    }
+    fn derivative(
+        field: &TransformField,
+        rows: &mut [Vec<Self>],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError> {
+        field.derivative_u8(rows, cancelled)
+    }
+}
+
+/// Bytes of workspace per stripe byte for `rows` transform rows of lane `L`
+/// over a field of `unit` bytes: the rows themselves, the conversion buffer
+/// when the lane needs one, and one stripe of slack.
+fn workspace_per_byte<L: Lane>(rows: usize, unit: usize) -> Option<usize> {
+    rows.checked_mul(size_of::<L>() / unit)?
+        .checked_add(usize::from(!L::DIRECT) + 1)
+}
+
 /// Move row handles so that a `rows`-by-`columns` row-major arrangement becomes
 /// a `columns`-by-`rows` one. Only the handles move; no symbol is copied.
-fn transpose(handles: &mut [Vec<u16>], rows: usize, columns: usize, visited: &mut [u64]) {
+fn transpose<T>(handles: &mut [Vec<T>], rows: usize, columns: usize, visited: &mut [u64]) {
     debug_assert_eq!(handles.len(), rows * columns);
     let mark = |visited: &mut [u64], at: usize| visited[at / 64] |= 1 << (at % 64);
     let seen = |visited: &[u64], at: usize| visited[at / 64] >> (at % 64) & 1 == 1;
@@ -338,7 +526,13 @@ impl FftCodec {
         } else {
             // Locator, row metadata, and the smallest field-aligned row/input
             // buffers. These are the same layouts admitted by decode/buffers.
-            g.domain * 32 + g.domain * 32 + (g.domain * (2 / unit) + 2) * unit
+            let per_byte = if g.bits == 8 {
+                workspace_per_byte::<u8>(g.domain, unit)
+            } else {
+                workspace_per_byte::<u16>(g.domain, unit)
+            }
+            .ok_or(EngineError::resource_limit("FFT stripes"))?;
+            g.domain * 32 + g.domain * 32 + per_byte * unit
         };
         let _decode = self
             .options
@@ -368,16 +562,26 @@ impl FftCodec {
             .map_or(1, |workers| workers.pool().current_num_threads())
     }
 
-    fn transform(&self, rows: &mut [Vec<u16>], origin: usize, inverse: bool) -> EngineResult<()> {
-        self.transform_counted(rows, origin, inverse, 0)
+    /// One additive transform. `zero` flags the rows the layout leaves all
+    /// zero, so the backend can skip the butterflies that cannot change them;
+    /// the diagnostics still count the transform's full butterfly total.
+    fn transform<L: Lane>(
+        &self,
+        rows: &mut [Vec<L>],
+        zero: Option<&[bool]>,
+        origin: usize,
+        inverse: bool,
+    ) -> EngineResult<()> {
+        self.transform_counted(rows, zero, origin, inverse, 0)
     }
 
     /// One additive transform, counted. `skipped` is the butterflies a plan
     /// removed from what this call would otherwise have had to perform, so the
     /// diagnostics can report the pruned and unpruned costs side by side.
-    fn transform_counted(
+    fn transform_counted<L: Lane>(
         &self,
-        rows: &mut [Vec<u16>],
+        rows: &mut [Vec<L>],
+        zero: Option<&[bool]>,
         origin: usize,
         inverse: bool,
         skipped: u64,
@@ -393,8 +597,10 @@ impl FftCodec {
         let performed = butterflies(rows.len());
         let symbols = rows.first().map_or(0, Vec::len);
         if let Some(workers) = &self.workers {
-            field.transform_in_pool(
+            L::transform_in_pool(
+                field,
                 rows,
+                zero,
                 origin,
                 inverse,
                 self.options.fft_backend,
@@ -402,8 +608,10 @@ impl FftCodec {
                 &cancelled,
             )
         } else {
-            field.transform_with_backend(
+            L::transform(
+                field,
                 rows,
+                zero,
                 origin,
                 inverse,
                 self.options.fft_backend,
@@ -426,10 +634,14 @@ impl FftCodec {
     /// butterfly this performs is one the full transform would have performed,
     /// with the same factor, in the same order relative to the rows it touches,
     /// so the rows the caller reads come out byte for byte identical.
-    fn transform_forward(&self, rows: &mut [Vec<u16>], plan: &mut ForwardPlan) -> EngineResult<()> {
+    fn transform_forward<L: Lane>(
+        &self,
+        rows: &mut [Vec<L>],
+        plan: &mut ForwardPlan,
+    ) -> EngineResult<()> {
         use rayon::prelude::*;
         if plan.block_log2 == 0 {
-            return self.transform_counted(rows, 0, false, 0);
+            return self.transform_counted(rows, None, 0, false, 0);
         }
         let field = self.field.as_ref().expect("nontrivial FFT field");
         let backend = self.options.fft_backend;
@@ -440,10 +652,9 @@ impl FftCodec {
         let span = rows.len() >> plan.block_log2;
         let symbols = rows.first().map_or(0, Vec::len);
         let blocks = &plan.blocks;
-        let wide = |rows: &mut [Vec<u16>]| -> EngineResult<()> {
-            let run = |class: &mut [Vec<u16>]| {
-                field
-                    .transform_with_backend(class, 0, false, backend, &cancelled)
+        let wide = |rows: &mut [Vec<L>]| -> EngineResult<()> {
+            let run = |class: &mut [Vec<L>]| {
+                L::transform(field, class, None, 0, false, backend, &cancelled)
                     .map_err(transform_error)
             };
             match &self.workers {
@@ -453,13 +664,12 @@ impl FftCodec {
                 None => rows.chunks_mut(span).try_for_each(run),
             }
         };
-        let narrow = |rows: &mut [Vec<u16>]| -> EngineResult<()> {
-            let run = |(block, at): (usize, &mut [Vec<u16>])| {
+        let narrow = |rows: &mut [Vec<L>]| -> EngineResult<()> {
+            let run = |(block, at): (usize, &mut [Vec<L>])| {
                 if blocks.binary_search(&block).is_err() {
                     return Ok(());
                 }
-                field
-                    .transform_with_backend(at, block * width, false, backend, &cancelled)
+                L::transform(field, at, None, block * width, false, backend, &cancelled)
                     .map_err(transform_error)
             };
             match &self.workers {
@@ -492,11 +702,11 @@ impl FftCodec {
         block_size: u64,
         first: usize,
         count: usize,
-        mut read: impl FnMut(usize, u64, &mut [u8]) -> EngineResult<()>,
+        read: impl FnMut(usize, u64, &mut [u8]) -> EngineResult<()>,
         mut write: impl FnMut(usize, u64, &[u8]) -> EngineResult<()>,
     ) -> EngineResult<()> {
         let mut progress = self.options.stage(crate::runtime::Stage::Encode)?;
-        let mut write = |index, offset, bytes: &[u8]| {
+        let write = |index, offset, bytes: &[u8]| {
             write(index, offset, bytes)?;
             progress.advance(bytes.len() as u64);
             self.options.cancel.check()
@@ -510,44 +720,74 @@ impl FftCodec {
         if g.is_trivial() {
             return self.encode_trivial(block_size, first, count, read, write);
         }
+        if g.bits == 8 {
+            self.encode_rows::<u8>(block_size, first, count, read, write)
+        } else {
+            self.encode_rows::<u16>(block_size, first, count, read, write)
+        }
+    }
+
+    fn encode_rows<L: Lane>(
+        &self,
+        block_size: u64,
+        first: usize,
+        count: usize,
+        mut read: impl FnMut(usize, u64, &mut [u8]) -> EngineResult<()>,
+        mut write: impl FnMut(usize, u64, &[u8]) -> EngineResult<()>,
+    ) -> EngineResult<()> {
+        let g = self.geometry;
         let rows = g
             .capacity
             .checked_mul(2)
             .ok_or(EngineError::resource_limit("FFT encoder rows"))?;
-        let (stripe, _buffers) = self.buffers(block_size, rows)?;
+        let (stripe, _buffers) = self.buffers::<L>(block_size, rows)?;
         let symbols = stripe / g.field_bytes();
-        let mut work = vec![vec![0u16; symbols]; g.capacity];
-        let mut sum = vec![vec![0u16; symbols]; g.capacity];
-        let mut bytes = vec![0; stripe];
+        let mut work = vec![vec![L::default(); symbols]; g.capacity];
+        let mut sum = vec![vec![L::default(); symbols]; g.capacity];
+        let mut bytes = vec![0; if L::DIRECT { 0 } else { stripe }];
+        // The last chunk's rows past the final input are zero.
+        let tail = g.inputs % g.capacity;
+        let tail: Vec<bool> = (0..g.capacity).map(|at| tail != 0 && at >= tail).collect();
         let mut offset = 0;
         while offset < block_size {
             self.options.cancel.check()?;
             let take = (block_size - offset).min(stripe as u64) as usize;
             for row in &mut sum {
-                row.fill(0);
+                row.fill(L::default());
             }
             for base in (0..g.inputs).step_by(g.capacity) {
                 for (at, row) in work.iter_mut().enumerate() {
                     self.options.cancel.check()?;
-                    row.fill(0);
+                    row.fill(L::default());
                     if base + at >= g.inputs {
                         continue;
                     }
-                    bytes.fill(0);
-                    read(base + at, offset, &mut bytes[..take])?;
-                    unpack(g.field_bytes(), &bytes, row);
+                    if let Some(row) = L::direct(row) {
+                        read(base + at, offset, &mut row[..take])?;
+                    } else {
+                        bytes.fill(0);
+                        read(base + at, offset, &mut bytes[..take])?;
+                        L::unpack(g.field_bytes(), &bytes, row);
+                    }
                 }
-                self.transform(&mut work, g.capacity + base, true)?;
+                let zero = (base + g.capacity > g.inputs).then_some(tail.as_slice());
+                self.transform(&mut work, zero, g.capacity + base, true)?;
                 for (to, from) in sum.iter_mut().zip(&work) {
                     for (to, from) in to.iter_mut().zip(from) {
-                        *to ^= from;
+                        *to ^= *from;
                     }
                 }
             }
-            self.transform(&mut sum, 0, false)?;
+            self.transform(&mut sum, None, 0, false)?;
             for (index, row) in sum.iter().enumerate().skip(first).take(count) {
-                pack(g.field_bytes(), row, &mut bytes);
-                write(index, offset, &bytes[..take])?;
+                let out = match L::direct_ref(row) {
+                    Some(row) => row,
+                    None => {
+                        L::pack(g.field_bytes(), row, &mut bytes);
+                        &bytes
+                    }
+                };
+                write(index, offset, &out[..take])?;
             }
             offset += take as u64;
         }
@@ -561,11 +801,11 @@ impl FftCodec {
         block_size: u64,
         lost: &[usize],
         recovery: &[usize],
-        mut read: impl FnMut(FftInput, u64, &mut [u8]) -> EngineResult<()>,
+        read: impl FnMut(FftInput, u64, &mut [u8]) -> EngineResult<()>,
         mut write: impl FnMut(usize, u64, &[u8]) -> EngineResult<()>,
     ) -> EngineResult<()> {
         let mut progress = self.options.stage(crate::runtime::Stage::Decode)?;
-        let mut write = |index, offset, bytes: &[u8]| {
+        let write = |index, offset, bytes: &[u8]| {
             write(index, offset, bytes)?;
             self.options.diagnostics.note_reconstructed(bytes.len());
             progress.advance(bytes.len() as u64);
@@ -581,6 +821,22 @@ impl FftCodec {
         if g.is_trivial() {
             return self.decode_trivial(block_size, lost, recovery, read, write);
         }
+        if g.bits == 8 {
+            self.decode_rows::<u8>(block_size, lost, recovery, read, write)
+        } else {
+            self.decode_rows::<u16>(block_size, lost, recovery, read, write)
+        }
+    }
+
+    fn decode_rows<L: Lane>(
+        &self,
+        block_size: u64,
+        lost: &[usize],
+        recovery: &[usize],
+        mut read: impl FnMut(FftInput, u64, &mut [u8]) -> EngineResult<()>,
+        mut write: impl FnMut(usize, u64, &[u8]) -> EngineResult<()>,
+    ) -> EngineResult<()> {
+        let g = self.geometry;
         let field = self.field.as_ref().expect("nontrivial FFT field");
         let _plan = self.options.memory.reserve_as(
             MemoryCategory::CodecScratch,
@@ -608,48 +864,64 @@ impl FftCodec {
         let factors = field
             .erasure_factors(&erased, &cancelled)
             .map_err(transform_error)?;
-        let (stripe, _buffers) = self.buffers(block_size, g.domain)?;
+        let (stripe, _buffers) = self.buffers::<L>(block_size, g.domain)?;
         let symbols = stripe / g.field_bytes();
         let mut plan = ForwardPlan::new(g, lost, symbols, &self.options)?;
-        let mut rows = vec![vec![0u16; symbols]; g.domain];
-        let mut bytes = vec![0; stripe];
+        let mut rows = vec![vec![L::default(); symbols]; g.domain];
+        let mut bytes = vec![0; if L::DIRECT { 0 } else { stripe }];
+        // Erased and padding rows are never read, so they stay zero.
+        let zero: Vec<bool> = (0..g.domain)
+            .map(|index| erased[index] || index >= g.capacity + g.inputs)
+            .collect();
         let mut offset = 0;
         while offset < block_size {
             self.options.cancel.check()?;
             let take = (block_size - offset).min(stripe as u64) as usize;
             for (index, row) in rows.iter_mut().enumerate() {
                 self.options.cancel.check()?;
-                row.fill(0);
-                if erased[index] || index >= g.capacity + g.inputs {
+                row.fill(L::default());
+                if zero[index] {
                     continue;
                 }
-                bytes.fill(0);
                 let source = if index < g.capacity {
                     FftInput::Recovery(index)
                 } else {
                     FftInput::Original(index - g.capacity)
                 };
-                read(source, offset, &mut bytes[..take])?;
-                unpack(g.field_bytes(), &bytes, row);
-                field
-                    .scale_with_backend(row, factors[index], self.options.fft_backend, &cancelled)
-                    .map_err(transform_error)?;
-            }
-            self.transform(&mut rows, 0, true)?;
-            field
-                .derivative(&mut rows, &cancelled)
+                if let Some(row) = L::direct(row) {
+                    read(source, offset, &mut row[..take])?;
+                } else {
+                    bytes.fill(0);
+                    read(source, offset, &mut bytes[..take])?;
+                    L::unpack(g.field_bytes(), &bytes, row);
+                }
+                L::scale(
+                    field,
+                    row,
+                    factors[index],
+                    self.options.fft_backend,
+                    &cancelled,
+                )
                 .map_err(transform_error)?;
+            }
+            self.transform(&mut rows, Some(&zero), 0, true)?;
+            L::derivative(field, &mut rows, &cancelled).map_err(transform_error)?;
             self.transform_forward(&mut rows, &mut plan)?;
             for &index in lost {
                 let factor = field
                     .inverse(factors[g.capacity + index])
                     .ok_or(EngineError::InvalidState("singular FFT locator"))?;
                 let row = &mut rows[g.capacity + index];
-                field
-                    .scale_with_backend(row, factor, self.options.fft_backend, &cancelled)
+                L::scale(field, row, factor, self.options.fft_backend, &cancelled)
                     .map_err(transform_error)?;
-                pack(g.field_bytes(), row, &mut bytes);
-                write(index, offset, &bytes[..take])?;
+                let out = match L::direct_ref(row) {
+                    Some(row) => row,
+                    None => {
+                        L::pack(g.field_bytes(), row, &mut bytes);
+                        &bytes
+                    }
+                };
+                write(index, offset, &out[..take])?;
             }
             offset += take as u64;
         }
@@ -763,7 +1035,10 @@ impl FftCodec {
         Ok(admitted)
     }
 
-    fn buffers(&self, block_size: u64, rows: usize) -> EngineResult<(usize, Reservation)> {
+    /// Admit `rows` transform rows of lane `L`, plus its conversion buffer.
+    /// Byte rows charge one byte per stripe byte, so a GF(2^8) cohort gets
+    /// twice the stripe the same budget admitted for zero-extended rows.
+    fn buffers<L: Lane>(&self, block_size: u64, rows: usize) -> EngineResult<(usize, Reservation)> {
         self.options.validate()?;
         let unit = self.geometry.field_bytes();
         if block_size == 0 || !block_size.is_multiple_of(unit as u64) {
@@ -772,9 +1047,7 @@ impl FftCodec {
         let overhead = rows
             .checked_mul(32)
             .ok_or(EngineError::resource_limit("FFT rows"))?;
-        let per_byte = rows
-            .checked_mul(2 / unit)
-            .and_then(|n| n.checked_add(2))
+        let per_byte = workspace_per_byte::<L>(rows, unit)
             .ok_or(EngineError::resource_limit("FFT stripes"))?;
         let target = self
             .options
@@ -927,29 +1200,29 @@ mod charge_tests {
         }
     }
 
-    /// One cohort's row workspace is `domain` transform rows plus one byte
-    /// stripe. The charge is taken before any of it is allocated, so it must
-    /// cover every row's capacity and its vector header.
+    /// One cohort's row workspace is `domain` transform rows plus, for 16-bit
+    /// rows, one byte stripe. The charge is taken before any of it is
+    /// allocated, so it must cover every row's capacity and its vector header.
     #[test]
     fn row_workspace_charge_matches_the_rows_a_cohort_allocates() {
-        for inputs in [200u64, 5_000] {
+        fn check<L: Lane>(inputs: u64) {
             let geometry = FftGeometry::new(inputs, 1).unwrap();
             let options = options(256 << 20);
             let codec = FftCodec::new(geometry, options.clone()).unwrap();
             let unit = geometry.field_bytes();
             let block_size = 1 << 16;
             let before = options.memory.used();
-            let (stripe, buffers) = codec.buffers(block_size, geometry.domain).unwrap();
+            let (stripe, buffers) = codec.buffers::<L>(block_size, geometry.domain).unwrap();
             assert_eq!(options.memory.used() - before, buffers.bytes());
 
             // Exactly what `decode` allocates once the charge is granted.
             let symbols = stripe / unit;
-            let rows = vec![vec![0u16; symbols]; geometry.domain];
-            let bytes = vec![0u8; stripe];
-            let measured = rows.capacity() * size_of::<Vec<u16>>()
+            let rows = vec![vec![L::default(); symbols]; geometry.domain];
+            let bytes = vec![0u8; if L::DIRECT { 0 } else { stripe }];
+            let measured = rows.capacity() * size_of::<Vec<L>>()
                 + rows
                     .iter()
-                    .map(|row| row.capacity() * size_of::<u16>())
+                    .map(|row| row.capacity() * size_of::<L>())
                     .sum::<usize>()
                 + bytes.capacity();
             assert!(
@@ -968,6 +1241,11 @@ mod charge_tests {
             drop(codec);
             assert_eq!(options.memory.used(), 0);
         }
+        // The byte lane GF(2^8) runs on, the zero-extended reference it
+        // replaced, and GF(2^16).
+        check::<u8>(200);
+        check::<u16>(200);
+        check::<u16>(5_000);
     }
 
     /// The repair adapter keeps two byte buffers for the whole reconstruction
@@ -1139,14 +1417,16 @@ mod plan_tests {
 
         // One transform that does run, so the test is measuring a difference
         // and not an engine that never counts anything.
-        codec.transform(&mut workspace, 0, false).expect("runs");
+        codec
+            .transform(&mut workspace, None, 0, false)
+            .expect("runs");
         let ran = options.diagnostics.codec();
         assert!(ran.transform_calls > 0 && ran.butterflies > 0, "{ran:?}");
 
         options.cancel.cancel();
         assert!(
             matches!(
-                codec.transform(&mut workspace, 0, false),
+                codec.transform(&mut workspace, None, 0, false),
                 Err(EngineError::Cancelled)
             ),
             "a cancelled transform did not report it"
@@ -1181,7 +1461,7 @@ mod plan_tests {
             let levels = geometry.domain.trailing_zeros();
             let start = rows(geometry.domain, symbols, geometry.bits, 0x9e37 + inputs);
             let mut expected = start.clone();
-            codec.transform(&mut expected, 0, false).unwrap();
+            codec.transform(&mut expected, None, 0, false).unwrap();
             for block_log2 in 1..=levels {
                 let width = 1usize << block_log2;
                 for first in [0usize, 1, geometry.domain / 2] {
@@ -1236,5 +1516,213 @@ mod plan_tests {
             }
             drop(options);
         }
+    }
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use super::*;
+    use crate::runtime::MemoryBudget;
+
+    fn bytes(count: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        (0..count)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 32) as u8
+            })
+            .collect()
+    }
+
+    fn codec(geometry: FftGeometry, stripe: usize, workers: usize, scalar: bool) -> FftCodec {
+        let options = ExecutionOptions {
+            memory: MemoryBudget::new(256 << 20),
+            workers,
+            stripe_bytes: stripe,
+            fft_backend: if scalar {
+                LinearBackend::Scalar
+            } else {
+                LinearBackend::Auto
+            },
+            ..ExecutionOptions::default()
+        };
+        FftCodec::new(geometry, options).unwrap()
+    }
+
+    /// Recovery rows `0..capacity` through the public entry point (the byte
+    /// lane for GF(2^8)) and through the zero-extended `u16` reference.
+    fn encode_both(
+        codec: &FftCodec,
+        block: usize,
+        data: &[Vec<u8>],
+    ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let capacity = codec.geometry.capacity();
+        let read = |index: usize, offset: u64, out: &mut [u8]| {
+            let offset = offset as usize;
+            out.copy_from_slice(&data[index][offset..offset + out.len()]);
+            Ok(())
+        };
+        let mut lane = vec![vec![0u8; block]; capacity];
+        let mut reference = lane.clone();
+        codec
+            .encode(block as u64, 0, capacity, read, |index, offset, bytes| {
+                let offset = offset as usize;
+                lane[index][offset..offset + bytes.len()].copy_from_slice(bytes);
+                Ok(())
+            })
+            .unwrap();
+        codec
+            .encode_rows::<u16>(block as u64, 0, capacity, read, |index, offset, bytes| {
+                let offset = offset as usize;
+                reference[index][offset..offset + bytes.len()].copy_from_slice(bytes);
+                Ok(())
+            })
+            .unwrap();
+        (lane, reference)
+    }
+
+    fn decode_with(
+        codec: &FftCodec,
+        reference: bool,
+        block: usize,
+        data: &[Vec<u8>],
+        recovery_rows: &[Vec<u8>],
+        lost: &[usize],
+        recovery: &[usize],
+    ) -> Vec<Vec<u8>> {
+        let read = |source: FftInput, offset: u64, out: &mut [u8]| {
+            let offset = offset as usize;
+            let row = match source {
+                FftInput::Original(index) => {
+                    assert!(!lost.contains(&index), "read a lost row");
+                    &data[index]
+                }
+                FftInput::Recovery(index) => &recovery_rows[index],
+            };
+            out.copy_from_slice(&row[offset..offset + out.len()]);
+            Ok(())
+        };
+        let mut out = vec![vec![0u8; block]; data.len()];
+        let write = |index: usize, offset: u64, bytes: &[u8]| {
+            let offset = offset as usize;
+            out[index][offset..offset + bytes.len()].copy_from_slice(bytes);
+            Ok(())
+        };
+        if reference {
+            codec
+                .decode_rows::<u16>(block as u64, lost, recovery, read, write)
+                .unwrap();
+        } else {
+            codec
+                .decode(block as u64, lost, recovery, read, write)
+                .unwrap();
+        }
+        out
+    }
+
+    /// The byte lane must emit exactly what the zero-extended 16-bit lane
+    /// emitted for GF(2^8): every recovery row on encode and every
+    /// reconstructed row on decode, across cohort shapes (one and several
+    /// input bases, full and padded domains), block lengths that are odd,
+    /// below one vector and split across several stripes, both backends, and
+    /// serial and pooled execution.
+    #[test]
+    fn the_byte_lane_matches_the_word_lane_bit_for_bit() {
+        let shapes = [
+            (2u64, 1i8),
+            (5, 2),
+            (13, 3),
+            (40, 3),
+            (100, 5),
+            (150, 6),
+            (192, 6),
+            (64, 7),
+        ];
+        let mut cases = 0;
+        for (shape, &(inputs, capacity_log2)) in shapes.iter().enumerate() {
+            let geometry = FftGeometry::new(inputs, capacity_log2).unwrap();
+            assert_eq!(geometry.field_bytes(), 1);
+            assert!(!geometry.is_trivial());
+            let capacity = geometry.capacity();
+            let inputs = geometry.inputs();
+            for (block, stripe) in [
+                (1usize, 1 << 16),
+                (3, 2),
+                (15, 1 << 16),
+                (17, 16),
+                (65, 64),
+                (1000, 333),
+                (4097, 1 << 16),
+            ] {
+                let data: Vec<Vec<u8>> = (0..inputs)
+                    .map(|index| bytes(block, (shape * 1_000_003 + block * 131 + index) as u64))
+                    .collect();
+                // Loss patterns: one row, a leading run, scattered rows, and
+                // as many rows as the recovery can carry.
+                let all = capacity.min(inputs);
+                let patterns: Vec<Vec<usize>> = vec![
+                    vec![inputs / 2],
+                    (0..all.div_ceil(2)).collect(),
+                    (0..inputs).step_by(3).take(all).collect(),
+                    (inputs - all..inputs).rev().collect(),
+                ];
+                for workers in [1usize, 4] {
+                    for scalar in [false, true] {
+                        let codec = codec(geometry, stripe, workers, scalar);
+                        let (lane, reference) = encode_both(&codec, block, &data);
+                        assert_eq!(
+                            lane, reference,
+                            "encode {inputs}+{capacity} block {block} stripe {stripe} \
+                             workers {workers} scalar {scalar}"
+                        );
+                        for lost in &patterns {
+                            // Recovery rows, highest first, so decodes do not
+                            // always draw the same prefix.
+                            let recovery: Vec<usize> =
+                                (0..capacity).rev().take(lost.len() + 1).collect();
+                            let recovery = &recovery[..lost.len().max(1).min(capacity)];
+                            let actual =
+                                decode_with(&codec, false, block, &data, &lane, lost, recovery);
+                            let expected =
+                                decode_with(&codec, true, block, &data, &lane, lost, recovery);
+                            assert_eq!(
+                                actual, expected,
+                                "decode {inputs}+{capacity} block {block} lost {lost:?} \
+                                 workers {workers} scalar {scalar}"
+                            );
+                            for &index in lost {
+                                assert_eq!(actual[index], data[index], "row {index} not repaired");
+                            }
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, shapes.len() * 7 * 4 * 2 * 2);
+    }
+
+    /// Byte rows are charged at one byte per stripe byte, so a budget that
+    /// narrows the zero-extended rows admits the byte lane a wider stripe.
+    #[test]
+    fn a_gf8_cohort_gets_twice_the_stripe_under_the_same_budget() {
+        let geometry = FftGeometry::new(150, 6).unwrap();
+        let options = ExecutionOptions {
+            memory: MemoryBudget::new(8 << 20),
+            workers: 1,
+            stripe_bytes: 1 << 20,
+            ..ExecutionOptions::default()
+        };
+        let codec = FftCodec::new(geometry, options).unwrap();
+        let (bytes, held) = codec.buffers::<u8>(1 << 20, geometry.domain()).unwrap();
+        drop(held);
+        let (words, _held) = codec.buffers::<u16>(1 << 20, geometry.domain()).unwrap();
+        assert!(words < 1 << 20, "the budget should narrow the stripe");
+        assert!(
+            bytes >= 2 * words - 64,
+            "byte lane admitted {bytes}, word lane {words}"
+        );
     }
 }
