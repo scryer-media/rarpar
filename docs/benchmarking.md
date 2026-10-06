@@ -336,7 +336,7 @@ and counts differ.
   nondeterministic, so `par3 run` and `fleet plan` warn per set, with the
   path length and the number of characters to cut, and then run anyway; if the
   reference fails, its rows are DNF as above. Keep `--work` short, for example
-  `/home/bench/p3` or `C:\p3`.
+  `/bench/p3` or `C:\p3`.
 - **Windows.** The fleet uses the official `windows/par3.exe` from the pinned
   archive, verified by digest, instead of building it.
 

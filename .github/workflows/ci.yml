@@ -154,7 +154,8 @@ jobs:
             ':!target/**' \
             ':!bench/fleet.example.toml' \
             ':!bench/rarpar-bench/config/hosts.example.json' \
-            ':!bench/rarpar-bench/internal/fleet/fleet_test.go'; then
+            ':!bench/rarpar-bench/internal/fleet/fleet_test.go' \
+            ':!bench/rarpar-bench/internal/fleet/fleet_par3_test.go'; then
             echo "::error::tracked files contain local personal paths"
             exit 1
           fi
