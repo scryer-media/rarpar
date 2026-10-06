@@ -1,0 +1,1 @@
+if (-not (Test-Path -LiteralPath 'C:\bench\oracles\O''Brien\UnRAR.exe' -PathType Leaf)) { 'MISSING' } else { (Get-FileHash -Algorithm SHA256 -LiteralPath 'C:\bench\oracles\O''Brien\UnRAR.exe').Hash.ToLower() }

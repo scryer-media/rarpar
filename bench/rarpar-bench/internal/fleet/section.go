@@ -137,6 +137,22 @@ func (item *section) strings(key string, fallback []string) []string {
 	return out
 }
 
+func (item *section) integers(key string, fallback []int) []int {
+	value, ok := item.value(key, tomlArray)
+	if !ok {
+		return fallback
+	}
+	out := make([]int, 0, len(value.array))
+	for _, element := range value.array {
+		if element.kind != tomlInt {
+			item.state.fail("%s must be an array of integers (line %d)", item.label(key), value.line)
+			return fallback
+		}
+		out = append(out, int(element.int))
+	}
+	return out
+}
+
 func (item *section) has(key string) bool {
 	if !item.present {
 		return false

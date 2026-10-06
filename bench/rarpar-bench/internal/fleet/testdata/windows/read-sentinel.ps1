@@ -1,0 +1,1 @@
+if (Test-Path -LiteralPath 'C:\bench\fleet-stage\fleet-testrun\DONE' -PathType Leaf) { [IO.File]::ReadAllText('C:\bench\fleet-stage\fleet-testrun\DONE') } else { '__PENDING__' }

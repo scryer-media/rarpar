@@ -49,6 +49,8 @@ func run(ctx context.Context, args []string) error {
 		return runRender(args[1:])
 	case "fleet":
 		return runFleet(ctx, args[1:])
+	case "par3":
+		return runPAR3(ctx, args[1:], os.Stdout)
 	case "-h", "--help", "help":
 		usage()
 		return nil
@@ -73,6 +75,7 @@ func usage() {
   rarpar-bench report --input FILE --out FILE
   rarpar-bench render --input FILE --out DIR
   rarpar-bench fleet plan|run|collect|teardown --config PATH
+  rarpar-bench par3 matrix|build-reference|run|report ...   (rarpar-bench par3 help)
 
 LANE is cpu, metal, or docker-cpu. PAR2 placement is canonical or smart; canonical
 matches conventional expected-path verification for direct comparisons. Corpus data and run evidence are

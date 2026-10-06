@@ -127,9 +127,9 @@ Append a `[[machines]]` block. The mandatory decisions:
 
 | Field | What it decides |
 | --- | --- |
-| `kind` | `local-ssh` (a machine you own) or `aws-ec2` (launched and destroyed per run) |
+| `kind` | `local-ssh` (a machine you own) or `aws-ec2` (launched and destroyed per run; `ec2.access` = `ssh` or `ssm`) |
 | `platform_label` | Names the SVGs and the report machine label. Must be unique — a collision overwrites another machine's charts |
-| `suites` | `crc-probe`, `yenc-micro`, `macro-rar`, `macro-par2` |
+| `suites` | `crc-probe`, `yenc-micro`, `macro-rar`, `macro-par2`, `macro-par3` |
 | `capabilities.perf` | `linux-perf`, `samply`, or `none`. Decides which diagnostic pass runs |
 | `capabilities.no_pgrep` | Set on busybox-class appliances; the load gate falls back to `ps -ef \| grep` |
 | `bundle.source` | `docker` (build the recipe) or `prebuilt` (stage a directory) |
@@ -189,18 +189,170 @@ exiting) therefore blocks that host until the orchestrator's
 it is waiting on. Clear the process, or drop that name from
 `quiet_load_process_names` for the run.
 
+## PAR3 suite on the fleet
+
+Add `macro-par3` to a machine's `suites` and give it a `par3` oracle. The
+bundle then carries `toolchains.json`, and the host runs `rarpar-bench par3 run`
+before the perf pass. Evidence goes to `<results>/par3/` (`results.json`,
+`runs.jsonl`, `report.md`), and logs go to `par3-run.out`/`.err`. The suite
+itself is documented in [benchmarking.md](benchmarking.md#par3-suite).
+
+```toml
+[machines.oracles.par3]
+policy = "source-build"
+recipe = "par3cmdline-onhost"     # built on the host from the pinned archive
+
+[machines.par3]
+profile = "full"                  # or "smoke"
+# sets = ["a-gf16", "c-gf16"]     # default: every set in the profile
+# ops = ["create", "verify", "repair"]
+workers = [1, 8]
+warmups = 1
+repeats = 5
+pin_cpus = "0-7"
+work = "/home/bench/p3"           # keep it short, see below
+timeout_minutes = 20              # per run, rarpar rows too; a reference over it is DNF
+# reference_timeout_minutes = 60  # default 0: the reference uses timeout_minutes
+# durability = ["durable"]        # default: durable and buffered rows
+```
+
+- **Durability rows.** Every `rarpar` create and repair runs durable (the
+  default) and buffered; the reference gets one row. `durability` narrows that
+  and must include `durable`. Verify writes nothing, so it has no buffered
+  row and runs once per worker count. In the text plan, the macro-par3 step
+  lists the durabilities and the per-run timeout, and the machine's `par3`
+  block lists the variants and the rows each op produces; `--json` carries
+  the same rows under `par3.rows`.
+- **Timeouts.** `timeout_minutes` (default 20, lower than before) applies to
+  `rarpar` rows too; raise it on slow hosts. `reference_timeout_minutes`
+  gives the reference its own limit (0 = the same).
+- **Reference failures** that mean "did not finish" (timeout, signal, non-zero
+  exit, missing, short or unreadable recovery files) are recorded as DNF with
+  the exit code and stderr line, and the PAR3 section carries on. A reference
+  that would not start, did not reproduce its own canonical set, or repaired
+  wrongly fails the section; see
+  [benchmarking.md](benchmarking.md#timeouts-and-reference-dnf).
+
+- **Linux and macOS hosts** use `recipe = "par3cmdline-onhost"`. The host runs
+  `par3 build-reference` against the shipped `toolchains.json`, so the
+  reference is compiled natively and never emulated. It needs CMake and a C
+  compiler; EC2 user-data installs `build-essential` and `cmake` when this
+  recipe is selected. This recipe takes no `url` or `sha256`.
+- **Windows hosts** use `policy = "official-binary"` with the pinned archive's
+  `windows/par3.exe` (`archive_member`, `binary_sha256`); see the example
+  config. `par3cmdline-onhost` is refused on Windows, and so is
+  `[machines.par3].iocount`.
+- **Work path.** `fleet plan` checks `[machines.par3].work`, which defaults to
+  `<scratch>/p3`, against the reference's file-name limit. An over-long path
+  is a plan warning with the character count, and preflight logs it; neither
+  refuses, because the reference bug is nondeterministic and a failure only
+  costs DNF rows. The run deletes the work directory afterwards.
+- **Defender.** A quarantined or blocked binary stops the PAR3 section as
+  `binary-quarantined`. The harness reports it and does not work around it.
+  Defender misflags the `par3-rs` `engine_perf.exe` example as
+  `Trojan:Win64/AsyncRAT.C!MTB`. The fleet neither ships nor runs it; it only
+  matters for a manual `par3 run --engine-perf`. See the Windows section below.
+
+```sh
+rarpar-bench fleet plan --config bench/fleet.toml --suite macro-par3
+rarpar-bench fleet run  --config bench/fleet.toml --suite macro-par3
+```
+
+Public write-ups name hosts by core type only, for example "Zen 4" or
+"Graviton 4", never by machine name. `platform_label` should follow the same
+rule.
+
+## EC2 over SSM
+
+`access = "ssh"` is the default: the run uses a temporary keypair, a security
+group, and SSH on `fleet.aws.ssh_ingress_port`. Use `access = "ssm"` when SSH
+into EC2 is unreliable from the orchestrating network:
+
+```toml
+[fleet.aws]
+ssm_bucket = "your-transfer-bucket"           # scripts and tarballs travel here
+instance_profile = "your-ssm-instance-profile" # AmazonSSMManagedInstanceCore + bucket access
+
+[[machines]]
+kind = "aws-ec2"
+[machines.ec2]
+access = "ssm"
+spot = true                                    # optional, SSM only
+```
+
+- No keypair, security group, or ingress rule is created. The instance gets
+  the instance profile and nothing else.
+- Every script runs through `AWS-RunShellScript`. The script is uploaded to
+  `s3://<bucket>/<prefix>/<run>/<machine>/`, which the host fetches, deletes
+  and runs. Bundles and results move as tar objects under the same prefix,
+  and each object is deleted after its transfer.
+- User-data leaves snapd running: the SSM agent on Ubuntu cloud images is a
+  snap, and disabling snapd would cut the only channel to the instance. The
+  host's AWS CLI also comes from `snap install aws-cli --classic`. The SSH
+  path still disables snapd.
+- `corpus_source` is refused with SSM. Use the generated PAR3 data or a
+  prebuilt corpus in the bundle.
+- Preflight checks the bucket (`s3api head-bucket`) and the profile
+  (`iam get-instance-profile`) read-only. `--dry-run-aws` stops before
+  launch, exactly as it does for SSH.
+
 ## Known limits
 
 - `bundle.build_host` accepts a machine name but only `"local"` is implemented.
   A remote build host is refused at build time with a message telling you to
   build there yourself and use `bundle.source = "prebuilt"`.
 - The Windows runner has never been executed (see below).
+- The SSM access mode is implemented and unit-tested but has not been run
+  against a live account yet. Treat its first run as bring-up.
+- The Windows transport is implemented and unit-tested but has not run against
+  a live host (see below).
 
 ## Windows hosts
 
-Schema-complete and implemented, but **unvalidated**: no Windows host has run it
-yet. The runner uploads a `.ps1` and executes the *file* — PowerShell is never
-driven by an inline command string, because quoting a script through
-ssh → cmd.exe → powershell truncates it silently. `capabilities.perf` must be
-`none`. Treat the first Windows run as bring-up, not evidence. See the TODO at
-the top of `internal/fleet/windows.go`.
+Implemented and unit-tested, but **unvalidated: it has never run against a live
+Windows host.** Treat the first Windows run as bring-up, not evidence. See the
+TODO at the top of `internal/fleet/windows.go` for what bring-up must confirm.
+
+The host needs Windows OpenSSH (sshd with its default sftp subsystem) and
+Windows PowerShell 5.1. It needs no `sh` and no `tar`:
+
+- **Control commands** (probe, mkdir, existence checks, the oracle check,
+  reading the `DONE` sentinel, cleanup) are short PowerShell scripts sent as
+  `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass
+  -EncodedCommand <base64>`. Base64 has nothing cmd.exe or PowerShell
+  interprets, so there is no quoting layer. A script too long for cmd.exe's
+  command-line limit is refused rather than truncated.
+- **Uploads.** The bundle and the run script are zipped locally, sent with
+  `scp -P <port>` (same key, known-hosts file and multiplexing as ssh) to
+  `/C:/...`, and unpacked with `Expand-Archive`.
+- **The run** is the uploaded `run.ps1` *file*, never an inline command string,
+  because quoting a script through ssh → cmd.exe → PowerShell truncates it
+  silently. It starts through `Win32_Process.Create`, so it is outside the
+  sshd session's job object and survives the connection closing. Its output
+  goes to `run.log`.
+- **Evidence** is `results.zip`, built on the host with
+  `System.IO.Compression.ZipFile` and fetched by scp. Locally, backslash entry
+  names are normalised and entries that would escape the destination are
+  refused; the inventory manifest is verified as on POSIX hosts.
+- **Preflight** probes Windows hosts too (OS caption, `NUMBER_OF_PROCESSORS`,
+  CPU load) and checks host-path oracles with `Get-FileHash`.
+- **Paths.** Windows host paths must be absolute and must not contain a double
+  quote, `%` or a line break, because the detached start passes them through a
+  cmd.exe command line.
+- `capabilities.perf` must be `none`.
+
+The generated PowerShell is pinned by golden files in
+`bench/rarpar-bench/internal/fleet/testdata/windows/`; regenerate them with
+`go test ./internal/fleet -run Golden -update` and review the diff. The POSIX
+transport is unchanged.
+
+**Defender.** Defender flags the `par3-rs` `engine_perf.exe` example as
+`Trojan:Win64/AsyncRAT.C!MTB`, a false positive. The fleet neither ships nor
+runs `engine_perf.exe`; it is used only by a manual
+`rarpar-bench par3 run --engine-perf PATH` on the host. The operator-approved
+handling is a path-scoped Defender exclusion, added by hand by the host owner,
+on the bench work directory that holds `engine_perf.exe` (cargo's
+`target\release\examples` where it was built, or the directory it was copied
+into for `--engine-perf`), and no wider. Nothing in the fleet tooling touches
+Defender settings, and nothing may; a quarantine still surfaces as
+`binary-quarantined`.

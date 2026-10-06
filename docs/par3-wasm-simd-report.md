@@ -14,13 +14,13 @@ shown below by byte comparison rather than by timing.
 | | |
 | --- | --- |
 | wasm and native aarch64 | Apple M5 Max, macOS 26.0 (Darwin 25.6.0), 18 cores |
-| native x86-64 | `codex-x86`, 12th Gen Intel Core i5-1240P, 16 threads, Ubuntu |
+| native x86-64 | Alder Lake host, 12th Gen Intel Core i5-1240P, 16 threads, Ubuntu |
 | runtime | wasmtime 47.0.3 — the version `ci.yml` pins as `WASMTIME_VERSION` |
 | toolchain | rustc 1.97.1, the `rust-toolchain.toml` pin, on both hosts |
 | target | `wasm32-wasip1`, release profile (`lto = "fat"`, one codegen unit) |
 | corpus | the published PAR3 fixture corpus, `xtask test-corpus hydrate --profile par3` |
 
-wasmtime is not installed on `codex-x86`, so every wasm number here is from the
+wasmtime is not installed on the Alder Lake host, so every wasm number here is from the
 Mac. What that leaves unmeasured is stated at the end.
 
 ## What is measured
@@ -219,7 +219,7 @@ The timing A/B was run anyway, as asked:
 
 | host | n | before | after | delta |
 | --- | ---: | ---: | ---: | ---: |
-| x86-64 `codex-x86` | 15 | 155.15 | 154.57 | **−0.38 %** |
+| x86-64 Alder Lake | 15 | 155.15 | 154.57 | **−0.38 %** |
 | aarch64 Mac | 20 | 198.39 | 192.71 | **−2.86 %** |
 
 The x86 figure is inside the ±1% the gate names. The Mac figure is not, in the
@@ -254,7 +254,7 @@ fingerprints at native speed. Before these two changes the same comparison was
 
 * **relaxed-simd on an x86 host.** The clamp `i8x16.swizzle` must emit on x86
   is the only thing `i8x16_relaxed_swizzle` removes, so the flavour's benefit
-  can only appear there. wasmtime is not installed on `codex-x86` and installing
+  can only appear there. wasmtime is not installed on the Alder Lake host and installing
   it was out of scope for this pass. The lane is correct and byte-exact on both
   hosts' terms; only its x86 speedup is unknown.
 * **A wasm runtime other than wasmtime.** Every wasm number is wasmtime 47.0.3,

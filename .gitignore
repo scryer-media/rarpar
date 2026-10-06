@@ -4,6 +4,8 @@
 # Deterministic benchmark corpora, runs, and rendered reports.
 /target/bench/
 /bench/rarpar-bench/.cache/
+# Harness output written with a relative --out from inside bench/rarpar-bench.
+/bench/rarpar-bench/target/
 # Operator-specific benchmark host inventory; it may reference private SSH keys.
 /bench/rarpar-bench/config/hosts.local.json
 # Operator-private benchmark fleet configuration; it names private hosts, SSH
