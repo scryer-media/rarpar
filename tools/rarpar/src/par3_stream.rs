@@ -411,6 +411,15 @@ impl Lane {
         self.offset += length;
     }
 
+    /// Record a protected chunk whose bytes repeat an earlier chunk's, as
+    /// the copy of a ZIP footer after the packets: it maps to the same blocks.
+    pub(crate) fn repeat_chunk(&mut self, chunk: &ChunkDescription) {
+        if let ChunkDescription::Protected { length, .. } = chunk {
+            self.offset += length;
+        }
+        self.chunks.push(chunk.clone());
+    }
+
     fn close_tail(&mut self) -> Result<(), String> {
         if let Some(open) = self.open_tail.take() {
             let mut block = open.data;

@@ -1,10 +1,17 @@
-//! `rarpar par3 archive`: write a 7z archive and protect it with PAR3 in the
-//! same pass.
+//! `rarpar par3 archive`: write a 7z or ZIP archive and protect it with PAR3
+//! in the same pass.
 //!
-//! sevenz-turbo writes the archive through [`Tee`], which hands every byte to
-//! [`Protect`] in file order as it reaches the disk. The 7z start header is the
-//! one exception: the writer leaves its 32 bytes for last, so they are fed as
-//! zeros and patched in when the writer goes back for them.
+//! sevenz-turbo or the zip crate writes the archive through [`Tee`], which
+//! hands every byte to [`Protect`] in file order as it reaches the disk. The 7z
+//! start header is the one exception: the writer leaves its 32 bytes for last,
+//! so they are fed as zeros and patched in when the writer goes back for them.
+//! The ZIP writer streams, with data descriptors, and never goes back.
+//!
+//! A ZIP set inside the archive follows par3cmdline: the end records (the
+//! footer) form their own chunk, the packets follow them, and a copy of the
+//! footer ends the file so that it is still a ZIP. The footer is only known at
+//! the end, so with a set inside a ZIP the lanes trail the archive by the most
+//! a footer can take.
 //!
 //! The set's geometry depends on the archive's final length, which is only
 //! known once the end header is written. Small archives are held in memory
@@ -23,13 +30,14 @@ use std::sync::{Arc, Mutex};
 
 use par3_rs::hash::QUICK_HASH_LEN;
 use par3_rs::packet::{CreatorPacket, GaloisField};
-use rarpar::cli::{ArchiveFilter, Cli, Par3ArchiveArgs};
+use rarpar::cli::{ArchiveFilter, ArchiveFormat, Cli, Par3ArchiveArgs};
 use serde_json::{Value, json};
 use sevenz_turbo::encoder_options::{EncoderOptions, Lzma2Options};
 use sevenz_turbo::{
     ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod, SourceReader,
 };
 
+use crate::compat_7z::local_civil;
 use crate::error::RarparError;
 use crate::par3::{parent, reject_symlinks};
 use crate::par3_stream::{
@@ -40,6 +48,14 @@ use crate::par3_stream::{
 
 const MIB: u64 = 1 << 20;
 
+/// How far back from the end par3cmdline looks for a ZIP's end records, and so
+/// how far the lanes trail a ZIP that takes a set inside.
+const ZIP_SEARCH: usize = 1024;
+
+/// The end records the zip crate writes without a comment: the end of central
+/// directory record, or that with the ZIP64 record and locator before it.
+const ZIP_FOOTERS: &[u64] = &[22, 98];
+
 /// How the set is laid out.
 #[derive(Clone, Copy)]
 enum Plan {
@@ -48,8 +64,13 @@ enum Plan {
         block_size: u64,
         choice: RecoveryChoice,
     },
-    /// After the end header, as `par3 i -r<n>` lays it out.
-    Inside { params: InsideParams },
+    /// After the end header, as `par3 i -r<n>` lays it out. `footers` are
+    /// the footer lengths the finished archive may end with, until
+    /// `params.footer` is set to the one it does.
+    Inside {
+        params: InsideParams,
+        footers: &'static [u64],
+    },
 }
 
 /// The geometry the finished archive settles on.
@@ -65,7 +86,18 @@ impl Plan {
     fn inside_params(params: &InsideParams, size: u64) -> InsideParams {
         InsideParams {
             file_size: size,
+            footer: params.footer.min(size),
             ..*params
+        }
+    }
+
+    fn with_footer(self, footer: u64) -> Plan {
+        match self {
+            Plan::Inside { params, footers } => Plan::Inside {
+                params: InsideParams { footer, ..params },
+                footers,
+            },
+            sibling => sibling,
         }
     }
 
@@ -81,7 +113,7 @@ impl Plan {
                     inside: None,
                 }
             }
-            Plan::Inside { params } => {
+            Plan::Inside { params, .. } => {
                 let shape = inside_geometry(&Self::inside_params(&params, size));
                 Geometry {
                     block_size: shape.block_size,
@@ -114,66 +146,89 @@ impl Plan {
                     rows: choice.rows(block_count(high, block_size)),
                 }]
             }
-            Plan::Inside { params } => {
-                let mut sizes: Vec<u64> = Vec::new();
-                const POINTS: u64 = 4096;
-                if high - low <= POINTS {
-                    sizes.extend(low..=high);
-                } else {
-                    // Even steps and geometric steps, so that both a narrow
-                    // window and a wide one are sampled densely near `low`.
-                    let ratio = (high as f64 / low.max(1) as f64).powf(1.0 / POINTS as f64);
-                    let mut at = low.max(1) as f64;
-                    for step in 0..=POINTS {
-                        sizes.push(low + (high - low) / POINTS * step);
-                        sizes.push((at as u64).clamp(low, high));
-                        at *= ratio;
+            Plan::Inside { params, footers } => {
+                let mut merged: Vec<Candidate> = Vec::new();
+                for &footer in footers {
+                    let params = InsideParams { footer, ..params };
+                    for candidate in Self::inside_candidates(&params, low, high) {
+                        match merged
+                            .iter_mut()
+                            .find(|known| known.block_size == candidate.block_size)
+                        {
+                            Some(known) => {
+                                for field in candidate.fields {
+                                    if !known.fields.contains(&field) {
+                                        known.fields.push(field);
+                                    }
+                                }
+                                known.rows = known.rows.max(candidate.rows);
+                            }
+                            None => merged.push(candidate),
+                        }
                     }
-                    sizes.push(high);
                 }
-                let mut chosen: Vec<u64> = sizes
-                    .iter()
-                    .map(|&size| inside_geometry(&Self::inside_params(&params, size)).block_size)
-                    .collect();
-                chosen.sort_unstable();
-                chosen.dedup();
-                // The ladder par3cmdline steps through: 40, 64, 128, 256, ...
-                let below = |size: u64| match size {
-                    0..=40 => None,
-                    41..=64 => Some(40),
-                    _ => Some(size / 2),
-                };
-                let above = |size: u64| if size <= 40 { 64 } else { size * 2 };
-                let mut block_sizes = Vec::new();
-                for size in chosen {
-                    block_sizes.extend(below(size));
-                    block_sizes.push(size);
-                    block_sizes.push(above(size));
-                }
-                block_sizes.sort_unstable();
-                block_sizes.dedup();
-                block_sizes
-                    .into_iter()
-                    .map(|block_size| {
-                        let field = |size: u64| {
-                            let shape =
-                                inside_size(&Self::inside_params(&params, size), block_size);
-                            reference_field(shape.blocks, 0, shape.recovery, shape.recovery)
-                        };
-                        let mut fields = vec![field(low)];
-                        if field(high) != fields[0] {
-                            fields.push(field(high));
-                        }
-                        Candidate {
-                            block_size,
-                            fields,
-                            rows: inside_size(&Self::inside_params(&params, high), block_size)
-                                .recovery,
-                        }
-                    })
-                    .collect()
+                merged
             }
         }
+    }
+
+    fn inside_candidates(params: &InsideParams, low: u64, high: u64) -> Vec<Candidate> {
+        let params = *params;
+        let mut sizes: Vec<u64> = Vec::new();
+        const POINTS: u64 = 4096;
+        if high - low <= POINTS {
+            sizes.extend(low..=high);
+        } else {
+            // Even steps and geometric steps, so that both a narrow
+            // window and a wide one are sampled densely near `low`.
+            let ratio = (high as f64 / low.max(1) as f64).powf(1.0 / POINTS as f64);
+            let mut at = low.max(1) as f64;
+            for step in 0..=POINTS {
+                sizes.push(low + (high - low) / POINTS * step);
+                sizes.push((at as u64).clamp(low, high));
+                at *= ratio;
+            }
+            sizes.push(high);
+        }
+        let mut chosen: Vec<u64> = sizes
+            .iter()
+            .map(|&size| inside_geometry(&Self::inside_params(&params, size)).block_size)
+            .collect();
+        chosen.sort_unstable();
+        chosen.dedup();
+        // The ladder par3cmdline steps through: 40, 64, 128, 256, ...
+        let below = |size: u64| match size {
+            0..=40 => None,
+            41..=64 => Some(40),
+            _ => Some(size / 2),
+        };
+        let above = |size: u64| if size <= 40 { 64 } else { size * 2 };
+        let mut block_sizes = Vec::new();
+        for size in chosen {
+            block_sizes.extend(below(size));
+            block_sizes.push(size);
+            block_sizes.push(above(size));
+        }
+        block_sizes.sort_unstable();
+        block_sizes.dedup();
+        block_sizes
+            .into_iter()
+            .map(|block_size| {
+                let field = |size: u64| {
+                    let shape = inside_size(&Self::inside_params(&params, size), block_size);
+                    reference_field(shape.blocks, 0, shape.recovery, shape.recovery)
+                };
+                let mut fields = vec![field(low)];
+                if field(high) != fields[0] {
+                    fields.push(field(high));
+                }
+                Candidate {
+                    block_size,
+                    fields,
+                    rows: inside_size(&Self::inside_params(&params, high), block_size).recovery,
+                }
+            })
+            .collect()
     }
 }
 
@@ -225,6 +280,10 @@ struct Protect {
     head_cap: u64,
     buffering: bool,
     lanes: Vec<Lane>,
+    /// How many of the latest bytes the lanes trail by.
+    hold: usize,
+    /// The bytes the lanes have not been fed yet, at most `hold`.
+    held: Vec<u8>,
     digest: FileDigest,
     len: u64,
     next_prune: u64,
@@ -253,13 +312,37 @@ impl Protect {
             }
             return Ok(());
         }
-        for lane in &mut self.lanes {
-            if let Err(error) = lane.feed(data) {
-                return Err(self.fail(RarparError::Data(error)));
+        if self.hold == 0 {
+            self.feed_lanes(data)?;
+        } else {
+            let total = self.held.len() + data.len();
+            if total <= self.hold {
+                self.held.extend_from_slice(data);
+            } else {
+                let release = total - self.hold;
+                let mut held = std::mem::take(&mut self.held);
+                let from_held = release.min(held.len());
+                self.feed_lanes(&held[..from_held])?;
+                self.feed_lanes(&data[..release - from_held])?;
+                held.drain(..from_held);
+                held.extend_from_slice(&data[release - from_held..]);
+                self.held = held;
             }
         }
         if self.len >= self.next_prune {
             self.prune();
+        }
+        Ok(())
+    }
+
+    fn feed_lanes(&mut self, data: &[u8]) -> io::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        for lane in &mut self.lanes {
+            if let Err(error) = lane.feed(data) {
+                return Err(self.fail(RarparError::Data(error)));
+            }
         }
         Ok(())
     }
@@ -287,6 +370,7 @@ impl Protect {
         if needed > self.budget {
             return Err(self.fail(memory_error(needed, self.budget)));
         }
+        let fed = self.head.len() - self.hold.min(self.head.len());
         let mut lanes = Vec::with_capacity(candidates.len());
         for candidate in &candidates {
             let mut lane = Lane::new(candidate.block_size, true, true);
@@ -297,12 +381,13 @@ impl Protect {
                 }
             }
             lane.begin_chunk();
-            if let Err(error) = lane.feed(&self.head) {
+            if let Err(error) = lane.feed(&self.head[..fed]) {
                 return Err(self.fail(RarparError::Data(error)));
             }
             lanes.push(lane);
         }
         self.lanes = lanes;
+        self.held = self.head[fed..].to_vec();
         self.head = Vec::new();
         self.buffering = false;
         self.schedule_prune();
@@ -591,6 +676,13 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
         .to_owned();
     let directory = parent(output);
     let creator = par3_stream::creator_text();
+    let zip = args.format == ArchiveFormat::Zip;
+    if zip && (args.filter != ArchiveFilter::None || args.no_solid) {
+        return Err(RarparError::Usage(
+            "--filter and --no-solid are for 7z archives; a ZIP compresses each file on its own"
+                .into(),
+        ));
+    }
     let plan = if args.inside {
         let redundancy = args.recovery_percent.unwrap_or(0);
         if redundancy > 250 {
@@ -607,6 +699,7 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
                 redundancy: u64::from(redundancy),
                 repetition_limit: 0,
             },
+            footers: if zip { ZIP_FOOTERS } else { &[0] },
         }
     } else {
         Plan::Sibling {
@@ -637,7 +730,7 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
         return Ok((
             true,
             json!({"operation":"par3_archive","success":true,"dry_run":true,
-                "archive":output,"mode":if args.inside {"inside"} else {"sibling"},
+                "archive":output,"format":format_name(args.format),"mode":if args.inside {"inside"} else {"sibling"},
                 "members":members.len(),"input_bytes":input_bytes}),
         ));
     }
@@ -646,14 +739,28 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
         .par3_workers
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from))
         .clamp(1, 64) as u32;
-    let (methods, in_flight) = methods(args, threads);
-    let header: u64 = members
-        .iter()
-        .map(|member| member.name.encode_utf16().count() as u64 * 2 + 128)
-        .sum::<u64>()
-        .saturating_mul(102)
-        / 100
-        + 4096;
+    let (methods, in_flight) = if zip {
+        // The deflate stream holds back little more than its window.
+        (Vec::new(), MIB)
+    } else {
+        methods(args, threads)
+    };
+    let header: u64 = if zip {
+        // Local header, ZIP64 fields, data descriptor and central header.
+        members
+            .iter()
+            .map(|member| member.name.len() as u64 * 2 + 200)
+            .sum::<u64>()
+            + 4096
+    } else {
+        members
+            .iter()
+            .map(|member| member.name.encode_utf16().count() as u64 * 2 + 128)
+            .sum::<u64>()
+            .saturating_mul(102)
+            / 100
+            + 4096
+    };
     let consumed = Arc::new(AtomicU64::new(0));
     let failure = Arc::new(Mutex::new(None));
     let budget = (cli.par3_memory_mib as u64).saturating_mul(MIB);
@@ -671,6 +778,8 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
         head_cap: budget / 2,
         buffering: true,
         lanes: Vec::new(),
+        hold: if zip && args.inside { ZIP_SEARCH } else { 0 },
+        held: Vec::new(),
         digest: FileDigest::new(),
         len: 0,
         next_prune: 0,
@@ -691,7 +800,11 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
         end: 0,
         protect,
     };
-    let written = write_archive(tee, &members, methods, args.no_solid, &consumed);
+    let written = if zip {
+        write_zip(tee, &members, args.level, &consumed)
+    } else {
+        write_archive(tee, &members, methods, args.no_solid, &consumed)
+    };
     let tee = match written {
         Ok(tee) => tee,
         Err(error) => {
@@ -710,6 +823,26 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
     } = tee;
     let mut file = file.into_inner().map_err(|error| error.into_error())?;
 
+    // The footer of a ZIP that takes the set inside, found as par3cmdline
+    // finds it, among the bytes the lanes have not been fed.
+    let (footer, plan) = if zip && args.inside {
+        let tail: &[u8] = if protect.buffering {
+            &protect.head
+        } else {
+            &protect.held
+        };
+        let tail = &tail[tail.len().saturating_sub(ZIP_SEARCH)..];
+        let footer = zip_footer(tail, size).ok_or_else(|| {
+            RarparError::Data("the ZIP writer's end records were not where par3 looks".into())
+        })?;
+        (
+            tail[tail.len() - footer as usize..].to_vec(),
+            plan.with_footer(footer),
+        )
+    } else {
+        (Vec::new(), plan)
+    };
+    let data_end = size - footer.len() as u64;
     let geometry = plan.geometry(size);
     if geometry.blocks == 0 {
         return Err(RarparError::Usage(
@@ -722,9 +855,13 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
         if needed > budget {
             return Err(memory_error(needed, budget));
         }
-        exact_lane(&geometry, |lane| lane.feed(&protect.head))?
-    } else if let Some(lane) = protect.take_lane(&geometry) {
+        exact_lane(&geometry, |lane| {
+            lane.feed(&protect.head[..data_end as usize])
+        })?
+    } else if let Some(mut lane) = protect.take_lane(&geometry) {
         protect.lanes.clear();
+        let held = &protect.held[..protect.held.len() - footer.len()];
+        lane.feed(held).map_err(RarparError::Data)?;
         lane
     } else {
         protect.lanes.clear();
@@ -733,7 +870,7 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
         }
         reread = true;
         file.flush()?;
-        let mut source = File::open(staged.path())?;
+        let mut source = File::open(staged.path())?.take(data_end);
         let mut buffer = vec![0u8; MIB as usize];
         exact_lane(&geometry, |lane| {
             loop {
@@ -748,9 +885,22 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
         })?
     };
     protect.head = Vec::new();
+    protect.held = Vec::new();
     lane.end_chunk().map_err(RarparError::Data)?;
+    let footer_chunk = if footer.is_empty() {
+        None
+    } else {
+        lane.begin_chunk();
+        lane.feed(&footer).map_err(RarparError::Data)?;
+        Some(lane.end_chunk().map_err(RarparError::Data)?)
+    };
     if let Some(shape) = geometry.inside {
         lane.unprotected(shape.total_packet_size);
+    }
+    if let Some(chunk) = &footer_chunk {
+        // The copy after the packets is protected too, by the same blocks.
+        lane.repeat_chunk(chunk);
+        protect.digest.update(&footer, false);
     }
     lane.finish().map_err(RarparError::Data)?;
     if lane.block_count() != geometry.blocks {
@@ -795,7 +945,16 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
     if let Some(shape) = geometry.inside {
         file.seek(SeekFrom::End(0))?;
         let mut out = BufWriter::new(&mut file);
-        write_inside(&mut out, &set, rows, 0, shape.repeat)?;
+        let packets = write_inside(&mut out, &set, rows, 0, shape.repeat)?;
+        if packets != shape.total_packet_size {
+            // par3cmdline sizes the run before writing it; a run that
+            // differs would leave the chunk lengths describing other bytes.
+            return Err(RarparError::Data(format!(
+                "the packets take {packets} bytes where par3 reserves {}",
+                shape.total_packet_size
+            )));
+        }
+        out.write_all(&footer)?;
         out.flush()?;
         drop(out);
     }
@@ -811,13 +970,67 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
     Ok((
         true,
         json!({"operation":"par3_archive","success":true,"dry_run":false,
-            "archive":output,"mode":if args.inside {"inside"} else {"sibling"},
+            "archive":output,"format":format_name(args.format),
+            "mode":if args.inside {"inside"} else {"sibling"},
             "outputs":written,"members":members.len(),"input_bytes":input_bytes,
             "archive_bytes":archive_bytes,"protected_bytes":size,
             "set_id":set.set_id.to_string(),"block_size":geometry.block_size,
             "blocks":geometry.blocks,"recovery_blocks":geometry.rows,
             "field_bytes":geometry.galois.size,"read_back":reread}),
     ))
+}
+
+fn format_name(format: ArchiveFormat) -> &'static str {
+    match format {
+        ArchiveFormat::SevenZ => "7z",
+        ArchiveFormat::Zip => "zip",
+    }
+}
+
+/// par3cmdline's `check_outside_format` for ZIP: the length of the end
+/// records, found by scanning `tail`, the last bytes of a `size`-byte file,
+/// backwards for an end of central directory record (or its ZIP64 form) that
+/// accounts for the file's end.
+fn zip_footer(tail: &[u8], size: u64) -> Option<u64> {
+    let u32_at =
+        |at: usize| u32::from_le_bytes([tail[at], tail[at + 1], tail[at + 2], tail[at + 3]]);
+    let u64_at = |at: usize| {
+        let bytes = tail.get(at..at + 8)?;
+        Some(u64::from_le_bytes(bytes.try_into().ok()?))
+    };
+    let len = tail.len() as i64;
+    let mut offset = len - 22;
+    while offset >= 0 {
+        let at = offset as usize;
+        let records = (len - offset) as u64;
+        match u32_at(at) {
+            0x0605_4b50 => {
+                let directory = u64::from(u32_at(at + 12));
+                let start = u64::from(u32_at(at + 16));
+                if start + directory + records == size {
+                    return Some(records);
+                } else if directory == 0xFFFF_FFFF || start == 0xFFFF_FFFF {
+                    offset -= 19;
+                } else if start + directory + records < size {
+                    return None;
+                }
+            }
+            0x0606_4b50 => {
+                let end = u64_at(at + 40)
+                    .zip(u64_at(at + 48))
+                    .and_then(|(directory, start)| start.checked_add(directory))
+                    .and_then(|end| end.checked_add(records));
+                match end {
+                    Some(end) if end == size => return Some(records),
+                    Some(end) if end < size => return None,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        offset -= 1;
+    }
+    None
 }
 
 /// A lane for exactly `geometry`, fed by `feed`.
@@ -891,6 +1104,101 @@ fn write_archive(
     Ok(tee)
 }
 
+/// Members this large get ZIP64 sizes from the start: the writer streams, so
+/// the local header cannot be widened once the sizes are known, and deflate
+/// can grow incompressible input a little.
+const ZIP64_MEMBER: u64 = 0xFFFF_FFFF - (0xFFFF_FFFF >> 8);
+
+fn write_zip(
+    tee: Tee,
+    members: &[Member],
+    level: u32,
+    consumed: &Arc<AtomicU64>,
+) -> Result<Tee, RarparError> {
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let mut writer = ZipWriter::new_stream(tee);
+    let mut buffer = vec![0u8; 256 << 10];
+    for member in members {
+        let meta = std::fs::metadata(&member.path)?;
+        let mut options = SimpleFileOptions::default()
+            .last_modified_time(dos_time(&meta))
+            .large_file(member.size >= ZIP64_MEMBER);
+        options = if level == 0 || member.directory {
+            options.compression_method(CompressionMethod::Stored)
+        } else {
+            options
+                .compression_method(CompressionMethod::Deflated)
+                .compression_level(Some(i64::from(level)))
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            options = options.unix_permissions(meta.permissions().mode() & 0o7777);
+        }
+        if member.directory {
+            writer
+                .add_directory(member.name.as_str(), options)
+                .map_err(zip_error)?;
+            continue;
+        }
+        writer
+            .start_file(member.name.as_str(), options)
+            .map_err(zip_error)?;
+        let mut input = Input {
+            path: member.path.clone(),
+            file: None,
+            done: false,
+            consumed: consumed.clone(),
+        };
+        loop {
+            let read = input.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            writer.write_all(&buffer[..read])?;
+        }
+    }
+    let mut tee = writer.finish().map_err(zip_error)?.into_inner();
+    tee.flush()?;
+    Ok(tee)
+}
+
+/// A file's modification time as a ZIP stores it: local time, clamped to the
+/// years the format holds.
+fn dos_time(meta: &std::fs::Metadata) -> zip::DateTime {
+    let secs = meta
+        .modified()
+        .ok()
+        .and_then(|time| {
+            time.duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_secs() as i64)
+                .ok()
+        })
+        .unwrap_or(0);
+    let [year, month, day, hour, minute, second] = local_civil(secs);
+    if year < 1980 {
+        return zip::DateTime::default();
+    }
+    if year > 2107 {
+        return zip::DateTime::from_date_and_time(2107, 12, 31, 23, 59, 58).unwrap_or_default();
+    }
+    zip::DateTime::from_date_and_time(
+        year as u16,
+        month as u8,
+        day as u8,
+        hour as u8,
+        minute as u8,
+        second as u8,
+    )
+    .unwrap_or_default()
+}
+
+fn zip_error(error: zip::result::ZipError) -> RarparError {
+    RarparError::Data(format!("ZIP writer: {error}"))
+}
+
 fn archive_error(error: sevenz_turbo::Error) -> RarparError {
     RarparError::Data(format!("7z writer: {error}"))
 }
@@ -899,7 +1207,7 @@ fn archive_error(error: sevenz_turbo::Error) -> RarparError {
 mod tests {
     use super::*;
 
-    fn inside(redundancy: u64) -> Plan {
+    fn inside(redundancy: u64, footers: &'static [u64]) -> Plan {
         Plan::Inside {
             params: InsideParams {
                 file_size: 0,
@@ -909,6 +1217,7 @@ mod tests {
                 redundancy,
                 repetition_limit: 0,
             },
+            footers,
         }
     }
 
@@ -916,23 +1225,31 @@ mod tests {
     /// geometry jumps back down, is covered by that window's candidates.
     #[test]
     fn candidates_cover_every_length_in_their_window() {
-        for redundancy in [0, 1, 10, 40, 250] {
-            let plan = inside(redundancy);
+        let plans = [0, 1, 10, 40, 250]
+            .map(|redundancy| (redundancy, &[0u64][..]))
+            .into_iter()
+            .chain([0, 10, 250].map(|redundancy| (redundancy, ZIP_FOOTERS)));
+        for (redundancy, footers) in plans {
+            let plan = inside(redundancy, footers);
             let mut low = 1u64 << 12;
             while low < 1 << 34 {
                 for spread in [0u64, 1, 37, 4096, low / 100, low / 3, low] {
                     let high = low + spread;
                     let candidates = plan.candidates(low, high);
                     for size in [low, low + spread / 3, low + spread / 2, high] {
-                        let geometry = plan.geometry(size);
-                        let candidate = candidates
-                            .iter()
-                            .find(|candidate| candidate.block_size == geometry.block_size)
-                            .unwrap_or_else(|| {
-                                panic!("-r{redundancy} [{low}, {high}] misses {size}")
-                            });
-                        assert!(candidate.fields.contains(&geometry.galois));
-                        assert!(candidate.rows >= geometry.rows);
+                        for &footer in footers {
+                            let geometry = plan.with_footer(footer).geometry(size);
+                            let candidate = candidates
+                                .iter()
+                                .find(|candidate| candidate.block_size == geometry.block_size)
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "-r{redundancy} footer {footer} [{low}, {high}] misses {size}"
+                                    )
+                                });
+                            assert!(candidate.fields.contains(&geometry.galois));
+                            assert!(candidate.rows >= geometry.rows);
+                        }
                     }
                 }
                 low = low * 3 / 2 + 7;
@@ -977,6 +1294,8 @@ mod tests {
             head_cap: 4096,
             buffering: true,
             lanes: Vec::new(),
+            hold: 0,
+            held: Vec::new(),
             digest: FileDigest::new(),
             len: 0,
             next_prune: 0,

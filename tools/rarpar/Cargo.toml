@@ -46,7 +46,7 @@ crypto-rust = [
     "unrar-rs?/crypto-rust",
     "sevenz-turbo?/native-crypto",
 ]
-# 7z support: one-pass archive-and-protect (`rarpar par3 archive`), PAR-inside for
+# 7z support: one-pass archive-and-protect (`rarpar par3 archive`, 7z or ZIP output), PAR-inside for
 # 7z and ZIP in the par3cmdline facade, and the 7-Zip command-line facade
 # (`7z`/`7za`/`7zz`/`7zr`, or `rarpar 7z ...`) for SABnzbd and NZBGet. The 7z
 # codec is sevenz-turbo; the PAR3 side is par3-rs. Neither depends on the
@@ -58,6 +58,7 @@ sevenz = [
     "dep:crc-fast",
     "dep:filetime",
     "dep:libc",
+    "dep:zip",
 ]
 # musl-only global allocator. The dependency is declared under a
 # `cfg(target_env = "musl")` target table, so enabling this feature is a
@@ -86,6 +87,11 @@ tempfile = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
+# ZIP output for `rarpar par3 archive --format zip`: stored or deflated
+# through flate2's zlib-rs backend, with no encryption.
+zip = { version = "8.6", default-features = false, features = [
+    "deflate-flate2-zlib-rs",
+], optional = true }
 
 # The 7-Zip facade prints local times the way 7-Zip does, through the C
 # library's time zone conversion.

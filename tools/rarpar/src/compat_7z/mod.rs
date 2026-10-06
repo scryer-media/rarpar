@@ -9,6 +9,8 @@ mod list;
 mod switches;
 mod volume;
 
+pub(crate) use format::local_civil;
+
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufRead, Write};

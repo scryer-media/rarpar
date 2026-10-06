@@ -238,7 +238,7 @@ pub struct Par3CreateArgs {
 #[cfg(feature = "sevenz")]
 #[derive(Debug, Clone, Args)]
 pub struct Par3ArchiveArgs {
-    /// Output 7z archive path.
+    /// Output archive path.
     pub output: PathBuf,
     /// Files and directories to archive, relative to --base-path (defaults to current directory).
     #[arg(required = true, num_args = 1..)]
@@ -246,13 +246,16 @@ pub struct Par3ArchiveArgs {
     /// Directory archive member names are relative to.
     #[arg(long)]
     pub base_path: Option<PathBuf>,
+    /// Archive format: 7z (LZMA2) or zip (deflate).
+    #[arg(long, value_enum, default_value_t = ArchiveFormat::SevenZ)]
+    pub format: ArchiveFormat,
     /// Compression level, 0 (stored) to 9.
     #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(0..=9))]
     pub level: u32,
-    /// Executable filter applied before compression.
+    /// Executable filter applied before compression; 7z only.
     #[arg(long, value_enum, default_value_t = ArchiveFilter::None)]
     pub filter: ArchiveFilter,
-    /// Compress every file on its own instead of as one solid block.
+    /// Compress every file on its own instead of as one solid block; 7z only.
     #[arg(long)]
     pub no_solid: bool,
     /// Append the PAR3 set inside the archive, after its end header, instead of beside it.
@@ -267,6 +270,14 @@ pub struct Par3ArchiveArgs {
     /// Recovery percentage of input blocks, rounded up; with --inside, 0 to 250, and 0 means one block.
     #[arg(short = 'r', long, conflicts_with = "recovery_count")]
     pub recovery_percent: Option<u32>,
+}
+
+#[cfg(feature = "sevenz")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ArchiveFormat {
+    #[value(name = "7z")]
+    SevenZ,
+    Zip,
 }
 
 #[cfg(feature = "sevenz")]

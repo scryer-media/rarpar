@@ -302,11 +302,18 @@ pub(super) fn unix_time_string(secs: i64) -> String {
     local_civil_string(secs)
 }
 
+/// Seconds since the Unix epoch as local `YYYY-MM-DD HH:MM:SS`.
+fn local_civil_string(secs: i64) -> String {
+    let [year, month, day, hour, minute, second] = local_civil(secs);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
+}
+
 /// Local time as 7-Zip shows it on Unix: shifted by the offset from UTC in
 /// effect now, whatever the offset was on that date (its
-/// `FileTimeToLocalFileTime` takes one offset for every time).
+/// `FileTimeToLocalFileTime` takes one offset for every time). Returns year,
+/// month, day, hour, minute and second.
 #[cfg(unix)]
-fn local_civil_string(secs: i64) -> String {
+pub(crate) fn local_civil(secs: i64) -> [i64; 6] {
     static OFFSET: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
     let offset = *OFFSET.get_or_init(|| {
         // SAFETY: `time` with a null pointer only returns the clock.
@@ -317,15 +324,15 @@ fn local_civil_string(secs: i64) -> String {
         let ok = unsafe { !libc::localtime_r(&now, &mut tm).is_null() };
         if ok { tm.tm_gmtoff as i64 } else { 0 }
     });
-    utc_civil_string(secs + offset)
+    utc_civil(secs + offset)
 }
 
 #[cfg(not(unix))]
-fn local_civil_string(secs: i64) -> String {
-    utc_civil_string(secs)
+pub(crate) fn local_civil(secs: i64) -> [i64; 6] {
+    utc_civil(secs)
 }
 
-fn utc_civil_string(secs: i64) -> String {
+fn utc_civil(secs: i64) -> [i64; 6] {
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
     // Howard Hinnant's days-to-civil.
@@ -338,12 +345,7 @@ fn utc_civil_string(secs: i64) -> String {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
-        rem / 3600,
-        (rem / 60) % 60,
-        rem % 60
-    )
+    [year, month, day, rem / 3600, (rem / 60) % 60, rem % 60]
 }
 
 /// 7-Zip's `PrintSize_bytes_Smart`: `N bytes (K KiB)`.
@@ -396,9 +398,9 @@ mod tests {
 
     #[test]
     fn utc_civil_dates() {
-        assert_eq!(utc_civil_string(0), "1970-01-01 00:00:00");
-        assert_eq!(utc_civil_string(951_782_400), "2000-02-29 00:00:00");
-        assert_eq!(utc_civil_string(-1), "1969-12-31 23:59:59");
+        assert_eq!(utc_civil(0), [1970, 1, 1, 0, 0, 0]);
+        assert_eq!(utc_civil(951_782_400), [2000, 2, 29, 0, 0, 0]);
+        assert_eq!(utc_civil(-1), [1969, 12, 31, 23, 59, 59]);
     }
 
     #[test]
