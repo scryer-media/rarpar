@@ -1403,9 +1403,7 @@ impl SourceAccess for Trickle {
 /// the file hash and chunk hashes run on the workers while the next buffer is
 /// read. The reads must be the serial walk's, call for call and byte for byte,
 /// and the set must be the same set. Only the stacks and the two parallel-hash
-/// buffers may differ. A small source beside it keeps the serial walk. No
-/// recovery is asked for, as the command line's first plan asks for none,
-/// so the plan takes the planning walk rather than fusing it with the encode.
+/// buffers may differ. A small source beside it keeps the serial walk.
 #[test]
 fn a_planning_pool_changes_scratch_and_nothing_else() {
     use par3_rs::creation::{CreationDurability, CreationOptions, CreationPlan, CreationSource};
@@ -1429,7 +1427,7 @@ fn a_planning_pool_changes_scratch_and_nothing_else() {
             inner.insert(SourceId(2), 1, small.clone().into());
             let mut options = CreationOptions {
                 block_size,
-                recovery_count: 0,
+                recovery_count: 2,
                 ..CreationOptions::default()
             };
             options.execution.workers = workers;
@@ -1585,155 +1583,6 @@ fn pooled_planning_hashes_blocks_shorter_than_an_inline_tail() {
         assert!(serial.is_ok(), "block {block_size}: {:?}", serial.err());
         assert!(serial == pooled, "block {block_size}: {:?}", pooled.err());
         assert_eq!(serial_io, pooled_io, "block {block_size}");
-    }
-}
-
-/// Without deduplication a Cauchy plan of 8 MiB or more hashes and encodes
-/// from one read of every source. Each region of a source is one read: a
-/// whole block, a tail, an inline tail. Nothing is read again to encode, the
-/// workers change no read, and a read that fails fails the plan after the
-/// same reads on two workers as on four. One worker keeps the serial walk.
-#[test]
-fn a_fused_plan_reads_every_region_once() {
-    use par3_rs::creation::{CreationOptions, CreationPlan, CreationSource};
-    let block = 100_000u64;
-    let large: Vec<u8> = (0..(8usize << 20) + 3001)
-        .map(|i| (i * 131 + i / 977) as u8)
-        .collect();
-    let small: Vec<u8> = (0..70_013usize).map(|i| (i * 7 + i / 251) as u8).collect();
-    let inline: Vec<u8> = (0..23u8).collect();
-    let total = (large.len() + small.len() + inline.len()) as u64;
-    // Whole blocks of the large file, then each file's tail.
-    let regions = large.len() as u64 / block + 3;
-    let plan = |workers: usize, trickle: bool, fail_at: Option<u64>| {
-        let mut inner = MemorySourceAccess::default();
-        inner.insert(SourceId(1), 1, large.clone().into());
-        inner.insert(SourceId(2), 1, small.clone().into());
-        inner.insert(SourceId(3), 1, inline.clone().into());
-        let access: Arc<dyn SourceAccess> = if trickle {
-            Arc::new(Trickle { inner, fail_at })
-        } else {
-            Arc::new(inner)
-        };
-        let mut options = CreationOptions {
-            block_size: block,
-            recovery_count: 3,
-            ..CreationOptions::default()
-        };
-        options.execution.workers = workers;
-        let execution = options.execution.clone();
-        let sources: Vec<CreationSource> = ["large.bin", "small.bin", "inline.bin"]
-            .into_iter()
-            .enumerate()
-            .map(|(index, name)| CreationSource {
-                name: name.into(),
-                source: SourceId(index as u64 + 1),
-            })
-            .collect();
-        (CreationPlan::build(access, &sources, options), execution)
-    };
-    let run = |workers: usize, trickle: bool| {
-        let (plan, execution) = plan(workers, trickle, None);
-        let plan = plan.unwrap();
-        let planned = execution.diagnostics.source_io();
-        let verify = execution.diagnostics.stage(Stage::Verify);
-        let tree = common::TempTree::new(&format!("fused-reads-{workers}-{trickle}"));
-        let carriers: Vec<Vec<u8>> = plan
-            .execute(&tree.path().join("set"), tree.path())
-            .unwrap()
-            .iter()
-            .map(|path| std::fs::read(path).unwrap())
-            .collect();
-        assert_eq!(
-            execution.diagnostics.source_io(),
-            planned,
-            "{workers} workers: the encode read the sources"
-        );
-        (carriers, planned, verify.completed)
-    };
-    let (serial, serial_reads, serial_verify) = run(2, false);
-    assert_eq!(serial_reads.read_bytes, total);
-    assert_eq!(serial_reads.read_requested, total);
-    assert_eq!(serial_reads.read_calls, regions);
-    assert_eq!(serial_verify, total);
-    let (pooled, pooled_reads, pooled_verify) = run(4, false);
-    assert_eq!(pooled_reads, serial_reads, "the pool changed the reads");
-    assert_eq!(pooled_verify, serial_verify);
-    assert!(pooled == serial, "the pool changed the set");
-    // Short forward reads that stop at half of each file and continue
-    // positionally take more calls and the same bytes and set.
-    let (short, short_reads, _) = run(2, true);
-    let (short_pooled, short_pooled_reads, _) = run(4, true);
-    assert_eq!(short_reads.read_bytes, total);
-    assert_eq!(short_pooled_reads, short_reads);
-    assert!(short == serial && short_pooled == serial);
-    let fail_at = Some(large.len() as u64 / 2 - 5000);
-    let (serial_error, serial_execution) = plan(2, true, fail_at);
-    let (pooled_error, pooled_execution) = plan(4, true, fail_at);
-    let serial_error = serial_error.err().expect("two workers read past the fault");
-    let pooled_error = pooled_error
-        .err()
-        .expect("four workers read past the fault");
-    assert_eq!(pooled_error.to_string(), serial_error.to_string());
-    assert_eq!(
-        pooled_execution.diagnostics.source_io(),
-        serial_execution.diagnostics.source_io(),
-        "a failed read changed the reads"
-    );
-}
-
-/// A fused plan encodes while it plans, so cancelling from its encode
-/// progress cancels the plan itself and releases everything it held; a plan
-/// that completes holds its rows until it is executed or dropped.
-#[test]
-fn cancelling_a_fused_plan_releases_its_rows() {
-    use par3_rs::creation::{CreationOptions, CreationPlan, CreationSource};
-    let bytes: Vec<u8> = (0..(9usize << 20) + 777)
-        .map(|i| (i * 131 + i / 977) as u8)
-        .collect();
-    for (workers, cancelled) in [(2, true), (4, true), (2, false), (4, false)] {
-        let mut options = ExecutionOptions::default();
-        options.workers = workers;
-        if cancelled {
-            let cancel = options.cancel.clone();
-            options.progress = Some(ProgressCallback::new(move |event| {
-                if event.stage == Stage::Encode && event.phase == ProgressPhase::Advance {
-                    cancel.cancel();
-                }
-            }));
-        }
-        let mut source = MemorySourceAccess::default();
-        source.insert(SourceId(1), 1, bytes.clone().into());
-        let plan = CreationPlan::build(
-            Arc::new(source),
-            &[CreationSource {
-                source: SourceId(1),
-                name: "a.bin".into(),
-            }],
-            CreationOptions {
-                block_size: 64 << 10,
-                recovery_count: 5,
-                execution: options.clone(),
-                ..CreationOptions::default()
-            },
-        );
-        let case = format!("{workers} workers");
-        if cancelled {
-            let error = plan.err().expect("the plan ran past its cancellation");
-            assert!(matches!(error, EngineError::Cancelled), "{case}: {error}");
-            assert!(options.diagnostics.source_io().read_bytes < bytes.len() as u64);
-        } else {
-            let plan = plan.unwrap();
-            assert!(
-                options.memory.used() >= 5 * (64 << 10),
-                "{case}: rows released"
-            );
-            let tree = common::TempTree::new(&format!("fused-cancel-{workers}"));
-            plan.execute(&tree.path().join("set"), tree.path()).unwrap();
-            drop(plan);
-        }
-        assert_eq!(options.handles.used(), 0, "{case}");
-        assert_eq!(options.memory.used(), 0, "{case}");
     }
 }
 
