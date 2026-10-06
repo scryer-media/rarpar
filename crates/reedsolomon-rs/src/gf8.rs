@@ -94,25 +94,13 @@ impl MulPlan {
         }
         // wasm has no runtime feature detection: an artifact is built with a
         // fixed `target_feature` set, so the tier is chosen here at compile
-        // time instead. relaxed-simd takes precedence over plain simd128 — it
-        // is the richer build — and a wasm build without simd128 keeps falling
-        // through to the scalar path below, exactly as it did before this tier
-        // existed. This mirrors the GF(2¹⁶) dispatch in `gf_simd`.
-        #[cfg(all(target_arch = "wasm32", target_feature = "relaxed-simd"))]
+        // time instead. A `+relaxed-simd` build takes the relaxed swizzle
+        // inside the same kernel (see `fused_wasm::swizzle`), and a wasm build
+        // without simd128 keeps falling through to the scalar path below.
+        // This mirrors the GF(2¹⁶) dispatch in `gf_simd`.
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
         {
-            // SAFETY: the kernel only exists in a simd128 build, which
-            // relaxed-simd implies, and it bounds every load and store.
-            unsafe { self.wasm_simd128::<true>(source, destination) };
-            return;
-        }
-        #[cfg(all(
-            target_arch = "wasm32",
-            target_feature = "simd128",
-            not(target_feature = "relaxed-simd")
-        ))]
-        {
-            // SAFETY: as above, for the plain-simd128 build.
-            unsafe { self.wasm_simd128::<false>(source, destination) };
+            self.wasm_simd128(source, destination);
             return;
         }
         #[allow(unreachable_code)]
@@ -767,68 +755,257 @@ impl MulPlan {
         at
     }
 
-    /// wasm simd128: 16 bytes per iteration, the same split-nibble shape the
-    /// NEON tier uses. The two 16-byte product tables are the swizzle operands,
-    /// so one `i8x16.swizzle` per nibble replaces sixteen table indexings.
-    ///
-    /// Two flavors share one body through the `lookup!` macro parameter, as in
-    /// the GF(2¹⁶) kernel in `gf_simd`:
-    ///
-    /// * `i8x16_swizzle` (simd128) clears a lane whose index is out of range,
-    ///   which never happens here: the low index is masked to 0..=15 and the
-    ///   high index is a logical shift right by four.
-    /// * `i8x16_relaxed_swizzle` (relaxed-simd) produces the same bytes; it
-    ///   only drops the lane clamp the plain form must emit on x86 hosts.
+    /// wasm simd128: the split-nibble shape the NEON tier uses. The two
+    /// 16-byte product tables are the swizzle operands, so one
+    /// `i8x16.swizzle` per nibble replaces sixteen table indexings; see
+    /// [`fused_wasm::swizzle`] for the relaxed-simd flavour and
+    /// [`fused_wasm::UNROLL`] for the block shape.
     ///
     /// Dispatch is compile-time — see `accumulate` — so this function exists
     /// only in a `+simd128` build.
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    unsafe fn wasm_simd128<const RELAXED: bool>(&self, source: &[u8], destination: &mut [u8]) {
-        use core::arch::wasm32::*;
+    pub(crate) fn wasm_simd128(&self, source: &[u8], destination: &mut [u8]) {
+        assert_eq!(source.len(), destination.len());
+        let t = fused_wasm::tables(self);
+        let (from, to) = (source.as_ptr(), destination.as_mut_ptr());
+        // SAFETY: `drive!` hands each block an offset with `U` whole vectors
+        // of both equally long slices from it.
+        let at = fused_wasm::drive!(source.len(), 16, |at, U| unsafe {
+            fused_wasm::accumulate::<U>(&t, from.add(at), to.add(at))
+        });
+        self.scalar(&source[at..], &mut destination[at..]);
+    }
 
-        // `i8x16_relaxed_swizzle` is only defined when relaxed-simd is enabled,
-        // so without it the `RELAXED` arm is compiled out entirely.
-        macro_rules! lookup {
-            ($table:expr, $index:expr) => {{
-                #[cfg(target_feature = "relaxed-simd")]
-                {
-                    if RELAXED {
-                        i8x16_relaxed_swizzle($table, $index)
-                    } else {
-                        i8x16_swizzle($table, $index)
-                    }
-                }
-                #[cfg(not(target_feature = "relaxed-simd"))]
-                {
-                    let _ = RELAXED;
-                    i8x16_swizzle($table, $index)
-                }
-            }};
-        }
+    /// [`Self::butterfly_scalar`] on wasm simd128; returns the bytes
+    /// processed. Rows must have equal lengths.
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    pub(crate) fn butterfly_wasm<const INVERSE: bool>(
+        &self,
+        left: &mut [u8],
+        right: &mut [u8],
+    ) -> usize {
+        assert_eq!(left.len(), right.len());
+        let t = fused_wasm::tables(self);
+        let (l, r) = (left.as_mut_ptr(), right.as_mut_ptr());
+        // SAFETY: as in `wasm_simd128`, for two distinct rows.
+        fused_wasm::drive!(left.len(), 16, |at, U| unsafe {
+            fused_wasm::butterfly::<INVERSE, U>(&t, l.add(at), r.add(at))
+        })
+    }
 
-        // SAFETY: the caller established equal lengths. The loop stops before a
-        // 16-byte load or store could cross either slice, and each table load
-        // spans exactly the sixteen bytes of its array.
-        unsafe {
-            let low = v128_load(self.low.as_ptr() as *const v128);
-            let high = v128_load(self.high.as_ptr() as *const v128);
-            let mask = u8x16_splat(15);
-            let mut at = 0;
-            while source.len() - at >= 16 {
-                let value = v128_load(source.as_ptr().add(at) as *const v128);
-                let product = v128_xor(
-                    lookup!(low, v128_and(value, mask)),
-                    lookup!(high, u8x16_shr(value, 4)),
-                );
-                let previous = v128_load(destination.as_ptr().add(at) as *const v128);
-                v128_store(
-                    destination.as_mut_ptr().add(at) as *mut v128,
-                    v128_xor(previous, product),
-                );
-                at += 16;
+    /// [`Self::radix4_scalar`] on wasm simd128; returns the bytes processed.
+    /// All four rows must have equal lengths.
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    pub(crate) fn radix4_wasm<const INVERSE: bool>(
+        plans: [&Self; 3],
+        rows: [&mut [u8]; 4],
+    ) -> usize {
+        let tables = plans.map(fused_wasm::tables);
+        let width = rows[0].len();
+        assert!(rows.iter().all(|row| row.len() == width));
+        let rows = rows.map(<[u8]>::as_mut_ptr);
+        // SAFETY: as in `wasm_simd128`, for four distinct rows.
+        fused_wasm::drive!(width, 16, |at, U| unsafe {
+            fused_wasm::radix4::<INVERSE, U>(&tables, rows.map(|row| row.add(at)))
+        })
+    }
+
+    /// [`Self::map_scalar`] on wasm simd128; returns the bytes processed.
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    pub(crate) fn map_wasm(&self, row: &mut [u8]) -> usize {
+        let t = fused_wasm::tables(self);
+        let pointer = row.as_mut_ptr();
+        // SAFETY: as in `wasm_simd128`, for one row rewritten in place.
+        fused_wasm::drive!(row.len(), 16, |at, U| unsafe {
+            fused_wasm::map_block::<U>(&t, pointer.add(at))
+        })
+    }
+}
+
+/// Table registers, the split-nibble map and the block kernels of the wasm
+/// simd128 tier. Compile-time selected: the module exists only in a
+/// `+simd128` build.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+pub(crate) mod fused_wasm {
+    use super::MulPlan;
+    use core::arch::wasm32::*;
+
+    /// Vectors per block. Every kernel loads a whole block, maps it, then
+    /// stores it, so the work of one vector never waits on the stores of
+    /// the one before. Measured under wasmtime on an Apple M5 Max, the
+    /// fused 8-bit butterfly runs 27 GiB/s one vector at a time and 40 at
+    /// two; the other kernels gain less or hold, except the 16-bit radix-4,
+    /// whose 24 table vectors leave no room for a second block: it runs 16
+    /// GiB/s one block at a time and 12 at two, so it passes 1.
+    pub(crate) const UNROLL: usize = 2;
+
+    /// Run `$body` over `$len` bytes in blocks of `$unroll` (by default
+    /// [`UNROLL`]) vectors of `$vector` bytes, then single vectors, with
+    /// `$at` the block's offset and `$u` a `const` holding its vector count;
+    /// evaluates to the bytes done, a multiple of `$vector`.
+    macro_rules! drive {
+        ($len:expr, $vector:expr, |$at:ident, $u:ident| $body:expr) => {
+            $crate::gf8::fused_wasm::drive!(
+                $len,
+                $vector,
+                $crate::gf8::fused_wasm::UNROLL,
+                |$at, $u| $body
+            )
+        };
+        ($len:expr, $vector:expr, $unroll:expr, |$at:ident, $u:ident| $body:expr) => {{
+            let len: usize = $len;
+            let mut $at = 0usize;
+            {
+                const $u: usize = $unroll;
+                while len - $at >= $u * $vector {
+                    $body;
+                    $at += $u * $vector;
+                }
             }
-            self.scalar(&source[at..], &mut destination[at..]);
+            {
+                const $u: usize = 1;
+                while len - $at >= $vector {
+                    $body;
+                    $at += $vector;
+                }
+            }
+            $at
+        }};
+    }
+    pub(crate) use drive;
+
+    /// One 16-entry table lookup. Every caller masks or shifts its indices
+    /// into 0..=15, where `i8x16.swizzle` and `i8x16.relaxed_swizzle` agree
+    /// exactly; the relaxed form only drops the lane clamp the plain form
+    /// must emit on x86 hosts, so a `+relaxed-simd` build takes it.
+    #[inline(always)]
+    pub(crate) fn swizzle(table: v128, index: v128) -> v128 {
+        #[cfg(target_feature = "relaxed-simd")]
+        {
+            i8x16_relaxed_swizzle(table, index)
         }
+        #[cfg(not(target_feature = "relaxed-simd"))]
+        {
+            i8x16_swizzle(table, index)
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn tables(plan: &MulPlan) -> (v128, v128) {
+        // SAFETY: each load reads exactly one 16-byte table.
+        unsafe {
+            (
+                v128_load(plan.low.as_ptr().cast()),
+                v128_load(plan.high.as_ptr().cast()),
+            )
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn map(tables: &(v128, v128), value: v128) -> v128 {
+        v128_xor(
+            swizzle(tables.0, v128_and(value, u8x16_splat(15))),
+            swizzle(tables.1, u8x16_shr(value, 4)),
+        )
+    }
+
+    /// # Safety
+    /// `at` must address `16 * U` readable bytes.
+    #[inline(always)]
+    unsafe fn load<const U: usize>(at: *const u8) -> [v128; U] {
+        // SAFETY: the caller's bound; wasm loads have no alignment requirement.
+        std::array::from_fn(|k| unsafe { v128_load(at.add(16 * k).cast()) })
+    }
+
+    /// # Safety
+    /// `at` must address `16 * U` writable bytes.
+    #[inline(always)]
+    unsafe fn store<const U: usize>(at: *mut u8, value: [v128; U]) {
+        for (k, value) in value.into_iter().enumerate() {
+            // SAFETY: the caller's bound.
+            unsafe { v128_store(at.add(16 * k).cast(), value) };
+        }
+    }
+
+    /// # Safety
+    /// Both pointers must address `16 * U` bytes, readable and writable
+    /// respectively, and must not overlap.
+    #[inline(always)]
+    pub(super) unsafe fn accumulate<const U: usize>(
+        tables: &(v128, v128),
+        source: *const u8,
+        destination: *mut u8,
+    ) {
+        // SAFETY: the caller's bounds.
+        unsafe {
+            let value = load::<U>(source);
+            let mut sum = load::<U>(destination);
+            for k in 0..U {
+                sum[k] = v128_xor(sum[k], map(tables, value[k]));
+            }
+            store(destination, sum);
+        }
+    }
+
+    /// # Safety
+    /// Both pointers must address `16 * U` writable bytes and must not
+    /// overlap.
+    #[inline(always)]
+    pub(super) unsafe fn butterfly<const INVERSE: bool, const U: usize>(
+        tables: &(v128, v128),
+        left: *mut u8,
+        right: *mut u8,
+    ) {
+        // SAFETY: the caller's bounds.
+        unsafe {
+            let (mut l, mut r) = (load::<U>(left), load::<U>(right));
+            for k in 0..U {
+                let (mut x, mut y) = (l[k], r[k]);
+                crate::gf_simd::fused_butterfly!(INVERSE, x, y, tables, v128_xor, map);
+                (l[k], r[k]) = (x, y);
+            }
+            store(left, l);
+            store(right, r);
+        }
+    }
+
+    /// # Safety
+    /// Every pointer must address `16 * U` writable bytes; no two overlap.
+    #[inline(always)]
+    pub(super) unsafe fn radix4<const INVERSE: bool, const U: usize>(
+        tables: &[(v128, v128); 3],
+        rows: [*mut u8; 4],
+    ) {
+        let [outer, inner_a, inner_b] = tables;
+        // SAFETY: the caller's bounds.
+        let mut values = rows.map(|row| unsafe { load::<U>(row) });
+        for k in 0..U {
+            let [mut a, mut b, mut c, mut d] = values.map(|row| row[k]);
+            crate::gf_simd::fused_radix4!(
+                INVERSE,
+                [a, b, c, d],
+                outer,
+                inner_a,
+                inner_b,
+                v128_xor,
+                map
+            );
+            for (row, value) in values.iter_mut().zip([a, b, c, d]) {
+                row[k] = value;
+            }
+        }
+        for (row, value) in rows.into_iter().zip(values) {
+            // SAFETY: the caller's bounds.
+            unsafe { store(row, value) };
+        }
+    }
+
+    /// # Safety
+    /// `row` must address `16 * U` writable bytes.
+    #[inline(always)]
+    pub(super) unsafe fn map_block<const U: usize>(tables: &(v128, v128), row: *mut u8) {
+        // SAFETY: the caller's bound.
+        unsafe { store(row, load::<U>(row).map(|value| map(tables, value))) };
     }
 }
 
@@ -1046,6 +1223,10 @@ pub fn mul_acc_input_batch(destination: &mut [u8], inputs: &[PlanSrc<'_>]) {
         unsafe { batch_neon(destination, inputs) };
         return;
     }
+    // wasm simd128 folds source by source through the unrolled
+    // `MulPlan::accumulate`: under wasmtime on an Apple M5 Max a grouped
+    // kernel ties it at 64 KiB and loses a third at 1 MiB and above with
+    // sixteen sources, so `input_batch_width` stays 1 there.
     #[allow(unreachable_code)]
     for input in inputs {
         input.plan.accumulate(input.src, destination);
@@ -1457,6 +1638,79 @@ mod tests {
                         // SAFETY: NEON was detected; equal lengths.
                         unsafe { batch_neon(&mut actual, &inputs) };
                         assert_eq!(actual, expected, "neon, {what}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The wasm simd128 fused kernels against the scalar tier for every
+    /// factor (0 and 1 included), at lengths either side of the 16-byte
+    /// vector and unaligned starts: map, butterfly both ways, and radix-4
+    /// both ways with three distinct plans.
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    #[test]
+    fn wasm_fused_kernels_match_the_scalar_tier_for_every_factor() {
+        let source: Vec<u8> = (0..4 * 1100u32)
+            .map(|i| (i * 167 + i / 256) as u8)
+            .collect();
+        for factor in 0..=255u8 {
+            let plans = [
+                MulPlan::new(factor),
+                MulPlan::new(factor.wrapping_mul(7) ^ 1),
+                MulPlan::new(factor.wrapping_add(91)),
+            ];
+            let plan = &plans[0];
+            for offset in [0usize, 1, 3] {
+                for length in [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 257] {
+                    let what = format!("factor {factor}, offset {offset}, length {length}");
+                    let rows: [Vec<u8>; 4] = std::array::from_fn(|row| {
+                        let start = row * 1100 + offset;
+                        source[start..start + length].to_vec()
+                    });
+
+                    let (mut actual, mut expected) = (rows[0].clone(), rows[0].clone());
+                    let done = plan.map_wasm(&mut actual);
+                    plan.map_scalar(&mut actual[done..]);
+                    plan.map_scalar(&mut expected);
+                    assert_eq!(actual, expected, "map, {what}");
+
+                    for inverse in [false, true] {
+                        let (mut l, mut r) = (rows[0].clone(), rows[1].clone());
+                        let (mut el, mut er) = (l.clone(), r.clone());
+                        let done = if inverse {
+                            plan.butterfly_wasm::<true>(&mut l, &mut r)
+                        } else {
+                            plan.butterfly_wasm::<false>(&mut l, &mut r)
+                        };
+                        if inverse {
+                            plan.butterfly_scalar::<true>(&mut l[done..], &mut r[done..]);
+                            plan.butterfly_scalar::<true>(&mut el, &mut er);
+                        } else {
+                            plan.butterfly_scalar::<false>(&mut l[done..], &mut r[done..]);
+                            plan.butterfly_scalar::<false>(&mut el, &mut er);
+                        }
+                        assert_eq!((l, r), (el, er), "butterfly inverse {inverse}, {what}");
+
+                        let mut actual = rows.clone();
+                        let mut expected = rows.clone();
+                        let refs = [&plans[0], &plans[1], &plans[2]];
+                        let [a, b, c, d] = actual.each_mut().map(Vec::as_mut_slice);
+                        let done = if inverse {
+                            MulPlan::radix4_wasm::<true>(refs, [a, b, c, d])
+                        } else {
+                            MulPlan::radix4_wasm::<false>(refs, [a, b, c, d])
+                        };
+                        let [a, b, c, d] = actual.each_mut().map(|row| &mut row[done..]);
+                        let [w, x, y, z] = expected.each_mut().map(Vec::as_mut_slice);
+                        if inverse {
+                            MulPlan::radix4_scalar::<true>(refs, [a, b, c, d]);
+                            MulPlan::radix4_scalar::<true>(refs, [w, x, y, z]);
+                        } else {
+                            MulPlan::radix4_scalar::<false>(refs, [a, b, c, d]);
+                            MulPlan::radix4_scalar::<false>(refs, [w, x, y, z]);
+                        }
+                        assert_eq!(actual, expected, "radix-4 inverse {inverse}, {what}");
                     }
                 }
             }

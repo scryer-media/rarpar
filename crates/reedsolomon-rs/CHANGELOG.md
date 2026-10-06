@@ -136,6 +136,28 @@
   bytes on a little-endian target, where a symbol's little-endian pair is
   its own representation, so a caller can read the on-disk layout into and
   write it from the row itself; `None` elsewhere.
+- A wasm simd128 tier for `LinearMap8` and `LinearMap16`: multiply-accumulate,
+  map, fused butterfly and fused radix-4 run as `i8x16.swizzle` nibble
+  lookups, with byte planes split by two shuffles on the 16-bit lane. It is
+  compiled only into a `+simd128` build (wasm has no runtime detection), and
+  a `+relaxed-simd` build takes `i8x16.relaxed_swizzle` in the same kernels.
+  `LinearKernel` still reports `Scalar` on wasm; the new
+  `gf_simd::linear_uses_wasm_simd128` says whether the tier is in use. Output
+  is bit-identical to the scalar oracle.
+- The GF(2^16) wasm kernel covers all sixteen symbols of each 32-byte step
+  instead of eight, and the GF(2^8) wasm kernels load, map and store two
+  vectors per step. The 16-bit radix-4 keeps one block per step, where two
+  were slower. The grouped GF(2^8) batch stays source by source on wasm: a
+  grouped wasm kernel tied at 64 KiB and lost a third at 1 MiB and above.
+  Single-thread GiB/s at 64 KiB under wasmtime on an Apple M5 Max (the only
+  wasm host measured), previous simd128 build → this one: `gf16
+  mul_acc_region` 11.1 → 19.4, `gf8 mul_acc_region` 31.7 → 40.9,
+  `LinearMap8` accumulate 1.6 → 41.7, `LinearMap16` accumulate 0.8 → 19.3,
+  8-bit map 1.9 → 46.3, 16-bit map 0.8 → 22.7, 8-bit butterfly 3.6 → 37.8,
+  8-bit radix-4 1.2 → 34.5, 16-bit butterfly 1.7 → 32.5, 16-bit radix-4
+  1.3 → 18.0.
+- `kernel_ceiling` builds and runs on wasm32-wasip1 and gains rows for the
+  linear-map accumulate, map, butterfly and radix-4 kernels on both lanes.
 
 ## 0.4.7
 
