@@ -694,11 +694,14 @@ fn the_syndrome_group_changes_scratch_and_nothing_else() {
         let narrow = full(high + 4096, workers).unwrap();
         let (narrow_admission, wide_admission) =
             (narrow.diagnostics.admission(), wide.diagnostics.admission());
-        // Both outputs were already compared with the input.
+        // Both outputs were already compared with the input. With workers the
+        // roomy repair also holds a second set of sixteen to read ahead into;
+        // a serial one never does.
         if narrow_admission.output_tile == wide_admission.output_tile {
+            let read_ahead = if workers > 1 { 16 } else { 0 };
             assert_eq!(
                 scratch(&wide) - scratch(&narrow),
-                15 * stripe as u64,
+                (15 + read_ahead) * stripe as u64,
                 "{workers} workers: the roomy fold was not sixteen stripes wide"
             );
         }
@@ -711,6 +714,88 @@ fn the_syndrome_group_changes_scratch_and_nothing_else() {
         assert_eq!(narrow_io.write_calls, wide_io.write_calls, "{workers}");
         assert_eq!(narrow_io.write_bytes, wide_io.write_bytes, "{workers}");
     }
+}
+
+/// With a pool, the calling thread reads the next group of surviving stripes
+/// into a second set while the workers fold the last one. That set is taken
+/// only from budget left after the first and the slack, so a budget exactly as
+/// large as the roomy repair's peak keeps the sixteen-stripe group and drops
+/// the second set. Reading ahead or not, the repaired bytes, the reads, their
+/// order-sensitive checks and the writes must be the same.
+#[test]
+fn reading_ahead_changes_scratch_and_nothing_else() {
+    let (blocks, block_size, recovery) = (48usize, 64u64 << 10, 16u64);
+    let stripe = block_size as usize;
+    let tree = common::TempTree::new("read-ahead");
+    let set = common::cauchy_block_set(blocks, block_size, recovery, b"PAR3 read ahead", &tree);
+    let (name, bytes) = set.contents[0].clone();
+    let mut damaged = bytes.clone();
+    for lost in 0..recovery as usize {
+        damaged[(lost * 3 + 1) * stripe + 11] ^= 0x80;
+    }
+    let scanning = ExecutionOptions::default();
+    let carriers: Vec<_> = set
+        .paths
+        .iter()
+        .flat_map(|path| common::scanned_packets(std::fs::read(path).unwrap(), &scanning))
+        .collect();
+    let repair = |budget: usize| -> ExecutionOptions {
+        let mut access = MemorySourceAccess::default();
+        access.insert(SourceId(1), 2, damaged.clone().into());
+        let mut options = ExecutionOptions::default();
+        options.workers = 4;
+        options.stripe_bytes = stripe;
+        options.memory = MemoryBudget::new(budget);
+        let mut session =
+            Par3RepairSession::new(set.id, Arc::new(access), options.clone()).unwrap();
+        session.bind_file(&name, SourceId(1)).unwrap();
+        for packet in &carriers {
+            session.merge(packet.clone()).unwrap();
+        }
+        assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
+        let output = common::TempTree::new("read-ahead-out");
+        let report = session.repair(output.path(), false).unwrap();
+        assert_eq!(report.reconstructed_blocks, recovery);
+        assert!(
+            std::fs::read(output.path().join(&name)).unwrap() == bytes,
+            "{budget}: the repair did not reproduce the input"
+        );
+        drop(session);
+        assert_eq!(options.memory.used(), 0, "the session leaked");
+        options
+    };
+    let scratch = |options: &ExecutionOptions| {
+        options
+            .diagnostics
+            .memory()
+            .unwrap()
+            .category(MemoryCategory::CodecScratch)
+            .peak
+    };
+    let ahead = repair(32 << 20);
+    let alternating = repair(ahead.memory.peak());
+    let (ahead_admission, alternating_admission) = (
+        ahead.diagnostics.admission(),
+        alternating.diagnostics.admission(),
+    );
+    assert_eq!(ahead_admission.stripe_bytes, stripe as u64);
+    assert_eq!(ahead_admission, alternating_admission);
+    assert!(ahead_admission.workers > 1, "the roomy repair had no pool");
+    assert_eq!(
+        scratch(&ahead) - scratch(&alternating),
+        16 * stripe as u64,
+        "the tighter repair should keep its group and drop only the second set"
+    );
+    assert_eq!(
+        ahead.diagnostics.source_io(),
+        alternating.diagnostics.source_io(),
+        "reading ahead changed the reads"
+    );
+    assert_eq!(
+        ahead.diagnostics.file_io(),
+        alternating.diagnostics.file_io(),
+        "reading ahead changed the staged file I/O"
+    );
 }
 
 /// PR #73 finding 10. Successive stripe passes walk disjoint slices of every

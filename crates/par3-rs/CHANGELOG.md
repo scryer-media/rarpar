@@ -94,6 +94,13 @@
   every I/O count are unchanged. 1 GiB, 100 rows: create 23% fewer cycles at
   one worker and 2.7× faster at eight; repair 2× faster at eight workers with
   a third of the CPU.
+- With a worker pool, Cauchy repair reads and scatters the next group of
+  surviving stripes while the workers fold the previous one, and adds the
+  recovery rows to their syndromes in parallel. The second set of stripes is
+  taken only from spare budget beyond the slack; reads, writes and
+  source-change checks keep their order and counts on the calling thread,
+  and one worker runs the unchanged alternating walk. Decode on 1 GiB with
+  50 lost blocks: 1.06 → 0.62 s at four workers, flat CPU.
 - Carrier regeneration reads each source stripe once per group of recovery
   rows the memory budget admits, instead of once per row.
 - Recovery rows that fit the memory budget alongside the codec stay resident
