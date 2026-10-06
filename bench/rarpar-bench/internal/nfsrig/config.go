@@ -28,6 +28,12 @@ const (
 	MountAsync = "/na"
 	MountSync  = "/ns"
 	LocalWork  = "/w"
+	// LocalExt4 is where the client mounts an ext4 image when RIG_EXT4 asks
+	// for one: a local filesystem without file clones, so a repair's
+	// no-clone path runs without the network. The image lives in the cache
+	// volume and is made afresh for every run.
+	LocalExt4 = "/e"
+	Ext4Image = "/cache/ext4/target.img"
 	// Cache holds the cargo home, the target directory and the reference
 	// build across runs; Source is the read-only repository; Results is the
 	// host's evidence directory.
