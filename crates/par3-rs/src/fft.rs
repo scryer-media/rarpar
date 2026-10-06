@@ -297,10 +297,27 @@ trait Lane: Copy + Default + Send + Sync + std::ops::BitXorAssign + 'static {
         backend: LinearBackend,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), TransformError>;
+    /// [`Self::unpack`] then [`Self::scale`], in one pass where the field
+    /// allows it.
+    fn unpack_scaled(
+        field: &TransformField,
+        unit: usize,
+        bytes: &[u8],
+        row: &mut [Self],
+        factor: u16,
+        backend: LinearBackend,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError>;
     fn derivative(
         field: &TransformField,
         rows: &mut [Vec<Self>],
         cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError>;
+    fn derivative_in_pool(
+        field: &TransformField,
+        rows: &mut [Vec<Self>],
+        pool: &rayon::ThreadPool,
+        cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<(), TransformError>;
 }
 
@@ -359,12 +376,36 @@ impl Lane for u16 {
     ) -> Result<(), TransformError> {
         field.scale_with_backend(row, factor, backend, cancelled)
     }
+    fn unpack_scaled(
+        field: &TransformField,
+        unit: usize,
+        bytes: &[u8],
+        row: &mut [Self],
+        factor: u16,
+        backend: LinearBackend,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError> {
+        if unit == 2 {
+            field.scale_le_bytes_with_backend(bytes, row, factor, backend, cancelled)
+        } else {
+            unpack(unit, bytes, row);
+            field.scale_with_backend(row, factor, backend, cancelled)
+        }
+    }
     fn derivative(
         field: &TransformField,
         rows: &mut [Vec<Self>],
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), TransformError> {
         field.derivative(rows, cancelled)
+    }
+    fn derivative_in_pool(
+        field: &TransformField,
+        rows: &mut [Vec<Self>],
+        pool: &rayon::ThreadPool,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError> {
+        field.derivative_in_pool(rows, pool, cancelled)
     }
 }
 
@@ -424,12 +465,31 @@ impl Lane for u8 {
     ) -> Result<(), TransformError> {
         field.scale_u8_with_backend(row, factor, backend, cancelled)
     }
+    fn unpack_scaled(
+        _: &TransformField,
+        _: usize,
+        _: &[u8],
+        _: &mut [Self],
+        _: u16,
+        _: LinearBackend,
+        _: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError> {
+        unreachable!("byte rows are read directly")
+    }
     fn derivative(
         field: &TransformField,
         rows: &mut [Vec<Self>],
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), TransformError> {
         field.derivative_u8(rows, cancelled)
+    }
+    fn derivative_in_pool(
+        field: &TransformField,
+        rows: &mut [Vec<Self>],
+        pool: &rayon::ThreadPool,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError> {
+        field.derivative_u8_in_pool(rows, pool, cancelled)
     }
 }
 
@@ -697,6 +757,9 @@ impl FftCodec {
 
     /// Encode a compatible recovery range. Input and output callbacks receive
     /// positioned byte stripes; neither whole input nor recovery blocks are kept.
+    /// The input callback must fill every byte of the stripe it is handed,
+    /// zeros past the end of a short input included: the stripe is not
+    /// cleared beforehand.
     pub fn encode(
         &self,
         block_size: u64,
@@ -748,30 +811,38 @@ impl FftCodec {
         // The last chunk's rows past the final input are zero.
         let tail = g.inputs % g.capacity;
         let tail: Vec<bool> = (0..g.capacity).map(|at| tail != 0 && at >= tail).collect();
+        let unit = g.field_bytes();
         let mut offset = 0;
         while offset < block_size {
             self.options.cancel.check()?;
             let take = (block_size - offset).min(stripe as u64) as usize;
-            for row in &mut sum {
-                row.fill(L::default());
-            }
+            // Symbols holding stripe bytes; the read fills those bytes, so
+            // only the symbols past them are cleared.
+            let used = take.div_ceil(unit);
             for base in (0..g.inputs).step_by(g.capacity) {
-                for (at, row) in work.iter_mut().enumerate() {
+                // The first chunk is transformed in the sum rows themselves,
+                // which therefore need no clearing and no addition.
+                let rows = if base == 0 { &mut sum } else { &mut work };
+                for (at, row) in rows.iter_mut().enumerate() {
                     self.options.cancel.check()?;
-                    row.fill(L::default());
                     if base + at >= g.inputs {
+                        row.fill(L::default());
                         continue;
                     }
                     if let Some(row) = L::direct(row) {
                         read(base + at, offset, &mut row[..take])?;
                     } else {
-                        bytes.fill(0);
                         read(base + at, offset, &mut bytes[..take])?;
-                        L::unpack(g.field_bytes(), &bytes, row);
+                        bytes[take..used * unit].fill(0);
+                        L::unpack(unit, &bytes[..used * unit], &mut row[..used]);
                     }
+                    row[used..].fill(L::default());
                 }
                 let zero = (base + g.capacity > g.inputs).then_some(tail.as_slice());
-                self.transform(&mut work, zero, g.capacity + base, true)?;
+                self.transform(rows, zero, g.capacity + base, true)?;
+                if base == 0 {
+                    continue;
+                }
                 for (to, from) in sum.iter_mut().zip(&work) {
                     for (to, from) in to.iter_mut().zip(from) {
                         *to ^= *from;
@@ -796,6 +867,8 @@ impl FftCodec {
 
     /// Recover missing original rows using precisely the admitted recovery
     /// indices. Unused transform positions are authenticated geometry padding.
+    /// As for [`Self::encode`], the input callback must fill every byte of
+    /// the stripe it is handed.
     pub fn decode(
         &self,
         block_size: u64,
@@ -873,14 +946,20 @@ impl FftCodec {
         let zero: Vec<bool> = (0..g.domain)
             .map(|index| erased[index] || index >= g.capacity + g.inputs)
             .collect();
+        let unit = g.field_bytes();
+        let backend = self.options.fft_backend;
         let mut offset = 0;
         while offset < block_size {
             self.options.cancel.check()?;
             let take = (block_size - offset).min(stripe as u64) as usize;
+            // Symbols holding stripe bytes; the read fills those bytes, so
+            // only the symbols past them are cleared, and each symbol is
+            // scaled as it is loaded.
+            let used = take.div_ceil(unit);
             for (index, row) in rows.iter_mut().enumerate() {
                 self.options.cancel.check()?;
-                row.fill(L::default());
                 if zero[index] {
+                    row.fill(L::default());
                     continue;
                 }
                 let source = if index < g.capacity {
@@ -888,24 +967,35 @@ impl FftCodec {
                 } else {
                     FftInput::Original(index - g.capacity)
                 };
-                if let Some(row) = L::direct(row) {
-                    read(source, offset, &mut row[..take])?;
+                let factor = factors[index];
+                if let Some(direct) = L::direct(row) {
+                    read(source, offset, &mut direct[..take])?;
+                    L::scale(field, &mut row[..used], factor, backend, &cancelled)
                 } else {
-                    bytes.fill(0);
                     read(source, offset, &mut bytes[..take])?;
-                    L::unpack(g.field_bytes(), &bytes, row);
+                    bytes[take..used * unit].fill(0);
+                    let packed = &bytes[..used * unit];
+                    L::unpack_scaled(
+                        field,
+                        unit,
+                        packed,
+                        &mut row[..used],
+                        factor,
+                        backend,
+                        &cancelled,
+                    )
                 }
-                L::scale(
-                    field,
-                    row,
-                    factors[index],
-                    self.options.fft_backend,
-                    &cancelled,
-                )
                 .map_err(transform_error)?;
+                row[used..].fill(L::default());
             }
             self.transform(&mut rows, Some(&zero), 0, true)?;
-            L::derivative(field, &mut rows, &cancelled).map_err(transform_error)?;
+            match &self.workers {
+                Some(workers) => {
+                    L::derivative_in_pool(field, &mut rows, workers.pool(), &cancelled)
+                }
+                None => L::derivative(field, &mut rows, &cancelled),
+            }
+            .map_err(transform_error)?;
             self.transform_forward(&mut rows, &mut plan)?;
             for &index in lost {
                 let factor = field

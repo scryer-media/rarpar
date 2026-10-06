@@ -42,6 +42,14 @@
   calls. The transform uses fused radix-4 butterflies and skips butterflies
   over rows the layout knows are zero (padding past the inputs, erased rows).
   Carriers and repaired bytes are identical.
+- **Behaviour change:** `fft::FftCodec::encode` and `decode` no longer zero a
+  stripe before handing it to the input callback; the callback must fill every
+  byte of the slice it is given, as every in-crate caller already did. Decode
+  reads, unpacks and scales each row in one pass and clears only the part of
+  a row past the read; encode transforms the first chunk directly in the sum
+  rows. The formal derivative stores each row once and splits its columns
+  across the worker pool. Decode codec time falls 8–22% at one to eight
+  workers on both fields; carriers and repaired bytes are identical.
 
 ## 0.4.3
 

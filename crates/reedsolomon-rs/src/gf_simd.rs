@@ -277,6 +277,22 @@ impl LinearMap8 {
             ],
         );
     }
+
+    /// [`LinearMap16::map_in_place`] on byte rows.
+    pub(crate) fn map_in_place(&self, row: &mut [u8]) {
+        let done = match self.kernel {
+            // SAFETY (all three): the kernel's ISA was detected when the map
+            // was built, and each kernel bounds its loads and stores by the row.
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            LinearKernel::Neon => unsafe { self.plan.map_neon(row) },
+            #[cfg(target_arch = "x86_64")]
+            LinearKernel::Avx2 => unsafe { self.plan.map_avx2(row) },
+            #[cfg(target_arch = "x86_64")]
+            LinearKernel::Ssse3 => unsafe { self.plan.map_ssse3(row) },
+            _ => 0,
+        };
+        self.plan.map_scalar(&mut row[done..]);
+    }
 }
 
 /// One additive-FFT butterfly on the values `$l` and `$r` with the prepared
@@ -441,6 +457,77 @@ impl LinearMap16 {
             (a[at], b[at], c[at], d[at]) = (w, x, y, z);
         }
     }
+
+    /// Replace every symbol of `row` by its image, each loaded and stored
+    /// once: the symbols [`Self::accumulate`] leaves in a zeroed destination,
+    /// without a second buffer.
+    pub(crate) fn map_in_place(&self, row: &mut [u16]) {
+        let pointer = row.as_mut_ptr().cast::<u8>();
+        // SAFETY: the row's own storage, read and rewritten in place.
+        let done = unsafe { self.map_prefix(pointer, pointer, row.len()) };
+        for value in &mut row[done..] {
+            *value = self.apply(*value);
+        }
+    }
+
+    /// Store the image of each symbol held as a little-endian pair in
+    /// `source` into `destination`, each loaded and stored once: unpacking
+    /// and mapping in one pass. `source` holds two bytes per symbol.
+    pub(crate) fn map_le_bytes(&self, source: &[u8], destination: &mut [u16]) {
+        assert_eq!(source.len(), destination.len() * 2);
+        // SAFETY: distinct slices of the asserted lengths. The vector prefix
+        // exists only on little-endian targets, where a symbol's pair is its
+        // in-memory representation.
+        let done = unsafe {
+            self.map_prefix(
+                source.as_ptr(),
+                destination.as_mut_ptr().cast(),
+                destination.len(),
+            )
+        };
+        for (to, from) in destination[done..]
+            .iter_mut()
+            .zip(source[done * 2..].chunks_exact(2))
+        {
+            *to = self.apply(u16::from_le_bytes([from[0], from[1]]));
+        }
+    }
+
+    /// Map the vector-sized prefix of `symbols` symbols from `source` to
+    /// `destination`; returns the symbols done. Scalar kernels do none.
+    ///
+    /// # Safety
+    /// Both pointers must address `2 * symbols` bytes, readable and writable
+    /// respectively, and be either equal or non-overlapping.
+    unsafe fn map_prefix(&self, source: *const u8, destination: *mut u8, symbols: usize) -> usize {
+        #[cfg(any(
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_endian = "little")
+        ))]
+        if self.kernel != LinearKernel::Scalar {
+            let bytes = symbols * 2;
+            // SAFETY: the caller's bounds; only the detected ISA is invoked.
+            return unsafe {
+                match self.kernel {
+                    #[cfg(target_arch = "x86_64")]
+                    LinearKernel::Avx2 => {
+                        fused16_x86::map_region_avx2(&self.tables, source, destination, bytes)
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    LinearKernel::Ssse3 => {
+                        fused16_x86::map_region_ssse3(&self.tables, source, destination, bytes)
+                    }
+                    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                    LinearKernel::Neon => {
+                        fused16_neon::map_region(&self.tables, source, destination, bytes)
+                    }
+                    _ => 0,
+                }
+            } / 2;
+        }
+        let _ = (source, destination, symbols);
+        0
+    }
 }
 
 /// Fused transform kernels for 16-bit symbols on NEON: `vld2q_u8` splits a
@@ -546,6 +633,33 @@ mod fused16_neon {
                 vst2q_u8(rb.as_mut_ptr().add(at), b);
                 vst2q_u8(rc.as_mut_ptr().add(at), c);
                 vst2q_u8(rd.as_mut_ptr().add(at), d);
+            }
+            at += 32;
+        }
+        at
+    }
+
+    /// Stores the image of each symbol of `source` at the same position of
+    /// `destination`; returns the bytes processed, a multiple of 32.
+    ///
+    /// # Safety
+    /// `source` must address `bytes` readable bytes and `destination` as many
+    /// writable ones. The two are either the same pointer or do not overlap.
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn map_region(
+        tables: &MulTables,
+        source: *const u8,
+        destination: *mut u8,
+        bytes: usize,
+    ) -> usize {
+        let t = self::tables(tables);
+        let mut at = 0;
+        while bytes - at >= 32 {
+            // SAFETY: both hold 32 bytes from `at`; each block is loaded
+            // before it is stored, so a shared pointer is rewritten in place.
+            unsafe {
+                let value = vld2q_u8(source.add(at));
+                vst2q_u8(destination.add(at), map(&t, value));
             }
             at += 32;
         }
@@ -843,6 +957,59 @@ mod fused16_x86 {
                 store128(rb.as_mut_ptr().add(at), b);
                 store128(rc.as_mut_ptr().add(at), c);
                 store128(rd.as_mut_ptr().add(at), d);
+            }
+            at += 32;
+        }
+        at
+    }
+
+    /// Stores the image of each symbol of `source` at the same position of
+    /// `destination`; returns the bytes processed, a multiple of 32.
+    ///
+    /// # Safety
+    /// AVX2 must be available. `source` must address `bytes` readable bytes
+    /// and `destination` as many writable ones; the two are either the same
+    /// pointer or do not overlap.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn map_region_avx2(
+        tables: &MulTables,
+        source: *const u8,
+        destination: *mut u8,
+        bytes: usize,
+    ) -> usize {
+        let t = tables256(tables);
+        let mut at = 0;
+        while bytes - at >= 64 {
+            // SAFETY: both hold 64 bytes from `at`; each block is loaded
+            // before it is stored, so a shared pointer is rewritten in place.
+            unsafe {
+                let value = load256(source.add(at));
+                store256(destination.add(at), map256(&t, value));
+            }
+            at += 64;
+        }
+        // SAFETY: AVX2 implies SSSE3; the remainders keep the caller's bounds.
+        at + unsafe { map_region_ssse3(tables, source.add(at), destination.add(at), bytes - at) }
+    }
+
+    /// As [`map_region_avx2`], 32 bytes at a time.
+    ///
+    /// # Safety
+    /// SSSE3 must be available; pointers as for [`map_region_avx2`].
+    #[target_feature(enable = "ssse3")]
+    pub(super) unsafe fn map_region_ssse3(
+        tables: &MulTables,
+        source: *const u8,
+        destination: *mut u8,
+        bytes: usize,
+    ) -> usize {
+        let t = tables128(tables);
+        let mut at = 0;
+        while bytes - at >= 32 {
+            // SAFETY: as in `map_region_avx2`, for 32 bytes from `at`.
+            unsafe {
+                let value = load128(source.add(at));
+                store128(destination.add(at), map128(&t, value));
             }
             at += 32;
         }

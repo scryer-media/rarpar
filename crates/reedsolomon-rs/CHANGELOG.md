@@ -17,6 +17,14 @@
   flag per row that the caller knows to be zero (padding past the inputs,
   erased rows before an inverse transform) and skip or reduce the butterflies
   those rows feed. Flags come from the layout; rows are never scanned.
+- Scaling runs in place on every tier, with no bounce buffer, and
+  `TransformField::scale_le_bytes_with_backend` unpacks little-endian byte
+  pairs into scaled `u16` rows in one pass. The range check for `u16`
+  rows on GF(2^8) is a vectorised fold; GF(2^16) and byte rows make no check
+  pass. A radix-2 scale step with a known-zero left row is one accumulate,
+  copy or product instead of a butterfly. `derivative_in_pool` and
+  `derivative_u8_in_pool` store each row once and split columns across the
+  pool; the sequential derivative also stores each row once.
 - Benches: `kernel_ceiling` reports single-thread GiB/s for the GF(2^8) and
   GF(2^16) multiply-accumulate kernels, the fused batch kernels and memory
   baselines; `fft_transform` gains the u8-vs-u16, pooled and known-zero groups.
