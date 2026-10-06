@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.4
+## 0.4.5
 
 - **Behaviour change:** the streaming creation engine (`creation::CreationPlan`)
   now derives the InputSetID the way the reference does — and the way
@@ -55,41 +55,6 @@
   `par3 c -c1 -cm4`. They previously refused every such set but the
   capacity-one one as an unsupported field.
 - `engine_perf` takes `PAR3_BENCH_CREATOR` to replace the Creator packet text.
-- **Behaviour change:** repair output on native targets is now confined to an
-  opened directory capability. Replacing the output-root path or swapping a
-  destination parent during repair cannot redirect rebuild reads or installs
-  outside that opened tree. Existing symbolic links in destination paths are
-  refused before staging, and output names that the destination filesystem
-  merges by case or Unicode normalization are refused before any output is
-  created. Normal verification retains its existing host filesystem-link
-  behavior.
-- **Behaviour change:** repair temporaries now live in an exclusively created
-  `.par3-stage-*` directory under the requested output root.
-  Successful repair removes its empty staging directory. After an interrupted
-  repair, callers should remove the reported temporary files and then their
-  now-empty staging parent.
-- Repair no longer reuses or removes entries in the deterministic temporary
-  namespace used by earlier releases. This prevents a pre-existing file or
-  symbolic link from redirecting or being overwritten by a repair.
-- Alias preflight probes each actual destination parent and every candidate
-  pair, including directories with different case-folding behavior.
-- Native directory capabilities now count against the shared open-handle budget.
-  Ordinary repair preflight requires at least five handles; a cross-filesystem
-  install can require a sixth for its destination-local copy.
-- Failed staging-file sizing removes the file or retains its cleanup path if
-  removal fails. Native interruption checks the staging identity and cleans
-  through its held capability instead of returning a replaced ambient path.
-- Cross-filesystem native installs use a private destination-local copy and
-  rename it atomically. Failed installation rolls back its backup.
-- Unix staging directories are created with mode `0700`; Windows creates them
-  with a protected owner-only ACL. Windows native calls are isolated in one
-  module with safe interfaces; targets other than Windows, macOS and Linux
-  retain `forbid(unsafe_code)` (see file-clone staging below).
-- Close the staging-directory handle before removing it on Windows. WASI staging
-  no longer queries a process ID, which is unsupported by that runtime.
-- Native builds add `cap-std` for capability-relative filesystem operations;
-  WASI continues to use the runtime's preopened directories as its outer
-  capability boundary.
 - The sliding-window placement scan rolls its CRC-64 with a shift-only byte
   step and a four-byte lookahead over contiguous stripe slices, seeds the first
   window with `crc-fast`, and confirms a hit from the bytes already in the scan
@@ -403,6 +368,43 @@
 - On x86_64 hosts with GFNI, the FFT codec's byte maps run as affine
   transforms and the formal derivative as one AVX2 pass (`reedsolomon-rs`
   0.4.8); carriers and repaired bytes are identical.
+
+## 0.4.4
+
+- **Behaviour change:** repair output on native targets is now confined to an
+  opened directory capability. Replacing the output-root path or swapping a
+  destination parent during repair cannot redirect rebuild reads or installs
+  outside that opened tree. Existing symbolic links in destination paths are
+  refused before staging, and output names that the destination filesystem
+  merges by case or Unicode normalization are refused before any output is
+  created. Normal verification retains its existing host filesystem-link
+  behavior.
+- **Behaviour change:** repair temporaries now live in an exclusively created
+  `.par3-stage-*` directory under the requested output root.
+  Successful repair removes its empty staging directory. After an interrupted
+  repair, callers should remove the reported temporary files and then their
+  now-empty staging parent.
+- Repair no longer reuses or removes entries in the deterministic temporary
+  namespace used by earlier releases. This prevents a pre-existing file or
+  symbolic link from redirecting or being overwritten by a repair.
+- Alias preflight probes each actual destination parent and every candidate
+  pair, including directories with different case-folding behavior.
+- Native directory capabilities now count against the shared open-handle budget.
+  Ordinary repair preflight requires at least five handles; a cross-filesystem
+  install can require a sixth for its destination-local verified copy.
+- Failed staging-file sizing removes the file or retains its cleanup path if
+  removal fails. Native interruption checks the staging identity and cleans
+  through its held capability instead of returning a replaced ambient path.
+- Cross-filesystem native installs use a private destination-local copy, verify
+  its bytes, and rename it atomically. Failed installation rolls back its backup.
+- Unix staging directories are created with mode `0700`; Windows creates them
+  with a protected owner-only ACL. Windows native calls are isolated in one
+  module with safe interfaces; all other targets retain `forbid(unsafe_code)`.
+- Close the staging-directory handle before removing it on Windows. WASI staging
+  no longer queries a process ID, which is unsupported by that runtime.
+- Native builds add `cap-std` for capability-relative filesystem operations;
+  WASI continues to use the runtime's preopened directories as its outer
+  capability boundary.
 
 ## 0.4.3
 
