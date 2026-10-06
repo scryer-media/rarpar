@@ -140,6 +140,15 @@
   50 lost 1 MiB blocks, eight workers on four Alder Lake P-cores: 1.36 →
   0.94 s, one worker and CPU time unchanged, read, write and open counts
   identical, bytes identical.
+- A stripe that one extent supplies whole is read straight into its buffer:
+  the per-byte coverage map, which every read zeroed, scanned byte by byte
+  for an alias, filled and scanned again, is kept only for stripes assembled
+  from several extents or padded past a file's end, and its alias scan is one
+  `memchr`. That bookkeeping was five bytes touched per byte read, on the
+  thread the walks' workers wait for. Cauchy repair Decode on ext4, 1 GiB,
+  50 lost 1 MiB blocks, Alder Lake: one worker 2.64–2.68 → 2.31–2.40 s,
+  eight 0.94–1.00 → 0.80–0.86 s, CPU time down 0.35 and 0.7 s; reads,
+  checks and bytes unchanged.
 - Carrier regeneration reads each source stripe once per group of recovery
   rows the memory budget admits, instead of once per row.
 - Recovery rows that fit the memory budget alongside the codec stay resident

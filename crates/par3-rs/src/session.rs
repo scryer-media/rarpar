@@ -1445,6 +1445,8 @@ impl Par3RepairSession {
     /// Read one stripe of an input block. Each source range read is checked
     /// against its snapshot afterwards, or, given `owed`, recorded there for
     /// the caller to settle before writing anything derived from it.
+    /// `covered` is scratch, and what `out` holds after an error is
+    /// unspecified.
     pub(crate) fn read_block(
         &self,
         block: u64,
@@ -1454,9 +1456,8 @@ impl Par3RepairSession {
         owed: Option<&OwedChecks>,
     ) -> EngineResult<()> {
         let layout = self.layout.as_ref().expect("prepared layout");
-        out.fill(0);
-        covered.fill(0);
         if let Some(payload) = self.data_payloads().get(&block) {
+            out.fill(0);
             payload.read_at(offset, out)?;
             return Ok(());
         }
@@ -1464,14 +1465,12 @@ impl Par3RepairSession {
             .locations(block)
             .ok_or(EngineError::InvalidState("unresolved input block"))?;
         let stripe_end = offset + out.len() as u64;
-        for location in locations.iter() {
+        // Which bytes of the stripe an extent supplies, with where to read
+        // them from, for an extent that is placed or proven intact.
+        let supply = |location: &crate::layout::ExtentLocation| {
             let file = &layout.files[location.file];
-            let Some(extent) = file.extents.range(location.extent) else {
-                continue;
-            };
-            let Some((_, block_offset)) = file.extents.block_at(location.extent) else {
-                continue;
-            };
+            let extent = file.extents.range(location.extent)?;
+            let (_, block_offset) = file.extents.block_at(location.extent)?;
             let (source, snapshot, source_offset) =
                 if let Some(placement) = self.placements.get(&(location.file, location.extent)) {
                     (placement.source, placement.snapshot, placement.offset)
@@ -1480,19 +1479,65 @@ impl Par3RepairSession {
                 {
                     (proof.source, proof.snapshot, extent.start)
                 } else {
-                    continue;
+                    return None;
                 };
             let start = offset.max(block_offset);
             let end = stripe_end.min(block_offset + extent.end - extent.start);
-            if start >= end {
-                continue;
+            (start < end).then(|| {
+                (
+                    source,
+                    snapshot,
+                    source_offset + start - block_offset,
+                    start,
+                    end,
+                )
+            })
+        };
+        // Most stripes come whole from the one extent naming their block:
+        // nothing to zero, no coverage to keep, and the read itself fills
+        // `out`. The map below is only for stripes assembled from several
+        // extents, or padded past a file's end.
+        let mut resolved = None;
+        if let [location] = &*locations
+            && let Some((source, snapshot, source_offset, start, end)) =
+                *resolved.insert(supply(location))
+            && start == offset
+            && end == stripe_end
+        {
+            if let Err(error) = read_exact_at(
+                &self.options.diagnostics,
+                self.access.as_ref(),
+                source,
+                source_offset,
+                out,
+            ) {
+                if let Some(owed) = owed {
+                    owed.settle(self.access.as_ref())?;
+                }
+                ensure_snapshot(self.access.as_ref(), source, snapshot)?;
+                return Err(error);
             }
+            match owed {
+                Some(owed) => owed.owe(source, snapshot),
+                None => ensure_snapshot(self.access.as_ref(), source, snapshot)?,
+            }
+            return Ok(());
+        }
+        out.fill(0);
+        covered.fill(0);
+        for location in locations.iter() {
+            // A single extent not supplying the whole stripe was resolved above.
+            let supplied = resolved.take().unwrap_or_else(|| supply(location));
+            let Some((source, snapshot, source_offset, start, end)) = supplied else {
+                continue;
+            };
             let begin = (start - offset) as usize;
             let finish = (end - offset) as usize;
             // Only the check after the read vouches for the bytes; a failed
             // read is reported as the change that caused it, if one did.
             let mut read = || -> EngineResult<()> {
-                if covered[begin..finish].iter().any(|value| *value != 0) {
+                // The map holds only zeros and ones, so this is one `memchr`.
+                if covered[begin..finish].contains(&1) {
                     // A second extent naming this block: its bytes are fetched
                     // again so they can be compared with what the first extent
                     // already supplied. These are the only bytes this engine
@@ -1511,7 +1556,7 @@ impl Par3RepairSession {
                             &self.options.diagnostics,
                             self.access.as_ref(),
                             source,
-                            source_offset + start - block_offset + (position - begin) as u64,
+                            source_offset + (position - begin) as u64,
                             &mut scratch[..take],
                         )?;
                         for (index, &byte) in scratch[..take].iter().enumerate() {
@@ -1529,7 +1574,7 @@ impl Par3RepairSession {
                         &self.options.diagnostics,
                         self.access.as_ref(),
                         source,
-                        source_offset + start - block_offset,
+                        source_offset,
                         &mut out[begin..finish],
                     )?;
                 }

@@ -1079,6 +1079,14 @@ fn a_copy_that_walks_a_block_in_windows_counts_one_pass_per_window() {
         block_size.div_ceil(stripe as u64),
         amplification.stripe_passes
     );
+    // The twin's three intact blocks are each named by two intact extents, so
+    // the copy reads each a second time and compares: the alias check, which
+    // is the only genuine reread this engine makes.
+    assert_eq!(
+        amplification.reread_bytes,
+        (blocks - 1) * block_size,
+        "each intact aliased block is read once more for its check"
+    );
     drop(session);
     assert_eq!(options.memory.used(), 0, "the session leaked");
 }
