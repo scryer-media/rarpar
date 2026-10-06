@@ -159,6 +159,129 @@ inventory only names its local path. SSH uses batch mode, supports optional
 per-host ports and additional OpenSSH options, and leaves host-key verification
 under the operator's normal SSH policy.
 
+## PAR3 Suite
+
+`rarpar-bench par3` compares the shipped `rarpar` CLI with the pinned
+`par3cmdline` reference on create, verify and repair. It measures the CLI
+because that is what ships, the same way the PAR2 suite drives `rarpar par`.
+If you pass `--engine-perf PATH`, it also runs the `par3-rs` `engine_perf`
+example once per set as an untimed stage breakdown. Nothing from that pass goes
+into the timing tables.
+
+```sh
+cd bench/rarpar-bench
+go build -o target/rarpar-bench ./cmd/rarpar-bench
+
+# The matrix the profile runs; it builds and runs nothing.
+target/rarpar-bench par3 matrix --profile full
+
+# Build the reference from the pinned archive in config/toolchains.json
+# (mirror first, then upstream; BLAKE3-verified either way). Needs CMake.
+target/rarpar-bench par3 build-reference --out target/par3-reference
+
+# Smoke run, about a minute.
+target/rarpar-bench par3 run --profile smoke \
+  --reference target/par3-reference/build/par3cmd/par3 \
+  --candidate ../../target/release/rarpar \
+  --work target/p3 --out target/par3-smoke \
+  --ops create,verify,verify-damaged,repair --repeats 3
+
+# Re-render the Markdown from a saved results.json.
+target/rarpar-bench par3 report --input target/par3-smoke/results.json
+```
+
+### Sets
+
+Each set is a deterministic generated dataset plus one codec configuration.
+The same inputs and damage are produced on every host:
+
+| set | data | block | input / recovery | codec | damage |
+|---|---|---|---|---|---|
+| `a-gf16` | 1 GiB | 1 MiB | 1024 / 103 | Cauchy GF(2^16) | 50 lost blocks |
+| `a-gf8` | 1 GiB | 8 MiB | 128 / 13 | Cauchy GF(2^8) | 6 lost blocks |
+| `a-fft` | 1 GiB | 1 MiB | 1024 / 103 | FFT | 50 lost blocks |
+| `b-gf16` | 300 MiB, many files | 1 MiB | 300 / 30 | Cauchy GF(2^16) | 10 lost blocks in 5 of 10 files |
+| `c-gf16` | 1.5 GiB | 32 KiB | 49152 / 4916 | Cauchy GF(2^16) | 2000 lost blocks |
+| `smoke-*` | 8 MiB | 16-128 KiB | 65-514 / 7-52 | GF8, GF16, FFT | 6-30 lost blocks |
+
+`--profile full` runs sets A, B and C and then the smoke sets.
+`--profile smoke` runs only the three smoke sets. Use `--set ID` (repeatable) to narrow either profile.
+
+### Rows and protocol
+
+The rows are the reference (single-threaded), `rarpar-w1` and `rarpar-w8`. Use
+`--workers` to choose different worker counts. `--kernel-variant
+NAME:VAR=value[,VAR=value]` adds a `rarpar` row with extra environment
+variables. The env-gated kernel pins on main are currently no-ops for PAR3;
+the flag is plumbing for when they exist.
+
+Each variant gets the warmups, then the measured repeats, and the variant order
+alternates on every repeat. Each table cell is the median with the range,
+`median [min–max]`, for wall time, user+sys CPU, and peak RSS. Ratios compare
+medians against the reference, so below 1.000 means `rarpar` used less. Use
+`--pin-cpus 0-7` to confine every timed process to that CPU range (Linux
+`taskset`, Windows affinity). `--iocount` adds an untimed `strace -f -c` pass on
+Linux and reports block and syscall counts.
+
+Repair runs against a fresh copy of the damaged tree each time. A repair row
+passes only when the repaired files hash back to the originals. The
+"left behind" column lists the backup files each tool writes.
+
+### Identity verdicts
+
+Every create row is compared with the reference's set for the same inputs:
+
+- `identical`: byte-identical files.
+- `payloads-only`: every recovery block's payload matches, but packet metadata
+  differs.
+- `DIFFERENT`: the recovery payloads differ.
+
+Today's CLI sets are `DIFFERENT` by design. They carry a different `Creator`
+and `InputSetID`, write each packet once per volume where the reference writes
+it twice, and order the inputs differently. As a result the recovery
+coefficients differ too. For sets with 129-255 input blocks, `rarpar` and the
+reference also choose GF(2^8) versus GF(2^16) at different thresholds. This is
+recorded rather than failed: each tool's create is still verified by itself
+and repaired back to the original bytes. The report says which packet types
+and counts differ.
+
+### Reference caveats
+
+- **macOS.** Upstream `par3cmdline` does not build on macOS. On macOS,
+  `build-reference` applies
+  `internal/par3bench/patches/par3cmdline-2971702e-macos.patch`, a bench-only
+  port that is labelled in its header, and fetches a pinned `sse2neon.h` on
+  arm64. Linux and Windows build or use the unmodified source. The patch
+  digest is recorded in `reference.json` and in the results.
+- **Work-path length.** The reference stores pointers into its list of
+  recovery file names, then reallocates the list once it outgrows 1 KiB. It
+  reopens the volumes through those dangling pointers and fails with
+  "Failed to open Recovery File". It turns the output path into an absolute
+  path first, so only the total length of the absolute volume paths matters,
+  and a relative `--work` does not help. FFT sets always reach this path, and
+  so do Cauchy sets too large to hold in memory. `par3 run` and `fleet plan`
+  check every set before generating any data and give the number of
+  characters to cut. Keep `--work` short, for example `/home/bench/p3` or
+  `C:\p3`.
+- **Windows.** The fleet uses the official `windows/par3.exe` from the pinned
+  archive, verified by digest, instead of building it.
+
+### Windows Defender
+
+The suite hashes both binaries at startup and again before every batch. A
+binary that refuses to start (a Defender block), disappears, or changes on
+disk stops the run as `binary-quarantined`, with the path and what happened.
+The harness never adds exclusions and never retries around it. Restore the
+binary, or ask the host owner to allow it, then rerun.
+
+### Output
+
+`--out` receives `results.json` (schema `rarpar-par3-bench-v1`), `runs.jsonl`
+(one line per process, warmups included) and `report.md`. Generated datasets
+and the reference's canonical sets are cached under `--work`; delete it to
+reclaim the space. `--keep-stages` keeps the per-run directories for
+inspection.
+
 ## Evidence And Charts
 
 Build a report and render static charts from a completed comparative run:

@@ -33,13 +33,13 @@ func (orch *orchestrator) collectMachine(ctx context.Context, machine Machine, h
 		}
 	}
 	orch.state.SetStatus(hostState, StatusCollecting)
-	transport, err := NewTransport(machine, orch.runDir)
+	transport, err := orch.transportFor(machine, hostState)
 	if err != nil {
 		return err
 	}
 	defer transport.Close()
 
-	layout := LayoutFor(machine, orch.options.RunID)
+	layout := HostLayout(machine, orch.options.RunID)
 	deadline := time.Now().Add(time.Duration(orch.options.Config.Fleet.HostTimeoutMinutes) * time.Minute)
 	if machine.Kind == KindAWSEC2 && machine.EC2 != nil {
 		// The cost cap is a hard deadline, not a target: past it the host is

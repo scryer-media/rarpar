@@ -93,6 +93,14 @@ public_ip_lookup = ["dig +short -4 txt ch whoami.cloudflare @1.0.0.1", "dig +sho
 ssh_ingress_port = 22022
 # Ceiling for any single machine's ec2.max_hours.
 max_session_hours = 3
+# SSM access (ec2.access = "ssm"): every file an SSM machine sends or returns
+# moves through this bucket as a short-lived tar object under
+# <resource_prefix>/<run id>/<machine>/, and the instance profile below (role
+# with AmazonSSMManagedInstanceCore plus read/write on the bucket) is attached
+# at launch so the agent registers at boot. Both are checked read-only in
+# preflight. No key pair, security group, or inbound rule is created for them.
+ssm_bucket = "example-bench-transfer-bucket"
+instance_profile = "example-bench-instance-profile"
 
 [fleet.render]
 enabled = true
@@ -108,7 +116,7 @@ kind = "local-ssh"                       # local-ssh | aws-ec2
 platform_label = "linux-x86_64-adl-avx2"
 build_target = "x86_64-unknown-linux-musl"
 enabled = true
-suites = ["crc-probe", "yenc-micro", "macro-rar", "macro-par2"]
+suites = ["crc-probe", "yenc-micro", "macro-rar", "macro-par2", "macro-par3"]
 
 [machines.connection]
 # Always an explicit address, user, and port. ssh_config aliases are refused:
@@ -185,6 +193,34 @@ ghz = 4.4
 record_cases = ["par2-generate-rar5-v7-volumes", "rar5-v7-solid-multivolume"]
 stat_repeats = 3
 record_frequency = 499
+
+# macro-par3: the shipped rarpar CLI against the pinned par3cmdline reference
+# on generated data (no corpus). par3cmdline publishes no Linux binary, so the
+# reference is built on the host from the config/toolchains.json pin (the
+# bundle ships that file; the host needs cmake and a C compiler).
+[machines.oracles.par3]
+policy = "source-build"
+reason = "par3cmdline publishes no Linux binary; built on the host from the toolchains.json pin"
+recipe = "par3cmdline-onhost"
+version = "par3cmdline 0.0.1 (2971702e)"
+
+[machines.par3]
+profile = "full"                         # full | smoke
+# sets = ["a-gf16", "c-gf16"]            # default: every set in the profile
+# ops = ["create", "verify", "repair"]   # default; verify-damaged is opt-in
+workers = [1, 8]                         # rarpar rows; the reference is single-threaded
+warmups = 1
+repeats = 5
+pin_cpus = "0-7"                         # P-cores on a hybrid part; empty = unpinned
+iocount = false                          # untimed strace -f -c pass (Linux)
+# The reference keeps its volume paths in a 1 KiB buffer and fails on longer
+# lists, so the work path must stay short (set C writes 13 volumes: about 40
+# characters at most). The plan refuses a path that is too long.
+work = "/home/bench/p3"
+# Extra rarpar rows with environment overrides, NAME:VAR=value[,VAR=value].
+# Only meaningful once the candidate honours the variable.
+# kernel_variants = ["name:VAR=value"]
+timeout_minutes = 120
 
 # ------------------------------------- machine: appliance NAS, askpass auth ----
 # A DSM-class appliance: password auth through an askpass helper, no perf, no
@@ -342,6 +378,64 @@ corpus_source = "/Users/you/rarpar/target/bench/corpus"
 # if the tag is not in the registry.
 # corpus_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/rarpar-corpus:dca3e362"
 
+# ------------------------------------------- machine: EC2 over SSM (PAR3) ----
+# Reached through SSM RunCommand + the fleet.aws.ssm_bucket transfer bucket,
+# for orchestrating networks that cannot hold an SSH session to EC2. The
+# instance needs no inbound path at all.
+[[machines]]
+name = "ec2-zen4-ssm"
+kind = "aws-ec2"
+platform_label = "linux-x86_64-zen4-par3"
+build_target = "x86_64-unknown-linux-musl"
+enabled = true
+wave = 1
+suites = ["macro-par3"]
+
+[machines.connection]
+# Unused by SSM, but the block is shared with the SSH path.
+user = "ubuntu"
+shell = "sh"
+
+[machines.capabilities]
+perf = "none"
+
+[machines.paths]
+staging = "/home/ubuntu/fs"
+cleanup = false
+
+[machines.bundle]
+source = "docker"
+image = "docker.io/library/rust:1.97-alpine"
+build_host = "local"
+rust_target = "x86_64-unknown-linux-musl"
+go_os = "linux"
+go_arch = "amd64"
+goamd64 = "v2"
+crt_static = true
+
+[machines.oracles.par3]
+policy = "source-build"
+reason = "par3cmdline publishes no Linux binary; built on the host from the toolchains.json pin"
+recipe = "par3cmdline-onhost"
+
+[machines.par3]
+profile = "full"
+workers = [1, 8]
+work = "/home/ubuntu/p3"
+
+[machines.ec2]
+instance_type = "c7a.2xlarge"
+region = "us-east-1"
+ami = "ami-00000000000000000"
+vcpus = 8
+volume_gb = 40
+deadman_minutes = 240
+max_hours = 3.0
+hourly_usd = 0.4106
+access = "ssm"                           # ssh (default) | ssm
+spot = true                              # one-time spot, terminated on interruption
+# instance_profile = "..."               # default: fleet.aws.instance_profile
+
 # ------------------------------------------------- machine: Windows (dGPU) ----
 # UNVALIDATED PATH. The runner uploads and executes a .ps1 file (never an inline
 # PowerShell command string) and perf is unavailable. Treat the first run on a
@@ -352,7 +446,7 @@ kind = "local-ssh"
 platform_label = "windows-x86_64-zen4"
 build_target = "x86_64-pc-windows-msvc"
 enabled = false
-suites = ["crc-probe", "macro-rar"]
+suites = ["crc-probe", "macro-rar", "macro-par3"]
 
 [machines.connection]
 host = "203.0.113.30"
@@ -380,6 +474,21 @@ path = "/Users/example/bench/fleet-bundles/windows-x86_64"
 policy = "host-path"
 path = "C:\\bench\\oracles\\UnRAR.exe"
 version = "unrar 7.2.3"
+
+# The pinned par3cmdline archive ships an official Windows binary, so the
+# standing rule applies: use it, never build it.
+[machines.oracles.par3]
+policy = "official-binary"
+url = "https://github.com/Parchive/par3cmdline/archive/2971702e501f1350b1c7b9d11369af9157d6ed56.tar.gz"
+sha256 = "41695d424730bfa4838bada4f2750928f895ff8cf5cb6e6dc81ebe89731c6e8d"
+archive_member = "par3cmdline-2971702e501f1350b1c7b9d11369af9157d6ed56/windows/par3.exe"
+binary_sha256 = "3170c437d54ca1cb3a46bc1f046e6e63a7d0c98fd47177fb2212d687d3febe20"
+version = "par3cmdline 0.0.1 (2971702e)"
+
+[machines.par3]
+profile = "full"
+workers = [1, 8]
+work = "C:\\p3"
 
 [machines.run]
 warmups = 1

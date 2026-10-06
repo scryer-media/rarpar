@@ -62,8 +62,8 @@ func TestReferenceFieldFollowsPar3cmdline(t *testing.T) {
 		{"cauchy", 128, 128, "gf8"},
 		{"cauchy", 129, 13, "gf16"}, // more than 128 inputs, even with a small total
 		{"cauchy", 120, 137, "gf16"},
-		{"fft", 100, 50, "fft-gf8"},   // next_pow2(64+100) = 256
-		{"fft", 200, 52, "fft-gf16"},  // next_pow2(64+200) = 512
+		{"fft", 100, 50, "fft-gf8"},  // next_pow2(64+100) = 256
+		{"fft", 200, 52, "fft-gf16"}, // next_pow2(64+200) = 512
 		{"fft", 1024, 103, "fft-gf16"},
 	}
 	for _, c := range cases {

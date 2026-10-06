@@ -38,6 +38,8 @@ type Transport struct {
 	KnownHosts  string
 	ControlPath string
 	Persist     string
+	// ssm, when set, replaces SSH: every method goes through RunCommand + S3.
+	ssm *ssmChannel
 }
 
 func NewTransport(machine Machine, runDir string) (*Transport, error) {
@@ -124,6 +126,9 @@ func (transport *Transport) command(ctx context.Context, extra ...string) *exec.
 // RunScript pipes a script to the remote shell on stdin. No quoting of operator
 // data into a remote command line, ever.
 func (transport *Transport) RunScript(ctx context.Context, script string) (string, string, error) {
+	if transport.ssm != nil {
+		return transport.ssm.run(ctx, script)
+	}
 	remoteShell := transport.Shell
 	if remoteShell == "powershell" {
 		return "", "", fmt.Errorf("machine %s: RunScript is POSIX-only; use the PowerShell runner", transport.Machine)
@@ -152,6 +157,9 @@ func (transport *Transport) Probe(ctx context.Context) (string, error) {
 // UploadDir sends a local directory as a gzipped tar stream. gzip is invoked
 // explicitly rather than through tar -z so busybox and bsdtar behave alike.
 func (transport *Transport) UploadDir(ctx context.Context, localDir, remoteDir string) error {
+	if transport.ssm != nil {
+		return transport.ssm.uploadDir(ctx, localDir, remoteDir)
+	}
 	if err := transport.Mkdir(ctx, remoteDir); err != nil {
 		return err
 	}
@@ -195,6 +203,9 @@ func (transport *Transport) UploadDir(ctx context.Context, localDir, remoteDir s
 // DownloadPath pulls one remote file into a local directory over the same
 // tar-over-ssh channel.
 func (transport *Transport) DownloadPath(ctx context.Context, remotePath, localDir string) error {
+	if transport.ssm != nil {
+		return transport.ssm.downloadPath(ctx, remotePath, localDir)
+	}
 	if err := os.MkdirAll(localDir, 0o755); err != nil {
 		return err
 	}
@@ -247,6 +258,9 @@ func (transport *Transport) Exists(ctx context.Context, remotePath string) (bool
 // Close drops the multiplexed master so a torn-down cloud host leaves no
 // dangling control socket behind.
 func (transport *Transport) Close() {
+	if transport.ssm != nil {
+		return
+	}
 	command := exec.Command("ssh", append(transport.baseArgs(), "-O", "exit", transport.target())...)
 	command.Env = transport.environment()
 	_ = command.Run()

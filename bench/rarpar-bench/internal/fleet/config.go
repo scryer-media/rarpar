@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/oci"
+	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/par3bench"
 )
 
 const ConfigSchemaVersion = 1
@@ -31,6 +32,23 @@ const (
 	SuiteYencMicro = "yenc-micro"
 	SuiteMacroRAR  = "macro-rar"
 	SuiteMacroPAR2 = "macro-par2"
+	// SuiteMacroPAR3 runs `rarpar-bench par3 run`: the shipped CLI against the
+	// pinned par3cmdline reference on generated inputs. It needs no corpus.
+	SuiteMacroPAR3 = "macro-par3"
+)
+
+// EC2 access modes. SSH is the original path (session key pair + security
+// group); SSM reaches the instance through Systems Manager RunCommand and
+// moves files through S3, so no inbound path is needed at all.
+const (
+	AccessSSH = "ssh"
+	AccessSSM = "ssm"
+)
+
+// Oracle recipes.
+const (
+	RecipeUnrarPortable   = "unrar-portable"
+	RecipePAR3CmdlineHost = "par3cmdline-onhost"
 )
 
 // Machine kinds.
@@ -61,10 +79,13 @@ const (
 )
 
 var (
-	knownSuites   = []string{SuiteCRCProbe, SuiteYencMicro, SuiteMacroRAR, SuiteMacroPAR2}
-	knownRecipes  = []string{"unrar-portable"}
+	knownSuites   = []string{SuiteCRCProbe, SuiteYencMicro, SuiteMacroRAR, SuiteMacroPAR2, SuiteMacroPAR3}
 	knownShells   = []string{"sh", "bash", "powershell"}
 	suiteFamilies = map[string]string{SuiteMacroRAR: "rar", SuiteMacroPAR2: "par2"}
+	// suiteOracles names the oracle role each suite compares against.
+	suiteOracles = map[string]string{SuiteMacroRAR: "rar", SuiteMacroPAR2: "par2", SuiteMacroPAR3: "par3"}
+	// recipeRoles is the audited source-build recipe set, per oracle role.
+	recipeRoles = map[string]string{RecipeUnrarPortable: "rar", RecipePAR3CmdlineHost: "par3"}
 )
 
 type Config struct {
@@ -114,6 +135,10 @@ type AWSSettings struct {
 	PublicIPLookup  []string `json:"public_ip_lookup"`
 	SSHIngressPort  int      `json:"ssh_ingress_port"`
 	MaxSessionHours float64  `json:"max_session_hours"`
+	// SSMBucket carries every file an SSM-access machine sends or returns.
+	SSMBucket string `json:"ssm_bucket,omitempty"`
+	// InstanceProfile is the default ec2.instance_profile for SSM machines.
+	InstanceProfile string `json:"instance_profile,omitempty"`
 }
 
 type Render struct {
@@ -138,7 +163,29 @@ type Machine struct {
 	Oracles      map[string]Oracle `json:"oracles,omitempty"`
 	Run          RunOverrides      `json:"run"`
 	Perf         PerfPlan          `json:"perf"`
+	PAR3         PAR3Plan          `json:"par3"`
 	EC2          *EC2              `json:"ec2,omitempty"`
+}
+
+// PAR3Plan configures the macro-par3 suite on one machine. Every field maps to
+// a `rarpar-bench par3 run` flag.
+type PAR3Plan struct {
+	Profile string   `json:"profile"`
+	Sets    []string `json:"sets,omitempty"`
+	Ops     []string `json:"ops,omitempty"`
+	Workers []int    `json:"workers"`
+	Warmups int      `json:"warmups"`
+	Repeats int      `json:"repeats"`
+	// PinCPUs confines every timed process to an inclusive CPU range (Linux
+	// taskset, Windows affinity). Empty means unpinned.
+	PinCPUs string `json:"pin_cpus,omitempty"`
+	IOCount bool   `json:"iocount"`
+	// Work overrides the dataset/stage directory. The reference keeps volume
+	// paths in a fixed 1 KiB buffer, so this path must stay short; the plan
+	// checks it against every selected set.
+	Work           string   `json:"work,omitempty"`
+	KernelVariants []string `json:"kernel_variants,omitempty"`
+	TimeoutMinutes int      `json:"timeout_minutes"`
 }
 
 type Connection struct {
@@ -232,6 +279,13 @@ type EC2 struct {
 	// wedged c4 rounds. Tags are corpus-generation digests, so a ref pins
 	// exactly one corpus tree.
 	CorpusImage string `json:"corpus_image,omitempty"`
+	// Access is "ssh" (default) or "ssm". SSM launches with InstanceProfile,
+	// needs no key pair or security group, and moves files through
+	// fleet.aws.ssm_bucket.
+	Access          string `json:"access"`
+	InstanceProfile string `json:"instance_profile,omitempty"`
+	// Spot requests a one-time spot instance that terminates on interruption.
+	Spot bool `json:"spot,omitempty"`
 }
 
 // LoadConfig reads, decodes, and validates a fleet configuration.
@@ -338,6 +392,8 @@ func decodeSettings(item *section) Settings {
 		// pins it back explicitly.
 		SSHIngressPort:  aws.integer("ssh_ingress_port", 22022),
 		MaxSessionHours: aws.float("max_session_hours", 3),
+		SSMBucket:       aws.str("ssm_bucket", ""),
+		InstanceProfile: aws.str("instance_profile", ""),
 	}
 	aws.finish()
 
@@ -461,20 +517,39 @@ func decodeMachine(item *section, settings Settings) Machine {
 	}
 	perf.finish()
 
+	par3 := item.child("par3")
+	machine.PAR3 = PAR3Plan{
+		Profile:        par3.str("profile", "full"),
+		Sets:           par3.strings("sets", nil),
+		Ops:            par3.strings("ops", nil),
+		Workers:        par3.integers("workers", []int{1, 8}),
+		Warmups:        par3.integer("warmups", 1),
+		Repeats:        par3.integer("repeats", 5),
+		PinCPUs:        par3.str("pin_cpus", ""),
+		IOCount:        par3.boolean("iocount", false),
+		Work:           par3.str("work", ""),
+		KernelVariants: par3.strings("kernel_variants", nil),
+		TimeoutMinutes: par3.integer("timeout_minutes", 120),
+	}
+	par3.finish()
+
 	if ec2 := item.child("ec2"); ec2.present {
 		machine.EC2 = &EC2{
-			InstanceType:   ec2.requiredStr("instance_type"),
-			Region:         ec2.str("region", settings.AWS.Region),
-			AMI:            ec2.requiredStr("ami"),
-			VCPUs:          ec2.integer("vcpus", 0),
-			VolumeGB:       ec2.integer("volume_gb", 30),
-			Subnet:         ec2.str("subnet", ""),
-			DeadmanMinutes: ec2.integer("deadman_minutes", 180),
-			SSHWaitMinutes: ec2.integer("ssh_wait_minutes", 10),
-			MaxHours:       ec2.float("max_hours", 2),
-			HourlyUSD:      ec2.float("hourly_usd", 0),
-			CorpusSource:   ec2.str("corpus_source", ""),
-			CorpusImage:    ec2.str("corpus_image", ""),
+			InstanceType:    ec2.requiredStr("instance_type"),
+			Region:          ec2.str("region", settings.AWS.Region),
+			AMI:             ec2.requiredStr("ami"),
+			VCPUs:           ec2.integer("vcpus", 0),
+			VolumeGB:        ec2.integer("volume_gb", 30),
+			Subnet:          ec2.str("subnet", ""),
+			DeadmanMinutes:  ec2.integer("deadman_minutes", 180),
+			SSHWaitMinutes:  ec2.integer("ssh_wait_minutes", 10),
+			MaxHours:        ec2.float("max_hours", 2),
+			HourlyUSD:       ec2.float("hourly_usd", 0),
+			CorpusSource:    ec2.str("corpus_source", ""),
+			CorpusImage:     ec2.str("corpus_image", ""),
+			Access:          ec2.str("access", AccessSSH),
+			InstanceProfile: ec2.str("instance_profile", settings.AWS.InstanceProfile),
+			Spot:            ec2.boolean("spot", false),
 		}
 		ec2.finish()
 	}
@@ -648,6 +723,9 @@ func validate(state *decodeState, config *Config) {
 
 		validateBundle(state, prefix, machine)
 		validateOracles(state, prefix, machine)
+		if machine.hasSuite(SuiteMacroPAR3) {
+			validatePAR3(state, prefix, machine)
+		}
 
 		if machine.Run.Warmups < 0 || machine.Run.Repeats < 1 {
 			state.fail("%s: run.warmups must be >= 0 and run.repeats >= 1", prefix)
@@ -763,7 +841,7 @@ func validateBundle(state *decodeState, prefix string, machine *Machine) {
 
 func validateOracles(state *decodeState, prefix string, machine *Machine) {
 	for _, suite := range machine.Suites {
-		role, ok := suiteFamilies[suite]
+		role, ok := suiteOracles[suite]
 		if !ok {
 			continue
 		}
@@ -778,8 +856,8 @@ func validateOracles(state *decodeState, prefix string, machine *Machine) {
 	sort.Strings(roles)
 	for _, role := range roles {
 		oracle := machine.Oracles[role]
-		if role != "rar" && role != "par2" {
-			state.fail("%s: unknown oracle role %q (rar, par2)", prefix, role)
+		if role != "rar" && role != "par2" && role != "par3" {
+			state.fail("%s: unknown oracle role %q (rar, par2, par3)", prefix, role)
 		}
 		switch oracle.Policy {
 		case OracleHostPath:
@@ -801,11 +879,24 @@ func validateOracles(state *decodeState, prefix string, machine *Machine) {
 			if oracle.Reason == "" {
 				state.fail("%s: oracles.%s.reason is required for policy %q; record why no official binary exists", prefix, role, OracleSourceBuild)
 			}
-			if oracle.URL == "" || oracle.SHA256 == "" {
+			recipeRole, known := recipeRoles[oracle.Recipe]
+			switch {
+			case !known:
+				state.fail("%s: oracles.%s.recipe must be one of %s", prefix, role, strings.Join(sortedKeys(recipeRoles), ", "))
+			case recipeRole != role:
+				state.fail("%s: oracles.%s.recipe %q builds the %s oracle, not %s", prefix, role, oracle.Recipe, recipeRole, role)
+			case oracle.Recipe == RecipePAR3CmdlineHost:
+				// The source pin lives in config/toolchains.json (par3_generator,
+				// BLAKE3-verified, mirror first); a second pin here could only
+				// disagree with it.
+				if oracle.URL != "" || oracle.SHA256 != "" {
+					state.fail("%s: oracles.%s: recipe %q takes its source pin from config/toolchains.json; drop url and sha256", prefix, role, RecipePAR3CmdlineHost)
+				}
+				if machine.isWindows() {
+					state.fail("%s: oracles.%s: par3cmdline ships an official windows/par3.exe in the pinned archive; use policy %q with archive_member instead of building it", prefix, role, OracleOfficialBinary)
+				}
+			case oracle.URL == "" || oracle.SHA256 == "":
 				state.fail("%s: oracles.%s needs the source url and sha256 for policy %q", prefix, role, OracleSourceBuild)
-			}
-			if !contains(knownRecipes, oracle.Recipe) {
-				state.fail("%s: oracles.%s.recipe must be one of %s", prefix, role, strings.Join(knownRecipes, ", "))
 			}
 		default:
 			state.fail("%s: oracles.%s.policy must be %s, %s, or %s", prefix, role,
@@ -814,6 +905,50 @@ func validateOracles(state *decodeState, prefix string, machine *Machine) {
 		if oracle.BinarySHA256 != "" && !isHexSHA256(oracle.BinarySHA256) {
 			state.fail("%s: oracles.%s.binary_sha256 must be 64 hex characters", prefix, role)
 		}
+	}
+}
+
+// validatePAR3 checks the macro-par3 plan against the suite's own profile
+// table, so a typo in a set ID fails here instead of on the host.
+func validatePAR3(state *decodeState, prefix string, machine *Machine) {
+	plan := machine.PAR3
+	profile, err := par3bench.LookupProfile(plan.Profile)
+	if err != nil {
+		state.fail("%s: par3.profile: %v", prefix, err)
+		return
+	}
+	if _, err := profile.Select(plan.Sets); err != nil {
+		state.fail("%s: par3.sets: %v", prefix, err)
+	}
+	for _, op := range plan.Ops {
+		if !contains(par3bench.KnownOps, op) {
+			state.fail("%s: par3.ops: unknown op %q (known: %s)", prefix, op, strings.Join(par3bench.KnownOps, ", "))
+		}
+	}
+	if len(plan.Workers) == 0 {
+		state.fail("%s: par3.workers must not be empty", prefix)
+	}
+	for _, workers := range plan.Workers {
+		if workers < 1 {
+			state.fail("%s: par3.workers must be positive", prefix)
+		}
+	}
+	if plan.Warmups < 0 || plan.Repeats < 1 {
+		state.fail("%s: par3.warmups must be >= 0 and par3.repeats >= 1", prefix)
+	}
+	if plan.TimeoutMinutes < 1 {
+		state.fail("%s: par3.timeout_minutes must be positive", prefix)
+	}
+	for _, variant := range plan.KernelVariants {
+		if _, err := par3bench.ParseKernelVariant(variant); err != nil {
+			state.fail("%s: par3.kernel_variants: %v", prefix, err)
+		}
+	}
+	if plan.IOCount && machine.isWindows() {
+		state.fail("%s: par3.iocount uses strace and is Linux-only", prefix)
+	}
+	if plan.Work != "" {
+		validateHostPath(state, prefix, "par3.work", plan.Work, machine.isWindows())
 	}
 }
 
@@ -854,6 +989,24 @@ func validateEC2(state *decodeState, prefix string, machine *Machine, settings *
 	}
 	if ec2.Region == "" {
 		state.fail("%s: ec2.region is required (or set fleet.aws.region)", prefix)
+	}
+	switch ec2.Access {
+	case AccessSSH:
+		if ec2.Spot {
+			state.fail("%s: ec2.spot is only supported with access = %q", prefix, AccessSSM)
+		}
+	case AccessSSM:
+		if ec2.InstanceProfile == "" {
+			state.fail("%s: access = %q needs ec2.instance_profile (or fleet.aws.instance_profile); the instance registers with SSM through it", prefix, AccessSSM)
+		}
+		if settings.AWS.SSMBucket == "" {
+			state.fail("%s: access = %q needs fleet.aws.ssm_bucket; every file moves through it", prefix, AccessSSM)
+		}
+		if ec2.CorpusSource != "" {
+			state.fail("%s: ec2.corpus_source streams the corpus over SSH; use ec2.corpus_image with access = %q", prefix, AccessSSM)
+		}
+	default:
+		state.fail("%s: ec2.access must be %q or %q", prefix, AccessSSH, AccessSSM)
 	}
 }
 
@@ -944,6 +1097,16 @@ func roundCents(value float64) float64 { return math.Round(value*100) / 100 }
 
 func (machine Machine) needsCorpus() bool {
 	return machine.hasSuite(SuiteMacroRAR) || machine.hasSuite(SuiteMacroPAR2)
+}
+
+// needsCandidate reports whether the bundle must carry the rarpar CLI.
+func (machine Machine) needsCandidate() bool {
+	return machine.needsCorpus() || machine.hasSuite(SuiteMacroPAR3)
+}
+
+// usesSSM reports whether this cloud machine is reached through SSM.
+func (machine Machine) usesSSM() bool {
+	return machine.Kind == KindAWSEC2 && machine.EC2 != nil && machine.EC2.Access == AccessSSM
 }
 
 func (machine Machine) hasSuite(name string) bool { return contains(machine.Suites, name) }

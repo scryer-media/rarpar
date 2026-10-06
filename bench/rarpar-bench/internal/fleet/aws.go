@@ -256,7 +256,7 @@ func (aws *AWS) CreateSession(ctx context.Context, prefix, publicIP, keyDir stri
 // UserData is the deadman plus quiet-box hygiene applied to every cloud host,
 // plus the sshd relocation that pairs with the session security group when the
 // machine's SSH port is not 22.
-func UserData(deadmanMinutes, sshPort int) string {
+func UserData(deadmanMinutes, sshPort int, packages ...string) string {
 	relocate := ""
 	if sshPort != 22 {
 		// Reachability, not just hygiene: the security group only opens the
@@ -299,8 +299,50 @@ systemctl disable --now motd-news.timer man-db.timer >/dev/null 2>&1
 # Applied live for this boot and dropped in so a reboot cannot take it back.
 echo 'kernel.perf_event_paranoid=1' > /etc/sysctl.d/99-bench-perf.conf
 sysctl -w kernel.perf_event_paranoid=1 >/dev/null 2>&1
-touch /var/lib/cloud/instance/BENCH_USERDATA_DONE
-`, deadmanMinutes, relocate)
+%stouch /var/lib/cloud/instance/BENCH_USERDATA_DONE
+`, deadmanMinutes, relocate, packageInstall(packages))
+}
+
+// UserDataSSM is UserData for SSM-access machines: the same deadman and
+// quiet-box hygiene, minus the snapd shutdown (the SSM agent on Ubuntu cloud
+// images is a snap; disabling snapd cuts the only channel to the box) and the
+// sshd relocation, plus aws-cli for the S3 transfers and any build packages
+// the machine's suites need.
+func UserDataSSM(deadmanMinutes int, packages []string) string {
+	install := packageInstall(packages)
+	return fmt.Sprintf(`#!/bin/bash
+# Deadman. instance-initiated-shutdown-behavior=terminate makes this a hard cap:
+# if the orchestrator dies, the box still disappears.
+shutdown -h +%d
+# Quiet-box hygiene: nothing may wake up mid-measurement. snapd stays up: the
+# SSM agent is a snap and is the only way in.
+systemctl disable --now unattended-upgrades.service >/dev/null 2>&1
+systemctl disable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1
+systemctl disable --now motd-news.timer man-db.timer >/dev/null 2>&1
+echo 'kernel.perf_event_paranoid=1' > /etc/sysctl.d/99-bench-perf.conf
+sysctl -w kernel.perf_event_paranoid=1 >/dev/null 2>&1
+# aws-cli carries every file to and from the transfer bucket.
+for attempt in 1 2 3 4 5; do snap install aws-cli --classic >/dev/null 2>&1 && break; sleep 10; done
+%stouch /var/lib/cloud/instance/BENCH_USERDATA_DONE
+`, deadmanMinutes, install)
+}
+
+// packageInstall installs build packages before the user-data sentinel, so
+// a run never starts on a box still installing them.
+func packageInstall(packages []string) string {
+	if len(packages) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("# Build packages for on-host oracle builds.\nDEBIAN_FRONTEND=noninteractive apt-get update -q >/dev/null 2>&1\nDEBIAN_FRONTEND=noninteractive apt-get install -y -q %s >/dev/null 2>&1\n", strings.Join(packages, " "))
+}
+
+// bootstrapPackages are the distro packages a machine's suites need on host:
+// the par3cmdline-onhost recipe builds the reference with CMake.
+func bootstrapPackages(machine Machine) []string {
+	if oracle, ok := machine.Oracles["par3"]; ok && oracle.Policy == OracleSourceBuild && oracle.Recipe == RecipePAR3CmdlineHost {
+		return []string{"build-essential", "cmake"}
+	}
+	return nil
 }
 
 func (aws *AWS) Launch(ctx context.Context, machine Machine, session SessionResources, userDataPath string) (*CloudState, error) {
@@ -315,19 +357,24 @@ func (aws *AWS) Launch(ctx context.Context, machine Machine, session SessionReso
 		"ec2", "run-instances",
 		"--image-id", spec.AMI,
 		"--instance-type", spec.InstanceType,
-		"--key-name", session.KeyName,
-		"--security-group-ids", session.SecurityGroupID,
+	}
+	if machine.usesSSM() {
+		args = append(args, SSMLaunchArgs(*spec)...)
+	} else {
+		args = append(args, "--key-name", session.KeyName, "--security-group-ids", session.SecurityGroupID)
+	}
+	args = append(args,
 		"--associate-public-ip-address",
 		// Paired with the deadman shutdown in user-data: shutdown means gone,
 		// not stopped-and-still-billing-for-storage.
 		"--instance-initiated-shutdown-behavior", "terminate",
 		"--block-device-mappings", blockDevice,
-		"--user-data", "file://" + userDataPath,
+		"--user-data", "file://"+userDataPath,
 		"--metadata-options", "HttpTokens=required,HttpEndpoint=enabled",
 		"--tag-specifications", fmt.Sprintf("ResourceType=instance,Tags=[{Key=Name,Value=%s-%s},{Key=purpose,Value=%s}]",
 			session.Prefix, machine.Name, session.Prefix),
 		"--query", "Instances[0].InstanceId", "--output", "text",
-	}
+	)
 	if spec.Subnet != "" {
 		args = append(args, "--subnet-id", spec.Subnet)
 	}

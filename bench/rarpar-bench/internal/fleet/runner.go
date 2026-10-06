@@ -121,7 +121,7 @@ func Run(ctx context.Context, options Options) (Summary, error) {
 			Status:        StatusPending,
 			Suites:        machine.Suites,
 			Endpoint:      endpointOf(machine),
-			Remote:        LayoutFor(machine, options.RunID),
+			Remote:        HostLayout(machine, options.RunID),
 		})
 	}
 	if err := orch.state.Save(); err != nil {
@@ -220,6 +220,16 @@ func (orch *orchestrator) preflight(ctx context.Context) error {
 		}
 	}
 	orch.prepareAWS()
+	// The reference's name-buffer limit turns a long PAR3 work path into a
+	// mid-run failure on the host; refuse it here instead.
+	for _, machine := range orch.options.Machines {
+		if !machine.hasSuite(SuiteMacroPAR3) {
+			continue
+		}
+		if _, problem := par3View(machine, HostLayout(machine, orch.options.RunID)); problem != "" {
+			return fmt.Errorf("machine %s: %s", machine.Name, problem)
+		}
+	}
 	// Same fail-before-spend rule for corpus images: a tag missing from ECR
 	// would otherwise only surface as an on-instance fetch failure.
 	for _, machine := range orch.options.Config.Machines {
@@ -296,6 +306,9 @@ func (orch *orchestrator) preflight(ctx context.Context) error {
 		if quota.EstimatedUSD > 0 {
 			orch.log("preflight: worst-case cloud spend for this run is $%.2f", quota.EstimatedUSD)
 		}
+		if err := orch.checkSSM(ctx); err != nil {
+			return err
+		}
 	}
 
 	// Local hosts are probed in parallel; an unreachable host fails the run
@@ -339,6 +352,34 @@ func (orch *orchestrator) preflight(ctx context.Context) error {
 	}
 	if len(failures) > 0 {
 		return fmt.Errorf("preflight failed:\n  - %s", strings.Join(failures, "\n  - "))
+	}
+	return nil
+}
+
+// checkSSM proves, read-only, that the transfer bucket and every SSM machine's
+// instance profile exist before anything launches.
+func (orch *orchestrator) checkSSM(ctx context.Context) error {
+	checked := map[string]bool{}
+	for _, machine := range orch.options.Machines {
+		if !machine.usesSSM() {
+			continue
+		}
+		bucket := orch.options.Config.Fleet.AWS.SSMBucket
+		if !checked["bucket:"+bucket] {
+			if _, err := orch.aws.run(ctx, "s3api", "head-bucket", "--bucket", bucket); err != nil {
+				return fmt.Errorf("preflight: SSM transfer bucket %s: %w", bucket, err)
+			}
+			checked["bucket:"+bucket] = true
+			orch.log("preflight: SSM transfer bucket %s reachable", bucket)
+		}
+		profile := machine.EC2.InstanceProfile
+		if !checked["profile:"+profile] {
+			if _, err := orch.aws.run(ctx, "iam", "get-instance-profile", "--instance-profile-name", profile); err != nil {
+				return fmt.Errorf("preflight: machine %s: instance profile %s: %w", machine.Name, profile, err)
+			}
+			checked["profile:"+profile] = true
+			orch.log("preflight: instance profile %s exists", profile)
+		}
 	}
 	return nil
 }
@@ -430,7 +471,10 @@ func (orch *orchestrator) build(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			layout := LayoutFor(machine, orch.options.RunID)
+			// Windows hosts stage under backslash paths; resolving oracles
+			// against the POSIX layout handed the runner paths that do not
+			// exist there.
+			layout := HostLayout(machine, orch.options.RunID)
 			oracles, err := ResolveOracles(ctx, machine, bundleDir, cacheDir, layout, orch.options.AllowFetch)
 			if err != nil {
 				return err
@@ -515,13 +559,17 @@ func (orch *orchestrator) runMachine(ctx context.Context, machine Machine, hostS
 	}
 	orch.state.SetStatus(hostState, StatusSpawning)
 
-	if machine.Kind == KindAWSEC2 {
+	if machine.usesSSM() {
+		if err := orch.launchSSM(ctx, machine, hostState); err != nil || hostState.Status == StatusSkipped {
+			return err
+		}
+	} else if machine.Kind == KindAWSEC2 {
 		session, err := orch.ensureSession(ctx)
 		if err != nil {
 			return err
 		}
 		userDataPath := filepath.Join(orch.runDir, "userdata-"+machine.Name+".sh")
-		if err := os.WriteFile(userDataPath, []byte(UserData(machine.EC2.DeadmanMinutes, machine.Connection.Port)), 0o644); err != nil {
+		if err := os.WriteFile(userDataPath, []byte(UserData(machine.EC2.DeadmanMinutes, machine.Connection.Port, bootstrapPackages(machine)...)), 0o644); err != nil {
 			return err
 		}
 		cloud, err := orch.aws.Launch(ctx, machine, *session, userDataPath)
@@ -548,7 +596,7 @@ func (orch *orchestrator) runMachine(ctx context.Context, machine Machine, hostS
 		}
 	}
 
-	transport, err := NewTransport(machine, orch.runDir)
+	transport, err := orch.transportFor(machine, hostState)
 	if err != nil {
 		return err
 	}
@@ -674,6 +722,72 @@ func (orch *orchestrator) ensureSession(ctx context.Context) (*SessionResources,
 	orch.state.Session = &session
 	_ = orch.state.Save()
 	return orch.session, nil
+}
+
+// transportFor returns the channel to one machine: SSM for SSM-access cloud
+// machines, SSH for everything else.
+func (orch *orchestrator) transportFor(machine Machine, hostState *MachineState) (*Transport, error) {
+	if !machine.usesSSM() {
+		return NewTransport(machine, orch.runDir)
+	}
+	if hostState.Cloud == nil || hostState.Cloud.InstanceID == "" {
+		return nil, fmt.Errorf("machine %s: no launched instance to reach over SSM", machine.Name)
+	}
+	settings := orch.options.Config.Fleet.AWS
+	return NewSSMTransport(machine, orch.aws, settings.SSMBucket,
+		ssmPrefix(settings.ResourcePrefix, orch.options.RunID, machine.Name), hostState.Cloud.InstanceID, orch.runDir)
+}
+
+// launchSSM launches an SSM-access instance (no key pair, no security group)
+// and waits until RunCommand reaches it and its user-data has finished.
+func (orch *orchestrator) launchSSM(ctx context.Context, machine Machine, hostState *MachineState) error {
+	userDataPath := filepath.Join(orch.runDir, "userdata-"+machine.Name+".sh")
+	if err := os.WriteFile(userDataPath, []byte(UserDataSSM(machine.EC2.DeadmanMinutes, bootstrapPackages(machine))), 0o644); err != nil {
+		return err
+	}
+	session := SessionResources{Prefix: orch.options.Config.Fleet.AWS.ResourcePrefix, Region: orch.aws.Region, DryRun: orch.options.DryRunAWS}
+	cloud, err := orch.aws.Launch(ctx, machine, session, userDataPath)
+	hostState.Cloud = cloud
+	_ = orch.state.Save()
+	if err != nil {
+		return err
+	}
+	market := "on-demand"
+	if machine.EC2.Spot {
+		market = "spot"
+	}
+	orch.state.Record(hostState, "spawn", "instance %s (%s, SSM access via %s; deadman %dmin, cost cap %.2fh)",
+		cloud.InstanceID, market, machine.EC2.InstanceProfile, machine.EC2.DeadmanMinutes, machine.EC2.MaxHours)
+	hostState.Endpoint = "ssm:" + cloud.InstanceID
+	if orch.options.DryRunAWS {
+		orch.state.Record(hostState, "spawn", "dry-run-aws: stopping before SSM; no instance exists")
+		orch.state.SetStatus(hostState, StatusSkipped)
+		return nil
+	}
+	wait := time.Duration(machine.EC2.SSHWaitMinutes) * time.Minute
+	if err := orch.aws.WaitSSMOnline(ctx, cloud.InstanceID, wait); err != nil {
+		return fmt.Errorf("machine %s: %w", machine.Name, err)
+	}
+	transport, err := orch.transportFor(machine, hostState)
+	if err != nil {
+		return err
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		ready, readyErr := transport.ssm.ready(ctx)
+		if readyErr == nil && ready {
+			orch.state.Record(hostState, "spawn", "SSM Online and user-data finished")
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("machine %s: user-data never finished (aws-cli/build packages) within %s: %v", machine.Name, wait, readyErr)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(15 * time.Second):
+		}
+	}
 }
 
 func (orch *orchestrator) waitForSSH(ctx context.Context, machine Machine) error {

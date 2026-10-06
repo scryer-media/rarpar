@@ -64,6 +64,7 @@ func WindowsRunScript(machine Machine, defaults RunDefaults, runID string, layou
 	write("$Candidate = Join-Path $Bin 'rarpar.exe'")
 	write("$OracleRar = '%s'", oracles["rar"])
 	write("$OraclePar2 = '%s'", oracles["par2"])
+	write("$OraclePar3 = '%s'", oracles["par3"])
 	write("$Status = 'ok'")
 	write("$Failures = @()")
 	write("$Started = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')")
@@ -109,6 +110,23 @@ func WindowsRunScript(machine Machine, defaults RunDefaults, runID string, layou
 		write("Copy-Item (Join-Path $out 'raw.json') (Join-Path $R 'raw-%s.json') -ErrorAction SilentlyContinue", family)
 		write("& $Bench report --input (Join-Path $out 'raw.json') --out (Join-Path $R 'report-%s.json') *> (Join-Path $R 'report-%s.log')", family, family)
 		write("Remove-Item -Recurse -Force $out -ErrorAction SilentlyContinue")
+	}
+	if machine.hasSuite(SuiteMacroPAR3) {
+		// The suite detects a Defender quarantine of either binary (errno 225/
+		// 226 or a changed hash) and records Get-MpThreatDetection evidence; it
+		// never adds exclusions or otherwise works around Defender.
+		args := make([]string, 0)
+		for _, arg := range par3Args(machine) {
+			args = append(args, "'"+strings.ReplaceAll(arg, "'", "''")+"'")
+		}
+		write("$p3Work = '%s'", PAR3Work(machine, layout))
+		write("if (Test-Path $OraclePar3) {")
+		write("  Gate 'macro-par3'")
+		write("  $p3Args = @('par3','run','--reference',$OraclePar3,'--candidate',$Candidate,'--work',$p3Work,'--out',(Join-Path $R 'par3'),'--machine',$Machine,%s)", strings.Join(args, ","))
+		write("  & $Bench @p3Args *> (Join-Path $R 'par3-run.log')")
+		write("  if ($LASTEXITCODE -ne 0) { Fail 'macro-par3' }")
+		write("} else { Fail 'par3-reference-missing' }")
+		write("Remove-Item -Recurse -Force $p3Work -ErrorAction SilentlyContinue")
 	}
 	write("'capabilities.perf = none on Windows hosts; phase timings only' | Out-File -FilePath (Join-Path $R 'perf-NO-COLLECTOR.txt') -Encoding utf8")
 	write("$Finished = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')")

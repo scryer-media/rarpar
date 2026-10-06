@@ -45,23 +45,29 @@ func ResolveOracles(ctx context.Context, machine Machine, bundleDir, cacheDir st
 			resolution.SHA256 = oracle.BinarySHA256
 			resolution.Origin = "preinstalled on the host: " + oracle.Path
 		case OracleOfficialBinary:
-			name := oracleBinaryName(role, oracle)
+			name := oracleBinaryName(machine, role, oracle)
 			local := filepath.Join(bundleDir, name)
 			digest, err := materializeOfficialBinary(ctx, oracle, cacheDir, local, allowFetch)
 			if err != nil {
 				return nil, fmt.Errorf("machine %s: oracle %s: %w", machine.Name, role, err)
 			}
-			resolution.RemotePath = joinPosix(layout.Bin, name)
+			resolution.RemotePath = hostJoin(machine, layout.Bin, name)
 			resolution.SHA256 = digest
 			resolution.Origin = "official release asset " + oracle.URL
 		case OracleSourceBuild:
-			name := oracleBinaryName(role, oracle)
+			if oracle.Recipe == RecipePAR3CmdlineHost {
+				// Built on the host by the run script itself; nothing ships but
+				// the toolchain lock that pins the source.
+				resolution = sourceBuildResolution(machine, role, oracle, layout)
+				break
+			}
+			name := oracleBinaryName(machine, role, oracle)
 			local := filepath.Join(bundleDir, name)
 			digest, err := buildOracleFromSource(ctx, machine, oracle, cacheDir, local, allowFetch)
 			if err != nil {
 				return nil, fmt.Errorf("machine %s: oracle %s: %w", machine.Name, role, err)
 			}
-			resolution.RemotePath = joinPosix(layout.Bin, name)
+			resolution.RemotePath = hostJoin(machine, layout.Bin, name)
 			resolution.SHA256 = digest
 			resolution.Origin = "source build (" + oracle.Recipe + ") from " + oracle.URL
 			resolution.Note = oracle.Reason
@@ -71,14 +77,30 @@ func ResolveOracles(ctx context.Context, machine Machine, bundleDir, cacheDir st
 	return resolutions, nil
 }
 
-func oracleBinaryName(role string, oracle Oracle) string {
+func oracleBinaryName(machine Machine, role string, oracle Oracle) string {
 	if oracle.ArchiveMember != "" {
 		return posixBase(oracle.ArchiveMember)
 	}
-	if role == "rar" {
-		return "unrar"
+	name := map[string]string{"rar": "unrar", "par2": "par2", "par3": "par3"}[role]
+	if machine.isWindows() {
+		name += ".exe"
 	}
-	return "par2"
+	return name
+}
+
+// sourceBuildResolution describes a source-built oracle without building it.
+// The par3cmdline-onhost recipe builds on the host during the run, at the path
+// `rarpar-bench par3 build-reference` produces.
+func sourceBuildResolution(machine Machine, role string, oracle Oracle, layout RemoteLayout) OracleResolution {
+	resolution := OracleResolution{Role: role, Policy: oracle.Policy, Note: oracle.Reason}
+	if oracle.Recipe == RecipePAR3CmdlineHost {
+		resolution.RemotePath = hostJoin(machine, par3ReferenceDir(machine, layout), "build", "par3cmd", oracleBinaryName(machine, role, oracle))
+		resolution.Origin = "on-host source build (" + oracle.Recipe + ") of the config/toolchains.json par3_generator pin"
+		return resolution
+	}
+	resolution.RemotePath = hostJoin(machine, layout.Bin, oracleBinaryName(machine, role, oracle))
+	resolution.Origin = "audited portable source build (" + oracle.Recipe + ")"
+	return resolution
 }
 
 func materializeOfficialBinary(ctx context.Context, oracle Oracle, cacheDir, destination string, allowFetch bool) (string, error) {

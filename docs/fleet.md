@@ -127,9 +127,9 @@ Append a `[[machines]]` block. The mandatory decisions:
 
 | Field | What it decides |
 | --- | --- |
-| `kind` | `local-ssh` (a machine you own) or `aws-ec2` (launched and destroyed per run) |
+| `kind` | `local-ssh` (a machine you own) or `aws-ec2` (launched and destroyed per run; `ec2.access` = `ssh` or `ssm`) |
 | `platform_label` | Names the SVGs and the report machine label. Must be unique — a collision overwrites another machine's charts |
-| `suites` | `crc-probe`, `yenc-micro`, `macro-rar`, `macro-par2` |
+| `suites` | `crc-probe`, `yenc-micro`, `macro-rar`, `macro-par2`, `macro-par3` |
 | `capabilities.perf` | `linux-perf`, `samply`, or `none`. Decides which diagnostic pass runs |
 | `capabilities.no_pgrep` | Set on busybox-class appliances; the load gate falls back to `ps -ef \| grep` |
 | `bundle.source` | `docker` (build the recipe) or `prebuilt` (stage a directory) |
@@ -189,12 +189,103 @@ exiting) therefore blocks that host until the orchestrator's
 it is waiting on. Clear the process, or drop that name from
 `quiet_load_process_names` for the run.
 
+## PAR3 suite on the fleet
+
+Add `macro-par3` to a machine's `suites` and give it a `par3` oracle. The
+bundle then carries `toolchains.json`, and the host runs `rarpar-bench par3 run`
+before the perf pass. Evidence goes to `<results>/par3/` (`results.json`,
+`runs.jsonl`, `report.md`), and logs go to `par3-run.out`/`.err`. The suite
+itself is documented in [benchmarking.md](benchmarking.md#par3-suite).
+
+```toml
+[machines.oracles.par3]
+policy = "source-build"
+recipe = "par3cmdline-onhost"     # built on the host from the pinned archive
+
+[machines.par3]
+profile = "full"                  # or "smoke"
+# sets = ["a-gf16", "c-gf16"]     # default: every set in the profile
+# ops = ["create", "verify", "repair"]
+workers = [1, 8]
+warmups = 1
+repeats = 5
+pin_cpus = "0-7"
+work = "/home/bench/p3"           # keep it short, see below
+timeout_minutes = 120
+```
+
+- **Linux and macOS hosts** use `recipe = "par3cmdline-onhost"`. The host runs
+  `par3 build-reference` against the shipped `toolchains.json`, so the
+  reference is compiled natively and never emulated. It needs CMake and a C
+  compiler; EC2 user-data installs `build-essential` and `cmake` when this
+  recipe is selected. This recipe takes no `url` or `sha256`.
+- **Windows hosts** use `policy = "official-binary"` with the pinned archive's
+  `windows/par3.exe` (`archive_member`, `binary_sha256`); see the example
+  config. `par3cmdline-onhost` is refused on Windows, and so is
+  `[machines.par3].iocount`.
+- **Work path.** `fleet plan` checks `[machines.par3].work`, which defaults to
+  `<scratch>/p3`, against the reference's file-name limit. It shows a warning
+  in the plan, and preflight treats it as an error, so an over-long path never
+  reaches a host. The run deletes the work directory afterwards.
+- **Defender.** A quarantined or blocked binary stops the PAR3 section as
+  `binary-quarantined`. The harness reports it and does not work around it.
+
+```sh
+rarpar-bench fleet plan --config bench/fleet.toml --suite macro-par3
+rarpar-bench fleet run  --config bench/fleet.toml --suite macro-par3
+```
+
+Public write-ups name hosts by core type only, for example "Zen 4" or
+"Graviton 4", never by machine name. `platform_label` should follow the same
+rule.
+
+## EC2 over SSM
+
+`access = "ssh"` is the default: the run uses a temporary keypair, a security
+group, and SSH on `fleet.aws.ssh_ingress_port`. Use `access = "ssm"` when SSH
+into EC2 is unreliable from the orchestrating network:
+
+```toml
+[fleet.aws]
+ssm_bucket = "your-transfer-bucket"           # scripts and tarballs travel here
+instance_profile = "your-ssm-instance-profile" # AmazonSSMManagedInstanceCore + bucket access
+
+[[machines]]
+kind = "aws-ec2"
+[machines.ec2]
+access = "ssm"
+spot = true                                    # optional, SSM only
+```
+
+- No keypair, security group, or ingress rule is created. The instance gets
+  the instance profile and nothing else.
+- Every script runs through `AWS-RunShellScript`. The script is uploaded to
+  `s3://<bucket>/<prefix>/<run>/<machine>/`, which the host fetches, deletes
+  and runs. Bundles and results move as tar objects under the same prefix,
+  and each object is deleted after its transfer.
+- User-data leaves snapd running: the SSM agent on Ubuntu cloud images is a
+  snap, and disabling snapd would cut the only channel to the instance. The
+  host's AWS CLI also comes from `snap install aws-cli --classic`. The SSH
+  path still disables snapd.
+- `corpus_source` is refused with SSM. Use the generated PAR3 data or a
+  prebuilt corpus in the bundle.
+- Preflight checks the bucket (`s3api head-bucket`) and the profile
+  (`iam get-instance-profile`) read-only. `--dry-run-aws` stops before
+  launch, exactly as it does for SSH.
+
 ## Known limits
 
 - `bundle.build_host` accepts a machine name but only `"local"` is implemented.
   A remote build host is refused at build time with a message telling you to
   build there yourself and use `bundle.source = "prebuilt"`.
 - The Windows runner has never been executed (see below).
+- The SSM access mode is implemented and unit-tested but has not been run
+  against a live account yet. Treat its first run as bring-up.
+- The Windows path is unvalidated end to end. The run script is PowerShell,
+  but the transport still assumes a POSIX shell on the far side: it runs `sh`
+  and uses `tar` for bundle upload and result download. Before the first
+  Windows round, the host needs an OpenSSH default shell that provides those,
+  or the transport needs a PowerShell path.
 
 ## Windows hosts
 

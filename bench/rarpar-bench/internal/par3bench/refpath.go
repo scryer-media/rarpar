@@ -15,6 +15,8 @@ import (
 // when recovery blocks are computed after the volumes are laid out — the FFT
 // codec, and Cauchy sets too large to hold in memory — so the total length of
 // the absolute volume paths is what matters, not any single path.
+// par3cmdline turns the output path into an absolute one first, so passing a
+// relative path does not help; only a shorter work directory does.
 const referenceNameBuffer = 1024
 
 // ReferenceNameBytes is the space par3cmdline's name list needs for a create
@@ -80,4 +82,10 @@ func volumeCount(recovery int64) int {
 // shortenBy spreads the excess over every name that carries the directory.
 func shortenBy(excess, names int) int {
 	return (excess + names - 1) / names
+}
+
+// CheckWorkPath applies the same reference name-buffer check to a work
+// directory chosen elsewhere (the fleet plan), before anything runs.
+func CheckWorkPath(profile Profile, work string) error {
+	return checkReferencePaths(Options{Profile: profile, Work: work})
 }

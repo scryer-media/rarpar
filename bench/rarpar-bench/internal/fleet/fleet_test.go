@@ -26,8 +26,8 @@ func TestExampleConfigLoads(t *testing.T) {
 	if config.SchemaVersion != ConfigSchemaVersion {
 		t.Fatalf("schema version = %d, want %d", config.SchemaVersion, ConfigSchemaVersion)
 	}
-	if len(config.Machines) != 4 {
-		t.Fatalf("machines = %d, want 4 (one of each kind plus the Windows example)", len(config.Machines))
+	if len(config.Machines) != 5 {
+		t.Fatalf("machines = %d, want 5 (one of each kind, an SSM cloud machine, and the Windows example)", len(config.Machines))
 	}
 	if config.SHA256 == "" {
 		t.Fatal("config digest must be recorded so a run can name the config it used")
@@ -36,7 +36,7 @@ func TestExampleConfigLoads(t *testing.T) {
 	for _, machine := range config.Machines {
 		kinds[machine.Kind]++
 	}
-	if kinds[KindAWSEC2] != 1 || kinds[KindLocalSSH] != 3 {
+	if kinds[KindAWSEC2] != 2 || kinds[KindLocalSSH] != 3 {
 		t.Fatalf("unexpected machine kinds: %v", kinds)
 	}
 }
@@ -449,7 +449,7 @@ func TestBuildPlan(t *testing.T) {
 			}
 		}
 	}
-	if plan.Quota.Requested != 4 || !plan.Quota.Fits {
+	if plan.Quota.Requested != 12 || !plan.Quota.Fits {
 		t.Fatalf("unexpected quota check: %+v", plan.Quota)
 	}
 	var text strings.Builder
@@ -920,7 +920,8 @@ func TestCloudSSHPortCanBePinnedPerMachine(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, machine := range config.Machines {
-		if machine.Kind == KindAWSEC2 && machine.Connection.Port != 2200 {
+		// The substitution lands in the first cloud machine's block only.
+		if machine.Name == "ec2-graviton4" && machine.Connection.Port != 2200 {
 			t.Fatalf("machine %s: port = %d, want the per-machine pin 2200", machine.Name, machine.Connection.Port)
 		}
 	}
