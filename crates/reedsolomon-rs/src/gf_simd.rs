@@ -51,8 +51,8 @@ pub enum LinearKernel {
     /// x86 SSSE3 byte shuffles.
     Ssse3,
     /// x86 AVX2 byte shuffles, or GFNI affine transforms where
-    /// [`linear_uses_gfni`] holds; the 8-bit maps run on 512-bit vectors
-    /// where [`linear_uses_avx512`] holds.
+    /// [`linear_uses_gfni`] holds; the 8-bit shuffle maps run on 512-bit
+    /// vectors where [`linear_uses_avx512`] holds.
     Avx2,
 }
 
@@ -76,18 +76,22 @@ pub fn linear_uses_gfni() -> bool {
     false
 }
 
-/// Whether the AVX2 kernels of [`LinearMap8`] run on 512-bit vectors, in
-/// their GFNI form where [`linear_uses_gfni`] holds and their nibble-shuffle
-/// form otherwise; the remainder below 64 bytes stays on the 256-bit kernels.
-/// Setting `WEAVER_LINEAR_AVX512=0` pins the 256-bit kernels so an AVX-512
-/// host can A/B the two without a rebuild. The variable is read once and
-/// cached; it never enables a kernel whose features are absent.
+/// Whether the nibble-shuffle AVX2 kernels of [`LinearMap8`] run on 512-bit
+/// vectors; the remainder below 64 bytes stays on the 256-bit kernels. Only
+/// hosts without the GFNI form ([`linear_uses_gfni`]) take them: AVX512BW
+/// without GFNI, such as Skylake-SP. The affine form stays at 256 bits,
+/// where 512 measured a wash on Zen 4 and 2-4% slower end to end on
+/// Sapphire Rapids. Setting `WEAVER_LINEAR_AVX512=0` pins the 256-bit
+/// kernels so an AVX-512 host can A/B the two without a rebuild. The
+/// variable is read once and cached; it never enables a kernel whose
+/// features are absent.
 pub fn linear_uses_avx512() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         return *ENABLED.get_or_init(|| {
             !std::env::var_os("WEAVER_LINEAR_AVX512").is_some_and(|v| v == "0")
+                && !linear_uses_gfni()
                 && is_x86_feature_detected!("avx2")
                 && is_x86_feature_detected!("avx512bw")
                 && is_x86_feature_detected!("avx512vl")
@@ -266,11 +270,7 @@ impl LinearMap8 {
             LinearKernel::Neon => unsafe { self.plan.neon(source, destination) },
             #[cfg(target_arch = "x86_64")]
             LinearKernel::Avx2 => match (self.affine, self.wide) {
-                (Some(affine), true) => unsafe {
-                    self.plan
-                        .accumulate_gfni_avx512(affine, source, destination)
-                },
-                (Some(affine), false) => unsafe {
+                (Some(affine), _) => unsafe {
                     self.plan.accumulate_gfni(affine, source, destination)
                 },
                 // SAFETY: `wide` is set only after detecting AVX512BW/VL.
@@ -302,11 +302,7 @@ impl LinearMap8 {
             LinearKernel::Neon => unsafe { self.plan.butterfly_neon::<INVERSE>(left, right) },
             #[cfg(target_arch = "x86_64")]
             LinearKernel::Avx2 => match (self.affine, self.wide) {
-                (Some(affine), true) => unsafe {
-                    self.plan
-                        .butterfly_gfni_avx512::<INVERSE>(affine, left, right)
-                },
-                (Some(affine), false) => unsafe {
+                (Some(affine), _) => unsafe {
                     self.plan.butterfly_gfni::<INVERSE>(affine, left, right)
                 },
                 (None, true) => unsafe { self.plan.butterfly_avx512::<INVERSE>(left, right) },
@@ -349,14 +345,7 @@ impl LinearMap8 {
             #[cfg(target_arch = "x86_64")]
             LinearKernel::Avx2 => {
                 match ([outer.affine, inner[0].affine, inner[1].affine], outer.wide) {
-                    ([Some(o), Some(x), Some(y)], true) => unsafe {
-                        crate::gf8::MulPlan::radix4_gfni_avx512::<INVERSE>(
-                            plans,
-                            [o, x, y],
-                            [&mut *a, &mut *b, &mut *c, &mut *d],
-                        )
-                    },
-                    ([Some(o), Some(x), Some(y)], false) => unsafe {
+                    ([Some(o), Some(x), Some(y)], _) => unsafe {
                         crate::gf8::MulPlan::radix4_gfni::<INVERSE>(
                             plans,
                             [o, x, y],
@@ -406,8 +395,7 @@ impl LinearMap8 {
             LinearKernel::Neon => unsafe { self.plan.map_neon(row) },
             #[cfg(target_arch = "x86_64")]
             LinearKernel::Avx2 => match (self.affine, self.wide) {
-                (Some(affine), true) => unsafe { self.plan.map_gfni_avx512(affine, row) },
-                (Some(affine), false) => unsafe { self.plan.map_gfni(affine, row) },
+                (Some(affine), _) => unsafe { self.plan.map_gfni(affine, row) },
                 (None, true) => unsafe { self.plan.map_avx512(row) },
                 (None, false) => unsafe { self.plan.map_avx2(row) },
             },
@@ -1379,9 +1367,6 @@ mod fused_tests {
                 }
                 if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vl") {
                     kernels.push((LinearKernel::Avx2, false, true));
-                    if gfni {
-                        kernels.push((LinearKernel::Avx2, true, true));
-                    }
                 } else {
                     eprintln!("SKIP fused_tests 512-bit 8-bit tiers: host lacks avx512bw+vl");
                 }
@@ -1520,10 +1505,11 @@ mod fused_tests {
         }
         let scalar = (LinearKernel::Scalar, false, false);
         // The 512-bit quad, where the host has it: the outer map decides the
-        // width for all three.
+        // width for all three, and an affine inner map still takes the
+        // shuffle form there (only a quad of three affine maps runs GFNI).
         let wide = [
-            (LinearKernel::Avx2, true, true),
             (LinearKernel::Avx2, false, true),
+            (LinearKernel::Avx2, true, false),
         ];
         let wide = kernels().contains(&wide[0]).then_some(wide);
         let lengths = [

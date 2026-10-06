@@ -873,45 +873,6 @@ impl MulPlan {
         unsafe { self.avx2(&source[at..], &mut destination[at..]) };
     }
 
-    /// [`Self::butterfly_gfni`] with 512-bit vectors; returns the bytes
-    /// processed.
-    ///
-    /// # Safety
-    /// GFNI, AVX512BW and AVX512VL must be available and the rows must have
-    /// equal lengths.
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "gfni,avx512bw,avx512vl")]
-    pub(crate) unsafe fn butterfly_gfni_avx512<const INVERSE: bool>(
-        &self,
-        affine: u64,
-        left: &mut [u8],
-        right: &mut [u8],
-    ) -> usize {
-        use std::arch::x86_64::*;
-        let m = fused_x86::matrix512(affine);
-        let mut at = 0;
-        while left.len() - at >= 64 {
-            // SAFETY: both rows hold 64 bytes from `at`.
-            unsafe {
-                let mut l = _mm512_loadu_si512(left.as_ptr().add(at).cast());
-                let mut r = _mm512_loadu_si512(right.as_ptr().add(at).cast());
-                crate::gf_simd::fused_butterfly!(
-                    INVERSE,
-                    l,
-                    r,
-                    &m,
-                    _mm512_xor_si512,
-                    fused_x86::affine512
-                );
-                _mm512_storeu_si512(left.as_mut_ptr().add(at).cast(), l);
-                _mm512_storeu_si512(right.as_mut_ptr().add(at).cast(), r);
-            }
-            at += 64;
-        }
-        // SAFETY: the 512-bit features imply the 256-bit ones; equal lengths.
-        at + unsafe { self.butterfly_gfni::<INVERSE>(affine, &mut left[at..], &mut right[at..]) }
-    }
-
     /// [`Self::butterfly_avx2`] with 512-bit vectors; returns the bytes
     /// processed.
     ///
@@ -948,60 +909,6 @@ impl MulPlan {
         }
         // SAFETY: AVX512BW implies AVX2; the remainders have equal lengths.
         at + unsafe { self.butterfly_avx2::<INVERSE>(&mut left[at..], &mut right[at..]) }
-    }
-
-    /// [`Self::radix4_gfni`] with 512-bit vectors; returns the bytes
-    /// processed.
-    ///
-    /// # Safety
-    /// GFNI, AVX512BW and AVX512VL must be available and all four rows must
-    /// have equal lengths.
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "gfni,avx512bw,avx512vl")]
-    pub(crate) unsafe fn radix4_gfni_avx512<const INVERSE: bool>(
-        plans: [&Self; 3],
-        affine: [u64; 3],
-        rows: [&mut [u8]; 4],
-    ) -> usize {
-        use std::arch::x86_64::*;
-        let [outer, inner_a, inner_b] = [
-            fused_x86::matrix512(affine[0]),
-            fused_x86::matrix512(affine[1]),
-            fused_x86::matrix512(affine[2]),
-        ];
-        let [ra, rb, rc, rd] = rows;
-        let mut at = 0;
-        while ra.len() - at >= 64 {
-            // SAFETY: all four rows hold 64 bytes from `at`.
-            unsafe {
-                let mut a = _mm512_loadu_si512(ra.as_ptr().add(at).cast());
-                let mut b = _mm512_loadu_si512(rb.as_ptr().add(at).cast());
-                let mut c = _mm512_loadu_si512(rc.as_ptr().add(at).cast());
-                let mut d = _mm512_loadu_si512(rd.as_ptr().add(at).cast());
-                crate::gf_simd::fused_radix4!(
-                    INVERSE,
-                    [a, b, c, d],
-                    &outer,
-                    &inner_a,
-                    &inner_b,
-                    _mm512_xor_si512,
-                    fused_x86::affine512
-                );
-                _mm512_storeu_si512(ra.as_mut_ptr().add(at).cast(), a);
-                _mm512_storeu_si512(rb.as_mut_ptr().add(at).cast(), b);
-                _mm512_storeu_si512(rc.as_mut_ptr().add(at).cast(), c);
-                _mm512_storeu_si512(rd.as_mut_ptr().add(at).cast(), d);
-            }
-            at += 64;
-        }
-        // SAFETY: the 512-bit features imply the 256-bit ones; equal lengths.
-        at + unsafe {
-            Self::radix4_gfni::<INVERSE>(
-                plans,
-                affine,
-                [&mut ra[at..], &mut rb[at..], &mut rc[at..], &mut rd[at..]],
-            )
-        }
     }
 
     /// [`Self::radix4_avx2`] with 512-bit vectors; returns the bytes
@@ -1054,31 +961,6 @@ impl MulPlan {
                 [&mut ra[at..], &mut rb[at..], &mut rc[at..], &mut rd[at..]],
             )
         }
-    }
-
-    /// [`Self::map_gfni`] with 512-bit vectors; returns the bytes processed.
-    ///
-    /// # Safety
-    /// GFNI, AVX512BW and AVX512VL must be available.
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "gfni,avx512bw,avx512vl")]
-    pub(crate) unsafe fn map_gfni_avx512(&self, affine: u64, row: &mut [u8]) -> usize {
-        use std::arch::x86_64::*;
-        let m = fused_x86::matrix512(affine);
-        let mut at = 0;
-        while row.len() - at >= 64 {
-            // SAFETY: the row holds 64 bytes from `at`.
-            unsafe {
-                let value = _mm512_loadu_si512(row.as_ptr().add(at).cast());
-                _mm512_storeu_si512(
-                    row.as_mut_ptr().add(at).cast(),
-                    fused_x86::affine512(&m, value),
-                );
-            }
-            at += 64;
-        }
-        // SAFETY: the 512-bit features imply the 256-bit ones.
-        at + unsafe { self.map_gfni(affine, &mut row[at..]) }
     }
 
     /// [`Self::map_avx2`] with 512-bit vectors; returns the bytes processed.
@@ -1289,20 +1171,6 @@ mod fused_x86 {
                 _mm512_and_si512(_mm512_srli_epi16::<4>(value), mask),
             ),
         )
-    }
-
-    /// A [`MulPlan::affine`] matrix in every qword lane of a 512-bit vector.
-    #[target_feature(enable = "gfni,avx512bw,avx512vl")]
-    #[inline]
-    pub(super) fn matrix512(affine: u64) -> __m512i {
-        _mm512_set1_epi64(affine as i64)
-    }
-
-    /// [`affine256`] on 512-bit vectors.
-    #[target_feature(enable = "gfni,avx512bw,avx512vl")]
-    #[inline]
-    pub(super) fn affine512(matrix: &__m512i, value: __m512i) -> __m512i {
-        _mm512_gf2p8affine_epi64_epi8::<0>(value, *matrix)
     }
 
     #[target_feature(enable = "ssse3")]
@@ -2315,12 +2183,6 @@ mod tests {
                             Box::new(|r: &mut [u8]| unsafe { plan.map_avx512(r) }),
                         ));
                     }
-                    if wide && gfni {
-                        maps.push((
-                            "gfni avx512",
-                            Box::new(|r: &mut [u8]| unsafe { plan.map_gfni_avx512(affine[0], r) }),
-                        ));
-                    }
                     let mut expected = rows[0].clone();
                     plan.map_scalar(&mut expected);
                     for (name, map) in &maps {
@@ -2356,7 +2218,6 @@ mod tests {
                             Some("avx2"),
                             gfni.then_some("gfni"),
                             wide.then_some("avx512"),
-                            (wide && gfni).then_some("gfni avx512"),
                         ]
                         .into_iter()
                         .flatten()
@@ -2386,20 +2247,10 @@ mod tests {
                                                     [&mut a, &mut b, &mut c, &mut d],
                                                 ),
                                             ),
-                                            "avx512" => (
+                                            _ => (
                                                 plan.butterfly_avx512::<$inv>(&mut l, &mut r),
                                                 MulPlan::radix4_avx512::<$inv>(
                                                     refs,
-                                                    [&mut a, &mut b, &mut c, &mut d],
-                                                ),
-                                            ),
-                                            _ => (
-                                                plan.butterfly_gfni_avx512::<$inv>(
-                                                    affine[0], &mut l, &mut r,
-                                                ),
-                                                MulPlan::radix4_gfni_avx512::<$inv>(
-                                                    refs,
-                                                    affine,
                                                     [&mut a, &mut b, &mut c, &mut d],
                                                 ),
                                             ),
