@@ -447,7 +447,7 @@ Versioned CLI and library migration notes are in [CHANGELOG.md](CHANGELOG.md).
 
 Engine-side kernel and platform work for the PAR2, PAR3 and RAR crates. Weaver's README carries the product-side radar.
 
-Rules that govern every row: one binary with runtime dispatch; a kernel tier is never dropped because no local host has its instruction set; a tier is kept only when it wins at least 5% end to end where it engages and regresses nothing else by more than 1%; disk work (fsyncs, opens, read and write calls) is a regression axis on its own.
+Rules that govern every row: one binary with runtime dispatch; a kernel tier is never dropped because no local host has its instruction set; a tier is kept when it materially moves wall clock or CPU time where it engages without adding significant risk or code, and regresses nothing else by more than 1%; there is no minimum percentage; disk work (fsyncs, opens, read and write calls) is a regression axis on its own.
 
 Status: **Landed** ships; **Building** has an owner now; **Exploring** is a measured spike before a decision; **Watch** waits on hardware or evidence.
 
