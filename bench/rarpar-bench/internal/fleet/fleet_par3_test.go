@@ -49,6 +49,8 @@ func TestPAR3ConfigValidation(t *testing.T) {
 		{"unknown op", `# ops = ["create", "verify", "repair"]   # default; verify-damaged is opt-in`, `ops = ["explode"]`, "unknown op"},
 		{"zero workers", `workers = [1, 8]                         # rarpar rows; the reference is single-threaded`, `workers = [0]`, "par3.workers must be positive"},
 		{"bad kernel variant", `# kernel_variants = ["name:VAR=value"]`, `kernel_variants = ["novar"]`, "kernel_variants"},
+		{"duplicate worker count", `workers = [1, 8]                         # rarpar rows; the reference is single-threaded`, `workers = [8, 8]`, "appears twice"},
+		{"pin list", `pin_cpus = "0-7"`, `pin_cpus = "0,2"`, "par3.pin_cpus"},
 		{"missing par3 oracle", "[machines.oracles.par3]\npolicy = \"source-build\"\nreason = \"par3cmdline publishes no Linux binary; built on the host from the toolchains.json pin\"\nrecipe = \"par3cmdline-onhost\"\nversion",
 			"[machines.oracles.par3x]\npolicy = \"source-build\"\nreason = \"x\"\nrecipe = \"par3cmdline-onhost\"\nversion", "needs [machines.oracles.par3]"},
 		{"onhost recipe takes no url", `recipe = "par3cmdline-onhost"
@@ -252,5 +254,36 @@ func TestPAR3ReferenceTimeoutReachesTheHost(t *testing.T) {
 	machine.PAR3.ReferenceTimeoutMinutes = 45
 	if args := strings.Join(par3Args(machine), " "); !strings.Contains(args, "--timeout 20m --reference-timeout 45m") {
 		t.Fatalf("par3 args = %s", args)
+	}
+}
+
+// UNC staging keeps its leading separators, and a trailing separator on a
+// Windows staging path is not doubled into the layout.
+func TestWindowsHostPaths(t *testing.T) {
+	_, machine := exampleMachine(t, "win-dgpu")
+	if got := hostJoin(machine, `\\fileserver\bench\run`, "work", "p3"); got != `\\fileserver\bench\run\work\p3` {
+		t.Fatalf("UNC join = %q", got)
+	}
+	if got := hostJoin(machine, `C:\bench\`, `\bin\`, "par3.exe"); got != `C:\bench\bin\par3.exe` {
+		t.Fatalf("drive join = %q", got)
+	}
+	machine.Paths.Staging = `C:\bench\`
+	machine.Paths.Scratch = `D:\scratch\`
+	layout := windowsLayout(machine, "run1")
+	if layout.Base != `C:\bench\run1` || layout.Scratch != `D:\scratch\run1` {
+		t.Fatalf("layout base %q scratch %q", layout.Base, layout.Scratch)
+	}
+}
+
+// A manifest entry that points outside the evidence directory is refused
+// before anything is stat'ed or hashed.
+func TestVerifyManifestRefusesEscapingPaths(t *testing.T) {
+	root := t.TempDir()
+	manifest := `{"schema_version": 1, "files": [{"path": "../outside.txt", "bytes": 1, "sha256": ""}]}`
+	if err := os.WriteFile(filepath.Join(root, "MANIFEST.json"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifyManifest(root); err == nil || !strings.Contains(err.Error(), "unsafe path") {
+		t.Fatalf("want an unsafe-path refusal, got %v", err)
 	}
 }

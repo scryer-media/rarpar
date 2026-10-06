@@ -537,3 +537,32 @@ func TestReferenceRowWithOnlyFailedRunsHasNoSelfRatio(t *testing.T) {
 		t.Fatalf("a reference row whose runs all failed must not print 1.000 ratios:\n%s", report)
 	}
 }
+
+func TestValidatePinCPUs(t *testing.T) {
+	for _, good := range []string{"", "0", "3", "0-7", "8-15", "63"} {
+		if err := ValidatePinCPUs(good); err != nil {
+			t.Errorf("%q refused: %v", good, err)
+		}
+	}
+	for _, bad := range []string{"0,2", "7-0", "-1", "a-b", "0-64", "x"} {
+		if err := ValidatePinCPUs(bad); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}
+
+// Two rows with one name would merge their runs into a single row.
+func TestDuplicateRowsAreRefused(t *testing.T) {
+	if err := CheckVariantNames(Variants([]int{1, 8}, nil, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckVariantNames(Variants([]int{1, 1}, nil, nil)); err == nil {
+		t.Fatal("--workers 1,1 must be refused")
+	}
+	// A kernel variant named like a durability suffix collides with the
+	// buffered row.
+	kernel := KernelVariant{Name: "buffered", Env: []string{"X=1"}}
+	if err := CheckVariantNames(Variants([]int{1}, []KernelVariant{kernel}, nil)); err == nil {
+		t.Fatal("kernel variant \"buffered\" collides with rarpar-w1-buffered and must be refused")
+	}
+}

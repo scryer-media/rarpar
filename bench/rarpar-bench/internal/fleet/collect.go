@@ -206,7 +206,13 @@ func verifyManifest(root string) (*HostManifest, error) {
 	}
 	var problems []string
 	for _, file := range manifest.Files {
-		path := filepath.Join(root, filepath.FromSlash(file.Path))
+		// The manifest is host data: a path that resolves outside the
+		// evidence directory is refused, never stat'ed or hashed.
+		path, err := containedPath(root, file.Path)
+		if err != nil {
+			problems = append(problems, err.Error())
+			continue
+		}
 		info, err := os.Stat(path)
 		if err != nil {
 			problems = append(problems, file.Path+": missing from the tarball")

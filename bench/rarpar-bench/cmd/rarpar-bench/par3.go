@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 
 	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/bench"
@@ -136,6 +138,9 @@ func runPAR3Matrix(args []string, stdout io.Writer) error {
 		}
 	}
 	rows := par3bench.Variants(workerList, variants, durabilities)
+	if err := par3bench.CheckVariantNames(rows); err != nil {
+		return err
+	}
 	byOp := par3bench.RowsByOp(rows, opList)
 	if *jsonOut {
 		return writeJSONTo(stdout, map[string]any{"profile": profile, "ops": opList, "durabilities": durabilities, "variants": rows, "rows": byOp})
@@ -276,6 +281,17 @@ func runPAR3Suite(ctx context.Context, args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// Every timed process runs in its own process group so a timeout can kill
+	// its whole tree; that also keeps it out of the terminal's group, so an
+	// interrupt or a SIGTERM to the harness must cancel the context (which
+	// kills the group) instead of leaving the child running. A second signal
+	// gets the default behaviour back.
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 	results, err := par3bench.RunSuite(ctx, par3bench.Options{
 		Reference: workspacePath(*reference), Candidate: workspacePath(*candidate), EnginePerf: workspacePath(*enginePerf),
 		Work: workspacePath(*work), Out: workspacePath(*out), Profile: profile, Ops: splitList(*ops),

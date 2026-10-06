@@ -68,8 +68,9 @@ if (Test-Path -LiteralPath $p3Work) { Remove-Item -LiteralPath $p3Work -Recurse 
 [IO.File]::WriteAllText((Join-Path $R 'perf-NO-COLLECTOR.txt'), "capabilities.perf = none on Windows hosts; phase timings only`r`n", $Utf8NoBom)
 $Finished = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 $Elapsed = [int]([DateTime]::UtcNow - $StartTicks).TotalSeconds
+$RFull = (Get-Item -LiteralPath $R).FullName.TrimEnd('\')
 $files = Get-ChildItem -LiteralPath $R -Recurse -File | Where-Object { $_.Name -ne 'MANIFEST.json' } | ForEach-Object {
-  [ordered]@{ path = $_.FullName.Substring($R.Length + 1).Replace('\','/'); bytes = $_.Length; sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLower() } }
+  [ordered]@{ path = $_.FullName.Substring($RFull.Length + 1).Replace('\','/'); bytes = $_.Length; sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLower() } }
 $manifest = [ordered]@{ schema_version = 1; run_id = $RunId; machine = $MachineName; platform_label = $Machine; started_utc = $Started; finished_utc = $Finished; elapsed_seconds = $Elapsed; status = $Status; failures = ($Failures -join ' '); files = @($files) }
 [IO.File]::WriteAllText((Join-Path $R 'MANIFEST.json'), ($manifest | ConvertTo-Json -Depth 5), $Utf8NoBom)
 Add-Type -AssemblyName System.IO.Compression.FileSystem

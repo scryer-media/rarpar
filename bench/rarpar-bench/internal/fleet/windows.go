@@ -40,10 +40,12 @@ import (
 )
 
 func windowsLayout(machine Machine, runID string) RemoteLayout {
-	base := machine.Paths.Staging + "\\" + runID
+	// A configured trailing separator (C:\bench\) would otherwise double
+	// it, and the manifest's relative paths are cut at a fixed length.
+	base := strings.TrimRight(machine.Paths.Staging, "\\/") + "\\" + runID
 	scratch := base + "\\work"
 	if machine.Paths.Scratch != "" {
-		scratch = machine.Paths.Scratch + "\\" + runID
+		scratch = strings.TrimRight(machine.Paths.Scratch, "\\/") + "\\" + runID
 	}
 	return RemoteLayout{
 		Base:    base,
@@ -151,8 +153,12 @@ func WindowsRunScript(machine Machine, defaults RunDefaults, runID string, layou
 	write("[IO.File]::WriteAllText((Join-Path $R 'perf-NO-COLLECTOR.txt'), \"capabilities.perf = none on Windows hosts; phase timings only`r`n\", $Utf8NoBom)")
 	write("$Finished = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')")
 	write("$Elapsed = [int]([DateTime]::UtcNow - $StartTicks).TotalSeconds")
+	// Relative paths are cut from each file's FullName at the length of the
+	// results directory's own FullName, never of $R as configured: .NET
+	// normalises separators, so the two spellings can differ in length.
+	write("$RFull = (Get-Item -LiteralPath $R).FullName.TrimEnd('\\')")
 	write("$files = Get-ChildItem -LiteralPath $R -Recurse -File | Where-Object { $_.Name -ne 'MANIFEST.json' } | ForEach-Object {")
-	write("  [ordered]@{ path = $_.FullName.Substring($R.Length + 1).Replace('\\','/'); bytes = $_.Length; sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLower() } }")
+	write("  [ordered]@{ path = $_.FullName.Substring($RFull.Length + 1).Replace('\\','/'); bytes = $_.Length; sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLower() } }")
 	write("$manifest = [ordered]@{ schema_version = 1; run_id = $RunId; machine = $MachineName; platform_label = $Machine; started_utc = $Started; finished_utc = $Finished; elapsed_seconds = $Elapsed; status = $Status; failures = ($Failures -join ' '); files = @($files) }")
 	// Out-File -Encoding utf8 writes a BOM on Windows PowerShell 5.1, which
 	// encoding/json rejects; write UTF-8 without one.

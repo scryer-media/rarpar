@@ -33,8 +33,18 @@ func hostJoin(machine Machine, parts ...string) string {
 		return joinPosix(parts...)
 	}
 	cleaned := make([]string, 0, len(parts))
-	for _, part := range parts {
-		part = strings.Trim(strings.ReplaceAll(part, "/", "\\"), "\\")
+	for index, part := range parts {
+		part = strings.ReplaceAll(part, "/", "\\")
+		if index == 0 {
+			// Keep the leading separators: they are what makes a UNC path
+			// (\\server\share) absolute.
+			part = strings.TrimRight(part, "\\")
+			if strings.Trim(part, "\\") == "" {
+				part = ""
+			}
+		} else {
+			part = strings.Trim(part, "\\")
+		}
 		if part != "" {
 			cleaned = append(cleaned, part)
 		}

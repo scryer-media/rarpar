@@ -959,13 +959,23 @@ func validatePAR3(state *decodeState, prefix string, machine *Machine) {
 	if plan.ReferenceTimeoutMinutes < 0 {
 		state.fail("%s: par3.reference_timeout_minutes must not be negative (0 = timeout_minutes)", prefix)
 	}
+	var kernels []par3bench.KernelVariant
 	for _, variant := range plan.KernelVariants {
-		if _, err := par3bench.ParseKernelVariant(variant); err != nil {
+		kernel, err := par3bench.ParseKernelVariant(variant)
+		if err != nil {
 			state.fail("%s: par3.kernel_variants: %v", prefix, err)
+			continue
 		}
+		kernels = append(kernels, kernel)
 	}
-	if _, err := par3bench.ParseDurabilities(strings.Join(plan.Durability, ",")); err != nil {
+	durabilities, err := par3bench.ParseDurabilities(strings.Join(plan.Durability, ","))
+	if err != nil {
 		state.fail("%s: par3.durability: %v", prefix, err)
+	} else if err := par3bench.CheckVariantNames(par3bench.Variants(plan.Workers, kernels, durabilities)); err != nil {
+		state.fail("%s: par3: %v", prefix, err)
+	}
+	if err := par3bench.ValidatePinCPUs(plan.PinCPUs); err != nil {
+		state.fail("%s: par3.pin_cpus: %v", prefix, err)
 	}
 	if plan.IOCount && machine.isWindows() {
 		state.fail("%s: par3.iocount uses strace and is Linux-only", prefix)

@@ -236,7 +236,10 @@ alternates on every repeat. Each table cell is the median with the range,
 `median [min–max]`, for wall time, user+sys CPU, and peak RSS. Ratios compare
 medians against the reference, so below 1.000 means `rarpar` used less. Use
 `--pin-cpus 0-7` to confine every timed process to that CPU range (Linux
-`taskset`, Windows affinity). `--iocount` adds an untimed `strace -f -c` pass on
+`taskset`, Windows affinity). It takes one CPU or an inclusive range within
+CPUs 0-63; a list such as `0,2` is refused because the Windows mask cannot
+apply it. A matrix that would hold two rows with the same name, such as
+`--workers 1,1`, is refused too. `--iocount` adds an untimed `strace -f -c` pass on
 Linux and reports block and syscall counts.
 
 Repair runs against a fresh copy of the damaged tree each time. A repair row
@@ -273,7 +276,8 @@ A reference run is **DNF** for exactly these failure classes, recorded with
 the exit code (or the timeout) and the last line it printed:
 
 - `timeout`: it exceeded its timeout and was killed, with its whole process
-  group;
+  group (an interrupt or SIGTERM to `par3 run` kills the running process
+  group the same way before the harness exits);
 - `signal`: it was killed by a signal;
 - `exit-N`: it exited non-zero;
 - `no-carriers`, `truncated-carriers`, `unreadable-carriers`: a create exited 0

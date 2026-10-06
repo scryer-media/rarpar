@@ -200,6 +200,44 @@ func Variants(workers []int, kernels []KernelVariant, durabilities []string) []V
 	return variants
 }
 
+// ValidatePinCPUs accepts an empty value, one CPU "N", or an inclusive range
+// "N-M". That is the form both pinning paths apply as given (Linux taskset,
+// the Windows affinity mask), so a value either takes effect or is refused
+// here; a list such as "0,2" would be honoured by taskset and silently
+// dropped by the Windows mask while the results still claimed a pin.
+func ValidatePinCPUs(pin string) error {
+	if pin == "" {
+		return nil
+	}
+	low, high, ranged := strings.Cut(pin, "-")
+	if !ranged {
+		high = low
+	}
+	first, err1 := strconv.Atoi(low)
+	last, err2 := strconv.Atoi(high)
+	if err1 != nil || err2 != nil || first < 0 || last < first {
+		return fmt.Errorf("--pin-cpus %q: want one CPU N or an inclusive range N-M", pin)
+	}
+	if last >= 64 {
+		return fmt.Errorf("--pin-cpus %q: CPUs above 63 cannot be pinned (the Windows affinity mask is 64 bits)", pin)
+	}
+	return nil
+}
+
+// CheckVariantNames refuses a matrix with two rows of the same name, such as
+// "--workers 1,1" or a kernel variant listed twice: their runs would merge
+// into one row and every repeat count and median would be wrong.
+func CheckVariantNames(variants []Variant) error {
+	seen := map[string]bool{}
+	for _, variant := range variants {
+		if seen[variant.Name] {
+			return fmt.Errorf("row %q appears twice in the matrix; list each worker count and kernel variant once", variant.Name)
+		}
+		seen[variant.Name] = true
+	}
+	return nil
+}
+
 // ParseDurabilities reads a comma-separated durability list. Durable is the
 // default mode and is always measured.
 func ParseDurabilities(text string) ([]string, error) {
@@ -530,6 +568,12 @@ func validateOptions(options *Options) error {
 		options.ReferenceTimeout = options.Timeout
 	}
 	if err := options.Profile.Validate(); err != nil {
+		return err
+	}
+	if err := ValidatePinCPUs(options.PinCPUs); err != nil {
+		return err
+	}
+	if err := CheckVariantNames(Variants(options.Workers, options.KernelVariants, options.Durabilities)); err != nil {
 		return err
 	}
 	for _, path := range []*string{&options.Reference, &options.Candidate, &options.EnginePerf, &options.Work, &options.Out} {
