@@ -29,7 +29,9 @@ type EngineCounters struct {
 	Opens      int64 `json:"file_opens"`
 	Syncs      int64 `json:"file_syncs"`
 	Clones     int64 `json:"file_clones"`
-	Snapshots  int64 `json:"snapshots"`
+	// InPlace counts outputs repaired by patching their source.
+	InPlace   int64 `json:"file_in_place"`
+	Snapshots int64 `json:"snapshots"`
 	// SyncSeconds is the time the engine spent in fsync.
 	SyncSeconds  float64 `json:"sync_seconds"`
 	StripePasses int64   `json:"stripe_passes"`
@@ -74,7 +76,7 @@ func ParseEngineOutput(stdout string) (EngineCounters, bool) {
 				"file_read_bytes": &counters.ReadBytes, "file_read_calls": &counters.ReadCalls,
 				"file_write_bytes": &counters.WriteBytes, "file_write_calls": &counters.WriteCalls,
 				"file_opens": &counters.Opens, "file_syncs": &counters.Syncs, "file_clones": &counters.Clones,
-				"snapshots": &counters.Snapshots,
+				"file_in_place": &counters.InPlace, "snapshots": &counters.Snapshots,
 			} {
 				if value, ok := number(key); ok {
 					*target = value

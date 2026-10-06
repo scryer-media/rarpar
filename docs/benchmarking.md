@@ -406,7 +406,9 @@ Mount options are client environment variables (`NFS_VERS`, `NFS_PROTO`,
 `NFS_NCONNECT`, `NFS_EXTRA_OPTS`) and are recorded in every row with the
 server type and export mode. `--service bench-client-lowmem` runs in a client
 whose memory limit (`RIG_LOWMEM_LIMIT`, default 768m) is below the largest
-set file, so a second read pass cannot come from the page cache. Evidence goes
+set file, so a second read pass cannot come from the page cache. `--env
+RIG_EXT4=8G` adds a `local-ext4` target, a fresh loop-mounted ext4 image of
+that size: a local filesystem without file clones. Evidence goes
 to `target/bench/nfs/<label>/`, with the host's load average sampled into
 `host-load.jsonl`. The cache volume keeps builds and datasets between runs;
 `nfs down --volumes` removes it.

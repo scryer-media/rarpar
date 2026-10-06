@@ -148,6 +148,68 @@
   AVX-512 moves the same way. On an M-series, which does not tile, the same
   creates and repairs stay within 3% of the slab-walk build's wall and CPU
   at 1, 8 and 18 workers.
+- x86_64 hosts with AVX512BW but no GFNI (Skylake-SP and its server
+  successors before Ice Lake) run the GF(2^8) one-source and grouped
+  multiply-accumulate kernels as `vpshufb` nibble shuffles on 512-bit
+  vectors; only whole 64-byte strips take the 512-bit form and the tail
+  runs the existing kernels. `gf8::kernel_name` reports the tier in use, and
+  `WEAVER_GF8_AVX512=0` pins the 256-bit kernels the way `WEAVER_GF8_GFNI=0`
+  pins the shuffles. Output is bit-identical. 1 GiB, 100 rows, GF(2^8)
+  Cauchy, Skylake-SP: create 8.24 → 6.21 s at one worker and 4.70 → 3.75 s
+  at four (CPU -26% and -32%), repair 4.72 → 3.77 s and 3.15 → 2.78 s;
+  one-source ceiling at 4 KiB 27.2 → 46.8 GiB/s. GFNI hosts are unchanged.
+- `MulPlan::cached` returns a plan for any factor from a table built at
+  compile time (`MulPlan::new` and `gf8::mul` are now `const fn`), so a
+  caller that folds short rows no longer rebuilds the nibble tables and
+  affine matrix per call: build-plus-accumulate at 4 KiB rises 7% on Zen 4
+  and 9% on Skylake-SP with the AVX2 GFNI and nibble kernels; at 64 KiB
+  and above it is neutral. `gf8::mul_acc_region` takes the cached plan.
+- In `MulPlan::accumulate`, factor 0 is a no-op and factor 1 a vector XOR on
+  every tier instead of a full table multiply, and the grouped kernel drops
+  zero-factor sources before it forms its groups.
+- `LinearMap8` runs its nibble-shuffle maps (multiply-accumulate, map, fused
+  butterfly and radix-4) on 512-bit vectors on AVX512BW hosts without GFNI;
+  `gf_simd::linear_uses_avx512` says whether it does and
+  `WEAVER_LINEAR_AVX512=0` pins the 256-bit kernels. On Skylake-SP the u8
+  lane transform of 256 rows of 4 KiB runs 386 → 280 µs, and a 1 GiB GF(2^8)
+  FFT create takes about 1% less wall and 1-3% less CPU. The GFNI affine
+  maps stay at 256 bits: a 512-bit form measured a wash on Zen 4 and 2-4%
+  slower end to end on Sapphire Rapids, where the 512-bit units clock lower.
+  Output is bit-identical.
+- `kernel_ceiling` names the GF(2^8) kernel and linear forms in use and
+  gains rows for `MulPlan::new` plus accumulate (the gap to the cached row
+  is the table build) and for `LinearMap8::accumulate`.
+- Pooled transforms and derivatives walk the bank in slabs. When a bank of
+  three levels or more outgrows `fft::TRANSFORM_SCRATCH_BYTES` (512 KiB)
+  and every pass of the walk has at least one slab per thread, each worker
+  gathers the rows of a slab into its own contiguous scratch, runs every
+  sweep of a pass over that slab and scatters the result back, in one pass
+  when a window of the scratch holds 2 KiB rows and otherwise in two passes
+  split at the middle level — the low levels over blocks of consecutive
+  rows, the high levels over rows a block apart — so each sweep reads its
+  rows from cache instead of streaming the whole bank per level. A slab's
+  window is no wider than the rows split across the workers, so their
+  slabs together never hold more than the bank, rounded up to whole
+  64-symbol runs. Rows flagged zero before a
+  pass are not gathered and rows still zero after it are not put back. A
+  walked transform keeps the butterflies of every sweep while it runs,
+  prepared once for all the slabs: `walk_units_bytes` says how much that
+  is and `walks` whether a transform walks at all; a bank the pool would
+  not walk is still swept a level at a time across the workers, which on
+  the Alder Lake cores beats transforming banks of a mebibyte side by side
+  on sibling threads. The derivative gathers a window of every row the
+  same way and differentiates bit-major into a second copy, so each worker
+  takes at most the scratch and all of them together at most twice the
+  bank. The sequential
+  `transform` and `derivative` sweep whole rows as before: alone, the
+  kernels are bound by their own work and the copies would be pure cost.
+  `fft::POOL_GATHERS` is false on Apple silicon, whose memory system
+  streams the whole-row sweeps faster than the copies cost (walk 1.5 times
+  and derivative twice as long as the row-parallel sweeps on an M-series),
+  so there the pooled paths stay as they were and take no scratch. Output
+  is bit-identical. Decode of 2048 data rows of 1 MiB over GF(2^16), 50
+  lost, eight workers on four Alder Lake P-cores: 1.67 → 1.34 s, CPU
+  11.3 → 8.3 s; one worker unchanged.
 - `TransformField::derivative_at` and `derivative_u8_at` run an erasure
   decode's inverse transform, formal derivative and forward transform as
   one step and return only the rows the caller asks for. With the levels

@@ -347,6 +347,7 @@ struct State {
     files: IoCounters,
     opens: AtomicU64,
     clones: AtomicU64,
+    in_place: AtomicU64,
     stages: [StageCounters; STAGES],
     sync: StageCounters,
     next: AtomicU64,
@@ -417,6 +418,16 @@ impl ExecutionDiagnostics {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn note_clone(&self) {
         add(&self.0.clones, 1);
+    }
+    /// Repair outputs that could not be cloned and were repaired in place,
+    /// with backups off: only the extents the repair rebuilt were written
+    /// into the existing file, which was then read back whole.
+    pub fn file_in_place_repairs(&self) -> u64 {
+        self.0.in_place.load(Ordering::Relaxed)
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn note_in_place(&self) {
+        add(&self.0.in_place, 1);
     }
     /// File synchronization barriers, including time waiting for storage.
     /// `calls` counts attempts and `completed` counts successes. Durations are

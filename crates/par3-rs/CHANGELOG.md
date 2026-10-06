@@ -175,6 +175,12 @@
   blocks, GF(2^8) create at one worker, codec seconds: Sapphire Rapids 3.62
   to 1.87, Zen 4 3.27 to 2.03, Alder Lake 3.65 to 2.33 (GFNI AVX2), Apple
   M-series 2.33 to 2.17; bytes identical.
+- GF(2^8) batches take each factor's plan from `gf8::MulPlan::cached` instead
+  of building sixteen plans per stripe, and pick up the 512-bit shuffle
+  kernels of reedsolomon-rs 0.4.8 on AVX512BW hosts without GFNI. 1 GiB,
+  100 rows, GF(2^8) Cauchy on Skylake-SP: create 8.24 to 6.21 s at one
+  worker and 4.70 to 3.75 s at four, repair 4.72 to 3.77 s and 3.15 to
+  2.78 s; Zen 4 and Sapphire Rapids within noise; bytes identical.
 - With a worker pool, Cauchy repair reads and scatters the next group of
   surviving stripes while the workers fold the previous one, and adds the
   recovery rows to their syndromes in parallel. The second set of stripes is
@@ -370,6 +376,32 @@
   clone attempt uses `DiskSourceAccess`'s cached read handle, so it costs no
   open while handles are cached. Repair also no longer reads surviving
   blocks that no reconstruction and no staged output needs.
+- On macOS and Linux, where no clone is taken and the repair keeps no
+  backup (`Par3RepairSession::repair` with `backup` off), a damaged file is
+  now patched where it stands instead of being copied whole into a stage:
+  only the extents its
+  evidence does not hold intact are written. It applies only when the
+  registry hands over the very file the evidence verified, that file has a
+  single link and no unprotected range, it is unchanged since its snapshot,
+  and nothing else the repair reads (a placed extent, another file's
+  evidence, a recovery or data payload) comes from it. The patched file is
+  then read back whole and checked against its File packet before it is
+  reported repaired, since its own writes move its snapshot; a mismatch fails
+  the repair. A patch cut short leaves the intact extents untouched, so the
+  file still verifies as damaged and repairs again. Where the filesystem has
+  no clones, a file with a few lost blocks now costs those blocks' writes and
+  one read-back instead of a full rewrite, which on a network mount is most of
+  the repair. A file with a backup, a second hard link, or a separate output
+  directory is still staged and copied as before; Windows is unchanged.
+  `ExecutionDiagnostics::file_in_place_repairs()` counts patched files, and
+  `engine_perf` reports it as `file_in_place`.
+- A repaired output that is read back before installation (a file patched in
+  place, or a staged one whose writes did not prove it) is now read in runs
+  of adjacent protected extents rather than one extent at a time. An output
+  of 8 MiB or more is read in 1 MiB pieces hashed across up to four workers
+  of an admitted pool, as disk verification already hashes a large source;
+  it falls back to the serial 64 KiB read when memory or the worker budget
+  refuses. The fingerprint and its verdict are unchanged.
 - macOS and Linux builds take `libc` as a regular dependency, and permit
   `unsafe` only in the two file-clone calls. Every other non-Windows target
   keeps `forbid(unsafe_code)`.

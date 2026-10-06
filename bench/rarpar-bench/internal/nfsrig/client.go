@@ -28,6 +28,10 @@ type ClientConfig struct {
 	// Reference builds the pinned par3cmdline into the cache volume when it
 	// is not there yet (RIG_REFERENCE, default on).
 	Reference bool `json:"reference"`
+	// Ext4 is the size of a loop-mounted ext4 image to add as the
+	// `local-ext4` target, in truncate(1) units ("8G"), or empty for none
+	// (RIG_EXT4).
+	Ext4 string `json:"ext4,omitempty"`
 }
 
 // ClientConfigFromEnv reads the client role's environment.
@@ -54,7 +58,27 @@ func ClientConfigFromEnv(getenv func(string) string) (ClientConfig, error) {
 			return ClientConfig{}, fmt.Errorf("%s=%q: want on or off", flag.name, text)
 		}
 	}
+	if text := getenv("RIG_EXT4"); text != "" {
+		if !validSize(text) {
+			return ClientConfig{}, fmt.Errorf("RIG_EXT4=%q: want a size such as 8G", text)
+		}
+		config.Ext4 = text
+	}
 	return config, nil
+}
+
+// validSize accepts a decimal count with an optional K, M, G or T suffix.
+func validSize(text string) bool {
+	digits := strings.TrimRight(text, "KMGT")
+	if len(text)-len(digits) > 1 || digits == "" {
+		return false
+	}
+	for _, r := range digits {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // Binaries are the client's built tools, all in the cache volume.
@@ -79,7 +103,10 @@ type Session struct {
 	// Markers are the server's provenance files, by target name.
 	Markers map[string]ServerMarker
 	// LocalFS is the filesystem type under the local control directory.
-	LocalFS      string
+	LocalFS string
+	// Ext4 says the `local-ext4` target is mounted.
+	Ext4         bool
+	loop         string
 	localIOSaved string
 	mounted      []string
 	log          io.Writer
@@ -144,12 +171,83 @@ func Mount(ctx context.Context, config ClientConfig, log io.Writer) (*Session, e
 		return nil, err
 	}
 	session.LocalFS = backingFS(LocalWork)
+	if config.Ext4 != "" {
+		session.Ext4 = true
+		loop, err := mountExt4(ctx, config.Ext4, log)
+		session.loop = loop
+		if err != nil {
+			session.Close()
+			return nil, err
+		}
+		session.mounted = append(session.mounted, LocalExt4)
+	}
 	return session, nil
+}
+
+// mountExt4 makes a fresh sparse ext4 image of size and mounts it at
+// LocalExt4 through a loop device, which it returns once attached, even when
+// the mount then fails. A container's /dev holds only the loop nodes that
+// existed when it started, so the node for the device the kernel hands out
+// is made here when it is missing.
+func mountExt4(ctx context.Context, size string, log io.Writer) (string, error) {
+	if err := os.MkdirAll(filepath.Dir(Ext4Image), 0o755); err != nil {
+		return "", err
+	}
+	if err := os.Remove(Ext4Image); err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+	if err := os.MkdirAll(LocalExt4, 0o755); err != nil {
+		return "", err
+	}
+	run := func(args ...string) (string, error) {
+		fmt.Fprintf(log, "nfs client: %s\n", strings.Join(args, " "))
+		output, err := exec.CommandContext(ctx, args[0], args[1:]...).CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("%s: %w\n%s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+		}
+		return strings.TrimSpace(string(output)), nil
+	}
+	if _, err := run("truncate", "-s", size, Ext4Image); err != nil {
+		return "", err
+	}
+	if _, err := run("mkfs.ext4", "-q", "-F", "-E", "nodiscard", Ext4Image); err != nil {
+		return "", err
+	}
+	device, err := run("losetup", "-f")
+	if err != nil {
+		return "", err
+	}
+	minor, ok := strings.CutPrefix(device, "/dev/loop")
+	if !ok || minor == "" || strings.Trim(minor, "0123456789") != "" {
+		return "", fmt.Errorf("losetup -f: unexpected device %q", device)
+	}
+	if _, err := os.Stat(device); os.IsNotExist(err) {
+		if _, err := run("mknod", device, "b", "7", minor); err != nil {
+			return "", err
+		}
+	}
+	if _, err := run("losetup", device, Ext4Image); err != nil {
+		return "", err
+	}
+	if _, err := run("mount", device, LocalExt4); err != nil {
+		return device, err
+	}
+	return device, nil
 }
 
 // TargetArgs are this session's `par3 run` target arguments.
 func (s *Session) TargetArgs() []string {
-	return TargetArgs(s.Markers, s.Config.Mount, s.LocalFS)
+	args := TargetArgs(s.Markers, s.Config.Mount, s.LocalFS)
+	if s.Ext4 {
+		args = append(args, Ext4TargetArgs()...)
+	}
+	return args
+}
+
+// Ext4TargetArgs name the loop-mounted ext4 target.
+func Ext4TargetArgs() []string {
+	return []string{"--target", "local-ext4=" + LocalExt4,
+		"--target-meta", "local-ext4:storage=loop-image,backing_fs=ext4"}
 }
 
 // Close unmounts the exports and puts LOCALIO back as it was.
@@ -160,6 +258,16 @@ func (s *Session) Close() {
 		}
 	}
 	s.mounted = nil
+	if s.loop != "" {
+		if output, err := exec.Command("losetup", "-d", s.loop).CombinedOutput(); err != nil {
+			fmt.Fprintf(s.log, "nfs client: losetup -d %s: %v %s\n", s.loop, err, strings.TrimSpace(string(output)))
+		}
+		s.loop = ""
+	}
+	if s.Ext4 {
+		_ = os.Remove(Ext4Image)
+		s.Ext4 = false
+	}
 	if s.localIOSaved != "" {
 		if err := os.WriteFile(localIOParameter, []byte(s.localIOSaved), 0o644); err != nil {
 			fmt.Fprintf(s.log, "nfs client: restore localio=%s: %v\n", s.localIOSaved, err)
