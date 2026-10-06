@@ -1,4 +1,5 @@
 mod cleanup;
+mod compat_par3;
 mod compat_unrar;
 mod discovery;
 mod error;
@@ -33,7 +34,7 @@ fn main() -> ExitCode {
     let program = raw_args.next().unwrap_or_default();
     let args: Vec<_> = raw_args.collect();
 
-    if let Some(code) = dispatch_compat(&args) {
+    if let Some(code) = dispatch_compat(&program, &args) {
         return ExitCode::from(code);
     }
 
@@ -342,6 +343,12 @@ fn run_rar_command(cli: &Cli, command: RarCommand) -> Result<u8, RarparError> {
     }
 }
 
-fn dispatch_compat(args: &[OsString]) -> Option<u8> {
-    par2::dispatch_par2cmdline_compat(args).or_else(|| compat_unrar::dispatch(args))
+fn dispatch_compat(program: &OsString, args: &[OsString]) -> Option<u8> {
+    // Started as `par3`, rarpar is par3cmdline and takes every command line.
+    if compat_par3::invoked_as_par3(program) {
+        return compat_par3::dispatch(args, true);
+    }
+    compat_par3::dispatch(args, false)
+        .or_else(|| par2::dispatch_par2cmdline_compat(args))
+        .or_else(|| compat_unrar::dispatch(args))
 }
