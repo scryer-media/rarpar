@@ -99,15 +99,11 @@ pub fn is_carrier(path: &Path) -> bool {
 }
 
 pub fn is_carrier_candidate(path: &Path) -> bool {
-    use std::io::Read;
     if is_carrier(path) {
         return true;
     }
-    let mut prefix = [0; 8];
-    std::fs::File::open(path)
-        .and_then(|mut file| file.read_exact(&mut prefix))
-        .is_ok()
-        && &prefix == par3_rs::MAGIC
+    crate::discovery::read_prefix(path, par3_rs::MAGIC.len())
+        .is_ok_and(|prefix| prefix == par3_rs::MAGIC)
 }
 
 fn carrier_options(
