@@ -18,8 +18,13 @@ type Measurement struct {
 	WallSeconds float64 `json:"wall_seconds"`
 	UserSeconds float64 `json:"user_seconds"`
 	SysSeconds  float64 `json:"sys_seconds"`
-	// MaxRSSBytes is the peak resident set (POSIX ru_maxrss, normalised to
-	// bytes) or the peak working set on Windows.
+	// MaxRSSBytes is the peak resident set, required on every row: the
+	// child's own rusage ru_maxrss on macOS (bytes, the figure
+	// `/usr/bin/time -l` prints as "maximum resident set size") and Linux
+	// (KiB, normalised; `/usr/bin/time -v` "Maximum resident set size"), and
+	// PeakWorkingSetSize from K32GetProcessMemoryInfo on a handle held
+	// across the child's exit on Windows (Process.PeakWorkingSet64 reads
+	// null once the process has exited, so it is not used).
 	MaxRSSBytes int64 `json:"max_rss_bytes"`
 	// BlockInOps / BlockOutOps are ru_inblock / ru_oublock: block I/O the
 	// kernel charged to the process (POSIX). Page-cache hits are free, so these

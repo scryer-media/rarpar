@@ -51,6 +51,12 @@ type PAR3View struct {
 	Args     []string `json:"args"`
 	Configs  []string `json:"configs"`
 	Variants []string `json:"variants"`
+	// Rows lists, per op, the rows each set produces: rarpar's create and
+	// repair rows come in durable (default) and buffered pairs.
+	Rows map[string][]string `json:"rows"`
+	// Warnings are reference work-path warnings: the run goes ahead and a
+	// reference that fails is recorded as DNF.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 type Protocol struct {
@@ -180,6 +186,9 @@ func BuildPlan(config Config, machines []Machine, runID string) FleetPlan {
 			if problem != "" {
 				plan.Warnings = append(plan.Warnings, fmt.Sprintf("machine %s: %s; fleet run would refuse to start", machine.Name, problem))
 			}
+			for _, warning := range view.Warnings {
+				plan.Warnings = append(plan.Warnings, fmt.Sprintf("machine %s: par3 work path: %s", machine.Name, warning))
+			}
 		}
 		if machine.Kind == KindAWSEC2 && machine.EC2 != nil {
 			teardown := []string{
@@ -262,8 +271,9 @@ func machineSteps(machine Machine, layout RemoteLayout) []string {
 		if oracle, ok := machine.Oracles["par3"]; ok && oracle.Recipe == RecipePAR3CmdlineHost {
 			steps = append(steps, "on host: build the par3cmdline reference from the toolchains.json pin (cmake, Release)")
 		}
-		steps = append(steps, fmt.Sprintf("on host: macro-par3, profile %s, workers %v, warmups=%d repeats=%d, work %s",
-			machine.PAR3.Profile, machine.PAR3.Workers, machine.PAR3.Warmups, machine.PAR3.Repeats, PAR3Work(machine, layout)))
+		steps = append(steps, fmt.Sprintf("on host: macro-par3, profile %s, workers %v, rarpar create/repair %s, warmups=%d repeats=%d, %dm per-run timeout (reference failures are DNF), work %s",
+			machine.PAR3.Profile, machine.PAR3.Workers, strings.Join(par3Durabilities(machine), "+"), machine.PAR3.Warmups, machine.PAR3.Repeats,
+			machine.PAR3.TimeoutMinutes, PAR3Work(machine, layout)))
 	}
 	switch machine.Capabilities.Perf {
 	case PerfLinux:
@@ -286,7 +296,10 @@ func machineSteps(machine Machine, layout RemoteLayout) []string {
 }
 
 // par3View resolves the macro-par3 matrix and checks the work path against the
-// reference's name-buffer limit. A non-empty problem blocks the run.
+// reference's name-buffer limit. A non-empty problem (a matrix that does not
+// resolve) blocks the run; an over-long work path is only a warning, because
+// the suite records a failing reference as DNF and still runs every rarpar
+// row.
 func par3View(machine Machine, layout RemoteLayout) (*PAR3View, string) {
 	work := PAR3Work(machine, layout)
 	view := &PAR3View{Work: work, Args: par3Args(machine)}
@@ -306,13 +319,29 @@ func par3View(machine Machine, layout RemoteLayout) (*PAR3View, string) {
 		}
 		variants = append(variants, variant)
 	}
-	for _, variant := range par3bench.Variants(machine.PAR3.Workers, variants) {
+	durabilities, err := par3bench.ParseDurabilities(strings.Join(machine.PAR3.Durability, ","))
+	if err != nil {
+		return view, "par3: " + err.Error()
+	}
+	all := par3bench.Variants(machine.PAR3.Workers, variants, durabilities)
+	for _, variant := range all {
 		view.Variants = append(view.Variants, variant.Name)
 	}
-	if err := par3bench.CheckWorkPath(profile, work); err != nil {
-		return view, "par3 work path: " + err.Error()
+	ops := machine.PAR3.Ops
+	if len(ops) == 0 {
+		ops = par3bench.DefaultOps
 	}
+	view.Rows = par3bench.RowsByOp(all, ops)
+	view.Warnings = par3bench.WorkPathWarnings(profile, work)
 	return view, ""
+}
+
+func par3Durabilities(machine Machine) []string {
+	durabilities, err := par3bench.ParseDurabilities(strings.Join(machine.PAR3.Durability, ","))
+	if err != nil {
+		return machine.PAR3.Durability
+	}
+	return durabilities
 }
 
 func startStep(machine Machine) string {

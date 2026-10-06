@@ -185,7 +185,12 @@ type PAR3Plan struct {
 	// checks it against every selected set.
 	Work           string   `json:"work,omitempty"`
 	KernelVariants []string `json:"kernel_variants,omitempty"`
-	TimeoutMinutes int      `json:"timeout_minutes"`
+	// Durability lists rarpar's durability rows for create and repair
+	// (default: durable, buffered). Durable is always included.
+	Durability []string `json:"durability,omitempty"`
+	// TimeoutMinutes bounds every timed process (default 20); a reference run
+	// past it is DNF.
+	TimeoutMinutes int `json:"timeout_minutes"`
 }
 
 type Connection struct {
@@ -529,7 +534,8 @@ func decodeMachine(item *section, settings Settings) Machine {
 		IOCount:        par3.boolean("iocount", false),
 		Work:           par3.str("work", ""),
 		KernelVariants: par3.strings("kernel_variants", nil),
-		TimeoutMinutes: par3.integer("timeout_minutes", 120),
+		Durability:     par3.strings("durability", nil),
+		TimeoutMinutes: par3.integer("timeout_minutes", 20),
 	}
 	par3.finish()
 
@@ -943,6 +949,9 @@ func validatePAR3(state *decodeState, prefix string, machine *Machine) {
 		if _, err := par3bench.ParseKernelVariant(variant); err != nil {
 			state.fail("%s: par3.kernel_variants: %v", prefix, err)
 		}
+	}
+	if _, err := par3bench.ParseDurabilities(strings.Join(plan.Durability, ",")); err != nil {
+		state.fail("%s: par3.durability: %v", prefix, err)
 	}
 	if plan.IOCount && machine.isWindows() {
 		state.fail("%s: par3.iocount uses strace and is Linux-only", prefix)

@@ -51,23 +51,31 @@ func ReferenceNameBytes(dir string, recovery int64) int {
 	return total
 }
 
-// checkReferencePaths refuses a work directory whose reference output paths
-// would overflow par3cmdline's name buffer, before any data is generated.
-func checkReferencePaths(options Options) error {
-	for _, config := range options.Profile.Configs {
+// referencePathWarnings lists every set whose reference output paths under
+// work would overflow par3cmdline's name buffer. It is a warning, not a
+// refusal: the run goes ahead, and a reference that then fails is recorded as
+// DNF while the rarpar rows still run.
+func referencePathWarnings(profile Profile, work string) []string {
+	var warnings []string
+	for _, config := range profile.Configs {
+		worst := 0
 		for _, dir := range []string{
-			filepath.Join(options.Work, "k", config.ID),
-			filepath.Join(options.Work, "s", config.ID, "create-ref"),
+			filepath.Join(work, "k", config.ID),
+			filepath.Join(work, "s", config.ID, "create-ref"),
 		} {
-			need := ReferenceNameBytes(dir, config.Recovery)
-			if need >= referenceNameBuffer {
-				excess := need - referenceNameBuffer + 1
-				return fmt.Errorf("set %s: --work %s is too long for the reference: its %d recovery volumes need %d bytes of absolute file names and par3cmdline mishandles more than %d (a dangling pointer after its name list grows; it fails with \"Failed to open Recovery File\"). Shorten --work by at least %d characters",
-					config.ID, options.Work, volumeCount(config.Recovery), need, referenceNameBuffer-1, shortenBy(excess, volumeCount(config.Recovery)+1))
+			if need := ReferenceNameBytes(dir, config.Recovery); need > worst {
+				worst = need
 			}
 		}
+		if worst < referenceNameBuffer {
+			continue
+		}
+		excess := worst - referenceNameBuffer + 1
+		volumes := volumeCount(config.Recovery)
+		warnings = append(warnings, fmt.Sprintf("set %s: --work %s (%d characters) gives the reference %d characters of absolute file names for its %d recovery volumes; par3cmdline mishandles more than %d (a dangling pointer after its name list grows; it exits 6 with \"Failed to open Recovery File\"). Running anyway: if the reference fails, its rows for this set are recorded as DNF. Shortening --work by %d characters avoids the risk",
+			config.ID, work, len(work), worst, volumes, referenceNameBuffer-1, shortenBy(excess, volumes+1)))
 	}
-	return nil
+	return warnings
 }
 
 func volumeCount(recovery int64) int {
@@ -84,8 +92,8 @@ func shortenBy(excess, names int) int {
 	return (excess + names - 1) / names
 }
 
-// CheckWorkPath applies the same reference name-buffer check to a work
+// WorkPathWarnings applies the same reference name-buffer check to a work
 // directory chosen elsewhere (the fleet plan), before anything runs.
-func CheckWorkPath(profile Profile, work string) error {
-	return checkReferencePaths(Options{Profile: profile, Work: work})
+func WorkPathWarnings(profile Profile, work string) []string {
+	return referencePathWarnings(profile, work)
 }

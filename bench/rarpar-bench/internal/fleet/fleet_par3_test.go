@@ -27,7 +27,7 @@ func TestPAR3SuiteDecodes(t *testing.T) {
 	}
 	plan := machine.PAR3
 	if plan.Profile != "full" || len(plan.Workers) != 2 || plan.Workers[0] != 1 || plan.Workers[1] != 8 ||
-		plan.PinCPUs != "0-7" || plan.Work != "/home/bench/p3" || plan.TimeoutMinutes != 120 {
+		plan.PinCPUs != "0-7" || plan.Work != "/home/bench/p3" || plan.TimeoutMinutes != 20 {
 		t.Fatalf("unexpected par3 plan: %+v", plan)
 	}
 	if oracle := machine.Oracles["par3"]; oracle.Recipe != RecipePAR3CmdlineHost {
@@ -91,7 +91,7 @@ func TestPAR3RunScriptSection(t *testing.T) {
 		`par3 build-reference --out '/home/bench/fleet-stage/fleet-testrun/par3-reference' --toolchains "$BIN/toolchains.json"`,
 		`par3 run --reference "$P3_REFERENCE" --candidate "$CANDIDATE" --work "$P3_WORK"`,
 		"P3_WORK='/home/bench/p3'",
-		"'--profile' 'full' '--workers' '1,8' '--warmups' '1' '--repeats' '5' '--timeout' '120m' '--pin-cpus' '0-7'",
+		"'--profile' 'full' '--workers' '1,8' '--warmups' '1' '--repeats' '5' '--timeout' '20m' '--pin-cpus' '0-7'",
 		"gate macro-par3",
 		"fail par3-reference-missing",
 	} {
@@ -135,19 +135,36 @@ func TestPAR3WindowsUsesTheOfficialBinaryAndHostPaths(t *testing.T) {
 	}
 }
 
-func TestPAR3PlanRefusesALongWorkPath(t *testing.T) {
-	_, machine := exampleMachine(t, "linux-avx2")
+func TestPAR3PlanWarnsAboutALongWorkPathButRuns(t *testing.T) {
+	config, machine := exampleMachine(t, "linux-avx2")
 	layout := LayoutFor(machine, "fleet-testrun")
 	view, problem := par3View(machine, layout)
-	if problem != "" {
-		t.Fatalf("the example work path must pass: %s", problem)
+	if problem != "" || len(view.Warnings) != 0 {
+		t.Fatalf("the example work path must pass cleanly: %s %v", problem, view.Warnings)
 	}
-	if len(view.Configs) == 0 || strings.Join(view.Variants, ",") != "reference,rarpar-w1,rarpar-w8" {
+	if len(view.Configs) == 0 || strings.Join(view.Variants, ",") != "reference,rarpar-w1,rarpar-w1-buffered,rarpar-w8,rarpar-w8-buffered" {
 		t.Fatalf("unexpected view: %+v", view)
 	}
+	if strings.Join(view.Rows["create"], ",") != "reference,rarpar-w1,rarpar-w1-buffered,rarpar-w8,rarpar-w8-buffered" ||
+		strings.Join(view.Rows["verify"], ",") != "reference,rarpar-w1,rarpar-w8" {
+		t.Fatalf("unexpected rows: %v", view.Rows)
+	}
 	machine.PAR3.Work = "/home/bench/" + strings.Repeat("deep/", 20) + "p3"
-	if _, problem := par3View(machine, layout); !strings.Contains(problem, "Shorten --work") {
-		t.Fatalf("a long work path must be refused: %q", problem)
+	view, problem = par3View(machine, layout)
+	if problem != "" {
+		t.Fatalf("a long work path must not block the run: %q", problem)
+	}
+	if len(view.Warnings) == 0 || !strings.Contains(view.Warnings[0], "characters)") || !strings.Contains(view.Warnings[0], "DNF") {
+		t.Fatalf("a long work path must warn with the character count: %v", view.Warnings)
+	}
+	plan := BuildPlan(config, []Machine{machine}, "fleet-testrun")
+	warnings := strings.Join(plan.Warnings, "\n")
+	if !strings.Contains(warnings, "par3 work path") || strings.Contains(warnings, "would refuse") {
+		t.Fatalf("plan warnings: %s", warnings)
+	}
+	machine.PAR3.Durability = []string{"buffered"}
+	if _, problem := par3View(machine, layout); !strings.Contains(problem, "durable") {
+		t.Fatalf("a durability list without durable must be refused: %q", problem)
 	}
 }
 

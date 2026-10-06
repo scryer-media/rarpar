@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Stat is a median with its range.
@@ -30,10 +31,14 @@ func stat(values []float64) Stat {
 
 // Row is one variant's summary for one configuration and operation.
 type Row struct {
-	Config   string
-	Op       string
-	Variant  string
-	Tool     string
+	Config  string
+	Op      string
+	Variant string
+	Tool    string
+	// Durability is "durable"/"buffered" for rarpar rows, "" for the reference.
+	Durability string
+	// DNF describes why a reference row did not finish; empty otherwise.
+	DNF      string
 	Wall     Stat
 	CPU      Stat
 	RSS      Stat
@@ -51,28 +56,42 @@ type Row struct {
 func Summarize(results *Results) []Row {
 	type key struct{ config, op, variant string }
 	grouped := map[key][]RunRecord{}
+	dnf := map[key]RunRecord{}
 	for _, run := range results.Runs {
+		k := key{run.Config, run.Op, run.Variant}
+		if run.Status == StatusDNF {
+			// A DNF ends the row whether it hit a warmup, a measured run,
+			// or the canonical seed.
+			if _, seen := dnf[k]; !seen {
+				dnf[k] = run
+			}
+			continue
+		}
 		if run.Warmup {
 			continue
 		}
-		k := key{run.Config, run.Op, run.Variant}
 		grouped[k] = append(grouped[k], run)
 	}
 	var rows []Row
 	for _, config := range results.Configs {
 		for _, op := range results.Ops {
 			for _, variant := range results.Variants {
-				runs := grouped[key{config.ID, op, variant.Name}]
-				if len(runs) == 0 {
+				k := key{config.ID, op, variant.Name}
+				runs := grouped[k]
+				stopped, didNotFinish := dnf[k]
+				if len(runs) == 0 && !didNotFinish {
 					continue
 				}
-				row := Row{Config: config.ID, Op: op, Variant: variant.Name, Tool: variant.Tool}
+				row := Row{Config: config.ID, Op: op, Variant: variant.Name, Tool: variant.Tool, Durability: variant.EffectiveDurability()}
+				if didNotFinish {
+					row.DNF = describeDNF(stopped)
+				}
 				var wall, cpu, rss, bin, bout, rops, wops []float64
 				identities := map[string]bool{}
 				repaired := map[string]bool{}
 				extras := map[string]bool{}
 				for _, run := range runs {
-					if run.Status != "ok" {
+					if run.Status != StatusOK {
 						row.Failed++
 						continue
 					}
@@ -149,8 +168,22 @@ func RenderReport(results *Results) string {
 	if results.PinCPUs != "" {
 		fmt.Fprintf(&b, "; pinned to CPUs %s (applied: %t)", results.PinCPUs, results.PinApplied)
 	}
-	fmt.Fprintf(&b, "\n- Started %s, finished %s, status **%s**\n\n", results.StartedUTC, results.FinishedUTC, results.Status)
-	fmt.Fprintln(&b, "Wall and CPU (user+sys) are seconds, RSS is peak MiB; cells are median [min–max]. Ratios are rarpar/reference medians: below 1.000 rarpar used less. The reference is single-threaded.")
+	fmt.Fprintln(&b)
+	durabilities := results.Durabilities
+	if len(durabilities) == 0 {
+		durabilities = []string{DurabilityDurable}
+	}
+	fmt.Fprintf(&b, "- Durability: rarpar create and repair run as %s; **durable** (every output synced) is rarpar's default. The reference never syncs and has one row.", strings.Join(durabilities, " and "))
+	for _, op := range results.BufferedUnsupported {
+		fmt.Fprintf(&b, " This candidate has no buffered %s mode, so %s has only the durable row.", op, op)
+	}
+	fmt.Fprintln(&b)
+	if results.TimeoutSeconds > 0 {
+		fmt.Fprintf(&b, "- Per-run timeout %s (reference %s); a reference run that exits non-zero, times out, or writes no or truncated carriers is **DNF** and the rest of the matrix still runs\n",
+			formatTimeout(results.TimeoutSeconds), formatTimeout(results.ReferenceTimeoutSeconds))
+	}
+	fmt.Fprintf(&b, "- Started %s, finished %s, status **%s**\n\n", results.StartedUTC, results.FinishedUTC, results.Status)
+	fmt.Fprintln(&b, "Wall and CPU (user+sys) are seconds, RSS is peak MiB; cells are median [min–max]. Ratios are rarpar/reference medians: below 1.000 rarpar used less. The reference is single-threaded. Every rarpar row, durable and buffered, is compared with the same reference row.")
 	fmt.Fprintln(&b, "Carriers: `identical` = byte-identical to the reference's set; `payloads-only` = every recovery block's payload matches but packet metadata differs; `DIFFERENT` = recovery payloads differ.")
 	fmt.Fprintln(&b)
 
@@ -187,8 +220,14 @@ func RenderReport(results *Results) string {
 				fmt.Fprintf(&b, "; damage %s (%d blocks)", config.Damage.Name, config.Damage.LostBlocks())
 			}
 			fmt.Fprint(&b, ".\n\n")
-			header := "| variant | wall s | CPU s | RSS MiB | wall ratio | CPU ratio | RSS ratio |"
-			rule := "|---|---|---|---|---|---|---|"
+			header := "| variant |"
+			rule := "|---|"
+			if writes(row.Op) {
+				header += " durability |"
+				rule += "---|"
+			}
+			header += " wall s | CPU s | RSS MiB | wall ratio | CPU ratio | RSS ratio |"
+			rule += "---|---|---|---|---|---|"
 			if windowsCounters {
 				header += " read ops | write ops |"
 				rule += "---|---|"
@@ -210,11 +249,20 @@ func RenderReport(results *Results) string {
 			fmt.Fprintln(&b, rule)
 		}
 		reference := references[group]
-		line := fmt.Sprintf("| %s | %s | %s | %s |", row.Variant, seconds(row.Wall), seconds(row.CPU), mebibytes(row.RSS))
-		if row.Tool == ToolReference {
-			line += " 1.000 | 1.000 | 1.000 |"
-		} else {
-			line += fmt.Sprintf(" %s | %s | %s |", ratio(row.Wall, reference.Wall), ratio(row.CPU, reference.CPU), ratio(row.RSS, reference.RSS))
+		line := fmt.Sprintf("| %s |", row.Variant)
+		if writes(row.Op) {
+			line += fmt.Sprintf(" %s |", durabilityLabel(row))
+		}
+		switch {
+		case row.DNF != "":
+			line += " DNF | - | - | - | - | - |"
+		case row.Tool == ToolReference:
+			line += fmt.Sprintf(" %s | %s | %s | 1.000 | 1.000 | 1.000 |", seconds(row.Wall), seconds(row.CPU), mebibytes(row.RSS))
+		case reference.DNF != "":
+			line += fmt.Sprintf(" %s | %s | %s | - | - | - |", seconds(row.Wall), seconds(row.CPU), mebibytes(row.RSS))
+		default:
+			line += fmt.Sprintf(" %s | %s | %s | %s | %s | %s |", seconds(row.Wall), seconds(row.CPU), mebibytes(row.RSS),
+				ratio(row.Wall, reference.Wall), ratio(row.CPU, reference.CPU), ratio(row.RSS, reference.RSS))
 		}
 		if windowsCounters {
 			line += fmt.Sprintf(" %s | %s |", count(row.ReadOps), count(row.WriteOps))
@@ -232,6 +280,7 @@ func RenderReport(results *Results) string {
 		// Close the table after the group's last row.
 		if next := nextGroup(rows, row); next != group {
 			fmt.Fprintln(&b)
+			writeDNFDetail(&b, rows, group, configs[row.Config])
 			writeIdentityDetail(&b, results, row.Config, row.Op)
 			writeIOCounts(&b, results, row.Config, row.Op)
 		}
@@ -240,7 +289,11 @@ func RenderReport(results *Results) string {
 		fmt.Fprintln(&b, "## engine_perf stage breakdown (untimed pass)")
 		fmt.Fprintln(&b)
 		for _, run := range results.EnginePerfRuns {
-			fmt.Fprintf(&b, "- %s %s w%d: %.3fs", run.Config, run.Op, run.Workers, run.WallSeconds)
+			fmt.Fprintf(&b, "- %s %s w%d", run.Config, run.Op, run.Workers)
+			if run.Durability != "" {
+				fmt.Fprintf(&b, " %s", run.Durability)
+			}
+			fmt.Fprintf(&b, ": %.3fs", run.WallSeconds)
 			if run.Error != "" {
 				fmt.Fprintf(&b, " — error: %s", run.Error)
 			}
@@ -251,9 +304,12 @@ func RenderReport(results *Results) string {
 		}
 		fmt.Fprintln(&b)
 	}
-	if len(results.Notes) > 0 || len(results.Failures) > 0 {
+	if len(results.Notes) > 0 || len(results.Failures) > 0 || len(results.DNF) > 0 {
 		fmt.Fprintln(&b, "## Notes")
 		fmt.Fprintln(&b)
+		for _, dnf := range results.DNF {
+			fmt.Fprintf(&b, "- %s\n", dnf)
+		}
 		for _, note := range results.Notes {
 			fmt.Fprintf(&b, "- %s\n", note)
 		}
@@ -262,6 +318,42 @@ func RenderReport(results *Results) string {
 		}
 	}
 	return b.String()
+}
+
+// writes reports whether op writes output, and so has durability rows.
+func writes(op string) bool { return op == OpCreate || op == OpRepair }
+
+func durabilityLabel(row Row) string {
+	switch row.Durability {
+	case "":
+		return "none (never syncs)"
+	case DurabilityDurable:
+		return "durable (default)"
+	default:
+		return row.Durability
+	}
+}
+
+func formatTimeout(seconds float64) string {
+	return time.Duration(seconds * float64(time.Second)).String()
+}
+
+func writeDNFDetail(b *strings.Builder, rows []Row, group string, config ConfigSummary) {
+	wrote := false
+	for _, row := range rows {
+		if row.Config+"/"+row.Op != group || row.DNF == "" {
+			continue
+		}
+		fmt.Fprintf(b, "- %s DNF: %s\n", row.Variant, row.DNF)
+		wrote = true
+	}
+	if config.CanonicalSource == ToolCandidate && strings.HasSuffix(group, "/"+OpCreate) {
+		fmt.Fprintln(b, "- The reference did not finish the canonical create, so rarpar's carriers were used for verify and repair; no identity verdict exists for this set.")
+		wrote = true
+	}
+	if wrote {
+		fmt.Fprintln(b)
+	}
 }
 
 func nextGroup(rows []Row, current Row) string {

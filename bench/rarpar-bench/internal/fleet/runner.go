@@ -220,14 +220,19 @@ func (orch *orchestrator) preflight(ctx context.Context) error {
 		}
 	}
 	orch.prepareAWS()
-	// The reference's name-buffer limit turns a long PAR3 work path into a
-	// mid-run failure on the host; refuse it here instead.
+	// A PAR3 matrix that does not resolve is refused here. A work path long
+	// enough to trip the reference's name-buffer bug is only a warning: the
+	// suite records the reference as DNF and still runs every rarpar row.
 	for _, machine := range orch.options.Machines {
 		if !machine.hasSuite(SuiteMacroPAR3) {
 			continue
 		}
-		if _, problem := par3View(machine, HostLayout(machine, orch.options.RunID)); problem != "" {
+		view, problem := par3View(machine, HostLayout(machine, orch.options.RunID))
+		if problem != "" {
 			return fmt.Errorf("machine %s: %s", machine.Name, problem)
+		}
+		for _, warning := range view.Warnings {
+			orch.log("preflight: WARNING machine %s: par3 work path: %s", machine.Name, warning)
 		}
 	}
 	// Same fail-before-spend rule for corpus images: a tag missing from ECR

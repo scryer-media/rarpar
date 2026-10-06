@@ -135,3 +135,7 @@ func isQuarantineError(err error) bool {
 	}
 	return false
 }
+
+func rssSource() string {
+	return "K32GetProcessMemoryInfo PeakWorkingSetSize on the held process handle"
+}

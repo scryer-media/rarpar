@@ -211,8 +211,17 @@ warmups = 1
 repeats = 5
 pin_cpus = "0-7"
 work = "/home/bench/p3"           # keep it short, see below
-timeout_minutes = 120
+timeout_minutes = 20              # per run; a reference over it is DNF
+# durability = ["durable"]        # default: durable and buffered rows
 ```
+
+- **Durability rows.** Every `rarpar` create and repair runs durable (the
+  default) and buffered; the reference gets one row. `durability` narrows that
+  and must include `durable`. The plan's macro-par3 step lists the
+  durabilities, the per-run timeout and the rows per op.
+- **Reference failures** (non-zero exit, missing or short recovery files, or a
+  timeout) are recorded as DNF with the exit code and stderr line. The PAR3
+  section carries on and does not fail because of them.
 
 - **Linux and macOS hosts** use `recipe = "par3cmdline-onhost"`. The host runs
   `par3 build-reference` against the shipped `toolchains.json`, so the
@@ -224,11 +233,15 @@ timeout_minutes = 120
   config. `par3cmdline-onhost` is refused on Windows, and so is
   `[machines.par3].iocount`.
 - **Work path.** `fleet plan` checks `[machines.par3].work`, which defaults to
-  `<scratch>/p3`, against the reference's file-name limit. It shows a warning
-  in the plan, and preflight treats it as an error, so an over-long path never
-  reaches a host. The run deletes the work directory afterwards.
+  `<scratch>/p3`, against the reference's file-name limit. An over-long path
+  is a plan warning with the character count, and preflight logs it; neither
+  refuses, because the reference bug is nondeterministic and a failure only
+  costs DNF rows. The run deletes the work directory afterwards.
 - **Defender.** A quarantined or blocked binary stops the PAR3 section as
   `binary-quarantined`. The harness reports it and does not work around it.
+  Defender misflags `engine_perf.exe` as `Trojan:Win64/AsyncRAT.C!MTB`; the
+  approved handling is a path-scoped exclusion on the bench work directory,
+  added by hand. No automation here touches Defender.
 
 ```sh
 rarpar-bench fleet plan --config bench/fleet.toml --suite macro-par3

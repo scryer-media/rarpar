@@ -165,8 +165,10 @@ under the operator's normal SSH policy.
 `par3cmdline` reference on create, verify and repair. It measures the CLI
 because that is what ships, the same way the PAR2 suite drives `rarpar par`.
 If you pass `--engine-perf PATH`, it also runs the `par3-rs` `engine_perf`
-example once per set as an untimed stage breakdown. Nothing from that pass goes
-into the timing tables.
+example once per set and durability as an untimed stage breakdown, selecting
+the durability with `PAR3_BENCH_CREATE_DURABILITY` and
+`PAR3_BENCH_REPAIR_DURABILITY` (`durable` or `buffered`; older builds ignore
+the repair variable). Nothing from that pass goes into the timing tables.
 
 ```sh
 cd bench/rarpar-bench
@@ -215,6 +217,17 @@ NAME:VAR=value[,VAR=value]` adds a `rarpar` row with extra environment
 variables. The env-gated kernel pins on main are currently no-ops for PAR3;
 the flag is plumbing for when they exist.
 
+Every `rarpar` create and repair row runs twice: once durable, which is the
+default (no flag, one fsync per output), and once buffered (`--buffered`, no
+fsync). The durable row is listed first and labelled `durable (default)`; the
+buffered row is named `rarpar-wN-buffered`. Both carry ratios against the
+single reference row, whose durability column reads `none (never syncs)`.
+Verify rows write nothing and run once. `--durability durable` drops the
+buffered rows; durable is always required. The suite probes
+`rarpar par3 <op> --help` for `--buffered`, and when the CLI lacks it, which is
+the case for `par3 repair` today, it skips that op's buffered row and says so in
+the report notes. `par3 matrix --profile full` prints the rows per op.
+
 Each variant gets the warmups, then the measured repeats, and the variant order
 alternates on every repeat. Each table cell is the median with the range,
 `median [min–max]`, for wall time, user+sys CPU, and peak RSS. Ratios compare
@@ -226,6 +239,39 @@ Linux and reports block and syscall counts.
 Repair runs against a fresh copy of the damaged tree each time. A repair row
 passes only when the repaired files hash back to the originals. The
 "left behind" column lists the backup files each tool writes.
+
+### Peak RSS
+
+Peak RSS is a required field of every row (`max_rss_bytes` in `results.json`
+and `runs.jsonl`). Every table shows it next to wall and CPU, with the
+ours/reference RSS ratio. The harness reads it from the child itself:
+
+| platform | source | equivalent tool output |
+|---|---|---|
+| macOS | `wait4` rusage `ru_maxrss`, already bytes | `/usr/bin/time -l` "maximum resident set size" |
+| Linux | `wait4` rusage `ru_maxrss`, KiB scaled to bytes | `/usr/bin/time -v` "Maximum resident set size" |
+| Windows | `K32GetProcessMemoryInfo` `PeakWorkingSetSize` on a handle opened at start and held across exit | (`Process.PeakWorkingSet64` reads null after exit, so it is not used) |
+
+A process that exits without a peak RSS is a harness bug, not a missing value:
+the row fails as `harness-missing-rss` (for the reference too; it is never
+turned into a DNF), and `par3 report` refuses a `results.json` whose ok rows
+lack the field. Only rows that never finished, such as a DNF or a timeout, may
+have no RSS.
+
+### Timeouts and reference DNF
+
+Every run has a per-run timeout, `--timeout`, 20 minutes by default.
+`--reference-timeout` sets a different limit for the reference only. A
+reference run that exits non-zero, writes no recovery files or fewer recovery
+blocks than asked for, or exceeds its timeout is recorded as `DNF` with the
+exit code (or the timeout) and the last line it printed. The suite carries on:
+the rest of that reference row is skipped, every `rarpar` row still runs, and
+the run never fails because of it. Ratios against a DNF reference show `-`.
+
+Verify and repair need a canonical recovery set, normally written by an untimed
+reference create. If that create DNFs, `rarpar` (durable, most workers) writes
+the canonical set instead, the reference still verifies and repairs it, the
+identity verdicts are skipped, and the report says where the set came from.
 
 ### Identity verdicts
 
@@ -259,10 +305,11 @@ and counts differ.
   "Failed to open Recovery File". It turns the output path into an absolute
   path first, so only the total length of the absolute volume paths matters,
   and a relative `--work` does not help. FFT sets always reach this path, and
-  so do Cauchy sets too large to hold in memory. `par3 run` and `fleet plan`
-  check every set before generating any data and give the number of
-  characters to cut. Keep `--work` short, for example `/home/bench/p3` or
-  `C:\p3`.
+  so do Cauchy sets too large to hold in memory. The failure is
+  nondeterministic, so `par3 run` and `fleet plan` warn per set, with the
+  path length and the number of characters to cut, and then run anyway; if the
+  reference fails, its rows are DNF as above. Keep `--work` short, for example
+  `/home/bench/p3` or `C:\p3`.
 - **Windows.** The fleet uses the official `windows/par3.exe` from the pinned
   archive, verified by digest, instead of building it.
 
@@ -274,9 +321,17 @@ disk stops the run as `binary-quarantined`, with the path and what happened.
 The harness never adds exclusions and never retries around it. Restore the
 binary, or ask the host owner to allow it, then rerun.
 
+Known false positive: Defender flags the `par3-rs` `engine_perf.exe` example
+as `Trojan:Win64/AsyncRAT.C!MTB` and quarantines it. The operator-approved
+handling is a path-scoped Defender exclusion on the bench work directory, added
+by hand by the host owner. No automation in this repository touches Defender
+settings, and none may.
+
 ### Output
 
-`--out` receives `results.json` (schema `rarpar-par3-bench-v1`), `runs.jsonl`
+`--out` receives `results.json` (schema `rarpar-par3-bench-v1`; the
+durability, DNF, timeout and canonical-source fields were added without
+changing any existing field, so the schema name stays v1), `runs.jsonl`
 (one line per process, warmups included) and `report.md`. Generated datasets
 and the reference's canonical sets are cached under `--work`; delete it to
 reclaim the space. `--keep-stages` keeps the per-run directories for

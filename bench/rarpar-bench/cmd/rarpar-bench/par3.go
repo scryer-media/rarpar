@@ -9,19 +9,19 @@ import (
 	"strconv"
 	"strings"
 	"text/tabwriter"
-	"time"
 
 	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/bench"
 	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/par3bench"
 )
 
 const par3Usage = `Usage:
-  rarpar-bench par3 matrix [--profile smoke|full] [--set ID]... [--workers 1,8] [--kernel-variant NAME:VAR=V]... [--json]
+  rarpar-bench par3 matrix [--profile smoke|full] [--set ID]... [--ops LIST] [--workers 1,8] [--durability durable,buffered]
+        [--kernel-variant NAME:VAR=V]... [--json]
   rarpar-bench par3 build-reference --out DIR [--toolchains PATH] [--cache DIR] [--mirror-base URL] [--cmake PATH] [--jobs N]
   rarpar-bench par3 run --reference PATH --candidate PATH --work DIR --out DIR [--profile smoke|full] [--set ID]...
         [--ops create,verify,repair] [--warmups N] [--repeats N] [--workers 1,8] [--pin-cpus 0-7]
-        [--kernel-variant NAME:VAR=V[,VAR=V]]... [--iocount] [--engine-perf PATH] [--candidate-arg ARG]...
-        [--machine LABEL] [--timeout DURATION] [--keep-stages]
+        [--durability durable,buffered] [--kernel-variant NAME:VAR=V[,VAR=V]]... [--iocount] [--engine-perf PATH]
+        [--candidate-arg ARG]... [--machine LABEL] [--timeout 20m] [--reference-timeout DURATION] [--keep-stages]
   rarpar-bench par3 report --input results.json [--out report.md]
 
 The PAR3 suite benchmarks the shipped rarpar CLI against the pinned par3cmdline
@@ -104,6 +104,8 @@ func runPAR3Matrix(args []string, stdout io.Writer) error {
 	flags := flag.NewFlagSet("par3 matrix", flag.ContinueOnError)
 	profileName := flags.String("profile", "smoke", "profile: smoke or full")
 	workers := flags.String("workers", "1,8", "rarpar worker counts")
+	ops := flags.String("ops", strings.Join(par3bench.DefaultOps, ","), "operations: "+strings.Join(par3bench.KnownOps, ","))
+	durability := flags.String("durability", strings.Join(par3bench.KnownDurabilities, ","), "rarpar durability rows for create and repair (durable is the default and always runs)")
 	jsonOut := flags.Bool("json", false, "emit JSON")
 	var sets, kernels stringList
 	flags.Var(&sets, "set", "restrict to a set ID (repeatable)")
@@ -123,9 +125,20 @@ func runPAR3Matrix(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	rows := par3bench.Variants(workerList, variants)
+	durabilities, err := par3bench.ParseDurabilities(*durability)
+	if err != nil {
+		return err
+	}
+	opList := splitList(*ops)
+	for _, op := range opList {
+		if !containsString(par3bench.KnownOps, op) {
+			return fmt.Errorf("unknown op %q (known: %s)", op, strings.Join(par3bench.KnownOps, ", "))
+		}
+	}
+	rows := par3bench.Variants(workerList, variants, durabilities)
+	byOp := par3bench.RowsByOp(rows, opList)
 	if *jsonOut {
-		return writeJSONTo(stdout, map[string]any{"profile": profile, "variants": rows})
+		return writeJSONTo(stdout, map[string]any{"profile": profile, "ops": opList, "durabilities": durabilities, "variants": rows, "rows": byOp})
 	}
 	table := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(table, "SET\tDATASET\tBYTES\tBLOCK\tINPUT\tRECOVERY\tCODEC\tFIELD\tDAMAGE")
@@ -142,12 +155,51 @@ func runPAR3Matrix(args []string, stdout io.Writer) error {
 	if err := table.Flush(); err != nil {
 		return err
 	}
-	names := make([]string, 0, len(rows))
-	for _, row := range rows {
-		names = append(names, row.Name)
+	fmt.Fprintln(stdout, "\nrows per set (the reference never syncs and has one row; rarpar's durable row is the default):")
+	table = tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+	for _, op := range opList {
+		labels := make([]string, 0, len(byOp[op]))
+		for _, name := range byOp[op] {
+			labels = append(labels, matrixLabel(rows, name, op))
+		}
+		fmt.Fprintf(table, "  %s\t%s\n", op, strings.Join(labels, ", "))
 	}
-	_, err = fmt.Fprintf(stdout, "\nvariants: %s\n", strings.Join(names, ", "))
+	if err := table.Flush(); err != nil {
+		return err
+	}
+	if containsString(durabilities, par3bench.DurabilityBuffered) {
+		_, err = fmt.Fprintln(stdout, "buffered rows run with the candidate's --buffered flag; an op whose `rarpar par3 OP --help` lists none keeps only its durable row (noted in the results).")
+	}
 	return err
+}
+
+func matrixLabel(variants []par3bench.Variant, name, op string) string {
+	for _, variant := range variants {
+		if variant.Name != name {
+			continue
+		}
+		if op != par3bench.OpCreate && op != par3bench.OpRepair {
+			return name
+		}
+		switch variant.EffectiveDurability() {
+		case "":
+			return name
+		case par3bench.DurabilityDurable:
+			return name + " (durable, default)"
+		default:
+			return name + " (" + variant.EffectiveDurability() + ")"
+		}
+	}
+	return name
+}
+
+func containsString(list []string, value string) bool {
+	for _, item := range list {
+		if item == value {
+			return true
+		}
+	}
+	return false
 }
 
 func runPAR3BuildReference(ctx context.Context, args []string, stdout io.Writer) error {
@@ -194,7 +246,9 @@ func runPAR3Suite(ctx context.Context, args []string, stdout io.Writer) error {
 	iocount := flags.Bool("iocount", false, "add an untimed strace -f -c pass per variant and op (Linux)")
 	machine := flags.String("machine", "", "machine label recorded in the results")
 	memory := flags.Int("engine-perf-memory-mib", 256, "engine_perf memory budget")
-	timeout := flags.Duration("timeout", 2*time.Hour, "per-process timeout")
+	timeout := flags.Duration("timeout", par3bench.DefaultTimeout, "per-run timeout for every timed process; a reference run past it is DNF")
+	referenceTimeout := flags.Duration("reference-timeout", 0, "per-run timeout for reference processes (default: --timeout)")
+	durability := flags.String("durability", strings.Join(par3bench.KnownDurabilities, ","), "rarpar durability rows for create and repair (durable is the default and always runs)")
 	keep := flags.Bool("keep-stages", false, "keep per-run stage directories")
 	var sets, kernels, candidateArgs stringList
 	flags.Var(&sets, "set", "restrict to a set ID (repeatable)")
@@ -218,12 +272,16 @@ func runPAR3Suite(ctx context.Context, args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	durabilities, err := par3bench.ParseDurabilities(*durability)
+	if err != nil {
+		return err
+	}
 	results, err := par3bench.RunSuite(ctx, par3bench.Options{
 		Reference: workspacePath(*reference), Candidate: workspacePath(*candidate), EnginePerf: workspacePath(*enginePerf),
 		Work: workspacePath(*work), Out: workspacePath(*out), Profile: profile, Ops: splitList(*ops),
 		Warmups: *warmups, Repeats: *repeats, Workers: workerList, PinCPUs: *pin, KernelVariants: variants,
 		IOCount: *iocount, MachineLabel: *machine, CandidateArgs: candidateArgs, EnginePerfMemoryMiB: *memory,
-		KeepStages: *keep, Timeout: *timeout, Log: os.Stderr,
+		KeepStages: *keep, Timeout: *timeout, ReferenceTimeout: *referenceTimeout, Durabilities: durabilities, Log: os.Stderr,
 	})
 	if err != nil {
 		return err

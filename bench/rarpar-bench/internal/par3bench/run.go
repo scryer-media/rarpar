@@ -29,8 +29,36 @@ const (
 	ToolReference = "reference"
 	ToolCandidate = "rarpar"
 
+	// StatusOK, StatusFailed and StatusDNF are the run statuses. DNF ("did not
+	// finish") is only ever given to the reference: a reference that exits
+	// non-zero, times out, or writes no or truncated carriers is recorded and
+	// the matrix carries on. It never fails the run or skips a rarpar row.
+	StatusOK     = "ok"
+	StatusFailed = "failed"
+	StatusDNF    = "dnf"
+
+	// FailureMissingRSS marks a run whose process exited but whose peak RSS
+	// the harness did not capture. It is a harness bug, so it fails the run
+	// for either tool and is never turned into a reference DNF.
+	FailureMissingRSS = "harness-missing-rss"
+
+	// DurabilityDurable is rarpar's default: every output file is synced
+	// before the command returns. DurabilityBuffered flushes without
+	// requesting storage barriers. The reference never syncs, so it has no
+	// durability mode and gets one row.
+	DurabilityDurable  = "durable"
+	DurabilityBuffered = "buffered"
+
+	// DefaultTimeout bounds every timed process ("per row": a row that hits it
+	// is finished, see StatusDNF). Set C Cauchy on the reference otherwise
+	// runs for hours.
+	DefaultTimeout = 20 * time.Minute
+
 	carrierName = "set.par3"
 )
+
+// KnownDurabilities lists the rarpar durability modes, default first.
+var KnownDurabilities = []string{DurabilityDurable, DurabilityBuffered}
 
 // KnownOps lists every operation in run order.
 var KnownOps = []string{OpCreate, OpVerify, OpVerifyDamaged, OpRepair}
@@ -87,8 +115,14 @@ type Options struct {
 	// EnginePerfMemoryMiB is engine_perf's memory budget (the CLI default is 256).
 	EnginePerfMemoryMiB int
 	KeepStages          bool
-	Timeout             time.Duration
-	Log                 io.Writer
+	// Durabilities are the rarpar durability rows for create and repair
+	// (default: durable, then buffered). Durable is always included.
+	Durabilities []string
+	// Timeout bounds every timed process (default DefaultTimeout).
+	Timeout time.Duration
+	// ReferenceTimeout bounds every reference process (default: Timeout).
+	ReferenceTimeout time.Duration
+	Log              io.Writer
 }
 
 // Variant is one benchmarked tool configuration.
@@ -98,6 +132,28 @@ type Variant struct {
 	Workers int      `json:"workers,omitempty"`
 	Kernel  string   `json:"kernel,omitempty"`
 	Env     []string `json:"env,omitempty"`
+	// Durability is "durable" or "buffered" for rarpar rows and empty for
+	// the reference. Results written before durability rows existed have it
+	// empty on rarpar rows too; those ran durable.
+	Durability string `json:"durability,omitempty"`
+}
+
+// EffectiveDurability is the variant's durability mode: "" for the
+// reference, "durable" for a rarpar row that does not say.
+func (v Variant) EffectiveDurability() string {
+	if v.Tool == ToolReference {
+		return ""
+	}
+	if v.Durability == "" {
+		return DurabilityDurable
+	}
+	return v.Durability
+}
+
+// RunsOp reports whether the variant has a row for op. Buffered rows exist
+// only for the operations that write: create and repair.
+func (v Variant) RunsOp(op string) bool {
+	return v.EffectiveDurability() != DurabilityBuffered || op == OpCreate || op == OpRepair
 }
 
 // dirName is the variant's short stage-directory name. Stage paths are kept
@@ -109,21 +165,77 @@ func (v Variant) dirName() string {
 	return strings.TrimPrefix(v.Name, "rarpar-")
 }
 
-// Variants expands the reference plus every candidate worker/kernel row.
-func Variants(workers []int, kernels []KernelVariant) []Variant {
+// Variants expands the reference plus every candidate worker/kernel row, each
+// rarpar row once per durability mode: the durable (default) row first, named
+// as before, then "<name>-buffered". Nil durabilities means both modes.
+func Variants(workers []int, kernels []KernelVariant, durabilities []string) []Variant {
+	if len(durabilities) == 0 {
+		durabilities = KnownDurabilities
+	}
 	variants := []Variant{{Name: "reference", Tool: ToolReference}}
+	add := func(base Variant) {
+		for _, durability := range KnownDurabilities {
+			if !contains(durabilities, durability) {
+				continue
+			}
+			variant := base
+			variant.Durability = durability
+			if durability != DurabilityDurable {
+				variant.Name += "-" + durability
+			}
+			variants = append(variants, variant)
+		}
+	}
 	for _, count := range workers {
-		variants = append(variants, Variant{Name: fmt.Sprintf("rarpar-w%d", count), Tool: ToolCandidate, Workers: count})
+		add(Variant{Name: fmt.Sprintf("rarpar-w%d", count), Tool: ToolCandidate, Workers: count})
 	}
 	for _, kernel := range kernels {
 		for _, count := range workers {
-			variants = append(variants, Variant{
+			add(Variant{
 				Name: fmt.Sprintf("rarpar-w%d-%s", count, kernel.Name), Tool: ToolCandidate,
 				Workers: count, Kernel: kernel.Name, Env: kernel.Env,
 			})
 		}
 	}
 	return variants
+}
+
+// ParseDurabilities reads a comma-separated durability list. Durable is the
+// default mode and is always measured.
+func ParseDurabilities(text string) ([]string, error) {
+	var modes []string
+	for _, field := range strings.Split(text, ",") {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		if !contains(KnownDurabilities, field) {
+			return nil, fmt.Errorf("unknown durability %q (known: %s)", field, strings.Join(KnownDurabilities, ", "))
+		}
+		if !contains(modes, field) {
+			modes = append(modes, field)
+		}
+	}
+	if len(modes) == 0 {
+		return append([]string(nil), KnownDurabilities...), nil
+	}
+	if !contains(modes, DurabilityDurable) {
+		return nil, fmt.Errorf("durability %q must include %q: it is rarpar's default and every ratio starts from it", text, DurabilityDurable)
+	}
+	return modes, nil
+}
+
+// RowsByOp lists, per operation, the row names a matrix produces.
+func RowsByOp(variants []Variant, ops []string) map[string][]string {
+	rows := map[string][]string{}
+	for _, op := range ops {
+		for _, variant := range variants {
+			if variant.RunsOp(op) {
+				rows[op] = append(rows[op], variant.Name)
+			}
+		}
+	}
+	return rows
 }
 
 // Binary identifies an executable the run used.
@@ -142,21 +254,31 @@ type RepairCheck struct {
 
 // RunRecord is one process run.
 type RunRecord struct {
-	Config   string `json:"config"`
-	Op       string `json:"op"`
-	Variant  string `json:"variant"`
-	Tool     string `json:"tool"`
-	Workers  int    `json:"workers,omitempty"`
-	Kernel   string `json:"kernel,omitempty"`
-	Warmup   bool   `json:"warmup"`
-	Repeat   int    `json:"repeat"`
-	Position int    `json:"position"`
-	Command  string `json:"command"`
+	Config  string `json:"config"`
+	Op      string `json:"op"`
+	Variant string `json:"variant"`
+	Tool    string `json:"tool"`
+	Workers int    `json:"workers,omitempty"`
+	Kernel  string `json:"kernel,omitempty"`
+	// Durability is the rarpar durability mode ("durable"/"buffered"); empty
+	// for the reference.
+	Durability string `json:"durability,omitempty"`
+	// Canonical marks the untimed reference create that seeds the canonical
+	// carriers. It is only recorded when it did not finish (StatusDNF).
+	Canonical bool   `json:"canonical,omitempty"`
+	Warmup    bool   `json:"warmup"`
+	Repeat    int    `json:"repeat"`
+	Position  int    `json:"position"`
+	Command   string `json:"command"`
 	Measurement
-	Status     string       `json:"status"`
-	Failure    string       `json:"failure,omitempty"`
-	Error      string       `json:"error,omitempty"`
-	StderrTail string       `json:"stderr_tail,omitempty"`
+	// Status is "ok", "failed" (rarpar only) or "dnf" (reference only).
+	Status     string `json:"status"`
+	Failure    string `json:"failure,omitempty"`
+	Error      string `json:"error,omitempty"`
+	StderrTail string `json:"stderr_tail,omitempty"`
+	// StderrLine is the last non-empty line the process printed (stderr,
+	// else stdout), recorded for every run that did not finish cleanly.
+	StderrLine string       `json:"stderr_line,omitempty"`
 	Identity   *Identity    `json:"identity,omitempty"`
 	Repair     *RepairCheck `json:"repair,omitempty"`
 }
@@ -175,6 +297,7 @@ type EnginePerfRecord struct {
 	Config      string            `json:"config"`
 	Op          string            `json:"op"`
 	Workers     int               `json:"workers"`
+	Durability  string            `json:"durability,omitempty"`
 	WallSeconds float64           `json:"wall_seconds"`
 	Lines       []json.RawMessage `json:"lines"`
 	Error       string            `json:"error,omitempty"`
@@ -186,34 +309,51 @@ type ConfigSummary struct {
 	DatasetBytes int64 `json:"dataset_bytes"`
 	InputBlocks  int64 `json:"input_blocks"`
 	CapacityLog2 int   `json:"capacity_log2,omitempty"`
+	// CanonicalSource is the tool whose create produced the carriers every
+	// verify and repair read: "reference" normally, "rarpar" when the
+	// reference's seed create did not finish.
+	CanonicalSource string `json:"canonical_source,omitempty"`
 }
 
 // Results is the evidence document a run writes.
 type Results struct {
-	Schema         string             `json:"schema"`
-	StartedUTC     string             `json:"started_utc"`
-	FinishedUTC    string             `json:"finished_utc"`
-	Machine        bench.Machine      `json:"machine"`
-	Profile        string             `json:"profile"`
-	Ops            []string           `json:"ops"`
-	Warmups        int                `json:"warmups"`
-	Repeats        int                `json:"repeats"`
-	Workers        []int              `json:"workers"`
-	PinCPUs        string             `json:"pin_cpus,omitempty"`
-	PinApplied     bool               `json:"pin_applied"`
-	KernelVariants []KernelVariant    `json:"kernel_variants,omitempty"`
-	CandidateArgs  []string           `json:"candidate_args,omitempty"`
-	Reference      Binary             `json:"reference"`
-	Candidate      Binary             `json:"candidate"`
-	EnginePerf     *Binary            `json:"engine_perf,omitempty"`
-	Variants       []Variant          `json:"variants"`
-	Configs        []ConfigSummary    `json:"configs"`
-	Runs           []RunRecord        `json:"runs"`
-	IOCounts       []IOCountRecord    `json:"io_counts,omitempty"`
-	EnginePerfRuns []EnginePerfRecord `json:"engine_perf_runs,omitempty"`
-	Notes          []string           `json:"notes,omitempty"`
-	Status         string             `json:"status"`
-	Failures       []string           `json:"failures,omitempty"`
+	Schema         string          `json:"schema"`
+	StartedUTC     string          `json:"started_utc"`
+	FinishedUTC    string          `json:"finished_utc"`
+	Machine        bench.Machine   `json:"machine"`
+	Profile        string          `json:"profile"`
+	Ops            []string        `json:"ops"`
+	Warmups        int             `json:"warmups"`
+	Repeats        int             `json:"repeats"`
+	Workers        []int           `json:"workers"`
+	PinCPUs        string          `json:"pin_cpus,omitempty"`
+	PinApplied     bool            `json:"pin_applied"`
+	KernelVariants []KernelVariant `json:"kernel_variants,omitempty"`
+	CandidateArgs  []string        `json:"candidate_args,omitempty"`
+	// Durabilities are the rarpar durability modes measured for create and
+	// repair, default first. BufferedArgs records, per op, the arguments that
+	// selected buffered output on this candidate; an op the candidate cannot
+	// run buffered is missing and listed in BufferedUnsupported.
+	Durabilities        []string            `json:"durabilities,omitempty"`
+	BufferedArgs        map[string][]string `json:"buffered_args,omitempty"`
+	BufferedUnsupported []string            `json:"buffered_unsupported,omitempty"`
+	// TimeoutSeconds / ReferenceTimeoutSeconds bound each timed process.
+	TimeoutSeconds          float64            `json:"timeout_seconds,omitempty"`
+	ReferenceTimeoutSeconds float64            `json:"reference_timeout_seconds,omitempty"`
+	Reference               Binary             `json:"reference"`
+	Candidate               Binary             `json:"candidate"`
+	EnginePerf              *Binary            `json:"engine_perf,omitempty"`
+	Variants                []Variant          `json:"variants"`
+	Configs                 []ConfigSummary    `json:"configs"`
+	Runs                    []RunRecord        `json:"runs"`
+	IOCounts                []IOCountRecord    `json:"io_counts,omitempty"`
+	EnginePerfRuns          []EnginePerfRecord `json:"engine_perf_runs,omitempty"`
+	Notes                   []string           `json:"notes,omitempty"`
+	// DNF lists every reference row that did not finish. DNF rows do not
+	// change Status.
+	DNF      []string `json:"dnf,omitempty"`
+	Status   string   `json:"status"`
+	Failures []string `json:"failures,omitempty"`
 }
 
 type runner struct {
@@ -222,6 +362,9 @@ type runner struct {
 	journal  *os.File
 	guards   map[string]Binary
 	failures []string
+	// finished marks config/op/variant rows that already ended in DNF; their
+	// remaining runs are skipped.
+	finished map[string]bool
 }
 
 func (r *runner) logf(format string, args ...any) {
@@ -258,9 +401,18 @@ func RunSuite(ctx context.Context, options Options) (*Results, error) {
 		PinCPUs:        options.PinCPUs,
 		KernelVariants: options.KernelVariants,
 		CandidateArgs:  options.CandidateArgs,
-		Variants:       Variants(options.Workers, options.KernelVariants),
+		Variants:       Variants(options.Workers, options.KernelVariants, options.Durabilities),
+		Durabilities:   options.Durabilities,
+		BufferedArgs:   map[string][]string{},
+
+		TimeoutSeconds:          options.Timeout.Seconds(),
+		ReferenceTimeoutSeconds: options.ReferenceTimeout.Seconds(),
 	}
-	r := &runner{options: options, results: results, journal: journal, guards: map[string]Binary{}}
+	r := &runner{options: options, results: results, journal: journal, guards: map[string]Binary{}, finished: map[string]bool{}}
+	for _, warning := range referencePathWarnings(options.Profile, options.Work) {
+		r.logf("WARNING: %s", warning)
+		results.Notes = append(results.Notes, "work path: "+warning)
+	}
 	if options.PinCPUs != "" {
 		results.PinApplied = PinSupported()
 		if !results.PinApplied {
@@ -289,6 +441,7 @@ func RunSuite(ctx context.Context, options Options) (*Results, error) {
 			r.options.IOCount = false
 		}
 	}
+	r.probeBuffered(ctx)
 
 	for _, config := range options.Profile.Configs {
 		if err := ctx.Err(); err != nil {
@@ -300,7 +453,7 @@ func RunSuite(ctx context.Context, options Options) (*Results, error) {
 			summary.CapacityLog2 = config.CapacityLog2()
 		}
 		results.Configs = append(results.Configs, summary)
-		if err := r.runConfig(ctx, config, dataset); err != nil {
+		if err := r.runConfig(ctx, config, dataset, &results.Configs[len(results.Configs)-1]); err != nil {
 			r.failures = append(r.failures, fmt.Sprintf("%s: %v", config.ID, err))
 			r.logf("%s: %v", config.ID, err)
 			var quarantined *quarantineError
@@ -311,9 +464,9 @@ func RunSuite(ctx context.Context, options Options) (*Results, error) {
 	}
 	results.FinishedUTC = time.Now().UTC().Format(time.RFC3339)
 	results.Failures = r.failures
-	results.Status = "ok"
+	results.Status = StatusOK
 	if len(r.failures) > 0 {
-		results.Status = "failed"
+		results.Status = StatusFailed
 	}
 	if err := writeJSONFile(filepath.Join(options.Out, "results.json"), results); err != nil {
 		return results, err
@@ -357,6 +510,20 @@ func validateOptions(options *Options) error {
 	if options.EnginePerfMemoryMiB == 0 {
 		options.EnginePerfMemoryMiB = 256
 	}
+	durabilities, err := ParseDurabilities(strings.Join(options.Durabilities, ","))
+	if err != nil {
+		return err
+	}
+	options.Durabilities = durabilities
+	if options.Timeout < 0 || options.ReferenceTimeout < 0 {
+		return errors.New("timeouts cannot be negative")
+	}
+	if options.Timeout == 0 {
+		options.Timeout = DefaultTimeout
+	}
+	if options.ReferenceTimeout == 0 {
+		options.ReferenceTimeout = options.Timeout
+	}
 	if err := options.Profile.Validate(); err != nil {
 		return err
 	}
@@ -380,7 +547,52 @@ func validateOptions(options *Options) error {
 			return fmt.Errorf("binary %s is not a regular file", path)
 		}
 	}
-	return checkReferencePaths(*options)
+	return nil
+}
+
+// probeBuffered finds out how this candidate selects buffered output for each
+// writing op, from its own --help. An op whose help lists no --buffered flag
+// gets no buffered row: running the durable command twice under a buffered
+// label would be a lie.
+func (r *runner) probeBuffered(ctx context.Context) {
+	if !contains(r.options.Durabilities, DurabilityBuffered) {
+		return
+	}
+	for _, op := range []string{OpCreate, OpRepair} {
+		if !contains(r.options.Ops, op) {
+			continue
+		}
+		result := Run(ctx, Command{Path: r.options.Candidate, Args: []string{"par3", op, "--help"}, Timeout: 30 * time.Second})
+		if strings.Contains(result.Stdout+result.Stderr, "--buffered") {
+			r.results.BufferedArgs[op] = []string{"--buffered"}
+			continue
+		}
+		r.results.BufferedUnsupported = append(r.results.BufferedUnsupported, op)
+		note := fmt.Sprintf("buffered %s rows not run: `rarpar par3 %s --help` on this candidate lists no --buffered flag, so only its durable %s row exists", op, op, op)
+		if r.options.EnginePerf != "" {
+			note += fmt.Sprintf("; the untimed engine_perf pass still measures buffered %s (PAR3_BENCH_%s_DURABILITY=buffered)", op, strings.ToUpper(op))
+		}
+		r.results.Notes = append(r.results.Notes, note)
+		r.logf("%s", note)
+	}
+}
+
+// runsOp reports whether variant has a row for op on this candidate.
+func (r *runner) runsOp(variant Variant, op string) bool {
+	if !variant.RunsOp(op) {
+		return false
+	}
+	if variant.EffectiveDurability() == DurabilityBuffered {
+		return r.results.BufferedArgs[op] != nil
+	}
+	return true
+}
+
+func (r *runner) timeoutFor(tool string) time.Duration {
+	if tool == ToolReference {
+		return r.options.ReferenceTimeout
+	}
+	return r.options.Timeout
 }
 
 func contains(list []string, value string) bool {
@@ -482,12 +694,18 @@ func (r *runner) record(record RunRecord) {
 	if record.Repair != nil {
 		extra = fmt.Sprintf(" repaired=%t", record.Repair.Match)
 	}
+	if record.Canonical {
+		phase = "canonical-seed"
+	}
+	if record.Status != StatusOK && record.Failure != "" {
+		extra += " " + record.Failure
+	}
 	r.logf("%s %s %s %s#%d %.3fs user=%.3fs sys=%.3fs rss=%dMiB exit=%d %s%s",
 		record.Config, record.Op, record.Variant, phase, record.Repeat, record.WallSeconds,
 		record.UserSeconds, record.SysSeconds, record.MaxRSSBytes>>20, record.ExitCode, record.Status, extra)
 }
 
-func (r *runner) runConfig(ctx context.Context, config Config, dataset Dataset) error {
+func (r *runner) runConfig(ctx context.Context, config Config, dataset Dataset, summary *ConfigSummary) error {
 	dataDir := filepath.Join(r.options.Work, "data", dataset.ID)
 	manifest, err := EnsureDataset(dataDir, dataset, r.logf)
 	if err != nil {
@@ -508,38 +726,31 @@ func (r *runner) runConfig(ctx context.Context, config Config, dataset Dataset) 
 	// check compares against it, and every verify and repair, ours included,
 	// reads it, so both tools always work from the same recovery set.
 	canonical := filepath.Join(r.options.Work, "k", config.ID)
-	if err := os.RemoveAll(canonical); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(canonical, 0o755); err != nil {
-		return err
-	}
-	reference := Variant{Name: "reference", Tool: ToolReference}
-	seed := Run(ctx, r.createCommand(config, dataset, dataDir, canonical, reference))
-	if seed.Failure != "" || seed.ExitCode != 0 {
-		if seed.Failure == "binary-quarantined" {
-			return r.quarantined(ctx, r.options.Reference, "refused to start")
-		}
-		return fmt.Errorf("reference create for the canonical carriers failed (exit %d %s): %s", seed.ExitCode, seed.Failure, firstLine(seed.Stderr))
-	}
-	canonicalSet, err := ReadCarrierSet(canonical)
+	canonicalSet, source, err := r.seedCanonical(ctx, config, dataset, dataDir, canonical)
 	if err != nil {
 		return err
 	}
-	if len(canonicalSet.Files) == 0 {
-		return errors.New("reference create wrote no carriers")
-	}
+	summary.CanonicalSource = source
 
-	variants := r.results.Variants
 	var failed []string
 	for _, op := range r.options.Ops {
 		if err := r.checkBinaries(ctx); err != nil {
 			return err
 		}
+		var variants []Variant
+		for _, variant := range r.results.Variants {
+			if r.runsOp(variant, op) {
+				variants = append(variants, variant)
+			}
+		}
 		for run := 0; run < r.options.Warmups+r.options.Repeats; run++ {
 			order := orderFor(variants, run)
 			for position, variant := range order {
-				record, err := r.runOne(ctx, op, config, dataset, manifest, dataDir, canonical, canonicalSet, stageRoot, variant)
+				key := rowKey(config.ID, op, variant.Name)
+				if r.finished[key] {
+					continue
+				}
+				record, err := r.runOne(ctx, op, config, dataset, manifest, dataDir, canonical, canonicalSet, source, stageRoot, variant)
 				if err != nil {
 					return err
 				}
@@ -549,8 +760,17 @@ func (r *runner) runConfig(ctx context.Context, config Config, dataset Dataset) 
 					record.Repeat = run - r.options.Warmups
 				}
 				record.Position = position
+				if record.Tool == ToolReference && record.Status != StatusOK && record.Failure != FailureMissingRSS {
+					// The reference did not finish: record it once and stop
+					// running this row. Nothing about it fails the run.
+					record.Status = StatusDNF
+					r.finished[key] = true
+				}
 				r.record(record)
-				if record.Status != "ok" {
+				switch record.Status {
+				case StatusDNF:
+					r.noteDNF(record, r.options.Warmups+r.options.Repeats-run-1)
+				case StatusFailed:
 					failed = append(failed, fmt.Sprintf("%s/%s/%s: %s", config.ID, op, variant.Name, record.Status))
 				}
 			}
@@ -562,7 +782,9 @@ func (r *runner) runConfig(ctx context.Context, config Config, dataset Dataset) 
 		}
 		if r.options.EnginePerf != "" {
 			for _, workers := range r.options.Workers {
-				r.enginePerf(ctx, op, config, dataset, dataDir, canonical, stageRoot, workers)
+				for _, durability := range r.enginePerfDurabilities(op) {
+					r.enginePerf(ctx, op, config, dataset, dataDir, canonical, stageRoot, workers, durability)
+				}
 			}
 		}
 	}
@@ -570,6 +792,141 @@ func (r *runner) runConfig(ctx context.Context, config Config, dataset Dataset) 
 		return fmt.Errorf("%d run(s) failed: %s", len(failed), strings.Join(dedupe(failed), "; "))
 	}
 	return nil
+}
+
+func rowKey(config, op, variant string) string { return config + "/" + op + "/" + variant }
+
+// seedCanonical writes the canonical carriers with the reference. When the
+// reference does not finish, the seed is recorded as the reference create
+// row's DNF and rarpar writes the canonical carriers instead, so every rarpar
+// row still runs; identity verdicts are then unavailable for the set.
+func (r *runner) seedCanonical(ctx context.Context, config Config, dataset Dataset, dataDir, canonical string) (CarrierSet, string, error) {
+	if err := resetDir(canonical); err != nil {
+		return CarrierSet{}, "", err
+	}
+	reference := Variant{Name: "reference", Tool: ToolReference}
+	command := r.createCommand(config, dataset, dataDir, canonical, reference)
+	seed := Run(ctx, command)
+	if seed.Failure == "binary-quarantined" {
+		return CarrierSet{}, "", r.quarantined(ctx, r.options.Reference, "refused to start")
+	}
+	failure, detail := referenceCreateProblem(seed, canonical, config)
+	if failure == "" {
+		set, err := ReadCarrierSet(canonical)
+		return set, ToolReference, err
+	}
+	if err := ctx.Err(); err != nil {
+		return CarrierSet{}, "", err
+	}
+	record := RunRecord{
+		Config: config.ID, Op: OpCreate, Variant: reference.Name, Tool: ToolReference, Canonical: true, Warmup: true,
+		Command: command.Describe(), Measurement: seed.Measurement, Status: StatusDNF, Failure: failure, Error: detail,
+		StderrTail: seed.Stderr, StderrLine: lastLine(seed),
+	}
+	r.record(record)
+	if contains(r.options.Ops, OpCreate) {
+		// The timed reference create would repeat the same failure (or the
+		// same timeout); its row is this DNF.
+		r.finished[rowKey(config.ID, OpCreate, reference.Name)] = true
+	}
+	r.noteDNF(record, -1)
+
+	workers := 1
+	for _, count := range r.options.Workers {
+		if count > workers {
+			workers = count
+		}
+	}
+	fallback := Variant{Name: "rarpar-canonical", Tool: ToolCandidate, Workers: workers, Durability: DurabilityDurable}
+	if err := resetDir(canonical); err != nil {
+		return CarrierSet{}, "", err
+	}
+	result := Run(ctx, r.createCommand(config, dataset, dataDir, canonical, fallback))
+	if result.Failure != "" || result.ExitCode != 0 {
+		if result.Failure == "binary-quarantined" {
+			return CarrierSet{}, "", r.quarantined(ctx, r.options.Candidate, "refused to start")
+		}
+		return CarrierSet{}, "", fmt.Errorf("the reference did not finish the canonical create and rarpar's fallback create failed too (exit %d %s): %s",
+			result.ExitCode, result.Failure, lastLine(result))
+	}
+	set, err := ReadCarrierSet(canonical)
+	if err != nil {
+		return CarrierSet{}, "", fmt.Errorf("rarpar's fallback canonical carriers: %w", err)
+	}
+	if len(set.Files) == 0 {
+		return CarrierSet{}, "", errors.New("rarpar's fallback canonical create wrote no carriers")
+	}
+	r.results.Notes = append(r.results.Notes, fmt.Sprintf("%s: the reference did not finish the canonical create, so rarpar (durable, %d workers) wrote the carriers every verify and repair read; create identity verdicts are unavailable for this set", config.ID, workers))
+	return set, ToolCandidate, nil
+}
+
+// referenceCreateProblem classifies a reference create that did not finish:
+// a failed or timed-out process, a non-zero exit, or carriers that are
+// missing, unreadable or short of the requested recovery blocks.
+func referenceCreateProblem(result Result, dir string, config Config) (string, string) {
+	if result.Failure != "" {
+		return result.Failure, fmt.Sprint(result.Err)
+	}
+	if result.ExitCode != 0 {
+		return fmt.Sprintf("exit-%d", result.ExitCode), ""
+	}
+	set, err := ReadCarrierSet(dir)
+	if err != nil {
+		return "unreadable-carriers", err.Error()
+	}
+	if len(set.Files) == 0 {
+		return "no-carriers", "the reference exited 0 but wrote no .par3 files"
+	}
+	if got := int64(len(set.recovery)); got != config.Recovery {
+		return "truncated-carriers", fmt.Sprintf("%d of %d recovery blocks present", got, config.Recovery)
+	}
+	return "", ""
+}
+
+// noteDNF lists a DNF row in the results and the log.
+func (r *runner) noteDNF(record RunRecord, skipped int) {
+	text := fmt.Sprintf("%s/%s/%s: DNF %s", record.Config, record.Op, record.Variant, describeDNF(record))
+	if record.Canonical {
+		text += " (canonical seed create)"
+	}
+	if skipped > 0 {
+		text += fmt.Sprintf("; its %d remaining run(s) skipped", skipped)
+	}
+	r.results.DNF = append(r.results.DNF, text)
+	r.logf("%s", text)
+}
+
+// describeDNF is "exit 6: <stderr line>", "timeout after 20m0s", and so on.
+func describeDNF(record RunRecord) string {
+	var text string
+	switch {
+	case record.Failure == "timeout":
+		text = "timeout after " + time.Duration(record.WallSeconds*float64(time.Second)).Round(time.Millisecond).String()
+	case strings.HasPrefix(record.Failure, "exit-"):
+		text = "exit " + strings.TrimPrefix(record.Failure, "exit-")
+	default:
+		text = fmt.Sprintf("%s (exit %d)", record.Failure, record.ExitCode)
+	}
+	if record.Error != "" && record.Failure != "timeout" {
+		text += " (" + record.Error + ")"
+	}
+	if record.StderrLine != "" {
+		text += ": " + record.StderrLine
+	}
+	return text
+}
+
+// lastLine is the last non-empty output line: stderr first, else stdout.
+func lastLine(result Result) string {
+	for _, text := range []string{result.Stderr, result.Stdout} {
+		lines := strings.Split(strings.TrimSpace(text), "\n")
+		for i := len(lines) - 1; i >= 0; i-- {
+			if line := strings.TrimSpace(lines[i]); line != "" {
+				return line
+			}
+		}
+	}
+	return ""
 }
 
 func dedupe(values []string) []string {
@@ -609,7 +966,7 @@ func (r *runner) createCommand(config Config, dataset Dataset, dataDir, outDir s
 		}
 		args = append(args, "-B"+dataDir, output)
 		args = append(args, names...)
-		return Command{Path: r.options.Reference, Args: args, Dir: dataDir, PinCPUs: r.pin(), Timeout: r.options.Timeout}
+		return Command{Path: r.options.Reference, Args: args, Dir: dataDir, PinCPUs: r.pin(), Timeout: r.timeoutFor(ToolReference)}
 	}
 	args := append(r.candidateGlobals(variant), "par3", "create", output)
 	args = append(args, names...)
@@ -619,7 +976,17 @@ func (r *runner) createCommand(config Config, dataset Dataset, dataDir, outDir s
 	if config.Codec == "fft" {
 		args = append(args, "--codec", "fft", "--capacity-log2", strconv.Itoa(config.CapacityLog2()))
 	}
-	return Command{Path: r.options.Candidate, Args: args, Dir: dataDir, Env: variant.Env, PinCPUs: r.pin(), Timeout: r.options.Timeout}
+	args = append(args, r.durabilityArgs(OpCreate, variant)...)
+	return Command{Path: r.options.Candidate, Args: args, Dir: dataDir, Env: variant.Env, PinCPUs: r.pin(), Timeout: r.timeoutFor(ToolCandidate)}
+}
+
+// durabilityArgs selects buffered output for a buffered rarpar row; the
+// durable row runs the CLI's default.
+func (r *runner) durabilityArgs(op string, variant Variant) []string {
+	if variant.EffectiveDurability() != DurabilityBuffered {
+		return nil
+	}
+	return r.results.BufferedArgs[op]
 }
 
 func (r *runner) candidateGlobals(variant Variant) []string {
@@ -640,14 +1007,17 @@ func (r *runner) checkCommand(op string, stage string, variant Variant) Command 
 		if op == OpRepair {
 			letter = "r"
 		}
-		return Command{Path: r.options.Reference, Args: []string{letter, "-q", carrierName}, Dir: stage, PinCPUs: r.pin(), Timeout: r.options.Timeout}
+		return Command{Path: r.options.Reference, Args: []string{letter, "-q", carrierName}, Dir: stage, PinCPUs: r.pin(), Timeout: r.timeoutFor(ToolReference)}
 	}
 	sub := "verify"
 	if op == OpRepair {
 		sub = "repair"
 	}
 	args := append(r.candidateGlobals(variant), "par3", sub, carrierName)
-	return Command{Path: r.options.Candidate, Args: args, Dir: stage, Env: variant.Env, PinCPUs: r.pin(), Timeout: r.options.Timeout}
+	if op == OpRepair {
+		args = append(args, r.durabilityArgs(OpRepair, variant)...)
+	}
+	return Command{Path: r.options.Candidate, Args: args, Dir: stage, Env: variant.Env, PinCPUs: r.pin(), Timeout: r.timeoutFor(ToolCandidate)}
 }
 
 // stage lays out a verify or repair directory: inputs (linked when the op
@@ -695,8 +1065,9 @@ func stage(dir string, dataset Dataset, dataDir, canonical string, config Config
 }
 
 func (r *runner) runOne(ctx context.Context, op string, config Config, dataset Dataset, manifest DatasetManifest,
-	dataDir, canonical string, canonicalSet CarrierSet, stageRoot string, variant Variant) (RunRecord, error) {
-	record := RunRecord{Config: config.ID, Op: op, Variant: variant.Name, Tool: variant.Tool, Workers: variant.Workers, Kernel: variant.Kernel}
+	dataDir, canonical string, canonicalSet CarrierSet, canonicalSource, stageRoot string, variant Variant) (RunRecord, error) {
+	record := RunRecord{Config: config.ID, Op: op, Variant: variant.Name, Tool: variant.Tool, Workers: variant.Workers, Kernel: variant.Kernel,
+		Durability: variant.EffectiveDurability()}
 	dir := filepath.Join(stageRoot, op+"-"+variant.dirName())
 	var command Command
 	if op == OpCreate {
@@ -716,14 +1087,27 @@ func (r *runner) runOne(ctx context.Context, op string, config Config, dataset D
 	record.Command = command.Describe()
 	result := Run(ctx, command)
 	record.Measurement = result.Measurement
-	record.Status = "ok"
+	record.Status = StatusOK
+	if result.Failure == "" && result.MaxRSSBytes <= 0 {
+		// Peak RSS is a required field of every row. A process that ran to
+		// exit without one means the harness failed to measure it.
+		record.Status = StatusFailed
+		record.Failure = FailureMissingRSS
+		record.Error = "the process exited but the harness recorded no peak RSS (" + rssSource() + ")"
+		return record, nil
+	}
 	if result.Failure != "" {
-		record.Status = "failed"
+		record.Status = StatusFailed
 		record.Failure = result.Failure
 		record.Error = fmt.Sprint(result.Err)
 		record.StderrTail = result.Stderr
+		record.StderrLine = lastLine(result)
 		if result.Failure == "binary-quarantined" {
 			return record, r.quarantined(ctx, command.Path, "refused to start: "+fmt.Sprint(result.Err))
+		}
+		if result.Failure == "timeout" && ctx.Err() != nil {
+			// The whole run was cancelled, not this row.
+			return record, ctx.Err()
 		}
 		return record, nil
 	}
@@ -735,26 +1119,40 @@ func (r *runner) runOne(ctx context.Context, op string, config Config, dataset D
 		accepted = result.ExitCode == 0 || result.ExitCode == 1
 	}
 	if !accepted {
-		record.Status = "failed"
+		record.Status = StatusFailed
 		record.Failure = fmt.Sprintf("exit-%d", result.ExitCode)
 		record.StderrTail = result.Stderr
+		record.StderrLine = lastLine(result)
 		return record, nil
 	}
 	switch op {
 	case OpCreate:
+		if variant.Tool == ToolReference {
+			if failure, detail := referenceCreateProblem(result, dir, config); failure != "" {
+				record.Status = StatusFailed
+				record.Failure = failure
+				record.Error = detail
+				record.StderrLine = lastLine(result)
+				return record, nil
+			}
+		}
 		set, err := ReadCarrierSet(dir)
 		if err != nil {
-			record.Status = "failed"
+			record.Status = StatusFailed
 			record.Failure = "unreadable-carriers"
 			record.Error = err.Error()
 			return record, nil
+		}
+		if canonicalSource != ToolReference {
+			// No reference set to compare against.
+			break
 		}
 		identity := CompareCarriers(canonicalSet, set)
 		record.Identity = &identity
 		if variant.Tool == ToolReference && !identity.Bytes {
 			// The reference must reproduce itself; if it does not, nothing
 			// compared against it means anything.
-			record.Status = "failed"
+			record.Status = StatusFailed
 			record.Failure = "reference-nondeterministic"
 		}
 	case OpRepair:
@@ -764,9 +1162,10 @@ func (r *runner) runOne(ctx context.Context, op string, config Config, dataset D
 		}
 		record.Repair = &check
 		if !check.Match {
-			record.Status = "failed"
+			record.Status = StatusFailed
 			record.Failure = "repair-mismatch"
 			record.StderrTail = result.Stderr
+			record.StderrLine = lastLine(result)
 		}
 	}
 	return record, nil
@@ -845,13 +1244,18 @@ func resetDir(dir string) error {
 // per-stage JSON lines. It drives the library directly, so it explains where
 // the CLI's time goes; it is never the headline number.
 func (r *runner) enginePerf(ctx context.Context, op string, config Config, dataset Dataset,
-	dataDir, canonical, stageRoot string, workers int) {
+	dataDir, canonical, stageRoot string, workers int, durability string) {
 	if op == OpVerifyDamaged {
 		return
 	}
-	record := EnginePerfRecord{Config: config.ID, Op: op, Workers: workers}
+	record := EnginePerfRecord{Config: config.ID, Op: op, Workers: workers, Durability: durability}
 	memory := strconv.Itoa(r.options.EnginePerfMemoryMiB)
-	base := filepath.Join(stageRoot, fmt.Sprintf("engine-perf-%s-w%d", op, workers))
+	base := filepath.Join(stageRoot, fmt.Sprintf("engine-perf-%s-w%d-%s", op, workers, durability))
+	var env []string
+	if durability == DurabilityBuffered {
+		// engine_perf's own switches; unset means its sync-files default.
+		env = []string{fmt.Sprintf("PAR3_BENCH_%s_DURABILITY=buffered", strings.ToUpper(op))}
+	}
 	carriers, output, damaged := filepath.Join(base, "carriers"), filepath.Join(base, "output"), filepath.Join(base, "data")
 	var args []string
 	var setupErr error
@@ -881,7 +1285,7 @@ func (r *runner) enginePerf(ctx context.Context, op string, config Config, datas
 	if setupErr != nil {
 		record.Error = setupErr.Error()
 	} else {
-		result := Run(ctx, Command{Path: r.options.EnginePerf, Args: args, PinCPUs: r.pin(), Timeout: r.options.Timeout})
+		result := Run(ctx, Command{Path: r.options.EnginePerf, Args: args, Env: env, PinCPUs: r.pin(), Timeout: r.options.Timeout})
 		record.WallSeconds = result.WallSeconds
 		scanner := bufio.NewScanner(strings.NewReader(result.Stdout))
 		for scanner.Scan() {
@@ -895,8 +1299,17 @@ func (r *runner) enginePerf(ctx context.Context, op string, config Config, datas
 		}
 	}
 	r.results.EnginePerfRuns = append(r.results.EnginePerfRuns, record)
-	r.logf("%s %s engine_perf w%d %.3fs lines=%d %s", config.ID, op, workers, record.WallSeconds, len(record.Lines), record.Error)
+	r.logf("%s %s engine_perf w%d %s %.3fs lines=%d %s", config.ID, op, workers, durability, record.WallSeconds, len(record.Lines), record.Error)
 	_ = os.RemoveAll(base)
+}
+
+// enginePerfDurabilities is the durability modes the untimed engine_perf pass
+// covers for op: every requested mode for the writing ops, durable otherwise.
+func (r *runner) enginePerfDurabilities(op string) []string {
+	if op == OpCreate || op == OpRepair {
+		return r.options.Durabilities
+	}
+	return []string{DurabilityDurable}
 }
 
 func writeJSONFile(path string, value any) error {
@@ -920,7 +1333,30 @@ func ReadResults(path string) (*Results, error) {
 	if results.Schema != ResultsSchema {
 		return nil, fmt.Errorf("%s: schema %q, want %q", path, results.Schema, ResultsSchema)
 	}
+	if err := ValidateResults(&results); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
 	return &results, nil
+}
+
+// ValidateResults enforces the required per-row fields. max_rss_bytes is
+// required: every run whose status is "ok" must carry a positive peak RSS, and
+// a results file with one that does not is invalid.
+func ValidateResults(results *Results) error {
+	var bad []string
+	for _, run := range results.Runs {
+		if run.Status == StatusOK && run.MaxRSSBytes <= 0 {
+			bad = append(bad, fmt.Sprintf("%s/%s/%s repeat %d", run.Config, run.Op, run.Variant, run.Repeat))
+		}
+	}
+	if len(bad) > 0 {
+		shown := bad
+		if len(shown) > 5 {
+			shown = append(shown[:5:5], fmt.Sprintf("… %d more", len(bad)-5))
+		}
+		return fmt.Errorf("%d ok run(s) lack the required max_rss_bytes: %s", len(bad), strings.Join(shown, ", "))
+	}
+	return nil
 }
 
 // CollectMachine extends the shared host description with a usable CPU name

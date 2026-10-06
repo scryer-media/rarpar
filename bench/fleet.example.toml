@@ -214,13 +214,15 @@ repeats = 5
 pin_cpus = "0-7"                         # P-cores on a hybrid part; empty = unpinned
 iocount = false                          # untimed strace -f -c pass (Linux)
 # The reference keeps its volume paths in a 1 KiB buffer and fails on longer
-# lists, so the work path must stay short (set C writes 13 volumes: about 40
-# characters at most). The plan refuses a path that is too long.
+# lists, so keep the work path short (set C writes 13 volumes: about 40
+# characters at most). The plan warns about a longer path but runs anyway; the
+# reference rows it breaks are recorded as DNF.
 work = "/home/bench/p3"
 # Extra rarpar rows with environment overrides, NAME:VAR=value[,VAR=value].
 # Only meaningful once the candidate honours the variable.
 # kernel_variants = ["name:VAR=value"]
-timeout_minutes = 120
+# durability = ["durable", "buffered"]   # default; rarpar create/repair rows, durable first
+timeout_minutes = 20                     # per run; a reference run past it is DNF
 
 # ------------------------------------- machine: appliance NAS, askpass auth ----
 # A DSM-class appliance: password auth through an askpass helper, no perf, no

@@ -410,6 +410,9 @@ func par3Args(machine Machine) []string {
 	for _, variant := range plan.KernelVariants {
 		args = append(args, "--kernel-variant", variant)
 	}
+	if len(plan.Durability) > 0 {
+		args = append(args, "--durability", strings.Join(plan.Durability, ","))
+	}
 	return args
 }
 

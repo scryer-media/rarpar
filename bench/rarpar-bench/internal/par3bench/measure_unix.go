@@ -51,3 +51,10 @@ func fillRusage(measurement *Measurement, state *os.ProcessState) {
 }
 
 func isQuarantineError(error) bool { return false }
+
+func rssSource() string {
+	if runtime.GOOS == "darwin" {
+		return "rusage ru_maxrss, bytes"
+	}
+	return "rusage ru_maxrss, KiB"
+}
