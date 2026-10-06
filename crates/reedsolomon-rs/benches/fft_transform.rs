@@ -278,6 +278,186 @@ fn main() {
             });
         });
     }
+    // Known-zero left halves in a radix-2 sweep: an odd stage count ends on
+    // one, and with the low half of the rows zero every butterfly of that
+    // last inverse stage only scales the right row into the left.
+    for (count, width) in [(128usize, 65536usize), (512, 32768)] {
+        let zero: Vec<bool> = (0..count).map(|row| row < count / 2).collect();
+        let fill = |row: usize, at: usize| ((row * 7919 + at * 103) % 256) as u16;
+        group.throughput(Throughput::Bytes((count * width) as u64));
+        if count <= 256 {
+            let original: Vec<Vec<u8>> = (0..count)
+                .map(|row| {
+                    (0..width)
+                        .map(|at| if zero[row] { 0 } else { fill(row, at) as u8 })
+                        .collect()
+                })
+                .collect();
+            let mut rows = original.clone();
+            group.bench_function(
+                BenchmarkId::new(format!("u8_{count}x{width}_left_zero"), true),
+                |b| {
+                    b.iter(|| {
+                        rows.clone_from(&original);
+                        byte_field
+                            .transform_u8_known_zero_with_backend(
+                                black_box(&mut rows),
+                                &zero,
+                                0,
+                                true,
+                                LinearBackend::Auto,
+                                &|| false,
+                            )
+                            .unwrap();
+                    });
+                },
+            );
+        } else {
+            let original: Vec<Vec<u16>> = (0..count)
+                .map(|row| {
+                    (0..width)
+                        .map(|at| if zero[row] { 0 } else { fill(row, at) * 251 })
+                        .collect()
+                })
+                .collect();
+            let mut rows = original.clone();
+            group.bench_function(
+                BenchmarkId::new(format!("u16_{count}x{width}_left_zero"), true),
+                |b| {
+                    b.iter(|| {
+                        rows.clone_from(&original);
+                        word_field
+                            .transform_known_zero_with_backend(
+                                black_box(&mut rows),
+                                &zero,
+                                0,
+                                true,
+                                LinearBackend::Auto,
+                                &|| false,
+                            )
+                            .unwrap();
+                    });
+                },
+            );
+        }
+    }
+    group.finish();
+
+    // Scaling one row in place, one worker: GF(2^8) byte rows, GF(2^16) word
+    // rows, and 8-bit symbols on word rows (the one lane that validates).
+    // Then a PAR3 decoder's front end, every received row scaled and the
+    // known-zero inverse transform run on the result.
+    let mut group = criterion.benchmark_group("cantor_scale");
+    for width in [4096usize, 65536] {
+        let mut bytes: Vec<u8> = (0..width).map(|at| (at * 103 % 251) as u8).collect();
+        group.throughput(Throughput::Bytes(width as u64));
+        group.bench_function(BenchmarkId::new("u8_gf8", width), |b| {
+            b.iter(|| {
+                byte_field
+                    .scale_u8_with_backend(
+                        black_box(&mut bytes),
+                        0x53,
+                        LinearBackend::Auto,
+                        &|| false,
+                    )
+                    .unwrap();
+            });
+        });
+        let mut words: Vec<u16> = (0..width / 2).map(|at| (at * 7919) as u16).collect();
+        group.bench_function(BenchmarkId::new("u16_gf16", width), |b| {
+            b.iter(|| {
+                word_field
+                    .scale_with_backend(black_box(&mut words), 0x1234, LinearBackend::Auto, &|| {
+                        false
+                    })
+                    .unwrap();
+            });
+        });
+        let mut narrow: Vec<u16> = (0..width / 2).map(|at| (at * 103 % 251) as u16).collect();
+        group.bench_function(BenchmarkId::new("u16_gf8", width), |b| {
+            b.iter(|| {
+                byte_field
+                    .scale_with_backend(black_box(&mut narrow), 0x53, LinearBackend::Auto, &|| {
+                        false
+                    })
+                    .unwrap();
+            });
+        });
+    }
+    // A decoder's formal derivative over every row at the PAR3 stripe shapes.
+    let mut bytes: Vec<Vec<u8>> = (0..256)
+        .map(|row| {
+            (0..65536)
+                .map(|at| ((row * 7919 + at * 103) % 256) as u8)
+                .collect()
+        })
+        .collect();
+    group.throughput(Throughput::Bytes((256 * 65536) as u64));
+    group.bench_function(BenchmarkId::new("u8_derivative", "256x65536"), |b| {
+        b.iter(|| {
+            byte_field
+                .derivative_u8(black_box(&mut bytes), &|| false)
+                .unwrap()
+        });
+    });
+    let mut words: Vec<Vec<u16>> = (0..512)
+        .map(|row| {
+            (0..32768)
+                .map(|at| ((row * 7919 + at * 103) % 65536) as u16)
+                .collect()
+        })
+        .collect();
+    group.throughput(Throughput::Bytes((512 * 65536) as u64));
+    group.bench_function(BenchmarkId::new("u16_derivative", "512x32768"), |b| {
+        b.iter(|| {
+            word_field
+                .derivative(black_box(&mut words), &|| false)
+                .unwrap()
+        });
+    });
+    let zero = decoder(256, 32, 150, 15);
+    let factors: Vec<u16> = (0..256).map(|row| (row * 37 % 255 + 1) as u16).collect();
+    let original: Vec<Vec<u8>> = (0..256)
+        .map(|row| {
+            (0..65536)
+                .map(|at| {
+                    if zero[row] {
+                        0
+                    } else {
+                        ((row * 7919 + at * 103) % 256) as u8
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    let mut bytes = original.clone();
+    group.throughput(Throughput::Bytes((256 * 65536) as u64));
+    group.bench_function(BenchmarkId::new("u8_decode_front", "256x65536"), |b| {
+        b.iter(|| {
+            bytes.clone_from(&original);
+            let rows = black_box(&mut bytes);
+            for (row, factor) in rows
+                .iter_mut()
+                .zip(&factors)
+                .zip(&zero)
+                .filter_map(|(pair, &zero)| (!zero).then_some(pair))
+            {
+                byte_field
+                    .scale_u8_with_backend(row, *factor, LinearBackend::Auto, &|| false)
+                    .unwrap();
+            }
+            byte_field
+                .transform_u8_known_zero_with_backend(
+                    rows,
+                    &zero,
+                    0,
+                    true,
+                    LinearBackend::Auto,
+                    &|| false,
+                )
+                .unwrap();
+        });
+    });
     group.finish();
     criterion.final_summary();
 }

@@ -465,6 +465,84 @@ impl MulPlan {
         at
     }
 
+    /// Replace every byte of `row` by its image under this plan's map, on the
+    /// portable table walk.
+    pub(crate) fn map_scalar(&self, row: &mut [u8]) {
+        for value in row {
+            *value = self.apply(*value);
+        }
+    }
+
+    /// [`Self::map_scalar`] on NEON; returns the bytes processed.
+    ///
+    /// # Safety
+    /// NEON must be available.
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    pub(crate) unsafe fn map_neon(&self, row: &mut [u8]) -> usize {
+        use std::arch::aarch64::*;
+        let t = fused_neon::tables(self);
+        let mut at = 0;
+        while row.len() - at >= 16 {
+            // SAFETY: the row holds 16 bytes from `at`.
+            unsafe {
+                let value = vld1q_u8(row.as_ptr().add(at));
+                vst1q_u8(row.as_mut_ptr().add(at), fused_neon::map(&t, value));
+            }
+            at += 16;
+        }
+        at
+    }
+
+    /// [`Self::map_scalar`] on AVX2; returns the bytes processed.
+    ///
+    /// # Safety
+    /// AVX2 must be available.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    pub(crate) unsafe fn map_avx2(&self, row: &mut [u8]) -> usize {
+        use std::arch::x86_64::*;
+        let t = fused_x86::tables256(self);
+        let mut at = 0;
+        while row.len() - at >= 32 {
+            // SAFETY: the row holds 32 bytes from `at`.
+            unsafe {
+                let value = _mm256_loadu_si256(row.as_ptr().add(at).cast());
+                _mm256_storeu_si256(
+                    row.as_mut_ptr().add(at).cast(),
+                    fused_x86::map256(&t, value),
+                );
+            }
+            at += 32;
+        }
+        // SAFETY: AVX2 implies SSSE3.
+        at + unsafe { self.map_ssse3(&mut row[at..]) }
+    }
+
+    /// [`Self::map_scalar`] on SSSE3; returns the bytes processed.
+    ///
+    /// # Safety
+    /// SSSE3 must be available.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "ssse3")]
+    pub(crate) unsafe fn map_ssse3(&self, row: &mut [u8]) -> usize {
+        use std::arch::x86_64::*;
+        let t = fused_x86::tables128(self);
+        let mut at = 0;
+        while row.len() - at >= 16 {
+            // SAFETY: the row holds 16 bytes from `at`.
+            unsafe {
+                let value = _mm_loadu_si128(row.as_ptr().add(at).cast());
+                _mm_storeu_si128(
+                    row.as_mut_ptr().add(at).cast(),
+                    fused_x86::map128(&t, value),
+                );
+            }
+            at += 16;
+        }
+        at
+    }
+
     /// wasm simd128: 16 bytes per iteration, the same split-nibble shape the
     /// NEON tier uses. The two 16-byte product tables are the swizzle operands,
     /// so one `i8x16.swizzle` per nibble replaces sixteen table indexings.

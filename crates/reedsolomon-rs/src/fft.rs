@@ -100,10 +100,12 @@ impl TransformField {
     }
 
     /// Multiply a stripe by one Cantor-representation factor in place.
-    /// Uses fixed-size stack scratch and the selected shuffle backend, with a
-    /// scalar fallback. Cancellation is checked at most 256 symbols apart;
-    /// cancelled calls may have modified a prefix. Invalid symbols or factors
-    /// return `Geometry` before modifying the stripe.
+    /// Each symbol is loaded and stored once by the selected shuffle backend,
+    /// with a scalar fallback; no scratch is used. Cancellation is checked at
+    /// most 256 symbols apart; cancelled calls may have modified a prefix.
+    /// Invalid symbols or factors return `Geometry` before modifying the
+    /// stripe. Only the 8-bit field can be handed invalid symbols, so only it
+    /// reads the stripe once beforehand to check them.
     pub fn scale_with_backend(
         &self,
         values: &mut [u16],
@@ -141,7 +143,7 @@ impl TransformField {
         if cancelled() {
             return Err(TransformError::Cancelled);
         }
-        if S::RANGED {
+        if S::ranged(self) {
             for stripe in values.chunks(256) {
                 if cancelled() {
                     return Err(TransformError::Cancelled);
@@ -157,20 +159,67 @@ impl TransformField {
         let plan =
             (backend != crate::gf_simd::LinearBackend::Scalar && values.len() >= 64 && factor > 1)
                 .then(|| S::map(self, factor, backend));
-        let mut source = [S::default(); 256];
-        for stripe in values.chunks_mut(source.len()) {
+        for stripe in values.chunks_mut(256) {
             if cancelled() {
                 return Err(TransformError::Cancelled);
             }
             if factor == 0 {
                 stripe.fill(S::default());
             } else if let Some(plan) = &plan {
-                source[..stripe.len()].copy_from_slice(stripe);
-                stripe.fill(S::default());
-                S::accumulate(plan, &source[..stripe.len()], stripe);
+                S::map_in_place(plan, stripe);
             } else {
                 for value in stripe {
                     *value = S::mul(self, *value, factor);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Set `destination` to `factor` times the 16-bit symbols stored as
+    /// little-endian pairs in `source`, the on-disk layout: unpacking and
+    /// [`Self::scale_with_backend`] in one pass, each symbol loaded and
+    /// stored once. `source` must hold two bytes per destination symbol and
+    /// `factor` must be a symbol (`Geometry` otherwise); any field but the
+    /// 16-bit one returns `Field`. Cancellation is checked at most 256
+    /// symbols apart; cancelled calls may have written a prefix.
+    pub fn scale_le_bytes_with_backend(
+        &self,
+        source: &[u8],
+        destination: &mut [u16],
+        factor: u16,
+        backend: crate::gf_simd::LinearBackend,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError> {
+        if self.bits != 16 {
+            return Err(TransformError::Field);
+        }
+        if source.len() != destination.len().saturating_mul(2) || factor as usize >= self.order() {
+            return Err(TransformError::Geometry);
+        }
+        if cancelled() {
+            return Err(TransformError::Cancelled);
+        }
+        let plan = (backend != crate::gf_simd::LinearBackend::Scalar
+            && destination.len() >= 64
+            && factor > 1)
+            .then(|| <u16 as Lane>::map(self, factor, backend));
+        for (to, from) in destination.chunks_mut(256).zip(source.chunks(512)) {
+            if cancelled() {
+                return Err(TransformError::Cancelled);
+            }
+            match &plan {
+                _ if factor == 0 => to.fill(0),
+                Some(plan) => plan.map_le_bytes(from, to),
+                None => {
+                    for (to, from) in to.iter_mut().zip(from.chunks_exact(2)) {
+                        let value = u16::from_le_bytes([from[0], from[1]]);
+                        *to = if factor == 1 {
+                            value
+                        } else {
+                            self.mul(value, factor)
+                        };
+                    }
                 }
             }
         }
@@ -545,7 +594,7 @@ impl TransformField {
             if cancelled() {
                 return Err(TransformError::Cancelled);
             }
-            if row.len() != rows[0].len() || (S::RANGED && !S::admits(self, row)) {
+            if row.len() != rows[0].len() || (S::ranged(self) && !S::admits(self, row)) {
                 return Err(TransformError::Geometry);
             }
         }
@@ -560,39 +609,9 @@ impl TransformField {
         Ok(())
     }
 
-    fn butterfly<S: Lane>(
-        &self,
-        factor: u16,
-        inverse: bool,
-        backend: crate::gf_simd::LinearBackend,
-        width: usize,
-    ) -> impl Fn(&mut [S], &mut [S]) + Sync + '_ {
-        let plan = (backend != crate::gf_simd::LinearBackend::Scalar && width >= 64 && factor > 1)
-            .then(|| S::map(self, factor, backend));
-        move |left, right| {
-            if factor == 0 && backend != crate::gf_simd::LinearBackend::Scalar {
-                for (a, b) in left.iter().zip(right) {
-                    *b ^= *a;
-                }
-            } else if let Some(plan) = &plan {
-                S::butterfly(plan, left, right, inverse);
-            } else if inverse {
-                for (a, b) in left.iter_mut().zip(right) {
-                    *b ^= *a;
-                    *a ^= S::mul(self, *b, factor);
-                }
-            } else {
-                for (a, b) in left.iter_mut().zip(right) {
-                    *a ^= S::mul(self, *b, factor);
-                    *b ^= *a;
-                }
-            }
-        }
-    }
-
     /// The butterfly of the radix-2 group at `base` on `level`, given whether
-    /// each of its two rows is known zero. A single product degrades to the
-    /// full butterfly here, which leaves the same bytes.
+    /// each of its two rows is known zero. A single product writes only the
+    /// zero left row, as the radix-4 units do; the right row is not stored.
     fn pair<S: Lane>(
         &self,
         schedule: &Schedule,
@@ -600,13 +619,44 @@ impl TransformField {
         base: usize,
         width: usize,
     ) -> impl Fn(&mut [S], &mut [S], [bool; 2]) + Sync + '_ {
+        use crate::gf_simd::LinearBackend;
         let factor = ((schedule.origin ^ base) >> level) as u16;
         let inverse = schedule.inverse;
-        let butterfly = self.butterfly(factor, inverse, schedule.backend, width);
+        let backend = schedule.backend;
+        let plan = (backend != LinearBackend::Scalar && width >= 64 && factor > 1)
+            .then(|| S::map(self, factor, backend));
         move |left, right, zero| match Step::of(zero, factor == 0, inverse).0 {
             Step::Skip | Step::Keep => {}
             Step::Copy => right.copy_from_slice(left),
-            Step::Scale | Step::Full => butterfly(left, right),
+            // The left row is zero and the factor is not.
+            Step::Scale => match &plan {
+                Some(plan) => S::accumulate(plan, right, left),
+                None if factor == 1 => left.copy_from_slice(right),
+                None => {
+                    for (a, b) in left.iter_mut().zip(right) {
+                        *a = S::mul(self, *b, factor);
+                    }
+                }
+            },
+            Step::Full => {
+                if factor == 0 && backend != LinearBackend::Scalar {
+                    for (a, b) in left.iter().zip(right) {
+                        *b ^= *a;
+                    }
+                } else if let Some(plan) = &plan {
+                    S::butterfly(plan, left, right, inverse);
+                } else if inverse {
+                    for (a, b) in left.iter_mut().zip(right) {
+                        *b ^= *a;
+                        *a ^= S::mul(self, *b, factor);
+                    }
+                } else {
+                    for (a, b) in left.iter_mut().zip(right) {
+                        *a ^= S::mul(self, *b, factor);
+                        *b ^= *a;
+                    }
+                }
+            }
         }
     }
 
@@ -681,11 +731,82 @@ impl TransformField {
         self.derivative_lane(rows, cancelled)
     }
 
-    fn derivative_lane<S: Lane>(
+    /// [`Self::derivative`] inside a caller-owned, bounded worker pool: the
+    /// columns are split between tasks, each running the sequential
+    /// derivative on its own columns of every row, so the rows come out
+    /// exactly as [`Self::derivative`] leaves them. Small stripes execute
+    /// synchronously, as in [`Self::transform_in_pool`].
+    pub fn derivative_in_pool(
+        &self,
+        rows: &mut [Vec<u16>],
+        pool: &rayon::ThreadPool,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError> {
+        self.derivative_lane_in_pool(rows, pool, cancelled)
+    }
+
+    /// [`Self::derivative_in_pool`] on byte rows of the 8-bit field. Any
+    /// other field returns `Field`.
+    pub fn derivative_u8_in_pool(
+        &self,
+        rows: &mut [Vec<u8>],
+        pool: &rayon::ThreadPool,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError> {
+        self.byte_lane()?;
+        self.derivative_lane_in_pool(rows, pool, cancelled)
+    }
+
+    fn derivative_lane_in_pool<S: Lane>(
         &self,
         rows: &mut [Vec<S>],
-        cancelled: &dyn Fn() -> bool,
+        pool: &rayon::ThreadPool,
+        cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<(), TransformError> {
+        use rayon::prelude::*;
+        let n = rows.len();
+        let width = rows.first().map_or(0, Vec::len);
+        let threads = pool.current_num_threads();
+        // The same 64 KiB synchronous cutoff as the pooled transforms, and
+        // no column share narrower than one 64-byte cache line.
+        let share = width
+            .div_ceil(threads)
+            .next_multiple_of(64 / size_of::<S>());
+        if threads == 1 || size_of::<S>() * width * n < 65536 || share >= width {
+            return self.derivative_lane(rows, cancelled);
+        }
+        self.validate_derivative(rows)?;
+        // One pointer per row, the same size as the row handles themselves.
+        let shared = SharedRows(rows.iter_mut().map(|row| row.as_mut_ptr()).collect(), width);
+        pool.install(|| {
+            (0..width.div_ceil(share))
+                .into_par_iter()
+                .try_for_each(|task| {
+                    let columns = task * share..width.min((task + 1) * share);
+                    for index in 0..n {
+                        if cancelled() {
+                            return Err(TransformError::Cancelled);
+                        }
+                        let mut sources = [&[] as &[S]; 16];
+                        let mut count = 0;
+                        for bit in (0..n.trailing_zeros()).filter(|bit| index & (1 << bit) == 0) {
+                            // SAFETY: rows `index | 1 << bit` lie past `index`,
+                            // so none is the target; see `SharedRows::columns`.
+                            sources[count] =
+                                unsafe { shared.columns(index | (1 << bit), &columns) };
+                            count += 1;
+                        }
+                        // SAFETY: the one mutable slice this task holds; see
+                        // `SharedRows::columns`.
+                        let target = unsafe { shared.columns_mut(index, &columns) };
+                        xor_sum(target, &sources[..count]);
+                    }
+                    Ok(())
+                })
+        })
+    }
+
+    fn validate_derivative<S: Lane>(&self, rows: &[Vec<S>]) -> Result<(), TransformError> {
         let n = rows.len();
         if !n.is_power_of_two()
             || n > self.order()
@@ -693,22 +814,33 @@ impl TransformField {
         {
             return Err(TransformError::Geometry);
         }
+        Ok(())
+    }
+
+    fn derivative_lane<S: Lane>(
+        &self,
+        rows: &mut [Vec<S>],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError> {
+        self.validate_derivative(rows)?;
+        let n = rows.len();
+        // Coefficient `index` becomes the XOR of the coefficients one set bit
+        // above it, all of which lie later in the rows, so ascending order
+        // reads each before it is overwritten. Each target is stored once,
+        // its sources folded two at a time, rather than cleared and then
+        // rewritten once per source.
         for index in 0..n {
             if cancelled() {
                 return Err(TransformError::Cancelled);
             }
             let (done, remaining) = rows.split_at_mut(index + 1);
-            let target = &mut done[index];
-            target.fill(S::default());
-            for bit in 0..n.trailing_zeros() {
-                if index & (1 << bit) != 0 {
-                    continue;
-                }
-                let source = &remaining[(index | (1 << bit)) - index - 1];
-                for (to, from) in target.iter_mut().zip(source) {
-                    *to ^= *from;
-                }
+            let mut sources = [&[] as &[S]; 16];
+            let mut count = 0;
+            for bit in (0..n.trailing_zeros()).filter(|bit| index & (1 << bit) == 0) {
+                sources[count] = &remaining[(index | (1 << bit)) - index - 1];
+                count += 1;
             }
+            xor_sum(&mut done[index], &sources[..count]);
         }
         Ok(())
     }
@@ -748,17 +880,29 @@ impl TransformField {
 /// Symbol storage a transform runs on: 16-bit words for either field, or one
 /// byte per symbol for the 8-bit field. The butterfly schedule is shared; a
 /// lane supplies only its multiply-accumulate kernel and its scalar oracle.
-trait Lane: Copy + Default + PartialEq + Send + Sync + std::ops::BitXorAssign + 'static {
+trait Lane:
+    Copy
+    + Default
+    + PartialEq
+    + Send
+    + Sync
+    + std::ops::BitXor<Output = Self>
+    + std::ops::BitXorAssign
+    + 'static
+{
     /// Prepared multiplication by one Cantor-representation factor.
     type Map: Sync;
-    /// Whether stored values can lie outside the field and must be checked.
-    const RANGED: bool;
+    /// Whether this lane can store values outside `field`, which must then
+    /// be checked: 16-bit words holding 8-bit symbols.
+    fn ranged(field: &TransformField) -> bool;
     fn map(
         field: &TransformField,
         factor: u16,
         backend: crate::gf_simd::LinearBackend,
     ) -> Self::Map;
     fn accumulate(map: &Self::Map, source: &[Self], destination: &mut [Self]);
+    /// Replace each value by its image, each loaded and stored once.
+    fn map_in_place(map: &Self::Map, values: &mut [Self]);
     /// One butterfly, each row loaded and stored once.
     fn butterfly(map: &Self::Map, left: &mut [Self], right: &mut [Self], inverse: bool);
     /// Two consecutive stages over four rows, each loaded and stored once.
@@ -769,7 +913,9 @@ trait Lane: Copy + Default + PartialEq + Send + Sync + std::ops::BitXorAssign + 
 
 impl Lane for u16 {
     type Map = crate::gf_simd::LinearMap16;
-    const RANGED: bool = true;
+    fn ranged(field: &TransformField) -> bool {
+        field.bits < 16
+    }
     fn map(
         field: &TransformField,
         factor: u16,
@@ -789,6 +935,9 @@ impl Lane for u16 {
     fn accumulate(map: &Self::Map, source: &[Self], destination: &mut [Self]) {
         map.accumulate(source, destination);
     }
+    fn map_in_place(map: &Self::Map, values: &mut [Self]) {
+        map.map_in_place(values);
+    }
     fn butterfly(map: &Self::Map, left: &mut [Self], right: &mut [Self], inverse: bool) {
         map.butterfly(left, right, inverse);
     }
@@ -798,8 +947,10 @@ impl Lane for u16 {
     fn mul(field: &TransformField, value: Self, factor: u16) -> Self {
         field.mul(value, factor)
     }
+    /// The order is a power of two, so every value is below it exactly when
+    /// their OR is; the reduction has no early exit and vectorizes.
     fn admits(field: &TransformField, values: &[Self]) -> bool {
-        field.bits != 8 || values.iter().all(|&value| value <= 255)
+        (values.iter().fold(0, |any, &value| any | value) as usize) < field.order()
     }
 }
 
@@ -807,7 +958,9 @@ impl Lane for u16 {
 /// alone, so every byte is a symbol.
 impl Lane for u8 {
     type Map = crate::gf_simd::LinearMap8;
-    const RANGED: bool = false;
+    fn ranged(_: &TransformField) -> bool {
+        false
+    }
     fn map(
         field: &TransformField,
         factor: u16,
@@ -820,6 +973,9 @@ impl Lane for u8 {
     }
     fn accumulate(map: &Self::Map, source: &[Self], destination: &mut [Self]) {
         map.accumulate(source, destination);
+    }
+    fn map_in_place(map: &Self::Map, values: &mut [Self]) {
+        map.map_in_place(values);
     }
     fn butterfly(map: &Self::Map, left: &mut [Self], right: &mut [Self], inverse: bool) {
         map.butterfly(left, right, inverse);
@@ -934,6 +1090,70 @@ fn sweeps(levels: u32, inverse: bool, radix4: bool) -> impl Iterator<Item = Swee
     })
 }
 
+/// Equally wide rows, taken mutably for the duration of a pooled derivative
+/// whose tasks each touch only their own range of columns.
+struct SharedRows<S>(Vec<*mut S>, usize);
+
+// SAFETY: the pointers come from an exclusive borrow of the rows held for as
+// long as this exists, and every access goes through the methods below,
+// whose callers keep concurrent slices disjoint.
+unsafe impl<S: Send + Sync> Sync for SharedRows<S> {}
+
+impl<S> SharedRows<S> {
+    /// Columns `columns` of row `row`.
+    ///
+    /// # Safety
+    /// `row` must be in bounds and `columns` within the width, and no mutable
+    /// slice may overlap the result while it lives. A pooled derivative gives
+    /// each task its own columns, and within them reads only rows past the
+    /// one it writes.
+    unsafe fn columns(&self, row: usize, columns: &std::ops::Range<usize>) -> &[S] {
+        debug_assert!(columns.end <= self.1);
+        // SAFETY: as documented above.
+        unsafe { std::slice::from_raw_parts(self.0[row].add(columns.start), columns.len()) }
+    }
+
+    /// [`Self::columns`], mutably.
+    ///
+    /// # Safety
+    /// As for [`Self::columns`], and no other slice may overlap the result.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn columns_mut(&self, row: usize, columns: &std::ops::Range<usize>) -> &mut [S] {
+        debug_assert!(columns.end <= self.1);
+        // SAFETY: as documented above.
+        unsafe { std::slice::from_raw_parts_mut(self.0[row].add(columns.start), columns.len()) }
+    }
+}
+
+/// Store the XOR of `sources` (zero when there are none) in `out`, which is
+/// written once, folding two sources per pass.
+fn xor_sum<S: Lane>(out: &mut [S], sources: &[&[S]]) {
+    match sources {
+        [] => out.fill(S::default()),
+        [only] => out.copy_from_slice(only),
+        [first, second, rest @ ..] => {
+            for ((to, &a), &b) in out.iter_mut().zip(*first).zip(*second) {
+                *to = a ^ b;
+            }
+            for pair in rest.chunks(2) {
+                match pair {
+                    [a, b] => {
+                        for ((to, &a), &b) in out.iter_mut().zip(*a).zip(*b) {
+                            *to ^= a ^ b;
+                        }
+                    }
+                    [a] => {
+                        for (to, &a) in out.iter_mut().zip(*a) {
+                            *to ^= a;
+                        }
+                    }
+                    _ => unreachable!("chunks of two"),
+                }
+            }
+        }
+    }
+}
+
 /// Split a radix-4 group into its four equal quarters.
 fn quarters<T>(group: &mut [T]) -> [&mut [T]; 4] {
     let (front, back) = group.split_at_mut(group.len() / 2);
@@ -1045,8 +1265,9 @@ mod tests {
             assert_eq!(
                 field.scale_with_backend(&mut values, 2, LinearBackend::Auto, &|| {
                     calls.set(calls.get() + 1);
-                    // Initial check, four validation chunks, one scaled chunk.
-                    calls.get() == 7
+                    // Initial check, four validation chunks on the 8-bit
+                    // field (every word is a 16-bit symbol), one scaled chunk.
+                    calls.get() == if bits == 8 { 7 } else { 3 }
                 }),
                 Err(TransformError::Cancelled)
             );
@@ -1568,6 +1789,293 @@ mod tests {
             );
             assert!(decoder[Step::Skip as usize] > 0);
         }
+    }
+
+    const WIDTHS: [usize; 10] = [0, 1, 3, 15, 16, 17, 63, 64, 65, 1000];
+
+    fn words(width: usize, seed: u64, mask: u16) -> Vec<u16> {
+        random_bytes(width * 2, seed)
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]) & mask)
+            .collect()
+    }
+
+    /// In-place maps against the accumulating maps into zeros, which the
+    /// byte-map test checks against field products: every lane and field,
+    /// both backends, unaligned starts and every vector tail.
+    #[test]
+    fn in_place_maps_match_accumulating_maps() {
+        use crate::gf_simd::LinearBackend;
+        fn check<S: Lane + std::fmt::Debug>(field: &TransformField, values: &[S], factors: &[u16]) {
+            for &factor in factors {
+                for backend in [LinearBackend::Auto, LinearBackend::Scalar] {
+                    let map = S::map(field, factor, backend);
+                    for offset in [0usize, 1, 3] {
+                        for length in [0, 1, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 255, 1000] {
+                            let input = &values[offset..offset + length];
+                            let mut expected = vec![S::default(); length];
+                            S::accumulate(&map, input, &mut expected);
+                            let mut actual = input.to_vec();
+                            S::map_in_place(&map, &mut actual);
+                            assert_eq!(
+                                actual, expected,
+                                "GF(2^{}) factor {factor}, {backend:?}, offset {offset}, \
+                                 length {length}",
+                                field.bits
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let small = TransformField::new(8).unwrap();
+        let wide = TransformField::new(16).unwrap();
+        let all: Vec<u16> = (0..256).collect();
+        check(&small, &random_bytes(1100, 7), &all);
+        check(&small, &words(1100, 8, 0xff), &all);
+        check(
+            &wide,
+            &words(1100, 9, 0xffff),
+            &[0, 1, 2, 3, 42, 255, 256, 32768, 65535],
+        );
+    }
+
+    /// The fused little-endian load against unpacking then scaling in place,
+    /// at every width either side of the vector and plan thresholds, plus
+    /// its errors and cancellation points.
+    #[test]
+    fn fused_le_byte_scaling_matches_unpack_then_scale() {
+        use crate::gf_simd::LinearBackend;
+        let field = TransformField::new(16).unwrap();
+        let never = || false;
+        for width in WIDTHS.into_iter().chain([255, 256, 257, 4097]) {
+            let bytes = random_bytes(width * 2, width as u64 + 5);
+            for factor in [0u16, 1, 2, 3, 42, 255, 256, 32768, 65535] {
+                for backend in [LinearBackend::Scalar, LinearBackend::Auto] {
+                    let mut expected: Vec<u16> = bytes
+                        .chunks_exact(2)
+                        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                        .collect();
+                    field
+                        .scale_with_backend(&mut expected, factor, backend, &never)
+                        .unwrap();
+                    let mut actual = vec![0x5a5a; width];
+                    field
+                        .scale_le_bytes_with_backend(&bytes, &mut actual, factor, backend, &never)
+                        .unwrap();
+                    assert_eq!(
+                        actual, expected,
+                        "width {width}, factor {factor}, {backend:?}"
+                    );
+                }
+            }
+        }
+        let mut out = vec![0u16; 4];
+        assert_eq!(
+            TransformField::new(8).unwrap().scale_le_bytes_with_backend(
+                &[0; 8],
+                &mut out,
+                2,
+                LinearBackend::Auto,
+                &never
+            ),
+            Err(TransformError::Field)
+        );
+        assert_eq!(
+            field.scale_le_bytes_with_backend(&[0; 7], &mut out, 2, LinearBackend::Auto, &never),
+            Err(TransformError::Geometry)
+        );
+        let calls = std::cell::Cell::new(0);
+        let source = [1u8, 0].repeat(1024);
+        let mut values = vec![7u16; 1024];
+        assert_eq!(
+            field.scale_le_bytes_with_backend(
+                &source,
+                &mut values,
+                2,
+                LinearBackend::Auto,
+                &|| {
+                    calls.set(calls.get() + 1);
+                    // Initial check, one scaled chunk, then the second chunk's.
+                    calls.get() == 3
+                }
+            ),
+            Err(TransformError::Cancelled)
+        );
+        let two = field.mul(1, 2);
+        assert!(values[..256].iter().all(|&v| v == two));
+        assert!(values[256..].iter().all(|&v| v == 7));
+    }
+
+    /// Radix-2 sweeps whose butterflies reduce to a single product — the
+    /// left row known zero, the factor not, the inverse direction — against
+    /// the dense transform: every power-of-two row count from 2 to 512, the
+    /// usual widths, both directions, fields, lanes and backends, sequential
+    /// and pooled. The scalar backend and rows under 64 symbols run radix-2
+    /// sweeps throughout; wider rows reach them on odd stage counts.
+    #[test]
+    fn radix2_single_products_match_dense_transforms() {
+        use crate::gf_simd::LinearBackend;
+        let never = || false;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap();
+        for bits in [8u32, 16] {
+            let field = TransformField::new(bits).unwrap();
+            let mask = (field.order() - 1) as u16;
+            for levels in 1..=bits.min(9) {
+                let count = 1usize << levels;
+                let noise = random_bytes(count, count as u64 + 1);
+                let patterns: [Vec<bool>; 2] = [
+                    (0..count).map(|row| row < count / 2).collect(),
+                    (0..count).map(|row| noise[row] & 3 != 0).collect(),
+                ];
+                for width in WIDTHS.into_iter().filter(|&w| w < 1000 || count <= 64) {
+                    for zero in &patterns {
+                        let original: Vec<Vec<u16>> = (0..count)
+                            .map(|row| {
+                                let values = words(width, (row * 17 + width + count) as u64, mask);
+                                if zero[row] { vec![0; width] } else { values }
+                            })
+                            .collect();
+                        let bytes: Vec<Vec<u8>> = original
+                            .iter()
+                            .map(|row| row.iter().map(|&v| v as u8).collect())
+                            .collect();
+                        let origin = if 2 * count <= field.order() { count } else { 0 };
+                        for inverse in [false, true] {
+                            for backend in [LinearBackend::Scalar, LinearBackend::Auto] {
+                                let what = format!(
+                                    "GF(2^{bits}) {count}x{width}, origin {origin}, \
+                                     inverse {inverse}, {backend:?}"
+                                );
+                                let mut dense = original.clone();
+                                field
+                                    .transform_with_backend(
+                                        &mut dense, origin, inverse, backend, &never,
+                                    )
+                                    .unwrap();
+                                let mut rows = original.clone();
+                                field
+                                    .transform_known_zero_with_backend(
+                                        &mut rows, zero, origin, inverse, backend, &never,
+                                    )
+                                    .unwrap();
+                                assert_eq!(rows, dense, "{what}");
+                                let mut rows = original.clone();
+                                field
+                                    .transform_known_zero_in_pool(
+                                        &mut rows, zero, origin, inverse, backend, &pool, &never,
+                                    )
+                                    .unwrap();
+                                assert_eq!(rows, dense, "pooled, {what}");
+                                if bits == 8 {
+                                    let mut rows = bytes.clone();
+                                    field
+                                        .transform_u8_known_zero_with_backend(
+                                            &mut rows, zero, origin, inverse, backend, &never,
+                                        )
+                                        .unwrap();
+                                    assert_eq!(widen(&rows), dense, "bytes, {what}");
+                                    let mut rows = bytes.clone();
+                                    field
+                                        .transform_u8_known_zero_in_pool(
+                                            &mut rows, zero, origin, inverse, backend, &pool,
+                                            &never,
+                                        )
+                                        .unwrap();
+                                    assert_eq!(widen(&rows), dense, "pooled bytes, {what}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The single-store derivative against its definition computed out of
+    /// place, and the pooled derivative against the sequential one on both
+    /// sides of the 64 KiB cutoff, in both lanes.
+    #[test]
+    fn derivatives_match_the_definition_sequential_and_pooled() {
+        let never = || false;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let field = TransformField::new(8).unwrap();
+        let wide = TransformField::new(16).unwrap();
+        let definition = |rows: &[Vec<u16>]| -> Vec<Vec<u16>> {
+            let n = rows.len();
+            (0..n)
+                .map(|index| {
+                    let mut out = vec![0u16; rows[0].len()];
+                    for bit in 0..n.trailing_zeros() {
+                        if index & (1 << bit) == 0 {
+                            for (to, &from) in out.iter_mut().zip(&rows[index | (1 << bit)]) {
+                                *to ^= from;
+                            }
+                        }
+                    }
+                    out
+                })
+                .collect()
+        };
+        let shapes = (0..=9)
+            .flat_map(|levels| WIDTHS.map(|width| (1usize << levels, width)))
+            .chain([(256, 300), (128, 1031), (64, 4096), (512, 129)]);
+        for (count, width) in shapes {
+            let bytes: Vec<Vec<u8>> = (0..count)
+                .map(|row| random_bytes(width, (row * 29 + width + count) as u64))
+                .collect();
+            let wide_rows: Vec<Vec<u16>> = (0..count)
+                .map(|row| words(width, (row * 31 + width) as u64, 0xffff))
+                .collect();
+            for (field, original) in [(&field, widen(&bytes)), (&wide, wide_rows)] {
+                if count > field.order() {
+                    continue;
+                }
+                let expected = definition(&original);
+                let what = format!("GF(2^{}) {count}x{width}", field.bits);
+                let mut rows = original.clone();
+                field.derivative(&mut rows, &never).unwrap();
+                assert_eq!(rows, expected, "{what}");
+                let mut rows = original.clone();
+                field.derivative_in_pool(&mut rows, &pool, &never).unwrap();
+                assert_eq!(rows, expected, "pooled, {what}");
+            }
+            if count <= field.order() {
+                let mut rows = bytes.clone();
+                field
+                    .derivative_u8_in_pool(&mut rows, &pool, &never)
+                    .unwrap();
+                let mut sequential = bytes.clone();
+                field.derivative_u8(&mut sequential, &never).unwrap();
+                assert_eq!(rows, sequential, "bytes {count}x{width}");
+            }
+        }
+        let mut rows = vec![vec![0u8; 4096]; 3];
+        assert_eq!(
+            field.derivative_u8_in_pool(&mut rows, &pool, &never),
+            Err(TransformError::Geometry)
+        );
+        let mut rows = vec![vec![0u8; 4096]; 64];
+        assert_eq!(
+            wide.derivative_u8_in_pool(&mut rows, &pool, &never),
+            Err(TransformError::Field)
+        );
+        rows[1].pop();
+        assert_eq!(
+            field.derivative_u8_in_pool(&mut rows, &pool, &never),
+            Err(TransformError::Geometry)
+        );
+        let mut rows = vec![vec![0u8; 4096]; 64];
+        assert_eq!(
+            field.derivative_u8_in_pool(&mut rows, &pool, &|| true),
+            Err(TransformError::Cancelled)
+        );
     }
 
     #[test]
