@@ -152,6 +152,7 @@ input file once, and preserves the reference-compatible default output.
 
 For advanced creation, inspect `CreationPlan::requirements()` before execution.
 It reports block counts, recovery geometry, output sizes, and scratch space.
+Output sizes include each carrier's repeated metadata copies.
 File and chunk hashes share one planning pass; sliding deduplication can read
 additional candidate windows. Encoding reads sources again. Destinations must
 be absent; execution uses a caller-selected scratch directory.
@@ -360,7 +361,13 @@ reference. The deviations affecting interpretation are:
 - **Start packet:** no leading random bytes. The older layout is detected by
   body length and preserved.
 - **InputSetID:** an opaque grouping key; it cannot be recomputed from stored
-  bytes as the draft describes.
+  bytes as the draft describes. Both creation APIs derive it the way the
+  reference does, from the file names, sizes, hashes and chunk layout and
+  the Start packet body.
+- **Metadata repetition:** a recovery volume carries one copy of every
+  metadata packet up front and, as the reference writes it, `floor(log2(n))`
+  further copies of all but the Creator packet spread between its `n`
+  recovery rows; the index file carries one copy.
 - **File hash:** a 16-byte BLAKE3 hash, absent from the draft, over protected
   chunks concatenated in file order. Unprotected bytes are omitted.
 - **Chunks:** no per-chunk fingerprint from the draft layout.

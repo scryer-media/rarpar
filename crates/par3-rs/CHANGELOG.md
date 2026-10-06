@@ -2,6 +2,29 @@
 
 ## 0.4.4 (Unreleased)
 
+- **Behaviour change:** the streaming creation engine (`creation::CreationPlan`)
+  now derives the InputSetID the way the reference does — and the way
+  `create::create` already did, through the same code — from each file's full
+  name, size, hash and chunk layout, the directory names, and the Start packet
+  body. It previously digested the block size, field and File packets, so sets
+  it writes now carry a different InputSetID than before for the same inputs.
+- **Behaviour change:** streaming-engine recovery and data volumes now repeat
+  the metadata the way the reference does: after one full copy up front, every
+  packet but the Creator packet is written `floor(log2(n))` more times, one
+  packet at a time and cycling through them, spread between the volume's `n`
+  rows (or data blocks). A volume previously held a single copy.
+  `CreationRequirements::output_sizes` counts the copies, and a
+  `VolumeLayout::SizeLimited` carrier still fits its limit with them included.
+  The index file and embedded (PAR-inside) carriers keep one copy. Directory
+  and Root packets now list their children sorted by packet hash, and Directory
+  packets are written in the reference's order. With these, the engine
+  writes `par3cmdline`'s bytes, Cauchy and FFT alike, whenever the reference's
+  storage order (longest chunk tail, then largest file, then name) is name
+  order and no tail is packed behind an older tail block — a single file, or
+  files of one size. Other multi-file sets still differ in file order and tail
+  packing, and the engine writes no Comment packet.
+- `engine_perf` takes `PAR3_BENCH_CREATOR` to replace the Creator packet text.
+
 - **Behaviour change:** repair output on native targets is now confined to an
   opened directory capability. Replacing the output-root path or swapping a
   destination parent during repair cannot redirect rebuild reads or installs

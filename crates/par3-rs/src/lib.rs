@@ -107,7 +107,13 @@
 //! - **Start packet:** no leading random bytes. The older layout is detected by
 //!   body length and preserved.
 //! - **InputSetID:** an opaque grouping key; it cannot be recomputed from stored
-//!   bytes as the draft describes.
+//!   bytes as the draft describes. Both creation APIs derive it the way the
+//!   reference does, from the file names, sizes, hashes and chunk layout and
+//!   the Start packet body.
+//! - **Metadata repetition:** a recovery volume carries one copy of every
+//!   metadata packet up front and, as the reference writes it, `floor(log2(n))`
+//!   further copies of all but the Creator packet spread between its `n`
+//!   recovery rows; the index file carries one copy.
 //! - **File hash:** a 16-byte BLAKE3 hash, absent from the draft, over protected
 //!   chunks concatenated in file order. Unprotected bytes are omitted.
 //! - **Chunks:** no per-chunk fingerprint from the draft layout.
