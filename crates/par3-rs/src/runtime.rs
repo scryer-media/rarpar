@@ -735,10 +735,10 @@ pub struct ExecutionOptions {
     /// FFT butterfly CPU selection; `kernel()` reports the detected shuffle ISA.
     /// This does not change the independent Cauchy dispatch.
     pub fft_backend: reedsolomon_rs::gf_simd::LinearBackend,
-    /// Whether an FFT decode whose bank outgrows the transform scratch runs
+    /// Whether an FFT decode whose bank outgrows a transform tile runs
     /// its inverse transform, derivative and forward transform fused
     /// (`reedsolomon_rs`'s `TransformField::derivative_at`). `None`, the
-    /// default, fuses where `reedsolomon_rs::fft::POOL_GATHERS` holds, which
+    /// default, fuses where `reedsolomon_rs::fft::COLUMN_TILES` holds, which
     /// is every target but Apple silicon, at every worker count. A forced
     /// value exists so every target's tests run both decodes; output is
     /// identical either way.

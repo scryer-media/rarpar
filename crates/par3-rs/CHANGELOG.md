@@ -183,37 +183,53 @@
   buffer, no unpacking pass and no ring, and scales in place. Elsewhere the
   rows still convert through one byte buffer. One worker 2.00 → 1.98 s,
   eight unchanged, 2 MiB less resident.
-- Pooled FFT transforms and derivatives walk the bank in slabs
-  (`reedsolomon-rs` 0.4.8): each worker gathers a slab of rows into at most
-  512 KiB of its own scratch, runs the sweeps of a pass over it from cache
-  and scatters it back; the forward transform's pruned width classes and
-  kept blocks beyond that scratch go to the pool one after another, walked
-  in slabs or swept a level at a time, so one class streams through the
-  workers' caches at a time (classes of a mebibyte transformed side by
-  side on sibling threads cost 2% of the decode and 5% of its CPU), and
-  smaller ones run side by side as before. The codec
-  charges that scratch beside the rows — at the configured stripe as what
-  the workers may gather together, never more than twice the bank, or as
-  twice the admitted bank per stripe byte, whichever leaves the wider
-  stripe, the other when that does not fit at all — and the butterflies
-  the walked inverse transform keeps. On Apple
-  silicon, where the pool does not gather, nothing changes and nothing is
-  charged. Same decode, eight workers: 1.66–1.68 → 1.33–1.35 s and CPU
-  11.3 → 8.3 s; one worker, which never walks, unchanged at 2.05 s.
+- FFT transforms and derivatives run their banks in column tiles, in place
+  (`reedsolomon-rs` 0.4.8): beyond 512 KiB a pass takes a tile of rows at a
+  window of columns through every sweep while it stays in the cache, the
+  workers sharing a pass's tiles and a lone worker running them itself, so
+  one worker tiles too. This replaces the slab walk this release carried
+  before, which gathered rows into each worker's scratch and back. The
+  forward transform's pruned width classes and kept blocks beyond a tile go
+  to the pool one after another, so one class streams through the workers'
+  caches at a time (classes of a mebibyte transformed side by side on
+  sibling threads cost 2% of the decode and 5% of its CPU), and smaller
+  ones run side by side as before. An encode adds each tile of a chunk's
+  transform into its running sum as the last pass leaves it, with no pass
+  of its own. The rows live in `reedsolomon-rs`'s `RowBank`, one zeroed,
+  page-aligned allocation per bank instead of a vector per row, padded a
+  cache line per row where rows are a multiple of 512 bytes and backed by
+  huge pages on Linux x86_64. The codec charges the banks' padding and
+  page rounding, the butterflies a tiled transform keeps, on one worker as
+  on a pool, and a tiled derivative's tile copies (at most 256 KiB a
+  worker, never more than the bank) beside the rows. On Apple silicon,
+  which does not tile, the transforms sweep whole rows as before and no
+  scratch is charged. Carriers and repaired files are byte-identical, and
+  reads, writes and syncs are unchanged. Against the slab walk on Sapphire
+  Rapids, 1.5 GiB of 32 KiB blocks over GF(2^16), 4916 recovery blocks:
+  create 4.09 → 3.27 s at one worker (CPU 3.25 → 2.43 s) and 2.87 →
+  2.42 s at eight (CPU 4.46 → 3.88 s); repair of 2000 lost 16.74 →
+  16.60 s and 15.55 → 14.86 s, decode 6.37 → 6.05 s and 4.06 → 3.56 s,
+  with eight workers spending 15.5 s of CPU instead of 14.6 s. 512 MiB of
+  4 MiB blocks over GF(2^8), eight lost: repair 4.34 → 4.16 s and 4.13 →
+  4.07 s, CPU 1.26 → 1.09 s and 2.31 → 1.88 s. The AVX2 and GFNI tier the
+  host takes without AVX-512 moves the same way. On an M-series, which
+  does not tile, both sets stay within 3% of the slab-walk build's wall and
+  CPU at 1, 8 and 18 workers, apart from sub-second GF(2^8) repairs that
+  move by up to a tenth either way between runs.
 - FFT decode runs its inverse transform, formal derivative and forward
   transform as one step, `reedsolomon-rs` 0.4.8's
-  `TransformField::derivative_at`: three slab passes over the bank instead
+  `TransformField::derivative_at`: three tiled passes over the bank instead
   of the walked inverse, a separate derivative pass that streamed the whole
   bank once per set bit of a row index, and the pruned forward plan. The
   codec admits the domain's rows plus one per lost block for what the step
   returns, the index of each lost row, and the step's sweeps, bookkeeping
-  and slab scratch beside them. The fused rows charge more than the
+  and tile scratch beside them. The fused rows charge more than the
   separate steps, so a binding budget narrows their stripe further; they
   are taken only where their stripe walks each block in no more passes
   than the separate steps' stripe from the same budget, so they never read
-  an input more often or more bytes of it. Where the bank fits the
-  transform scratch, where the budget refuses those rows or would take more
-  passes, and on Apple silicon, whose pools do not gather (forced on, an
+  an input more often or more bytes of it. Where the bank fits a
+  transform tile, where the budget refuses those rows or would take more
+  passes, and on Apple silicon, which does not tile (forced on, an
   Apple M5 Max decode took 1.81 → 2.61 s at one worker), the previous path
   runs. `ExecutionOptions::fft_fused_decode` (hidden) forces either path,
   for tests. The direct lane reads up to 256 rows ahead of its workers, a
