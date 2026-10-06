@@ -207,18 +207,6 @@ impl MulPlan {
         width
     }
 
-    /// [`Self::map_scalar`] on SVE2 over the whole row; returns its length.
-    ///
-    /// # Safety
-    /// SVE2 must be available.
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-    pub(crate) unsafe fn map_sve2(&self, row: &mut [u8]) -> usize {
-        let pointer = row.as_mut_ptr();
-        // SAFETY: the row's own storage, read and rewritten in place.
-        unsafe { crate::sve2::map8_map(&self.low, &self.high, pointer, pointer, row.len()) };
-        row.len()
-    }
-
     #[cfg(target_arch = "aarch64")]
     #[target_feature(enable = "neon")]
     pub(crate) unsafe fn neon(&self, source: &[u8], destination: &mut [u8]) {
