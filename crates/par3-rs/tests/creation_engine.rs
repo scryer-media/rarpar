@@ -621,6 +621,166 @@ fn cauchy_creation_is_byte_identical_for_every_worker_count() {
     }
 }
 
+/// One Cauchy creation under `memory`, or `None` when the budget refuses it:
+/// the carriers, the source reads the encode made, and the encode's scratch
+/// peak, which is where its source group and staged rows are charged.
+fn grouped_carriers(
+    bytes: &[u8],
+    block_size: u64,
+    recovery_count: u64,
+    workers: usize,
+    memory: usize,
+) -> Option<(Vec<Vec<u8>>, u64, usize)> {
+    let mut access = MemorySourceAccess::default();
+    access.insert(SourceId(1), 1, bytes.to_vec().into());
+    let mut options = CreationOptions {
+        block_size,
+        recovery_count,
+        first_recovery: 1,
+        codec: CreationCodec::Cauchy,
+        ..CreationOptions::default()
+    };
+    options.execution.workers = workers;
+    options.execution.memory = par3_rs::runtime::MemoryBudget::new(memory);
+    let execution = options.execution.clone();
+    let plan = CreationPlan::build(
+        Arc::new(access),
+        &[CreationSource {
+            name: "input.bin".into(),
+            source: SourceId(1),
+        }],
+        options,
+    )
+    .ok()?;
+    let reads = execution.diagnostics.source_io().read_calls;
+    let tree = common::TempTree::new(&format!("cauchy-groups-{block_size}-{memory}-{workers}"));
+    let paths = plan
+        .execute_with_durability(
+            &tree.path().join("set"),
+            tree.path(),
+            par3_rs::creation::CreationDurability::Buffered,
+        )
+        .ok()?;
+    assert!(execution.memory.peak() <= execution.memory.limit());
+    let scratch = execution
+        .diagnostics
+        .memory()
+        .unwrap()
+        .category(par3_rs::runtime::MemoryCategory::CodecScratch)
+        .peak as usize;
+    Some((
+        paths
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect(),
+        execution.diagnostics.source_io().read_calls - reads,
+        scratch,
+    ))
+}
+
+#[test]
+fn cauchy_creation_is_byte_identical_for_every_source_group() {
+    // Eight blocks, so the widest group is all of them. At the default budget
+    // the rows are resident and every block's stripe is folded in one group.
+    // At the smallest budget that still walks the source once, the rows are
+    // spooled and nothing is left beyond the batch: one stripe per group,
+    // exactly the walk before grouping existed. The bytes must not care, and
+    // neither may the reads.
+    for (name, block_size, recovery_count) in [("gf8", 4096u64, 64u64), ("gf16", 2048, 256)] {
+        let stripe = block_size as usize;
+        let rows = recovery_count as usize;
+        let bytes: Vec<u8> = (0..stripe * 8 - 77)
+            .map(|i| (i * 131 + i / 977) as u8)
+            .collect();
+        let (wide, one_pass_reads, wide_scratch) =
+            grouped_carriers(&bytes, block_size, recovery_count, 1, 256 << 20).unwrap();
+        assert_eq!(wide[0][..8], *b"PAR3\0PKT", "{name}");
+        // Resident rows charge only their table; the group is all 8 stripes.
+        assert_eq!(wide_scratch, rows * 64 + 8 * stripe, "{name}: widest group");
+        let (mut low, mut high) = (0usize, 256 << 20);
+        while low + 1 < high {
+            let middle = low + (high - low) / 2;
+            match grouped_carriers(&bytes, block_size, recovery_count, 1, middle) {
+                Some((_, reads, _)) if reads == one_pass_reads => high = middle,
+                _ => low = middle,
+            }
+        }
+        // Scratch paths are charged too and their names grow with a counter,
+        // so stand a little above the edge: far less than the slack and the
+        // stripe a second source would need.
+        let high = high + 4096;
+        let (narrow, reads, narrow_scratch) =
+            grouped_carriers(&bytes, block_size, recovery_count, 1, high).unwrap();
+        assert_eq!(reads, one_pass_reads, "{name}");
+        // Spooled rows charge a stripe each; the group is one stripe.
+        assert_eq!(
+            narrow_scratch,
+            rows * (stripe + 64) + stripe,
+            "{name}: single-stripe group"
+        );
+        assert!(narrow == wide, "{name}: the group width changed bytes");
+        for (memory, workers) in [(high, 4), (256 << 20, 4)] {
+            let (parallel, reads, _) =
+                grouped_carriers(&bytes, block_size, recovery_count, workers, memory).unwrap();
+            assert_eq!(
+                reads, one_pass_reads,
+                "{name}: {workers} workers at {memory}"
+            );
+            assert!(
+                parallel == wide,
+                "{name}: {workers} workers at {memory} changed bytes"
+            );
+        }
+    }
+}
+
+#[test]
+fn staged_resident_rows_write_the_same_carriers() {
+    // Blocks wider than the encode stripe: resident rows are then a block
+    // apart, and accumulate in contiguous staged stripes when the budget has
+    // room, in place when it does not. Both must write what the spooled rows
+    // write.
+    let (block_size, stripe, rows) = (256u64 << 10, 64usize << 10, 20usize);
+    let bytes: Vec<u8> = (0..block_size as usize * 6 - 4099)
+        .map(|i| (i * 7 + i / 4093) as u8)
+        .collect();
+    let mut reference = None;
+    // The budget at which resident rows were first folded in place, and
+    // whether a larger budget then staged them. Staged rows charge a stripe
+    // each, as spooled rows do; in-place rows charge only their table.
+    let (mut in_place, mut staged) = (None, false);
+    for memory in (2..=28).map(|m| m << 19) {
+        for workers in [1, 3] {
+            let Some((carriers, _, scratch)) =
+                grouped_carriers(&bytes, block_size, rows as u64, workers, memory)
+            else {
+                continue;
+            };
+            let group = |charged: usize| {
+                let extra = scratch.checked_sub(charged)?;
+                (extra % stripe == 0 && (1..=6).contains(&(extra / stripe))).then_some(())
+            };
+            if group(rows * 64).is_some() {
+                in_place.get_or_insert(memory);
+            } else if in_place.is_some_and(|first| memory > first) {
+                staged |= group(rows * (64 + stripe)).is_some();
+            }
+            match &reference {
+                None => reference = Some(carriers),
+                Some(reference) => {
+                    assert!(carriers == *reference, "{memory} with {workers} workers")
+                }
+            }
+        }
+    }
+    assert!(reference.is_some());
+    assert!(
+        in_place.is_some(),
+        "no budget folded resident rows in place"
+    );
+    assert!(staged, "no budget staged resident rows");
+}
+
 #[test]
 fn creation_refuses_a_name_repair_would_refuse_to_write() {
     // par3-rs must never produce a set it would later decline to repair, so

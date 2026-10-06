@@ -64,6 +64,17 @@
 - Cauchy creation encodes recovery rows on the worker pool when the rows per
   pass carry at least 1 MiB of work per worker. Output is byte-identical for
   every worker count and no read is added.
+- Cauchy creation and repair fold up to 16 source stripes into each
+  recovery or syndrome row per fork/join through grouped multiply-accumulate
+  kernels, and the repair solve is grouped the same way. Resident recovery
+  rows accumulate in contiguous stripe buffers and are copied home once per
+  pass, so a pass no longer walks slices a block apart. The extra stripes are
+  taken only from budget left over after the pass, the pool and a stripe of
+  slack, and fall back to the one-stripe walk without them; peak reservation
+  rises by at most fifteen stripes plus the staged rows. Output bytes and
+  every I/O count are unchanged. 1 GiB, 100 rows: create 23% fewer cycles at
+  one worker and 2.7× faster at eight; repair 2× faster at eight workers with
+  a third of the CPU.
 - Carrier regeneration reads each source stripe once per group of recovery
   rows the memory budget admits, instead of once per row.
 - Recovery rows that fit the memory budget alongside the codec stay resident

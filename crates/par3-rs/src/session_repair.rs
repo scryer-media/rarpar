@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use rayon::prelude::*;
 
-use crate::gf::{Field, Gf8, Gf16};
+use crate::gf::{Field, Gf8, Gf16, MulAccBatch};
 use crate::layout::BlockLayout;
 use crate::packet::PacketBody;
 use crate::repair_tree::{Destination, RepairTree};
@@ -419,7 +419,7 @@ fn reconstruct<F>(
     field: F,
 ) -> EngineResult<()>
 where
-    F: Field + Sync,
+    F: MulAccBatch + Sync,
     F::Symbol: Send + Sync,
 {
     let mut progress = session.options.stage(crate::runtime::Stage::Decode)?;
@@ -545,9 +545,45 @@ where
         .options
         .diagnostics
         .note_tiling(stripe, buffer_count, tile);
+    // Surviving stripes are folded into the syndromes a group at a time, so
+    // the workers meet once per group and each folds the whole group into its
+    // rows with one grouped multiply-accumulate. The extra stripes come only
+    // out of what the bank left, beyond a stripe of slack, so they never
+    // narrow the stripe, the tile or the pool; with no room for a second one
+    // this is the walk one stripe at a time.
+    let contributing = coverage
+        .clone()
+        .filter(|block| lost.binary_search(block).is_err())
+        .count();
+    let mut group = crate::gf::BATCH_SOURCES.min(contributing).min(
+        1 + session
+            .options
+            .memory
+            .available()
+            .saturating_sub(crate::runtime::SOURCE_GROUP_SLACK)
+            / stripe,
+    );
+    let _group = if group > 1 {
+        match session
+            .options
+            .memory
+            .reserve_as(MemoryCategory::CodecScratch, (group - 1) * stripe)
+        {
+            Ok(reservation) => Some(reservation),
+            Err(_) => {
+                group = 1;
+                None
+            }
+        }
+    } else {
+        group = 1;
+        None
+    };
+    tracing::debug!(group, "PAR3 Cauchy syndrome group admitted");
     let mut syndromes = vec![vec![0u8; stripe]; n];
     let mut recovered = vec![vec![0u8; stripe]; tile];
-    let mut input = vec![0u8; stripe];
+    let mut inputs = vec![vec![0u8; stripe]; group];
+    let mut members = [0u64; crate::gf::BATCH_SOURCES];
     let mut covered = vec![0u8; stripe];
     let writers = StageWriters::new(tree, session);
     let mut offset = 0;
@@ -565,6 +601,37 @@ where
         for syndrome in &mut syndromes {
             syndrome[..take].fill(0);
         }
+        // Fold the held surviving stripes, block `members[k]` in `held[k]`,
+        // into every syndrome row.
+        let fold = |syndromes: &mut [Vec<u8>], members: &[u64], held: &[Vec<u8>]| {
+            let mut sources: [&[u8]; crate::gf::BATCH_SOURCES] = [&[]; crate::gf::BATCH_SOURCES];
+            for (source, bytes) in sources.iter_mut().zip(held) {
+                *source = &bytes[..take];
+            }
+            let sources = &sources[..held.len()];
+            let apply = |(syndrome, row): (&mut Vec<u8>, &u64)| -> EngineResult<()> {
+                session.options.cancel.check()?;
+                let mut factors = [F::Symbol::default(); crate::gf::BATCH_SOURCES];
+                for (factor, block) in factors.iter_mut().zip(members) {
+                    *factor = crate::cauchy::element(&field, *block, *row)?;
+                }
+                field.mul_acc_batch(&mut syndrome[..take], sources, &factors[..members.len()]);
+                Ok(())
+            };
+            if let Some(pool) = &pool {
+                pool.pool().install(|| {
+                    syndromes
+                        .par_iter_mut()
+                        .zip(rows.par_iter())
+                        .try_for_each(apply)
+                })
+            } else {
+                syndromes.iter_mut().zip(rows.iter()).try_for_each(apply)
+            }
+        };
+        // Reads and the scatters that follow them keep their order; only the
+        // arithmetic waits for the group to fill.
+        let mut held = 0;
         for block in 0..layout.block_count {
             session.options.cancel.check()?;
             if lost.binary_search(&block).is_ok() {
@@ -573,18 +640,19 @@ where
             session.read_block(
                 block,
                 offset,
-                &mut input[..take],
+                &mut inputs[held][..take],
                 &mut covered[..take],
                 Some(writers.owed()),
             )?;
-            scatter(&writers, layout, outputs, block, offset, &input[..take])?;
+            scatter(
+                &writers,
+                layout,
+                outputs,
+                block,
+                offset,
+                &inputs[held][..take],
+            )?;
             if coverage.contains(&block) {
-                let apply = |(syndrome, row): (&mut Vec<u8>, &u64)| -> EngineResult<()> {
-                    session.options.cancel.check()?;
-                    let factor = crate::cauchy::element(&field, block, *row)?;
-                    field.mul_acc(&mut syndrome[..take], &input[..take], factor);
-                    Ok(())
-                };
                 // One code-matrix element per surviving block per recovery row,
                 // recomputed on every stripe pass. Counted here so the report
                 // can say what that costs before anything caches it.
@@ -592,18 +660,18 @@ where
                     .options
                     .diagnostics
                     .note_factors(rows.len() as u64, 0);
-                if let Some(pool) = &pool {
-                    pool.pool().install(|| {
-                        syndromes
-                            .par_iter_mut()
-                            .zip(rows.par_iter())
-                            .try_for_each(apply)
-                    })?;
-                } else {
-                    syndromes.iter_mut().zip(rows.iter()).try_for_each(apply)?;
+                members[held] = block;
+                held += 1;
+                if held == group {
+                    fold(&mut syndromes, &members[..held], &inputs[..held])?;
+                    held = 0;
                 }
             }
         }
+        if held != 0 {
+            fold(&mut syndromes, &members[..held], &inputs[..held])?;
+        }
+        let input = &mut inputs[0];
         for (row, payload) in assessment.recovery.iter().enumerate() {
             input[..take].fill(0);
             payload.read_at(offset, &mut input[..take])?;
@@ -621,13 +689,20 @@ where
                 let column = base + slot;
                 session.options.cancel.check()?;
                 bytes[..take].fill(0);
-                for (row, syndrome) in syndromes.iter().enumerate() {
+                // Every syndrome row feeds this column: a group of them at a
+                // time goes through one grouped multiply-accumulate.
+                for (first, group) in (0..n)
+                    .step_by(crate::gf::BATCH_SOURCES)
+                    .zip(syndromes.chunks(crate::gf::BATCH_SOURCES))
+                {
                     session.options.cancel.check()?;
-                    field.mul_acc(
-                        &mut bytes[..take],
-                        &syndrome[..take],
-                        inverse[column * n + row],
-                    );
+                    let mut sources: [&[u8]; crate::gf::BATCH_SOURCES] =
+                        [&[]; crate::gf::BATCH_SOURCES];
+                    for (source, syndrome) in sources.iter_mut().zip(group) {
+                        *source = &syndrome[..take];
+                    }
+                    let factors = &inverse[column * n + first..column * n + first + group.len()];
+                    field.mul_acc_batch(&mut bytes[..take], &sources[..group.len()], factors);
                 }
                 Ok(())
             };

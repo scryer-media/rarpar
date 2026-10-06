@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::fft::{FftCodec, FftGeometry};
-use crate::gf::Field;
+use crate::gf::MulAccBatch;
 use crate::packet::{
     BlockChecksum, BlockRange, CauchyMatrixPacket, ChunkDescription, ChunkTail, CreatorPacket,
     DirectoryPacket, ExternalDataPacket, FftMatrixPacket, FilePacket, GaloisField, PacketBody,
@@ -1050,7 +1050,7 @@ impl CreationPlan {
         Ok(())
     }
 
-    fn encode_cauchy<F: Field + Sync>(
+    fn encode_cauchy<F: MulAccBatch + Sync>(
         &self,
         field: F,
         scratch_directory: &Path,
@@ -1075,11 +1075,12 @@ impl CreationPlan {
                 "minimum Cauchy encoding stripe",
             ));
         }
-        // Rows and workers meet once per source stripe, so a worker is only
-        // worth its fork and join with enough arithmetic behind it.
+        // Rows and workers meet once per group of source stripes, so a worker
+        // is only worth its fork and join with enough arithmetic behind it.
         const MIN_WORKER_BYTES: usize = 1 << 20;
-        // Resident rows accumulate where they are written from, so beside
-        // them the encode needs only a row table and one source stripe, and
+        // Resident rows can accumulate where they are written from, so beside
+        // them the encode needs at least only a row table and one source
+        // stripe (staging and grouping below are taken only from spare room), and
         // every row is in the one batch that walks the source once. They are
         // admitted only with room for the pool that single pass asks for, so
         // holding them never narrows the workers either.
@@ -1093,57 +1094,114 @@ impl CreationPlan {
                 )),
             scratch_directory,
         )?;
-        let per_row = match spool {
-            RecoverySpool::Memory { .. } => 64,
-            RecoverySpool::File { .. } => stripe + 64,
-        };
-        let rows_that_fit = || {
+        let resident_rows = matches!(spool, RecoverySpool::Memory { .. });
+        let per_row = if resident_rows { 64 } else { stripe + 64 };
+        // Rows that fit beside a group of `sources` source stripes, each also
+        // given a stripe buffer to accumulate in when `staged` asks for one.
+        let rows_that_fit = |sources: usize, staged: bool| {
             count.min(
                 self.options
                     .execution
                     .memory
                     .available()
-                    .saturating_sub(stripe)
-                    / per_row,
+                    .saturating_sub(stripe.saturating_mul(sources))
+                    / (per_row + if staged { stripe } else { 0 }),
             )
         };
-        let serial = rows_that_fit();
+        let serial = rows_that_fit(1, false);
         if serial == 0 {
             return Err(EngineError::resource_limit("Cauchy encoding buffers"));
         }
-        // Recovery rows are independent, so each source stripe is spread over
-        // the batch's rows by a worker pool. Every batch is one more walk over
-        // the source, so the pool is admitted only into what is left after a
-        // batch wide enough for the serial pass count; workers never cost a
-        // read. If the batch still comes out narrower, the stacks go back.
+        // Recovery rows are independent, so each group of source stripes is
+        // spread over the batch's rows by a worker pool. Every batch is one
+        // more walk over the source, so the pool is admitted only into what is
+        // left after a batch wide enough for the serial pass count; workers
+        // never cost a read. If the batch still comes out narrower, the stacks
+        // go back.
         let passes = count.div_ceil(serial);
         let rows_per_pass = count.div_ceil(passes);
+        let headroom = rows_per_pass * per_row + stripe;
+        let work = |group: usize| {
+            rows_per_pass.saturating_mul(stripe).saturating_mul(group) / MIN_WORKER_BYTES
+        };
+        // Two optional widenings, both taken only from what is left once that
+        // batch and a pool as wide as the work asks for are set aside, plus a
+        // stripe of slack, so neither ever costs a read, a row or a worker.
+        //
+        // Staging: a resident row is a block-sized stride from the next, so a
+        // pass that accumulated in place would spread its working set over
+        // slices a power of two apart. Rows accumulate instead in one
+        // contiguous run of stripe buffers, as spooled rows always have, and
+        // each finished stripe is copied home once per pass. A block no wider
+        // than the stripe is already contiguous and is left in place.
+        //
+        // Grouping: workers meet once per group of source stripes rather than
+        // once per stripe, and fold the whole group into each row with one
+        // grouped multiply-accumulate.
+        //
+        // Staging is preferred, then the widest group. With room for neither,
+        // this is the in-place walk one stripe at a time, admitted as before.
+        let stageable = resident_rows && self.options.block_size > stripe as u64;
+        let available = self.options.execution.memory.available();
+        let widest = crate::gf::BATCH_SOURCES.min(self.blocks.len()).max(1);
+        let fits = |staged: bool, group: usize| {
+            headroom
+                .saturating_add(if staged { rows_per_pass * stripe } else { 0 })
+                .saturating_add((group - 1).saturating_mul(stripe))
+                .saturating_add(crate::runtime::SOURCE_GROUP_SLACK)
+                .saturating_add(crate::runtime::WorkerPool::unnarrowed_bytes(
+                    &self.options.execution,
+                    work(group),
+                ))
+                <= available
+        };
+        let (mut staged, mut group) = [true, false]
+            .into_iter()
+            .filter(|&staged| stageable || !staged)
+            .flat_map(|staged| (1..=widest).rev().map(move |group| (staged, group)))
+            .find(|&(staged, group)| (staged || group > 1) && fits(staged, group))
+            .unwrap_or((false, 1));
+        let extra = |staged: bool, group: usize| {
+            (group - 1) * stripe + if staged { rows_per_pass * stripe } else { 0 }
+        };
         let mut pool = crate::runtime::WorkerPool::for_work(
             &self.options.execution,
-            rows_per_pass * stripe / MIN_WORKER_BYTES,
-            rows_per_pass * per_row + stripe,
+            work(group),
+            headroom + extra(staged, group),
         )?;
-        let mut batch = rows_that_fit();
-        if batch < rows_per_pass && pool.is_some() {
-            pool = None;
-            let wanted = self.options.execution.workers;
-            self.options.execution.diagnostics.note_workers(1, wanted);
-            batch = rows_that_fit();
+        let mut batch = rows_that_fit(group, staged);
+        if batch < rows_per_pass && (pool.is_some() || group > 1 || staged) {
+            if pool.is_some() {
+                pool = None;
+                let wanted = self.options.execution.workers;
+                self.options.execution.diagnostics.note_workers(1, wanted);
+            }
+            (staged, group) = (false, 1);
+            batch = rows_that_fit(1, false);
         }
         if batch == 0 {
             return Err(EngineError::resource_limit("Cauchy encoding buffers"));
         }
-        let _memory = self
-            .options
-            .execution
-            .memory
-            .reserve_as(MemoryCategory::CodecScratch, batch * per_row + stripe)?;
+        let _memory = self.options.execution.memory.reserve_as(
+            MemoryCategory::CodecScratch,
+            batch * (per_row + if staged { stripe } else { 0 }) + stripe * group,
+        )?;
+        tracing::debug!(group, batch, staged, "PAR3 Cauchy encode admitted");
         let (mut resident, mut file) = match &mut spool {
             RecoverySpool::Memory { rows, .. } => (Some(rows), None),
             RecoverySpool::File { file, .. } => (None, Some(file)),
         };
-        let mut rows = vec![vec![0; stripe]; if resident.is_some() { 0 } else { batch }];
-        let mut bytes = vec![0; stripe];
+        // Spooled rows, and staged resident ones, accumulate here, one
+        // contiguous stripe per row.
+        let mut rows = vec![
+            0;
+            if resident.is_none() || staged {
+                batch * stripe
+            } else {
+                0
+            }
+        ];
+        let mut sources = vec![vec![0; stripe]; group];
         // A stripe pass reads every block before writing any row, so each
         // source is checked once per pass, after its last read.
         let owed = OwedChecks::default();
@@ -1152,18 +1210,20 @@ impl CreationPlan {
             let mut offset = 0;
             while offset < self.options.block_size {
                 let take = (self.options.block_size - offset).min(stripe as u64) as usize;
-                // A resident row's stripe is accumulated in place; a spooled
-                // one in a stripe buffer written out once it is complete.
+                // An unstaged resident row's stripe is accumulated in place;
+                // any other in its stripe buffer, copied home or written out
+                // once it is complete.
                 let at = offset as usize;
                 let mut active: Vec<&mut [u8]> = match resident.as_deref_mut() {
-                    Some(resident) => resident
+                    Some(resident) if !staged => resident
                         .chunks_exact_mut(self.options.block_size as usize)
                         .skip(first)
                         .take(amount)
                         .map(|row| &mut row[at..at + take])
                         .collect(),
-                    None => rows[..amount]
-                        .iter_mut()
+                    _ => rows
+                        .chunks_exact_mut(stripe)
+                        .take(amount)
                         .map(|row| &mut row[..take])
                         .collect(),
                 };
@@ -1176,26 +1236,37 @@ impl CreationPlan {
                 // are the same reads, in the same order, on one thread.
                 let parallel = pool.is_some();
                 let mut accumulate = || -> EngineResult<()> {
-                    for block in 0..self.blocks.len() {
-                        self.options.execution.cancel.check()?;
-                        self.read_block(block, offset, &mut bytes[..take], Some(&owed))?;
-                        let source = &bytes[..take];
+                    let mut start = 0;
+                    while start < self.blocks.len() {
+                        let end = (start + group).min(self.blocks.len());
+                        for (source, block) in sources.iter_mut().zip(start..end) {
+                            self.options.execution.cancel.check()?;
+                            self.read_block(block, offset, &mut source[..take], Some(&owed))?;
+                        }
+                        let mut inputs: [&[u8]; crate::gf::BATCH_SOURCES] =
+                            [&[]; crate::gf::BATCH_SOURCES];
+                        for (input, source) in inputs.iter_mut().zip(&sources[..end - start]) {
+                            *input = &source[..take];
+                        }
+                        let inputs = &inputs[..end - start];
                         let apply = |(index, row): (usize, &mut &mut [u8])| -> EngineResult<()> {
-                            let factor = crate::cauchy::element(
-                                &field,
-                                block as u64,
-                                self.options.first_recovery + (first + index) as u64,
-                            )?;
-                            field.mul_acc(&mut row[..take], source, factor);
+                            let recovery = self.options.first_recovery + (first + index) as u64;
+                            let mut factors = [F::Symbol::default(); crate::gf::BATCH_SOURCES];
+                            for (factor, block) in factors.iter_mut().zip(start..end) {
+                                *factor = crate::cauchy::element(&field, block as u64, recovery)?;
+                            }
+                            field.mul_acc_batch(&mut row[..take], inputs, &factors[..end - start]);
                             Ok(())
                         };
-                        // Each task owns disjoint rows and reads the one shared
-                        // stripe, so the bytes are the same for any worker count.
+                        // Each task owns disjoint rows and reads the shared
+                        // stripes, so the bytes are the same for any worker
+                        // count and any group width.
                         if parallel {
                             active.par_iter_mut().enumerate().try_for_each(apply)?;
                         } else {
                             active.iter_mut().enumerate().try_for_each(apply)?;
                         }
+                        start = end;
                     }
                     Ok(())
                 };
@@ -1206,12 +1277,19 @@ impl CreationPlan {
                 // Every block was read before any row leaves this pass, so
                 // each source is checked once per pass.
                 owed.settle(self.access.as_ref())?;
-                for (index, row) in active.iter().enumerate() {
+                drop(active);
+                for index in 0..amount {
+                    let home = (first + index) as u64 * self.options.block_size + offset;
+                    // Empty when unstaged resident rows were filled in place.
+                    let row = rows
+                        .get(index * stripe..index * stripe + take)
+                        .unwrap_or(&[]);
                     if let Some(file) = file.as_mut() {
-                        file.seek(SeekFrom::Start(
-                            (first + index) as u64 * self.options.block_size + offset,
-                        ))?;
+                        file.seek(SeekFrom::Start(home))?;
                         file.write_all(row)?;
+                    } else if let Some(resident) = resident.as_deref_mut().filter(|_| staged) {
+                        let home = home as usize;
+                        resident[home..home + take].copy_from_slice(row);
                     }
                     progress.advance(take as u64);
                     self.options.execution.cancel.check()?;

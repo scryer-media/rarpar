@@ -615,6 +615,104 @@ fn a_larger_budget_never_refuses_a_repair_a_smaller_one_completed() {
     );
 }
 
+/// Surviving stripes are folded into the syndromes a group at a time, the
+/// group sized from what the stripe bank leaves. At the smallest budget that
+/// still admits the full stripe there is no room for a second stripe, so the
+/// fold is one stripe at a time; with room, it is sixteen. The repaired bytes
+/// must not care, and neither may the reads, the writes or the stripe.
+#[test]
+fn the_syndrome_group_changes_scratch_and_nothing_else() {
+    // Every recovery row is spent, on stripes as wide as a block, so the stripe
+    // bank is the widest thing the repair holds and its minimum is the budget's.
+    let (blocks, block_size, recovery) = (48usize, 64u64 << 10, 16u64);
+    let stripe = block_size as usize;
+    let damage: Vec<usize> = (0..recovery as usize).map(|lost| lost * 3 + 1).collect();
+    let tree = common::TempTree::new("syndrome-groups");
+    let set =
+        common::cauchy_block_set(blocks, block_size, recovery, b"PAR3 syndrome groups", &tree);
+    let (name, bytes) = set.contents[0].clone();
+    let mut damaged = bytes.clone();
+    for block in &damage {
+        damaged[block * stripe + 11] ^= 0x80;
+    }
+    let scanning = ExecutionOptions::default();
+    let carriers: Vec<_> = set
+        .paths
+        .iter()
+        .flat_map(|path| common::scanned_packets(std::fs::read(path).unwrap(), &scanning))
+        .collect();
+    let full = |budget: usize, workers: usize| -> Option<ExecutionOptions> {
+        let mut access = MemorySourceAccess::default();
+        access.insert(SourceId(1), 2, damaged.clone().into());
+        let mut options = ExecutionOptions::default();
+        options.workers = workers;
+        options.stripe_bytes = stripe;
+        options.memory = MemoryBudget::new(budget);
+        let mut session = Par3RepairSession::new(set.id, Arc::new(access), options.clone()).ok()?;
+        session.bind_file(&name, SourceId(1)).ok()?;
+        for packet in &carriers {
+            session.merge(packet.clone()).ok()?;
+        }
+        if session.assess().ok()?.status != RepairStatus::Ready {
+            return None;
+        }
+        let output = common::TempTree::new("syndrome-groups-out");
+        let report = session.repair(output.path(), false).ok()?;
+        assert_eq!(report.reconstructed_blocks, recovery);
+        assert!(
+            std::fs::read(output.path().join(&name)).unwrap() == bytes,
+            "{workers} workers at {budget}: the repair did not reproduce the input"
+        );
+        drop(session);
+        assert_eq!(options.memory.used(), 0, "the session leaked");
+        Some(options)
+            .filter(|options| options.diagnostics.admission().stripe_bytes == stripe as u64)
+    };
+    let scratch = |options: &ExecutionOptions| {
+        options
+            .diagnostics
+            .memory()
+            .unwrap()
+            .category(MemoryCategory::CodecScratch)
+            .peak
+    };
+    let roomy = 32 << 20;
+    for workers in [1, 4] {
+        let wide = full(roomy, workers).expect("the roomy repair");
+        let (mut low, mut high) = (0usize, roomy);
+        while low + 1 < high {
+            let middle = low + (high - low) / 2;
+            if full(middle, workers).is_some() {
+                high = middle;
+            } else {
+                low = middle;
+            }
+        }
+        // Scratch paths are charged too and their names grow with a counter,
+        // so stand a little above the edge: far less than the slack and the
+        // stripe a second source would need.
+        let narrow = full(high + 4096, workers).unwrap();
+        let (narrow_admission, wide_admission) =
+            (narrow.diagnostics.admission(), wide.diagnostics.admission());
+        // Both outputs were already compared with the input.
+        if narrow_admission.output_tile == wide_admission.output_tile {
+            assert_eq!(
+                scratch(&wide) - scratch(&narrow),
+                15 * stripe as u64,
+                "{workers} workers: the roomy fold was not sixteen stripes wide"
+            );
+        }
+        assert_eq!(
+            narrow.diagnostics.source_io(),
+            wide.diagnostics.source_io(),
+            "{workers} workers: the group changed the reads"
+        );
+        let (narrow_io, wide_io) = (narrow.diagnostics.file_io(), wide.diagnostics.file_io());
+        assert_eq!(narrow_io.write_calls, wide_io.write_calls, "{workers}");
+        assert_eq!(narrow_io.write_bytes, wide_io.write_bytes, "{workers}");
+    }
+}
+
 /// PR #73 finding 10. Successive stripe passes walk disjoint slices of every
 /// block, so a repair that cannot hold a whole block reads each source byte
 /// exactly once. `reread_bytes` is what a host uses to see I/O amplification,
