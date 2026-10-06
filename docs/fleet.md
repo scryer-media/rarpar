@@ -262,6 +262,13 @@ Public write-ups name hosts by core type only, for example "Zen 4" or
 "Graviton 4", never by machine name. `platform_label` should follow the same
 rule.
 
+## Network-mount rig
+
+Remote-filesystem rows do not run on the fleet. They come from the local
+compose rig, `rarpar-bench nfs run`, which runs the PAR3 suite on kernel NFS
+exports and a local control in one run; see
+[benchmarking.md](benchmarking.md#network-mount-rig).
+
 ## EC2 over SSM
 
 `access = "ssh"` is the default: the run uses a temporary keypair, a security
