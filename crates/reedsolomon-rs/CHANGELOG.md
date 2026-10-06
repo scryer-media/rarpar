@@ -41,6 +41,20 @@
   GF(2^16) multiply-accumulate kernels, the fused batch kernels and memory
   baselines; `fft_transform` gains the u8-vs-u16, pooled and known-zero groups
   and prints which linear kernel runs.
+- The GF(2^16) GFNI batch kernels accumulate in byte planes: the destination
+  strip is split into its low and high bytes once, every source's four
+  affine products land in the planes, and the planes merge once before the
+  store, instead of splitting and merging around every source. On AVX-512
+  hosts with VBMI the planes come from `vpermt2b` over 128-byte strips and
+  the matrices broadcast from memory; `WEAVER_GF16_GFNI_VBMI=0` pins the
+  previous interleaved kernel. The AVX2 kernels do the same with shuffles and
+  unpacks. Output is bit-identical. Sixteen-source batch ceiling at 64 KiB:
+  Zen 4 41.8 → 50.1 GiB/s, Sapphire Rapids 36.7 → 48.7 GiB/s, Alder Lake
+  (AVX2) 30.0 → 31.2 GiB/s.
+- `gf_simd::input_batch_width` reports how many sources the grouped
+  multiply-accumulate folds per destination pass on this host, or 1 where the
+  single-source kernel is faster than the grouped one (AVX-512 without GFNI,
+  AVX2 without GFNI), so a caller can fold source by source there.
 
 ## 0.4.7
 

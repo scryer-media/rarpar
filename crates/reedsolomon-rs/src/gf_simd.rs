@@ -2380,6 +2380,25 @@ fn folded_avx512_enabled() -> bool {
     })
 }
 
+/// Whether the planar grouped-input GFNI kernel
+/// ([`mul_acc_input_batch_gfni_avx512vbmi_prepared`]) can run: it needs
+/// AVX512-VBMI's byte permute on top of GFNI+AVX512BW/VL. Setting
+/// `WEAVER_GF16_GFNI_VBMI=0` pins the interleaved kernel so hardware with both
+/// can A/B the two loop shapes without a rebuild.
+#[cfg(target_arch = "x86_64")]
+fn gfni_vbmi_batch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if std::env::var_os("WEAVER_GF16_GFNI_VBMI").is_some_and(|v| v == "0") {
+            return false;
+        }
+        is_x86_feature_detected!("gfni")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vl")
+            && is_x86_feature_detected!("avx512vbmi")
+    })
+}
+
 /// Whether the 512-bit shuffle2x kernel can run. Setting
 /// `WEAVER_GF16_SHUFFLE2X_AVX512=0` pins the 256-bit kernel so wide hardware
 /// can A/B the two widths without a rebuild.
@@ -3772,6 +3791,44 @@ pub const INPUT_BATCH_INTERLEAVE_LANES: usize = CLMUL_SRC_GROUP_WIDE;
 #[cfg(not(target_arch = "aarch64"))]
 pub const INPUT_BATCH_INTERLEAVE_LANES: usize = 1;
 
+/// How many sources a caller should fold per [`mul_acc_input_batch`] call on
+/// this machine: `1` where walking the destination once per source is the
+/// faster shape, else the widest pass the grouped kernels make.
+///
+/// The grouped kernels save destination traffic but spend more instructions
+/// per product than the single-source region kernels on some tiers. Measured
+/// over a 1 GiB GF(2^16) Cauchy create and a 50-block repair, one thread,
+/// 100 recovery blocks of 1 MiB:
+///
+/// - GFNI (affine products, no table loads): the batch of 16 beats one
+///   source at a time by 1.2–1.4× on both Zen 4 and Sapphire Rapids.
+/// - AVX-512BW without GFNI (Skylake-SP): the shuffle batch is 0.70× of the
+///   per-source kernel on create and 0.79× on repair.
+/// - AVX2 without GFNI (Zen 3): the batch is 0.9× of per-source.
+/// - NEON with PMULL: the CLMUL batch wins by 1.3× at eight workers.
+///
+/// Callers that stage source groups for I/O reasons may still stage the
+/// wider group and fold it one source at a time when this returns `1`.
+#[must_use]
+pub fn input_batch_width() -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
+            return 2 * SRC_STREAM_GROUP;
+        }
+        return 1;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if clmul_batch_enabled() {
+            return 2 * CLMUL_SRC_GROUP_WIDE;
+        }
+        return 1;
+    }
+    #[allow(unreachable_code)]
+    1
+}
+
 /// Multiply multiple input regions by prepared factors and XOR-accumulate the
 /// results into a single destination buffer.
 pub fn mul_acc_input_batch_prepared(dst: &mut [u8], factors_and_srcs: &[PreparedFactorSrc<'_>]) {
@@ -3792,7 +3849,7 @@ pub fn mul_acc_input_batch_prepared(dst: &mut [u8], factors_and_srcs: &[Prepared
             && is_x86_feature_detected!("avx512bw")
             && is_x86_feature_detected!("avx512vl")
         {
-            unsafe { mul_acc_input_batch_gfni_avx512_prepared(dst, factors_and_srcs) };
+            unsafe { mul_acc_input_batch_gfni_avx512_best(dst, factors_and_srcs) };
             return;
         }
         if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
@@ -5202,6 +5259,15 @@ unsafe fn mul_acc_input_batch_gfni_avx2(dst: &mut [u8], factors_and_srcs: &[Fact
                     }
                 }
 
+                // The accumulator is split into byte planes once per chunk
+                // and the products XOR into the planes; the chunk is
+                // re-interleaved once before the store. That drops the two
+                // byte unpacks the merge cost per source.
+                let a = _mm256_shuffle_epi8(acc0, deint_pair);
+                let b = _mm256_shuffle_epi8(acc1, deint_pair);
+                let mut acc_lo = _mm256_unpacklo_epi64(a, b);
+                let mut acc_hi = _mm256_unpackhi_epi64(a, b);
+
                 for input in group {
                     let s0 = _mm256_loadu_si256(input.src.as_ptr().add(offset) as *const __m256i);
                     let s1 =
@@ -5222,12 +5288,18 @@ unsafe fn mul_acc_input_batch_gfni_avx2(dst: &mut [u8], factors_and_srcs: &[Fact
                         _mm256_gf2p8affine_epi64_epi8::<0>(hi_bytes, input.m_hh),
                     );
 
-                    acc0 = _mm256_xor_si256(acc0, _mm256_unpacklo_epi8(result_lo, result_hi));
-                    acc1 = _mm256_xor_si256(acc1, _mm256_unpackhi_epi8(result_lo, result_hi));
+                    acc_lo = _mm256_xor_si256(acc_lo, result_lo);
+                    acc_hi = _mm256_xor_si256(acc_hi, result_hi);
                 }
 
-                _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, acc0);
-                _mm256_storeu_si256(dst.as_mut_ptr().add(offset + 32) as *mut __m256i, acc1);
+                _mm256_storeu_si256(
+                    dst.as_mut_ptr().add(offset) as *mut __m256i,
+                    _mm256_unpacklo_epi8(acc_lo, acc_hi),
+                );
+                _mm256_storeu_si256(
+                    dst.as_mut_ptr().add(offset + 32) as *mut __m256i,
+                    _mm256_unpackhi_epi8(acc_lo, acc_hi),
+                );
                 offset += 64;
             }
 
@@ -5325,6 +5397,15 @@ unsafe fn mul_acc_input_batch_gfni_avx2_prepared(
                     }
                 }
 
+                // The accumulator is split into byte planes once per chunk
+                // and the products XOR into the planes; the chunk is
+                // re-interleaved once before the store. That drops the two
+                // byte unpacks the merge cost per source.
+                let a = _mm256_shuffle_epi8(acc0, deint_pair);
+                let b = _mm256_shuffle_epi8(acc1, deint_pair);
+                let mut acc_lo = _mm256_unpacklo_epi64(a, b);
+                let mut acc_hi = _mm256_unpackhi_epi64(a, b);
+
                 for input in group {
                     let s0 = _mm256_loadu_si256(input.src.as_ptr().add(offset) as *const __m256i);
                     let s1 =
@@ -5345,12 +5426,18 @@ unsafe fn mul_acc_input_batch_gfni_avx2_prepared(
                         _mm256_gf2p8affine_epi64_epi8::<0>(hi_bytes, input.m_hh),
                     );
 
-                    acc0 = _mm256_xor_si256(acc0, _mm256_unpacklo_epi8(result_lo, result_hi));
-                    acc1 = _mm256_xor_si256(acc1, _mm256_unpackhi_epi8(result_lo, result_hi));
+                    acc_lo = _mm256_xor_si256(acc_lo, result_lo);
+                    acc_hi = _mm256_xor_si256(acc_hi, result_hi);
                 }
 
-                _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, acc0);
-                _mm256_storeu_si256(dst.as_mut_ptr().add(offset + 32) as *mut __m256i, acc1);
+                _mm256_storeu_si256(
+                    dst.as_mut_ptr().add(offset) as *mut __m256i,
+                    _mm256_unpacklo_epi8(acc_lo, acc_hi),
+                );
+                _mm256_storeu_si256(
+                    dst.as_mut_ptr().add(offset + 32) as *mut __m256i,
+                    _mm256_unpackhi_epi8(acc_lo, acc_hi),
+                );
                 offset += 64;
             }
 
@@ -5536,6 +5623,218 @@ unsafe fn mul_acc_input_batch_gfni_avx512_prepared(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Grouped-input GFNI + AVX-512 + VBMI planar kernel
+//
+// Same contract as `mul_acc_input_batch_gfni_avx512_prepared`, with the
+// destination strip held in byte planes for the whole source loop. The
+// interleaved kernel splits every source into low/high byte planes (two
+// vpshufb plus two qword unpacks), multiplies, and re-interleaves the product
+// into the accumulator (two byte unpacks): six shuffle-port µops per source
+// next to four gf2p8affineqb. Here the accumulator is split once per strip,
+// each source is split with two VBMI byte permutes straight from its two
+// 64-byte loads, the four affine products XOR into the planes, and the planes
+// are re-interleaved once before the store: two shuffle-port µops per source.
+// The matrices stay as qwords in the prepared list so the affine instructions
+// take them as embedded-broadcast memory operands (8 bytes per load, not 64).
+//
+// Byte planes: `lo[i]` is byte `2i` of the 128-byte strip, the low byte of
+// word `i`; `hi[i]` is byte `2i + 1`. The affine transform works per byte, so
+// a planar product keeps its word placement and `acc0 = interleave(lo[0..32),
+// hi[0..32))`, `acc1 = interleave(lo[32..64), hi[32..64))` restore the strip.
+// ---------------------------------------------------------------------------
+
+/// Byte-permute indices for `_mm512_permutex2var_epi8(a, idx, b)` over the
+/// two halves of a 128-byte strip: index `2i` / `2i + 1` (bit 6 selecting
+/// `b`) gathers word `i`'s low / high byte into plane position `i`.
+#[cfg(target_arch = "x86_64")]
+const PLANE_INDEX: [[u8; 64]; 2] = {
+    let mut idx = [[0u8; 64]; 2];
+    let mut i = 0;
+    while i < 64 {
+        idx[0][i] = (2 * i) as u8;
+        idx[1][i] = (2 * i + 1) as u8;
+        i += 1;
+    }
+    idx
+};
+
+/// Byte-permute indices restoring strip half `h` from the planes
+/// (`a = lo`, `b = hi`): position `2i` takes `lo[32h + i]`, position `2i + 1`
+/// takes `hi[32h + i]`.
+#[cfg(target_arch = "x86_64")]
+const MERGE_INDEX: [[u8; 64]; 2] = {
+    let mut idx = [[0u8; 64]; 2];
+    let mut h = 0;
+    while h < 2 {
+        let mut i = 0;
+        while i < 32 {
+            idx[h][2 * i] = (32 * h + i) as u8;
+            idx[h][2 * i + 1] = (64 + 32 * h + i) as u8;
+            i += 1;
+        }
+        h += 1;
+    }
+    idx
+};
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "gfni,avx512bw,avx512vl,avx512vbmi")]
+unsafe fn mul_acc_input_batch_gfni_avx512vbmi_prepared(
+    dst: &mut [u8],
+    factors_and_srcs: &[PreparedFactorSrc<'_>],
+) {
+    use std::arch::x86_64::*;
+
+    let len = dst.len();
+
+    /// Matrices as qwords, broadcast at the use site so the affine
+    /// instruction loads eight bytes per operand.
+    struct PreparedInput<'a> {
+        m_ll: i64,
+        m_lh: i64,
+        m_hl: i64,
+        m_hh: i64,
+        src: &'a [u8],
+    }
+
+    let xor_inputs: Vec<&[u8]> = factors_and_srcs
+        .iter()
+        .filter(|fs| fs.prepared.factor == 1)
+        .map(|fs| fs.src)
+        .collect();
+
+    // Same flavor contract as the interleaved kernel: a foreign Avx2-flavored
+    // factor would vanish from both this loop and the AVX2 tail delegate.
+    debug_assert!(
+        factors_and_srcs.iter().all(|fs| matches!(
+            fs.prepared.x86.as_ref(),
+            None | Some(PreparedX86Factor::Gfni(_))
+        )),
+        "gfni avx512vbmi batch requires GFNI-flavored prepared factors"
+    );
+    let prepared: Vec<PreparedInput<'_>> = factors_and_srcs
+        .iter()
+        .filter_map(|fs| match fs.prepared.x86.as_ref() {
+            Some(PreparedX86Factor::Gfni(matrices)) => Some(PreparedInput {
+                m_ll: matrices.m_ll as i64,
+                m_lh: matrices.m_lh as i64,
+                m_hl: matrices.m_hl as i64,
+                m_hh: matrices.m_hh as i64,
+                src: fs.src,
+            }),
+            _ => None,
+        })
+        .collect();
+
+    let vec_len = len & !127;
+    unsafe {
+        let idx_lo = _mm512_loadu_si512(PLANE_INDEX[0].as_ptr() as *const __m512i);
+        let idx_hi = _mm512_loadu_si512(PLANE_INDEX[1].as_ptr() as *const __m512i);
+        let idx_first = _mm512_loadu_si512(MERGE_INDEX[0].as_ptr() as *const __m512i);
+        let idx_second = _mm512_loadu_si512(MERGE_INDEX[1].as_ptr() as *const __m512i);
+
+        // Same source-group blocking as the interleaved kernels: bound the
+        // concurrent read streams per destination pass. Eight was measured
+        // against four and sixteen on Zen 4 and Sapphire Rapids at one
+        // worker: four costs 4% of create on Zen 4 and ties on Sapphire
+        // Rapids, sixteen costs 50% on Zen 4 (the sixteen streams overrun its
+        // 32 KiB L1) and 4% on Sapphire Rapids.
+        let mut first_pass = true;
+        let mut group_start = 0usize;
+        loop {
+            let group_end = (group_start + SRC_STREAM_GROUP).min(prepared.len());
+            let group = &prepared[group_start..group_end];
+
+            let mut offset = 0usize;
+            while offset + 128 <= vec_len {
+                let mut acc0 = _mm512_loadu_si512(dst.as_ptr().add(offset) as *const __m512i);
+                let mut acc1 = _mm512_loadu_si512(dst.as_ptr().add(offset + 64) as *const __m512i);
+
+                if first_pass {
+                    for src in &xor_inputs {
+                        let s0 = _mm512_loadu_si512(src.as_ptr().add(offset) as *const __m512i);
+                        let s1 =
+                            _mm512_loadu_si512(src.as_ptr().add(offset + 64) as *const __m512i);
+                        acc0 = _mm512_xor_si512(acc0, s0);
+                        acc1 = _mm512_xor_si512(acc1, s1);
+                    }
+                }
+
+                // Split the strip once; every product lands in the planes.
+                let mut acc_lo = _mm512_permutex2var_epi8(acc0, idx_lo, acc1);
+                let mut acc_hi = _mm512_permutex2var_epi8(acc0, idx_hi, acc1);
+
+                for input in group {
+                    let s0 = _mm512_loadu_si512(input.src.as_ptr().add(offset) as *const __m512i);
+                    let s1 =
+                        _mm512_loadu_si512(input.src.as_ptr().add(offset + 64) as *const __m512i);
+                    let lo_bytes = _mm512_permutex2var_epi8(s0, idx_lo, s1);
+                    let hi_bytes = _mm512_permutex2var_epi8(s0, idx_hi, s1);
+
+                    let result_lo = _mm512_xor_si512(
+                        _mm512_gf2p8affine_epi64_epi8::<0>(lo_bytes, _mm512_set1_epi64(input.m_ll)),
+                        _mm512_gf2p8affine_epi64_epi8::<0>(hi_bytes, _mm512_set1_epi64(input.m_lh)),
+                    );
+                    let result_hi = _mm512_xor_si512(
+                        _mm512_gf2p8affine_epi64_epi8::<0>(lo_bytes, _mm512_set1_epi64(input.m_hl)),
+                        _mm512_gf2p8affine_epi64_epi8::<0>(hi_bytes, _mm512_set1_epi64(input.m_hh)),
+                    );
+                    acc_lo = _mm512_xor_si512(acc_lo, result_lo);
+                    acc_hi = _mm512_xor_si512(acc_hi, result_hi);
+                }
+
+                _mm512_storeu_si512(
+                    dst.as_mut_ptr().add(offset) as *mut __m512i,
+                    _mm512_permutex2var_epi8(acc_lo, idx_first, acc_hi),
+                );
+                _mm512_storeu_si512(
+                    dst.as_mut_ptr().add(offset + 64) as *mut __m512i,
+                    _mm512_permutex2var_epi8(acc_lo, idx_second, acc_hi),
+                );
+                offset += 128;
+            }
+
+            first_pass = false;
+            group_start = group_end;
+            if group_start >= prepared.len() {
+                break;
+            }
+        }
+    }
+
+    // Tail: reuse the 256-bit prepared kernel for the remainder.
+    if vec_len < len {
+        let tail_srcs: Vec<PreparedFactorSrc<'_>> = factors_and_srcs
+            .iter()
+            .map(|fs| PreparedFactorSrc {
+                prepared: fs.prepared,
+                src: &fs.src[vec_len..],
+            })
+            .collect();
+        unsafe { mul_acc_input_batch_gfni_avx2_prepared(&mut dst[vec_len..], &tail_srcs) };
+    }
+}
+
+/// The best 512-bit GFNI grouped-input kernel for this machine: the planar
+/// VBMI loop where the byte permute exists (every GFNI+AVX-512 part shipped
+/// so far), else the interleaved one.
+///
+/// # Safety
+/// GFNI, AVX512BW and AVX512VL must be present; the prepared factors must be
+/// GFNI-flavored.
+#[cfg(target_arch = "x86_64")]
+unsafe fn mul_acc_input_batch_gfni_avx512_best(
+    dst: &mut [u8],
+    factors_and_srcs: &[PreparedFactorSrc<'_>],
+) {
+    if gfni_vbmi_batch_enabled() {
+        unsafe { mul_acc_input_batch_gfni_avx512vbmi_prepared(dst, factors_and_srcs) }
+    } else {
+        unsafe { mul_acc_input_batch_gfni_avx512_prepared(dst, factors_and_srcs) }
+    }
+}
+
 /// A GFNI-forced prepared factor for the unprepared 512-bit entry: inside a
 /// `gfni`-gated kernel the affine variant is always the right one, so skip
 /// `prepare_input_factor`'s runtime feature probe.
@@ -5567,7 +5866,7 @@ unsafe fn mul_acc_input_batch_gfni_avx512(dst: &mut [u8], factors_and_srcs: &[Fa
             src: fs.src,
         })
         .collect();
-    unsafe { mul_acc_input_batch_gfni_avx512_prepared(dst, &pairs) };
+    unsafe { mul_acc_input_batch_gfni_avx512_best(dst, &pairs) };
 }
 
 // ---------------------------------------------------------------------------
@@ -8098,6 +8397,146 @@ mod tests {
             let mut got = vec![0x6Bu8; len];
             unsafe { mul_acc_input_batch_gfni_avx512(&mut got, &pairs) };
             assert_eq!(got, reference, "gfni avx512 batch len={len}");
+        }
+    }
+
+    /// The planar VBMI kernel and the interleaved kernel it replaces agree
+    /// with the scalar reference and with each other (runs only on
+    /// GFNI+AVX512+VBMI hardware). Source counts 1, 7 and 19 cover a single
+    /// source, one short group, and two SRC_STREAM_GROUP crossings; the
+    /// factor mix carries the XOR fold (1), zero, the top bit and the all-ones
+    /// word; lengths straddle the 128-byte strip and the AVX2/scalar tail.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn input_batch_gfni_avx512vbmi_matches_scalar_and_interleaved() {
+        if !is_x86_feature_detected!("gfni")
+            || !is_x86_feature_detected!("avx512bw")
+            || !is_x86_feature_detected!("avx512vl")
+            || !is_x86_feature_detected!("avx512vbmi")
+        {
+            return;
+        }
+        for &count in &[1usize, 7, 19] {
+            for &len in &[
+                2usize, 62, 64, 66, 126, 128, 130, 254, 256, 258, 4096, 4094, 65_536,
+            ] {
+                let factors: Vec<u16> = (0..count)
+                    .map(|i| match i {
+                        0 => 1,
+                        1 => 0,
+                        2 => 0x8000,
+                        3 => 0xFFFF,
+                        4 => 2,
+                        _ => 0x1234u16.wrapping_mul(i as u16 + 1) | 1,
+                    })
+                    .collect();
+                let srcs: Vec<Vec<u8>> = (0..count)
+                    .map(|i| {
+                        (0..len)
+                            .map(|b| ((b * (i + 3) + 17 * i) % 251) as u8)
+                            .collect()
+                    })
+                    .collect();
+
+                let mut reference = vec![0x6Bu8; len];
+                for (&factor, src) in factors.iter().zip(srcs.iter()) {
+                    mul_acc_region_scalar(factor, src, &mut reference);
+                }
+
+                let prepared: Vec<PreparedInputFactor> = factors
+                    .iter()
+                    .map(|&f| prepare_input_factor_gfni(f))
+                    .collect();
+                let pairs: Vec<PreparedFactorSrc<'_>> = prepared
+                    .iter()
+                    .zip(srcs.iter())
+                    .map(|(prepared, src)| PreparedFactorSrc {
+                        prepared,
+                        src: src.as_slice(),
+                    })
+                    .collect();
+                let mut planar = vec![0x6Bu8; len];
+                unsafe { mul_acc_input_batch_gfni_avx512vbmi_prepared(&mut planar, &pairs) };
+                assert_eq!(
+                    planar, reference,
+                    "gfni avx512vbmi batch count={count} len={len}"
+                );
+                let mut interleaved = vec![0x6Bu8; len];
+                unsafe { mul_acc_input_batch_gfni_avx512_prepared(&mut interleaved, &pairs) };
+                assert_eq!(
+                    planar, interleaved,
+                    "planar vs interleaved count={count} len={len}"
+                );
+            }
+        }
+    }
+
+    /// Direct reference test for the 256-bit GFNI grouped-input entry and its
+    /// prepared twin (runs on any GFNI+AVX2 hardware; no-ops elsewhere). Same
+    /// source counts and factor mix as the VBMI test; lengths straddle the
+    /// 64-byte chunk and the scalar tail.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn input_batch_gfni_avx2_matches_scalar() {
+        if !is_x86_feature_detected!("gfni") || !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for &count in &[1usize, 7, 19] {
+            for &len in &[2usize, 30, 62, 64, 66, 126, 128, 130, 4096, 4094, 65_536] {
+                let factors: Vec<u16> = (0..count)
+                    .map(|i| match i {
+                        0 => 1,
+                        1 => 0,
+                        2 => 0x8000,
+                        3 => 0xFFFF,
+                        4 => 2,
+                        _ => 0x1234u16.wrapping_mul(i as u16 + 1) | 1,
+                    })
+                    .collect();
+                let srcs: Vec<Vec<u8>> = (0..count)
+                    .map(|i| {
+                        (0..len)
+                            .map(|b| ((b * (i + 3) + 17 * i) % 251) as u8)
+                            .collect()
+                    })
+                    .collect();
+
+                let mut reference = vec![0x6Bu8; len];
+                for (&factor, src) in factors.iter().zip(srcs.iter()) {
+                    mul_acc_region_scalar(factor, src, &mut reference);
+                }
+
+                let pairs: Vec<FactorSrc<'_>> = factors
+                    .iter()
+                    .zip(srcs.iter())
+                    .map(|(&factor, src)| FactorSrc {
+                        factor,
+                        src: src.as_slice(),
+                    })
+                    .collect();
+                let mut got = vec![0x6Bu8; len];
+                unsafe { mul_acc_input_batch_gfni_avx2(&mut got, &pairs) };
+                assert_eq!(got, reference, "gfni avx2 batch count={count} len={len}");
+
+                let prepared: Vec<PreparedInputFactor> = factors
+                    .iter()
+                    .map(|&f| prepare_input_factor_gfni(f))
+                    .collect();
+                let prepared_pairs: Vec<PreparedFactorSrc<'_>> = prepared
+                    .iter()
+                    .zip(srcs.iter())
+                    .map(|(prepared, src)| PreparedFactorSrc {
+                        prepared,
+                        src: src.as_slice(),
+                    })
+                    .collect();
+                let mut got = vec![0x6Bu8; len];
+                unsafe { mul_acc_input_batch_gfni_avx2_prepared(&mut got, &prepared_pairs) };
+                assert_eq!(
+                    got, reference,
+                    "gfni avx2 prepared batch count={count} len={len}"
+                );
+            }
         }
     }
 

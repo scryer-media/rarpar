@@ -581,11 +581,15 @@ impl MulAccBatch for Gf16 {
         // worker's stack holds (an optimised one fits in 16 KiB, and the x86
         // kernels fit in 256 KiB unoptimised), so it folds source by source
         // instead. The gate is the optimisation level, not debug assertions: a
-        // profile can switch those off at opt-level 0. The bytes are the same
+        // profile can switch those off at opt-level 0. Where the field's
+        // grouped kernel is slower than its single-source one (AVX-512 without
+        // GFNI, AVX2 without GFNI: 0.70× and 0.9× at one worker), the width is
+        // 1 and the sources also fold one at a time. The bytes are the same
         // either way.
         if sources.len() < 2
             || self.generator != Self::DEFAULT_GENERATOR
             || cfg!(all(par3_unoptimized, target_arch = "aarch64"))
+            || reedsolomon_rs::gf_simd::input_batch_width() < 2
         {
             for (src, factor) in sources.iter().zip(factors) {
                 self.mul_acc(dst, src, *factor);

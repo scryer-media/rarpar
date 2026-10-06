@@ -844,6 +844,9 @@ mod windows_volumes {
         let mut out = [0; 8];
         assert_eq!(access.read_at(SourceId(1), 0, &mut out).unwrap(), 8);
         assert_eq!(&out, b"replaced");
+    }
+}
+
 /// The FFT codec on both fields ends a create whose source changes
 /// mid-operation in `SourceChanged`, with no carrier installed.
 #[test]

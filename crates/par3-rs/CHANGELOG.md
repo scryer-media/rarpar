@@ -105,7 +105,14 @@
   create 24.5% fewer cycles at one worker and 2.3× faster at eight; repair
   2.2× faster at eight workers with 42% of the CPU. GF(2^8) gains are much
   smaller (create 2% fewer cycles at one worker, 1.6× at eight; repair 1.5×
-  at eight).
+  at eight). Where the host's grouped kernel is slower than its single-source
+  one (`reedsolomon_rs::gf_simd::input_batch_width() < 2`: AVX-512 without
+  GFNI measured at 0.70× of the one-source walk, AVX2 without GFNI at 0.9×),
+  the staged stripes still cut the I/O walks but fold source by source. The
+  GFNI byte-plane batch kernels in reedsolomon-rs 0.4.8 take 1 GiB, 100 rows,
+  GF(2^16) create at one worker from 2.56 to 2.10 s of codec time on Zen 4
+  and 2.63 to 2.42 s on Sapphire Rapids, 3.82 to 3.61 s on an AVX2 Alder
+  Lake; bytes identical.
 - With a worker pool, Cauchy repair reads and scatters the next group of
   surviving stripes while the workers fold the previous one, and adds the
   recovery rows to their syndromes in parallel. The second set of stripes is
