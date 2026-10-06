@@ -718,6 +718,10 @@ impl ScanWorkBudget {
             .map(|_| ())
             .map_err(|_| EngineError::resource_limit("cumulative scanning work"))
     }
+    /// Return part of a charge whose request came back short.
+    pub(crate) fn refund(&self, bytes: usize) {
+        self.0.used.fetch_sub(bytes as u64, Ordering::AcqRel);
+    }
 }
 
 /// Synchronous execution controls for a session.

@@ -211,6 +211,64 @@ fn carrier_read_ahead_reads_each_byte_once_and_rejects_changed_generations() {
 }
 
 #[test]
+fn a_carrier_is_scanned_in_mebibyte_reads_and_an_empty_poll_costs_one_stripe() {
+    // An official volume behind three and a half mebibytes of bytes that hold
+    // no packet: the scan walks them in reads of the sequential size, not
+    // the stripe, and charges exactly the bytes it read.
+    let volume = common::set_vol0_par3();
+    let mut bytes = vec![0; (7 << 20) / 2];
+    bytes.extend_from_slice(&volume);
+    let source = Arc::new(ArrivingSource {
+        visible: AtomicUsize::new(bytes.len()),
+        generation: AtomicU64::new(1),
+        reads: AtomicUsize::new(0),
+        bytes,
+    });
+    let options = ExecutionOptions::default();
+    let mut scanner = PacketScanner::new(
+        source.clone(),
+        SourceId(1),
+        options.clone(),
+        ScanLimits::default(),
+    )
+    .unwrap();
+    let mut hashes = Vec::new();
+    while let ScanEvent::Packet(packet) = scanner.poll().unwrap() {
+        hashes.push(packet.hash());
+    }
+    let expected: Vec<_> = common::scan(&volume)
+        .iter()
+        .map(|(_, packet)| packet.hash())
+        .collect();
+    assert_eq!(hashes, expected);
+    assert_eq!(options.scan_work.used(), source.bytes.len() as u64);
+    assert_eq!(
+        source.reads.load(Ordering::Relaxed),
+        source.bytes.len().div_ceil(1 << 20)
+    );
+
+    // Nothing has arrived: each poll asks for a mebibyte, gets nothing, and
+    // is charged the 64 KiB stripe a stripe-sized read-ahead would have
+    // asked for, no more.
+    source.visible.store(0, Ordering::Relaxed);
+    let options = ExecutionOptions::default();
+    let mut waiting = PacketScanner::new(
+        source.clone(),
+        SourceId(1),
+        options.clone(),
+        ScanLimits::default(),
+    )
+    .unwrap();
+    for polls in 1..=3 {
+        assert!(matches!(
+            waiting.poll().unwrap(),
+            ScanEvent::NeedData { offset: 0 }
+        ));
+        assert_eq!(options.scan_work.used(), polls * (64 << 10));
+    }
+}
+
+#[test]
 fn packets_from_one_read_ahead_stripe_share_one_generation_check() {
     // Counts snapshot calls; a disk provider pays one `stat` for each.
     struct Counted {

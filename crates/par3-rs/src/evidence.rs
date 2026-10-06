@@ -677,20 +677,16 @@ pub fn verify_arrivals(
     Ok(result)
 }
 
-/// The verification read buffer, grown to the parallel-hash size only when a
-/// pool is admitted, the source is large enough to use it, and the shared
-/// budget still leaves working room afterwards.
+/// The verification read buffer: the sequential read size for the source,
+/// whatever the block size and whether or not the hash runs in parallel, as
+/// long as the shared budget still leaves working room afterwards.
 ///
 /// A refused growth is not a refused verification: the small buffer is the
 /// documented fallback, and it never reacquires workers.
-fn verification_buffer(
-    options: &ExecutionOptions,
-    len: u64,
-    parallel: bool,
-) -> EngineResult<Reservation> {
+fn verification_buffer(options: &ExecutionOptions, len: u64) -> EngineResult<Reservation> {
     let small = options.stripe_bytes.min(64 << 10);
-    let large = crate::hash::PARALLEL_HASH_BYTES;
-    if parallel && len >= large as u64 {
+    let large = crate::source::sequential_read_bytes(options, len);
+    if large > small {
         match options
             .memory
             .reserve_as(MemoryCategory::SourceScratch, large)
@@ -770,7 +766,7 @@ pub(crate) fn verify_source_in_pool(
         offset: 0,
     })?;
     let mut verifier = StreamingVerifier::new(layout, file, source, snapshot, options.clone())?;
-    let reservation = verification_buffer(options, snapshot.len, parallel)?;
+    let reservation = verification_buffer(options, snapshot.len)?;
     let size = reservation.bytes();
     verifier.parallel_hash = parallel && size >= crate::hash::PARALLEL_HASH_BYTES;
     let _reservation = reservation;
@@ -977,24 +973,28 @@ mod parallel_tests {
                 stripe_bytes: 1 << 20,
                 ..ExecutionOptions::default()
             };
-            for parallel in [false, true] {
-                for len in [
-                    0,
-                    (PARALLEL_HASH_BYTES - 1) as u64,
-                    PARALLEL_HASH_BYTES as u64,
-                ] {
-                    let buffer = verification_buffer(&options, len, parallel).unwrap();
-                    let large = parallel
-                        && len >= PARALLEL_HASH_BYTES as u64
-                        && limit >= PARALLEL_HASH_BYTES + (128 << 10);
-                    assert_eq!(
-                        buffer.bytes(),
-                        if large { PARALLEL_HASH_BYTES } else { 64 << 10 }
-                    );
-                    assert_eq!(buffer.category(), MemoryCategory::SourceScratch);
-                    drop(buffer);
-                    assert_eq!(options.memory.used(), 0);
-                }
+            for len in [
+                0,
+                64 << 10,
+                (64 << 10) + 1,
+                (PARALLEL_HASH_BYTES - 1) as u64,
+                PARALLEL_HASH_BYTES as u64,
+                8 * PARALLEL_HASH_BYTES as u64,
+            ] {
+                let buffer = verification_buffer(&options, len).unwrap();
+                // A source's read size never depends on its block size or on
+                // whether its hash runs in parallel: only on its length and
+                // on room left in the budget.
+                let wanted = len.min(PARALLEL_HASH_BYTES as u64) as usize;
+                let expected = if wanted > 64 << 10 && limit >= wanted + (128 << 10) {
+                    wanted
+                } else {
+                    64 << 10
+                };
+                assert_eq!(buffer.bytes(), expected, "limit {limit} len {len}");
+                assert_eq!(buffer.category(), MemoryCategory::SourceScratch);
+                drop(buffer);
+                assert_eq!(options.memory.used(), 0);
             }
         }
     }
