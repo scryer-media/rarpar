@@ -557,11 +557,15 @@ impl MulAccBatch for Gf8 {
             .chunks(BATCH_SOURCES)
             .zip(factors.chunks(BATCH_SOURCES))
         {
-            let plans: [reedsolomon_rs::gf8::MulPlan; BATCH_SOURCES] = std::array::from_fn(|k| {
-                reedsolomon_rs::gf8::MulPlan::new(factors.get(k).copied().unwrap_or(0))
-            });
+            // A plan per source the chunk holds, none for the slots past it.
+            let plans: [Option<reedsolomon_rs::gf8::MulPlan>; BATCH_SOURCES] =
+                std::array::from_fn(|k| {
+                    factors
+                        .get(k)
+                        .map(|&f| reedsolomon_rs::gf8::MulPlan::new(f))
+                });
             for (tile, at) in dst.chunks_mut(TILE).zip((0..).step_by(TILE)) {
-                for (plan, src) in plans.iter().zip(sources) {
+                for (plan, src) in plans.iter().flatten().zip(sources) {
                     plan.accumulate(&src[at..at + tile.len()], tile);
                 }
             }
@@ -572,11 +576,16 @@ impl MulAccBatch for Gf8 {
 impl MulAccBatch for Gf16 {
     fn mul_acc_batch(&self, dst: &mut [u8], sources: &[&[u8]], factors: &[u16]) {
         assert_eq!(sources.len(), factors.len(), "one factor per source");
-        // An unoptimised build lays every temporary of the inlined grouped
-        // kernels out in one frame, measured past the 256 KiB a pool worker's
-        // stack holds (an optimised one fits in 16 KiB), so it folds source by
-        // source instead. The bytes are the same either way.
-        if sources.len() < 2 || self.generator != Self::DEFAULT_GENERATOR || cfg!(debug_assertions)
+        // An unoptimised aarch64 build lays every temporary of the inlined
+        // CLMUL batch kernel out in one frame, measured past the 256 KiB a pool
+        // worker's stack holds (an optimised one fits in 16 KiB, and the x86
+        // kernels fit in 256 KiB unoptimised), so it folds source by source
+        // instead. The gate is the optimisation level, not debug assertions: a
+        // profile can switch those off at opt-level 0. The bytes are the same
+        // either way.
+        if sources.len() < 2
+            || self.generator != Self::DEFAULT_GENERATOR
+            || cfg!(all(par3_unoptimized, target_arch = "aarch64"))
         {
             for (src, factor) in sources.iter().zip(factors) {
                 self.mul_acc(dst, src, *factor);
@@ -972,8 +981,8 @@ mod tests {
         };
         batch_agrees_with_single_sources(&Gf16::default(), &mut rng, batch);
         batch_agrees_with_single_sources(&Gf16::new(0x1_002d).unwrap(), &mut rng, batch);
-        // The grouped kernels themselves, which an unoptimised build only
-        // reaches here, on a thread with a test's stack.
+        // The grouped kernels themselves, which an unoptimised aarch64 build
+        // only reaches here, on a thread with a test's stack.
         batch_agrees_with_single_sources(&Gf16::default(), &mut rng, Gf16::mul_acc_grouped);
     }
 
@@ -1086,6 +1095,198 @@ mod tests {
         ] {
             assert!(for_set(&field).is_err(), "accepted {field:?}");
         }
+    }
+}
+
+/// The grouped multiply-accumulate against a symbol-at-a-time reference: 1 to
+/// 40 sources, factors 0, 1, the largest and the top bit, lengths either side
+/// of every vector width and tile, unaligned destinations and sources, and the
+/// non-default generators. The grouped GF(2^16) kernels are also called
+/// directly, so every build profile reaches them.
+#[cfg(test)]
+mod batch_sweep_tests {
+    use super::*;
+
+    fn bytes(state: &mut u64, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                *state ^= *state << 13;
+                *state ^= *state >> 7;
+                *state ^= *state << 17;
+                (*state >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// Symbol at a time through the log tables only, independent of every
+    /// SIMD kernel.
+    fn reference<F: Field>(field: &F, dst: &mut [u8], sources: &[&[u8]], factors: &[F::Symbol])
+    where
+        F::Symbol: Into<u64>,
+    {
+        for (src, factor) in sources.iter().zip(factors) {
+            for (d, s) in dst
+                .chunks_exact_mut(F::SYMBOL_BYTES)
+                .zip(src.chunks_exact(F::SYMBOL_BYTES))
+            {
+                let mut v = 0u64;
+                for (i, b) in s.iter().enumerate() {
+                    v |= u64::from(*b) << (8 * i);
+                }
+                let p: u64 = field.mul(*factor, F::symbol(v).unwrap()).into();
+                for (i, b) in d.iter_mut().enumerate() {
+                    *b ^= (p >> (8 * i)) as u8;
+                }
+            }
+        }
+    }
+
+    /// Every source count for the shortest lengths, the counts either side of
+    /// each 8- and 16-wide group for the longer ones, and fewer still for the
+    /// lengths past a tile, which keeps the sweep fast in an unoptimised build.
+    fn counts(len: usize) -> Vec<usize> {
+        match len {
+            0..=130 => (1..=40).collect(),
+            131..=1024 => vec![1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33, 40],
+            _ => vec![1, 2, 15, 16, 17, 40],
+        }
+    }
+
+    fn sweep<F: Field>(
+        field: &F,
+        lens: &[usize],
+        batch: impl Fn(&F, &mut [u8], &[&[u8]], &[F::Symbol]),
+    ) where
+        F::Symbol: Into<u64>,
+    {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ u64::from(field.generator());
+        for &len in lens {
+            for count in counts(len) {
+                for dst_shift in [0usize, 1, 3] {
+                    let src_shift = (count + dst_shift) % 5;
+                    let backing: Vec<Vec<u8>> = (0..count)
+                        .map(|_| bytes(&mut state, len + src_shift))
+                        .collect();
+                    let sources: Vec<&[u8]> = backing.iter().map(|b| &b[src_shift..]).collect();
+                    let raw = bytes(&mut state, 8);
+                    let factors: Vec<F::Symbol> = (0..count)
+                        .map(|k| {
+                            let v = match k % 7 {
+                                0 => 0,
+                                1 => 1,
+                                2 => F::MAX,
+                                3 => F::MAX.div_ceil(2),
+                                _ => u64::from(raw[k % 8]) * 257 % (F::MAX + 1),
+                            };
+                            F::symbol(v).unwrap()
+                        })
+                        .collect();
+                    let mut got = bytes(&mut state, len + dst_shift);
+                    let mut expected = got.clone();
+                    reference(field, &mut expected[dst_shift..], &sources, &factors);
+                    batch(field, &mut got[dst_shift..], &sources, &factors);
+                    assert!(
+                        got == expected,
+                        "generator {:#x}: len {len}, {count} sources, dst+{dst_shift}, src+{src_shift}",
+                        field.generator()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Either side of every vector width, and for GF(2^8) of its 8 KiB tile.
+    /// A non-default generator folds source by source, so it takes only the
+    /// lengths up to 258 bytes.
+    const LENS8: &[usize] = &[
+        0, 1, 2, 31, 32, 33, 63, 64, 65, 127, 128, 129, 191, 255, 256, 257, 1000, 8193,
+    ];
+    const SHORT8: usize = 16;
+    const LENS16: &[usize] = &[
+        0, 2, 30, 32, 34, 62, 64, 66, 126, 128, 130, 254, 256, 258, 1000, 4094, 8194,
+    ];
+    const SHORT16: usize = 14;
+
+    #[test]
+    fn gf8_batch_matches_symbol_reference() {
+        let batch = |f: &Gf8, d: &mut [u8], s: &[&[u8]], k: &[u8]| f.mul_acc_batch(d, s, k);
+        sweep(&Gf8::default(), LENS8, batch);
+        sweep(&Gf8::new(0x12b).unwrap(), &LENS8[..SHORT8], batch);
+    }
+
+    #[test]
+    fn gf16_batch_matches_symbol_reference() {
+        let batch = |f: &Gf16, d: &mut [u8], s: &[&[u8]], k: &[u16]| f.mul_acc_batch(d, s, k);
+        sweep(&Gf16::default(), LENS16, batch);
+        sweep(&Gf16::new(0x1_002d).unwrap(), &LENS16[..SHORT16], batch);
+    }
+
+    /// The grouped kernels directly, whatever the build profile.
+    #[test]
+    fn gf16_grouped_matches_symbol_reference() {
+        sweep(&Gf16::default(), LENS16, Gf16::mul_acc_grouped);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a whole number of 2-byte symbols")]
+    fn gf16_grouped_refuses_an_odd_length() {
+        let s = [0u8; 33];
+        Gf16::default().mul_acc_grouped(&mut [0u8; 33], &[&s, &s], &[2, 3]);
+    }
+
+    #[test]
+    #[should_panic(expected = "one factor per source")]
+    fn batch_refuses_mismatched_factors() {
+        let s = [0u8; 256];
+        Gf16::default().mul_acc_batch(&mut [0u8; 256], &[&s, &s], &[2]);
+    }
+
+    #[test]
+    #[should_panic(expected = "equal-length regions")]
+    fn gf8_batch_refuses_a_short_source() {
+        let (a, b) = ([0u8; 256], [0u8; 255]);
+        Gf8::default().mul_acc_batch(&mut [0u8; 256], &[&a, &b], &[2, 3]);
+    }
+
+    #[test]
+    #[should_panic(expected = "equal-length regions")]
+    fn gf16_grouped_refuses_a_short_source() {
+        let (a, b) = ([0u8; 256], [0u8; 254]);
+        Gf16::default().mul_acc_grouped(&mut [0u8; 256], &[&a, &b], &[2, 3]);
+    }
+
+    /// Sixteen sources through the `mul_acc_batch` entry the codecs use, on a
+    /// thread with a pool worker's 256 KiB stack. Wherever the build takes the
+    /// grouped kernel there, its frame has to fit.
+    #[test]
+    fn batch_runs_on_a_worker_stack() {
+        std::thread::Builder::new()
+            .stack_size(256 << 10)
+            .spawn(|| {
+                let field = Gf16::default();
+                let mut state = 7u64;
+                let backing: Vec<Vec<u8>> = (0..16).map(|_| bytes(&mut state, 65_536)).collect();
+                let sources: Vec<&[u8]> = backing.iter().map(Vec::as_slice).collect();
+                let factors: Vec<u16> = (0..16u16).map(|k| k * 4099 + 3).collect();
+                let mut dst = vec![0u8; 65_536];
+                let mut expected = dst.clone();
+                for (s, f) in sources.iter().zip(&factors) {
+                    field.mul_acc(&mut expected, s, *f);
+                }
+                field.mul_acc_batch(&mut dst, &sources, &factors);
+                assert!(dst == expected);
+                let factors: Vec<u8> = (1..=16).collect();
+                let mut got = vec![0u8; 65_536];
+                let mut expected = got.clone();
+                for (s, f) in sources.iter().zip(&factors) {
+                    Gf8::default().mul_acc(&mut expected, s, *f);
+                }
+                Gf8::default().mul_acc_batch(&mut got, &sources, &factors);
+                assert!(got == expected);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
 

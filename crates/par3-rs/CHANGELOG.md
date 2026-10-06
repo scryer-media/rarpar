@@ -89,11 +89,17 @@
   rows accumulate in contiguous stripe buffers and are copied home once per
   pass, so a pass no longer walks slices a block apart. The extra stripes are
   taken only from budget left over after the pass, the pool and a stripe of
-  slack, and fall back to the one-stripe walk without them; peak reservation
-  rises by at most fifteen stripes plus the staged rows. Output bytes and
-  every I/O count are unchanged. 1 GiB, 100 rows: create 23% fewer cycles at
-  one worker and 2.7× faster at eight; repair 2× faster at eight workers with
-  a third of the CPU.
+  slack, and fall back to the one-stripe walk without them. The encode's
+  scratch rises by at most fifteen stripes plus the staged rows, and a group
+  of stripes can admit more pool workers than one stripe did, each charged as
+  worker stacks: 10 rows of 256 KiB blocks at eight workers peak at 7.00 MB
+  rather than 2.80 MB, 2.62 MB of it worker stacks that were not admitted
+  before, still inside the budget. Repair's scratch rises by fifteen stripes.
+  Output bytes and every I/O count are unchanged. 1 GiB, 100 rows, GF(2^16):
+  create 24.5% fewer cycles at one worker and 2.3× faster at eight; repair
+  2.2× faster at eight workers with 42% of the CPU. GF(2^8) gains are much
+  smaller (create 2% fewer cycles at one worker, 1.6× at eight; repair 1.5×
+  at eight).
 - With a worker pool, Cauchy repair reads and scatters the next group of
   surviving stripes while the workers fold the previous one, and adds the
   recovery rows to their syndromes in parallel. The second set of stripes is

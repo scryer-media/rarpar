@@ -780,7 +780,14 @@ where
                         for (factor, block) in factors.iter_mut().zip(members) {
                             *factor = crate::cauchy::element(&field, *block, *row)?;
                         }
-                        field.mul_acc_batch(&mut syndrome[..take], sources, &factors[..count]);
+                        // A set of one calls the single-source kernel itself:
+                        // inlined through the batch fallback it compiles to a
+                        // slower loop.
+                        if let [source] = sources {
+                            field.mul_acc(&mut syndrome[..take], source, factors[0]);
+                        } else {
+                            field.mul_acc_batch(&mut syndrome[..take], sources, &factors[..count]);
+                        }
                         Ok(())
                     };
                     match parallel {

@@ -1331,7 +1331,18 @@ impl CreationPlan {
                             for (factor, block) in factors.iter_mut().zip(start..end) {
                                 *factor = crate::cauchy::element(&field, block as u64, recovery)?;
                             }
-                            field.mul_acc_batch(&mut row[..take], inputs, &factors[..end - start]);
+                            // A group of one, the one-stripe walk, calls the
+                            // single-source kernel itself: inlined through the
+                            // batch fallback it compiles to a slower loop.
+                            if let [input] = inputs {
+                                field.mul_acc(&mut row[..take], input, factors[0]);
+                            } else {
+                                field.mul_acc_batch(
+                                    &mut row[..take],
+                                    inputs,
+                                    &factors[..end - start],
+                                );
+                            }
                             Ok(())
                         };
                         // Each task owns disjoint rows and reads the shared
