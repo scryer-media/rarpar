@@ -842,7 +842,9 @@ func (r *runner) runsOp(variant Variant, op string) bool {
 	if !variant.RunsOp(op) {
 		return false
 	}
-	if variant.EffectiveDurability() == DurabilityBuffered {
+	// Engine rows select buffered output through their environment
+	// (PAR3_BENCH_<OP>_DURABILITY), not the CLI flag the probe looks for.
+	if variant.EffectiveDurability() == DurabilityBuffered && variant.Tool != ToolEngine {
 		return r.results.BufferedArgs[op] != nil
 	}
 	return true

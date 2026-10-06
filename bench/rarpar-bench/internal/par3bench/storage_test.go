@@ -214,3 +214,18 @@ func TestVerifyDamagedStageLinksTheSharedDamagedInputs(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+func TestEngineBufferedRowsDoNotNeedTheCLIFlag(t *testing.T) {
+	r := &runner{results: &Results{BufferedArgs: map[string][]string{}}}
+	engine := Variant{Name: "engine-w8-buffered", Tool: ToolEngine, Workers: 8, Durability: DurabilityBuffered}
+	cli := Variant{Name: "rarpar-w8-buffered", Tool: ToolCandidate, Workers: 8, Durability: DurabilityBuffered}
+	if !r.runsOp(engine, OpRepair) {
+		t.Error("engine buffered repair row dropped when the CLI has no --buffered")
+	}
+	if r.runsOp(cli, OpRepair) {
+		t.Error("CLI buffered repair row kept without a --buffered flag")
+	}
+	if r.runsOp(engine, OpVerify) {
+		t.Error("buffered row for a read-only op")
+	}
+}
