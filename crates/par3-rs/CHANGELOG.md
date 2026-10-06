@@ -61,6 +61,13 @@
   repair wall time roughly halves on Apple hosts and improves by about a
   quarter on x86 Linux; the 64 KiB default and user-chosen stripe sizes are
   unchanged.
+- Disk verification hashes a file as a whole first and hashes its extents
+  only when that hash does not prove the file intact. An intact file is read
+  and hashed once (about half the CPU, 1.9× faster on one worker); a damaged
+  file, or one whose length cannot match, is read a second time for its
+  extents, with one extra open. Verdicts are unchanged for any set whose
+  packets agree with each other; the streaming verifier still computes both
+  hashes in one pass.
 - Cauchy creation encodes recovery rows on the worker pool when the rows per
   pass carry at least 1 MiB of work per worker. Output is byte-identical for
   every worker count and no read is added.

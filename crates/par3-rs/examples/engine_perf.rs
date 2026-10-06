@@ -1,7 +1,8 @@
 //! Stage-level native benchmark driver, not a supported CLI.
 //!
 //! Arguments: OP DATA CARRIERS OUTPUT WORKERS MEMORY_MIB [CODEC BLOCK RECOVERY INTERLEAVE].
-//! OP is create, scan, verify, reassess, repair, or placement. Inputs are explicitly
+//! OP is create, scan, verify, assess, reassess, repair, or placement; assess
+//! accepts whatever status the assessment finds. Inputs are explicitly
 //! generated `.bin` files in DATA; carriers are `.par3` files in CARRIERS.
 //! Timing excludes directory discovery. Each invocation is one fresh process.
 //! PAR3_BENCH_CREATE_DURABILITY=buffered opts creation into buffered output;
@@ -233,6 +234,7 @@ fn main() -> Result<()> {
             }
             match operation {
                 "verify" | "reassess" if status == RepairStatus::Complete => {}
+                "assess" => {}
                 "repair" if status == RepairStatus::Ready => {
                     let before = options.diagnostics.source_io();
                     let start = Instant::now();
@@ -274,11 +276,12 @@ fn main() -> Result<()> {
     );
     let io = options.diagnostics.file_io();
     println!(
-        "{{\"file_read_bytes\":{},\"file_read_calls\":{},\"file_write_bytes\":{},\"file_write_calls\":{},\"memory_limit\":{},\"workers\":{}}}",
+        "{{\"file_read_bytes\":{},\"file_read_calls\":{},\"file_write_bytes\":{},\"file_write_calls\":{},\"file_opens\":{},\"memory_limit\":{},\"workers\":{}}}",
         io.read_bytes,
         io.read_calls,
         io.write_bytes,
         io.write_calls,
+        options.diagnostics.file_opens(),
         options.memory.limit(),
         options.workers
     );
