@@ -120,7 +120,7 @@ fn round_trip_restores_the_original_bytes_and_reinserts_identically() {
         let tree = common::TempTree::new(&format!("rar5-round-{layout:?}"));
         let inserted = insert(
             tree.path(),
-            &[source.clone()],
+            std::slice::from_ref(&source),
             layout,
             Rar5Placement::Spread,
             1024,
@@ -181,7 +181,7 @@ fn damage_in_the_header_middle_and_end_is_repaired_byte_for_byte() {
         let tree = common::TempTree::new(&format!("rar5-damage-{layout:?}"));
         let inserted = insert(
             tree.path(),
-            &[source.clone()],
+            std::slice::from_ref(&source),
             layout,
             Rar5Placement::Spread,
             1024,
@@ -226,7 +226,7 @@ fn region_damage_is_reported_and_the_region_is_regenerated() {
         let tree = common::TempTree::new(&format!("rar5-region-{layout:?}"));
         let inserted = insert(
             tree.path(),
-            &[source.clone()],
+            std::slice::from_ref(&source),
             layout,
             Rar5Placement::Spread,
             1024,

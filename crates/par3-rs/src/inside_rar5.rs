@@ -946,13 +946,17 @@ fn candidate(
     })
 }
 
+/// A recorded host name and, when a sibling was renamed, the name it would
+/// have under that sibling's stem.
+type RecordedName = (String, Option<String>);
+
 /// Recorded host names per set, each with the name it would have under the
 /// stem of a renamed sibling.
 fn recorded_names(
     candidates: &[Candidate],
     access: Arc<dyn SourceAccess>,
     options: &ExecutionOptions,
-) -> EngineResult<Vec<Vec<(String, Option<String>)>>> {
+) -> EngineResult<Vec<Vec<RecordedName>>> {
     let mut sessions: BTreeMap<InputSetId, Par3RepairSession> = BTreeMap::new();
     for candidate in candidates {
         for packet in candidate
@@ -961,16 +965,13 @@ fn recorded_names(
             .filter(|packet| packet.metadata().is_some())
         {
             let id = packet.input_set_id();
-            if !sessions.contains_key(&id) {
-                sessions.insert(
-                    id,
-                    Par3RepairSession::new(id, access.clone(), options.clone())?,
-                );
-            }
-            sessions
-                .get_mut(&id)
-                .expect("session")
-                .merge(packet.clone())?;
+            let session = match sessions.entry(id) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(Par3RepairSession::new(id, access.clone(), options.clone())?)
+                }
+            };
+            session.merge(packet.clone())?;
         }
     }
     let mut sets = Vec::new();
@@ -1273,7 +1274,7 @@ fn open_set(
         host.unresolved = if host.source.is_some() {
             assessed.unresolved.clone()
         } else {
-            vec![0..host.length]
+            std::iter::once(0..host.length).collect()
         };
         let Some(source) = host.source else { continue };
         let candidate = candidates
