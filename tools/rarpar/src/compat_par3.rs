@@ -1,18 +1,18 @@
-//! A par3cmdline-compatible front end over the par3-rs engine.
+//! A par3cmdline-compatible front end over the par3-rs engine, for the
+//! consumer side only: verify (`v`), repair (`r`) and list (`l`).
 //!
 //! Invoked as `par3` (a link or copy of the binary under that name), rarpar
-//! accepts par3cmdline's whole command line: every command and option is read
-//! the way par3cmdline reads it, with the same messages for malformed or
+//! reads par3cmdline's whole command line: every command and option is parsed
+//! the way par3cmdline parses it, with the same messages for malformed or
 //! conflicting options and the same exit codes. Invoked as `rarpar`, the facade
 //! claims a command line whose first word is a par3cmdline command and whose
 //! PAR file argument names a `.par3` file (or a `.zip`/`.7z` for the PAR-inside
 //! commands); everything else falls through to the other front ends.
 //!
-//! What the engine cannot do is refused with an explicit message and
-//! par3cmdline's invalid-command code, never ignored. Creation goes through
-//! the same planner as `rarpar par3 create`, which writes par3cmdline's bytes
-//! for the options it accepts, apart from the Creator packet: its text stays
-//! rarpar's own.
+//! Creation stays with rarpar's own `par3 create`: the create-side commands
+//! and the switches that only shape creation are refused with an explicit
+//! message and par3cmdline's invalid-command code, after par3cmdline's own
+//! argument checks, never ignored.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -20,11 +20,6 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use par3_rs::create::{CreateOptions, InputSpec, RecoveryAmount};
-use par3_rs::creation::{
-    CreationCodec, CreationDurability, CreationOptions, CreationPlan, CreationSource,
-    Deduplication, VolumeLayout,
-};
 use par3_rs::ingest::{IncrementalSet, IngestedPacket, PacketScanner, PayloadKind, ScanEvent};
 use par3_rs::layout::ExtentKind;
 use par3_rs::placement::{PlacementOptions, search_extent};
@@ -905,17 +900,24 @@ fn print_option_summary(invocation: &Invocation) {
 fn refuse_unsupported(invocation: &Invocation) -> Result<(), Failure> {
     let refuse = |message: &str| Err(Failure::new(RET_INVALID_COMMAND, message));
     let options = &invocation.options;
-    match invocation.operation {
-        Operation::Extend => {
-            return refuse(if invocation.trial {
-                "rarpar cannot extend a PAR3 set (te is not supported)."
-            } else {
-                "rarpar cannot extend a PAR3 set (e is not supported)."
-            });
+    // The facade decodes, verifies and repairs; creation stays with rarpar's
+    // own `par3 create`.
+    match (invocation.operation, invocation.trial) {
+        (Operation::Create, trial) => {
+            return refuse(&format!(
+                "rarpar does not create PAR3 files through the par3cmdline facade ({} is not supported); use `rarpar par3 create`.",
+                if trial { "tc" } else { "c" }
+            ));
         }
-        Operation::Insert | Operation::Delete => {
+        (Operation::Extend, trial) => {
+            return refuse(&format!(
+                "rarpar does not extend PAR3 files through the par3cmdline facade ({} is not supported); use `rarpar par3 create`.",
+                if trial { "te" } else { "e" }
+            ));
+        }
+        (Operation::Insert | Operation::Delete, _) => {
             return refuse(
-                "rarpar cannot insert PAR3 data into, or delete it from, a ZIP or 7z file (i, ti and d are not supported).",
+                "rarpar does not write PAR3 data into, or remove it from, a ZIP or 7z file (i, ti and d are not supported).",
             );
         }
         _ if invocation.self_target => {
@@ -925,31 +927,24 @@ fn refuse_unsupported(invocation: &Invocation) -> Result<(), Failure> {
         }
         _ => {}
     }
+    // par3cmdline accepts these with any command; they only shape creation.
     if options.file_system & 0x10007 != 0 {
-        return refuse("rarpar does not support UNIX or FAT Permissions Packets (-fu, -ff).");
+        return refuse(
+            "rarpar does not create PAR3 files through the par3cmdline facade, so -fu and -ff are not supported.",
+        );
     }
-    if invocation.operation == Operation::Create {
-        if options.absolute != 0 {
-            return refuse("rarpar cannot create a PAR3 set with absolute paths (-abs).");
-        }
-        if options.repetition_limit != 0 {
-            return refuse("rarpar cannot limit packet repetition (-lp).");
-        }
-        if options.file_scheme == -2 || options.file_scheme > 0 {
-            return refuse("rarpar cannot limit the size of recovery files (-l).");
-        }
-        if options.file_count != 0 && options.file_scheme != -1 {
-            return refuse("rarpar cannot set the number of recovery files without -u (-n).");
-        }
+    if options.absolute != 0 {
+        return refuse(
+            "rarpar does not create PAR3 files through the par3cmdline facade, so -abs is not supported.",
+        );
     }
     Ok(())
 }
 
 fn execute(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
     match invocation.operation {
-        Operation::Create => create(invocation, context),
         Operation::Verify | Operation::Repair | Operation::List => verify(invocation, context),
-        Operation::Extend | Operation::Insert | Operation::Delete => {
+        Operation::Create | Operation::Extend | Operation::Insert | Operation::Delete => {
             unreachable!("refused before execution")
         }
     }
@@ -1067,14 +1062,10 @@ fn join_name(directory: &str, name: &str) -> String {
     }
 }
 
-/// par3cmdline's `path_search`: files matching the pattern, and directories
-/// matching it as directory entries, recursing into them with `-R`.
-fn path_search(
-    base: &Path,
-    argument: &str,
-    recursive: bool,
-    list: &mut InputList,
-) -> Result<(), Failure> {
+/// par3cmdline's `path_search` for the extra names given to `v` and `r`:
+/// files matching the pattern, and directories matching it as directory
+/// entries.
+fn path_search(base: &Path, argument: &str, list: &mut InputList) -> Result<(), Failure> {
     let (directory, pattern) = split_search(base, argument)?;
     if !directory.is_empty() {
         // The directory of a nested name is itself an input directory.
@@ -1094,27 +1085,15 @@ fn path_search(
         let path = join_name(&directory, &name);
         if !is_dir {
             list.add_file(path);
-        } else if list.add_directory(path.clone()) && recursive {
-            recurse(base, &path, list).map_err(io)?;
-        }
-    }
-    Ok(())
-}
-
-fn recurse(base: &Path, directory: &str, list: &mut InputList) -> std::io::Result<()> {
-    for (name, is_dir) in visible_entries(&base.join(directory))? {
-        let path = join_name(directory, &name);
-        if !is_dir {
-            list.add_file(path);
-        } else if list.add_directory(path.clone()) {
-            recurse(base, &path, list)?;
+        } else {
+            list.add_directory(path);
         }
     }
     Ok(())
 }
 
 // ----------------------------------------------------------------------------
-// Create
+// Verify, repair and list
 
 fn engine_failure(error: impl Into<EngineError>, trailer: &str) -> Failure {
     let error = error.into();
@@ -1126,729 +1105,11 @@ fn engine_failure(error: impl Into<EngineError>, trailer: &str) -> Failure {
     Failure::new(code, format!("rarpar: {error}")).with_trailer(trailer)
 }
 
-fn par3_failure(error: Par3Error, trailer: &str) -> Failure {
-    engine_failure(EngineError::Format(error), trailer)
-}
-
-/// par3cmdline's recovery arithmetic (`calculate_recovery_count`), from the
-/// block count the planner settled on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Recovery {
-    /// 0 none, 1 Cauchy, 8 FFT.
-    ecc: u32,
-    count: u64,
-    first: u64,
-    max: u64,
-    cohorts: u64,
-}
-
-fn next_pow2(value: u64) -> u64 {
-    if value == 0 {
-        0
-    } else {
-        value.next_power_of_two()
-    }
-}
-
-fn roundup_log2(value: u64) -> u32 {
-    if value <= 1 {
-        0
-    } else {
-        64 - (value - 1).leading_zeros()
-    }
-}
-
-fn plan_recovery(
-    options: &Options,
-    blocks: u64,
-    lines: &mut Vec<String>,
-) -> Result<Recovery, Failure> {
-    let mut recovery = Recovery {
-        ecc: options.ecc,
-        count: options.recovery_count,
-        first: options.first_recovery,
-        max: options.max_recovery,
-        cohorts: 1,
-    };
-    if blocks == 0 {
-        return Ok(Recovery {
-            ecc: 0,
-            count: 0,
-            first: recovery.first,
-            max: 0,
-            cohorts: 1,
-        });
-    }
-    if recovery.ecc == 0 {
-        recovery.ecc = 1;
-    }
-    if recovery.count == 0 && options.redundancy == 0 {
-        return Ok(recovery);
-    }
-    if recovery.count == 0 && options.redundancy > 0 {
-        recovery.count = (blocks * u64::from(options.redundancy)).div_ceil(100);
-    }
-    if recovery.max == 0 && options.max_redundancy > 0 {
-        recovery.max = (blocks * u64::from(options.max_redundancy)).div_ceil(100);
-    }
-    let noise = options.noise;
-    let failed = |lines: &mut Vec<String>, message: String| {
-        lines.push(message);
-        let mut failure = Failure::new(RET_LOGIC_ERROR, "Failed to create PAR file");
-        let mut all = std::mem::take(lines);
-        all.append(&mut failure.lines);
-        failure.lines = all;
-        failure
-    };
-    if recovery.ecc & 1 != 0 {
-        if noise >= 0 {
-            lines.push("Cauchy Reed-Solomon Codes".into());
-        }
-        if recovery.max > 0 && recovery.max < recovery.count {
-            recovery.max = recovery.count;
-        }
-        let total = (blocks + recovery.first + recovery.count).max(blocks + recovery.max);
-        if total > 65536 {
-            return Err(failed(
-                lines,
-                format!("Total block count {total} are too many."),
-            ));
-        }
-        if noise >= 0 {
-            lines.push(format!("Recovery block count = {}", recovery.count));
-            if recovery.max > 0 {
-                lines.push(format!("Max recovery block count = {}", recovery.max));
-            }
-            lines.push(String::new());
-        }
-    } else if recovery.ecc & 8 != 0 {
-        if noise >= 0 {
-            lines.push("FFT based Reed-Solomon Codes".into());
-        }
-        let mut cohorts = u64::from(options.interleave) + 1;
-        if cohorts > blocks {
-            cohorts = blocks;
-            lines.push(format!("Number of cohort is decreased to {cohorts}."));
-        }
-        if cohorts == 1 {
-            let r0 = (recovery.first + recovery.count).max(recovery.max);
-            let total = blocks + r0;
-            if total > 65536 {
-                cohorts = total.div_ceil(65536);
-            }
-            loop {
-                let r1 = r0.div_ceil(cohorts);
-                let s1 = blocks.div_ceil(cohorts);
-                let m1 = next_pow2(r1);
-                let n1 = next_pow2(m1 + s1);
-                if n1 <= 65536 && r1 <= 32768 {
-                    break;
-                }
-                cohorts += 1;
-            }
-            if cohorts > 1 {
-                lines.push(format!("Number of cohort is increased to {cohorts}."));
-            }
-        }
-        if cohorts > 1 && noise >= 0 {
-            lines.push(format!(
-                "Number of cohort = {cohorts} (Interleaving time = {})",
-                cohorts - 1
-            ));
-            lines.push(format!(
-                "Input block count = {blocks} ({} per cohort)",
-                blocks.div_ceil(cohorts)
-            ));
-        }
-        let remainder = recovery.count % cohorts;
-        if remainder > 0 {
-            if noise >= 1 {
-                lines.push(format!(
-                    "Recovery block count is increased from {} to {}",
-                    recovery.count,
-                    recovery.count + cohorts - remainder
-                ));
-            }
-            recovery.count += cohorts - remainder;
-        }
-        if recovery.max > 0 {
-            if recovery.max < recovery.count {
-                recovery.max = recovery.count;
-            }
-            let remainder = recovery.max % cohorts;
-            if remainder > 0 {
-                recovery.max += cohorts - remainder;
-            }
-        }
-        let remainder = recovery.first % cohorts;
-        if remainder > 0 {
-            if noise >= 1 {
-                lines.push(format!(
-                    "First recovery block is decreased from {} to {}",
-                    recovery.first,
-                    recovery.first - remainder
-                ));
-            }
-            recovery.first -= remainder;
-        }
-        let r0 = (recovery.first + recovery.count).max(recovery.max);
-        let total = blocks + r0;
-        if total > 65536 * cohorts {
-            return Err(failed(
-                lines,
-                if cohorts == 1 {
-                    format!("Total block count {total} are too many.")
-                } else {
-                    format!(
-                        "Total block count {total} ({} per cohort) are too many.",
-                        total.div_ceil(cohorts)
-                    )
-                },
-            ));
-        }
-        let r1 = r0.div_ceil(cohorts);
-        let s1 = blocks.div_ceil(cohorts);
-        if r1 > 32768 || next_pow2(next_pow2(r1) + s1) > 65536 {
-            return Err(failed(
-                lines,
-                if cohorts == 1 {
-                    format!("Recovery block count {r0} are too many.")
-                } else {
-                    format!("Recovery block count {r0} ({r1} per cohort) are too many.")
-                },
-            ));
-        }
-        if noise >= 0 {
-            if cohorts == 1 {
-                lines.push(format!("Recovery block count = {}", recovery.count));
-            } else {
-                lines.push(format!(
-                    "Recovery block count = {} ({} per cohort)",
-                    recovery.count,
-                    recovery.count / cohorts
-                ));
-            }
-            if recovery.max > 0 {
-                if cohorts == 1 {
-                    lines.push(format!("Max recovery block count = {}", recovery.max));
-                } else {
-                    lines.push(format!(
-                        "Max recovery block count = {} ({} per cohort)",
-                        recovery.max,
-                        recovery.max / cohorts
-                    ));
-                }
-            }
-            lines.push(String::new());
-        }
-        recovery.cohorts = cohorts;
-    } else {
-        return Err(failed(
-            lines,
-            format!(
-                "The specified Error Correction Codes ({}) isn't implemented yet.",
-                recovery.ecc
-            ),
-        ));
-    }
-    Ok(recovery)
-}
-
-/// The FFT matrix's recorded capacity, as par3cmdline's `make_matrix_packet`
-/// stores it.
-fn fft_capacity_log2(recovery: &Recovery) -> i8 {
-    let max = recovery.max.max(recovery.first + recovery.count);
-    roundup_log2(max / recovery.cohorts) as i8
-}
-
-struct CreateInputs {
-    list: InputList,
-    sizes: BTreeMap<String, u64>,
-}
-
-fn create(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
-    let options = &invocation.options;
-    let noise = options.noise;
-    let base = &context.base;
-    let mut list = InputList::default();
-    let arguments = if invocation.files.is_empty() {
-        std::slice::from_ref(&invocation.par_argument)
-    } else {
-        &invocation.files[..]
-    };
-    for argument in arguments {
-        if argument.is_empty() {
-            continue;
-        }
-        path_search(base, argument, options.recursive, &mut list)
-            .map_err(|failure| failure.with_trailer(format!("Failed to search: {argument}")))?;
-    }
-    if list.files.is_empty() && list.directories.is_empty() {
-        return Err(Failure::new(
-            RET_INVALID_COMMAND,
-            "You must specify a list of files when creating.",
-        ));
-    }
-    if noise >= 0 {
-        println!(
-            "Number of input file = {}, directory = {}",
-            list.files.len(),
-            list.directories.len()
-        );
-    }
-    let mut sizes = BTreeMap::new();
-    for name in &list.files {
-        let size = std::fs::metadata(base.join(name))
-            .map_err(|_| {
-                Failure::new(
-                    RET_FILE_IO_ERROR,
-                    format!("Failed to get status information of \"{name}\""),
-                )
-                .with_trailer("Failed to check file status")
-            })?
-            .len();
-        sizes.insert(name.clone(), size);
-    }
-    let total: u64 = sizes.values().sum();
-    let largest = sizes.values().copied().max().unwrap_or(0);
-    if noise >= 0 {
-        println!("Total file size = {total}");
-        println!("Max file size = {largest}");
-    }
-    let mut block_size = options.block_size;
-    let mut suggested = false;
-    if options.block_count > 0 {
-        block_size = total.div_ceil(options.block_count);
-        if block_size & 1 != 0 {
-            block_size += 1;
-        }
-        suggested = true;
-    } else if block_size == 0 {
-        block_size = par3_rs::create::suggest_block_size(sizes.values().copied());
-        suggested = true;
-    } else if block_size & 1 != 0 {
-        block_size += 1;
-        suggested = true;
-    }
-    if block_size == 0 {
-        // Every input is empty: par3cmdline divides zero bytes into blocks of
-        // zero; the engine needs a positive size, and no block is ever cut.
-        block_size = 2;
-    }
-    if suggested && noise >= 0 {
-        println!("Suggested block size = {block_size}");
-    }
-    let possible: u64 = sizes
-        .values()
-        .map(|size| size / block_size + u64::from(size % block_size >= 40))
-        .sum();
-    if noise >= 0 {
-        println!("Possible block count = {possible}");
-        println!();
-    }
-    let inputs = CreateInputs { list, sizes };
-    create_set(invocation, context, &inputs, block_size, possible)
-}
-
-fn creation_access(
-    base: &Path,
-    files: &[String],
-    execution: &ExecutionOptions,
-) -> (Arc<dyn SourceAccess>, Vec<CreationSource>) {
-    let mut disk = DiskSourceAccess::with_options(execution.clone());
-    let mut sources = Vec::new();
-    for (index, name) in files.iter().enumerate() {
-        disk.insert(SourceId(index as u64), base.join(name));
-        sources.push(CreationSource {
-            name: name.clone(),
-            source: SourceId(index as u64),
-        });
-    }
-    (Arc::new(disk), sources)
-}
-
-/// Directories listed for protection that no protected file lies under.
-fn empty_directories(list: &InputList) -> Vec<String> {
-    list.directories
-        .iter()
-        .filter(|directory| {
-            let prefix = format!("{directory}/");
-            !list.files.iter().any(|file| file.starts_with(&prefix))
-        })
-        .cloned()
-        .collect()
-}
-
-fn create_set(
-    invocation: &Invocation,
-    context: &Context,
-    inputs: &CreateInputs,
-    block_size: u64,
-    possible: u64,
-) -> Result<(), Failure> {
-    let options = &invocation.options;
-    let noise = options.noise;
-    let fail_create = |failure: Failure| failure.with_trailer("Failed to create PAR file");
-    let (access, sources) = creation_access(&context.base, &inputs.list.files, &context.execution);
-    let deduplication = match options.dedup {
-        b'1' => Deduplication::Aligned,
-        b'2' => Deduplication::Sliding,
-        _ => Deduplication::None,
-    };
-    let mut config = CreationOptions {
-        execution: context.execution.clone(),
-        block_size,
-        codec: CreationCodec::Cauchy,
-        first_recovery: 0,
-        recovery_count: 0,
-        deduplication,
-        store_data: options.data_packets,
-        volumes: VolumeLayout::Variable,
-        ..CreationOptions::default()
-    };
-    // The first plan settles the block count every recovery rule works from.
-    let probe = CreationPlan::build(access.clone(), &sources, config.clone())
-        .map_err(|error| engine_failure(error, "Failed to create PAR file"))?;
-    let blocks = probe.requirements().blocks;
-    drop(probe);
-    if noise >= 0 {
-        if deduplication == Deduplication::None {
-            // Without deduplication every block past the full ones holds
-            // tails, so the tails that share one are what was packed.
-            println!(
-                "Actual block count = {blocks}, Tail packing = {}",
-                possible.saturating_sub(blocks)
-            );
-        } else {
-            println!("Actual block count = {blocks}");
-        }
-    }
-    let mut lines = Vec::new();
-    let recovery = plan_recovery(options, blocks, &mut lines);
-    for line in &lines {
-        println!("{line}");
-    }
-    let recovery = recovery?;
-    if !matches!(recovery.ecc, 0 | 1 | 8) {
-        // Only reachable without recovery blocks: par3cmdline then records
-        // an empty field for the unimplemented code, which the engine does
-        // not write.
-        return Err(Failure::new(
-            RET_INVALID_COMMAND,
-            format!(
-                "rarpar cannot write a set for Error Correction Codes ({}); use -e1 or -e8.",
-                recovery.ecc
-            ),
-        ));
-    }
-    if recovery.ecc == 1 && recovery.max > 0 {
-        return Err(Failure::new(
-            RET_INVALID_COMMAND,
-            "rarpar cannot record a maximum recovery block count for Cauchy Reed-Solomon Codes (-cm, -rm).",
-        ));
-    }
-    let rows = recovery.count / recovery.cohorts;
-    config.volumes = match (options.file_scheme, options.file_count) {
-        (-1, 0) if rows > 0 => VolumeLayout::Uniform(rows),
-        (-1, files) if files > 0 && rows > 0 => {
-            if rows % u64::from(files) != 0 {
-                return Err(Failure::new(
-                    RET_INVALID_COMMAND,
-                    format!(
-                        "rarpar cannot spread {rows} recovery rows unevenly over {files} uniform files (-u -n{files}); choose a count that divides evenly."
-                    ),
-                ));
-            }
-            VolumeLayout::Uniform(rows / u64::from(files))
-        }
-        _ => VolumeLayout::Variable,
-    };
-    if options.data_packets && options.file_scheme == -1 {
-        return Err(Failure::new(
-            RET_INVALID_COMMAND,
-            "rarpar cannot combine uniform recovery files with Data packets (-u -D).",
-        ));
-    }
-    config.first_recovery = recovery.first;
-    config.recovery_count = recovery.count;
-    if recovery.ecc == 8 {
-        config.codec = CreationCodec::Fft {
-            capacity_log2: fft_capacity_log2(&recovery),
-            interleave: recovery.cohorts - 1,
-        };
-    }
-
-    let empty = empty_directories(&inputs.list);
-    let cauchy_gf16_rule =
-        recovery.ecc != 8 && blocks > 128 && blocks + recovery.first + recovery.count <= 256;
-    // The convenience writer adds what the streaming planner cannot write:
-    // Comment packets, empty directories, and par3cmdline's 16-bit field for
-    // 129 to 256 blocks. It writes plain Cauchy sets only.
-    let simple = recovery.ecc != 8
-        && options.dedup <= b'0'
-        && !options.data_packets
-        && recovery.first == 0
-        && matches!(config.volumes, VolumeLayout::Variable);
-    let needs_simple = options.comment.is_some() || !empty.is_empty() || cauchy_gf16_rule;
-    if needs_simple && !simple {
-        if options.comment.is_some() {
-            return Err(Failure::new(
-                RET_INVALID_COMMAND,
-                "rarpar can write a comment (-C) only for a plain Cauchy set: not with -D, -d1, -d2, -e8, -cf or -u.",
-            ));
-        }
-        if !empty.is_empty() {
-            return Err(Failure::new(
-                RET_INVALID_COMMAND,
-                format!(
-                    "rarpar can protect an empty directory (\"{}\") only in a plain Cauchy set: not with -D, -d1, -d2, -e8, -cf or -u.",
-                    empty[0]
-                ),
-            ));
-        }
-    }
-
-    let stem_path = context.par_path.with_extension("");
-    let stem_path = if context
-        .par_path
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("par3"))
-    {
-        stem_path
-    } else {
-        context.par_path.clone()
-    };
-    if needs_simple && simple {
-        return create_simple(
-            invocation,
-            context,
-            inputs,
-            block_size,
-            recovery.count,
-            &empty,
-            &stem_path,
-        )
-        .map_err(fail_create);
-    }
-
-    let plan = CreationPlan::build(access, &sources, config)
-        .map_err(|error| engine_failure(error, "Failed to create PAR file"))?;
-    let outputs: Vec<PathBuf> = plan.output_paths(&stem_path).collect();
-    let sizes = plan.requirements().output_sizes.clone();
-    if invocation.trial {
-        let source_bytes = plan.requirements().source_bytes;
-        let blocks = plan.requirements().blocks;
-        print_trial(
-            options,
-            &outputs,
-            &sizes,
-            source_bytes,
-            blocks,
-            block_size,
-            recovery.count,
-        );
-        return Ok(());
-    }
-    check_outputs(&context.base, &inputs.list.files, &outputs).map_err(fail_create)?;
-    let directory = outputs[0]
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let stage = tempfile::tempdir_in(&directory).map_err(|error| {
-        fail_create(Failure::new(RET_FILE_IO_ERROR, format!("rarpar: {error}")))
-    })?;
-    let stage_stem = stage.path().join(stem_path.file_name().unwrap_or_default());
-    let staged = plan
-        .execute_with_durability(&stage_stem, stage.path(), CreationDurability::SyncFiles)
-        .map_err(|error| engine_failure(error, "Failed to create PAR file"))?;
-    for (source, destination) in staged.iter().zip(&outputs) {
-        std::fs::rename(source, destination).map_err(|error| {
-            fail_create(Failure::new(
-                RET_FILE_IO_ERROR,
-                format!("rarpar: {}: {error}", destination.display()),
-            ))
-        })?;
-    }
-    print_written(noise, &outputs);
-    if noise >= -1 {
-        println!("Done");
-    }
-    Ok(())
-}
-
-/// Refuse to write a PAR file over a directory or over one of the inputs.
-fn check_outputs(base: &Path, files: &[String], outputs: &[PathBuf]) -> Result<(), Failure> {
-    let inputs: BTreeSet<PathBuf> = files
-        .iter()
-        .filter_map(|name| base.join(name).canonicalize().ok())
-        .collect();
-    for output in outputs {
-        if let Ok(meta) = std::fs::symlink_metadata(output) {
-            let aliases = output
-                .canonicalize()
-                .is_ok_and(|path| inputs.contains(&path));
-            if !meta.is_file() || aliases {
-                return Err(Failure::new(
-                    RET_FILE_IO_ERROR,
-                    format!(
-                        "rarpar will not write a PAR file over an input file or a non-file: {}",
-                        output.display()
-                    ),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
-
-fn print_written(noise: i32, outputs: &[PathBuf]) {
-    if noise < -1 {
-        return;
-    }
-    // par3cmdline writes the index file, then the archive files, then the
-    // recovery files.
-    let (index, rest) = outputs.split_first().expect("an index file");
-    println!("Wrote index file, {}", file_name(index));
-    for path in rest.iter().filter(|path| file_name(path).contains(".part")) {
-        println!("Wrote archive file, {}", file_name(path));
-    }
-    for path in rest
-        .iter()
-        .filter(|path| !file_name(path).contains(".part"))
-    {
-        println!("Wrote recovery file, {}", file_name(path));
-    }
-}
-
-fn percent_tenths(rate: f64) -> String {
-    let value = (rate * 1000.0) as i64;
-    format!("{}.{}%", value / 10, value % 10)
-}
-
-fn print_trial(
-    options: &Options,
-    outputs: &[PathBuf],
-    sizes: &[u64],
-    source_bytes: u64,
-    blocks: u64,
-    block_size: u64,
-    recovery_count: u64,
-) {
-    if options.noise < -1 {
-        return;
-    }
-    let pairs: Vec<_> = outputs.iter().zip(sizes).collect();
-    let (index, rest) = pairs.split_first().expect("an index file");
-    println!("Size of index file = {}, {}", index.1, file_name(index.0));
-    for (path, size) in rest
-        .iter()
-        .filter(|(path, _)| file_name(path).contains(".part"))
-    {
-        println!("Size of archive file = {size}, {}", file_name(path));
-    }
-    for (path, size) in rest
-        .iter()
-        .filter(|(path, _)| !file_name(path).contains(".part"))
-    {
-        println!("Size of recovery file = {size}, {}", file_name(path));
-    }
-    let total: u64 = sizes.iter().sum();
-    println!();
-    println!("Total size of PAR files = {total}");
-    let (rate1, rate2) = if blocks == 0 || total == 0 {
-        (0.0, 0.0)
-    } else {
-        let data = source_bytes.min(blocks * block_size);
-        let rate1 = data as f64 / (block_size * blocks) as f64;
-        let recovery = (block_size * recovery_count) as f64;
-        let rate2 = if options.data_packets {
-            (data as f64 + recovery) / total as f64
-        } else {
-            recovery / total as f64
-        };
-        (rate1, rate2)
-    };
-    println!("File data in Source blocks = {}", percent_tenths(rate1));
-    println!("Recovery data in PAR files = {}", percent_tenths(rate2));
-    println!(
-        "Efficiency of PAR files    = {}",
-        percent_tenths(rate1 * rate2)
-    );
-    println!("Done");
-}
-
-fn create_simple(
-    invocation: &Invocation,
-    context: &Context,
-    inputs: &CreateInputs,
-    block_size: u64,
-    recovery_count: u64,
-    empty: &[String],
-    stem: &Path,
-) -> Result<(), Failure> {
-    let options = &invocation.options;
-    let files: Vec<PathBuf> = inputs.list.files.iter().map(PathBuf::from).collect();
-    let directories: Vec<PathBuf> = empty.iter().map(PathBuf::from).collect();
-    let spec = InputSpec::new(&context.base, &files).with_directories(&directories);
-    let mut create_options = CreateOptions::default()
-        .with_block_size(block_size)
-        .with_recovery(RecoveryAmount::Blocks(recovery_count))
-        .with_overwrite(true);
-    if let Some(comment) = &options.comment {
-        create_options = create_options.with_comment(comment.clone());
-    }
-    let into = |error: Par3Error| {
-        let failure = par3_failure(error, "");
-        Failure {
-            code: failure.code,
-            lines: failure.lines[..1].to_vec(),
-            stderr: Vec::new(),
-        }
-    };
-    if invocation.trial {
-        let directory = stem.parent().unwrap_or(Path::new("."));
-        let stage = tempfile::tempdir_in(directory)
-            .map_err(|error| Failure::new(RET_FILE_IO_ERROR, format!("rarpar: {error}")))?;
-        let staged_stem = stage.path().join(stem.file_name().unwrap_or_default());
-        let report = par3_rs::create::create(&spec, &staged_stem, &create_options).map_err(into)?;
-        let mut outputs = Vec::new();
-        let mut sizes = Vec::new();
-        for path in &report.files_written {
-            sizes.push(std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0));
-            outputs.push(stem.with_file_name(file_name(path)));
-        }
-        let source_bytes = inputs.sizes.values().sum();
-        print_trial(
-            options,
-            &outputs,
-            &sizes,
-            source_bytes,
-            report.block_count,
-            block_size,
-            report.recovery_count,
-        );
-        return Ok(());
-    }
-    // The writer is told to overwrite, as par3cmdline does; first make sure
-    // the index file it writes is not one of the inputs or a directory.
-    let index = PathBuf::from(format!("{}.par3", stem.display()));
-    check_outputs(&context.base, &inputs.list.files, &[index])?;
-    let report = par3_rs::create::create(&spec, stem, &create_options).map_err(into)?;
-    print_written(options.noise, &report.files_written);
-    if options.noise >= -1 {
-        println!("Done");
-    }
-    Ok(())
-}
-
-// ----------------------------------------------------------------------------
-// Verify, repair and list
 
 struct Loaded {
     /// Packets of every carrier, in load order, grouped by set.
@@ -1921,6 +1182,7 @@ fn load_carriers(
     carriers: &[(PathBuf, String)],
     execution: &ExecutionOptions,
     noise: i32,
+    trailer: &str,
 ) -> Result<Loaded, Failure> {
     let mut options = execution.clone();
     options.open_handles = options.open_handles.saturating_add(carriers.len());
@@ -1945,6 +1207,11 @@ fn load_carriers(
         );
         let mut scanner = match scanner {
             Ok(scanner) => scanner,
+            // A memory limit too small to read a packet stops the run, as
+            // par3cmdline's does; any other failure skips the file.
+            Err(error @ EngineError::ResourceLimit(_)) => {
+                return Err(engine_failure(error, trailer));
+            }
             Err(_) => {
                 println!("Failed to open \"{shown}\", skip to next file.");
                 continue;
@@ -1963,6 +1230,9 @@ fn load_carriers(
                     sets.entry(id).or_default().push(packet);
                 }
                 Ok(ScanEvent::End) => break,
+                Err(error @ EngineError::ResourceLimit(_)) => {
+                    return Err(engine_failure(error, trailer));
+                }
                 Ok(ScanEvent::NeedData { .. }) | Err(_) => {
                     println!("Failed to read \"{shown}\", skip to next file.");
                     break;
@@ -2247,7 +1517,7 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
             if argument.is_empty() {
                 continue;
             }
-            path_search(&context.base, argument, false, &mut extra)
+            path_search(&context.base, argument, &mut extra)
                 .map_err(|failure| failure.with_trailer(format!("Failed to search: {argument}")))?;
         }
     }
@@ -2263,7 +1533,7 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
         return Err(Failure::new(RET_FILE_IO_ERROR, "PAR file is not found")
             .with_trailer("Failed to search PAR files"));
     }
-    let loaded = load_carriers(&carriers, &context.execution, noise)?;
+    let loaded = load_carriers(&carriers, &context.execution, noise, trailer)?;
     let Some(id) = loaded.selected else {
         return Err(
             Failure::new(RET_INSUFFICIENT_DATA, "Failed to find PAR3 Start Packet")
@@ -3015,45 +2285,5 @@ mod tests {
         assert!(!wildcard_match(b"*.txt", b"alpha.bin"));
         assert!(wildcard_match(b"alpha.bin", b"alpha.bin"));
         assert!(!wildcard_match(b"alpha", b"alpha.bin"));
-    }
-
-    #[test]
-    fn recovery_counts_follow_par3cmdline_arithmetic() {
-        let mut lines = Vec::new();
-        let options = Options {
-            redundancy: 10,
-            ..Options::default()
-        };
-        let recovery = plan_recovery(&options, 95, &mut lines).unwrap();
-        assert_eq!((recovery.ecc, recovery.count), (1, 10));
-        let options = Options {
-            ecc: 8,
-            interleave: 1,
-            recovery_count: 3,
-            first_recovery: 3,
-            ..Options::default()
-        };
-        let recovery = plan_recovery(&options, 10, &mut lines).unwrap();
-        assert_eq!(
-            (recovery.cohorts, recovery.count, recovery.first),
-            (2, 4, 2)
-        );
-        assert_eq!(fft_capacity_log2(&recovery), 2);
-        let options = Options {
-            ecc: 2,
-            recovery_count: 1,
-            ..Options::default()
-        };
-        let failure = plan_recovery(&options, 10, &mut lines).unwrap_err();
-        assert_eq!(failure.code, RET_LOGIC_ERROR);
-        assert!(failure.lines.contains(
-            &"The specified Error Correction Codes (2) isn't implemented yet.".to_owned()
-        ));
-        // No recovery asked for: no codec is checked at all.
-        let options = Options {
-            ecc: 2,
-            ..Options::default()
-        };
-        assert_eq!(plan_recovery(&options, 10, &mut lines).unwrap().count, 0);
     }
 }

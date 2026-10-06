@@ -281,11 +281,21 @@ fn emit_command_outcome(
     Ok(())
 }
 
+/// par2cmdline's exit code for a command line it rejects.
+const PAR2CMDLINE_INVALID_COMMAND_LINE: u8 = 3;
+
 /// Accept a `par2 r [options] PARFILE WILDCARD` invocation directly.
 ///
-/// This is deliberately limited to repair mode; Rarpar's documented `par`
-/// subcommands remain the general-purpose interface.
+/// The facade is consumer-side only and deliberately limited to repair mode:
+/// creation stays with `rarpar par create`, and Rarpar's documented `par`
+/// subcommands remain the general-purpose interface. A par2cmdline `c` or `v`
+/// command line naming a `.par2` file, and a create-only switch given to `r`,
+/// are refused with par2cmdline's invalid-command-line code.
 pub fn dispatch_par2cmdline_compat(args: &[OsString]) -> Option<u8> {
+    if let Some(message) = refused_par2cmdline_invocation(args) {
+        eprintln!("{message}");
+        return Some(PAR2CMDLINE_INVALID_COMMAND_LINE);
+    }
     let input = parse_par2cmdline_repair_input(args)?;
     let resolved = match resolve_compat_input(&input.par2_path, input.base_dir, input.wildcard) {
         Ok(resolved) => resolved,
@@ -311,6 +321,60 @@ pub fn dispatch_par2cmdline_compat(args: &[OsString]) -> Option<u8> {
             Some(error.exit_code())
         }
     }
+}
+
+/// The refusal message for a par2cmdline command line the facade claims but
+/// does not run, or `None` to let the command line through.
+fn refused_par2cmdline_invocation(args: &[OsString]) -> Option<String> {
+    let command = args.first()?.to_str()?.to_ascii_lowercase();
+    let names_par2 = || {
+        args[1..].iter().any(|arg| {
+            Path::new(arg)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("par2"))
+        })
+    };
+    match command.as_str() {
+        "c" | "create" if names_par2() => {
+            return Some(format!(
+                "rarpar does not create PAR2 files through the par2cmdline facade ({command} is not supported); use `rarpar par create`."
+            ));
+        }
+        "v" | "verify" if names_par2() => {
+            return Some(format!(
+                "rarpar does not verify through the par2cmdline facade ({command} is not supported); use `rarpar par verify`."
+            ));
+        }
+        "r" if names_par2() => {}
+        _ => return None,
+    }
+    // par2cmdline reads options up to the first argument that is not one,
+    // and rejects the create-only switches when it is not creating.
+    let mut options = args[1..].iter().map(|arg| arg.to_string_lossy());
+    while let Some(option) = options.next() {
+        let Some(switch) = option.strip_prefix('-') else {
+            break;
+        };
+        let message = match switch.chars().next() {
+            Some('b') => "Cannot specify block count unless creating.",
+            Some('s') => "Cannot specify block size unless creating.",
+            Some('r') => "Cannot specify redundancy unless creating.",
+            Some('c') => "Cannot specify recovery block count unless creating.",
+            Some('f') => "Cannot specify first block number unless creating.",
+            Some('u') => "Cannot specify uniform files unless creating.",
+            Some('l') => "Cannot specify limit files unless creating.",
+            Some('n') => "Cannot specify recovery file count unless creating.",
+            Some('R') => "Cannot specific Recursive unless creating.",
+            Some('-') if switch == "-" => break,
+            Some('B' | 'a') if switch.len() == 1 => {
+                options.next();
+                continue;
+            }
+            _ => continue,
+        };
+        return Some(message.to_owned());
+    }
+    None
 }
 
 struct Par2cmdlineRepairInput {
@@ -948,4 +1012,66 @@ fn is_ext(path: &Path, expected: &str) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case(expected))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refused(args: &[&str]) -> Option<String> {
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        refused_par2cmdline_invocation(&args)
+    }
+
+    #[test]
+    fn par2cmdline_facade_refuses_the_create_side() {
+        assert!(
+            refused(&["c", "set.par2", "a"])
+                .unwrap()
+                .contains("(c is not supported)")
+        );
+        assert!(
+            refused(&["create", "-r10", "set.par2", "a"])
+                .unwrap()
+                .contains("(create is not supported)")
+        );
+        assert!(
+            refused(&["v", "set.par2"])
+                .unwrap()
+                .contains("(v is not supported)")
+        );
+        assert!(
+            refused(&["verify", "set.par2"])
+                .unwrap()
+                .contains("(verify is not supported)")
+        );
+        assert_eq!(
+            refused(&["r", "-q", "-s100", "set.par2"]).as_deref(),
+            Some("Cannot specify block size unless creating.")
+        );
+        assert_eq!(
+            refused(&["r", "-B", "-r", "-n2", "set.par2"]).as_deref(),
+            Some("Cannot specify recovery file count unless creating."),
+            "a bare -B takes the next argument as its path"
+        );
+    }
+
+    #[test]
+    fn par2cmdline_facade_keeps_the_repair_options() {
+        for args in [
+            &["r", "set.par2"][..],
+            &[
+                "r", "-N", "-p", "-q", "-m512", "-t4", "-B", "base", "set.par2", "*",
+            ],
+            &["r", "-v", "-v", "set.par2"],
+            // Options end at the first non-option, and at `--`.
+            &["r", "set.par2", "-s100"],
+            &["r", "--", "-s100", "set.par2"],
+        ] {
+            assert_eq!(refused(args), None, "{args:?}");
+        }
+        // Without a PAR2 argument the command line is not par2cmdline's.
+        assert_eq!(refused(&["c", "archive.rar", "file"]), None);
+        assert_eq!(refused(&["v", "archive.rar"]), None);
+    }
 }
