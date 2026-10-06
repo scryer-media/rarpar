@@ -1,5 +1,7 @@
 //! Explicit advanced creation plans over stable source identities.
 
+mod fused;
+
 use crate::runtime::{EngineFile as File, MemoryCategory, OpenBudgeted};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::OpenOptions;
@@ -206,6 +208,12 @@ pub struct CreationRequirements {
 }
 
 /// A plan retains metadata and source slices, never complete source blocks.
+///
+/// Without deduplication, a Cauchy plan of at least 8 MiB of sources whose
+/// recovery rows fit the budget resident beside a worker pool also encodes
+/// those rows while it reads the sources for its hashes. It then holds the
+/// rows, charged to the budget, until `execute` writes them, and the encode
+/// reads no source a second time.
 pub struct CreationPlan {
     access: Arc<dyn SourceAccess>,
     options: CreationOptions,
@@ -227,6 +235,9 @@ pub struct CreationPlan {
     /// An embedded carrier keeps the single copy its container layout sized.
     repeat_metadata: bool,
     requirements: CreationRequirements,
+    /// Recovery rows the plan already encoded while it read the sources,
+    /// held resident and charged to the budget until `execute` takes them.
+    encoded: std::sync::Mutex<Option<RecoverySpool>>,
     _reservation: Reservation,
 }
 
@@ -324,6 +335,45 @@ impl CreationPlan {
             .execution
             .memory
             .reserve_as(MemoryCategory::Caches, estimate)?;
+        let mut order: Vec<usize> = (0..sources.len()).collect();
+        if reference_order {
+            let block_size = options.block_size;
+            order.sort_by(|&left, &right| {
+                let (one, other) = (snapshots[left].len, snapshots[right].len);
+                (other % block_size)
+                    .cmp(&(one % block_size))
+                    .then_with(|| other.cmp(&one))
+                    .then_with(|| {
+                        sources[left]
+                            .name
+                            .as_bytes()
+                            .cmp(sources[right].name.as_bytes())
+                    })
+            });
+        }
+        // Without deduplication the layout needs no hash, so a large enough
+        // Cauchy set whose rows fit resident is hashed and encoded from one
+        // read of each source; `execute` then writes the rows it holds.
+        let (options, reservation) = if options.deduplication == Deduplication::None
+            && options.codec == CreationCodec::Cauchy
+            && options.recovery_count != 0
+            && source_bytes >= crate::hash::PARALLEL_SOURCE_BYTES
+        {
+            match Self::build_fused(
+                access.clone(),
+                sources,
+                &order,
+                &snapshots,
+                options,
+                source_bytes,
+                reservation,
+            )? {
+                Ok(plan) => return Ok(plan),
+                Err(declined) => (declined.options, declined.reservation),
+            }
+        } else {
+            (options, reservation)
+        };
         let stripe = options.execution.stripe_bytes.min(64 << 10);
         let _scratch = options
             .execution
@@ -385,22 +435,6 @@ impl CreationPlan {
         };
         let mut reused = 0;
         let mut names = BTreeMap::new();
-        let mut order: Vec<usize> = (0..sources.len()).collect();
-        if reference_order {
-            let block_size = options.block_size;
-            order.sort_by(|&left, &right| {
-                let (one, other) = (snapshots[left].len, snapshots[right].len);
-                (other % block_size)
-                    .cmp(&(one % block_size))
-                    .then_with(|| other.cmp(&one))
-                    .then_with(|| {
-                        sources[left]
-                            .name
-                            .as_bytes()
-                            .cmp(sources[right].name.as_bytes())
-                    })
-            });
-        }
         for (source, snapshot) in order
             .into_iter()
             .map(|index| (&sources[index], snapshots[index]))
@@ -552,6 +586,31 @@ impl CreationPlan {
                 },
             });
         }
+        Self::finish(
+            access,
+            options,
+            files,
+            blocks,
+            reused,
+            source_bytes,
+            &names,
+            reservation,
+        )
+    }
+
+    /// Everything planning derives once the walk has laid out and hashed the
+    /// files: the field, the requirements, the metadata and the volumes.
+    #[allow(clippy::too_many_arguments)]
+    fn finish(
+        access: Arc<dyn SourceAccess>,
+        options: CreationOptions,
+        files: Vec<PlannedFile>,
+        blocks: Vec<Block>,
+        reused: u64,
+        source_bytes: u64,
+        names: &BTreeMap<String, ()>,
+        reservation: Reservation,
+    ) -> EngineResult<Self> {
         for file in &files {
             let mut ancestor = parent(&file.name);
             while !ancestor.is_empty() {
@@ -576,30 +635,7 @@ impl CreationPlan {
                 "creation recovery range overflow",
             ))?;
         let field = match options.codec {
-            CreationCodec::Cauchy => {
-                let total = (blocks.len() as u64)
-                    .checked_add(last)
-                    .ok_or(EngineError::InvalidState("Cauchy geometry overflow"))?;
-                if total > 65536 {
-                    return Err(EngineError::Unsupported("Cauchy geometry exceeds field"));
-                }
-                if blocks.is_empty() {
-                    GaloisField {
-                        size: 0,
-                        generator: 0,
-                    }
-                } else if total <= 256 {
-                    GaloisField {
-                        size: 1,
-                        generator: 0x1d,
-                    }
-                } else {
-                    GaloisField {
-                        size: 2,
-                        generator: 0x100b,
-                    }
-                }
-            }
+            CreationCodec::Cauchy => cauchy_field(blocks.len() as u64, last)?,
             CreationCodec::Fft { capacity_log2, .. } => {
                 let geometry =
                     FftGeometry::new((blocks.len() as u64).div_ceil(cohorts), capacity_log2)?;
@@ -681,6 +717,7 @@ impl CreationPlan {
             data_volumes: Vec::new(),
             repeat_metadata: true,
             requirements,
+            encoded: std::sync::Mutex::new(None),
             _reservation: reservation,
         };
         plan.build_metadata()?;
@@ -981,6 +1018,16 @@ impl CreationPlan {
     /// Encode the recovery rows into a spool: resident when they fit the
     /// budget, otherwise a scratch file in `scratch_directory`.
     fn encode(&self, scratch_directory: &Path) -> EngineResult<RecoverySpool> {
+        // Rows encoded while planning read the sources are used once; a
+        // second execution encodes again.
+        if let Some(spool) = self
+            .encoded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            return Ok(spool);
+        }
         Ok(match self.options.codec {
             _ if self.options.recovery_count == 0 => RecoverySpool::Memory {
                 rows: Vec::new(),
@@ -1978,6 +2025,34 @@ impl TailSlots {
 
 /// A Directory or Root packet's children, in the order the reference writes
 /// them.
+/// The field a Cauchy set of `blocks` input blocks and recovery indices below
+/// `last` is stored in: none without blocks, GF(2^8) while every index fits
+/// it, GF(2^16) beyond that.
+fn cauchy_field(blocks: u64, last: u64) -> EngineResult<GaloisField> {
+    let total = blocks
+        .checked_add(last)
+        .ok_or(EngineError::InvalidState("Cauchy geometry overflow"))?;
+    if total > 65536 {
+        return Err(EngineError::Unsupported("Cauchy geometry exceeds field"));
+    }
+    Ok(if blocks == 0 {
+        GaloisField {
+            size: 0,
+            generator: 0,
+        }
+    } else if total <= 256 {
+        GaloisField {
+            size: 1,
+            generator: 0x1d,
+        }
+    } else {
+        GaloisField {
+            size: 2,
+            generator: 0x100b,
+        }
+    })
+}
+
 fn sorted_children(children: Option<Vec<Fingerprint>>) -> Vec<Fingerprint> {
     let mut children = children.unwrap_or_default();
     crate::create::sort_children(&mut children);

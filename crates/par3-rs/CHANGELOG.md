@@ -368,6 +368,22 @@
 - On x86_64 hosts with GFNI, the FFT codec's byte maps run as affine
   transforms and the formal derivative as one AVX2 pass (`reedsolomon-rs`
   0.4.8); carriers and repaired bytes are identical.
+- Without deduplication, a Cauchy `CreationPlan` of at least 8 MiB with a
+  worker pool reads each source once. Since no block placement depends on a
+  hash, it lays the blocks out from the source sizes, then takes the planning
+  hashes and folds 16 blocks at a time into the resident recovery rows from
+  the same read; `execute` writes the rows without reading the sources again.
+  The plan holds the rows, charged to the budget, from `build` to `execute`,
+  so a plan built only for its InputSetID now pays for the encode. One
+  worker, spooled rows, FFT sets and deduplicating plans keep the serial walk,
+  which stages a stripe of every row in cache and is faster on one thread.
+  Carriers are byte-identical. Apple M5 Max, eight workers, 1 GiB in 1 MiB
+  blocks with 100 recovery rows: source reads 2 GiB in 32,768 calls → 1 GiB
+  in 1,024, wall 1.46 → 1.41 s, CPU 7.59 → 8.31 s, peak RSS 113 → 136 MiB;
+  ten 30 MiB files in 1,000,000-byte blocks with 30 rows: reads 600 MiB in
+  10,065 calls → 300 MiB in 320, file opens 182 → 22, wall 0.32 → 0.19 s,
+  CPU 1.00 → 0.73 s. Reads, opens and snapshot checks fall by the same
+  counts on x86_64.
 
 ## 0.4.4
 

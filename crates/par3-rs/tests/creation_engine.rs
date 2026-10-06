@@ -1923,3 +1923,156 @@ fn reference_interleaved_data_volumes_differ_only_as_recorded() {
         }
     }
 }
+
+/// Sources that make a fused plan: past the planning pool's threshold, with
+/// tails that pack at odd and even offsets, inline tails, a file of whole
+/// blocks and empty files.
+fn fused_inputs(block: u64) -> Vec<(&'static str, u64)> {
+    vec![
+        ("m/a.bin", (4 << 20) + 701),
+        ("b.bin", 501),
+        ("c.bin", (3 << 20) + 300),
+        ("d.bin", 201),
+        ("e.bin", 41),
+        ("f.bin", 12 * block),
+        ("h.bin", (1 << 20) + 1203),
+        ("g.bin", 10),
+        ("x/e.bin", 0),
+        ("y/e.bin", 0),
+    ]
+}
+
+/// Without deduplication a plan of 8 MiB or more with a worker pool takes
+/// the planning hashes and the Cauchy rows from one read of every source. Its carriers are the
+/// ones the same plan writes when the budget leaves no room to fuse and the
+/// encode reads the sources a second time, and for a GF(2^16) set the ones
+/// `create` writes. (`create` writes every Cauchy set in GF(2^16); a plan of
+/// at most 256 blocks takes GF(2^8).)
+#[test]
+fn a_fused_plan_reads_each_source_once_and_writes_the_serial_carriers() {
+    use par3_rs::create::{CreateOptions, InputSpec, RecoveryAmount, create};
+
+    // 1 KiB blocks make GF(2^16) sets and the larger ones GF(2^8) sets. Odd
+    // tails pack at odd offsets, so two tails share a GF(2^16) symbol.
+    // A squeezed budget leaves the rows of the larger blocks no room beside a
+    // group of blocks, so the encode reads the sources again; small blocks
+    // always fuse.
+    for (block, recovery, squeezed) in [
+        (1024u64, 6u64, None),
+        (1026, 4, None),
+        (65_536, 9, Some(1536 << 10)),
+        (40_001, 3, Some(1 << 20)),
+    ] {
+        let inputs = fused_inputs(block);
+        let tree = common::TempTree::new(&format!("fused-{block}"));
+        let mut total = 0;
+        for (index, (name, length)) in inputs.iter().enumerate() {
+            let bytes: Vec<u8> = (0..*length)
+                .map(|i| ((i * 31 + i / 7 + index as u64 * 101) % 251) as u8)
+                .collect();
+            tree.write(&format!("in/{name}"), &bytes);
+            total += length;
+        }
+        let base = tree.path().join("in");
+        let creator = "fused creator";
+        let run = |workers: usize, memory: Option<usize>| {
+            let case = format!("{block}-byte blocks, {workers} workers, {memory:?}");
+            let mut options = CreationOptions {
+                block_size: block,
+                recovery_count: recovery,
+                creator: creator.to_owned(),
+                ..CreationOptions::default()
+            };
+            options.execution.workers = workers;
+            if let Some(memory) = memory {
+                options.execution.memory = par3_rs::runtime::MemoryBudget::new(memory);
+            }
+            let execution = options.execution.clone();
+            let mut access = DiskSourceAccess::with_options(execution.clone());
+            let mut sources = Vec::new();
+            for (index, (name, _)) in inputs.iter().enumerate() {
+                let id = SourceId(index as u64);
+                access.insert(id, base.join(name));
+                sources.push(CreationSource {
+                    name: (*name).to_owned(),
+                    source: id,
+                });
+            }
+            let plan = CreationPlan::build(Arc::new(access), &sources, options).unwrap();
+            let planned = execution.diagnostics.source_io();
+            let out = tree
+                .path()
+                .join(format!("plan-{workers}-{}", memory.is_some()));
+            std::fs::create_dir_all(&out).unwrap();
+            let written: Vec<Vec<u8>> = plan
+                .execute(&out.join("set"), tree.path())
+                .unwrap()
+                .iter()
+                .map(|path| std::fs::read(path).unwrap())
+                .collect();
+            let executed = execution.diagnostics.source_io();
+            assert!(
+                execution.memory.peak() <= execution.memory.limit(),
+                "{case}"
+            );
+            // Planning reads every source byte once. Fused, the encode reads
+            // nothing more; squeezed, it reads them all again.
+            assert_eq!(planned.read_bytes, total, "{case}");
+            let encode_reads = executed.read_bytes - planned.read_bytes;
+            if memory.is_none() && workers > 1 {
+                assert_eq!(encode_reads, 0, "{case}: the encode read the sources");
+                assert_eq!(executed.read_calls, planned.read_calls, "{case}");
+            } else {
+                // One worker, or no room, keeps the serial walk. Inline
+                // tails are in no block, so the encode skips them.
+                let inline: u64 = inputs
+                    .iter()
+                    .map(|(_, length)| length % block)
+                    .filter(|tail| *tail < 40)
+                    .sum();
+                assert_eq!(
+                    encode_reads,
+                    total - inline,
+                    "{case}: the squeezed plan fused"
+                );
+            }
+            (case, written, plan.requirements().field.size)
+        };
+        let expected = match squeezed {
+            Some(memory) => {
+                let (_, serial, field) = run(2, Some(memory));
+                assert_eq!(field, 1, "{block}-byte blocks");
+                let (_, pooled, _) = run(4, Some(memory));
+                assert!(
+                    pooled == serial,
+                    "{block}-byte blocks: squeezed pools differ"
+                );
+                serial
+            }
+            None => {
+                let files: Vec<std::path::PathBuf> = inputs
+                    .iter()
+                    .map(|(name, _)| std::path::PathBuf::from(name))
+                    .collect();
+                std::fs::create_dir_all(tree.path().join("create")).unwrap();
+                create(
+                    &InputSpec::new(&base, &files),
+                    &tree.path().join("create/set.par3"),
+                    &CreateOptions::default()
+                        .with_block_size(block)
+                        .with_recovery(RecoveryAmount::Blocks(recovery))
+                        .with_creator(creator),
+                )
+                .unwrap()
+                .files_written
+                .iter()
+                .map(|path| std::fs::read(path).unwrap())
+                .collect()
+            }
+        };
+        for workers in [1, 2, 4] {
+            let (case, written, _) = run(workers, None);
+            assert!(written == expected, "{case}: not the serial carriers");
+        }
+    }
+}
