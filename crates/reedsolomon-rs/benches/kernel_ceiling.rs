@@ -125,6 +125,12 @@ mod imp {
             }
         }
         notes.push(format!("folded gfni {}", gf_simd::folded_uses_gfni()));
+        notes.push(format!("gf8 kernel {}", gf8::kernel_name()));
+        notes.push(format!(
+            "linear gfni {} avx512 {}",
+            gf_simd::linear_uses_gfni(),
+            gf_simd::linear_uses_avx512()
+        ));
         notes.join(", ")
     }
 
@@ -142,7 +148,9 @@ mod imp {
             "copy_from_slice".to_owned(),
             "xor".to_owned(),
             "gf8::mul_acc_region".to_owned(),
+            "gf8 MulPlan::new + accumulate".to_owned(),
             "gf8::MulPlan::accumulate".to_owned(),
+            "gf8 LinearMap8::accumulate".to_owned(),
             format!("gf8 mul_acc_input_batch x{WIDE}"),
             "gf16 mul_acc_region".to_owned(),
             format!("gf16 mul_acc_input_batch x{NARROW}"),
@@ -177,9 +185,23 @@ mod imp {
                 gf8::mul_acc_region(0x8e, black_box(src), dst);
                 black_box(&mut *dst);
             }));
+            // A plan built per call, as `mul_acc_region` did before plans
+            // were cached: the gap to the next row is the table build.
+            cell(measure(len, floor, || {
+                gf8::MulPlan::new(black_box(0x8e)).accumulate(black_box(src), dst);
+                black_box(&mut *dst);
+            }));
             let plan = gf8::MulPlan::new(0x8e);
             cell(measure(len, floor, || {
                 plan.accumulate(black_box(src), dst);
+                black_box(&mut *dst);
+            }));
+            let map = gf_simd::LinearMap8::new(
+                [0x8e, 0x01, 0x02, 0x47, 0x8f, 0x10, 0x20, 0x40],
+                LinearBackend::Auto,
+            );
+            cell(measure(len, floor, || {
+                map.accumulate(black_box(src), dst);
                 black_box(&mut *dst);
             }));
             let plans: Vec<gf8::MulPlan> = (0..WIDE)
