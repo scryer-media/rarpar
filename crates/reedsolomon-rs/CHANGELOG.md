@@ -107,6 +107,31 @@
   is bit-identical. Decode of 2048 data rows of 1 MiB over GF(2^16), 50
   lost, eight workers on four Alder Lake P-cores: 1.67 → 1.34 s, CPU
   11.3 → 8.3 s; one worker unchanged.
+- `TransformField::derivative_at` and `derivative_u8_at` run an erasure
+  decode's inverse transform, formal derivative and forward transform as
+  one step and return only the rows the caller asks for. With the levels
+  split at the middle, the steps regroup into three slab passes over the
+  bank: blocks of consecutive rows (the low half of the inverse, and for a
+  block holding a requested row the whole low-level term), classes of rows
+  a block apart (the high halves of both transforms around the high-level
+  derivative), then only the blocks holding a requested row (the last low
+  half, added into the output). The derivative never leaves the workers'
+  scratch, so the bank is read and written once per pass instead of once
+  per transform pass plus once per set bit of a row index; every butterfly
+  takes the factor and order the separate steps take, and the rows returned
+  are bit-identical to theirs. `derivative_at_bytes` is what it keeps
+  beside the rows: its prepared sweeps, flags, each worker's slab scratch
+  and window list, and the call's and the pool's bookkeeping, measured at
+  no more than that on every engaged shape. `fft::derivative_at_walks` says
+  whether a bank is large enough for the fused passes (from 16 rows of 1-
+  or 2-byte symbols, beyond `TRANSFORM_SCRATCH_BYTES`); both return nothing
+  for any other symbol size and saturate rather than overflow. The
+  non-exhaustive `DerivativeWork` counts the transforms and butterflies it
+  performed: the inverse once, the forward once per class and twice per
+  block holding a requested row, so where most blocks hold one it runs
+  more butterflies than the two whole transforms. Smaller domains run the
+  separate steps. `POOL_GATHERS` is the default for whether a caller takes
+  the fused passes at all, on one worker as on a pool.
 - `TransformField::le_image` and `le_image_mut` view a `u16` row as its
   bytes on a little-endian target, where a symbol's little-endian pair is
   its own representation, so a caller can read the on-disk layout into and

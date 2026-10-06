@@ -454,7 +454,24 @@ impl TransformField {
     /// beyond its rows, and a slab transform runs the same ones over every
     /// slab.
     fn units<S: Lane>(&self, n: usize, width: usize, schedule: &Schedule) -> Vec<KeptUnits<'_, S>> {
-        sweeps(n.trailing_zeros(), schedule.inverse, schedule.radix4)
+        self.units_of(
+            n,
+            width,
+            schedule,
+            sweeps(n.trailing_zeros(), schedule.inverse, schedule.radix4),
+        )
+    }
+
+    /// [`Self::units`] for the sweeps `sweeps` only, a range of the levels
+    /// of a transform over `n` rows; see [`sweeps_between`].
+    fn units_of<S: Lane>(
+        &self,
+        n: usize,
+        width: usize,
+        schedule: &Schedule,
+        sweeps: impl Iterator<Item = Sweep>,
+    ) -> Vec<KeptUnits<'_, S>> {
+        sweeps
             .map(|sweep| match sweep {
                 Sweep::Radix2(level) => KeptUnits::Radix2(
                     level,
@@ -566,7 +583,7 @@ impl TransformField {
         let shared = SharedRows::of(rows);
         for (sweeps, pass) in &walk.passes {
             let flags = pass_flags(flags, sweeps);
-            let work = |rows: &mut [S], _: &mut [S], place| {
+            let work = |rows: &mut [S], _: &mut [S], place, _: &std::ops::Range<usize>| {
                 let mut windows: Vec<&mut [S]> = rows.chunks_exact_mut(walk.window).collect();
                 self.run_sweeps(
                     &mut windows,
@@ -578,12 +595,431 @@ impl TransformField {
             };
             let next = std::sync::atomic::AtomicUsize::new(0);
             pool.broadcast(|_| {
-                pass_tasks(&shared, &next, *pass, flags.1, flags.2, 0, work, cancelled)
+                pass_tasks(
+                    &shared, &next, *pass, None, flags.1, flags.2, 0, work, cancelled,
+                )
             })
             .into_iter()
             .collect::<Result<(), TransformError>>()?;
         }
         Ok(())
+    }
+
+    /// Rows `at` of the forward transform of the formal derivative of the
+    /// polynomial that `rows` interpolate, all at origin 0: what an erasure
+    /// decode reads after its inverse transform, derivative and forward
+    /// transform. `out` takes one row per entry of `at`, which must ascend;
+    /// `rows` is left holding intermediate values. `zero` flags rows known
+    /// zero, as for [`Self::transform_known_zero_with_backend`].
+    ///
+    /// The three steps never run over the whole bank one after another.
+    /// With the levels split at `h`, the inverse transform is its levels
+    /// below `h`, inside blocks of `2^h` consecutive rows, then those at `h`
+    /// and above, the same map applied to every class of rows `2^h` apart;
+    /// the forward transform is the same two halves in the other order, and
+    /// the derivative the sum of one over the low bits of a row's index,
+    /// inside each block, and one over the high bits, inside each class.
+    /// The block-wise derivative commutes with the class-wise halves of
+    /// both transforms, which undo each other, so the rows read are
+    ///
+    /// ```text
+    /// forward_low(derivative_low(X)) + forward_low(forward_high(
+    ///     derivative_high(inverse_high(X)))),   X = inverse_low(rows)
+    /// ```
+    ///
+    /// and that takes three passes, each holding a slab of a block or a
+    /// class in scratch of its own through every step it applies: blocks
+    /// (inverse low half, and for a block holding a row of `at` the whole
+    /// first term), classes (the inner part of the second term), then only
+    /// the blocks holding a row of `at` (its last half). The derivative never
+    /// leaves the scratch, and the bank is read and written once per pass,
+    /// instead of once per pass of each step and once per set bit of every
+    /// row index for the derivative. Every butterfly takes the factor and
+    /// order the separate steps take, and the arithmetic is exact, so `out`
+    /// holds exactly the rows the separate steps would leave.
+    ///
+    /// With `pool` the workers share each pass's slabs, each gathering into
+    /// at most [`TRANSFORM_SCRATCH_BYTES`] of its own; without, the calling
+    /// thread walks them. A domain under 16 rows runs the separate steps.
+    #[allow(clippy::too_many_arguments)]
+    pub fn derivative_at(
+        &self,
+        rows: &mut [Vec<u16>],
+        zero: Option<&[bool]>,
+        at: &[usize],
+        out: &mut [Vec<u16>],
+        backend: crate::gf_simd::LinearBackend,
+        pool: Option<&rayon::ThreadPool>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<DerivativeWork, TransformError> {
+        self.derivative_at_lane(rows, zero, at, out, backend, pool, cancelled)
+    }
+
+    /// [`Self::derivative_at`] on byte rows of the 8-bit field. Any other
+    /// field returns `Field`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn derivative_u8_at(
+        &self,
+        rows: &mut [Vec<u8>],
+        zero: Option<&[bool]>,
+        at: &[usize],
+        out: &mut [Vec<u8>],
+        backend: crate::gf_simd::LinearBackend,
+        pool: Option<&rayon::ThreadPool>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<DerivativeWork, TransformError> {
+        self.byte_lane()?;
+        self.derivative_at_lane(rows, zero, at, out, backend, pool, cancelled)
+    }
+
+    /// Bytes [`Self::derivative_at`] keeps beside the rows and `out` for `n`
+    /// rows `width` wide of `size`-byte symbols with `backend` on `threads`
+    /// workers (one without a pool): the butterflies of its sweeps, prepared
+    /// once, the known-zero and slab flags, the workers' scratch, and the
+    /// bookkeeping of the call and of each worker. A narrower width never
+    /// needs more. Zero where it runs the separate steps, including any
+    /// `size` but 1 or 2.
+    pub fn derivative_at_bytes(
+        &self,
+        n: usize,
+        width: usize,
+        size: usize,
+        backend: crate::gf_simd::LinearBackend,
+        threads: usize,
+    ) -> usize {
+        let Some(split) = Split::of(n, width, size, threads) else {
+            return 0;
+        };
+        // Either sweep grouping, whichever keeps more: a narrower width may
+        // fall under the radix-4 threshold.
+        let units = |radix4: bool| {
+            let schedule = |inverse| Schedule {
+                origin: 0,
+                inverse,
+                backend,
+                radix4,
+            };
+            let (low, levels) = (split.low, split.levels);
+            match size {
+                1 => {
+                    self.units_bytes_of::<u8>(
+                        n,
+                        &schedule(true),
+                        sweeps_between(0, levels, true, radix4),
+                    ) + self.units_bytes_of::<u8>(
+                        n,
+                        &schedule(false),
+                        sweeps_between(low, levels, false, radix4),
+                    ) + self.units_bytes_of::<u8>(
+                        n,
+                        &schedule(false),
+                        sweeps_between(0, low, false, radix4),
+                    )
+                }
+                _ => {
+                    self.units_bytes_of::<u16>(
+                        n,
+                        &schedule(true),
+                        sweeps_between(0, levels, true, radix4),
+                    ) + self.units_bytes_of::<u16>(
+                        n,
+                        &schedule(false),
+                        sweeps_between(low, levels, false, radix4),
+                    ) + self.units_bytes_of::<u16>(
+                        n,
+                        &schedule(false),
+                        sweeps_between(0, low, false, radix4),
+                    )
+                }
+            }
+        };
+        let sweeps = split.levels as usize + 1;
+        // The flags of each sweep and their list, the rows left idle and
+        // done, and the slots and kept blocks per block.
+        let flags = (sweeps + 2)
+            .saturating_mul(n)
+            .saturating_add((sweeps + 1) * size_of::<Vec<bool>>())
+            .saturating_add(2 * ((n >> split.low) + 1) * size_of::<usize>());
+        // Each worker's slab scratch, the list of its windows a task sweeps,
+        // and the pool's bookkeeping to hand it a pass; then the sweep lists
+        // and the rest of a call's own bookkeeping.
+        let worker = (2 * split.window)
+            .saturating_mul(split.group())
+            .saturating_mul(size)
+            .saturating_add(split.group() * size_of::<&mut [u16]>())
+            .saturating_add(DERIVATIVE_WORKER_BYTES);
+        let call = 4 * sweeps * size_of::<Sweep>() + DERIVATIVE_CALL_BYTES;
+        units(true)
+            .max(units(false))
+            .saturating_add(flags)
+            .saturating_add(threads.max(1).saturating_mul(worker))
+            .saturating_add(call)
+    }
+
+    /// [`Self::units_bytes`] for the sweeps `sweeps` alone.
+    fn units_bytes_of<S: Lane>(
+        &self,
+        n: usize,
+        schedule: &Schedule,
+        sweeps: impl Iterator<Item = Sweep>,
+    ) -> usize {
+        let pair = size_of_val(&self.pair::<S>(schedule, 0, 0, 64)) + size_of::<Box<PairUnit<S>>>();
+        let quad = size_of_val(&self.quad::<S>(schedule, 0, 0)) + size_of::<Box<QuadUnit<S>>>();
+        sweeps
+            .map(|sweep| match sweep {
+                Sweep::Radix2(level) => (n >> (level + 1)) * pair,
+                Sweep::Radix4(low) => (n >> (low + 2)) * quad,
+            })
+            .sum::<usize>()
+            + size_of::<KeptUnits<'_, S>>() * 64
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn derivative_at_lane<S: Lane>(
+        &self,
+        rows: &mut [Vec<S>],
+        zero: Option<&[bool]>,
+        at: &[usize],
+        out: &mut [Vec<S>],
+        backend: crate::gf_simd::LinearBackend,
+        pool: Option<&rayon::ThreadPool>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<DerivativeWork, TransformError> {
+        self.validate_transform(rows, zero, 0, cancelled)?;
+        let n = rows.len();
+        let width = rows.first().map_or(0, Vec::len);
+        if out.len() != at.len()
+            || out.iter().any(|row| row.len() != width)
+            || at.windows(2).any(|pair| pair[0] >= pair[1])
+            || at.last().is_some_and(|&row| row >= n)
+        {
+            return Err(TransformError::Geometry);
+        }
+        let levels = n.trailing_zeros();
+        let threads = pool.map_or(1, rayon::ThreadPool::current_num_threads);
+        let Some(split) = Split::of(n, width, size_of::<S>(), threads) else {
+            self.transform_lane(rows, zero, 0, true, backend, cancelled)?;
+            derivative_rows(rows, cancelled)?;
+            self.transform_lane(rows, None, 0, false, backend, cancelled)?;
+            for (out, &row) in out.iter_mut().zip(at) {
+                out.copy_from_slice(&rows[row]);
+            }
+            let full = (n as u64 / 2) * u64::from(levels);
+            return Ok(DerivativeWork {
+                transforms: 2,
+                butterflies: 2 * full,
+            });
+        };
+        let (low, window) = (split.low, split.window);
+        let block = 1usize << low;
+        let span = n >> low;
+        let radix4 = Self::fused(window, backend);
+        let inverse = Schedule {
+            origin: 0,
+            inverse: true,
+            backend,
+            radix4,
+        };
+        let forward = Schedule {
+            inverse: false,
+            ..inverse
+        };
+        let inverse_low: Vec<Sweep> = sweeps_between(0, low, true, radix4).collect();
+        let inverse_high: Vec<Sweep> = sweeps_between(low, levels, true, radix4).collect();
+        let units = |schedule: &Schedule, from: u32, to: u32| {
+            self.units_of::<S>(
+                n,
+                window,
+                schedule,
+                sweeps_between(from, to, schedule.inverse, radix4),
+            )
+        };
+        let inverse_low_units = units(&inverse, 0, low);
+        let inverse_high_units = units(&inverse, low, levels);
+        let forward_high_units = units(&forward, low, levels);
+        let forward_low_units = units(&forward, 0, low);
+        // The known-zero flags before each inverse sweep, low half then high,
+        // and after the last.
+        let flags = zero.map(|zero| {
+            let mut known = zero.to_vec();
+            let mut flags = Vec::with_capacity(inverse_low.len() + inverse_high.len() + 1);
+            for &sweep in inverse_low.iter().chain(&inverse_high) {
+                flags.push(known.clone());
+                advance(&mut known, sweep, 0, true, &mut |_| {});
+            }
+            flags.push(known);
+            flags
+        });
+        let low_flags = flags.as_deref().map(|flags| &flags[..=inverse_low.len()]);
+        let high_flags = flags.as_deref().map(|flags| &flags[inverse_low.len()..]);
+        // The rows of `at` each block holds: slots `first[b]..first[b + 1]`.
+        let mut first = vec![0usize; span + 1];
+        for &row in at {
+            first[(row >> low) + 1] += 1;
+        }
+        for b in 0..span {
+            first[b + 1] += first[b];
+        }
+        let kept: Vec<usize> = (0..span).filter(|&b| first[b] < first[b + 1]).collect();
+        // Rows a later pass never reads are not put back: outside the kept
+        // blocks after the classes, and every row after the last pass.
+        let idle: Vec<bool> = (0..n)
+            .map(|row| first[row >> low] == first[(row >> low) + 1])
+            .collect();
+        let done = vec![true; n];
+        let shared = SharedRows::of(rows);
+        let results = SharedRows::of(out);
+        fn windows<S>(rows: &mut [S], window: usize) -> Vec<&mut [S]> {
+            rows.chunks_exact_mut(window).collect()
+        }
+        let slots = |place: Place| {
+            let b = place.first >> low;
+            (first[b]..first[b + 1]).map(move |slot| (slot, at[slot] - place.first))
+        };
+
+        // Blocks: the inverse low half; then, for a kept block, the first
+        // term in the spare scratch, stored to its rows of `at`.
+        let blocks = Pass {
+            window,
+            rows: block,
+            stride: 1,
+        };
+        self.run_pass(
+            &shared,
+            pool,
+            blocks,
+            None,
+            low_flags.map(|flags| flags[0].as_slice()),
+            low_flags.map(|flags| flags[inverse_low.len()].as_slice()),
+            block * window,
+            |rows: &mut [S], spare: &mut [S], place: Place, columns: &std::ops::Range<usize>| {
+                self.run_sweeps(
+                    &mut windows(rows, window),
+                    &inverse_low_units,
+                    low_flags,
+                    place,
+                    cancelled,
+                )?;
+                if slots(place).next().is_none() {
+                    return Ok(());
+                }
+                derivative_blocks(rows, spare, block, window, cancelled)?;
+                self.run_sweeps(
+                    &mut windows(spare, window),
+                    &forward_low_units,
+                    None,
+                    place,
+                    cancelled,
+                )?;
+                for (slot, local) in slots(place) {
+                    // SAFETY: this task alone holds these columns of the
+                    // result rows of its block.
+                    unsafe { results.columns_mut(slot, columns) }
+                        .copy_from_slice(&spare[local * window..][..columns.len()]);
+                }
+                Ok(())
+            },
+            cancelled,
+        )?;
+        // Classes: inverse high half, high-bit derivative and forward high
+        // half, all in scratch; put back only where a kept block reads it.
+        let classes = Pass {
+            window,
+            rows: span,
+            stride: block,
+        };
+        self.run_pass(
+            &shared,
+            pool,
+            classes,
+            None,
+            high_flags.map(|flags| flags[0].as_slice()),
+            Some(&idle),
+            span * window,
+            |rows: &mut [S], spare: &mut [S], place: Place, _: &std::ops::Range<usize>| {
+                self.run_sweeps(
+                    &mut windows(rows, window),
+                    &inverse_high_units,
+                    high_flags,
+                    place,
+                    cancelled,
+                )?;
+                derivative_blocks(rows, spare, span, window, cancelled)?;
+                self.run_sweeps(
+                    &mut windows(spare, window),
+                    &forward_high_units,
+                    None,
+                    place,
+                    cancelled,
+                )?;
+                rows.copy_from_slice(spare);
+                Ok(())
+            },
+            cancelled,
+        )?;
+        // Kept blocks: the forward low half of the second term, added to
+        // the first in the rows of `at`.
+        self.run_pass(
+            &shared,
+            pool,
+            blocks,
+            Some(&kept),
+            None,
+            Some(&done),
+            0,
+            |rows: &mut [S], _: &mut [S], place: Place, columns: &std::ops::Range<usize>| {
+                self.run_sweeps(
+                    &mut windows(rows, window),
+                    &forward_low_units,
+                    None,
+                    place,
+                    cancelled,
+                )?;
+                for (slot, local) in slots(place) {
+                    // SAFETY: as in the first pass.
+                    let result = unsafe { results.columns_mut(slot, columns) };
+                    xor_into(result, &rows[local * window..][..columns.len()]);
+                }
+                Ok(())
+            },
+            cancelled,
+        )?;
+        let half = n as u64 / 2;
+        let kept_low = kept.len() as u64 * (block as u64 / 2) * u64::from(low);
+        Ok(DerivativeWork {
+            transforms: 1 + block as u64 + 2 * kept.len() as u64,
+            butterflies: half * u64::from(levels) + half * u64::from(levels - low) + 2 * kept_low,
+        })
+    }
+
+    /// One pass of [`Self::derivative_at`]: its tasks shared by the pool's
+    /// workers, or walked by the calling thread; see [`pass_tasks`].
+    #[allow(clippy::too_many_arguments)]
+    fn run_pass<S: Lane>(
+        &self,
+        shared: &SharedRows<S>,
+        pool: Option<&rayon::ThreadPool>,
+        pass: Pass,
+        groups: Option<&[usize]>,
+        before: Option<&[bool]>,
+        after: Option<&[bool]>,
+        spare: usize,
+        work: impl Fn(&mut [S], &mut [S], Place, &std::ops::Range<usize>) -> Result<(), TransformError>
+        + Sync,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError> {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let tasks = || {
+            pass_tasks(
+                shared, &next, pass, groups, before, after, spare, &work, cancelled,
+            )
+        };
+        match pool {
+            Some(pool) if pool.current_num_threads() > 1 => {
+                pool.broadcast(|_| tasks()).into_iter().collect()
+            }
+            _ => tasks(),
+        }
     }
 
     /// Run transform stages inside a caller-owned, bounded worker pool. No
@@ -1055,6 +1491,7 @@ impl TransformField {
                 pass,
                 None,
                 None,
+                None,
                 n * pass.window,
                 &work,
                 cancelled,
@@ -1069,8 +1506,9 @@ impl TransformField {
     fn derivative_work<S: Lane>(
         pass: Pass,
         cancelled: &(dyn Fn() -> bool + Sync),
-    ) -> impl Fn(&mut [S], &mut [S], Place) -> Result<(), TransformError> + Sync {
-        move |rows, spare, _| {
+    ) -> impl Fn(&mut [S], &mut [S], Place, &std::ops::Range<usize>) -> Result<(), TransformError> + Sync
+    {
+        move |rows, spare, _, _| {
             derivative_blocks(rows, spare, pass.rows, pass.window, cancelled)?;
             rows.copy_from_slice(spare);
             Ok(())
@@ -1378,13 +1816,25 @@ unsafe fn xor_into_avx2<S: Lane>(into: &mut [S], from: &[S]) {
 /// None is taken on a target that does not gather; see [`POOL_GATHERS`].
 pub const TRANSFORM_SCRATCH_BYTES: usize = 512 << 10;
 
+/// What [`TransformField::derivative_at_bytes`] allows each worker beyond
+/// its slab scratch and windows, for the pool's handing it each pass.
+const DERIVATIVE_WORKER_BYTES: usize = 2 << 10;
+
+/// What [`TransformField::derivative_at_bytes`] allows a call beyond the
+/// sweeps, flags and workers it counts: the lists of its prepared units
+/// and the passes' small state.
+const DERIVATIVE_CALL_BYTES: usize = 4 << 10;
+
 /// Whether the pooled transforms and derivatives of this target gather a
 /// bank beyond the scratch into slabs. Apple silicon streams the whole-row
 /// sweeps faster than the gathers and scatters cost: on an M-series, the
 /// slab walk of 4096 rows of 32768 16-bit symbols ran half as long again
 /// as the whole-row sweeps, and the gathered derivative twice as long. So
 /// there the pool sweeps whole rows, as every pool does for a bank within
-/// the scratch, and takes no scratch.
+/// the scratch, and takes no scratch. It is also the default for whether a
+/// caller takes the split slab steps of [`TransformField::derivative_at`]
+/// at all, on one worker as on a pool, since they gather the same way; see
+/// [`derivative_at_walks`].
 pub const POOL_GATHERS: bool = !cfg!(target_vendor = "apple");
 
 /// Whether [`TransformField::transform_in_pool`] of `n` rows `width` wide
@@ -1485,6 +1935,84 @@ impl Pass {
     fn tasks(self, n: usize, width: usize) -> usize {
         (n / self.rows) * width.div_ceil(self.window)
     }
+}
+
+/// Where [`TransformField::derivative_at`] splits a domain's levels, and
+/// the slab its passes gather: `low` levels inside each block, the rest
+/// inside each class, and a window of columns wide enough for the larger
+/// of the two groups and its derivative to share the scratch.
+#[derive(Clone, Copy)]
+struct Split {
+    low: u32,
+    levels: u32,
+    window: usize,
+}
+
+impl Split {
+    /// The split for `n` rows `width` wide of `size`-byte symbols on
+    /// `threads` workers: the levels halved, the window the widest run of
+    /// whole 64-symbol runs the scratch holds twice over the larger group,
+    /// and, with more workers than groups in the narrower pass, no wider
+    /// than an even share of the width between the workers on each group,
+    /// rounded up to whole runs; so a narrow width can still leave some
+    /// workers without a slab. None below 16 rows, where a block or class
+    /// would be under four, and for any `size` but 1 or 2.
+    fn of(n: usize, width: usize, size: usize, threads: usize) -> Option<Split> {
+        let levels = n.trailing_zeros();
+        if !n.is_power_of_two() || levels < 4 || width == 0 || !(1..=2).contains(&size) {
+            return None;
+        }
+        let low = levels / 2;
+        let group = 1usize << (levels - low);
+        let mut window = (TRANSFORM_SCRATCH_BYTES / (2 * group * size) / 64 * 64).max(64);
+        let groups = 1usize << low;
+        if threads > groups {
+            let share = width.div_ceil(threads.div_ceil(groups));
+            window = window.min(share.checked_next_multiple_of(64).unwrap_or(share));
+        }
+        Some(Split {
+            low,
+            levels,
+            window: window.min(width),
+        })
+    }
+
+    /// Rows in the larger of a block and a class.
+    fn group(self) -> usize {
+        1 << (self.levels - self.low)
+    }
+}
+
+/// What [`TransformField::derivative_at`] performed: transform calls and
+/// the butterflies they ran.
+///
+/// The split steps count the whole inverse once, but the forward per class
+/// and per block: one high half per class and two low halves for every
+/// block holding a row read, one per term of the derivative. The forward
+/// low half thus runs twice over each such block, so once more than half
+/// the blocks hold a row read the butterflies exceed those of the two
+/// whole transforms the separate steps run. The separate steps count two
+/// transforms and their butterflies.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DerivativeWork {
+    /// Additive transforms: the inverse, one forward high half per class,
+    /// and two forward low halves per block holding a row read.
+    pub transforms: u64,
+    /// Butterflies across them, as performed.
+    pub butterflies: u64,
+}
+
+/// Whether [`TransformField::derivative_at`] over `n` rows `width` wide of
+/// `size`-byte symbols splits the domain and walks it in slabs, rather than
+/// running the separate steps: from 16 rows of 1- or 2-byte symbols, and
+/// only for a bank beyond [`TRANSFORM_SCRATCH_BYTES`], where the passes it
+/// saves are passes over memory rather than over the cache. It says nothing
+/// of the target: a caller deciding whether to take the split steps at all,
+/// with a pool or one worker alone, also asks [`POOL_GATHERS`].
+pub fn derivative_at_walks(n: usize, width: usize, size: usize) -> bool {
+    Split::of(n, width, size, 1).is_some()
+        && n.saturating_mul(width).saturating_mul(size) > TRANSFORM_SCRATCH_BYTES
 }
 
 /// How a transform of a bank beyond the scratch walks it: each pass gathers
@@ -1666,22 +2194,24 @@ fn pass_flags<'a>(
 /// window keeps whatever its padding columns held: `work` treats every
 /// column on its own, so they touch nothing that is put back. One worker
 /// alone walks every task in order; several share them, and no two tasks
-/// of one pass share a symbol.
+/// of one pass share a symbol. `groups`, when given, names the only groups
+/// the pass visits, in order; `work` is also handed the columns it holds.
 #[allow(clippy::too_many_arguments)]
 fn pass_tasks<S: Lane>(
     shared: &SharedRows<S>,
     next: &std::sync::atomic::AtomicUsize,
     pass: Pass,
+    groups: Option<&[usize]>,
     before: Option<&[bool]>,
     after: Option<&[bool]>,
     spare: usize,
-    work: impl Fn(&mut [S], &mut [S], Place) -> Result<(), TransformError>,
+    work: impl Fn(&mut [S], &mut [S], Place, &std::ops::Range<usize>) -> Result<(), TransformError>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<(), TransformError> {
     use std::sync::atomic::Ordering;
     let (n, width) = (shared.0.len(), shared.1);
     let windows = width.div_ceil(pass.window);
-    let tasks = pass.tasks(n, width);
+    let tasks = groups.map_or_else(|| pass.tasks(n, width), |groups| groups.len() * windows);
     let mut scratch = vec![S::default(); pass.rows * pass.window + spare];
     let (rows, spare) = scratch.split_at_mut(pass.rows * pass.window);
     loop {
@@ -1692,7 +2222,8 @@ fn pass_tasks<S: Lane>(
         if cancelled() {
             return Err(TransformError::Cancelled);
         }
-        let place = pass.place(task / windows);
+        let group = task / windows;
+        let place = pass.place(groups.map_or(group, |groups| groups[group]));
         let at = task % windows;
         let columns = at * pass.window..width.min((at + 1) * pass.window);
         let w = columns.len();
@@ -1706,7 +2237,7 @@ fn pass_tasks<S: Lane>(
                 window[..w].copy_from_slice(unsafe { shared.columns(row, &columns) });
             }
         }
-        work(rows, spare, place)?;
+        work(rows, spare, place, &columns)?;
         for (k, window) in rows.chunks_exact(pass.window).enumerate() {
             let row = place.row(k);
             if after.is_some_and(|known| known[row]) {
@@ -1836,6 +2367,15 @@ fn sweeps(levels: u32, inverse: bool, radix4: bool) -> impl Iterator<Item = Swee
         };
         stage += if fused { 2 } else { 1 };
         Some(sweep)
+    })
+}
+
+/// [`sweeps`] of the levels `from..to` alone of a larger transform, in the
+/// same order and grouping a transform over `2^(to - from)` rows takes.
+fn sweeps_between(from: u32, to: u32, inverse: bool, radix4: bool) -> impl Iterator<Item = Sweep> {
+    sweeps(to - from, inverse, radix4).map(move |sweep| match sweep {
+        Sweep::Radix2(level) => Sweep::Radix2(level + from),
+        Sweep::Radix4(low) => Sweep::Radix4(low + from),
     })
 }
 
