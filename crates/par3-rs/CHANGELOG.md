@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.4 (Unreleased)
+## 0.4.4
 
 - **Behaviour change:** the streaming creation engine (`creation::CreationPlan`)
   now derives the InputSetID the way the reference does — and the way

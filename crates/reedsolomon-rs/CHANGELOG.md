@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.8 (Unreleased)
+## 0.4.8
 
 - `gf_simd::LinearMap8` is an 8-bit linear map beside `LinearMap16`: two
   nibble tables built from the caller's basis images, run through the existing
