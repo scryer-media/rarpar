@@ -162,6 +162,15 @@ pub enum Par3Command {
     Verify(Par3Args),
     /// Rebuild damaged files in the working directory, keeping numbered backups.
     Repair(Par3Args),
+    /// Write a 7z archive and protect it with PAR3 in the same pass.
+    #[cfg(feature = "sevenz")]
+    #[command(long_about = "\
+Write a 7z archive of the given files and directories and compute its PAR3
+recovery data from the bytes as they are written, without reading the archive
+back. By default the set is written beside the archive as OUTPUT.par3 and
+recovery volumes; --inside appends it after the archive's end header instead,
+where 7z readers ignore it and PAR3 tools find it.")]
+    Archive(Par3ArchiveArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -224,6 +233,54 @@ pub struct Par3CreateArgs {
     /// Flush buffers without requesting durable storage barriers.
     #[arg(long)]
     pub buffered: bool,
+}
+
+#[cfg(feature = "sevenz")]
+#[derive(Debug, Clone, Args)]
+pub struct Par3ArchiveArgs {
+    /// Output 7z archive path.
+    pub output: PathBuf,
+    /// Files and directories to archive, relative to --base-path (defaults to current directory).
+    #[arg(required = true, num_args = 1..)]
+    pub inputs: Vec<PathBuf>,
+    /// Directory archive member names are relative to.
+    #[arg(long)]
+    pub base_path: Option<PathBuf>,
+    /// Compression level, 0 (stored) to 9.
+    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(0..=9))]
+    pub level: u32,
+    /// Executable filter applied before compression.
+    #[arg(long, value_enum, default_value_t = ArchiveFilter::None)]
+    pub filter: ArchiveFilter,
+    /// Compress every file on its own instead of as one solid block.
+    #[arg(long)]
+    pub no_solid: bool,
+    /// Append the PAR3 set inside the archive, after its end header, instead of beside it.
+    #[arg(long, conflicts_with_all = ["block_size", "recovery_count"])]
+    pub inside: bool,
+    /// Logical block size in bytes for the sibling set; odd sizes are rounded up.
+    #[arg(short = 's', long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(40..))]
+    pub block_size: u64,
+    /// Number of recovery packets in the sibling set (defaults to one).
+    #[arg(short = 'c', long, conflicts_with = "recovery_percent")]
+    pub recovery_count: Option<u64>,
+    /// Recovery percentage of input blocks, rounded up; with --inside, 0 to 250, and 0 means one block.
+    #[arg(short = 'r', long, conflicts_with = "recovery_count")]
+    pub recovery_percent: Option<u32>,
+}
+
+#[cfg(feature = "sevenz")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ArchiveFilter {
+    None,
+    X86,
+    Arm,
+    ArmThumb,
+    Arm64,
+    Ia64,
+    Sparc,
+    Ppc,
+    Riscv,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

@@ -46,7 +46,7 @@ crypto-rust = [
     "unrar-rs?/crypto-rust",
     "sevenz-turbo?/native-crypto",
 ]
-# 7z support: one-pass archive-and-protect (`rarpar 7z-par3`), PAR-inside for
+# 7z support: one-pass archive-and-protect (`rarpar par3 archive`), PAR-inside for
 # 7z and ZIP in the par3cmdline facade, and the 7-Zip command-line facade
 # (`7z`/`7za`/`7zz`/`7zr`, or `rarpar 7z ...`) for SABnzbd and NZBGet. The 7z
 # codec is sevenz-turbo; the PAR3 side is par3-rs. Neither depends on the

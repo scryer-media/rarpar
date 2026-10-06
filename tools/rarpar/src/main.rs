@@ -1,3 +1,5 @@
+#[cfg(feature = "sevenz")]
+mod archive;
 mod cleanup;
 mod compat_par3;
 mod compat_unrar;
@@ -5,6 +7,8 @@ mod discovery;
 mod error;
 mod par2;
 mod par3;
+#[cfg(feature = "sevenz")]
+mod par3_stream;
 mod password;
 mod rar;
 mod report;

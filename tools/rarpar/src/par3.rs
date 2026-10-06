@@ -219,14 +219,14 @@ pub fn discover_sets(
     Ok(result)
 }
 
-fn parent(path: &Path) -> PathBuf {
+pub(crate) fn parent(path: &Path) -> PathBuf {
     path.parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
         .to_path_buf()
 }
 
-fn reject_symlinks(path: &Path) -> Result<(), RarparError> {
+pub(crate) fn reject_symlinks(path: &Path) -> Result<(), RarparError> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => {
             return Err(RarparError::Unsafe(format!(
@@ -411,6 +411,8 @@ pub fn run_command(cli: &Cli, command: Par3Command) -> Result<u8, RarparError> {
         Par3Command::Repair(args) => {
             verify_repair(cli, &args, true).map(|outcome| (outcome.success, outcome.report))
         }
+        #[cfg(feature = "sevenz")]
+        Par3Command::Archive(args) => crate::archive::run(cli, &args),
     };
     match result {
         Ok((success, report)) => {
