@@ -106,6 +106,7 @@ type Session struct {
 	LocalFS string
 	// Ext4 says the `local-ext4` target is mounted.
 	Ext4         bool
+	loop         string
 	localIOSaved string
 	mounted      []string
 	log          io.Writer
@@ -171,39 +172,67 @@ func Mount(ctx context.Context, config ClientConfig, log io.Writer) (*Session, e
 	}
 	session.LocalFS = backingFS(LocalWork)
 	if config.Ext4 != "" {
-		if err := mountExt4(ctx, config.Ext4, log); err != nil {
+		session.Ext4 = true
+		loop, err := mountExt4(ctx, config.Ext4, log)
+		session.loop = loop
+		if err != nil {
 			session.Close()
 			return nil, err
 		}
 		session.mounted = append(session.mounted, LocalExt4)
-		session.Ext4 = true
 	}
 	return session, nil
 }
 
-// mountExt4 makes a fresh sparse ext4 image of size and loop-mounts it at
-// LocalExt4.
-func mountExt4(ctx context.Context, size string, log io.Writer) error {
+// mountExt4 makes a fresh sparse ext4 image of size and mounts it at
+// LocalExt4 through a loop device, which it returns once attached, even when
+// the mount then fails. A container's /dev holds only the loop nodes that
+// existed when it started, so the node for the device the kernel hands out
+// is made here when it is missing.
+func mountExt4(ctx context.Context, size string, log io.Writer) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(Ext4Image), 0o755); err != nil {
-		return err
+		return "", err
 	}
 	if err := os.Remove(Ext4Image); err != nil && !os.IsNotExist(err) {
-		return err
+		return "", err
 	}
 	if err := os.MkdirAll(LocalExt4, 0o755); err != nil {
-		return err
+		return "", err
 	}
-	for _, args := range [][]string{
-		{"truncate", "-s", size, Ext4Image},
-		{"mkfs.ext4", "-q", "-F", "-E", "nodiscard", Ext4Image},
-		{"mount", "-o", "loop", Ext4Image, LocalExt4},
-	} {
+	run := func(args ...string) (string, error) {
 		fmt.Fprintf(log, "nfs client: %s\n", strings.Join(args, " "))
-		if output, err := exec.CommandContext(ctx, args[0], args[1:]...).CombinedOutput(); err != nil {
-			return fmt.Errorf("%s: %w\n%s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+		output, err := exec.CommandContext(ctx, args[0], args[1:]...).CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("%s: %w\n%s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+		}
+		return strings.TrimSpace(string(output)), nil
+	}
+	if _, err := run("truncate", "-s", size, Ext4Image); err != nil {
+		return "", err
+	}
+	if _, err := run("mkfs.ext4", "-q", "-F", "-E", "nodiscard", Ext4Image); err != nil {
+		return "", err
+	}
+	device, err := run("losetup", "-f")
+	if err != nil {
+		return "", err
+	}
+	minor, ok := strings.CutPrefix(device, "/dev/loop")
+	if !ok || minor == "" || strings.Trim(minor, "0123456789") != "" {
+		return "", fmt.Errorf("losetup -f: unexpected device %q", device)
+	}
+	if _, err := os.Stat(device); os.IsNotExist(err) {
+		if _, err := run("mknod", device, "b", "7", minor); err != nil {
+			return "", err
 		}
 	}
-	return nil
+	if _, err := run("losetup", device, Ext4Image); err != nil {
+		return "", err
+	}
+	if _, err := run("mount", device, LocalExt4); err != nil {
+		return device, err
+	}
+	return device, nil
 }
 
 // TargetArgs are this session's `par3 run` target arguments.
@@ -229,6 +258,12 @@ func (s *Session) Close() {
 		}
 	}
 	s.mounted = nil
+	if s.loop != "" {
+		if output, err := exec.Command("losetup", "-d", s.loop).CombinedOutput(); err != nil {
+			fmt.Fprintf(s.log, "nfs client: losetup -d %s: %v %s\n", s.loop, err, strings.TrimSpace(string(output)))
+		}
+		s.loop = ""
+	}
 	if s.Ext4 {
 		_ = os.Remove(Ext4Image)
 		s.Ext4 = false
