@@ -28,6 +28,7 @@ pub struct SourceSnapshot {
 
 /// The open local file behind a source, from [`SourceAccess::open_file`]. It
 /// has no public interface; only the engine uses it.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub struct SourceFile(pub(crate) Arc<File>);
 
 impl std::fmt::Debug for SourceFile {
