@@ -324,9 +324,6 @@ func (orch *orchestrator) preflight(ctx context.Context) error {
 		if machine.Kind != KindLocalSSH {
 			continue
 		}
-		if machine.isWindows() {
-			continue
-		}
 		wait.Add(1)
 		go func(index int, machine Machine) {
 			defer wait.Done()
@@ -397,9 +394,15 @@ func (orch *orchestrator) checkHostOracles(ctx context.Context, transport *Trans
 		if oracle.Policy != OracleHostPath {
 			continue
 		}
-		script := fmt.Sprintf("if [ ! -x %s ]; then echo MISSING; exit 0; fi\nif command -v sha256sum >/dev/null 2>&1; then sha256sum %s | cut -d' ' -f1; else echo NOHASH; fi\n",
-			shellQuote(oracle.Path), shellQuote(oracle.Path))
-		stdout, _, err := transport.RunScript(ctx, script)
+		var stdout string
+		var err error
+		if machine.isWindows() {
+			stdout, _, err = transport.RunPowerShell(ctx, psOracleCheckScript(oracle.Path))
+		} else {
+			script := fmt.Sprintf("if [ ! -x %s ]; then echo MISSING; exit 0; fi\nif command -v sha256sum >/dev/null 2>&1; then sha256sum %s | cut -d' ' -f1; else echo NOHASH; fi\n",
+				shellQuote(oracle.Path), shellQuote(oracle.Path))
+			stdout, _, err = transport.RunScript(ctx, script)
+		}
 		if err != nil {
 			return fmt.Errorf("machine %s: checking oracle %s: %v", machine.Name, role, err)
 		}

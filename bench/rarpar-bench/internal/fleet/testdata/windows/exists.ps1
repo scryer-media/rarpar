@@ -1,0 +1,1 @@
+if (Test-Path -LiteralPath 'C:\bench\fleet-stage\fleet-testrun\DONE') { 'yes' } else { 'no' }

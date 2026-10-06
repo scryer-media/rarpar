@@ -294,17 +294,50 @@ spot = true                                    # optional, SSM only
 - The Windows runner has never been executed (see below).
 - The SSM access mode is implemented and unit-tested but has not been run
   against a live account yet. Treat its first run as bring-up.
-- The Windows path is unvalidated end to end. The run script is PowerShell,
-  but the transport still assumes a POSIX shell on the far side: it runs `sh`
-  and uses `tar` for bundle upload and result download. Before the first
-  Windows round, the host needs an OpenSSH default shell that provides those,
-  or the transport needs a PowerShell path.
+- The Windows transport is implemented and unit-tested but has not run against
+  a live host (see below).
 
 ## Windows hosts
 
-Schema-complete and implemented, but **unvalidated**: no Windows host has run it
-yet. The runner uploads a `.ps1` and executes the *file* — PowerShell is never
-driven by an inline command string, because quoting a script through
-ssh → cmd.exe → powershell truncates it silently. `capabilities.perf` must be
-`none`. Treat the first Windows run as bring-up, not evidence. See the TODO at
-the top of `internal/fleet/windows.go`.
+Implemented and unit-tested, but **unvalidated: it has never run against a live
+Windows host.** Treat the first Windows run as bring-up, not evidence. See the
+TODO at the top of `internal/fleet/windows.go` for what bring-up must confirm.
+
+The host needs Windows OpenSSH (sshd with its default sftp subsystem) and
+Windows PowerShell 5.1. It needs no `sh` and no `tar`:
+
+- **Control commands** (probe, mkdir, existence checks, the oracle check,
+  reading the `DONE` sentinel, cleanup) are short PowerShell scripts sent as
+  `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass
+  -EncodedCommand <base64>`. Base64 has nothing cmd.exe or PowerShell
+  interprets, so there is no quoting layer. A script too long for cmd.exe's
+  command-line limit is refused rather than truncated.
+- **Uploads.** The bundle and the run script are zipped locally, sent with
+  `scp -P <port>` (same key, known-hosts file and multiplexing as ssh) to
+  `/C:/...`, and unpacked with `Expand-Archive`.
+- **The run** is the uploaded `run.ps1` *file*, never an inline command string,
+  because quoting a script through ssh → cmd.exe → PowerShell truncates it
+  silently. It starts through `Win32_Process.Create`, so it is outside the
+  sshd session's job object and survives the connection closing. Its output
+  goes to `run.log`.
+- **Evidence** is `results.zip`, built on the host with
+  `System.IO.Compression.ZipFile` and fetched by scp. Locally, backslash entry
+  names are normalised and entries that would escape the destination are
+  refused; the inventory manifest is verified as on POSIX hosts.
+- **Preflight** probes Windows hosts too (OS caption, `NUMBER_OF_PROCESSORS`,
+  CPU load) and checks host-path oracles with `Get-FileHash`.
+- **Paths.** Windows host paths must be absolute and must not contain a double
+  quote, `%` or a line break, because the detached start passes them through a
+  cmd.exe command line.
+- `capabilities.perf` must be `none`.
+
+The generated PowerShell is pinned by golden files in
+`bench/rarpar-bench/internal/fleet/testdata/windows/`; regenerate them with
+`go test ./internal/fleet -run Golden -update` and review the diff. The POSIX
+transport is unchanged.
+
+**Defender.** Defender flags the `par3-rs` `engine_perf.exe` example as
+`Trojan:Win64/AsyncRAT.C!MTB`, a false positive. The operator-approved
+handling is a path-scoped Defender exclusion on the bench work directory,
+added by hand by the host owner. Nothing in the fleet tooling touches Defender
+settings, and nothing may; a quarantine still surfaces as `binary-quarantined`.

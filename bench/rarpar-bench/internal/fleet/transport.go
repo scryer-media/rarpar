@@ -25,6 +25,9 @@ import (
 //     overruns the 104-byte unix socket limit for long hostnames;
 //   - commands fed to the remote shell on stdin, never interpolated into a
 //     remote command line.
+//
+// A powershell host (connection.shell = "powershell") takes the Windows path
+// in wintransport.go instead: scp and PowerShell, no sh, no tar.
 type Transport struct {
 	Machine     string
 	Host        string
@@ -130,8 +133,8 @@ func (transport *Transport) RunScript(ctx context.Context, script string) (strin
 		return transport.ssm.run(ctx, script)
 	}
 	remoteShell := transport.Shell
-	if remoteShell == "powershell" {
-		return "", "", fmt.Errorf("machine %s: RunScript is POSIX-only; use the PowerShell runner", transport.Machine)
+	if transport.windows() {
+		return "", "", fmt.Errorf("machine %s: RunScript is POSIX-only; use RunPowerShell", transport.Machine)
 	}
 	command := transport.command(ctx, remoteShell+" -s")
 	command.Stdin = strings.NewReader(script)
@@ -147,10 +150,17 @@ func (transport *Transport) RunScript(ctx context.Context, script string) (strin
 
 // Probe is a cheap reachability + identity check used in preflight.
 func (transport *Transport) Probe(ctx context.Context) (string, error) {
-	stdout, _, err := transport.RunScript(ctx, "uname -srm; echo \"nproc=$(nproc 2>/dev/null || echo unknown)\"; echo \"loadavg=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || uptime)\"")
+	var stdout string
+	var err error
+	if transport.windows() && transport.ssm == nil {
+		stdout, _, err = transport.RunPowerShell(ctx, psProbeScript())
+	} else {
+		stdout, _, err = transport.RunScript(ctx, "uname -srm; echo \"nproc=$(nproc 2>/dev/null || echo unknown)\"; echo \"loadavg=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || uptime)\"")
+	}
 	if err != nil {
 		return "", err
 	}
+	stdout = strings.ReplaceAll(stdout, "\r", "")
 	return strings.TrimSpace(strings.ReplaceAll(stdout, "\n", " | ")), nil
 }
 
@@ -159,6 +169,9 @@ func (transport *Transport) Probe(ctx context.Context) (string, error) {
 func (transport *Transport) UploadDir(ctx context.Context, localDir, remoteDir string) error {
 	if transport.ssm != nil {
 		return transport.ssm.uploadDir(ctx, localDir, remoteDir)
+	}
+	if transport.windows() {
+		return transport.uploadDirWindows(ctx, localDir, remoteDir)
 	}
 	if err := transport.Mkdir(ctx, remoteDir); err != nil {
 		return err
@@ -206,6 +219,9 @@ func (transport *Transport) DownloadPath(ctx context.Context, remotePath, localD
 	if transport.ssm != nil {
 		return transport.ssm.downloadPath(ctx, remotePath, localDir)
 	}
+	if transport.windows() {
+		return transport.downloadPathWindows(ctx, remotePath, localDir)
+	}
 	if err := os.MkdirAll(localDir, 0o755); err != nil {
 		return err
 	}
@@ -243,16 +259,62 @@ func (transport *Transport) DownloadPath(ctx context.Context, remotePath, localD
 }
 
 func (transport *Transport) Mkdir(ctx context.Context, remoteDir string) error {
+	if transport.windows() && transport.ssm == nil {
+		_, _, err := transport.RunPowerShell(ctx, psMkdirScript(remoteDir))
+		return err
+	}
 	_, _, err := transport.RunScript(ctx, "set -e\nmkdir -p "+shellQuote(remoteDir)+"\n")
 	return err
 }
 
 func (transport *Transport) Exists(ctx context.Context, remotePath string) (bool, error) {
-	stdout, _, err := transport.RunScript(ctx, "if [ -e "+shellQuote(remotePath)+" ]; then echo yes; else echo no; fi\n")
+	var stdout string
+	var err error
+	if transport.windows() && transport.ssm == nil {
+		stdout, _, err = transport.RunPowerShell(ctx, psExistsScript(remotePath))
+	} else {
+		stdout, _, err = transport.RunScript(ctx, "if [ -e "+shellQuote(remotePath)+" ]; then echo yes; else echo no; fi\n")
+	}
 	if err != nil {
 		return false, err
 	}
 	return strings.TrimSpace(stdout) == "yes", nil
+}
+
+// RemoveAll deletes remote paths recursively; absent paths are not an error.
+func (transport *Transport) RemoveAll(ctx context.Context, paths ...string) error {
+	if transport.windows() && transport.ssm == nil {
+		_, _, err := transport.RunPowerShell(ctx, psRemoveAllScript(paths...))
+		return err
+	}
+	quoted := make([]string, 0, len(paths))
+	for _, path := range paths {
+		quoted = append(quoted, shellQuote(path))
+	}
+	_, _, err := transport.RunScript(ctx, "rm -rf "+strings.Join(quoted, " ")+"\n")
+	return err
+}
+
+// readMissingMarker is printed in place of an absent file.
+const readMissingMarker = "__PENDING__"
+
+// ReadOptionalFile returns a remote file's contents, or found=false when it
+// does not exist yet.
+func (transport *Transport) ReadOptionalFile(ctx context.Context, remotePath string) (string, bool, error) {
+	var stdout string
+	var err error
+	if transport.windows() && transport.ssm == nil {
+		stdout, _, err = transport.RunPowerShell(ctx, psReadOptionalScript(remotePath, readMissingMarker))
+	} else {
+		stdout, _, err = transport.RunScript(ctx, "cat "+shellQuote(remotePath)+" 2>/dev/null || echo "+readMissingMarker+"\n")
+	}
+	if err != nil {
+		return "", false, err
+	}
+	if strings.Contains(stdout, readMissingMarker) {
+		return "", false, nil
+	}
+	return stdout, true, nil
 }
 
 // Close drops the multiplexed master so a torn-down cloud host leaves no

@@ -967,7 +967,7 @@ func TestWindowsRunScriptExecutesAFile(t *testing.T) {
 		t.Fatalf("the Windows runner must execute a script file: %s", layout.Script)
 	}
 	script := WindowsRunScript(windows, config.Fleet.Defaults, "fleet-testrun", layout, map[string]string{"rar": "C:\\bench\\oracles\\UnRAR.exe"})
-	for _, expected := range []string{"MANIFEST.json", "DONE", "Gate ", "tar.exe"} {
+	for _, expected := range []string{"MANIFEST.json", "DONE", "Gate ", "ZipFile]::CreateFromDirectory"} {
 		if !strings.Contains(script, expected) {
 			t.Fatalf("Windows run script is missing %q", expected)
 		}

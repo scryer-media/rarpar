@@ -810,6 +810,11 @@ func validateHostPath(state *decodeState, prefix, name, value string, windows bo
 		if !strings.Contains(value, ":\\") && !strings.HasPrefix(value, "\\\\") {
 			state.fail("%s: %s must be an absolute Windows path: %s", prefix, name, value)
 		}
+		// The detached start passes paths through a cmd.exe command line,
+		// where a double quote ends the quoting and % expands variables.
+		if strings.ContainsAny(value, "\"%\r\n") {
+			state.fail("%s: %s must not contain a double quote, %% or a line break: %s", prefix, name, value)
+		}
 		return
 	}
 	// Remote paths are never relative: a relative staging path once resolved

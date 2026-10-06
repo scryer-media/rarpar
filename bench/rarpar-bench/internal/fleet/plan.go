@@ -215,7 +215,7 @@ func BuildPlan(config Config, machines []Machine, runID string) FleetPlan {
 		}
 		if machine.isWindows() {
 			plan.Warnings = append(plan.Warnings,
-				fmt.Sprintf("machine %s is a Windows host: the runner uploads and executes a .ps1 (no inline PowerShell quoting) and perf is unavailable", machine.Name))
+				fmt.Sprintf("machine %s is a Windows host: UNVALIDATED, the Windows transport (scp + PowerShell, no sh or tar) has never run live; treat this run as bring-up. The runner uploads and executes a .ps1 and perf is unavailable", machine.Name))
 		}
 		plan.Machines = append(plan.Machines, item)
 	}
@@ -253,8 +253,11 @@ func machineSteps(machine Machine, layout RemoteLayout) []string {
 		steps = append(steps, "probe reachability and prepare "+layout.Base)
 	}
 	channel := "tar-over-ssh"
-	if machine.usesSSM() {
+	switch {
+	case machine.usesSSM():
 		channel = "S3 (tar object, fetched by SSM RunCommand)"
+	case machine.isWindows():
+		channel = "scp (local zip, unpacked by Expand-Archive over PowerShell -EncodedCommand)"
 	}
 	steps = append(steps,
 		"upload bundle by "+channel+" to "+layout.Bin,
@@ -284,8 +287,8 @@ func machineSteps(machine Machine, layout RemoteLayout) []string {
 		steps = append(steps, "on host: no sampling collector; harness phase timings only")
 	}
 	steps = append(steps,
-		"on host: tarball + MANIFEST.json inventory + DONE sentinel",
-		"orchestrator: poll for DONE, pull the tarball, verify the manifest digests")
+		"on host: "+remoteBase(layout.Tarball)+" + MANIFEST.json inventory + DONE sentinel",
+		"orchestrator: poll for DONE, pull "+remoteBase(layout.Tarball)+", verify the manifest digests")
 	if machine.Kind == KindAWSEC2 {
 		steps = append(steps, "orchestrator: terminate and verify teardown resource-by-resource")
 	} else if machine.Paths.Cleanup {
@@ -346,7 +349,7 @@ func par3Durabilities(machine Machine) []string {
 
 func startStep(machine Machine) string {
 	if machine.isWindows() {
-		return "start it detached (Start-Process on the uploaded .ps1 FILE, never an inline command string)"
+		return "start it detached (Win32_Process.Create runs the uploaded .ps1 FILE outside the SSH session, never an inline command string); evidence returns as results.zip by scp"
 	}
 	return "start it detached (nohup/setsid); the orchestrator stops interacting with the host"
 }
