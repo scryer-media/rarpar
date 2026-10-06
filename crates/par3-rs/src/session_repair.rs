@@ -216,13 +216,10 @@ fn repair_inner(
             evidence.snapshot,
         )?;
     }
-    for payload in assessment
-        .recovery
-        .iter()
-        .chain(session.data_payloads().values())
-    {
-        session.input.validate_payload(payload, &session.options)?;
-    }
+    // Every payload is authenticated before its bytes are used, by the read
+    // that consumes it where that read takes the whole payload.
+    let checks = PayloadChecks::new(session);
+    checks.before_walk(session.options.stripe_bytes, layout.block_size, None)?;
     let path_cost = assessment
         .files
         .iter()
@@ -327,11 +324,19 @@ fn repair_inner(
             }
         }
         if assessment.lost_blocks.is_empty() {
-            copy_available(session, layout, Some(&tree), &staged, &proof)?;
+            copy_available(session, &checks, layout, Some(&tree), &staged, &proof)?;
         } else if let Some(PacketBody::FftMatrix(matrix)) =
             assessment.matrix.as_ref().map(|packet| packet.body())
         {
-            reconstruct_fft(session, layout, Some(&tree), &staged, &proof, matrix)?;
+            reconstruct_fft(
+                session,
+                &checks,
+                layout,
+                Some(&tree),
+                &staged,
+                &proof,
+                matrix,
+            )?;
         } else {
             let field_bytes = crate::gf::construction_cost(
                 &session.set.as_ref().expect("ready set").galois_field(),
@@ -343,14 +348,27 @@ fn repair_inner(
             let field =
                 crate::gf::for_set(&session.set.as_ref().expect("ready set").galois_field())?;
             match field {
-                crate::gf::AnyField::Gf8(field) => {
-                    reconstruct(session, layout, Some(&tree), &staged, &proof, field)?
-                }
-                crate::gf::AnyField::Gf16(field) => {
-                    reconstruct(session, layout, Some(&tree), &staged, &proof, field)?
-                }
+                crate::gf::AnyField::Gf8(field) => reconstruct(
+                    session,
+                    &checks,
+                    layout,
+                    Some(&tree),
+                    &staged,
+                    &proof,
+                    field,
+                )?,
+                crate::gf::AnyField::Gf16(field) => reconstruct(
+                    session,
+                    &checks,
+                    layout,
+                    Some(&tree),
+                    &staged,
+                    &proof,
+                    field,
+                )?,
             }
         }
+        checks.finish()?;
         finish_staged(session, layout, Some(&tree), &staged, &proof, durability)?;
         drop(proof);
         for evidence in session.evidence.values() {
@@ -377,6 +395,13 @@ fn repair_inner(
         Ok(assessment.lost_blocks.len() as u64)
     })();
     if result.is_err() {
+        if checks.refused() {
+            // A payload that no longer matches its packet refuses the repair
+            // as it did when every payload was authenticated before anything
+            // was staged: nothing was installed, and the staged outputs are
+            // removed rather than handed to the host to clean up.
+            tree.discard_temporary_outputs(temporary_outputs);
+        }
         tree.sanitize_temporary_outputs(temporary_outputs)?;
     }
     result
@@ -415,13 +440,10 @@ pub(crate) fn stage_embedded(
             evidence.snapshot,
         )?;
     }
-    for payload in assessment
-        .recovery
-        .iter()
-        .chain(session.data_payloads().values())
-    {
-        session.input.validate_payload(payload, &session.options)?;
-    }
+    // Every payload is authenticated before its bytes are used, by the read
+    // that consumes it where that read takes the whole payload.
+    let checks = PayloadChecks::new(session);
+    checks.before_walk(session.options.stripe_bytes, layout.block_size, None)?;
     let targets = [StagedFile {
         index: 0,
         destination: None,
@@ -435,7 +457,7 @@ pub(crate) fn stage_embedded(
         .set_len(layout.files[0].len)?;
     let proof = StagedProof::new(layout, &targets, &session.options);
     if assessment.lost_blocks.is_empty() {
-        copy_available(session, layout, None, &targets, &proof)?;
+        copy_available(session, &checks, layout, None, &targets, &proof)?;
     } else if layout.block_count != 0 {
         let set = session.set.as_ref().expect("assessed set");
         let _field = session.options.memory.reserve_as(
@@ -444,13 +466,14 @@ pub(crate) fn stage_embedded(
         )?;
         match crate::gf::for_set(&set.galois_field())? {
             crate::gf::AnyField::Gf8(field) => {
-                reconstruct(session, layout, None, &targets, &proof, field)?
+                reconstruct(session, &checks, layout, None, &targets, &proof, field)?
             }
             crate::gf::AnyField::Gf16(field) => {
-                reconstruct(session, layout, None, &targets, &proof, field)?
+                reconstruct(session, &checks, layout, None, &targets, &proof, field)?
             }
         }
     }
+    checks.finish()?;
     finish_staged(session, layout, None, &targets, &proof, durability)?;
     drop(proof);
     for evidence in session.evidence.values() {
@@ -463,8 +486,181 @@ pub(crate) fn stage_embedded(
     Ok(assessment.lost_blocks.len() as u64)
 }
 
+/// The payloads one repair consumes, each authenticated once before any of its
+/// bytes are used.
+///
+/// A read that takes a whole payload, which is every read of it once one
+/// stripe covers the block, is authenticated over the bytes it read, so the
+/// packet is fetched once rather than once to hash and again to use. Any other
+/// read authenticates its packet first, in a pass of its own, as every payload
+/// once was before the repair began; later stripes of that payload then read
+/// it as before. Nothing is decoded or written from a payload before its hash
+/// has matched, and a mismatch refuses the repair as it always has.
+/// [`Self::finish`] authenticates whatever the codec never read, so a repair
+/// still refuses a set carrying a payload that no longer matches its packet.
+struct PayloadChecks<'a> {
+    session: &'a Par3RepairSession,
+    /// Payloads already authenticated: `(is data, block or recovery index)`.
+    done: Mutex<std::collections::BTreeSet<(bool, u64)>>,
+    /// Whether an authentication refused the repair.
+    refused: AtomicBool,
+}
+
+impl<'a> PayloadChecks<'a> {
+    fn new(session: &'a Par3RepairSession) -> Self {
+        Self {
+            session,
+            done: Mutex::new(std::collections::BTreeSet::new()),
+            refused: AtomicBool::new(false),
+        }
+    }
+
+    fn key(payload: &crate::ingest::PayloadRef) -> (bool, u64) {
+        match payload.kind() {
+            crate::ingest::PayloadKind::Data { index } => (true, index),
+            crate::ingest::PayloadKind::Recovery { index, .. } => (false, index),
+        }
+    }
+
+    /// Whether a payload's authentication is what ended the repair.
+    fn refused(&self) -> bool {
+        self.refused.load(Ordering::Relaxed)
+    }
+
+    fn refusing(&self, checked: EngineResult<()>) -> EngineResult<()> {
+        if checked.is_err() {
+            self.refused.store(true, Ordering::Relaxed);
+        }
+        checked
+    }
+
+    fn checked(&self, key: (bool, u64)) -> bool {
+        self.done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&key)
+    }
+
+    fn note(&self, key: (bool, u64)) {
+        self.done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key);
+    }
+
+    /// Read `payload` from `offset` into `out`, zero past its end, once the
+    /// packet is known to match its hash.
+    fn read(
+        &self,
+        payload: &crate::ingest::PayloadRef,
+        offset: u64,
+        out: &mut [u8],
+    ) -> EngineResult<()> {
+        let session = self.session;
+        let key = Self::key(payload);
+        if !self.checked(key) {
+            if offset == 0 && out.len() as u64 >= payload.len() {
+                self.refusing(session.input.read_payload(payload, &session.options, out))?;
+                self.note(key);
+                return Ok(());
+            }
+            self.authenticate(payload, Some(out))?;
+        }
+        out.fill(0);
+        payload.read_at(offset, out)?;
+        Ok(())
+    }
+
+    /// Authenticate `payload` in a pass of its own. The codec's stripes may
+    /// hold the budget that pass reserves its buffer from, so `scratch`, a
+    /// buffer the codec already holds, serves instead when it is refused.
+    fn authenticate(
+        &self,
+        payload: &crate::ingest::PayloadRef,
+        scratch: Option<&mut [u8]>,
+    ) -> EngineResult<()> {
+        let session = self.session;
+        let checked = match (
+            session.input.validate_payload(payload, &session.options),
+            scratch,
+        ) {
+            (Err(EngineError::ResourceLimit(_)), Some(scratch)) => session
+                .input
+                .validate_payload_in(payload, &session.options, scratch),
+            (checked, _) => checked,
+        };
+        self.refusing(checked)?;
+        self.note(Self::key(payload));
+        Ok(())
+    }
+
+    /// Before a codec walking `stripe`-wide reads starts: a stripe narrower
+    /// than the block reads no payload whole, so every payload is
+    /// authenticated now, in the order and passes it always was, rather than
+    /// one at a time between the codec's reads. A repair configured narrower
+    /// than its block calls this before it stages anything, with no scratch,
+    /// exactly where every payload was once authenticated.
+    fn before_walk(
+        &self,
+        stripe: usize,
+        block_size: u64,
+        mut scratch: Option<&mut [u8]>,
+    ) -> EngineResult<()> {
+        if stripe as u64 >= block_size {
+            return Ok(());
+        }
+        let session = self.session;
+        let assessment = session.assessment.as_ref().expect("assessment");
+        for payload in assessment
+            .recovery
+            .iter()
+            .chain(session.data_payloads().values())
+        {
+            if !self.checked(Self::key(payload)) {
+                self.authenticate(payload, scratch.as_deref_mut())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Par3RepairSession::read_block`], with a block carried in a data
+    /// packet read through [`Self::read`].
+    fn read_block(
+        &self,
+        block: u64,
+        offset: u64,
+        out: &mut [u8],
+        covered: &mut [u8],
+        owed: Option<&OwedChecks>,
+    ) -> EngineResult<()> {
+        match self.session.data_payloads().get(&block) {
+            Some(payload) => self.read(payload, offset, out),
+            None => self.session.read_block(block, offset, out, covered, owed),
+        }
+    }
+
+    /// Authenticate every payload the repair selected and never read.
+    fn finish(&self) -> EngineResult<()> {
+        let session = self.session;
+        let assessment = session.assessment.as_ref().expect("assessment");
+        for payload in assessment
+            .recovery
+            .iter()
+            .chain(session.data_payloads().values())
+        {
+            let key = Self::key(payload);
+            if !self.checked(key) {
+                self.refusing(session.input.validate_payload(payload, &session.options))?;
+                self.note(key);
+            }
+        }
+        Ok(())
+    }
+}
+
 fn copy_available(
     session: &Par3RepairSession,
+    checks: &PayloadChecks<'_>,
     layout: &BlockLayout,
     tree: Option<&RepairTree>,
     outputs: &[StagedFile],
@@ -492,7 +688,7 @@ fn copy_available(
         while offset < layout.block_size {
             session.options.cancel.check()?;
             let take = (layout.block_size - offset).min(size as u64) as usize;
-            session.read_block(
+            checks.read_block(
                 block,
                 offset,
                 &mut bytes[..take],
@@ -545,6 +741,7 @@ fn cauchy_coefficient_bytes<F: Field>(n: usize) -> Option<usize> {
 
 fn reconstruct<F>(
     session: &Par3RepairSession,
+    checks: &PayloadChecks<'_>,
     layout: &BlockLayout,
     tree: Option<&RepairTree>,
     outputs: &[StagedFile],
@@ -805,6 +1002,7 @@ where
     let mut recovered = vec![vec![0u8; stripe]; tile];
     let mut inputs = vec![vec![0u8; stripe]; group * sets];
     let mut covered = vec![0u8; stripe];
+    checks.before_walk(stripe, layout.block_size, Some(&mut covered))?;
     let parallel = pool.as_ref().map(crate::runtime::WorkerPool::pool);
     let mut offset = 0;
     while offset < layout.block_size {
@@ -933,7 +1131,7 @@ where
                 if !coverage.contains(&block) && !needs_write(layout, outputs, block) {
                     continue;
                 }
-                session.read_block(
+                checks.read_block(
                     block,
                     offset,
                     &mut set[held][..take],
@@ -968,8 +1166,7 @@ where
                 let Some(payload) = assessment.recovery.get(next_row) else {
                     break;
                 };
-                input[..take].fill(0);
-                payload.read_at(offset, &mut input[..take])?;
+                checks.read(payload, offset, &mut input[..take])?;
                 next_row += 1;
             }
             Ok((next_row != first).then_some(StagedWork::Recovery {
@@ -1077,6 +1274,7 @@ fn fft_codec_with_source_stripes(
 
 fn reconstruct_fft(
     session: &Par3RepairSession,
+    checks: &PayloadChecks<'_>,
     layout: &BlockLayout,
     tree: Option<&RepairTree>,
     outputs: &[StagedFile],
@@ -1103,6 +1301,7 @@ fn reconstruct_fft(
     )?;
     let mut covered = vec![0; stripe];
     let mut bytes = vec![0; stripe];
+    checks.before_walk(stripe, layout.block_size, Some(&mut bytes))?;
     let writers = StageWriters::new(tree, session, proof);
     // The proof's frontiers are reserved by the first decode, once its
     // stripe is known and before it reads anything: the first stripe pass
@@ -1132,7 +1331,7 @@ fn reconstruct_fft(
         while offset < layout.block_size {
             session.options.cancel.check()?;
             let take = (layout.block_size - offset).min(stripe as u64) as usize;
-            session.read_block(
+            checks.read_block(
                 block,
                 offset,
                 &mut bytes[..take],
@@ -1195,7 +1394,7 @@ fn reconstruct_fft(
                             if block >= coverage.end {
                                 out.fill(0);
                             } else {
-                                session.read_block(
+                                checks.read_block(
                                     block,
                                     offset,
                                     out,
@@ -1208,8 +1407,7 @@ fn reconstruct_fft(
                             }
                         }
                         FftInput::Recovery(index) => {
-                            out.fill(0);
-                            recovery[&index].read_at(offset, out)?;
+                            checks.read(recovery[&index], offset, out)?;
                         }
                     }
                     Ok(())

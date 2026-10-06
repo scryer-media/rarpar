@@ -151,6 +151,19 @@ impl RepairTree {
         Ok((name, display, false))
     }
 
+    /// Remove staged outputs a refused repair leaves no host a reason to keep.
+    /// A path that cannot be removed stays in `outputs`, so the host is still
+    /// told about it.
+    pub(crate) fn discard_temporary_outputs(&self, outputs: &mut Vec<PathBuf>) {
+        outputs.retain(|path| {
+            path.file_name()
+                .is_none_or(|name| match std::fs::remove_file(self.stage.join(name)) {
+                    Ok(()) => false,
+                    Err(error) => error.kind() != io::ErrorKind::NotFound,
+                })
+        });
+    }
+
     pub(crate) fn create_stage_file(
         &self,
         index: usize,
