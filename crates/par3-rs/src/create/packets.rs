@@ -70,11 +70,17 @@ pub(crate) fn build(
         legacy_random: None,
     };
     let start_body = start.to_body_bytes();
+    // Built once: the InputSetID digests what these packets carry, and then
+    // they are written.
+    let file_packets: Vec<FilePacket> = files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| file_packet(file, map, outcome, index))
+        .collect();
     let set_id = generate_set_id(
         files,
+        &file_packets,
         directories,
-        map,
-        outcome,
         shape.block_size,
         &start_body,
     );
@@ -102,11 +108,8 @@ pub(crate) fn build(
     // stream, but both parents still name that one hash as a child.
     let mut file_hashes: Vec<Fingerprint> = Vec::with_capacity(files.len());
     let mut written: Vec<Fingerprint> = Vec::new();
-    for (index, file) in files.iter().enumerate() {
-        let packet = Packet::new(
-            set_id,
-            PacketBody::File(file_packet(file, map, outcome, index)),
-        );
+    for file_packet in file_packets {
+        let packet = Packet::new(set_id, PacketBody::File(file_packet));
         let hash = packet.hash();
         file_hashes.push(hash);
         if !written.contains(&hash) {
@@ -280,22 +283,18 @@ fn last_component(name: &str) -> &str {
 
 /// Derive the set's InputSetID for this module's planned files.
 ///
-/// The chunk descriptions fed to the digest are the ones the File packets will
+/// The chunk descriptions fed to the digest are the ones the File packets
 /// carry, so this and the streaming engine in [`crate::creation`] share one
 /// derivation through [`input_set_id`].
 fn generate_set_id(
     files: &[PlannedFile],
+    packets: &[FilePacket],
     directories: &[String],
-    map: &BlockMap,
-    outcome: &EncodeOutcome,
     block_size: u64,
     start_body: &[u8],
 ) -> InputSetId {
-    let packets: Vec<FilePacket> = (0..files.len())
-        .map(|index| file_packet(&files[index], map, outcome, index))
-        .collect();
     input_set_id(
-        files.iter().zip(&packets).map(|(file, packet)| SetIdFile {
+        files.iter().zip(packets).map(|(file, packet)| SetIdFile {
             name: &file.name,
             size: file.size,
             fingerprint: &packet.fingerprint,
