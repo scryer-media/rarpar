@@ -775,3 +775,56 @@ fn a_copy_that_walks_a_block_in_windows_counts_one_pass_per_window() {
     drop(session);
     assert_eq!(options.memory.used(), 0, "the session leaked");
 }
+
+/// A repair proves each staged output from the bytes it writes, whether a
+/// stripe covers a whole block or a block is written over several passes, so
+/// no staged byte is read back. Only `SyncFiles`, the default, synchronizes it.
+#[test]
+fn repair_proves_staged_outputs_and_syncs_only_when_asked() {
+    use par3_rs::session_repair::RepairDurability;
+    let tree = common::TempTree::new("staged-proof");
+    let set = common::cauchy_block_set(64, 4096, 8, b"PAR3 staged proof", &tree);
+    let (name, bytes) = set.contents[0].clone();
+    let mut damaged = bytes.clone();
+    for block in [2usize, 5, 9] {
+        damaged[block * 4096 + 17] ^= 0x80;
+    }
+    for (stripe, durability, syncs) in [
+        (4096, RepairDurability::SyncFiles, 1),
+        (1024, RepairDurability::SyncFiles, 1),
+        (4096, RepairDurability::Buffered, 0),
+        (1024, RepairDurability::Buffered, 0),
+    ] {
+        let case = format!("{stripe}-byte stripes, {durability:?}");
+        let mut access = MemorySourceAccess::default();
+        access.insert(SourceId(1), 1, damaged.clone().into());
+        let mut options = ExecutionOptions::default();
+        options.workers = 1;
+        options.stripe_bytes = stripe;
+        let mut session =
+            Par3RepairSession::new(set.id, Arc::new(access), options.clone()).unwrap();
+        session.bind_file(&name, SourceId(1)).unwrap();
+        for path in &set.paths {
+            for packet in common::scanned_packets(std::fs::read(path).unwrap(), &options) {
+                session.merge(packet).unwrap();
+            }
+        }
+        assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
+        let output = common::TempTree::new("staged-proof-out");
+        let report = session
+            .repair_with_durability(output.path(), false, durability)
+            .unwrap();
+        assert_eq!(report.reconstructed_blocks, 3, "{case}");
+        assert_eq!(
+            std::fs::read(output.path().join(&name)).unwrap(),
+            bytes,
+            "{case}"
+        );
+        let io = options.diagnostics.file_io();
+        assert_eq!(io.read_bytes, 0, "{case}: a staged output was read back");
+        assert_eq!(io.write_bytes, bytes.len() as u64, "{case}");
+        assert_eq!(options.diagnostics.file_sync().calls, syncs, "{case}");
+        drop(session);
+        assert_eq!(options.memory.used(), 0, "{case}: the session leaked");
+    }
+}

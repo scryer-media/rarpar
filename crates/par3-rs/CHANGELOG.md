@@ -71,6 +71,27 @@
   synced. Spooled rows, and source blocks copied into data carriers, are read
   once instead of twice. Every other fsync and the carrier read-back are
   unchanged.
+- **Behaviour change:** staged outputs are no longer read back before
+  installation. Carriers are authenticated packet by packet as their bytes
+  reach the file, with the checks the scanner made; staged repair outputs are
+  proven from the bytes each write hands the kernel against the authenticated
+  block checksums, and fall back to the old read-back for anything that
+  proof does not cover (out-of-order or repeated writes, an extent without a
+  checksum, a budget refusal). What is proven is what the engine wrote; a
+  storage layer that keeps different bytes is the synchronization barrier's
+  contract and a later verification's question. A 1 GiB repair reads 1 GiB
+  less; creation no longer re-reads its carriers.
+- The recovery spool is never synchronized; it is scratch consumed by the same
+  process. `CreationDurability::SyncFiles` covers staged carriers only.
+- New `RepairDurability { SyncFiles, Buffered }` and
+  `Par3RepairSession::repair_with_durability`; `repair` keeps `SyncFiles`.
+  Under `Buffered` nothing is synchronized before installation and a crash
+  can leave a partial or empty output where the damaged one was; the host
+  must issue its own barrier.
+- Source-change checks during repair settle once at the end of each stripe
+  pass and before installation, not before every staged write (a 1 GiB
+  repair: 16,948 snapshots → 618). A source changed mid-repair still ends in
+  `SourceChanged` with nothing installed; it is noticed at the end of the pass.
 
 ## 0.4.3
 

@@ -545,31 +545,39 @@ fn repair_rejects_a_source_changed_within_or_between_stripe_passes() {
     options.workers = 1;
     options.stripe_bytes = 1024;
     // Thirty surviving blocks are read per pass: read 5 is inside the first
-    // pass, read 30 opens the second, after the first pass was staged. Each
-    // surviving stripe is staged as soon as it is read, so the change is
-    // caught by the check before that write, one read later.
-    for at in [5, 30] {
-        for truncate in [false, true] {
-            if !truncate && !cfg!(unix) {
-                continue;
-            }
-            let run = repair_watched(
-                &set,
-                &[(0, 4096 + 5), (0, 9 * 4096 + 7)],
-                &options,
-                Some((0, at, truncate)),
-            );
-            // The staged temporary is handed to the host; nothing installed.
-            match &run.result {
-                Err(EngineError::RepairInterrupted {
-                    installed, cause, ..
-                }) if installed.is_empty()
-                    && matches!(**cause, EngineError::SourceChanged(SourceId(1))) => {}
-                result => panic!("change before read {at} (truncate {truncate}): {result:?}"),
-            }
-            assert_eq!(run.reads, at + 1);
-            assert!(!run.output.path().join("input.bin").exists());
+    // pass, read 30 opens the second, after the first pass was staged. A
+    // replaced file still reads through the old handle and is caught when
+    // that pass settles, after its thirtieth read; a truncated one fails at
+    // block 16, the fifteenth read of the pass, the first past its new end.
+    // Either way the staged temporary is never installed.
+    for (at, truncate, reads) in [
+        (5, false, 30),
+        (5, true, 15),
+        (30, false, 60),
+        (30, true, 45),
+    ] {
+        if !truncate && !cfg!(unix) {
+            continue;
         }
+        let run = repair_watched(
+            &set,
+            &[(0, 4096 + 5), (0, 9 * 4096 + 7)],
+            &options,
+            Some((0, at, truncate)),
+        );
+        // The staged temporary is handed to the host; nothing installed.
+        match &run.result {
+            Err(EngineError::RepairInterrupted {
+                installed, cause, ..
+            }) if installed.is_empty()
+                && matches!(**cause, EngineError::SourceChanged(SourceId(1))) => {}
+            result => panic!("change before read {at} (truncate {truncate}): {result:?}"),
+        }
+        assert_eq!(
+            run.reads, reads,
+            "change before read {at} (truncate {truncate})"
+        );
+        assert!(!run.output.path().join("input.bin").exists());
     }
 }
 
@@ -581,12 +589,13 @@ fn repair_checks_sources_it_does_not_write_once_per_pass() {
     options.workers = 1;
     let run = repair_from_disk(&set, &[(1, 70)], &options);
     // One stripe pass reads all 127 surviving blocks in file order, and only
-    // the damaged second file is written. Its 15 reads are each checked before
-    // the write that follows them; the seven other sources are checked once
-    // each, before the next write. The other 32 are the evidence checks before
-    // and after reconstruction, four per file. Checking every read cost 159.
+    // the damaged second file is written. Each of the eight sources is checked
+    // once, when the pass settles; staging its writes no longer checks the
+    // reads before each one (that cost 15 + 7 more). The other 32 are the
+    // evidence checks before and after reconstruction, four per file.
+    // Checking every read cost 159.
     assert_eq!(run.reads, 127);
-    assert_eq!(run.snapshots, 32 + 15 + 7);
+    assert_eq!(run.snapshots, 32 + 8);
 }
 
 #[cfg(unix)]

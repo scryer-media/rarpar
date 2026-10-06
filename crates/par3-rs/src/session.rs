@@ -1285,16 +1285,34 @@ impl Par3RepairSession {
 
     /// Reconstruct damaged files into an explicitly selected output directory.
     /// Sources remain read-only; verified temporary outputs are installed only
-    /// after their complete protected-data hashes match.
+    /// after their complete protected-data hashes match. Each staged output is
+    /// synchronized before installation; see [`Self::repair_with_durability`].
     pub fn repair(
         &mut self,
         output: &Path,
         backup: bool,
     ) -> EngineResult<crate::session_repair::SessionRepairReport> {
+        self.repair_with_durability(
+            output,
+            backup,
+            crate::session_repair::RepairDurability::SyncFiles,
+        )
+    }
+
+    /// [`Self::repair`] with an explicit file synchronization policy. Under
+    /// [`crate::session_repair::RepairDurability::Buffered`] every output is
+    /// still verified before installation, but a crash after installation can
+    /// leave a partial file under its name; the host owns the barrier.
+    pub fn repair_with_durability(
+        &mut self,
+        output: &Path,
+        backup: bool,
+        durability: crate::session_repair::RepairDurability,
+    ) -> EngineResult<crate::session_repair::SessionRepairReport> {
         let _progress = self.options.stage(crate::runtime::Stage::Repair)?;
         // `assess` already counts its own refusals; only the repair's are added.
         self.assess()?;
-        let outcome = crate::session_repair::repair(self, output, backup);
+        let outcome = crate::session_repair::repair(self, output, backup, durability);
         if let Err(error) = &outcome {
             self.options.diagnostics.note_refusal(error);
         }

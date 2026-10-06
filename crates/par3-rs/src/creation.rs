@@ -63,9 +63,10 @@ pub enum VolumeLayout {
 /// File synchronization policy for standalone creation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CreationDurability {
-    /// Preserve the default: synchronize scratch and staged carrier files before
-    /// installation. This does not synchronize parent directories or promise
-    /// atomic installation of the complete set across a crash.
+    /// Preserve the default: synchronize each staged carrier file once before
+    /// installation. Scratch files are never synchronized. This does not
+    /// synchronize parent directories or promise atomic installation of the
+    /// complete set across a crash.
     #[default]
     SyncFiles,
     /// Flush application buffers without requesting durable storage barriers.
@@ -859,11 +860,8 @@ impl CreationPlan {
                 spool
             }
         };
-        if durability == CreationDurability::SyncFiles
-            && let RecoverySpool::File { file, .. } = &spool
-        {
-            file.sync_all()?;
-        }
+        // The spool is scratch this process reads back and deletes; no policy
+        // makes it durable.
         let mut staged = Vec::new();
         for (number, destination) in destinations.iter().enumerate() {
             self.options.execution.cancel.check()?;
@@ -878,7 +876,18 @@ impl CreationPlan {
             let file = OpenOptions::new()
                 .write(true)
                 .open_budgeted(temporary.path(), &self.options.execution)?;
-            let mut out = std::io::BufWriter::with_capacity(buffer_size, file);
+            // Packets are authenticated as the buffer hands them to the file,
+            // so the staged carrier is never read back. A streamed payload is
+            // read twice, once to hash and once to write; this is what proves
+            // the second read wrote what the first one hashed.
+            let mut out = std::io::BufWriter::with_capacity(
+                buffer_size,
+                crate::ingest::AuthenticatingWriter::new(
+                    file,
+                    self.id,
+                    self.options.execution.clone(),
+                ),
+            );
             for packet in &self.metadata {
                 out.write_all(packet)?;
             }
@@ -938,54 +947,18 @@ impl CreationPlan {
                     )?;
                 }
             }
-            out.flush()?;
+            let out = out
+                .into_inner()
+                .map_err(std::io::IntoInnerError::into_error)?;
+            // The temporary was created empty and written from its start, so
+            // the bytes counted are its length.
+            out.finish(self.requirements.output_sizes[number])?;
             if durability == CreationDurability::SyncFiles {
                 out.get_ref().sync_all()?;
             }
             drop(out);
             drop(whole);
             drop(_output_buffer);
-            if std::fs::metadata(temporary.path())?.len() != self.requirements.output_sizes[number]
-            {
-                return Err(EngineError::InvalidState("creation size differs from plan"));
-            }
-            let mut source =
-                crate::source::DiskSourceAccess::with_options(self.options.execution.clone());
-            source.insert(SourceId(0), temporary.path().to_owned());
-            let mut scanner = crate::ingest::PacketScanner::new(
-                Arc::new(source),
-                SourceId(0),
-                self.options.execution.clone(),
-                crate::ScanLimits::default(),
-            )?;
-            let mut authenticated_end = 0;
-            loop {
-                match scanner.poll()? {
-                    crate::ingest::ScanEvent::Packet(packet) => {
-                        let origin = packet.origin();
-                        if origin.offset != authenticated_end || packet.input_set_id() != self.id {
-                            return Err(EngineError::InvalidState(
-                                "staged carrier has unauthenticated bytes",
-                            ));
-                        }
-                        authenticated_end = origin
-                            .offset
-                            .checked_add(origin.length)
-                            .ok_or(EngineError::resource_limit("staged carrier length"))?;
-                    }
-                    crate::ingest::ScanEvent::End => break,
-                    crate::ingest::ScanEvent::NeedData { .. } => {
-                        return Err(EngineError::InvalidState(
-                            "created carrier has unavailable bytes",
-                        ));
-                    }
-                }
-            }
-            if authenticated_end != self.requirements.output_sizes[number] {
-                return Err(EngineError::InvalidState(
-                    "staged carrier authentication is incomplete",
-                ));
-            }
             staged.push(temporary);
         }
         drop(spool);
@@ -1260,9 +1233,10 @@ impl CreationPlan {
 
     /// What the carrier stage reserves at its peak while resident rows are
     /// still held. Writing takes the staging buffer and a streamed packet's
-    /// stripe; authenticating takes the scanner's two stripes, the widest
-    /// metadata packet twice over (wire copy and parsed body, each with its
-    /// bookkeeping) and a stripe of slack for a provider's pinned view.
+    /// stripe. Authentication runs as metadata is written, beside the staging
+    /// buffer alone, and takes the widest metadata packet twice over (wire
+    /// copy and parsed body, each with its bookkeeping); the second term was
+    /// sized for a scanner reading the carrier back and still bounds that.
     fn carrier_stage_bytes(&self) -> usize {
         let stripe = self.options.execution.stripe_bytes.min(64 << 10);
         let packet = self.metadata.iter().map(Vec::len).max().unwrap_or(0);

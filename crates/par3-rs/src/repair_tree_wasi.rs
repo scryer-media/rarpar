@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::runtime::{EngineError, EngineFile, EngineResult, ExecutionOptions};
+use crate::session_repair::RepairDurability;
 
 static STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -176,7 +177,10 @@ impl RepairTree {
         stage_name: &OsStr,
         destination: &Destination,
         backup: bool,
+        _durability: RepairDurability,
     ) -> EngineResult<Option<PathBuf>> {
+        // A plain rename never copies, so there is no destination-local file
+        // for the policy to synchronize.
         let (parent, filename) = relative_parent(&self.base, &destination.relative, true)?;
         let target = parent.join(&filename);
         let mut saved = None;

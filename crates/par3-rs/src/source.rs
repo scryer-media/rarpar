@@ -640,9 +640,10 @@ pub(crate) fn ensure_snapshot(
 
 /// Snapshot checks owed for bytes already read and not yet vouched for.
 ///
-/// A pass reading many ranges of a source before it writes anything derived
-/// from them records each read here and settles before its first write, so
-/// each source is checked once, after every read the write can depend on.
+/// A pass reading many ranges of a source records each read here and settles
+/// once, after its last read and before anything derived from those reads is
+/// verified, installed or carried into the next pass, so each source is checked
+/// once, after every read the output can depend on.
 #[derive(Default)]
 pub(crate) struct OwedChecks(Mutex<std::collections::BTreeSet<(SourceId, u64, u64)>>);
 
@@ -656,8 +657,8 @@ impl OwedChecks {
             .insert((source, snapshot.len, snapshot.generation));
     }
 
-    /// Check every owed source once. Call after the last read a write may
-    /// depend on and before that write.
+    /// Check every owed source once. Call after the last read an output may
+    /// depend on and before that output is relied on.
     pub(crate) fn settle(&self, access: &dyn SourceAccess) -> EngineResult<()> {
         let mut owed = self.lock();
         for &(source, len, generation) in owed.iter() {

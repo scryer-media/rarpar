@@ -6,10 +6,12 @@
 //! Timing excludes directory discovery. Each invocation is one fresh process.
 //! PAR3_BENCH_CREATE_DURABILITY=buffered opts creation into buffered output;
 //! the default is sync-files. The selected policy is recorded in metrics.
+//! PAR3_BENCH_REPAIR_DURABILITY=buffered does the same for repair.
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use par3_rs::ScanLimits;
@@ -18,9 +20,43 @@ use par3_rs::ingest::{PacketScanner, ScanEvent};
 use par3_rs::placement::{PlacementOptions, search_extent};
 use par3_rs::runtime::{ExecutionOptions, IoSnapshot, MemoryBudget, Stage};
 use par3_rs::session::{Par3RepairSession, RepairStatus};
-use par3_rs::source::{DiskSourceAccess, SourceId};
+use par3_rs::source::{DiskSourceAccess, SourceAccess, SourceId, SourceSnapshot};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
+
+/// The disk registry, counting the source snapshots (one metadata call each on
+/// Unix) the engine asks it for.
+struct Counted(DiskSourceAccess, Arc<AtomicU64>);
+
+impl SourceAccess for Counted {
+    fn pin(
+        &self,
+        source: SourceId,
+        options: &ExecutionOptions,
+    ) -> std::io::Result<Option<Arc<dyn SourceAccess>>> {
+        self.0.pin(source, options)
+    }
+    fn snapshot(&self, source: SourceId) -> std::io::Result<Option<SourceSnapshot>> {
+        self.1.fetch_add(1, Ordering::Relaxed);
+        self.0.snapshot(source)
+    }
+    fn read_at(&self, source: SourceId, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read_at(source, offset, out)
+    }
+    fn next_available(
+        &self,
+        source: SourceId,
+        offset: u64,
+    ) -> std::io::Result<Option<std::ops::Range<u64>>> {
+        self.0.next_available(source, offset)
+    }
+    fn open_sequential(
+        &self,
+        source: SourceId,
+    ) -> std::io::Result<Option<Box<dyn std::io::Read + Send>>> {
+        self.0.open_sequential(source)
+    }
+}
 
 fn files(directory: &Path, extension: &str) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
@@ -63,6 +99,7 @@ fn main() -> Result<()> {
     options.memory = MemoryBudget::new(args[5].parse::<usize>()? * (1 << 20));
     options.retained_bytes = options.retained_bytes.min(options.memory.limit() / 2);
     let mut access = DiskSourceAccess::with_options(options.clone());
+    let snapshots = Arc::new(AtomicU64::new(0));
     let mut sources = Vec::new();
     for (index, path) in files(data, "bin")?.into_iter().enumerate() {
         let id = SourceId(index as u64);
@@ -102,7 +139,7 @@ fn main() -> Result<()> {
             execution: options.clone(),
             ..CreationOptions::default()
         };
-        let access = Arc::new(access);
+        let access = Arc::new(Counted(access, snapshots.clone()));
         let before = options.diagnostics.source_io();
         let start = Instant::now();
         let plan = CreationPlan::build(access, &sources, settings)?;
@@ -137,7 +174,7 @@ fn main() -> Result<()> {
             access.insert(id, path);
             carrier_ids.push(id);
         }
-        let access = Arc::new(access);
+        let access = Arc::new(Counted(access, snapshots.clone()));
         let before = options.diagnostics.source_io();
         let start = Instant::now();
         let mut session = None;
@@ -236,7 +273,17 @@ fn main() -> Result<()> {
                 "repair" if status == RepairStatus::Ready => {
                     let before = options.diagnostics.source_io();
                     let start = Instant::now();
-                    let report = session.repair(output, false)?;
+                    let report = match std::env::var("PAR3_BENCH_REPAIR_DURABILITY").as_deref() {
+                        Ok("buffered") => session.repair_with_durability(
+                            output,
+                            false,
+                            par3_rs::session_repair::RepairDurability::Buffered,
+                        )?,
+                        Err(std::env::VarError::NotPresent) | Ok("sync-files") => {
+                            session.repair(output, false)?
+                        }
+                        _ => return Err("invalid PAR3_BENCH_REPAIR_DURABILITY".into()),
+                    };
                     metric("repair", start, before, &options);
                     println!(
                         "{{\"installed\":{},\"reconstructed_blocks\":{}}}",
@@ -274,11 +321,14 @@ fn main() -> Result<()> {
     );
     let io = options.diagnostics.file_io();
     println!(
-        "{{\"file_read_bytes\":{},\"file_read_calls\":{},\"file_write_bytes\":{},\"file_write_calls\":{},\"memory_limit\":{},\"workers\":{}}}",
+        "{{\"file_read_bytes\":{},\"file_read_calls\":{},\"file_write_bytes\":{},\"file_write_calls\":{},\"file_opens\":{},\"file_syncs\":{},\"source_snapshots\":{},\"memory_limit\":{},\"workers\":{}}}",
         io.read_bytes,
         io.read_calls,
         io.write_bytes,
         io.write_calls,
+        options.diagnostics.file_opens(),
+        sync.completed,
+        snapshots.load(Ordering::Relaxed),
         options.memory.limit(),
         options.workers
     );

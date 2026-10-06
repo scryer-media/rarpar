@@ -38,6 +38,23 @@ pub struct SessionRepairReport {
     pub reconstructed_blocks: u64,
 }
 
+/// File synchronization policy for retained-session repair.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RepairDurability {
+    /// Preserve the default: synchronize each staged output file once before
+    /// installation, and a destination-local copy once before it is renamed
+    /// into place. This does not synchronize parent directories or promise
+    /// atomic installation of the complete set across a crash.
+    #[default]
+    SyncFiles,
+    /// Flush application buffers without requesting durable storage barriers.
+    /// Every staged output is still checked against the authenticated layout
+    /// before installation, but a crash after installation can leave a
+    /// partial or stale file under the destination name. The host must own
+    /// the barrier, for example by synchronizing the outputs it was given.
+    Buffered,
+}
+
 struct StagedFile {
     index: usize,
     destination: Option<Destination>,
@@ -70,10 +87,18 @@ pub(crate) fn repair(
     session: &mut Par3RepairSession,
     output: &Path,
     backup: bool,
+    durability: RepairDurability,
 ) -> EngineResult<SessionRepairReport> {
     let mut installed = Vec::new();
     let mut temporary = Vec::new();
-    match repair_inner(session, output, backup, &mut installed, &mut temporary) {
+    match repair_inner(
+        session,
+        output,
+        backup,
+        durability,
+        &mut installed,
+        &mut temporary,
+    ) {
         Ok(reconstructed_blocks) => Ok(SessionRepairReport {
             installed,
             reconstructed_blocks,
@@ -93,6 +118,7 @@ fn repair_inner(
     session: &mut Par3RepairSession,
     output: &Path,
     backup: bool,
+    durability: RepairDurability,
     installed: &mut Vec<InstalledFile>,
     temporary_outputs: &mut Vec<PathBuf>,
 ) -> EngineResult<u64> {
@@ -186,12 +212,13 @@ fn repair_inner(
                 temporary,
             });
         }
+        let proof = StagedProof::new(layout, &staged, &session.options);
         if assessment.lost_blocks.is_empty() {
-            copy_available(session, layout, Some(&tree), &staged)?;
+            copy_available(session, layout, Some(&tree), &staged, &proof)?;
         } else if let Some(PacketBody::FftMatrix(matrix)) =
             assessment.matrix.as_ref().map(|packet| packet.body())
         {
-            reconstruct_fft(session, layout, Some(&tree), &staged, matrix)?;
+            reconstruct_fft(session, layout, Some(&tree), &staged, &proof, matrix)?;
         } else {
             let field_bytes = crate::gf::construction_cost(
                 &session.set.as_ref().expect("ready set").galois_field(),
@@ -204,29 +231,15 @@ fn repair_inner(
                 crate::gf::for_set(&session.set.as_ref().expect("ready set").galois_field())?;
             match field {
                 crate::gf::AnyField::Gf8(field) => {
-                    reconstruct(session, layout, Some(&tree), &staged, field)?
+                    reconstruct(session, layout, Some(&tree), &staged, &proof, field)?
                 }
                 crate::gf::AnyField::Gf16(field) => {
-                    reconstruct(session, layout, Some(&tree), &staged, field)?
+                    reconstruct(session, layout, Some(&tree), &staged, &proof, field)?
                 }
             }
         }
-        // Inline tails need no source and no recovery equation.
-        for target in &staged {
-            let mut file = open_staged(Some(&tree), target, false, true, &session.options)?;
-            let extents = &layout.files[target.index].extents;
-            for index in 0..extents.len() {
-                if let Some(bytes) = extents.inline_bytes(index) {
-                    let range = extents.range(index).expect("bounded extent");
-                    file.seek(SeekFrom::Start(range.start))?;
-                    file.write_all(bytes)?;
-                }
-            }
-            file.sync_all()?;
-        }
-        for target in &staged {
-            verify_staged(session, layout, Some(&tree), target)?;
-        }
+        finish_staged(session, layout, Some(&tree), &staged, &proof, durability)?;
+        drop(proof);
         for evidence in session.evidence.values() {
             crate::source::ensure_snapshot(
                 session.access.as_ref(),
@@ -240,6 +253,7 @@ fn repair_inner(
                 target.stage_name.as_deref().expect("tree staging name"),
                 target.destination.as_ref().expect("tree destination"),
                 backup,
+                durability,
             )?;
             temporary_outputs.retain(|path| path != &target.temporary);
             installed.push(InstalledFile {
@@ -260,6 +274,7 @@ fn repair_inner(
 pub(crate) fn stage_embedded(
     session: &mut Par3RepairSession,
     temporary: &Path,
+    durability: RepairDurability,
 ) -> EngineResult<u64> {
     session.options.validate()?;
     if !matches!(
@@ -304,8 +319,9 @@ pub(crate) fn stage_embedded(
         .write(true)
         .open_budgeted(temporary, &session.options)?
         .set_len(layout.files[0].len)?;
+    let proof = StagedProof::new(layout, &targets, &session.options);
     if assessment.lost_blocks.is_empty() {
-        copy_available(session, layout, None, &targets)?;
+        copy_available(session, layout, None, &targets, &proof)?;
     } else if layout.block_count != 0 {
         let set = session.set.as_ref().expect("assessed set");
         let _field = session.options.memory.reserve_as(
@@ -313,26 +329,16 @@ pub(crate) fn stage_embedded(
             crate::gf::construction_cost(&set.galois_field()),
         )?;
         match crate::gf::for_set(&set.galois_field())? {
-            crate::gf::AnyField::Gf8(field) => reconstruct(session, layout, None, &targets, field)?,
+            crate::gf::AnyField::Gf8(field) => {
+                reconstruct(session, layout, None, &targets, &proof, field)?
+            }
             crate::gf::AnyField::Gf16(field) => {
-                reconstruct(session, layout, None, &targets, field)?
+                reconstruct(session, layout, None, &targets, &proof, field)?
             }
         }
     }
-    let mut output = OpenOptions::new()
-        .write(true)
-        .open_budgeted(temporary, &session.options)?;
-    let extents = &layout.files[0].extents;
-    for index in 0..extents.len() {
-        if let Some(bytes) = extents.inline_bytes(index) {
-            let range = extents.range(index).expect("bounded extent");
-            output.seek(SeekFrom::Start(range.start))?;
-            output.write_all(bytes)?;
-        }
-    }
-    output.sync_all()?;
-    drop(output);
-    verify_staged(session, layout, None, &targets[0])?;
+    finish_staged(session, layout, None, &targets, &proof, durability)?;
+    drop(proof);
     for evidence in session.evidence.values() {
         crate::source::ensure_snapshot(
             session.access.as_ref(),
@@ -348,6 +354,7 @@ fn copy_available(
     layout: &BlockLayout,
     tree: Option<&RepairTree>,
     outputs: &[StagedFile],
+    proof: &StagedProof,
 ) -> EngineResult<()> {
     let mut progress = session.options.stage(crate::runtime::Stage::Repair)?;
     // Data packets, aliases and inline-only files require no field or matrix.
@@ -360,7 +367,7 @@ fn copy_available(
     let mut bytes = vec![0; size];
     let mut covered = vec![0; size];
     let mut copied = false;
-    let writers = StageWriters::new(tree, session);
+    let writers = StageWriters::new(tree, session, proof);
     for (block, locations) in layout.blocks() {
         if !locations
             .iter()
@@ -378,13 +385,16 @@ fn copy_available(
                 offset,
                 &mut bytes[..take],
                 &mut covered[..take],
-                None,
+                Some(writers.owed()),
             )?;
             scatter(&writers, layout, outputs, block, offset, &bytes[..take])?;
             progress.advance(take as u64);
             offset += take as u64;
         }
     }
+    // One check per source read, after the whole copy and before anything it
+    // staged is verified or installed.
+    writers.settle()?;
     // A block wider than the copy window is walked in windows, and each window
     // covers a different part of it, so no byte is fetched twice: what costs is
     // the extra walk. It is one walk over the copied blocks however many there
@@ -416,6 +426,7 @@ fn reconstruct<F>(
     layout: &BlockLayout,
     tree: Option<&RepairTree>,
     outputs: &[StagedFile],
+    proof: &StagedProof,
     field: F,
 ) -> EngineResult<()>
 where
@@ -549,7 +560,7 @@ where
     let mut recovered = vec![vec![0u8; stripe]; tile];
     let mut input = vec![0u8; stripe];
     let mut covered = vec![0u8; stripe];
-    let writers = StageWriters::new(tree, session);
+    let writers = StageWriters::new(tree, session, proof);
     let mut offset = 0;
     while offset < layout.block_size {
         session.options.cancel.check()?;
@@ -652,7 +663,8 @@ where
             }
             base += width;
         }
-        // Reads no write has settled yet are never carried into the next pass.
+        // Every source this pass read is checked once, here, so a change
+        // within or between passes ends the repair before anything is installed.
         writers.settle()?;
         offset += take as u64;
     }
@@ -675,6 +687,7 @@ fn reconstruct_fft(
     layout: &BlockLayout,
     tree: Option<&RepairTree>,
     outputs: &[StagedFile],
+    proof: &StagedProof,
     matrix: &crate::packet::FftMatrixPacket,
 ) -> EngineResult<()> {
     use crate::fft::{FftGeometry, FftInput};
@@ -697,7 +710,7 @@ fn reconstruct_fft(
     )?;
     let mut covered = vec![0; stripe];
     let mut bytes = vec![0; stripe];
-    let writers = StageWriters::new(tree, session);
+    let writers = StageWriters::new(tree, session, proof);
     // Copy only required output ranges outside damaged cohorts. Damaged cohorts
     // copy their intact ranges as their bytes are consumed by the decoder.
     for block in 0..layout.block_count {
@@ -725,12 +738,13 @@ fn reconstruct_fft(
                 offset,
                 &mut bytes[..take],
                 &mut covered[..take],
-                None,
+                Some(writers.owed()),
             )?;
             scatter(&writers, layout, outputs, block, offset, &bytes[..take])?;
             offset += take as u64;
         }
     }
+    writers.settle()?;
     for need in &assessment.requirements {
         let first = coverage.start + (need.cohort + cohorts - coverage.start % cohorts) % cohorts;
         let lost: Vec<usize> = assessment
@@ -819,9 +833,13 @@ fn open_staged(
 /// least one, stays open; the least recently written closes first, and an
 /// acquirer the budget would otherwise refuse closes them too.
 ///
-/// Reads recorded in [`Self::owed`] are checked against their snapshots before
-/// the next write, so nothing reaches a staged file from bytes no check has
-/// vouched for since they were read.
+/// Reads recorded in [`Self::owed`] are checked against their snapshots once
+/// per pass, when the pass calls [`Self::settle`], and every pass settles
+/// before anything it staged can be verified or installed. A staged file may
+/// briefly hold bytes from a source that has since changed, but such a file
+/// only ever ends in [`EngineError::SourceChanged`] with nothing installed.
+///
+/// Every successful write is also recorded in the [`StagedProof`].
 struct StageWriters<'a> {
     tree: Option<&'a RepairTree>,
     options: &'a ExecutionOptions,
@@ -829,6 +847,7 @@ struct StageWriters<'a> {
     owed: OwedChecks,
     capacity: usize,
     open: Arc<OpenWriters>,
+    proof: &'a StagedProof<'a>,
 }
 
 #[derive(Default)]
@@ -860,7 +879,11 @@ impl crate::runtime::IdleHandles for OpenWriters {
 }
 
 impl<'a> StageWriters<'a> {
-    fn new(tree: Option<&'a RepairTree>, session: &'a Par3RepairSession) -> Self {
+    fn new(
+        tree: Option<&'a RepairTree>,
+        session: &'a Par3RepairSession,
+        proof: &'a StagedProof<'a>,
+    ) -> Self {
         let options = &session.options;
         let open = Arc::<OpenWriters>::default();
         let weak: Weak<OpenWriters> = Arc::downgrade(&open);
@@ -872,10 +895,11 @@ impl<'a> StageWriters<'a> {
             owed: OwedChecks::default(),
             capacity: (options.open_handles.min(options.handles.limit()) / 4).max(1),
             open,
+            proof,
         }
     }
 
-    /// Source reads not yet checked; every write settles them first.
+    /// Source reads not yet checked; each pass settles them at its end.
     fn owed(&self) -> &OwedChecks {
         &self.owed
     }
@@ -884,8 +908,17 @@ impl<'a> StageWriters<'a> {
         self.owed.settle(self.access)
     }
 
-    fn write(&self, target: &StagedFile, offset: u64, bytes: &[u8]) -> EngineResult<()> {
-        self.settle()?;
+    /// Write `bytes` at `offset` of the staged output in `slot`, the part of
+    /// its extent `extent` starting `relative` bytes into that extent.
+    fn write(
+        &self,
+        slot: usize,
+        target: &StagedFile,
+        extent: usize,
+        relative: u64,
+        offset: u64,
+        bytes: &[u8],
+    ) -> EngineResult<()> {
         let mut slots = self
             .open
             .0
@@ -919,6 +952,8 @@ impl<'a> StageWriters<'a> {
         let (_, file, used) = &mut slots.files[position];
         *used = clock;
         file.write_all_at(offset, bytes)?;
+        // Recorded while the lock still orders the writes to this output.
+        self.proof.record(slot, extent, relative, bytes);
         Ok(())
     }
 }
@@ -935,9 +970,13 @@ fn scatter(
         return Ok(());
     };
     for location in locations.iter() {
-        let Some(target) = outputs.iter().find(|target| target.index == location.file) else {
+        let Some(slot) = outputs
+            .iter()
+            .position(|target| target.index == location.file)
+        else {
             continue;
         };
+        let target = &outputs[slot];
         let extents = &layout.files[location.file].extents;
         let Some(extent) = extents.range(location.extent) else {
             continue;
@@ -951,7 +990,10 @@ fn scatter(
             continue;
         }
         writers.write(
+            slot,
             target,
+            location.extent,
+            start - block_offset,
             extent.start + start - block_offset,
             &bytes[(start - offset) as usize..(end - offset) as usize],
         )?;
@@ -1000,6 +1042,255 @@ fn verify_staged(
         ));
     }
     Ok(())
+}
+
+/// Write the inline tails, synchronize under [`RepairDurability::SyncFiles`],
+/// and check every staged output before anything is installed.
+///
+/// Which check is exact. Every protected extent of an output has an
+/// authenticated fingerprint: the set's block checksum for a whole block, the
+/// File packet's own fingerprint for a described tail, and the bytes themselves
+/// for an inline tail. [`StagedProof`] hashes the bytes each write hands the
+/// kernel, in order from the start of the extent, and proves an extent only
+/// when that hash matches. The staged file is created by this repair at its
+/// final length and only these writes touch its protected ranges, so an output
+/// whose every protected extent is proven holds exactly the bytes the
+/// authenticated layout describes, which is what the read-back below
+/// established by hashing them again from disk. Anything less certain — bytes
+/// out of order or written twice, an extent without a fingerprint, an extent
+/// never written, a mismatch, a frontier the budget refuses, or a File packet
+/// with no whole-file fingerprint — falls back to that read-back, so a staged
+/// file built from wrong bytes is refused exactly as before.
+///
+/// The one difference is metadata that contradicts itself: per-extent
+/// fingerprints every proven byte matches, under a whole-file fingerprint those
+/// same bytes do not. The read-back refused such a set; the proof installs the
+/// bytes every extent's fingerprint vouches for, the rule
+/// [`crate::evidence::StreamingVerifier`] already applies to a file whose bytes
+/// it saw out of order.
+fn finish_staged(
+    session: &Par3RepairSession,
+    layout: &BlockLayout,
+    tree: Option<&RepairTree>,
+    staged: &[StagedFile],
+    proof: &StagedProof,
+    durability: RepairDurability,
+) -> EngineResult<()> {
+    for (slot, target) in staged.iter().enumerate() {
+        let extents = &layout.files[target.index].extents;
+        let inline = (0..extents.len()).any(|index| extents.inline_bytes(index).is_some());
+        if !inline && durability == RepairDurability::Buffered {
+            continue;
+        }
+        // Inline tails need no source and no recovery equation.
+        let mut file = open_staged(tree, target, false, true, &session.options)?;
+        for index in 0..extents.len() {
+            if let Some(bytes) = extents.inline_bytes(index) {
+                let range = extents.range(index).expect("bounded extent");
+                file.seek(SeekFrom::Start(range.start))?;
+                file.write_all(bytes)?;
+                proof.record(slot, index, 0, bytes);
+            }
+        }
+        if durability == RepairDurability::SyncFiles {
+            file.sync_all()?;
+        }
+    }
+    for (slot, target) in staged.iter().enumerate() {
+        if !proof.proves(slot) {
+            verify_staged(session, layout, tree, target)?;
+        }
+    }
+    Ok(())
+}
+
+/// What the staged writes prove about each staged output, one entry per slot
+/// of the outputs being staged. See [`finish_staged`] for why a proven output
+/// needs no read-back.
+struct StagedProof<'a> {
+    layout: &'a BlockLayout,
+    state: Mutex<ProofState>,
+}
+
+struct ProofState {
+    outputs: Vec<OutputProof>,
+    /// Proven-extent bits and open frontiers; `None` when the budget refused
+    /// them, and then every output reads back.
+    reservation: Option<crate::runtime::Reservation>,
+}
+
+struct OutputProof {
+    index: usize,
+    /// Something could not be proven; this output reads back.
+    doubt: bool,
+    /// Protected extents not yet proven.
+    unproven: usize,
+    proven: Vec<u64>,
+    /// Extents written in more than one piece, hashed up to `next`.
+    partial: HashMap<usize, PartialProof>,
+}
+
+struct PartialProof {
+    next: u64,
+    hasher: crate::FingerprintHasher,
+}
+
+/// Budget for one open frontier and its map entry.
+const PARTIAL_PROOF_BYTES: usize = 2 * std::mem::size_of::<(usize, PartialProof)>();
+
+impl<'a> StagedProof<'a> {
+    fn new(layout: &'a BlockLayout, outputs: &[StagedFile], options: &ExecutionOptions) -> Self {
+        let bits = outputs.iter().try_fold(0usize, |sum, target| {
+            let words = layout.files[target.index].extents.len().div_ceil(64);
+            sum.checked_add(words.checked_mul(8)?)?
+                .checked_add(std::mem::size_of::<OutputProof>())
+        });
+        let reservation = bits.and_then(|bytes| {
+            options
+                .memory
+                .reserve_as(MemoryCategory::OutputStaging, bytes)
+                .ok()
+        });
+        let outputs = outputs
+            .iter()
+            .map(|target| {
+                let file = &layout.files[target.index];
+                let unproven = (0..file.extents.len())
+                    .filter(|&index| !file.extents.is_unprotected(index))
+                    .count();
+                let doubt = reservation.is_none() || unproven == 0 || file.fingerprint == [0; 16];
+                OutputProof {
+                    index: target.index,
+                    doubt,
+                    unproven,
+                    proven: if doubt {
+                        Vec::new()
+                    } else {
+                        vec![0; file.extents.len().div_ceil(64)]
+                    },
+                    partial: HashMap::new(),
+                }
+            })
+            .collect();
+        Self {
+            layout,
+            state: Mutex::new(ProofState {
+                outputs,
+                reservation,
+            }),
+        }
+    }
+
+    /// Record `bytes` written `relative` bytes into extent `extent` of the
+    /// output in `slot`.
+    fn record(&self, slot: usize, extent: usize, relative: u64, bytes: &[u8]) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let ProofState {
+            outputs,
+            reservation,
+        } = &mut *state;
+        let Some(output) = outputs.get_mut(slot) else {
+            return;
+        };
+        if output.doubt {
+            return;
+        }
+        let extents = &self.layout.files[output.index].extents;
+        if !output.prove(extents, extent, relative, bytes, reservation) {
+            // Nothing more is learnt from this output; its frontiers go.
+            if let Some(reservation) = reservation.as_mut() {
+                let held = output.partial.len() * PARTIAL_PROOF_BYTES;
+                reservation.shrink_to(reservation.bytes() - held);
+            }
+            output.doubt = true;
+            output.partial = HashMap::new();
+        }
+    }
+
+    /// Whether every protected byte of the output in `slot` is proven.
+    fn proves(&self, slot: usize) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state
+            .outputs
+            .get(slot)
+            .is_some_and(|output| !output.doubt && output.unproven == 0)
+    }
+}
+
+impl OutputProof {
+    /// Fold one write into the proof, or say it cannot be proven.
+    fn prove(
+        &mut self,
+        extents: &crate::layout::FileExtents,
+        extent: usize,
+        relative: u64,
+        bytes: &[u8],
+        reservation: &mut Option<crate::runtime::Reservation>,
+    ) -> bool {
+        let Some(range) = extents.range(extent) else {
+            return false;
+        };
+        let len = range.end - range.start;
+        let (word, bit) = (extent / 64, 1u64 << (extent % 64));
+        if self.proven[word] & bit != 0
+            || relative
+                .checked_add(bytes.len() as u64)
+                .is_none_or(|end| end > len)
+        {
+            return false;
+        }
+        let actual = match self.partial.get_mut(&extent) {
+            Some(partial) => {
+                if partial.next != relative {
+                    return false;
+                }
+                partial.hasher.update(bytes);
+                partial.next += bytes.len() as u64;
+                if partial.next != len {
+                    return true;
+                }
+                let partial = self.partial.remove(&extent).expect("open frontier");
+                if let Some(reservation) = reservation.as_mut() {
+                    reservation.shrink_to(reservation.bytes() - PARTIAL_PROOF_BYTES);
+                }
+                partial.hasher.finalize()
+            }
+            None if relative != 0 => return false,
+            None if bytes.len() as u64 == len => crate::fingerprint(bytes),
+            None => {
+                let Some(reservation) = reservation.as_mut() else {
+                    return false;
+                };
+                if reservation.grow_by(PARTIAL_PROOF_BYTES).is_err() {
+                    return false;
+                }
+                let mut hasher = crate::FingerprintHasher::new();
+                hasher.update(bytes);
+                self.partial.insert(
+                    extent,
+                    PartialProof {
+                        next: bytes.len() as u64,
+                        hasher,
+                    },
+                );
+                return true;
+            }
+        };
+        let expected = match extents.get(extent).map(|extent| extent.kind) {
+            Some(crate::layout::ExtentKind::Block {
+                fingerprint: Some(fingerprint),
+                ..
+            }) => fingerprint,
+            Some(crate::layout::ExtentKind::Inline(bytes)) => crate::fingerprint(&bytes),
+            _ => return false,
+        };
+        if actual != expected {
+            return false;
+        }
+        self.proven[word] |= bit;
+        self.unproven -= 1;
+        true
+    }
 }
 
 /// Find the first pair of destinations a filesystem may merge under `key`.
@@ -1209,7 +1500,9 @@ mod tests {
             .unwrap();
         std::fs::write(&temporary, b"verified repaired bytes").unwrap();
 
-        let saved = tree.install(&stage_name, &resolved, backup).unwrap();
+        let saved = tree
+            .install(&stage_name, &resolved, backup, RepairDurability::SyncFiles)
+            .unwrap();
 
         assert_eq!(
             std::fs::read(&destination).unwrap(),
@@ -1644,5 +1937,199 @@ mod charge_tests {
                 ("b/File".into(), "b/file".into()),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod proof_tests {
+    //! A staged output is installed without a read-back only when its writes
+    //! proved every protected extent; anything else must read it back.
+    use super::*;
+    use crate::layout::ExtentKind;
+    use crate::runtime::MemoryBudget;
+
+    struct Case {
+        layout: BlockLayout,
+        staged: Vec<StagedFile>,
+        /// Per protected extent of each staged output: index and its bytes.
+        extents: Vec<Vec<(usize, Vec<u8>)>>,
+    }
+
+    /// Every file of the GF(2^8) reference set, staged.
+    fn case() -> Case {
+        let layout = BlockLayout::new(
+            &crate::test_reference::gf8_set(),
+            &ExecutionOptions::default(),
+        )
+        .unwrap();
+        let contents = crate::test_reference::gf8_contents();
+        let mut staged = Vec::new();
+        let mut extents = Vec::new();
+        for (index, file) in layout.files.iter().enumerate() {
+            let bytes = &contents
+                .iter()
+                .find(|(name, _)| *name == file.path)
+                .expect("reference contents")
+                .1;
+            staged.push(StagedFile {
+                index,
+                destination: None,
+                stage_name: None,
+                temporary: PathBuf::new(),
+            });
+            let mut protected = Vec::new();
+            for extent in 0..file.extents.len() {
+                let item = file.extents.get(extent).unwrap();
+                match item.kind {
+                    ExtentKind::Block {
+                        fingerprint: Some(_),
+                        ..
+                    }
+                    | ExtentKind::Inline(_) => {}
+                    ExtentKind::Unprotected => continue,
+                    ExtentKind::Block { .. } => panic!("the reference set fingerprints extents"),
+                }
+                let range = item.range.start as usize..item.range.end as usize;
+                protected.push((extent, bytes[range].to_vec()));
+            }
+            assert!(!protected.is_empty(), "{}", file.path);
+            extents.push(protected);
+        }
+        Case {
+            layout,
+            staged,
+            extents,
+        }
+    }
+
+    fn options(budget: usize) -> ExecutionOptions {
+        ExecutionOptions {
+            memory: MemoryBudget::new(budget),
+            ..ExecutionOptions::default()
+        }
+    }
+
+    fn proven(case: &Case, proof: &StagedProof) -> Vec<bool> {
+        (0..case.staged.len())
+            .map(|slot| proof.proves(slot))
+            .collect()
+    }
+
+    #[test]
+    fn whole_or_in_order_writes_prove_every_output_and_release_their_frontiers() {
+        let case = case();
+        for piece in [usize::MAX, 1000, 1] {
+            let options = options(1 << 20);
+            let proof = StagedProof::new(&case.layout, &case.staged, &options);
+            let base = options.memory.used();
+            for (slot, extents) in case.extents.iter().enumerate() {
+                for (extent, bytes) in extents {
+                    for (at, chunk) in bytes.chunks(piece.min(bytes.len())).enumerate() {
+                        let relative = (at * piece.min(bytes.len())) as u64;
+                        proof.record(slot, *extent, relative, chunk);
+                    }
+                }
+            }
+            assert!(proven(&case, &proof).iter().all(|&ok| ok), "{piece}");
+            assert_eq!(options.memory.used(), base, "{piece}: a frontier leaked");
+            drop(proof);
+            assert_eq!(options.memory.used(), 0);
+        }
+    }
+
+    #[test]
+    fn anything_short_of_proof_reads_the_output_back() {
+        let case = case();
+        let slot = case
+            .extents
+            .iter()
+            .position(|extents| extents.iter().any(|(_, bytes)| bytes.len() > 1))
+            .expect("an extent longer than a byte");
+        let (target, _) = case.extents[slot]
+            .iter()
+            .find(|(_, bytes)| bytes.len() > 1)
+            .cloned()
+            .unwrap();
+        type Write = fn(&StagedProof, usize, usize, &[u8]);
+        let wrong: [(&str, Write); 5] = [
+            ("missing", |_, _, _, _| {}),
+            ("flipped", |proof, slot, extent, bytes| {
+                let mut bytes = bytes.to_vec();
+                bytes[0] ^= 1;
+                proof.record(slot, extent, 0, &bytes);
+            }),
+            ("out of order", |proof, slot, extent, bytes| {
+                let half = bytes.len() / 2;
+                proof.record(slot, extent, half as u64, &bytes[half..]);
+                proof.record(slot, extent, 0, &bytes[..half]);
+            }),
+            ("rewritten", |proof, slot, extent, bytes| {
+                proof.record(slot, extent, 0, bytes);
+                proof.record(slot, extent, 0, bytes);
+            }),
+            ("past its end", |proof, slot, extent, bytes| {
+                let mut bytes = bytes.to_vec();
+                bytes.push(0);
+                proof.record(slot, extent, 0, &bytes);
+            }),
+        ];
+        for (name, write) in wrong {
+            let options = options(1 << 20);
+            let proof = StagedProof::new(&case.layout, &case.staged, &options);
+            for (at, extents) in case.extents.iter().enumerate() {
+                for (extent, bytes) in extents {
+                    if at == slot && *extent == target {
+                        write(&proof, at, *extent, bytes);
+                    } else {
+                        proof.record(at, *extent, 0, bytes);
+                    }
+                }
+            }
+            let proven = proven(&case, &proof);
+            for (at, ok) in proven.into_iter().enumerate() {
+                assert_eq!(ok, at != slot, "{name}: output {at}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_proof_the_budget_refuses_reads_every_output_back() {
+        let case = case();
+        // No room for the proven-extent bits: nothing is proven.
+        let options = options(0);
+        let proof = StagedProof::new(&case.layout, &case.staged, &options);
+        for (slot, extents) in case.extents.iter().enumerate() {
+            for (extent, bytes) in extents {
+                proof.record(slot, *extent, 0, bytes);
+            }
+        }
+        assert!(proven(&case, &proof).iter().all(|&ok| !ok));
+        // Room for the bits but not a frontier: an extent written in pieces
+        // cannot be proven, while one written whole still is.
+        let probe = options_with_bits(&case);
+        let proof = StagedProof::new(&case.layout, &case.staged, &probe);
+        for (slot, extents) in case.extents.iter().enumerate() {
+            for (extent, bytes) in extents {
+                if bytes.len() > 1 {
+                    proof.record(slot, *extent, 0, &bytes[..1]);
+                    proof.record(slot, *extent, 1, &bytes[1..]);
+                } else {
+                    proof.record(slot, *extent, 0, bytes);
+                }
+            }
+        }
+        for (slot, extents) in case.extents.iter().enumerate() {
+            let pieces = extents.iter().any(|(_, bytes)| bytes.len() > 1);
+            assert_eq!(proof.proves(slot), !pieces, "output {slot}");
+        }
+    }
+
+    /// A budget holding exactly the proof's bits.
+    fn options_with_bits(case: &Case) -> ExecutionOptions {
+        let roomy = options(1 << 20);
+        let proof = StagedProof::new(&case.layout, &case.staged, &roomy);
+        let bits = roomy.memory.used();
+        drop(proof);
+        options(bits)
     }
 }

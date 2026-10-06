@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::runtime::{EngineError, EngineFile, EngineResult, ExecutionOptions};
+use crate::session_repair::RepairDurability;
 
 static STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -315,6 +316,7 @@ impl RepairTree {
         stage_name: &OsStr,
         destination: &Destination,
         backup: bool,
+        durability: RepairDurability,
     ) -> EngineResult<Option<PathBuf>> {
         let (parent, filename) = self.destination_parent(&destination.relative, true)?;
         let mut saved = None;
@@ -347,7 +349,7 @@ impl RepairTree {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        if let Err(error) = self.move_stage(stage_name, &parent, &filename) {
+        if let Err(error) = self.move_stage(stage_name, &parent, &filename, durability) {
             if let Some(path) = &saved {
                 parent.remove_file(path.file_name().expect("backup filename"))?;
             }
@@ -391,7 +393,9 @@ impl RepairTree {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        if let Err(error) = self.move_stage(stage_name, &parent, &filename) {
+        if let Err(error) =
+            self.move_stage(stage_name, &parent, &filename, RepairDurability::SyncFiles)
+        {
             if let Some(path) = &saved {
                 parent.rename(
                     path.file_name().expect("backup filename"),
@@ -404,33 +408,44 @@ impl RepairTree {
         Ok(saved)
     }
 
-    fn move_stage(&self, name: &OsStr, parent: &BudgetedDir, filename: &OsStr) -> io::Result<()> {
+    fn move_stage(
+        &self,
+        name: &OsStr,
+        parent: &BudgetedDir,
+        filename: &OsStr,
+        durability: RepairDurability,
+    ) -> io::Result<()> {
         match self.stage().rename(name, parent, filename) {
             Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
-                self.copy_stage(name, parent, filename)
+                self.copy_stage(name, parent, filename, durability)
             }
             outcome => outcome,
         }
     }
 
     // A nested mount needs a destination-local temporary before atomic rename.
-    // Re-read its bytes against the copied source digest before publishing it.
-    fn copy_stage(&self, name: &OsStr, parent: &BudgetedDir, filename: &OsStr) -> io::Result<()> {
-        use std::io::{Read, Seek, SeekFrom, Write};
+    // The staged file was verified before installation began, and every byte
+    // read from it here is handed to `write_all`, which fails rather than
+    // writing less, so the copy is not read back.
+    fn copy_stage(
+        &self,
+        name: &OsStr,
+        parent: &BudgetedDir,
+        filename: &OsStr,
+        durability: RepairDurability,
+    ) -> io::Result<()> {
+        use std::io::{Read, Write};
         let local = PrivateInstall::new(parent, filename)?;
         let options = self.root.options.clone().unwrap_or_default();
         let _memory = options
             .memory
-            .reserve_as(
-                crate::runtime::MemoryCategory::OutputStaging,
-                8192 + 2 * size_of::<blake3::Hasher>(),
-            )
+            .reserve_as(crate::runtime::MemoryCategory::OutputStaging, 8192)
             .map_err(io::Error::other)?;
         let mut source = self
             .open_stage(name, true, false, &options)
             .map_err(io::Error::other)?;
         let mut open = OpenOptions::new();
-        open.read(true).write(true).create_new(true);
+        open.write(true).create_new(true);
         let mut output = EngineFile::open_with(&options, || {
             local
                 .dir()
@@ -439,36 +454,20 @@ impl RepairTree {
         })
         .map_err(io::Error::other)?;
         let mut buffer = [0u8; 8192];
-        let mut expected = blake3::Hasher::new();
         loop {
             options.cancel.check().map_err(io::Error::other)?;
             let read = source.read(&mut buffer)?;
             if read == 0 {
                 break;
             }
-            expected.update(&buffer[..read]);
             output.write_all(&buffer[..read])?;
         }
         drop(source);
-        output.sync_all()?;
-        output.seek(SeekFrom::Start(0))?;
-        let mut actual = blake3::Hasher::new();
-        loop {
-            options.cancel.check().map_err(io::Error::other)?;
-            let read = output.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            actual.update(&buffer[..read]);
-        }
-        if actual.finalize() != expected.finalize() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "destination-local staging verification failed",
-            ));
+        if durability == RepairDurability::SyncFiles {
+            output.sync_all()?;
         }
         drop(output);
-        // The verified local copy now owns the rebuilt bytes. Remove the
+        // The local copy now owns the rebuilt bytes. Remove the
         // original before installation so a cleanup error cannot hide an
         // already-installed output from the repair report.
         self.stage().remove_file(name)?;
@@ -904,7 +903,8 @@ mod tests {
         let (parent, filename) = tree
             .destination_parent(&destination.relative, true)
             .unwrap();
-        tree.copy_stage(&name, &parent, &filename).unwrap();
+        tree.copy_stage(&name, &parent, &filename, RepairDurability::SyncFiles)
+            .unwrap();
         assert_eq!(std::fs::read(&destination.display).unwrap(), bytes);
         assert!(!path.exists());
         assert_eq!(parent.entries().unwrap().count(), 1);
@@ -928,7 +928,10 @@ mod tests {
         let (parent, filename) = tree
             .destination_parent(&destination.relative, true)
             .unwrap();
-        assert!(tree.copy_stage(&name, &parent, &filename).is_err());
+        assert!(
+            tree.copy_stage(&name, &parent, &filename, RepairDurability::SyncFiles)
+                .is_err()
+        );
         assert_eq!(std::fs::read(&path).unwrap(), b"safe");
         assert_eq!(parent.entries().unwrap().count(), 0);
         assert_eq!(options.handles.used(), 3);
@@ -944,8 +947,13 @@ mod tests {
         let destination = tree.destination("file.bin").unwrap();
         std::fs::write(&destination.display, b"original").unwrap();
         assert!(
-            tree.install(OsStr::new("missing-stage"), &destination, true)
-                .is_err()
+            tree.install(
+                OsStr::new("missing-stage"),
+                &destination,
+                true,
+                RepairDurability::SyncFiles
+            )
+            .is_err()
         );
         assert_eq!(std::fs::read(&destination.display).unwrap(), b"original");
         assert!(!root.path().join("file.bin.1").exists());

@@ -963,11 +963,15 @@ fn resident_and_spooled_recovery_rows_write_the_same_carriers() {
             let scratch = resident.scratch_bytes;
             assert_eq!(scratch, recovery_count * block_size as u64, "{case}");
 
-            // Resident rows: only carriers are written, and the carrier
-            // re-scan is the only file read, so no scratch byte moves.
+            // Resident rows: only carriers are written, and carriers are
+            // authenticated as they are written, so no file is read at all.
             assert_eq!(
                 resident.file_io.write_bytes, resident.output_bytes,
                 "{case}"
+            );
+            assert_eq!(
+                resident.file_io.read_bytes, 0,
+                "{case}: a carrier was read back"
             );
             assert_eq!(resident.syncs, carriers, "{case}: a spool was synchronized");
             assert!(resident.resident_peak >= scratch, "{case}");
@@ -984,7 +988,11 @@ fn resident_and_spooled_recovery_rows_write_the_same_carriers() {
                 scratch,
                 "{case}: spooled payloads were not read exactly once"
             );
-            assert_eq!(spooled.syncs, carriers + 1, "{case}");
+            // The spool is scratch: only the staged carriers are synchronized.
+            assert_eq!(
+                spooled.syncs, carriers,
+                "{case}: the spool was synchronized"
+            );
             assert!(spooled.resident_peak < scratch, "{case}");
         }
     }
