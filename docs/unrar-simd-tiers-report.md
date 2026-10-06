@@ -14,15 +14,15 @@ goes, which is not where instruction-level width helps.
 | Host | CPU | ISA ceiling | Role |
 | --- | --- | --- | --- |
 | Mac (local) | Apple silicon, aarch64 | NEON (no SVE) | profiling, differential tests, noisy |
-| codex-x86 | Alder Lake-P (i5-1240P), x86-64 | AVX2 / x86-64-v3, no AVX-512 | all decisive A/B, quiet (load ~1.3) |
-| SYLIX (Windows) | — | — | unused this arc |
+| Alder Lake host | Alder Lake-P (i5-1240P), x86-64 | AVX2 / x86-64-v3, no AVX-512 | all decisive A/B, quiet (load ~1.3) |
+| Windows host (Zen 2) | — | — | unused this arc |
 | AWS fleet | — | — | not launched; see "AWS" below |
 
 Measurement protocol for every A/B in this document: one binary, both arms
 selected by a cached environment toggle sitting in exactly the position the
 shipped runtime-detection bool sits in, so no build-to-build codegen or layout
 difference can leak into the delta; interleaved rounds (base, candidate, base,
-candidate, …); medians of at least five rounds; `taskset -c 0-5` on codex-x86.
+candidate, …); medians of at least five rounds; `taskset -c 0-5` on the Alder Lake host.
 Single post-build runs were never trusted, and the Mac was treated as
 indicative only — a concurrent agent session kept its load average above 6 for
 the whole arc, and its run-to-run spread on the PPMd benches reached ±100%.
@@ -31,7 +31,7 @@ the whole arc, and its run-to-run spread on the PPMd benches reached ±100%.
 
 Baseline medians, n = 10.
 
-| Bench | Mac | codex-x86 |
+| Bench | Mac | Alder Lake host |
 | --- | --- | --- |
 | rar_solid_lz_chunked_extract | 68.9 ms | 176.3 ms |
 | weaver_solid_chunked_shape | 69.8 ms | 180.1 ms |
@@ -44,7 +44,7 @@ Baseline medians, n = 10.
 | rar_filter_e8e9 | 132.8 µs | 138.9 µs |
 | rar_crc_fast_baseline | 84.8 µs | 393.7 µs |
 
-Function shares (samply, Mac; `perf` could not be used on codex-x86 because
+Function shares (samply, Mac; `perf` could not be used on the Alder Lake host because
 `kernel.perf_event_paranoid` is 4 there and changing a kernel setting was out
 of scope):
 
@@ -104,7 +104,7 @@ dropped on measurement.
 Implemented as the two-lane `vinserti128` twin of the shipped SSSE3 kernel and
 differentially tested the same way.
 
-A/B on codex-x86, n = 6, AVX2 tier off vs on:
+A/B on the Alder Lake host, n = 6, AVX2 tier off vs on:
 
 | Bench | SSSE3 only | + AVX2 | delta |
 | --- | --- | --- | --- |
@@ -114,7 +114,7 @@ A/B on codex-x86, n = 6, AVX2 tier off vs on:
 Nothing. So the question became how much the *whole* family is worth, which is
 the number that settles (a), (b), (c) and the AVX-512 PPMd tier at once.
 
-**Ceiling: scalar vs. every PPMd batch kernel** (codex-x86, interleaved,
+**Ceiling: scalar vs. every PPMd batch kernel** (Alder Lake, interleaved,
 `UNRAR_RS_PPMD_SCALAR`):
 
 | Bench | n | scalar | all SIMD | delta |
@@ -182,7 +182,7 @@ The codegen was verified rather than assumed: the built bench binary contains
 52 `shrx`/`bzhi` instructions, which the baseline build cannot emit, so the
 second clone really is a different loop.
 
-**LZ symbol decoder, codex-x86, n = 6** (base = tier off):
+**LZ symbol decoder, Alder Lake, n = 6** (base = tier off):
 
 | Bench | tier off | tier on | delta |
 | --- | --- | --- | --- |
@@ -191,7 +191,7 @@ second clone really is a different loop.
 | rar_non_solid_lz_chunked_extract | 0.733 ms | 0.725 ms | −1.16% |
 | rar5_solid_extract_all_members | 187.210 ms | 186.190 ms | −0.54% |
 
-**PPMd decode loop, codex-x86, n = 5** (same tier, dispatched on the model):
+**PPMd decode loop, Alder Lake, n = 5** (same tier, dispatched on the model):
 
 | Bench | tier off | tier on | delta |
 | --- | --- | --- | --- |
@@ -221,7 +221,7 @@ the baseline entry point and by a `#[target_feature(enable =
 "avx2,bmi1,bmi2,lzcnt,popcnt")]` clone, dispatched on a cached probe with
 `RARPAR_LZ_DECODE_V3=0` as the A/B pin. The differential test in the same file
 runs both entry points over every block of the fast-vs-checked fixture on any
-capable host. Confirmation run on codex-x86 after the re-implementation is
+capable host. Confirmation run on the Alder Lake host after the re-implementation is
 recorded under "Confirmation" at the end of this document.
 
 ### (f) ARM executable filter — NOT MEASURED
@@ -255,7 +255,7 @@ workload with size, `rar5_encrypted_store_chunked_multivolume`, is 76.5% PBKDF2
 and 4.2% AES. The hashing-heavy fixture the amendment's gate asks for does not
 exist in the pinned corpus and cannot be generated here (see (f)).
 
-**Ceiling: all BLAKE2sp work removed** (codex-x86, n = 5, base = hashing
+**Ceiling: all BLAKE2sp work removed** (Alder Lake, n = 5, base = hashing
 skipped entirely, candidate = hashing as shipped). This is the absolute upper
 bound on what *any* BLAKE2sp kernel — SVE2, AVX-512VL or otherwise — could
 return end-to-end, since an infinitely fast hash is exactly the base arm:
@@ -287,7 +287,7 @@ taken on hardware that was already available, which is the gate's own rule
 ("a microbench win with no end-to-end movement is a DROP"):
 
 - AVX-512 VBMI/VBMI2 PPMd symbol search and escape path: the entire PPMd
-  vector family is worth ±1.5% end-to-end on codex-x86, and ≈0% on the most
+  vector family is worth ±1.5% end-to-end on the Alder Lake host, and ≈0% on the most
   PPMd-dominated workload. A wider gather cannot beat a scan that stops in the
   first few states.
 - AVX-512 VBMI/BW LZ pattern copy: the path is 0.29% inclusive.
@@ -341,7 +341,7 @@ were kept alongside the session scratchpad.
 ## Confirmation: the re-implemented v3 LZ symbol loop
 
 After the operator chose to keep the LZ half of (e), the clone was rewritten
-(`x86_v3` in `decompress/lz/parallel.rs`) and confirmed on codex-x86 with the
+(`x86_v3` in `decompress/lz/parallel.rs`) and confirmed on the Alder Lake host with the
 same protocol — one binary, `RARPAR_LZ_DECODE_V3=0` as the base arm, interleaved
 rounds, `taskset -c 0-5`, medians of five. The release bench binary carries 52
 `shrx`/`bzhi` instructions (the baseline build cannot emit any) and no `lzcnt`;
@@ -360,7 +360,7 @@ not know the toggle, so both arms were identical code — the four benches came
 out at +0.94%, −0.24%, −0.58% and +2.13%. Every delta in the table above is
 outside that band and in the same direction as the original measurement.
 
-The v3-vs-baseline differential test in `parallel.rs` ran on codex-x86 and
+The v3-vs-baseline differential test in `parallel.rs` ran on the Alder Lake host and
 passed. One unrelated test in the same module,
 `adaptive_rounds_switch_engines_without_restarting_the_window`, failed 1/8 runs
 there and 1/17 on the Mac: it asserts on a process-global pipelined-dispatch
