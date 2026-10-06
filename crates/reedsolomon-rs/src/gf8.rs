@@ -59,6 +59,12 @@ impl MulPlan {
     /// lengths and may be unaligned; CPU dispatch always has a scalar fallback.
     pub fn accumulate(&self, source: &[u8], destination: &mut [u8]) {
         assert_eq!(source.len(), destination.len());
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        if crate::sve2::enabled() {
+            // SAFETY: SVE2 was detected and the lengths are equal.
+            unsafe { self.sve2(source, destination) };
+            return;
+        }
         #[cfg(target_arch = "aarch64")]
         if std::arch::is_aarch64_feature_detected!("neon") {
             // SAFETY: NEON was detected and the implementation bounds every load.
@@ -113,6 +119,80 @@ impl MulPlan {
         for (to, from) in destination.iter_mut().zip(source) {
             *to ^= self.low[(from & 15) as usize] ^ self.high[(from >> 4) as usize];
         }
+    }
+
+    /// [`Self::accumulate`] on SVE2, over the whole slice.
+    ///
+    /// # Safety
+    /// SVE2 must be available and the slices must have equal lengths.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    pub(crate) unsafe fn sve2(&self, source: &[u8], destination: &mut [u8]) {
+        debug_assert_eq!(source.len(), destination.len());
+        // SAFETY: the caller checks SVE2 and equal lengths; distinct borrows
+        // cannot overlap.
+        unsafe {
+            crate::sve2::map8_acc(
+                &self.low,
+                &self.high,
+                source.as_ptr(),
+                destination.as_mut_ptr(),
+                source.len(),
+            );
+        }
+    }
+
+    /// [`Self::butterfly_scalar`] on SVE2 over the whole rows; returns their
+    /// length.
+    ///
+    /// # Safety
+    /// SVE2 must be available and the rows must have equal lengths.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    pub(crate) unsafe fn butterfly_sve2<const INVERSE: bool>(
+        &self,
+        left: &mut [u8],
+        right: &mut [u8],
+    ) -> usize {
+        debug_assert_eq!(left.len(), right.len());
+        // SAFETY: the caller's contract; distinct borrows cannot overlap.
+        unsafe {
+            crate::sve2::map8_butterfly::<INVERSE>(
+                &self.low,
+                &self.high,
+                left.as_mut_ptr(),
+                right.as_mut_ptr(),
+                left.len(),
+            );
+        }
+        left.len()
+    }
+
+    /// [`Self::radix4_scalar`] on SVE2 over the whole rows; returns their
+    /// length.
+    ///
+    /// # Safety
+    /// SVE2 must be available and all four rows must have equal lengths.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    pub(crate) unsafe fn radix4_sve2<const INVERSE: bool>(
+        plans: [&Self; 3],
+        rows: [&mut [u8]; 4],
+    ) -> usize {
+        let width = rows[0].len();
+        debug_assert!(rows.iter().all(|row| row.len() == width));
+        let [a, b, c, d] = rows;
+        // SAFETY: the caller's contract; distinct borrows cannot overlap.
+        unsafe {
+            crate::sve2::map8_radix4::<INVERSE>(
+                plans.map(|plan| (&plan.low, &plan.high)),
+                [
+                    a.as_mut_ptr(),
+                    b.as_mut_ptr(),
+                    c.as_mut_ptr(),
+                    d.as_mut_ptr(),
+                ],
+                width,
+            );
+        }
+        width
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -1217,6 +1297,12 @@ pub fn mul_acc_input_batch(destination: &mut [u8], inputs: &[PlanSrc<'_>]) {
             return;
         }
     }
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    if crate::sve2::enabled() {
+        // SAFETY: SVE2 was detected; every slice has the destination's length.
+        unsafe { batch_sve2(destination, inputs) };
+        return;
+    }
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("neon") {
         // SAFETY: NEON was detected; the kernel bounds every load.
@@ -1443,6 +1529,36 @@ unsafe fn batch_neon(destination: &mut [u8], inputs: &[PlanSrc<'_>]) {
         // SAFETY: NEON was detected by the caller; equal lengths.
         tail = |plan: &MulPlan, s, d| unsafe { plan.neon(s, d) },
     );
+}
+
+/// The grouped SVE2 kernel: up to [`crate::sve2::MAP8_BATCH`] table pairs
+/// stay in registers while every source of the group streams past two
+/// destination vectors, with no tail.
+///
+/// # Safety
+/// SVE2 must be available and the slices must have equal lengths.
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+unsafe fn batch_sve2(destination: &mut [u8], inputs: &[PlanSrc<'_>]) {
+    use crate::sve2::MAP8_BATCH;
+    for group in inputs.chunks(MAP8_BATCH) {
+        let mut tables = [[0; 32]; MAP8_BATCH];
+        let mut sources = [std::ptr::null(); MAP8_BATCH];
+        for ((table, source), input) in tables.iter_mut().zip(&mut sources).zip(group) {
+            table[..16].copy_from_slice(&input.plan.low);
+            table[16..].copy_from_slice(&input.plan.high);
+            *source = input.src.as_ptr();
+        }
+        // SAFETY: the caller checks SVE2 and equal lengths; the sources are
+        // shared borrows, so none overlaps the exclusive destination.
+        unsafe {
+            crate::sve2::map8_batch(
+                destination.as_mut_ptr(),
+                destination.len(),
+                &tables[..group.len()],
+                &sources[..group.len()],
+            );
+        }
+    }
 }
 
 #[cfg(test)]

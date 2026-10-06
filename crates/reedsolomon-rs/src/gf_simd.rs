@@ -85,6 +85,29 @@ pub fn linear_uses_wasm_simd128() -> bool {
     cfg!(all(target_arch = "wasm32", target_feature = "simd128"))
 }
 
+/// Whether the aarch64 kernels take their SVE2 form: the GF(2^8) and
+/// GF(2^16) region and grouped-input kernels and the [`LinearMap8`] and
+/// [`LinearMap16`] maps run as vector-length-agnostic SVE2 loops instead of
+/// NEON. Setting `WEAVER_SVE2=0` pins NEON so an SVE2 host can A/B the two
+/// without a rebuild. The variable is read once and cached; it never enables
+/// a kernel whose features are absent. Always false off aarch64.
+pub fn uses_sve2() -> bool {
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    return crate::sve2::enabled();
+    #[allow(unreachable_code)]
+    false
+}
+
+/// Shortest row, in bytes, a [`LinearMap8`] operation hands to its SVE2 form.
+/// Each SVE2 call loads its tables afresh, and on Neoverse V2 that set-up left
+/// 64-symbol transform rows about 1% behind NEON, while 4096-symbol rows
+/// gained. Shorter rows keep the NEON kernels. `map_in_place` always stays on
+/// NEON, which was 1-4% faster there at every measured size. [`LinearMap16`]
+/// has no SVE2 form: its fused butterfly and radix-4 measured 1-2% behind NEON
+/// on one thread and 1-5% ahead on four to eight, which is a wash.
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+const SVE2_MIN_ROW_BYTES: usize = 1024;
+
 impl LinearBackend {
     /// Resolve this selection on the executing CPU.
     pub fn kernel(self) -> LinearKernel {
@@ -233,6 +256,9 @@ pub struct LinearMap8 {
     /// The wasm simd128 kernels run this map; see [`linear_uses_wasm_simd128`].
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     simd: bool,
+    /// Whether the NEON kernel takes its SVE2 form ([`uses_sve2`]).
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    sve2: bool,
 }
 
 impl LinearMap8 {
@@ -252,6 +278,8 @@ impl LinearMap8 {
             affine: (kernel == LinearKernel::Avx2 && linear_uses_gfni()).then(|| plan.affine()),
             #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
             simd: backend == LinearBackend::Auto,
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            sve2: kernel == LinearKernel::Neon && uses_sve2(),
             plan,
             kernel,
         }
@@ -266,6 +294,10 @@ impl LinearMap8 {
             // kernel only after detecting its ISA, an affine matrix is present
             // only after detecting GFNI, and each kernel bounds every load and
             // store by the equal slice lengths asserted above.
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            LinearKernel::Neon if self.sve2 && source.len() >= SVE2_MIN_ROW_BYTES => unsafe {
+                self.plan.sve2(source, destination)
+            },
             #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             LinearKernel::Neon => unsafe { self.plan.neon(source, destination) },
             #[cfg(target_arch = "x86_64")]
@@ -296,6 +328,10 @@ impl LinearMap8 {
         let done = match self.kernel {
             // SAFETY (all three): the kernel's ISA was detected when the map
             // was built, and both rows have the length asserted by the caller.
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            LinearKernel::Neon if self.sve2 && left.len() >= SVE2_MIN_ROW_BYTES => unsafe {
+                self.plan.butterfly_sve2::<INVERSE>(left, right)
+            },
             #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             LinearKernel::Neon => unsafe { self.plan.butterfly_neon::<INVERSE>(left, right) },
             #[cfg(target_arch = "x86_64")]
@@ -330,6 +366,13 @@ impl LinearMap8 {
         let done = match outer.kernel {
             // SAFETY (all three): as in `butterfly_in`; all four rows have
             // the length asserted by the caller.
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            LinearKernel::Neon if outer.sve2 && a.len() >= SVE2_MIN_ROW_BYTES => unsafe {
+                crate::gf8::MulPlan::radix4_sve2::<INVERSE>(
+                    plans,
+                    [&mut *a, &mut *b, &mut *c, &mut *d],
+                )
+            },
             #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             LinearKernel::Neon => unsafe {
                 crate::gf8::MulPlan::radix4_neon::<INVERSE>(
@@ -2317,6 +2360,16 @@ pub fn mul_acc_region(factor: u16, src: &[u8], dst: &mut [u8]) {
         }
     }
 
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    if crate::sve2::enabled() {
+        // SAFETY: SVE2 was detected; the slices are distinct, of the asserted
+        // equal and even length.
+        unsafe {
+            crate::sve2::map16_acc(&tables.tables, src.as_ptr(), dst.as_mut_ptr(), src.len())
+        };
+        return;
+    }
+
     #[cfg(target_arch = "aarch64")]
     {
         unsafe { mul_acc_region_neon(&tables, src, dst) };
@@ -2537,6 +2590,24 @@ pub fn mul_acc_input_batch(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
             unsafe { mul_acc_input_batch_avx2(dst, factors_and_srcs) };
             return;
         }
+    }
+
+    // SVE2 takes the table batches; above three sources the NEON CLMUL
+    // kernel below stays faster on a 128-bit SVE2 core (see
+    // `mul_acc_input_batch_sve2`).
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    if crate::sve2::enabled() && !(factors_and_srcs.len() > 3 && clmul_batch_enabled()) {
+        // SAFETY: SVE2 was detected; every source has the destination's
+        // length and is a shared borrow distinct from it.
+        unsafe {
+            mul_acc_input_batch_sve2(
+                dst,
+                factors_and_srcs
+                    .iter()
+                    .map(|fs| (fs.factor, None, fs.src.as_ptr())),
+            )
+        };
+        return;
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -4160,6 +4231,20 @@ pub fn mul_acc_input_batch_prepared(dst: &mut [u8], factors_and_srcs: &[Prepared
             unsafe { mul_acc_input_batch_avx2_prepared(dst, factors_and_srcs) };
             return;
         }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    if crate::sve2::enabled() && !(factors_and_srcs.len() > 3 && clmul_batch_enabled()) {
+        // SAFETY: as in `mul_acc_input_batch`.
+        unsafe {
+            mul_acc_input_batch_sve2(
+                dst,
+                factors_and_srcs
+                    .iter()
+                    .map(|fs| (fs.prepared.factor, Some(fs.prepared), fs.src.as_ptr())),
+            )
+        };
+        return;
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -7780,6 +7865,51 @@ unsafe fn mul_acc_multi_region_neon(factors_and_dsts: &mut [FactorDst<'_>], src:
 // buffers because dispatch hands batches of more than 3 sources to the CLMUL
 // kernels.
 // ---------------------------------------------------------------------------
+
+/// The SVE2 grouped-input table kernel over lane-major sources, in groups
+/// of [`crate::sve2::GF16_TABLE_BATCH`]. Zero factors are skipped; a
+/// prepared factor lends its cached tables. It runs where the dispatch would
+/// otherwise take the NEON table kernel: three sources or fewer, or every
+/// batch under `WEAVER_GF16_CLMUL_BATCH=0`. Above three sources the NEON
+/// CLMUL kernel stays: on Neoverse V2 it beat both this kernel and an SVE2
+/// CLMUL port by 13-20%.
+///
+/// # Safety
+/// SVE2 must be available; every source pointer must address `dst.len()`
+/// readable bytes that do not overlap `dst`.
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+unsafe fn mul_acc_input_batch_sve2<'a>(
+    dst: &mut [u8],
+    inputs: impl Iterator<Item = (u16, Option<&'a PreparedInputFactor>, *const u8)>,
+) {
+    use crate::sve2::GF16_TABLE_BATCH;
+    let mut inputs = inputs.filter(|(factor, _, _)| *factor != 0);
+    let mut sources = [std::ptr::null(); GF16_TABLE_BATCH];
+    let mut tables = [[[0; 16]; 8]; GF16_TABLE_BATCH];
+    loop {
+        let mut count = 0;
+        for (factor, prepared, source) in inputs.by_ref().take(GF16_TABLE_BATCH) {
+            sources[count] = source;
+            tables[count] = match prepared {
+                Some(prepared) => prepared.arm_tables().tables,
+                None => precompute_mul_tables(factor).tables,
+            };
+            count += 1;
+        }
+        if count == 0 {
+            return;
+        }
+        // SAFETY: the caller's contract, for `count` sources.
+        unsafe {
+            crate::sve2::gf16_batch_tables(
+                dst.as_mut_ptr(),
+                dst.len(),
+                &tables[..count],
+                &sources[..count],
+            );
+        }
+    }
+}
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn mul_acc_input_batch_neon(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
