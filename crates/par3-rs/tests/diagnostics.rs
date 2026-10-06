@@ -90,16 +90,33 @@ fn creation_reports_only_outputs_installed_before_cancellation() {
 #[test]
 fn cancelling_encoding_from_progress_cleans_spool_and_staging_for_both_codecs() {
     use par3_rs::creation::{CreationCodec, CreationOptions, CreationPlan, CreationSource};
-    for codec in [
-        CreationCodec::Cauchy,
-        CreationCodec::Fft {
-            capacity_log2: 3,
-            interleave: 0,
-        },
+    // The default budget holds the two rows resident, so nothing reaches disk
+    // before the cancellation; 64 KiB has no room for them beside the carrier
+    // stage, so the rows go to a spool file that has to be cleaned up.
+    for (codec, memory) in [
+        (CreationCodec::Cauchy, None),
+        (CreationCodec::Cauchy, Some(64 << 10)),
+        (
+            CreationCodec::Fft {
+                capacity_log2: 3,
+                interleave: 0,
+            },
+            None,
+        ),
+        (
+            CreationCodec::Fft {
+                capacity_log2: 3,
+                interleave: 0,
+            },
+            Some(64 << 10),
+        ),
     ] {
         let mut options = ExecutionOptions::default();
         options.workers = 1;
         options.stripe_bytes = 128;
+        if let Some(memory) = memory {
+            options.memory = par3_rs::runtime::MemoryBudget::new(memory);
+        }
         let cancel = options.cancel.clone();
         options.progress = Some(ProgressCallback::new(move |event| {
             if event.stage == Stage::Encode && event.phase == ProgressPhase::Advance {
@@ -132,7 +149,11 @@ fn cancelling_encoding_from_progress_cleans_spool_and_staging_for_both_codecs() 
         assert_eq!(std::fs::read_dir(tree.path()).unwrap().count(), 0);
         assert_eq!(options.handles.used(), 0);
         assert_eq!(options.memory.used(), retained);
-        assert!(options.diagnostics.file_io().write_bytes > 0);
+        assert_eq!(
+            options.diagnostics.file_io().write_bytes > 0,
+            memory.is_some(),
+            "{codec:?} {memory:?}: only the spooled rows reach disk"
+        );
         assert!(options.diagnostics.stage(Stage::Encode).completed > 0);
         assert_eq!(options.diagnostics.stage(Stage::Encode).calls, 1);
         drop(plan);

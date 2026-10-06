@@ -508,6 +508,7 @@ impl CarrierPlan {
                                         offset,
                                         out,
                                         &mut covered[..out.len()],
+                                        None,
                                     )
                                 }
                             },
@@ -612,6 +613,7 @@ impl CarrierPlan {
                                 offset,
                                 &mut bytes[..take],
                                 &mut covered[..take],
+                                None,
                             )?,
                             PayloadKind::Recovery { matrix, index, .. } => {
                                 scratch.seek(SeekFrom::Start(
@@ -662,31 +664,78 @@ fn encode_cauchy<F: Field>(
     if stripe == 0 || !set.block_size().is_multiple_of(F::SYMBOL_BYTES as u64) {
         return Err(EngineError::InvalidState("carrier field alignment"));
     }
-    let _buffers = session.options.memory.reserve_as(
-        MemoryCategory::CodecScratch,
-        stripe
-            .checked_mul(3)
-            .ok_or(EngineError::resource_limit("carrier encoding stripes"))?,
-    )?;
+    // Recovery rows wanted from this matrix, in slot-map order. Their headers
+    // are covered by the caller's per-equation reservation.
+    let wanted: Vec<(u64, usize)> = slots
+        .iter()
+        .filter(|((hash, _), _)| *hash == matrix)
+        .map(|(&(_, index), &slot)| (index, slot))
+        .collect();
+    // Every row accumulates from one shared read of each source stripe, so the
+    // source is walked once per group of rows rather than once per row. The
+    // group is as wide as the budget holds beside the input and coverage
+    // stripes; one row is the narrowest, and is what was charged before. A
+    // peer may take bytes between measuring and charging, so measure once more
+    // against what it left before refusing.
+    let admit = || -> EngineResult<(usize, Reservation)> {
+        let room = session.options.memory.available() / stripe;
+        let group = room.saturating_sub(2).clamp(1, wanted.len().max(1));
+        let bytes = group
+            .checked_add(2)
+            .and_then(|count| count.checked_mul(stripe))
+            .ok_or(EngineError::resource_limit("carrier encoding stripes"))?;
+        Ok((
+            group,
+            session
+                .options
+                .memory
+                .reserve_as(MemoryCategory::CodecScratch, bytes)?,
+        ))
+    };
+    let (group, _buffers) = match admit() {
+        Err(EngineError::ResourceLimit(_)) => admit()?,
+        admitted => admitted?,
+    };
+    session
+        .options
+        .diagnostics
+        .note_tiling(stripe, group + 2, group);
+    // Serial on purpose: one multiply-accumulate per row per stripe is too
+    // little work to hand to a pool, and dispatching each one cost more wall
+    // and far more CPU than it saved.
     let mut input = vec![0; stripe];
     let mut covered = vec![0; stripe];
-    let mut output = vec![0; stripe];
-    for (&(hash, index), &slot) in slots {
-        if hash != matrix {
-            continue;
-        }
+    let mut rows = vec![vec![0; stripe]; group];
+    let owed = crate::source::OwedChecks::default();
+    for chunk in wanted.chunks(group) {
         let mut offset = 0;
         while offset < set.block_size() {
             let take = (set.block_size() - offset).min(stripe as u64) as usize;
-            output.fill(0);
+            for row in &mut rows[..chunk.len()] {
+                row[..take].fill(0);
+            }
             for block in range.clone() {
                 session.options.cancel.check()?;
-                session.read_block(block, offset, &mut input[..take], &mut covered[..take])?;
-                let factor = crate::cauchy::element(&field, block, index)?;
-                field.mul_acc(&mut output[..take], &input[..take], factor);
+                session.read_block(
+                    block,
+                    offset,
+                    &mut input[..take],
+                    &mut covered[..take],
+                    Some(&owed),
+                )?;
+                for (row, &(index, _)) in rows.iter_mut().zip(chunk) {
+                    session.options.cancel.check()?;
+                    let factor = crate::cauchy::element(&field, block, index)?;
+                    field.mul_acc(&mut row[..take], &input[..take], factor);
+                }
             }
-            scratch.seek(SeekFrom::Start(slot as u64 * set.block_size() + offset))?;
-            scratch.write_all(&output[..take])?;
+            // Every block was read before any row is written, so each source
+            // is checked once per stripe pass.
+            owed.settle(session.access.as_ref())?;
+            for (row, &(_, slot)) in rows.iter().zip(chunk) {
+                scratch.seek(SeekFrom::Start(slot as u64 * set.block_size() + offset))?;
+                scratch.write_all(&row[..take])?;
+            }
             offset += take as u64;
         }
     }

@@ -46,12 +46,11 @@ impl BudgetedDir {
         };
         // Cleanup and identity checks still need capabilities after cancellation.
         // Their leases obey the ceiling without restarting canceled data work.
-        let lease = options.handles.acquire().map_err(io::Error::other)?;
-        if options.handles.used() > options.open_handles {
-            return Err(io::Error::other(EngineError::resource_limit(
-                "open handles",
-            )));
-        }
+        // Idle cached handles are closed before a capability is refused.
+        let lease = options
+            .handles
+            .acquire_within(options.open_handles)
+            .map_err(io::Error::other)?;
         Ok(Some(lease))
     }
 

@@ -10,7 +10,7 @@ use crate::ingest::{IncrementalSet, IngestedPacket, MergeEffect, PayloadKind, Pa
 use crate::layout::BlockLayout;
 use crate::packet::{BlockRange, PacketBody};
 use crate::runtime::{EngineError, EngineResult, ExecutionOptions, MemoryCategory, Reservation};
-use crate::source::{SourceAccess, SourceId, ensure_snapshot, read_exact_at};
+use crate::source::{OwedChecks, SourceAccess, SourceId, ensure_snapshot, read_exact_at};
 use crate::{Fingerprint, InputSetId, Packet, Par3Set};
 
 #[path = "session_data.rs"]
@@ -1423,12 +1423,16 @@ impl Par3RepairSession {
         Ok(())
     }
 
+    /// Read one stripe of an input block. Each source range read is checked
+    /// against its snapshot afterwards, or, given `owed`, recorded there for
+    /// the caller to settle before writing anything derived from it.
     pub(crate) fn read_block(
         &self,
         block: u64,
         offset: u64,
         out: &mut [u8],
         covered: &mut [u8],
+        owed: Option<&OwedChecks>,
     ) -> EngineResult<()> {
         let layout = self.layout.as_ref().expect("prepared layout");
         out.fill(0);
@@ -1466,49 +1470,63 @@ impl Par3RepairSession {
             }
             let begin = (start - offset) as usize;
             let finish = (end - offset) as usize;
-            ensure_snapshot(self.access.as_ref(), source, snapshot)?;
-            if covered[begin..finish].iter().any(|value| *value != 0) {
-                // A second extent naming this block: its bytes are fetched
-                // again so they can be compared with what the first extent
-                // already supplied. These are the only bytes this engine
-                // genuinely reads twice.
-                self.options.diagnostics.note_reread(finish - begin);
-                let _scratch = self
-                    .options
-                    .memory
-                    .reserve_as(MemoryCategory::SourceScratch, 4096)?;
-                let mut scratch = [0; 4096];
-                let mut position = begin;
-                while position < finish {
-                    self.options.cancel.check()?;
-                    let take = (finish - position).min(scratch.len());
+            // Only the check after the read vouches for the bytes; a failed
+            // read is reported as the change that caused it, if one did.
+            let mut read = || -> EngineResult<()> {
+                if covered[begin..finish].iter().any(|value| *value != 0) {
+                    // A second extent naming this block: its bytes are fetched
+                    // again so they can be compared with what the first extent
+                    // already supplied. These are the only bytes this engine
+                    // genuinely reads twice.
+                    self.options.diagnostics.note_reread(finish - begin);
+                    let _scratch = self
+                        .options
+                        .memory
+                        .reserve_as(MemoryCategory::SourceScratch, 4096)?;
+                    let mut scratch = [0; 4096];
+                    let mut position = begin;
+                    while position < finish {
+                        self.options.cancel.check()?;
+                        let take = (finish - position).min(scratch.len());
+                        read_exact_at(
+                            &self.options.diagnostics,
+                            self.access.as_ref(),
+                            source,
+                            source_offset + start - block_offset + (position - begin) as u64,
+                            &mut scratch[..take],
+                        )?;
+                        for (index, &byte) in scratch[..take].iter().enumerate() {
+                            if covered[position + index] != 0 && out[position + index] != byte {
+                                return Err(EngineError::InvalidState(
+                                    "contradictory authenticated alias bytes",
+                                ));
+                            }
+                            out[position + index] = byte;
+                        }
+                        position += take;
+                    }
+                } else {
                     read_exact_at(
                         &self.options.diagnostics,
                         self.access.as_ref(),
                         source,
-                        source_offset + start - block_offset + (position - begin) as u64,
-                        &mut scratch[..take],
+                        source_offset + start - block_offset,
+                        &mut out[begin..finish],
                     )?;
-                    for (index, &byte) in scratch[..take].iter().enumerate() {
-                        if covered[position + index] != 0 && out[position + index] != byte {
-                            return Err(EngineError::InvalidState(
-                                "contradictory authenticated alias bytes",
-                            ));
-                        }
-                        out[position + index] = byte;
-                    }
-                    position += take;
                 }
-            } else {
-                read_exact_at(
-                    &self.options.diagnostics,
-                    self.access.as_ref(),
-                    source,
-                    source_offset + start - block_offset,
-                    &mut out[begin..finish],
-                )?;
+                Ok(())
+            };
+            if let Err(error) = read() {
+                if let Some(owed) = owed {
+                    owed.settle(self.access.as_ref())?;
+                }
+                ensure_snapshot(self.access.as_ref(), source, snapshot)?;
+                return Err(error);
             }
-            ensure_snapshot(self.access.as_ref(), source, snapshot)?;
+            match owed {
+                Some(owed) => owed.owe(source, snapshot),
+                None => ensure_snapshot(self.access.as_ref(), source, snapshot)?,
+            }
             covered[begin..finish].fill(1);
         }
         for location in locations.iter() {

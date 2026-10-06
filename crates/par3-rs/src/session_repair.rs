@@ -7,6 +7,7 @@ use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use rayon::prelude::*;
 
@@ -16,6 +17,7 @@ use crate::packet::PacketBody;
 use crate::repair_tree::{Destination, RepairTree};
 use crate::runtime::{EngineError, EngineResult};
 use crate::session::{Par3RepairSession, RepairStatus, block_range};
+use crate::source::{OwedChecks, SourceAccess};
 
 /// One verified output installed by a retained repair session.
 #[derive(Clone, Debug)]
@@ -358,6 +360,7 @@ fn copy_available(
     let mut bytes = vec![0; size];
     let mut covered = vec![0; size];
     let mut copied = false;
+    let writers = StageWriters::new(tree, session);
     for (block, locations) in layout.blocks() {
         if !locations
             .iter()
@@ -370,16 +373,14 @@ fn copy_available(
         while offset < layout.block_size {
             session.options.cancel.check()?;
             let take = (layout.block_size - offset).min(size as u64) as usize;
-            session.read_block(block, offset, &mut bytes[..take], &mut covered[..take])?;
-            scatter(
-                tree,
-                &session.options,
-                layout,
-                outputs,
+            session.read_block(
                 block,
                 offset,
-                &bytes[..take],
+                &mut bytes[..take],
+                &mut covered[..take],
+                None,
             )?;
+            scatter(&writers, layout, outputs, block, offset, &bytes[..take])?;
             progress.advance(take as u64);
             offset += take as u64;
         }
@@ -548,6 +549,7 @@ where
     let mut recovered = vec![vec![0u8; stripe]; tile];
     let mut input = vec![0u8; stripe];
     let mut covered = vec![0u8; stripe];
+    let writers = StageWriters::new(tree, session);
     let mut offset = 0;
     while offset < layout.block_size {
         session.options.cancel.check()?;
@@ -568,16 +570,14 @@ where
             if lost.binary_search(&block).is_ok() {
                 continue;
             }
-            session.read_block(block, offset, &mut input[..take], &mut covered[..take])?;
-            scatter(
-                tree,
-                &session.options,
-                layout,
-                outputs,
+            session.read_block(
                 block,
                 offset,
-                &input[..take],
+                &mut input[..take],
+                &mut covered[..take],
+                Some(writers.owed()),
             )?;
+            scatter(&writers, layout, outputs, block, offset, &input[..take])?;
             if coverage.contains(&block) {
                 let apply = |(syndrome, row): (&mut Vec<u8>, &u64)| -> EngineResult<()> {
                     session.options.cancel.check()?;
@@ -645,21 +645,15 @@ where
                     .try_for_each(recover)?;
             }
             for (index, bytes) in lost[base..base + width].iter().zip(&recovered[..width]) {
-                scatter(
-                    tree,
-                    &session.options,
-                    layout,
-                    outputs,
-                    *index,
-                    offset,
-                    &bytes[..take],
-                )?;
+                scatter(&writers, layout, outputs, *index, offset, &bytes[..take])?;
                 session.options.diagnostics.note_reconstructed(take);
                 progress.advance(take as u64);
                 session.options.cancel.check()?;
             }
             base += width;
         }
+        // Reads no write has settled yet are never carried into the next pass.
+        writers.settle()?;
         offset += take as u64;
     }
     Ok(())
@@ -703,6 +697,7 @@ fn reconstruct_fft(
     )?;
     let mut covered = vec![0; stripe];
     let mut bytes = vec![0; stripe];
+    let writers = StageWriters::new(tree, session);
     // Copy only required output ranges outside damaged cohorts. Damaged cohorts
     // copy their intact ranges as their bytes are consumed by the decoder.
     for block in 0..layout.block_count {
@@ -725,16 +720,14 @@ fn reconstruct_fft(
         while offset < layout.block_size {
             session.options.cancel.check()?;
             let take = (layout.block_size - offset).min(stripe as u64) as usize;
-            session.read_block(block, offset, &mut bytes[..take], &mut covered[..take])?;
-            scatter(
-                tree,
-                &session.options,
-                layout,
-                outputs,
+            session.read_block(
                 block,
                 offset,
-                &bytes[..take],
+                &mut bytes[..take],
+                &mut covered[..take],
+                None,
             )?;
+            scatter(&writers, layout, outputs, block, offset, &bytes[..take])?;
             offset += take as u64;
         }
     }
@@ -771,8 +764,14 @@ fn reconstruct_fft(
                         if block >= coverage.end {
                             out.fill(0);
                         } else {
-                            session.read_block(block, offset, out, &mut covered[..out.len()])?;
-                            scatter(tree, &session.options, layout, outputs, block, offset, out)?;
+                            session.read_block(
+                                block,
+                                offset,
+                                out,
+                                &mut covered[..out.len()],
+                                Some(writers.owed()),
+                            )?;
+                            scatter(&writers, layout, outputs, block, offset, out)?;
                         }
                     }
                     FftInput::Recovery(index) => {
@@ -784,8 +783,7 @@ fn reconstruct_fft(
             },
             |local, offset, bytes| {
                 scatter(
-                    tree,
-                    &session.options,
+                    &writers,
                     layout,
                     outputs,
                     first + local as u64 * cohorts,
@@ -794,6 +792,7 @@ fn reconstruct_fft(
                 )
             },
         )?;
+        writers.settle()?;
     }
     Ok(())
 }
@@ -815,9 +814,117 @@ fn open_staged(
     }
 }
 
+/// Staged outputs held open for one reconstruction pass rather than reopened
+/// for every extent written. At most a quarter of the handle budget, and at
+/// least one, stays open; the least recently written closes first, and an
+/// acquirer the budget would otherwise refuse closes them too.
+///
+/// Reads recorded in [`Self::owed`] are checked against their snapshots before
+/// the next write, so nothing reaches a staged file from bytes no check has
+/// vouched for since they were read.
+struct StageWriters<'a> {
+    tree: Option<&'a RepairTree>,
+    options: &'a ExecutionOptions,
+    access: &'a dyn SourceAccess,
+    owed: OwedChecks,
+    capacity: usize,
+    open: Arc<OpenWriters>,
+}
+
+#[derive(Default)]
+struct OpenWriters(Mutex<WriterSlots>);
+
+#[derive(Default)]
+struct WriterSlots {
+    files: Vec<(usize, File, u64)>,
+    clock: u64,
+}
+
+impl WriterSlots {
+    fn take_lru(&mut self) -> Option<File> {
+        let position = (0..self.files.len()).min_by_key(|&position| self.files[position].2)?;
+        Some(self.files.swap_remove(position).1)
+    }
+}
+
+impl crate::runtime::IdleHandles for OpenWriters {
+    // A writer is idle whenever no write holds the lock.
+    fn close_idle(&self) -> bool {
+        let Ok(mut slots) = self.0.try_lock() else {
+            return false;
+        };
+        let closed = slots.take_lru();
+        drop(slots);
+        closed.is_some()
+    }
+}
+
+impl<'a> StageWriters<'a> {
+    fn new(tree: Option<&'a RepairTree>, session: &'a Par3RepairSession) -> Self {
+        let options = &session.options;
+        let open = Arc::<OpenWriters>::default();
+        let weak: Weak<OpenWriters> = Arc::downgrade(&open);
+        options.handles.register_idle(weak);
+        Self {
+            tree,
+            options,
+            access: session.access.as_ref(),
+            owed: OwedChecks::default(),
+            capacity: (options.open_handles.min(options.handles.limit()) / 4).max(1),
+            open,
+        }
+    }
+
+    /// Source reads not yet checked; every write settles them first.
+    fn owed(&self) -> &OwedChecks {
+        &self.owed
+    }
+
+    fn settle(&self) -> EngineResult<()> {
+        self.owed.settle(self.access)
+    }
+
+    fn write(&self, target: &StagedFile, offset: u64, bytes: &[u8]) -> EngineResult<()> {
+        self.settle()?;
+        let mut slots = self
+            .open
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        slots.clock += 1;
+        let clock = slots.clock;
+        let position = match slots
+            .files
+            .iter()
+            .position(|(index, _, _)| *index == target.index)
+        {
+            Some(position) => position,
+            None => {
+                if slots.files.len() >= self.capacity {
+                    drop(slots.take_lru());
+                }
+                let file = loop {
+                    match open_staged(self.tree, target, false, true, self.options) {
+                        Ok(file) => break file,
+                        Err(EngineError::ResourceLimit(_)) if !slots.files.is_empty() => {
+                            drop(slots.take_lru());
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
+                slots.files.push((target.index, file, clock));
+                slots.files.len() - 1
+            }
+        };
+        let (_, file, used) = &mut slots.files[position];
+        *used = clock;
+        file.write_all_at(offset, bytes)?;
+        Ok(())
+    }
+}
+
 fn scatter(
-    tree: Option<&RepairTree>,
-    options: &ExecutionOptions,
+    writers: &StageWriters,
     layout: &BlockLayout,
     outputs: &[StagedFile],
     block: u64,
@@ -843,9 +950,11 @@ fn scatter(
         if start >= end {
             continue;
         }
-        let mut file = open_staged(tree, target, false, true, options)?;
-        file.seek(SeekFrom::Start(extent.start + start - block_offset))?;
-        file.write_all(&bytes[(start - offset) as usize..(end - offset) as usize])?;
+        writers.write(
+            target,
+            extent.start + start - block_offset,
+            &bytes[(start - offset) as usize..(end - offset) as usize],
+        )?;
     }
     Ok(())
 }

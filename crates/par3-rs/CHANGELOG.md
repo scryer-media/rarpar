@@ -36,6 +36,38 @@
 - Native builds add `cap-std` for capability-relative filesystem operations;
   WASI continues to use the runtime's preopened directories as its outer
   capability boundary.
+- The sliding-window placement scan rolls its CRC-64 with a shift-only byte
+  step and a four-byte lookahead over contiguous stripe slices, seeds the first
+  window with `crc-fast`, and confirms a hit from the bytes already in the scan
+  buffer instead of re-reading them. Placement runs about seven times faster
+  with identical matches; `PlacementReport::read_bytes` no longer counts
+  confirmation bytes served from memory.
+- Disk sources keep a small cache of open read handles behind the shared handle
+  budget and read with positioned I/O; repair stages hold one write handle per
+  output per pass. A heavy repair opens files tens of times instead of tens of
+  thousands. Idle cached handles yield their leases to other openers, a
+  replaced file is detected at the next snapshot, and Windows and WASI keep
+  opening per read. `ExecutionDiagnostics::file_opens()` counts opens.
+- Sources are snapshot-checked once per read-ahead refill in the scanner and
+  once per stripe pass in creation, carrier regeneration and repair, always
+  after the last read a write depends on and before that write, instead of
+  before and after every read. A file changed mid-operation still ends in
+  `SourceChanged` with nothing installed; the change surfaces at the next
+  write or pass end rather than the next read.
+- Budget-narrowed stripes round down to a multiple of 16 KiB (4 KiB below
+  that), so stripe reads and writes stay page-aligned. Budget-constrained FFT
+  repair wall time roughly halves; the 64 KiB default and user-chosen stripe
+  sizes are unchanged.
+- Cauchy creation encodes recovery rows on the worker pool when the rows per
+  pass carry at least 1 MiB of work per worker. Output is byte-identical for
+  every worker count and no read is added.
+- Carrier regeneration reads each source stripe once per group of recovery
+  rows the memory budget admits, instead of once per row.
+- Recovery rows that fit the memory budget alongside the codec stay resident
+  and are hashed and written straight to carriers; no spool file is created or
+  synced. Spooled rows, and source blocks copied into data carriers, are read
+  once instead of twice. Every other fsync and the carrier read-back are
+  unchanged.
 
 ## 0.4.3
 

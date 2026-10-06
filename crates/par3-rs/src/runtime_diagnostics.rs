@@ -184,7 +184,8 @@ pub struct AdmissionSnapshot {
     pub stripe_bytes: u64,
     /// Stripe-sized buffers that admission covered.
     pub stripe_buffers: u64,
-    /// Lost rows solved and scattered per tile in the most recent Cauchy pass.
+    /// Lost rows solved and scattered per tile in the most recent Cauchy pass,
+    /// or recovery rows a carrier regenerates from each walk over the source.
     pub output_tile: u64,
     /// Files in the most recently admitted verification batch.
     pub verify_batch: u64,
@@ -320,6 +321,7 @@ struct StageCounters {
 struct State {
     source: IoCounters,
     files: IoCounters,
+    opens: AtomicU64,
     stages: [StageCounters; STAGES],
     sync: StageCounters,
     next: AtomicU64,
@@ -369,6 +371,14 @@ impl ExecutionDiagnostics {
     /// Disk provider bytes also appear in source_io; do not sum the two layers.
     pub fn file_io(&self) -> IoSnapshot {
         self.0.files.snapshot()
+    }
+    /// Successful file opens charged to the handle budget, by the engine and by
+    /// cooperating disk providers. Directory capabilities are not counted.
+    pub fn file_opens(&self) -> u64 {
+        self.0.opens.load(Ordering::Relaxed)
+    }
+    pub(crate) fn note_open(&self) {
+        add(&self.0.opens, 1);
     }
     /// File synchronization barriers, including time waiting for storage.
     /// `calls` counts attempts and `completed` counts successes. Durations are

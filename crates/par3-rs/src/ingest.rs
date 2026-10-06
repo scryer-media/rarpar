@@ -116,16 +116,21 @@ impl PayloadRef {
     /// Read a payload range without allocation. Trailing trimmed bytes are not
     /// padded here: only the codec knows the logical block size.
     pub fn read_at(&self, offset: u64, out: &mut [u8]) -> EngineResult<usize> {
-        ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)?;
         let take = self.len().saturating_sub(offset).min(out.len() as u64) as usize;
-        if take != 0 {
-            read_exact_at(
+        // Only the check after the read makes the bytes trustworthy. A read
+        // that fails is checked too, so a changed carrier still reports the
+        // change rather than whatever the read ran into.
+        if take != 0
+            && let Err(error) = read_exact_at(
                 &self.diagnostics,
                 self.access.as_ref(),
                 self.source,
                 self.data_offset + offset,
                 &mut out[..take],
-            )?;
+            )
+        {
+            ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)?;
+            return Err(error);
         }
         ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)?;
         Ok(take)
@@ -447,6 +452,9 @@ struct ScanReadAhead {
     bytes: Vec<u8>,
     offset: u64,
     len: usize,
+    /// Bytes have been read from the source since its generation was last
+    /// confirmed.
+    unchecked: bool,
 }
 
 impl ScanReadAhead {
@@ -461,6 +469,7 @@ impl ScanReadAhead {
     ) -> EngineResult<usize> {
         if offset < self.offset || offset - self.offset >= self.len as u64 {
             self.len = 0;
+            self.unchecked = true;
             let take = source_len
                 .saturating_sub(offset)
                 .min(self.bytes.len() as u64) as usize;
@@ -529,7 +538,10 @@ enum Admission {
 /// range and a separate scanner to revisit the hole later. Neither operation
 /// assumes that holes contain zero bytes.
 /// A budgeted read-ahead stripe reuses bytes across packet boundaries. Seeking
-/// discards it; every poll still checks the source generation. The scanner
+/// discards it. The source generation is checked before any packet, end or
+/// missing-byte boundary is returned, unless no byte has been read since the
+/// last check, so packets parsed from bytes already confirmed cost no further
+/// check. The scanner
 /// reserves two stripes of at most 64 KiB each. A provider may also pin a
 /// budgeted handle for the scanner and its authenticated packets' lifetime.
 pub struct PacketScanner {
@@ -587,6 +599,7 @@ impl PacketScanner {
                 bytes: vec![0; size],
                 offset: 0,
                 len: 0,
+                unchecked: false,
             },
             _buffer_reservation: reservation,
         })
@@ -617,15 +630,17 @@ impl PacketScanner {
         let mut progress = self.options.stage(crate::runtime::Stage::Scan)?;
         loop {
             self.options.cancel.check()?;
-            ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)?;
             // A packet refused by a budget on the last poll is offered again
             // before anything new is read. Its bytes are already proven, so
             // this costs only the admission that failed.
-            if let Some(authenticated) = self.authenticated.take() {
+            if self.authenticated.is_some() {
+                self.confirm_generation()?;
+                let authenticated = self.authenticated.take().expect("pending packet");
                 return self.admit(authenticated);
             }
             if self.candidate.is_none() {
                 if self.offset >= self.snapshot.len {
+                    self.confirm_generation()?;
                     return Ok(ScanEvent::End);
                 }
                 let search_size = if self.at_packet_boundary {
@@ -636,6 +651,7 @@ impl PacketScanner {
                 self.at_packet_boundary = false;
                 let take = (self.snapshot.len - self.offset).min(search_size as u64) as usize;
                 if take < 8 {
+                    self.confirm_generation()?;
                     self.offset = self.snapshot.len;
                     return Ok(ScanEvent::End);
                 }
@@ -654,6 +670,7 @@ impl PacketScanner {
                         return Err(EngineError::InvalidState("invalid source read length"));
                     }
                     if count == 0 {
+                        self.confirm_generation()?;
                         return Ok(ScanEvent::NeedData {
                             offset: self.offset + read as u64,
                         });
@@ -669,6 +686,7 @@ impl PacketScanner {
                 };
                 self.offset += found as u64;
                 if self.snapshot.len - self.offset < HEADER_SIZE as u64 {
+                    self.confirm_generation()?;
                     self.offset = self.snapshot.len;
                     return Ok(ScanEvent::End);
                 }
@@ -691,6 +709,7 @@ impl PacketScanner {
                         return Err(EngineError::InvalidState("invalid source read length"));
                     }
                     if count == 0 {
+                        self.confirm_generation()?;
                         return Ok(ScanEvent::NeedData {
                             offset: self.offset + header_read as u64,
                         });
@@ -780,6 +799,8 @@ impl PacketScanner {
                 )?;
                 progress.advance(read as u64);
                 if read == 0 {
+                    ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)?;
+                    self.read_ahead.unchecked = false;
                     return Ok(ScanEvent::NeedData {
                         offset: candidate.offset + candidate.consumed,
                     });
@@ -800,7 +821,9 @@ impl PacketScanner {
                 }
                 candidate.consumed += read as u64;
             }
-            ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)?;
+            if self.read_ahead.unchecked {
+                self.confirm_generation()?;
+            }
             let candidate = self.candidate.take().expect("candidate present");
             if candidate.hash.finalize() != candidate.header.hash {
                 self.failed_hash_bytes = self
@@ -826,6 +849,14 @@ impl PacketScanner {
                 reservation: candidate.reservation,
             });
         }
+    }
+
+    /// Fail if the source left the scanned generation. Every byte read before
+    /// a successful check is confirmed by it.
+    fn confirm_generation(&mut self) -> EngineResult<()> {
+        ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)?;
+        self.read_ahead.unchecked = false;
+        Ok(())
     }
 
     /// Offer one authenticated packet to the budget, and move the scan past it

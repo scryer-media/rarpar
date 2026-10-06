@@ -456,8 +456,10 @@ fn advanced_cauchy_and_fft_sets_repair_and_report_exact_volume_sizes() {
         let paths = plan
             .execute(&carriers.path().join("set"), carriers.path())
             .unwrap();
+        // Six 256-byte rows are held resident, so there is no spool file to
+        // synchronize: one barrier per carrier and nothing else.
         let synced = options.execution.diagnostics.file_sync();
-        assert_eq!(synced.calls, paths.len() as u64 + 1);
+        assert_eq!(synced.calls, paths.len() as u64);
         assert_eq!(synced.completed, synced.calls);
         let buffered = common::TempTree::new(&format!("advanced-buffered-{number}"));
         let buffered_paths = plan
@@ -525,6 +527,97 @@ fn advanced_cauchy_and_fft_sets_repair_and_report_exact_volume_sizes() {
             std::fs::read(output.path().join("input.bin")).unwrap(),
             bytes
         );
+    }
+}
+
+/// Create one Cauchy set and return every carrier's bytes, the admitted worker
+/// count, and the source reads the creation made.
+fn cauchy_carriers(
+    name: &str,
+    bytes: &[u8],
+    block_size: u64,
+    recovery_count: u64,
+    workers: usize,
+    memory: Option<usize>,
+) -> (u8, Vec<Vec<u8>>, u64, u64) {
+    let mut access = MemorySourceAccess::default();
+    access.insert(SourceId(1), 1, bytes.to_vec().into());
+    let mut options = CreationOptions {
+        block_size,
+        recovery_count,
+        first_recovery: 1,
+        codec: CreationCodec::Cauchy,
+        ..CreationOptions::default()
+    };
+    options.execution.workers = workers;
+    if let Some(memory) = memory {
+        options.execution.memory = par3_rs::runtime::MemoryBudget::new(memory);
+    }
+    let diagnostics = options.execution.diagnostics.clone();
+    let plan = CreationPlan::build(
+        Arc::new(access),
+        &[CreationSource {
+            name: "input.bin".into(),
+            source: SourceId(1),
+        }],
+        options,
+    )
+    .unwrap();
+    let reads = diagnostics.source_io().read_calls;
+    let tree = common::TempTree::new(&format!("cauchy-workers-{name}-{workers}"));
+    let paths = plan
+        .execute_with_durability(
+            &tree.path().join("set"),
+            tree.path(),
+            par3_rs::creation::CreationDurability::Buffered,
+        )
+        .unwrap();
+    (
+        plan.requirements().field.size,
+        paths
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect(),
+        diagnostics.admission().workers,
+        diagnostics.source_io().read_calls - reads,
+    )
+}
+
+#[test]
+fn cauchy_creation_is_byte_identical_for_every_worker_count() {
+    // Each case has 4 MiB of rows behind every source stripe, enough for the
+    // encode to admit four workers, and a tail that leaves the last block short.
+    let mut one_pass_reads = 0;
+    for (name, field, block_size, blocks, recovery_count, memory, widest) in [
+        ("gf8", 1, 64 << 10, 8, 64, None, 4),
+        ("gf16", 2, 16 << 10, 8, 256, None, 4),
+        // Too little memory for one batch of all 256 rows: the encode walks
+        // the source twice, 2 MiB of rows at a time, which is room for two
+        // workers, and the pool must not make it walk a third time.
+        ("gf16-passes", 2, 16 << 10, 8, 256, Some(4 << 20), 2),
+    ] {
+        let bytes: Vec<u8> = (0..block_size as usize * blocks - 77)
+            .map(|i| (i * 131 + i / 977) as u8)
+            .collect();
+        let (serial_field, serial, serial_workers, serial_reads) =
+            cauchy_carriers(name, &bytes, block_size, recovery_count, 1, memory);
+        assert_eq!(serial_field, field, "{name}");
+        assert_eq!(serial_workers, 1, "{name}");
+        if memory.is_none() {
+            one_pass_reads = serial_reads;
+        } else {
+            assert!(serial_reads > one_pass_reads, "{name}: one pass was enough");
+        }
+        for workers in [2, 4] {
+            let (_, parallel, admitted, reads) =
+                cauchy_carriers(name, &bytes, block_size, recovery_count, workers, memory);
+            assert_eq!(admitted, workers.min(widest) as u64, "{name}: {workers}");
+            assert_eq!(reads, serial_reads, "{name}: workers changed the reads");
+            assert!(
+                parallel == serial,
+                "{name}: {workers} workers changed bytes"
+            );
+        }
     }
 }
 
@@ -748,5 +841,151 @@ fn a_recovery_range_that_is_not_whole_rows_is_refused() {
             ),
             "{first_recovery}+{recovery_count} is not a whole number of rows"
         );
+    }
+}
+
+/// What one creation wrote and what it cost on disk.
+struct Created {
+    carriers: Vec<Vec<u8>>,
+    output_bytes: u64,
+    scratch_bytes: u64,
+    file_io: par3_rs::runtime::IoSnapshot,
+    syncs: u64,
+    resident_peak: u64,
+    field: u8,
+}
+
+fn create_under(
+    name: &str,
+    bytes: &[u8],
+    settings: &CreationOptions,
+    memory: Option<usize>,
+) -> Created {
+    let mut access = MemorySourceAccess::default();
+    access.insert(SourceId(1), 1, bytes.to_vec().into());
+    let mut options = settings.clone();
+    options.execution.diagnostics = Default::default();
+    if let Some(memory) = memory {
+        options.execution.memory = par3_rs::runtime::MemoryBudget::new(memory);
+    }
+    let execution = options.execution.clone();
+    let plan = CreationPlan::build(
+        Arc::new(access),
+        &[CreationSource {
+            name: "input.bin".into(),
+            source: SourceId(1),
+        }],
+        options,
+    )
+    .unwrap();
+    let tree = common::TempTree::new(&format!("spool-{name}-{}", memory.is_some()));
+    let paths = plan.execute(&tree.path().join("set"), tree.path()).unwrap();
+    assert!(
+        execution.memory.peak() <= execution.memory.limit(),
+        "{name}"
+    );
+    let ledger = execution.diagnostics.memory().unwrap();
+    Created {
+        carriers: paths
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect(),
+        output_bytes: plan.requirements().output_sizes.iter().sum(),
+        scratch_bytes: plan.requirements().scratch_bytes,
+        field: plan.requirements().field.size,
+        file_io: execution.diagnostics.file_io(),
+        syncs: execution.diagnostics.file_sync().calls,
+        resident_peak: ledger
+            .category(par3_rs::runtime::MemoryCategory::OutputStaging)
+            .peak,
+    }
+}
+
+#[test]
+fn resident_and_spooled_recovery_rows_write_the_same_carriers() {
+    // Each case's rows fit the default budget and are held resident, and do
+    // not fit the small one beside the carrier stage, so they are spooled.
+    // The small budgets still leave the carrier stage room for one payload.
+    for (name, codec, blocks, block_size, recovery_count, small) in [
+        ("gf8", CreationCodec::Cauchy, 100, 8 << 10, 64, 512 << 10),
+        ("gf16", CreationCodec::Cauchy, 300, 8 << 10, 256, 2 << 20),
+        (
+            "fft",
+            CreationCodec::Fft {
+                capacity_log2: 4,
+                interleave: 0,
+            },
+            40,
+            32 << 10,
+            16,
+            768 << 10,
+        ),
+        (
+            "interleaved",
+            CreationCodec::Fft {
+                capacity_log2: 3,
+                interleave: 1,
+            },
+            40,
+            32 << 10,
+            16,
+            768 << 10,
+        ),
+    ] {
+        let bytes: Vec<u8> = (0..block_size * blocks - 77)
+            .map(|i| (i * 131 + i / 977) as u8)
+            .collect();
+        for volumes in [
+            VolumeLayout::Uniform(recovery_count),
+            VolumeLayout::Variable,
+        ] {
+            let mut settings = CreationOptions {
+                block_size: block_size as u64,
+                recovery_count,
+                codec,
+                volumes,
+                ..CreationOptions::default()
+            };
+            settings.execution.workers = 2;
+            let case = format!("{name}-{volumes:?}");
+            let resident = create_under(&case, &bytes, &settings, None);
+            let spooled = create_under(&case, &bytes, &settings, Some(small));
+            assert!(
+                resident.carriers == spooled.carriers,
+                "{case}: the spool changed the carriers"
+            );
+            let carriers = resident.carriers.len() as u64;
+            assert!(carriers > 1, "{case}");
+            if codec == CreationCodec::Cauchy {
+                let field = if name == "gf8" { 1 } else { 2 };
+                assert_eq!(resident.field, field, "{case}");
+            }
+            let scratch = resident.scratch_bytes;
+            assert_eq!(scratch, recovery_count * block_size as u64, "{case}");
+
+            // Resident rows: only carriers are written, and the carrier
+            // re-scan is the only file read, so no scratch byte moves.
+            assert_eq!(
+                resident.file_io.write_bytes, resident.output_bytes,
+                "{case}"
+            );
+            assert_eq!(resident.syncs, carriers, "{case}: a spool was synchronized");
+            assert!(resident.resident_peak >= scratch, "{case}");
+
+            // Spooled rows: each is written once and read back once, where
+            // the packet hash used to take a second read of every byte.
+            assert_eq!(
+                spooled.file_io.write_bytes,
+                spooled.output_bytes + scratch,
+                "{case}"
+            );
+            assert_eq!(
+                spooled.file_io.read_bytes - resident.file_io.read_bytes,
+                scratch,
+                "{case}: spooled payloads were not read exactly once"
+            );
+            assert_eq!(spooled.syncs, carriers + 1, "{case}");
+            assert!(spooled.resident_peak < scratch, "{case}");
+        }
     }
 }

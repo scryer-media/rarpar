@@ -7,7 +7,7 @@ use thiserror::Error;
 
 #[path = "runtime_handles.rs"]
 mod handles;
-pub(crate) use handles::{EngineFile, OpenBudgeted};
+pub(crate) use handles::{EngineFile, IdleHandles, OpenBudgeted};
 pub use handles::{HandleBudget, HandleLease};
 
 #[path = "runtime_diagnostics.rs"]
@@ -426,6 +426,27 @@ struct BudgetState {
     ledger: [CategoryLedger; MEMORY_CATEGORIES],
 }
 
+/// Granules a budget-narrowed stripe is rounded down to, largest first.
+/// Stripes are read and written at whole multiples of their width from a
+/// block's start, so a width that is a multiple of the page keeps those
+/// transfers off partial pages, which the page cache would otherwise read back
+/// before modifying. 16 KiB is a multiple of both common page sizes (4 KiB and
+/// 16 KiB); 4 KiB is the fallback when the room cannot hold 16 KiB. Both are
+/// multiples of every field unit, and fixed: no page-size probing.
+pub(crate) const STRIPE_GRANULES: [usize; 2] = [16 << 10, 4 << 10];
+
+/// The stripe width `room` bytes per buffer can hold when the budget, not the
+/// configured target, decides it. Rounding down never charges more than the
+/// room measured. A room smaller than every granule keeps the plain
+/// `alignment`-multiple, so a tight budget still runs rather than refuses.
+pub(crate) fn budget_stripe(room: usize, alignment: usize) -> usize {
+    let granule = STRIPE_GRANULES
+        .into_iter()
+        .find(|granule| room >= *granule && granule.is_multiple_of(alignment))
+        .unwrap_or(alignment);
+    room / granule * granule
+}
+
 /// A caller-owned allocation budget that may be shared across sessions.
 ///
 /// Reservations precede allocation and include conservative bookkeeping costs.
@@ -519,7 +540,11 @@ impl MemoryBudget {
         }
         for attempt in 0..2 {
             let room = self.available().saturating_sub(overhead) / count;
-            let stripe = target.min(room) / alignment * alignment;
+            let stripe = if room < target {
+                budget_stripe(room, alignment)
+            } else {
+                target / alignment * alignment
+            };
             if stripe == 0 {
                 break;
             }
@@ -745,6 +770,17 @@ impl WorkerPool {
         Self::for_work(options, workers, workers.saturating_mul(per_worker))
     }
 
+    /// Stacks `for_work` charges for `maximum` units when memory does not
+    /// narrow it: zero when the stage would run on the calling thread anyway.
+    pub(crate) fn unnarrowed_bytes(options: &ExecutionOptions, maximum: usize) -> usize {
+        let workers = options.workers.min(maximum);
+        if workers < 2 {
+            0
+        } else {
+            workers.saturating_mul(Self::WORKER_BYTES)
+        }
+    }
+
     pub(crate) fn for_work(
         options: &ExecutionOptions,
         maximum: usize,
@@ -885,6 +921,49 @@ mod stripe_tests {
         drop(scratch);
         drop(pool);
         assert_eq!(options.memory.used(), 0);
+    }
+
+    /// A stripe the budget narrows is cut to whole 16 KiB granules, or 4 KiB
+    /// ones when 16 KiB does not fit, so the reads and writes at multiples of
+    /// it stay page-aligned; a budget that cannot hold 4 KiB, and a target the
+    /// budget does not narrow, keep the field-unit rounding they had.
+    #[test]
+    fn budget_narrowed_stripes_round_down_to_whole_granules() {
+        assert_eq!(budget_stripe(50_316, 2), 49_152);
+        assert_eq!(budget_stripe(50_317, 1), 49_152);
+        assert_eq!(budget_stripe(30_000, 2), 16_384);
+        assert_eq!(budget_stripe(16_384, 2), 16_384);
+        assert_eq!(budget_stripe(16_383, 2), 12_288);
+        assert_eq!(budget_stripe(4096, 2), 4096);
+        assert_eq!(budget_stripe(4095, 2), 4094);
+        assert_eq!(budget_stripe(4095, 1), 4095);
+        assert_eq!(budget_stripe(1, 2), 0);
+
+        // Narrowed by the budget: whole granules, never more than measured.
+        let memory = MemoryBudget::new(3 * 50_317 + 64);
+        let (stripe, reservation) = memory
+            .reserve_stripes_with_overhead(MemoryCategory::CodecScratch, 64 << 10, 3, 2, 64)
+            .unwrap();
+        assert_eq!(stripe, 49_152);
+        assert_eq!(memory.used(), 3 * 49_152 + 64);
+        drop(reservation);
+
+        // Too small for one granule: the GF(2^16) unit still decides.
+        let memory = MemoryBudget::new(3 * 4001);
+        let (stripe, reservation) = memory
+            .reserve_stripes(MemoryCategory::CodecScratch, 64 << 10, 3, 2)
+            .unwrap();
+        assert_eq!(stripe, 4000);
+        drop(reservation);
+
+        // Not narrowed: the configured target is used as given, unrounded.
+        let memory = MemoryBudget::new(1 << 20);
+        let (stripe, reservation) = memory
+            .reserve_stripes(MemoryCategory::CodecScratch, 5001, 3, 2)
+            .unwrap();
+        assert_eq!(stripe, 5000);
+        drop(reservation);
+        assert_eq!(memory.used(), 0);
     }
 
     #[test]

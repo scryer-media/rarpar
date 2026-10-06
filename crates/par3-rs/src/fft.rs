@@ -344,11 +344,16 @@ impl FftCodec {
             .options
             .memory
             .reserve_as(MemoryCategory::CodecScratch, decode_floor)?;
-        let target = self
+        let wanted = self
             .options
             .stripe_bytes
-            .min(usize::try_from(block_size).unwrap_or(usize::MAX))
-            .min(self.options.memory.available() / 4);
+            .min(usize::try_from(block_size).unwrap_or(usize::MAX));
+        let room = self.options.memory.available() / 4;
+        let target = if room < wanted {
+            crate::runtime::budget_stripe(room, unit)
+        } else {
+            wanted
+        };
         let (stripe, reservation) =
             self.options
                 .memory
@@ -743,6 +748,26 @@ impl FftCodec {
         Ok(())
     }
 
+    /// What `encode` reserves for its stripes when memory does not narrow
+    /// them, by the same layout `buffers` and `byte_buffers` charge. A caller
+    /// holding output beside the encode leaves this much so the stripe stays
+    /// at its configured width.
+    pub(crate) fn encode_stripe_bytes(&self, block_size: u64) -> usize {
+        let target = self
+            .options
+            .stripe_bytes
+            .min(usize::try_from(block_size).unwrap_or(usize::MAX));
+        if self.geometry.is_trivial() {
+            return target.saturating_mul(2).saturating_add(64);
+        }
+        let unit = self.geometry.field_bytes();
+        let rows = self.geometry.capacity.saturating_mul(2);
+        let per_byte = rows.saturating_mul(2 / unit).saturating_add(2);
+        (target / unit * unit)
+            .saturating_mul(per_byte)
+            .saturating_add(rows.saturating_mul(32))
+    }
+
     fn byte_buffers(&self, block_size: u64) -> EngineResult<(usize, Reservation)> {
         self.options.validate()?;
         if block_size == 0 {
@@ -968,6 +993,28 @@ mod charge_tests {
             drop(codec);
             assert_eq!(options.memory.used(), 0);
         }
+    }
+
+    /// A budget too small for full-width stripes narrows them to whole 16 KiB
+    /// granules, in the decode workspace and in the repair adapter's source
+    /// buffers alike, so every stripe offset in a page-aligned block stays on a
+    /// page boundary.
+    #[test]
+    fn budget_narrowed_fft_stripes_are_whole_granules() {
+        // 400 inputs and capacity 64 pad to a 512-row GF(2^16) domain.
+        let geometry = FftGeometry::new(400, 6).unwrap();
+        assert_eq!((geometry.domain, geometry.field_bytes()), (512, 2));
+        let codec = FftCodec::new(geometry, options(24 << 20)).unwrap();
+        let (stripe, buffers) = codec.buffers(1 << 20, geometry.domain).unwrap();
+        assert!(stripe < 64 << 10, "the budget did not narrow: {stripe}");
+        assert!(stripe.is_multiple_of(16 << 10), "unaligned stripe {stripe}");
+        drop(buffers);
+        drop(codec);
+
+        let mut codec = FftCodec::new(geometry, options(768 << 10)).unwrap();
+        let (stripe, _buffers) = codec.reserve_source_stripes(1 << 20, 4).unwrap();
+        assert!(stripe < 64 << 10, "the budget did not narrow: {stripe}");
+        assert!(stripe.is_multiple_of(16 << 10), "unaligned stripe {stripe}");
     }
 
     /// The repair adapter keeps two byte buffers for the whole reconstruction

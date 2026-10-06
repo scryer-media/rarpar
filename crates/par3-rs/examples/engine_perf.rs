@@ -274,11 +274,18 @@ fn main() -> Result<()> {
     );
     let io = options.diagnostics.file_io();
     println!(
-        "{{\"file_read_bytes\":{},\"file_write_bytes\":{},\"memory_limit\":{},\"workers\":{}}}",
+        "{{\"file_read_bytes\":{},\"file_read_calls\":{},\"file_write_bytes\":{},\"file_write_calls\":{},\"memory_limit\":{},\"workers\":{}}}",
         io.read_bytes,
+        io.read_calls,
         io.write_bytes,
+        io.write_calls,
         options.memory.limit(),
         options.workers
+    );
+    let admission = options.diagnostics.admission();
+    println!(
+        "{{\"stripe_bytes\":{},\"stripe_buffers\":{},\"file_read_calls\":{},\"file_write_calls\":{}}}",
+        admission.stripe_bytes, admission.stripe_buffers, io.read_calls, io.write_calls
     );
     Ok(())
 }

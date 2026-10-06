@@ -1,11 +1,11 @@
 //! Positioned access to immutable generations of disk, memory or virtual bytes.
 
 use crate::runtime::{EngineFile as File, ExecutionOptions};
-use std::collections::BTreeMap;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::collections::{BTreeMap, HashMap};
+use std::io::{self, Read};
 use std::ops::Range;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::runtime::{EngineError, EngineResult};
 
@@ -62,10 +62,16 @@ pub trait SourceAccess: Send + Sync {
     }
 }
 
-/// Disk source registry. Positioned reads retain no handles; sequential readers
-/// hold one shared lease until dropped. Windows scanners use [`SourceAccess::pin`]
-/// to retain a budgeted read-only sharing lock and hash the carrier once.
-/// Drop the scanner and all scanned packets to release that carrier lock.
+/// Disk source registry. Sequential readers hold one shared lease until dropped.
+/// Windows scanners use [`SourceAccess::pin`] to retain a budgeted read-only
+/// sharing lock and hash the carrier once. Drop the scanner and all scanned
+/// packets to release that carrier lock.
+///
+/// On Unix, positioned reads keep a few read handles open between calls, at
+/// most a quarter of the handle budget. Each stays charged to the budget, is
+/// closed for any acquirer the budget would otherwise refuse, and is closed as
+/// soon as a snapshot finds the path naming a different file; dropping the
+/// registry closes them all. Elsewhere every positioned read opens the file.
 ///
 /// Unix generations include device, inode and change time. On other platforms,
 /// snapshots hash the file through bounded buffers because length and mtime do
@@ -77,6 +83,7 @@ pub trait SourceAccess: Send + Sync {
 pub struct DiskSourceAccess {
     paths: BTreeMap<SourceId, PathBuf>,
     options: ExecutionOptions,
+    handles: Arc<ReadHandles>,
 }
 
 impl DiskSourceAccess {
@@ -85,12 +92,15 @@ impl DiskSourceAccess {
         Self {
             paths: BTreeMap::new(),
             options,
+            handles: Arc::default(),
         }
     }
 
     /// Register a caller-selected path. File selection and containment belong to
     /// the caller; PAR3 paths are never interpreted by this registry.
     pub fn insert(&mut self, id: SourceId, path: PathBuf) {
+        let closed = self.handles.lock().remove(id);
+        drop(closed);
         self.paths.insert(id, path);
     }
 
@@ -98,6 +108,206 @@ impl DiskSourceAccess {
         self.paths
             .get(&id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unregistered PAR3 source"))
+    }
+
+    fn cached_handles(&self) -> usize {
+        if cfg!(unix) {
+            CACHED_READ_HANDLES.min(self.options.open_handles.min(self.options.handles.limit()) / 4)
+        } else {
+            0
+        }
+    }
+}
+
+/// Most read handles one disk registry keeps open between positioned reads.
+const CACHED_READ_HANDLES: usize = 8;
+
+/// The file a path or handle names, used to tell whether a cached handle still
+/// reads what the path does. Bytes and length are not part of it: a handle and
+/// a path naming the same file always read the same bytes.
+type FileIdentity = (u64, u64);
+
+#[cfg(unix)]
+fn file_identity(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &std::fs::Metadata) -> Option<FileIdentity> {
+    None
+}
+
+/// Positioned-read handles kept open between calls, least recently used closed
+/// first.
+///
+/// A cached handle keeps reading the file it opened even after the path is
+/// replaced, so a snapshot that finds the path naming another file closes it.
+/// A handle opened before such a snapshot is never cached: each source's
+/// epoch advances whenever its snapshots see a different file, and a handle
+/// is admitted only if no such change happened while it was being opened.
+#[derive(Default)]
+struct ReadHandles {
+    slots: Mutex<ReadSlots>,
+    registered: std::sync::atomic::AtomicBool,
+}
+
+impl std::fmt::Debug for ReadHandles {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ReadHandles")
+    }
+}
+
+#[derive(Default)]
+struct ReadSlots {
+    sources: HashMap<SourceId, ReadSlot>,
+    open: usize,
+    clock: u64,
+}
+
+#[derive(Default)]
+struct ReadSlot {
+    handle: Option<CachedRead>,
+    /// The file the path named at the last snapshot.
+    seen: Option<FileIdentity>,
+    epoch: u64,
+}
+
+struct CachedRead {
+    file: Arc<File>,
+    identity: FileIdentity,
+    used: u64,
+}
+
+impl ReadHandles {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ReadSlots> {
+        self.slots.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// The cached handle, or the epoch an uncached open must still match.
+    fn lookup(&self, source: SourceId) -> Result<Arc<File>, u64> {
+        let mut slots = self.lock();
+        slots.clock += 1;
+        let clock = slots.clock;
+        match slots.sources.get_mut(&source) {
+            Some(ReadSlot {
+                handle: Some(cached),
+                ..
+            }) => {
+                cached.used = clock;
+                Ok(Arc::clone(&cached.file))
+            }
+            Some(slot) => Err(slot.epoch),
+            None => Err(0),
+        }
+    }
+
+    /// Cache a freshly opened handle unless the path changed while opening it.
+    fn offer(
+        self: &Arc<Self>,
+        source: SourceId,
+        epoch: u64,
+        file: &Arc<File>,
+        capacity: usize,
+        budget: &crate::runtime::HandleBudget,
+    ) {
+        let Some(identity) = file.metadata().ok().as_ref().and_then(file_identity) else {
+            return;
+        };
+        let mut slots = self.lock();
+        let (cached, current, seen) = slots.sources.get(&source).map_or((false, 0, None), |slot| {
+            (slot.handle.is_some(), slot.epoch, slot.seen)
+        });
+        if cached || current != epoch || seen.is_some_and(|seen| seen != identity) {
+            return;
+        }
+        let evicted = (slots.open >= capacity)
+            .then(|| slots.take_lru(|_| true))
+            .flatten();
+        slots.open += 1;
+        let used = slots.clock;
+        slots.sources.entry(source).or_default().handle = Some(CachedRead {
+            file: Arc::clone(file),
+            identity,
+            used,
+        });
+        drop(slots);
+        drop(evicted);
+        if !self
+            .registered
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            let weak: std::sync::Weak<Self> = Arc::downgrade(self);
+            budget.register_idle(weak);
+        }
+    }
+
+    /// Record which file the path names now, closing a handle on another one.
+    fn observe(&self, source: SourceId, identity: Option<FileIdentity>) {
+        let mut slots = self.lock();
+        let slot = slots.sources.entry(source).or_default();
+        let stale = slot
+            .handle
+            .take_if(|cached| Some(cached.identity) != identity);
+        if slot.seen != identity {
+            slot.seen = identity;
+            slot.epoch += 1;
+        }
+        if stale.is_some() {
+            slots.open -= 1;
+        }
+        drop(slots);
+        drop(stale);
+    }
+
+    /// Close `file` if it is still the cached handle for `source`.
+    fn forget(&self, source: SourceId, file: &Arc<File>) {
+        let mut slots = self.lock();
+        let stale = slots.sources.get_mut(&source).and_then(|slot| {
+            slot.handle
+                .take_if(|cached| Arc::ptr_eq(&cached.file, file))
+        });
+        if stale.is_some() {
+            slots.open -= 1;
+        }
+        drop(slots);
+        drop(stale);
+    }
+}
+
+impl ReadSlots {
+    fn take_lru(&mut self, eligible: impl Fn(&CachedRead) -> bool) -> Option<CachedRead> {
+        let source = self
+            .sources
+            .iter()
+            .filter_map(|(source, slot)| Some((*source, slot.handle.as_ref()?)))
+            .filter(|(_, cached)| eligible(cached))
+            .min_by_key(|(_, cached)| cached.used)?
+            .0;
+        let cached = self.sources.get_mut(&source)?.handle.take();
+        self.open -= 1;
+        cached
+    }
+
+    fn remove(&mut self, source: SourceId) -> Option<ReadSlot> {
+        let slot = self.sources.remove(&source)?;
+        if slot.handle.is_some() {
+            self.open -= 1;
+        }
+        Some(slot)
+    }
+}
+
+impl crate::runtime::IdleHandles for ReadHandles {
+    // Only a handle no read is using releases its lease when closed. Never
+    // waits: the caller may be this registry, opening another file.
+    fn close_idle(&self) -> bool {
+        let Ok(mut slots) = self.slots.try_lock() else {
+            return false;
+        };
+        let closed = slots.take_lru(|cached| Arc::strong_count(&cached.file) == 1);
+        drop(slots);
+        closed.is_some()
     }
 }
 
@@ -155,7 +365,15 @@ impl SourceAccess for DiskSourceAccess {
         let Some(path) = self.paths.get(&source) else {
             return Ok(None);
         };
-        let metadata = match std::fs::metadata(path) {
+        let metadata = std::fs::metadata(path);
+        if self.cached_handles() != 0 {
+            let identity = match &metadata {
+                Ok(metadata) if metadata.is_file() => file_identity(metadata),
+                _ => None,
+            };
+            self.handles.observe(source, identity);
+        }
+        let metadata = match metadata {
             Ok(value) => value,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
@@ -183,10 +401,29 @@ impl SourceAccess for DiskSourceAccess {
     }
 
     fn read_at(&self, source: SourceId, offset: u64, out: &mut [u8]) -> io::Result<usize> {
-        let mut file =
-            File::open(self.path(source)?, &self.options).map_err(EngineError::into_io)?;
-        file.seek(SeekFrom::Start(offset))?;
-        file.read(out)
+        let path = self.path(source)?;
+        let capacity = self.cached_handles();
+        if capacity == 0 {
+            let file = File::open(path, &self.options).map_err(EngineError::into_io)?;
+            return file.read_at(offset, out);
+        }
+        self.options.validate().map_err(EngineError::into_io)?;
+        let epoch = match self.handles.lookup(source) {
+            Ok(file) => match file.read_at(offset, out) {
+                Ok(read) => return Ok(read),
+                // The handle may have gone stale under a replaced path, as on
+                // network mounts; read through the path as before.
+                Err(_) => {
+                    self.handles.forget(source, &file);
+                    self.handles.lookup(source).err().unwrap_or(0)
+                }
+            },
+            Err(epoch) => epoch,
+        };
+        let file = Arc::new(File::open(path, &self.options).map_err(EngineError::into_io)?);
+        self.handles
+            .offer(source, epoch, &file, capacity, &self.options.handles);
+        file.read_at(offset, out)
     }
 
     fn next_available(&self, source: SourceId, offset: u64) -> io::Result<Option<Range<u64>>> {
@@ -294,6 +531,7 @@ impl SourceAccess for PinnedDiskSource {
                 "unregistered PAR3 source",
             ));
         }
+        use std::io::{Seek, SeekFrom};
         let mut file = self
             .file
             .lock()
@@ -398,6 +636,36 @@ pub(crate) fn ensure_snapshot(
         return Err(EngineError::SourceChanged(source));
     }
     Ok(())
+}
+
+/// Snapshot checks owed for bytes already read and not yet vouched for.
+///
+/// A pass reading many ranges of a source before it writes anything derived
+/// from them records each read here and settles before its first write, so
+/// each source is checked once, after every read the write can depend on.
+#[derive(Default)]
+pub(crate) struct OwedChecks(Mutex<std::collections::BTreeSet<(SourceId, u64, u64)>>);
+
+impl OwedChecks {
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeSet<(SourceId, u64, u64)>> {
+        self.0.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub(crate) fn owe(&self, source: SourceId, snapshot: SourceSnapshot) {
+        self.lock()
+            .insert((source, snapshot.len, snapshot.generation));
+    }
+
+    /// Check every owed source once. Call after the last read a write may
+    /// depend on and before that write.
+    pub(crate) fn settle(&self, access: &dyn SourceAccess) -> EngineResult<()> {
+        let mut owed = self.lock();
+        for &(source, len, generation) in owed.iter() {
+            ensure_snapshot(access, source, SourceSnapshot { len, generation })?;
+        }
+        owed.clear();
+        Ok(())
+    }
 }
 
 #[cfg(test)]

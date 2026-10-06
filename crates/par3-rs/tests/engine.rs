@@ -197,10 +197,71 @@ fn carrier_read_ahead_reads_each_byte_once_and_rejects_changed_generations() {
     scanner.seek(0).unwrap();
     assert!(matches!(scanner.poll().unwrap(), ScanEvent::Packet(_)));
     source.generation.store(2, Ordering::Relaxed);
-    assert!(matches!(
-        scanner.poll(),
-        Err(EngineError::SourceChanged(SourceId(1)))
-    ));
+    // Packets parsed from read-ahead bytes confirmed before the change may
+    // still be returned; nothing read after it is, and the scan ends in the
+    // change rather than in a clean end.
+    let reads = source.reads.load(Ordering::Relaxed);
+    loop {
+        match scanner.poll() {
+            Ok(ScanEvent::Packet(_)) => assert_eq!(source.reads.load(Ordering::Relaxed), reads),
+            Err(EngineError::SourceChanged(SourceId(1))) => break,
+            other => panic!("changed generation was not reported: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn packets_from_one_read_ahead_stripe_share_one_generation_check() {
+    // Counts snapshot calls; a disk provider pays one `stat` for each.
+    struct Counted {
+        inner: ArrivingSource,
+        snapshots: AtomicUsize,
+    }
+    impl SourceAccess for Counted {
+        fn snapshot(&self, source: SourceId) -> std::io::Result<Option<SourceSnapshot>> {
+            self.snapshots.fetch_add(1, Ordering::Relaxed);
+            self.inner.snapshot(source)
+        }
+        fn read_at(&self, source: SourceId, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read_at(source, offset, out)
+        }
+        fn next_available(
+            &self,
+            source: SourceId,
+            offset: u64,
+        ) -> std::io::Result<Option<std::ops::Range<u64>>> {
+            self.inner.next_available(source, offset)
+        }
+    }
+    let bytes = common::set_vol0_par3();
+    let packets = common::scan(&bytes).len();
+    let source = Arc::new(Counted {
+        inner: ArrivingSource {
+            visible: AtomicUsize::new(bytes.len()),
+            generation: AtomicU64::new(1),
+            reads: AtomicUsize::new(0),
+            bytes,
+        },
+        snapshots: AtomicUsize::new(0),
+    });
+    let options = ExecutionOptions::default();
+    let mut scanner = PacketScanner::new(
+        source.clone(),
+        SourceId(1),
+        options.clone(),
+        ScanLimits::default(),
+    )
+    .unwrap();
+    let mut seen = 0;
+    while let ScanEvent::Packet(_) = scanner.poll().unwrap() {
+        seen += 1;
+    }
+    assert_eq!(seen, packets);
+    assert!(packets > 2);
+    // One snapshot to open, one after the only read-ahead refill, one at the
+    // end; it used to be two per packet.
+    assert_eq!(source.inner.reads.load(Ordering::Relaxed), 1);
+    assert_eq!(source.snapshots.load(Ordering::Relaxed), 3);
 }
 
 #[test]
