@@ -555,14 +555,15 @@ impl MulAccBatch for Gf8 {
             .chunks(BATCH_SOURCES)
             .zip(factors.chunks(BATCH_SOURCES))
         {
-            // A plan per source on the stack; the slots past a short chunk
-            // repeat its last plan and are never visited.
+            // The compile-time plan of each source's factor, so no tables
+            // are built per call; the slots past a short chunk repeat its
+            // last plan and are never visited.
             let last = sources.len() - 1;
-            let plans: [MulPlan; BATCH_SOURCES] =
-                std::array::from_fn(|k| MulPlan::new(factors[k.min(last)]));
+            let plans: [&MulPlan; BATCH_SOURCES] =
+                std::array::from_fn(|k| MulPlan::cached(factors[k.min(last)]));
             if grouped {
                 let inputs: [PlanSrc<'_>; BATCH_SOURCES] = std::array::from_fn(|k| PlanSrc {
-                    plan: &plans[k.min(last)],
+                    plan: plans[k.min(last)],
                     src: sources[k.min(last)],
                 });
                 mul_acc_input_batch(dst, &inputs[..sources.len()]);

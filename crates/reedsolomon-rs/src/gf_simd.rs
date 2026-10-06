@@ -51,7 +51,8 @@ pub enum LinearKernel {
     /// x86 SSSE3 byte shuffles.
     Ssse3,
     /// x86 AVX2 byte shuffles, or GFNI affine transforms where
-    /// [`linear_uses_gfni`] holds.
+    /// [`linear_uses_gfni`] holds; the 8-bit shuffle maps run on 512-bit
+    /// vectors where [`linear_uses_avx512`] holds.
     Avx2,
 }
 
@@ -94,6 +95,31 @@ pub fn linear_uses_wasm_simd128() -> bool {
 pub fn uses_sve2() -> bool {
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     return crate::sve2::enabled();
+    #[allow(unreachable_code)]
+    false
+}
+
+/// Whether the nibble-shuffle AVX2 kernels of [`LinearMap8`] run on 512-bit
+/// vectors; the remainder below 64 bytes stays on the 256-bit kernels. Only
+/// hosts without the GFNI form ([`linear_uses_gfni`]) take them: AVX512BW
+/// without GFNI, such as Skylake-SP. The affine form stays at 256 bits,
+/// where 512 measured a wash on Zen 4 and 2-4% slower end to end on
+/// Sapphire Rapids. Setting `WEAVER_LINEAR_AVX512=0` pins the 256-bit
+/// kernels so an AVX-512 host can A/B the two without a rebuild. The
+/// variable is read once and cached; it never enables a kernel whose
+/// features are absent.
+pub fn linear_uses_avx512() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        return *ENABLED.get_or_init(|| {
+            !std::env::var_os("WEAVER_LINEAR_AVX512").is_some_and(|v| v == "0")
+                && !linear_uses_gfni()
+                && is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("avx512bw")
+                && is_x86_feature_detected!("avx512vl")
+        });
+    }
     #[allow(unreachable_code)]
     false
 }
@@ -259,6 +285,10 @@ pub struct LinearMap8 {
     /// Whether the NEON kernel takes its SVE2 form ([`uses_sve2`]).
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     sve2: bool,
+    /// Whether the AVX2 kernel runs on 512-bit vectors
+    /// ([`linear_uses_avx512`]).
+    #[cfg(target_arch = "x86_64")]
+    wide: bool,
 }
 
 impl LinearMap8 {
@@ -280,6 +310,8 @@ impl LinearMap8 {
             simd: backend == LinearBackend::Auto,
             #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             sve2: kernel == LinearKernel::Neon && uses_sve2(),
+            #[cfg(target_arch = "x86_64")]
+            wide: kernel == LinearKernel::Avx2 && linear_uses_avx512(),
             plan,
             kernel,
         }
@@ -301,9 +333,13 @@ impl LinearMap8 {
             #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             LinearKernel::Neon => unsafe { self.plan.neon(source, destination) },
             #[cfg(target_arch = "x86_64")]
-            LinearKernel::Avx2 => match self.affine {
-                Some(affine) => unsafe { self.plan.accumulate_gfni(affine, source, destination) },
-                None => unsafe { self.plan.avx2(source, destination) },
+            LinearKernel::Avx2 => match (self.affine, self.wide) {
+                (Some(affine), _) => unsafe {
+                    self.plan.accumulate_gfni(affine, source, destination)
+                },
+                // SAFETY: `wide` is set only after detecting AVX512BW/VL.
+                (None, true) => unsafe { self.plan.avx512(source, destination) },
+                (None, false) => unsafe { self.plan.avx2(source, destination) },
             },
             #[cfg(target_arch = "x86_64")]
             LinearKernel::Ssse3 => unsafe { self.plan.ssse3(source, destination) },
@@ -335,9 +371,12 @@ impl LinearMap8 {
             #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             LinearKernel::Neon => unsafe { self.plan.butterfly_neon::<INVERSE>(left, right) },
             #[cfg(target_arch = "x86_64")]
-            LinearKernel::Avx2 => match self.affine {
-                Some(affine) => unsafe { self.plan.butterfly_gfni::<INVERSE>(affine, left, right) },
-                None => unsafe { self.plan.butterfly_avx2::<INVERSE>(left, right) },
+            LinearKernel::Avx2 => match (self.affine, self.wide) {
+                (Some(affine), _) => unsafe {
+                    self.plan.butterfly_gfni::<INVERSE>(affine, left, right)
+                },
+                (None, true) => unsafe { self.plan.butterfly_avx512::<INVERSE>(left, right) },
+                (None, false) => unsafe { self.plan.butterfly_avx2::<INVERSE>(left, right) },
             },
             #[cfg(target_arch = "x86_64")]
             LinearKernel::Ssse3 => unsafe { self.plan.butterfly_ssse3::<INVERSE>(left, right) },
@@ -380,22 +419,32 @@ impl LinearMap8 {
                     [&mut *a, &mut *b, &mut *c, &mut *d],
                 )
             },
+            // The three maps share one backend, so one map's width and form
+            // hold for all of them.
             #[cfg(target_arch = "x86_64")]
-            LinearKernel::Avx2 => match [outer.affine, inner[0].affine, inner[1].affine] {
-                [Some(o), Some(x), Some(y)] => unsafe {
-                    crate::gf8::MulPlan::radix4_gfni::<INVERSE>(
-                        plans,
-                        [o, x, y],
-                        [&mut *a, &mut *b, &mut *c, &mut *d],
-                    )
-                },
-                _ => unsafe {
-                    crate::gf8::MulPlan::radix4_avx2::<INVERSE>(
-                        plans,
-                        [&mut *a, &mut *b, &mut *c, &mut *d],
-                    )
-                },
-            },
+            LinearKernel::Avx2 => {
+                match ([outer.affine, inner[0].affine, inner[1].affine], outer.wide) {
+                    ([Some(o), Some(x), Some(y)], _) => unsafe {
+                        crate::gf8::MulPlan::radix4_gfni::<INVERSE>(
+                            plans,
+                            [o, x, y],
+                            [&mut *a, &mut *b, &mut *c, &mut *d],
+                        )
+                    },
+                    (_, true) => unsafe {
+                        crate::gf8::MulPlan::radix4_avx512::<INVERSE>(
+                            plans,
+                            [&mut *a, &mut *b, &mut *c, &mut *d],
+                        )
+                    },
+                    (_, false) => unsafe {
+                        crate::gf8::MulPlan::radix4_avx2::<INVERSE>(
+                            plans,
+                            [&mut *a, &mut *b, &mut *c, &mut *d],
+                        )
+                    },
+                }
+            }
             #[cfg(target_arch = "x86_64")]
             LinearKernel::Ssse3 => unsafe {
                 crate::gf8::MulPlan::radix4_ssse3::<INVERSE>(
@@ -429,9 +478,10 @@ impl LinearMap8 {
             #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             LinearKernel::Neon => unsafe { self.plan.map_neon(row) },
             #[cfg(target_arch = "x86_64")]
-            LinearKernel::Avx2 => match self.affine {
-                Some(affine) => unsafe { self.plan.map_gfni(affine, row) },
-                None => unsafe { self.plan.map_avx2(row) },
+            LinearKernel::Avx2 => match (self.affine, self.wide) {
+                (Some(affine), _) => unsafe { self.plan.map_gfni(affine, row) },
+                (None, true) => unsafe { self.plan.map_avx512(row) },
+                (None, false) => unsafe { self.plan.map_avx2(row) },
             },
             #[cfg(target_arch = "x86_64")]
             LinearKernel::Ssse3 => unsafe { self.plan.map_ssse3(row) },
@@ -1604,12 +1654,13 @@ mod fused_tests {
     }
 
     /// Every kernel this host can run, scalar included, each with whether it
-    /// takes its alternate form: GFNI for the x86 AVX2 kernel, the simd128
-    /// kernels for `Scalar` in a `+simd128` wasm build (which has no
-    /// `LinearKernel` of its own). The vector tiers are forced one at a time,
-    /// so SSSE3 is covered on an AVX2 host and the AVX2 shuffles on a GFNI
-    /// host.
-    fn kernels() -> Vec<(LinearKernel, bool)> {
+    /// takes its alternate form and whether its 8-bit maps run on 512-bit
+    /// vectors: GFNI for the x86 AVX2 kernel, the simd128 kernels for
+    /// `Scalar` in a `+simd128` wasm build (which has no `LinearKernel` of
+    /// its own), the 512-bit nibble shuffles for AVX2 on an AVX512BW host.
+    /// The vector tiers are forced one at a time, so SSSE3 is covered on an
+    /// AVX2 host and the AVX2 shuffles on a GFNI host.
+    fn kernels() -> Vec<(LinearKernel, bool, bool)> {
         #[cfg_attr(
             not(any(
                 target_arch = "x86_64",
@@ -1618,33 +1669,40 @@ mod fused_tests {
             )),
             allow(unused_mut)
         )]
-        let mut kernels = vec![(LinearKernel::Scalar, false)];
+        let mut kernels = vec![(LinearKernel::Scalar, false, false)];
         #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-        kernels.push((LinearKernel::Scalar, true));
+        kernels.push((LinearKernel::Scalar, true, false));
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         if std::arch::is_aarch64_feature_detected!("neon") {
-            kernels.push((LinearKernel::Neon, false));
+            kernels.push((LinearKernel::Neon, false, false));
         }
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("ssse3") {
-                kernels.push((LinearKernel::Ssse3, false));
+                kernels.push((LinearKernel::Ssse3, false, false));
             }
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("ssse3") {
-                kernels.push((LinearKernel::Avx2, false));
-                if is_x86_feature_detected!("gfni") {
-                    kernels.push((LinearKernel::Avx2, true));
+                kernels.push((LinearKernel::Avx2, false, false));
+                let gfni = is_x86_feature_detected!("gfni");
+                if gfni {
+                    kernels.push((LinearKernel::Avx2, true, false));
+                }
+                if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vl") {
+                    kernels.push((LinearKernel::Avx2, false, true));
+                } else {
+                    eprintln!("SKIP fused_tests 512-bit 8-bit tiers: host lacks avx512bw+vl");
                 }
             }
-            if !kernels.contains(&(LinearKernel::Avx2, true)) {
+            if !kernels.contains(&(LinearKernel::Avx2, true, false)) {
                 eprintln!("SKIP fused_tests GFNI affine tier: host lacks gfni+avx2+ssse3");
             }
         }
         kernels
     }
 
-    /// A 16-bit map forced onto one entry of [`kernels`].
-    fn map16(basis: [u16; 16], (kernel, gfni): (LinearKernel, bool)) -> LinearMap16 {
+    /// A 16-bit map forced onto one entry of [`kernels`]; the 16-bit maps
+    /// have no 512-bit form, so the width flag is ignored.
+    fn map16(basis: [u16; 16], (kernel, gfni, _): (LinearKernel, bool, bool)) -> LinearMap16 {
         let _ = gfni;
         LinearMap16 {
             kernel,
@@ -1657,8 +1715,8 @@ mod fused_tests {
     }
 
     /// An 8-bit map forced onto one entry of [`kernels`].
-    fn map8(basis: [u8; 8], (kernel, gfni): (LinearKernel, bool)) -> LinearMap8 {
-        let _ = gfni;
+    fn map8(basis: [u8; 8], (kernel, gfni, wide): (LinearKernel, bool, bool)) -> LinearMap8 {
+        let _ = (gfni, wide);
         let map = LinearMap8::new(basis, LinearBackend::Scalar);
         LinearMap8 {
             kernel,
@@ -1666,6 +1724,8 @@ mod fused_tests {
             affine: gfni.then(|| map.plan.affine()),
             #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
             simd: gfni,
+            #[cfg(target_arch = "x86_64")]
+            wide,
             ..map
         }
     }
@@ -1758,7 +1818,10 @@ mod fused_tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_radix4_quad_missing_one_affine_matrix_matches_the_scalar_tier() {
-        let (gfni, shuffle) = ((LinearKernel::Avx2, true), (LinearKernel::Avx2, false));
+        let (gfni, shuffle) = (
+            (LinearKernel::Avx2, true, false),
+            (LinearKernel::Avx2, false, false),
+        );
         if !kernels().contains(&gfni) {
             eprintln!(
                 "SKIP a_radix4_quad_missing_one_affine_matrix_matches_the_scalar_tier: host \
@@ -1766,7 +1829,15 @@ mod fused_tests {
             );
             return;
         }
-        let scalar = (LinearKernel::Scalar, false);
+        let scalar = (LinearKernel::Scalar, false, false);
+        // The 512-bit quad, where the host has it: the outer map decides the
+        // width for all three, and an affine inner map still takes the
+        // shuffle form there (only a quad of three affine maps runs GFNI).
+        let wide = [
+            (LinearKernel::Avx2, false, true),
+            (LinearKernel::Avx2, true, false),
+        ];
+        let wide = kernels().contains(&wide[0]).then_some(wide);
         let lengths = [
             0usize, 1, 7, 15, 16, 17, 31, 32, 33, 47, 63, 64, 65, 95, 96, 97, 127, 129, 1031,
         ];
@@ -1786,6 +1857,13 @@ mod fused_tests {
             map8(basis8[1], shuffle),
             map8(basis8[2], gfni),
         ];
+        let m8_wide = wide.map(|[gfni, shuffle]| {
+            [
+                map8(basis8[0], gfni),
+                map8(basis8[1], shuffle),
+                map8(basis8[2], gfni),
+            ]
+        });
         let o16 = basis16.map(|basis| map16(basis, scalar));
         let o8 = basis8.map(|basis| map8(basis, scalar));
         for &length in &lengths {
@@ -1814,12 +1892,18 @@ mod fused_tests {
                     assert_eq!(actual, expected, "16-bit radix-4, {what}");
 
                     let mut actual = rows8.clone();
-                    let mut expected = rows8;
+                    let mut expected = rows8.clone();
                     let [a, b, c, d] = actual.each_mut().map(Vec::as_mut_slice);
                     LinearMap8::radix4(&m8[0], [&m8[1], &m8[2]], [a, b, c, d], inverse);
                     let [a, b, c, d] = expected.each_mut().map(Vec::as_mut_slice);
                     LinearMap8::radix4(&o8[0], [&o8[1], &o8[2]], [a, b, c, d], inverse);
                     assert_eq!(actual, expected, "8-bit radix-4, {what}");
+                    if let Some(m8) = &m8_wide {
+                        let mut actual = rows8;
+                        let [a, b, c, d] = actual.each_mut().map(Vec::as_mut_slice);
+                        LinearMap8::radix4(&m8[0], [&m8[1], &m8[2]], [a, b, c, d], inverse);
+                        assert_eq!(actual, expected, "8-bit 512-bit radix-4, {what}");
+                    }
                 }
             }
         }

@@ -5,16 +5,33 @@
 pub struct MulPlan {
     low: [u8; 16],
     high: [u8; 16],
+    /// The map as the 8×8 bit matrix `gf2p8affineqb` applies, built once with
+    /// the tables so no GFNI call rebuilds it.
+    #[cfg(target_arch = "x86_64")]
+    affine: u64,
+    kind: Kind,
+}
+
+/// What a plan's map is, decided when the plan is built: the zero map is a
+/// no-op for every accumulate and the identity a plain XOR, so neither runs
+/// a multiplication kernel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    Zero,
+    Identity,
+    General,
 }
 
 /// Scalar multiplication, also used as the portable arithmetic oracle.
 #[must_use]
-pub fn mul(mut left: u8, mut right: u8) -> u8 {
+pub const fn mul(mut left: u8, mut right: u8) -> u8 {
     let mut result = 0;
-    for _ in 0..8 {
+    let mut step = 0;
+    while step < 8 {
         result ^= left & 0u8.wrapping_sub(right & 1);
         left = (left << 1) ^ (0x1d & 0u8.wrapping_sub(left >> 7));
         right >>= 1;
+        step += 1;
     }
     result
 }
@@ -24,26 +41,75 @@ pub fn mul(mut left: u8, mut right: u8) -> u8 {
 /// bit `row`, and its bit `col` is bit `row` of `images[col]`. Read with byte
 /// `col` as row `col`, the images are that matrix transposed and in reverse
 /// byte order, so three delta swaps and a byte swap build it.
-pub(crate) fn affine_from_images(images: [u8; 8]) -> u64 {
+pub(crate) const fn affine_from_images(images: [u8; 8]) -> u64 {
     let mut bits = u64::from_le_bytes(images);
-    for (shift, mask) in [
+    let steps = [
         (7, 0x00aa_00aa_00aa_00aa_u64),
         (14, 0x0000_cccc_0000_cccc),
         (28, 0x0000_0000_f0f0_f0f0),
-    ] {
+    ];
+    let mut at = 0;
+    while at < steps.len() {
+        let (shift, mask) = steps[at];
         let swap = (bits ^ (bits >> shift)) & mask;
         bits ^= swap ^ (swap << shift);
+        at += 1;
     }
     bits.swap_bytes()
 }
 
+/// The plan of every coefficient, built at compile time, so a caller that
+/// starts from a factor pays no table construction: see [`MulPlan::cached`].
+static PLANS: [MulPlan; 256] = {
+    // `MulPlan` is not `Copy`, so the array is filled one slot at a time from
+    // a placeholder rather than by a repeat expression of a non-const value.
+    const ZERO: MulPlan = MulPlan::new(0);
+    let mut plans = [ZERO; 256];
+    let mut factor = 1;
+    while factor < 256 {
+        plans[factor] = MulPlan::new(factor as u8);
+        factor += 1;
+    }
+    plans
+};
+
 impl MulPlan {
     /// Precompute the two 16-entry tables for a coefficient.
     #[must_use]
-    pub fn new(factor: u8) -> Self {
+    pub const fn new(factor: u8) -> Self {
+        let mut low = [0u8; 16];
+        let mut high = [0u8; 16];
+        let mut n = 0;
+        while n < 16 {
+            low[n] = mul(n as u8, factor);
+            high[n] = mul((n << 4) as u8, factor);
+            n += 1;
+        }
+        let kind = match factor {
+            0 => Kind::Zero,
+            1 => Kind::Identity,
+            _ => Kind::General,
+        };
+        Self::with_kind(low, high, kind)
+    }
+
+    /// The compile-time plan for `factor`: the same tables [`Self::new`]
+    /// builds, without building them. Hot loops that start from a factor
+    /// should take this instead of a transient plan.
+    #[must_use]
+    pub fn cached(factor: u8) -> &'static Self {
+        &PLANS[usize::from(factor)]
+    }
+
+    const fn with_kind(low: [u8; 16], high: [u8; 16], kind: Kind) -> Self {
         Self {
-            low: std::array::from_fn(|n| mul(n as u8, factor)),
-            high: std::array::from_fn(|n| mul((n << 4) as u8, factor)),
+            #[cfg(target_arch = "x86_64")]
+            affine: affine_from_images([
+                low[1], low[2], low[4], low[8], high[1], high[2], high[4], high[8],
+            ]),
+            low,
+            high,
+            kind,
         }
     }
 
@@ -52,13 +118,38 @@ impl MulPlan {
     /// so other representations, such as the Cantor basis of the FFT
     /// transforms, run on the same shuffles.
     pub(crate) fn from_tables(low: [u8; 16], high: [u8; 16]) -> Self {
-        Self { low, high }
+        let kind = if low == [0; 16] && high == [0; 16] {
+            Kind::Zero
+        } else if low == std::array::from_fn(|n| n as u8)
+            && high == std::array::from_fn(|n| (n << 4) as u8)
+        {
+            Kind::Identity
+        } else {
+            Kind::General
+        };
+        Self::with_kind(low, high, kind)
+    }
+
+    /// Whether this plan's map sends every byte to zero, so accumulating it
+    /// changes nothing.
+    pub(crate) fn is_zero(&self) -> bool {
+        self.kind == Kind::Zero
     }
 
     /// Accumulate `source * factor` into `destination`. Buffers must have equal
     /// lengths and may be unaligned; CPU dispatch always has a scalar fallback.
+    /// Factor 0 returns without touching either buffer and factor 1 is a plain
+    /// XOR, on every tier.
     pub fn accumulate(&self, source: &[u8], destination: &mut [u8]) {
         assert_eq!(source.len(), destination.len());
+        match self.kind {
+            Kind::Zero => return,
+            Kind::Identity => {
+                xor_into(source, destination);
+                return;
+            }
+            Kind::General => {}
+        }
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         if crate::sve2::enabled() {
             // SAFETY: SVE2 was detected and the lengths are equal.
@@ -72,20 +163,25 @@ impl MulPlan {
             return;
         }
         #[cfg(target_arch = "x86_64")]
-        match gfni_tier() {
-            GfniTier::Avx512 => {
-                // SAFETY: the tier was detected; all loads are unaligned and bounded.
-                unsafe { self.accumulate_gfni_avx512(self.affine(), source, destination) };
-                return;
+        {
+            // SAFETY (every arm): `x86_tier` reports a tier only after
+            // detecting its features; every kernel bounds its loads and
+            // stores by the equal lengths asserted above.
+            match x86_tier() {
+                X86Tier::GfniAvx512 => unsafe {
+                    self.accumulate_gfni_avx512(self.affine, source, destination)
+                },
+                X86Tier::GfniAvx2 => unsafe {
+                    self.accumulate_gfni(self.affine, source, destination)
+                },
+                X86Tier::Avx512 => unsafe { self.avx512(source, destination) },
+                X86Tier::Avx2 => unsafe { self.avx2(source, destination) },
+                X86Tier::Ssse3 => unsafe { self.ssse3(source, destination) },
+                X86Tier::Scalar => self.scalar(source, destination),
             }
-            GfniTier::Avx2 => {
-                // SAFETY: as above.
-                unsafe { self.accumulate_gfni(self.affine(), source, destination) };
-                return;
-            }
-            GfniTier::None => {}
+            return;
         }
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        #[cfg(target_arch = "x86")]
         {
             if std::arch::is_x86_feature_detected!("avx2") {
                 // SAFETY: AVX2 was detected; all loads are unaligned and bounded.
@@ -294,8 +390,13 @@ impl MulPlan {
     /// bits. Like the tables, it never consults the polynomial.
     #[cfg(any(target_arch = "x86_64", test))]
     pub(crate) fn affine(&self) -> u64 {
-        let [l, h] = [&self.low, &self.high];
-        affine_from_images([l[1], l[2], l[4], l[8], h[1], h[2], h[4], h[8]])
+        #[cfg(target_arch = "x86_64")]
+        return self.affine;
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let [l, h] = [&self.low, &self.high];
+            affine_from_images([l[1], l[2], l[4], l[8], h[1], h[2], h[4], h[8]])
+        }
     }
 
     /// One additive-FFT butterfly per byte on the portable table walk: forward
@@ -811,6 +912,150 @@ impl MulPlan {
         unsafe { self.accumulate_gfni(affine, &source[at..], &mut destination[at..]) };
     }
 
+    /// [`Self::avx2`] with 512-bit vectors: the split-nibble map on
+    /// `vpshufb` over whole 64-byte blocks, the remainder on the 256-bit
+    /// kernel. The tier for AVX-512 hosts without GFNI.
+    ///
+    /// # Safety
+    /// AVX512BW and AVX512VL must be available and the slices must have equal
+    /// lengths.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512bw,avx512vl")]
+    pub(crate) unsafe fn avx512(&self, source: &[u8], destination: &mut [u8]) {
+        use std::arch::x86_64::*;
+        let t = fused_x86::tables512(self);
+        let mut at = 0;
+        while source.len() - at >= 64 {
+            // SAFETY: both slices hold 64 bytes from `at`.
+            unsafe {
+                let value = _mm512_loadu_si512(source.as_ptr().add(at).cast());
+                let previous = _mm512_loadu_si512(destination.as_ptr().add(at).cast());
+                _mm512_storeu_si512(
+                    destination.as_mut_ptr().add(at).cast(),
+                    _mm512_xor_si512(previous, fused_x86::map512(&t, value)),
+                );
+            }
+            at += 64;
+        }
+        // SAFETY: AVX512BW implies AVX2; the remainders have equal lengths.
+        unsafe { self.avx2(&source[at..], &mut destination[at..]) };
+    }
+
+    /// [`Self::butterfly_avx2`] with 512-bit vectors; returns the bytes
+    /// processed.
+    ///
+    /// # Safety
+    /// AVX512BW and AVX512VL must be available and the rows must have equal
+    /// lengths.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512bw,avx512vl")]
+    pub(crate) unsafe fn butterfly_avx512<const INVERSE: bool>(
+        &self,
+        left: &mut [u8],
+        right: &mut [u8],
+    ) -> usize {
+        use std::arch::x86_64::*;
+        let t = fused_x86::tables512(self);
+        let mut at = 0;
+        while left.len() - at >= 64 {
+            // SAFETY: both rows hold 64 bytes from `at`.
+            unsafe {
+                let mut l = _mm512_loadu_si512(left.as_ptr().add(at).cast());
+                let mut r = _mm512_loadu_si512(right.as_ptr().add(at).cast());
+                crate::gf_simd::fused_butterfly!(
+                    INVERSE,
+                    l,
+                    r,
+                    &t,
+                    _mm512_xor_si512,
+                    fused_x86::map512
+                );
+                _mm512_storeu_si512(left.as_mut_ptr().add(at).cast(), l);
+                _mm512_storeu_si512(right.as_mut_ptr().add(at).cast(), r);
+            }
+            at += 64;
+        }
+        // SAFETY: AVX512BW implies AVX2; the remainders have equal lengths.
+        at + unsafe { self.butterfly_avx2::<INVERSE>(&mut left[at..], &mut right[at..]) }
+    }
+
+    /// [`Self::radix4_avx2`] with 512-bit vectors; returns the bytes
+    /// processed.
+    ///
+    /// # Safety
+    /// AVX512BW and AVX512VL must be available and all four rows must have
+    /// equal lengths.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512bw,avx512vl")]
+    pub(crate) unsafe fn radix4_avx512<const INVERSE: bool>(
+        plans: [&Self; 3],
+        rows: [&mut [u8]; 4],
+    ) -> usize {
+        use std::arch::x86_64::*;
+        let [outer, inner_a, inner_b] = [
+            fused_x86::tables512(plans[0]),
+            fused_x86::tables512(plans[1]),
+            fused_x86::tables512(plans[2]),
+        ];
+        let [ra, rb, rc, rd] = rows;
+        let mut at = 0;
+        while ra.len() - at >= 64 {
+            // SAFETY: all four rows hold 64 bytes from `at`.
+            unsafe {
+                let mut a = _mm512_loadu_si512(ra.as_ptr().add(at).cast());
+                let mut b = _mm512_loadu_si512(rb.as_ptr().add(at).cast());
+                let mut c = _mm512_loadu_si512(rc.as_ptr().add(at).cast());
+                let mut d = _mm512_loadu_si512(rd.as_ptr().add(at).cast());
+                crate::gf_simd::fused_radix4!(
+                    INVERSE,
+                    [a, b, c, d],
+                    &outer,
+                    &inner_a,
+                    &inner_b,
+                    _mm512_xor_si512,
+                    fused_x86::map512
+                );
+                _mm512_storeu_si512(ra.as_mut_ptr().add(at).cast(), a);
+                _mm512_storeu_si512(rb.as_mut_ptr().add(at).cast(), b);
+                _mm512_storeu_si512(rc.as_mut_ptr().add(at).cast(), c);
+                _mm512_storeu_si512(rd.as_mut_ptr().add(at).cast(), d);
+            }
+            at += 64;
+        }
+        // SAFETY: AVX512BW implies AVX2; the remainders have equal lengths.
+        at + unsafe {
+            Self::radix4_avx2::<INVERSE>(
+                plans,
+                [&mut ra[at..], &mut rb[at..], &mut rc[at..], &mut rd[at..]],
+            )
+        }
+    }
+
+    /// [`Self::map_avx2`] with 512-bit vectors; returns the bytes processed.
+    ///
+    /// # Safety
+    /// AVX512BW and AVX512VL must be available.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512bw,avx512vl")]
+    pub(crate) unsafe fn map_avx512(&self, row: &mut [u8]) -> usize {
+        use std::arch::x86_64::*;
+        let t = fused_x86::tables512(self);
+        let mut at = 0;
+        while row.len() - at >= 64 {
+            // SAFETY: the row holds 64 bytes from `at`.
+            unsafe {
+                let value = _mm512_loadu_si512(row.as_ptr().add(at).cast());
+                _mm512_storeu_si512(
+                    row.as_mut_ptr().add(at).cast(),
+                    fused_x86::map512(&t, value),
+                );
+            }
+            at += 64;
+        }
+        // SAFETY: AVX512BW implies AVX2.
+        at + unsafe { self.map_avx2(&mut row[at..]) }
+    }
+
     /// [`Self::map_scalar`] on SSSE3; returns the bytes processed.
     ///
     /// # Safety
@@ -1158,6 +1403,33 @@ mod fused_x86 {
         _mm256_gf2p8affine_epi64_epi8::<0>(value, *matrix)
     }
 
+    #[target_feature(enable = "avx512bw,avx512vl")]
+    #[inline]
+    pub(super) fn tables512(plan: &MulPlan) -> (__m512i, __m512i) {
+        // SAFETY: each load reads exactly one 16-byte table.
+        unsafe {
+            (
+                _mm512_broadcast_i32x4(_mm_loadu_si128(plan.low.as_ptr().cast())),
+                _mm512_broadcast_i32x4(_mm_loadu_si128(plan.high.as_ptr().cast())),
+            )
+        }
+    }
+
+    /// The split-nibble map on 512-bit vectors: `vpshufb` looks up within
+    /// each 128-bit lane, and every lane holds the same two tables.
+    #[target_feature(enable = "avx512bw,avx512vl")]
+    #[inline]
+    pub(super) fn map512(tables: &(__m512i, __m512i), value: __m512i) -> __m512i {
+        let mask = _mm512_set1_epi8(15);
+        _mm512_xor_si512(
+            _mm512_shuffle_epi8(tables.0, _mm512_and_si512(value, mask)),
+            _mm512_shuffle_epi8(
+                tables.1,
+                _mm512_and_si512(_mm512_srli_epi16::<4>(value), mask),
+            ),
+        )
+    }
+
     #[target_feature(enable = "ssse3")]
     #[inline]
     pub(super) fn tables128(plan: &MulPlan) -> (__m128i, __m128i) {
@@ -1181,41 +1453,152 @@ mod fused_x86 {
     }
 }
 
-/// Multiply-accumulate using a transient plan. Retain [`MulPlan`] when a
-/// coefficient will be reused across many stripes.
+/// Multiply-accumulate by `factor`, through its compile-time plan
+/// ([`MulPlan::cached`]): no tables are built per call, factor 0 returns at
+/// once and factor 1 is a plain XOR.
 pub fn mul_acc_region(factor: u8, source: &[u8], destination: &mut [u8]) {
-    MulPlan::new(factor).accumulate(source, destination);
+    MulPlan::cached(factor).accumulate(source, destination);
 }
 
-/// The widest GFNI form the one-source and grouped kernels take on this
-/// machine. Setting `WEAVER_GF8_GFNI=0` pins the nibble-shuffle kernels so a
-/// GFNI host can A/B the two without a rebuild; the variable is read once and
-/// never enables a kernel whose features are absent.
+/// `destination ^= source`, the identity plan's accumulate: whole vectors on
+/// the widest tier the host dispatches to, then a byte loop.
+fn xor_into(source: &[u8], destination: &mut [u8]) {
+    // SAFETY (both vector arms): the tier was detected and both slices have
+    // the length the caller asserted.
+    #[cfg(target_arch = "x86_64")]
+    let done = match x86_tier() {
+        X86Tier::GfniAvx512 | X86Tier::Avx512 => unsafe { xor_avx512(source, destination) },
+        X86Tier::GfniAvx2 | X86Tier::Avx2 => unsafe { xor_avx2(source, destination) },
+        X86Tier::Ssse3 | X86Tier::Scalar => 0,
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let done = 0;
+    for (to, from) in destination[done..].iter_mut().zip(&source[done..]) {
+        *to ^= from;
+    }
+}
+
+/// [`xor_into`] over whole 64-byte blocks; returns the bytes processed.
+///
+/// # Safety
+/// AVX512F must be available and the slices must have equal lengths.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn xor_avx512(source: &[u8], destination: &mut [u8]) -> usize {
+    use std::arch::x86_64::*;
+    let mut at = 0;
+    while source.len() - at >= 64 {
+        // SAFETY: both slices hold 64 bytes from `at`.
+        unsafe {
+            let value = _mm512_loadu_si512(source.as_ptr().add(at).cast());
+            let previous = _mm512_loadu_si512(destination.as_ptr().add(at).cast());
+            _mm512_storeu_si512(
+                destination.as_mut_ptr().add(at).cast(),
+                _mm512_xor_si512(previous, value),
+            );
+        }
+        at += 64;
+    }
+    at
+}
+
+/// [`xor_into`] over whole 32-byte blocks; returns the bytes processed.
+///
+/// # Safety
+/// AVX2 must be available and the slices must have equal lengths.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn xor_avx2(source: &[u8], destination: &mut [u8]) -> usize {
+    use std::arch::x86_64::*;
+    let mut at = 0;
+    while source.len() - at >= 32 {
+        // SAFETY: both slices hold 32 bytes from `at`.
+        unsafe {
+            let value = _mm256_loadu_si256(source.as_ptr().add(at).cast());
+            let previous = _mm256_loadu_si256(destination.as_ptr().add(at).cast());
+            _mm256_storeu_si256(
+                destination.as_mut_ptr().add(at).cast(),
+                _mm256_xor_si256(previous, value),
+            );
+        }
+        at += 32;
+    }
+    at
+}
+
+/// The kernel family the one-source and grouped GF(2⁸) multiply-accumulate
+/// take on this x86_64 host, widest first. Two variables pin a lower tier so
+/// one host can A/B every form without a rebuild: `WEAVER_GF8_GFNI=0` drops
+/// the GFNI affine forms for the nibble shuffles, and `WEAVER_GF8_AVX512=0`
+/// drops the 512-bit forms for the 256-bit ones. Both are read once, and
+/// neither ever enables a kernel whose features are absent.
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum GfniTier {
-    None,
-    Avx2,
+enum X86Tier {
+    /// `vgf2p8affineqb` on 512-bit vectors.
+    GfniAvx512,
+    /// `vgf2p8affineqb` on 256-bit vectors.
+    GfniAvx2,
+    /// The split-nibble `vpshufb` map on 512-bit vectors: AVX-512 without
+    /// GFNI (Skylake-SP through Cooper Lake).
     Avx512,
+    /// The split-nibble map on 256-bit vectors.
+    Avx2,
+    Ssse3,
+    Scalar,
 }
 
 #[cfg(target_arch = "x86_64")]
-fn gfni_tier() -> GfniTier {
-    static TIER: std::sync::OnceLock<GfniTier> = std::sync::OnceLock::new();
+fn x86_tier() -> X86Tier {
+    static TIER: std::sync::OnceLock<X86Tier> = std::sync::OnceLock::new();
     *TIER.get_or_init(|| {
-        if std::env::var_os("WEAVER_GF8_GFNI").is_some_and(|v| v == "0")
-            || !(std::arch::is_x86_feature_detected!("gfni")
-                && std::arch::is_x86_feature_detected!("avx2"))
-        {
-            GfniTier::None
-        } else if std::arch::is_x86_feature_detected!("avx512bw")
-            && std::arch::is_x86_feature_detected!("avx512vl")
-        {
-            GfniTier::Avx512
-        } else {
-            GfniTier::Avx2
+        let pinned = |name: &str| std::env::var_os(name).is_some_and(|v| v == "0");
+        let avx2 = std::arch::is_x86_feature_detected!("avx2");
+        let gfni =
+            avx2 && !pinned("WEAVER_GF8_GFNI") && std::arch::is_x86_feature_detected!("gfni");
+        let wide = avx2
+            && !pinned("WEAVER_GF8_AVX512")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vl");
+        match (gfni, wide) {
+            (true, true) => X86Tier::GfniAvx512,
+            (true, false) => X86Tier::GfniAvx2,
+            (false, true) => X86Tier::Avx512,
+            (false, false) if avx2 => X86Tier::Avx2,
+            _ if std::arch::is_x86_feature_detected!("ssse3") => X86Tier::Ssse3,
+            _ => X86Tier::Scalar,
         }
     })
+}
+
+/// The kernel family [`MulPlan::accumulate`] and [`mul_acc_input_batch`] run
+/// on this host, after the `WEAVER_GF8_*` pins: a diagnostic for benches and
+/// logs, not a stable identifier.
+#[must_use]
+pub fn kernel_name() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    return match x86_tier() {
+        X86Tier::GfniAvx512 => "gfni-avx512",
+        X86Tier::GfniAvx2 => "gfni-avx2",
+        X86Tier::Avx512 => "avx512",
+        X86Tier::Avx2 => "avx2",
+        X86Tier::Ssse3 => "ssse3",
+        X86Tier::Scalar => "scalar",
+    };
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        return "neon";
+    }
+    #[cfg(all(target_arch = "wasm32", target_feature = "relaxed-simd"))]
+    return "wasm-relaxed-simd";
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        not(target_feature = "relaxed-simd")
+    ))]
+    return "wasm-simd128";
+    #[allow(unreachable_code)]
+    "scalar"
 }
 
 /// A (plan, source) pair for grouped-input multiply-accumulate into one
@@ -1265,37 +1648,43 @@ pub fn input_batch_width() -> usize {
 /// `destination[i] ^= Σ plan_k(source_k[i])` over every pair: the destination
 /// strip stays in registers while a group of sources streams past it, so it
 /// is read and written once per group instead of once per source. Every
-/// slice must have the destination's length.
+/// slice must have the destination's length. Sources whose plan is the zero
+/// map are skipped, and a group left with one source runs the one-source
+/// kernel, which takes the plain XOR for the identity.
 pub fn mul_acc_input_batch(destination: &mut [u8], inputs: &[PlanSrc<'_>]) {
     for input in inputs {
         assert_eq!(input.src.len(), destination.len());
     }
     #[cfg(target_arch = "x86_64")]
     {
-        match gfni_tier() {
-            GfniTier::Avx512 => {
-                // SAFETY: the tier was detected; the kernel bounds every load.
-                unsafe {
-                    if gf8_prefetch_enabled() {
-                        batch_gfni_avx512::<GF8_PREFETCH_BYTES>(destination, inputs)
-                    } else {
-                        batch_gfni_avx512::<0>(destination, inputs)
-                    }
-                };
-                return;
+        // SAFETY (every arm): `x86_tier` reports a tier only after detecting
+        // its features; each kernel bounds every load and store by the equal
+        // lengths asserted above.
+        match x86_tier() {
+            X86Tier::GfniAvx512 if gf8_prefetch_enabled() => {
+                for_each_group(destination, inputs, |d, g| unsafe {
+                    batch_gfni_avx512::<GF8_PREFETCH_BYTES>(d, g)
+                })
             }
-            GfniTier::Avx2 => {
-                // SAFETY: as above.
-                unsafe { batch_gfni_avx2(destination, inputs) };
-                return;
+            X86Tier::GfniAvx512 => for_each_group(destination, inputs, |d, g| unsafe {
+                batch_gfni_avx512::<0>(d, g)
+            }),
+            X86Tier::GfniAvx2 => {
+                for_each_group(destination, inputs, |d, g| unsafe { batch_gfni_avx2(d, g) })
             }
-            GfniTier::None => {}
+            X86Tier::Avx512 => {
+                for_each_group(destination, inputs, |d, g| unsafe { batch_avx512(d, g) })
+            }
+            X86Tier::Avx2 => {
+                for_each_group(destination, inputs, |d, g| unsafe { batch_avx2(d, g) })
+            }
+            X86Tier::Ssse3 | X86Tier::Scalar => {
+                for input in inputs {
+                    input.plan.accumulate(input.src, destination);
+                }
+            }
         }
-        if std::arch::is_x86_feature_detected!("avx2") {
-            // SAFETY: AVX2 was detected; the kernel bounds every load.
-            unsafe { batch_avx2(destination, inputs) };
-            return;
-        }
+        return;
     }
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     if crate::sve2::enabled() {
@@ -1306,7 +1695,7 @@ pub fn mul_acc_input_batch(destination: &mut [u8], inputs: &[PlanSrc<'_>]) {
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("neon") {
         // SAFETY: NEON was detected; the kernel bounds every load.
-        unsafe { batch_neon(destination, inputs) };
+        for_each_group(destination, inputs, |d, g| unsafe { batch_neon(d, g) });
         return;
     }
     // wasm simd128 folds source by source through the unrolled
@@ -1319,16 +1708,54 @@ pub fn mul_acc_input_batch(destination: &mut [u8], inputs: &[PlanSrc<'_>]) {
     }
 }
 
-/// The grouped loop shared by every kernel: `$strip` bytes of the
-/// destination are held in `$lanes` vector registers while each source of a
-/// group of [`BATCH_GROUP`] streams past them; the remainder shorter than a
-/// strip goes to the one-source kernel `$tail`. `$load`, `$store` and `$xor`
-/// are the tier's vector operations, `$prepare` turns a plan into the
-/// operand `$map` applies to a loaded vector of source bytes. The closures
-/// are safe closures over raw pointers that carry their own `unsafe`
-/// blocks; that is sound only because they never leave this module-private
-/// macro, where every load and store is bounded by the strip arithmetic
-/// below and every tail by the equal lengths.
+/// Hand `kernel` the inputs in groups of at most [`BATCH_GROUP`], leaving out
+/// every zero-map source; a group of one goes to [`MulPlan::accumulate`]
+/// instead, whose one-source kernel the grouped strips cannot beat. No
+/// allocation: a set with zero maps is regrouped through a stack array.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn for_each_group(
+    destination: &mut [u8],
+    inputs: &[PlanSrc<'_>],
+    mut kernel: impl FnMut(&mut [u8], &[PlanSrc<'_>]),
+) {
+    let mut run = |destination: &mut [u8], group: &[PlanSrc<'_>]| match group {
+        [] => {}
+        [one] => one.plan.accumulate(one.src, destination),
+        _ => kernel(destination, group),
+    };
+    if !inputs.iter().any(|input| input.plan.is_zero()) {
+        for group in inputs.chunks(BATCH_GROUP) {
+            run(destination, group);
+        }
+        return;
+    }
+    let mut live = inputs.iter().filter(|input| !input.plan.is_zero());
+    let Some(first) = live.next() else {
+        return;
+    };
+    let mut group = [*first; BATCH_GROUP];
+    let mut held = 1;
+    for input in live {
+        if held == BATCH_GROUP {
+            run(destination, &group);
+            held = 0;
+        }
+        group[held] = *input;
+        held += 1;
+    }
+    run(destination, &group[..held]);
+}
+
+/// The grouped loop shared by every kernel, over one group of at most
+/// [`BATCH_GROUP`] sources: `$strip` bytes of the destination are held in
+/// `$lanes` vector registers while each source of the group streams past
+/// them; the remainder shorter than a strip goes to the one-source kernel
+/// `$tail`. `$load`, `$store` and `$xor` are the tier's vector operations,
+/// `$prepare` turns a plan into the operand `$map` applies to a loaded vector
+/// of source bytes. The closures are safe closures over raw pointers that
+/// carry their own `unsafe` blocks; that is sound only because they never
+/// leave this module-private macro, where every load and store is bounded by
+/// the strip arithmetic below and every tail by the equal lengths.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 macro_rules! grouped_accumulate {
     (
@@ -1338,7 +1765,8 @@ macro_rules! grouped_accumulate {
         $(, prefetch = $prefetch:expr)? $(,)?
     ) => {{
         let destination: &mut [u8] = $destination;
-        let inputs: &[PlanSrc<'_>] = $inputs;
+        let group: &[PlanSrc<'_>] = $inputs;
+        debug_assert!(!group.is_empty() && group.len() <= BATCH_GROUP);
         const LANE: usize = $strip / $lanes;
         const _: () = assert!(
             ($strip as usize).is_power_of_two()
@@ -1347,46 +1775,44 @@ macro_rules! grouped_accumulate {
             "a strip is a power of two of whole vectors"
         );
         let vec_len = destination.len() & !($strip - 1);
-        for group in inputs.chunks(BATCH_GROUP) {
-            // One operand per source; the slots past a short group repeat the
-            // first source's operand and are never visited, since the walk
-            // below is bounded by the group. No allocation per call.
-            let prepared: [_; BATCH_GROUP] =
-                std::array::from_fn(|k| $prepare(group.get(k).unwrap_or(&group[0]).plan));
-            let mut at = 0;
-            while at < vec_len {
-                let mut acc: [$vector; $lanes] = std::array::from_fn(|lane| {
-                    $load(destination.as_ptr().wrapping_add(at + lane * LANE))
-                });
-                for (input, operand) in group.iter().zip(prepared.iter()) {
-                    $(
-                        // See `GF8_PREFETCH_BYTES`. A hint past the slice is
-                        // architecturally harmless, and the wrapping arithmetic
-                        // keeps the pointer unused.
-                        let prefetch: usize = $prefetch;
-                        if prefetch > 0 {
-                            let ahead = input.src.as_ptr().wrapping_add(at + prefetch);
-                            for line in 0..$strip / 64 {
-                                prefetch_line(ahead.wrapping_add(line * 64));
-                            }
+        // One operand per source; the slots past a short group repeat the
+        // first source's operand and are never visited, since the walk below
+        // is bounded by the group. No allocation per call.
+        let prepared: [_; BATCH_GROUP] =
+            std::array::from_fn(|k| $prepare(group.get(k).unwrap_or(&group[0]).plan));
+        let mut at = 0;
+        while at < vec_len {
+            let mut acc: [$vector; $lanes] = std::array::from_fn(|lane| {
+                $load(destination.as_ptr().wrapping_add(at + lane * LANE))
+            });
+            for (input, operand) in group.iter().zip(prepared.iter()) {
+                $(
+                    // See `GF8_PREFETCH_BYTES`. A hint past the slice is
+                    // architecturally harmless, and the wrapping arithmetic
+                    // keeps the pointer unused.
+                    let prefetch: usize = $prefetch;
+                    if prefetch > 0 {
+                        let ahead = input.src.as_ptr().wrapping_add(at + prefetch);
+                        for line in 0..$strip / 64 {
+                            prefetch_line(ahead.wrapping_add(line * 64));
                         }
-                    )?
-                    for (lane, acc) in acc.iter_mut().enumerate() {
-                        let value = $load(input.src.as_ptr().wrapping_add(at + lane * LANE));
-                        *acc = $xor(*acc, $map(operand, value));
                     }
+                )?
+                for (lane, acc) in acc.iter_mut().enumerate() {
+                    let value = $load(input.src.as_ptr().wrapping_add(at + lane * LANE));
+                    *acc = $xor(*acc, $map(operand, value));
                 }
-                for (lane, acc) in acc.iter().enumerate() {
-                    $store(
-                        destination.as_mut_ptr().wrapping_add(at + lane * LANE),
-                        *acc,
-                    );
-                }
-                at += $strip;
             }
+            for (lane, acc) in acc.iter().enumerate() {
+                $store(
+                    destination.as_mut_ptr().wrapping_add(at + lane * LANE),
+                    *acc,
+                );
+            }
+            at += $strip;
         }
         if vec_len < destination.len() {
-            for input in inputs {
+            for input in group {
                 $tail(
                     input.plan,
                     &input.src[vec_len..],
@@ -1477,6 +1903,35 @@ unsafe fn batch_gfni_avx2(destination: &mut [u8], inputs: &[PlanSrc<'_>]) {
         map = fused_x86::affine256,
         // SAFETY: the tier was detected by the caller; equal lengths.
         tail = |plan: &MulPlan, s, d| unsafe { plan.accumulate_gfni(plan.affine(), s, d) },
+    );
+}
+
+/// The split-nibble map, two shuffles and an XOR, per 64 bytes per source:
+/// the grouped kernel of AVX-512 hosts without GFNI. Thirty-two vector
+/// registers hold the two tables of all eight sources beside the four
+/// accumulators, which the sixteen of AVX2 cannot.
+///
+/// # Safety
+/// AVX512BW and AVX512VL must be available and the slices must have equal
+/// lengths.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw,avx512vl")]
+unsafe fn batch_avx512(destination: &mut [u8], inputs: &[PlanSrc<'_>]) {
+    use std::arch::x86_64::*;
+    grouped_accumulate!(
+        destination,
+        inputs,
+        strip = 256,
+        lanes = 4,
+        vector = __m512i,
+        // SAFETY: the strip arithmetic keeps every load and store in bounds.
+        load = |p: *const u8| unsafe { _mm512_loadu_si512(p.cast()) },
+        store = |p: *mut u8, v| unsafe { _mm512_storeu_si512(p.cast(), v) },
+        xor = _mm512_xor_si512,
+        prepare = fused_x86::tables512,
+        map = fused_x86::map512,
+        // SAFETY: the tier was detected by the caller; equal lengths.
+        tail = |plan: &MulPlan, s, d| unsafe { plan.avx512(s, d) },
     );
 }
 
@@ -1717,44 +2172,45 @@ mod tests {
                     mul_acc_input_batch(&mut actual, &inputs);
                     assert_eq!(actual, expected, "dispatched, {what}");
 
+                    // Every grouped kernel the host can run, each fed its
+                    // groups by the dispatcher's own grouping. SAFETY (every
+                    // call): the kernel's features were detected just before
+                    // and every slice has the destination's length.
+                    let check = |name: &str, kernel: &dyn Fn(&mut [u8], &[PlanSrc<'_>])| {
+                        let mut actual = seed[offset..offset + length].to_vec();
+                        for_each_group(&mut actual, &inputs, kernel);
+                        assert_eq!(actual, expected, "{name}, {what}");
+                    };
                     #[cfg(target_arch = "x86_64")]
                     {
-                        if std::arch::is_x86_feature_detected!("avx2") {
-                            let mut actual = seed[offset..offset + length].to_vec();
-                            // SAFETY: AVX2 was detected; equal lengths.
-                            unsafe { batch_avx2(&mut actual, &inputs) };
-                            assert_eq!(actual, expected, "avx2, {what}");
+                        let avx2 = std::arch::is_x86_feature_detected!("avx2");
+                        let gfni = avx2 && std::arch::is_x86_feature_detected!("gfni");
+                        let wide = avx2
+                            && std::arch::is_x86_feature_detected!("avx512bw")
+                            && std::arch::is_x86_feature_detected!("avx512vl");
+                        if avx2 {
+                            check("avx2", &|d, g| unsafe { batch_avx2(d, g) });
                         }
-                        if std::arch::is_x86_feature_detected!("gfni")
-                            && std::arch::is_x86_feature_detected!("avx2")
-                        {
-                            let mut actual = seed[offset..offset + length].to_vec();
-                            // SAFETY: GFNI and AVX2 were detected; equal lengths.
-                            unsafe { batch_gfni_avx2(&mut actual, &inputs) };
-                            assert_eq!(actual, expected, "gfni avx2, {what}");
-                            if std::arch::is_x86_feature_detected!("avx512bw")
-                                && std::arch::is_x86_feature_detected!("avx512vl")
-                            {
-                                let mut actual = seed[offset..offset + length].to_vec();
-                                // SAFETY: AVX512BW/VL were detected too; equal lengths.
-                                unsafe { batch_gfni_avx512::<0>(&mut actual, &inputs) };
-                                assert_eq!(actual, expected, "gfni avx512, {what}");
-                                let mut actual = seed[offset..offset + length].to_vec();
-                                // SAFETY: as above.
-                                unsafe {
-                                    batch_gfni_avx512::<GF8_PREFETCH_BYTES>(&mut actual, &inputs)
-                                };
-                                assert_eq!(actual, expected, "gfni avx512 prefetch, {what}");
-                            }
+                        if wide {
+                            check("avx512", &|d, g| unsafe { batch_avx512(d, g) });
+                        }
+                        if gfni {
+                            check("gfni avx2", &|d, g| unsafe { batch_gfni_avx2(d, g) });
+                        }
+                        if gfni && wide {
+                            check("gfni avx512", &|d, g| unsafe {
+                                batch_gfni_avx512::<0>(d, g)
+                            });
+                            check("gfni avx512 prefetch", &|d, g| unsafe {
+                                batch_gfni_avx512::<GF8_PREFETCH_BYTES>(d, g)
+                            });
                         }
                     }
                     #[cfg(target_arch = "aarch64")]
                     if std::arch::is_aarch64_feature_detected!("neon") {
-                        let mut actual = seed[offset..offset + length].to_vec();
-                        // SAFETY: NEON was detected; equal lengths.
-                        unsafe { batch_neon(&mut actual, &inputs) };
-                        assert_eq!(actual, expected, "neon, {what}");
+                        check("neon", &|d, g| unsafe { batch_neon(d, g) });
                     }
+                    let _ = check;
                 }
             }
         }
@@ -1864,6 +2320,385 @@ mod tests {
                         "factor {factor}, offset {offset}, length {length}"
                     );
                 }
+            }
+        }
+    }
+
+    /// Deterministic pseudo-random bytes (xorshift64).
+    fn noise(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// The factors every kernel test covers: the two short-circuited ones,
+    /// the generator, the top bit, all ones, and a few from the noise.
+    fn test_factors() -> Vec<u8> {
+        let mut factors = vec![0u8, 1, 2, 0x80, 0xff];
+        factors.extend(noise(91, 6));
+        factors
+    }
+
+    /// Lengths either side of every vector and strip width, plus odd ones.
+    const LENGTHS: [usize; 22] = [
+        0, 1, 2, 15, 16, 17, 31, 32, 33, 63, 64, 65, 95, 127, 128, 129, 191, 255, 257, 1000, 4095,
+        4161,
+    ];
+
+    #[test]
+    fn cached_plans_are_the_built_plans() {
+        for factor in 0..=255u8 {
+            let (cached, built) = (MulPlan::cached(factor), MulPlan::new(factor));
+            assert_eq!(cached.low, built.low, "factor {factor}");
+            assert_eq!(cached.high, built.high, "factor {factor}");
+            assert_eq!(cached.kind, built.kind, "factor {factor}");
+            assert_eq!(cached.affine(), built.affine(), "factor {factor}");
+            let expected = match factor {
+                0 => Kind::Zero,
+                1 => Kind::Identity,
+                _ => Kind::General,
+            };
+            assert_eq!(cached.kind, expected, "factor {factor}");
+            for value in 0..=255u8 {
+                assert_eq!(cached.apply(value), mul(value, factor), "factor {factor}");
+            }
+        }
+        // A table plan is classified by its map, not by how it was built.
+        let identity = MulPlan::from_tables(
+            std::array::from_fn(|n| n as u8),
+            std::array::from_fn(|n| (n << 4) as u8),
+        );
+        assert_eq!(identity.kind, Kind::Identity);
+        assert_eq!(MulPlan::from_tables([0; 16], [0; 16]).kind, Kind::Zero);
+        let mut low = [0u8; 16];
+        low[3] = 1;
+        assert_eq!(MulPlan::from_tables(low, [0; 16]).kind, Kind::General);
+    }
+
+    /// Factor 0 leaves the destination as it was and factor 1 XORs the
+    /// source in, through the plan, the cached plan and the free function,
+    /// at every length and offset; the identity table plan does the same.
+    #[test]
+    fn factor_zero_and_one_take_their_short_paths() {
+        let source = noise(5, 4400);
+        let seed = noise(6, 4400);
+        let identity = MulPlan::from_tables(
+            std::array::from_fn(|n| n as u8),
+            std::array::from_fn(|n| (n << 4) as u8),
+        );
+        for offset in 0..4 {
+            for length in LENGTHS {
+                let input = &source[offset..offset + length];
+                let start = &seed[offset..offset + length];
+                let xored: Vec<u8> = start.iter().zip(input).map(|(d, s)| d ^ s).collect();
+                for (factor, expected) in [(0u8, start.to_vec()), (1, xored.clone())] {
+                    let what = format!("factor {factor} offset {offset} length {length}");
+                    let mut actual = start.to_vec();
+                    MulPlan::new(factor).accumulate(input, &mut actual);
+                    assert_eq!(actual, expected, "plan, {what}");
+                    let mut actual = start.to_vec();
+                    MulPlan::cached(factor).accumulate(input, &mut actual);
+                    assert_eq!(actual, expected, "cached, {what}");
+                    let mut actual = start.to_vec();
+                    mul_acc_region(factor, input, &mut actual);
+                    assert_eq!(actual, expected, "region, {what}");
+                }
+                let mut actual = start.to_vec();
+                identity.accumulate(input, &mut actual);
+                assert_eq!(
+                    actual, xored,
+                    "identity tables, offset {offset} length {length}"
+                );
+                let mut actual = start.to_vec();
+                xor_into(input, &mut actual);
+                assert_eq!(actual, xored, "xor_into, offset {offset} length {length}");
+            }
+        }
+    }
+
+    /// Every one-source accumulate kernel the host can run, by name.
+    #[allow(clippy::type_complexity)]
+    fn accumulate_kernels() -> Vec<(&'static str, fn(&MulPlan, &[u8], &mut [u8]))> {
+        let mut kernels: Vec<(&'static str, fn(&MulPlan, &[u8], &mut [u8]))> = vec![
+            ("dispatched", MulPlan::accumulate),
+            ("scalar", MulPlan::scalar),
+        ];
+        #[cfg(target_arch = "aarch64")]
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            // SAFETY (all kernel entries): each is pushed only after its
+            // features were detected, and every caller passes equal lengths.
+            kernels.push(("neon", |p, s, d| unsafe { p.neon(s, d) }));
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let has = |f: &str| match f {
+                "ssse3" => std::arch::is_x86_feature_detected!("ssse3"),
+                "avx2" => std::arch::is_x86_feature_detected!("avx2"),
+                "gfni" => std::arch::is_x86_feature_detected!("gfni"),
+                _ => {
+                    std::arch::is_x86_feature_detected!("avx512bw")
+                        && std::arch::is_x86_feature_detected!("avx512vl")
+                }
+            };
+            if has("ssse3") {
+                kernels.push(("ssse3", |p, s, d| unsafe { p.ssse3(s, d) }));
+            }
+            if has("avx2") {
+                kernels.push(("avx2", |p, s, d| unsafe { p.avx2(s, d) }));
+                if has("gfni") {
+                    kernels.push(("gfni avx2", |p, s, d| unsafe {
+                        p.accumulate_gfni(p.affine(), s, d)
+                    }));
+                }
+                if has("avx512") {
+                    kernels.push(("avx512", |p, s, d| unsafe { p.avx512(s, d) }));
+                    if has("gfni") {
+                        kernels.push(("gfni avx512", |p, s, d| unsafe {
+                            p.accumulate_gfni_avx512(p.affine(), s, d)
+                        }));
+                    }
+                } else {
+                    eprintln!("SKIP gf8 512-bit kernels: host lacks avx512bw+vl");
+                }
+            }
+        }
+        kernels
+    }
+
+    /// Every one-source kernel against the scalar oracle on pseudo-random
+    /// rows, at every test factor, length and a spread of offsets.
+    #[test]
+    fn every_accumulate_kernel_matches_the_scalar_oracle_on_random_rows() {
+        let source = noise(11, 4400);
+        let seed = noise(12, 4400);
+        let kernels = accumulate_kernels();
+        for factor in test_factors() {
+            let plan = MulPlan::new(factor);
+            for offset in [0usize, 1, 5, 63] {
+                for length in LENGTHS {
+                    let input = &source[offset..offset + length];
+                    let start = &seed[(offset * 3) % 7..(offset * 3) % 7 + length];
+                    let expected: Vec<u8> = start
+                        .iter()
+                        .zip(input)
+                        .map(|(d, s)| d ^ mul(*s, factor))
+                        .collect();
+                    for (name, kernel) in &kernels {
+                        let mut actual = start.to_vec();
+                        kernel(&plan, input, &mut actual);
+                        assert_eq!(
+                            actual, expected,
+                            "{name}, factor {factor:#x}, offset {offset}, length {length}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// An in-place row kernel that returns the bytes it processed.
+    #[cfg(target_arch = "x86_64")]
+    type RowKernel<'a> = Box<dyn Fn(&mut [u8]) -> usize + 'a>;
+
+    /// The fused map, butterfly and radix-4 kernels of every x86 tier against
+    /// their scalar walks on pseudo-random rows; each returns the bytes it
+    /// processed and the scalar walk finishes the rest, as `LinearMap8` does.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn every_fused_x86_kernel_matches_the_scalar_walk_on_random_rows() {
+        let avx2 = std::arch::is_x86_feature_detected!("avx2");
+        let gfni = avx2 && std::arch::is_x86_feature_detected!("gfni");
+        let wide = avx2
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vl");
+        if !avx2 {
+            eprintln!("SKIP every_fused_x86_kernel_matches_the_scalar_walk: host lacks avx2");
+            return;
+        }
+        let factors = test_factors();
+        for (at, &factor) in factors.iter().enumerate() {
+            let plans = [
+                MulPlan::new(factor),
+                MulPlan::new(factors[(at + 3) % factors.len()]),
+                MulPlan::new(factors[(at + 7) % factors.len()]),
+            ];
+            let plan = &plans[0];
+            let affine = plans.each_ref().map(MulPlan::affine);
+            for offset in [0usize, 1, 33] {
+                for length in LENGTHS {
+                    let what = format!("factor {factor:#x}, offset {offset}, length {length}");
+                    let rows: [Vec<u8>; 4] = std::array::from_fn(|row| {
+                        noise(at as u64 * 97 + row as u64, length + offset)[offset..].to_vec()
+                    });
+
+                    // SAFETY (every kernel call below): the kernel's
+                    // features were detected above; rows have equal lengths.
+                    let mut maps: Vec<(&str, RowKernel<'_>)> =
+                        vec![("avx2", Box::new(|r: &mut [u8]| unsafe { plan.map_avx2(r) }))];
+                    if gfni {
+                        maps.push((
+                            "gfni",
+                            Box::new(|r: &mut [u8]| unsafe { plan.map_gfni(affine[0], r) }),
+                        ));
+                    }
+                    if wide {
+                        maps.push((
+                            "avx512",
+                            Box::new(|r: &mut [u8]| unsafe { plan.map_avx512(r) }),
+                        ));
+                    }
+                    let mut expected = rows[0].clone();
+                    plan.map_scalar(&mut expected);
+                    for (name, map) in &maps {
+                        let mut actual = rows[0].clone();
+                        let done = map(&mut actual);
+                        plan.map_scalar(&mut actual[done..]);
+                        assert_eq!(actual, expected, "map {name}, {what}");
+                    }
+
+                    for inverse in [false, true] {
+                        let (mut el, mut er) = (rows[0].clone(), rows[1].clone());
+                        let (mut ea, mut eb, mut ec, mut ed) = (
+                            rows[0].clone(),
+                            rows[1].clone(),
+                            rows[2].clone(),
+                            rows[3].clone(),
+                        );
+                        let refs = [&plans[0], &plans[1], &plans[2]];
+                        if inverse {
+                            plan.butterfly_scalar::<true>(&mut el, &mut er);
+                            MulPlan::radix4_scalar::<true>(
+                                refs,
+                                [&mut ea, &mut eb, &mut ec, &mut ed],
+                            );
+                        } else {
+                            plan.butterfly_scalar::<false>(&mut el, &mut er);
+                            MulPlan::radix4_scalar::<false>(
+                                refs,
+                                [&mut ea, &mut eb, &mut ec, &mut ed],
+                            );
+                        }
+                        let tiers: Vec<&str> = [
+                            Some("avx2"),
+                            gfni.then_some("gfni"),
+                            wide.then_some("avx512"),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                        for tier in tiers {
+                            let what = format!("{tier}, inverse {inverse}, {what}");
+                            let (mut l, mut r) = (rows[0].clone(), rows[1].clone());
+                            let [mut a, mut b, mut c, mut d] = rows.clone();
+                            macro_rules! run {
+                                ($inv:literal) => {
+                                    unsafe {
+                                        match tier {
+                                            "avx2" => (
+                                                plan.butterfly_avx2::<$inv>(&mut l, &mut r),
+                                                MulPlan::radix4_avx2::<$inv>(
+                                                    refs,
+                                                    [&mut a, &mut b, &mut c, &mut d],
+                                                ),
+                                            ),
+                                            "gfni" => (
+                                                plan.butterfly_gfni::<$inv>(
+                                                    affine[0], &mut l, &mut r,
+                                                ),
+                                                MulPlan::radix4_gfni::<$inv>(
+                                                    refs,
+                                                    affine,
+                                                    [&mut a, &mut b, &mut c, &mut d],
+                                                ),
+                                            ),
+                                            _ => (
+                                                plan.butterfly_avx512::<$inv>(&mut l, &mut r),
+                                                MulPlan::radix4_avx512::<$inv>(
+                                                    refs,
+                                                    [&mut a, &mut b, &mut c, &mut d],
+                                                ),
+                                            ),
+                                        }
+                                    }
+                                };
+                            }
+                            let (pair, quad) = if inverse { run!(true) } else { run!(false) };
+                            if inverse {
+                                plan.butterfly_scalar::<true>(&mut l[pair..], &mut r[pair..]);
+                                MulPlan::radix4_scalar::<true>(
+                                    refs,
+                                    [
+                                        &mut a[quad..],
+                                        &mut b[quad..],
+                                        &mut c[quad..],
+                                        &mut d[quad..],
+                                    ],
+                                );
+                            } else {
+                                plan.butterfly_scalar::<false>(&mut l[pair..], &mut r[pair..]);
+                                MulPlan::radix4_scalar::<false>(
+                                    refs,
+                                    [
+                                        &mut a[quad..],
+                                        &mut b[quad..],
+                                        &mut c[quad..],
+                                        &mut d[quad..],
+                                    ],
+                                );
+                            }
+                            assert_eq!((&l, &r), (&el, &er), "butterfly {what}");
+                            assert_eq!([&a, &b, &c, &d], [&ea, &eb, &ec, &ed], "radix-4 {what}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sets with zero-map sources scattered through them, including whole
+    /// groups of them and a set of nothing else, fold to the per-source sum
+    /// on the dispatched grouped kernel, whichever way the zeros regroup the
+    /// rest.
+    #[test]
+    fn zero_sources_drop_out_of_the_grouping() {
+        let length = 1300;
+        let sources: Vec<Vec<u8>> = (0..27).map(|k| noise(300 + k, length)).collect();
+        let seed = noise(299, length);
+        let factors = test_factors();
+        for pattern in 0..6usize {
+            let plans: Vec<&MulPlan> = (0..sources.len())
+                .map(|k| {
+                    let zero = match pattern {
+                        0 => true,
+                        1 => k % 3 == 0,
+                        2 => k < 9,
+                        3 => k % 9 != 4,
+                        4 => (8..16).contains(&k),
+                        _ => k % 2 == 1,
+                    };
+                    MulPlan::cached(if zero { 0 } else { factors[k % factors.len()] })
+                })
+                .collect();
+            for count in [1usize, 2, 8, 9, 17, 27] {
+                let inputs: Vec<PlanSrc<'_>> = (0..count)
+                    .map(|k| PlanSrc {
+                        plan: plans[k],
+                        src: &sources[k],
+                    })
+                    .collect();
+                let mut expected = seed.clone();
+                for input in &inputs {
+                    input.plan.scalar(input.src, &mut expected);
+                }
+                let mut actual = seed.clone();
+                mul_acc_input_batch(&mut actual, &inputs);
+                assert_eq!(actual, expected, "pattern {pattern}, count {count}");
             }
         }
     }
