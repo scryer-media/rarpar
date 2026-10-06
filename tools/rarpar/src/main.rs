@@ -1,6 +1,8 @@
 #[cfg(feature = "sevenz")]
 mod archive;
 mod cleanup;
+#[cfg(feature = "sevenz")]
+mod compat_7z;
 mod compat_par3;
 mod compat_unrar;
 mod discovery;
@@ -351,6 +353,15 @@ fn dispatch_compat(program: &OsString, args: &[OsString]) -> Option<u8> {
     // Started as `par3`, rarpar is par3cmdline and takes every command line.
     if compat_par3::invoked_as_par3(program) {
         return compat_par3::dispatch(args, true);
+    }
+    #[cfg(feature = "sevenz")]
+    {
+        if compat_7z::invoked_as_7z(program) {
+            return Some(compat_7z::dispatch(args));
+        }
+        if args.first().is_some_and(|arg| arg == "7z") {
+            return Some(compat_7z::dispatch(&args[1..]));
+        }
     }
     compat_par3::dispatch(args, false)
         .or_else(|| par2::dispatch_par2cmdline_compat(args))

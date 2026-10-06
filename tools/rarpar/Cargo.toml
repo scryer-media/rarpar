@@ -51,7 +51,14 @@ crypto-rust = [
 # (`7z`/`7za`/`7zz`/`7zr`, or `rarpar 7z ...`) for SABnzbd and NZBGet. The 7z
 # codec is sevenz-turbo; the PAR3 side is par3-rs. Neither depends on the
 # other: they meet only here.
-sevenz = ["runtime", "dep:sevenz-turbo", "dep:blake3"]
+sevenz = [
+    "runtime",
+    "dep:sevenz-turbo",
+    "dep:blake3",
+    "dep:crc-fast",
+    "dep:filetime",
+    "dep:libc",
+]
 # musl-only global allocator. The dependency is declared under a
 # `cfg(target_env = "musl")` target table, so enabling this feature is a
 # provable no-op for every non-musl target: glibc, macOS and Windows builds
@@ -64,6 +71,8 @@ par3-rs = { path = "../../crates/par3-rs", version = "=0.4.5", default-features 
 unrar-rs = { path = "../../crates/unrar-rs", version = "0.10.8", default-features = false, optional = true }
 blake3 = { workspace = true, optional = true }
 clap = { workspace = true }
+crc-fast = { workspace = true, optional = true }
+filetime = { workspace = true, optional = true }
 sevenz-turbo = { version = "0.26.1", default-features = false, features = [
     "aes256",
     "bzip2",
@@ -77,6 +86,11 @@ tempfile = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
+
+# The 7-Zip facade prints local times the way 7-Zip does, through the C
+# library's time zone conversion.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true, optional = true }
 
 # musl's mallocng is markedly weaker than glibc's malloc under the
 # multithreaded allocation churn rayon generates. Only the musl distribution

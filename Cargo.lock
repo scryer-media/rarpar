@@ -2227,6 +2227,9 @@ version = "0.6.0"
 dependencies = [
  "blake3",
  "clap",
+ "crc-fast",
+ "filetime",
+ "libc",
  "mimalloc",
  "par2-rs",
  "par3-rs",
