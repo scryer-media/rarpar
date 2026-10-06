@@ -113,6 +113,13 @@
   GF(2^16) create at one worker from 2.56 to 2.10 s of codec time on Zen 4
   and 2.63 to 2.42 s on Sapphire Rapids, 3.82 to 3.61 s on an AVX2 Alder
   Lake; bytes identical.
+- GF(2^8) batches go through `reedsolomon_rs::gf8::mul_acc_input_batch`, the
+  grouped kernel of reedsolomon-rs 0.4.8, instead of folding each source
+  through the one-source kernel over 8 KiB tiles of the destination; hosts
+  without a grouped kernel keep the tile walk. 1 GiB, 100 rows, 8 MiB
+  blocks, GF(2^8) create at one worker, codec seconds: Sapphire Rapids 3.62
+  to 1.87, Zen 4 3.27 to 2.03, Alder Lake 3.65 to 2.33 (GFNI AVX2), Apple
+  M-series 2.33 to 2.17; bytes identical.
 - With a worker pool, Cauchy repair reads and scatters the next group of
   surviving stripes while the workers fold the previous one, and adds the
   recovery rows to their syndromes in parallel. The second set of stripes is

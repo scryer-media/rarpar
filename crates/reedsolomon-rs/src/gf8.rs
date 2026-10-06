@@ -65,6 +65,20 @@ impl MulPlan {
             unsafe { self.neon(source, destination) };
             return;
         }
+        #[cfg(target_arch = "x86_64")]
+        match gfni_tier() {
+            GfniTier::Avx512 => {
+                // SAFETY: the tier was detected; all loads are unaligned and bounded.
+                unsafe { self.accumulate_gfni_avx512(self.affine(), source, destination) };
+                return;
+            }
+            GfniTier::Avx2 => {
+                // SAFETY: as above.
+                unsafe { self.accumulate_gfni(self.affine(), source, destination) };
+                return;
+            }
+            GfniTier::None => {}
+        }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             if std::arch::is_x86_feature_detected!("avx2") {
@@ -696,6 +710,39 @@ impl MulPlan {
         unsafe { self.ssse3(&source[at..], &mut destination[at..]) };
     }
 
+    /// [`Self::accumulate_gfni`] with 512-bit vectors: one affine transform
+    /// per 64 bytes, the remainder on the 256-bit kernel.
+    ///
+    /// # Safety
+    /// GFNI, AVX512BW and AVX512VL must be available and the slices must have
+    /// equal lengths.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "gfni,avx512bw,avx512vl")]
+    pub(crate) unsafe fn accumulate_gfni_avx512(
+        &self,
+        affine: u64,
+        source: &[u8],
+        destination: &mut [u8],
+    ) {
+        use std::arch::x86_64::*;
+        let m = _mm512_set1_epi64(affine as i64);
+        let mut at = 0;
+        while source.len() - at >= 64 {
+            // SAFETY: both slices hold 64 bytes from `at`.
+            unsafe {
+                let value = _mm512_loadu_si512(source.as_ptr().add(at).cast());
+                let previous = _mm512_loadu_si512(destination.as_ptr().add(at).cast());
+                _mm512_storeu_si512(
+                    destination.as_mut_ptr().add(at).cast(),
+                    _mm512_xor_si512(previous, _mm512_gf2p8affine_epi64_epi8::<0>(value, m)),
+                );
+            }
+            at += 64;
+        }
+        // SAFETY: AVX512VL implies AVX2; the remainders have equal lengths.
+        unsafe { self.accumulate_gfni(affine, &source[at..], &mut destination[at..]) };
+    }
+
     /// [`Self::map_scalar`] on SSSE3; returns the bytes processed.
     ///
     /// # Safety
@@ -883,6 +930,340 @@ pub fn mul_acc_region(factor: u8, source: &[u8], destination: &mut [u8]) {
     MulPlan::new(factor).accumulate(source, destination);
 }
 
+/// The widest GFNI form the one-source and grouped kernels take on this
+/// machine. Setting `WEAVER_GF8_GFNI=0` pins the nibble-shuffle kernels so a
+/// GFNI host can A/B the two without a rebuild; the variable is read once and
+/// never enables a kernel whose features are absent.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GfniTier {
+    None,
+    Avx2,
+    Avx512,
+}
+
+#[cfg(target_arch = "x86_64")]
+fn gfni_tier() -> GfniTier {
+    static TIER: std::sync::OnceLock<GfniTier> = std::sync::OnceLock::new();
+    *TIER.get_or_init(|| {
+        if std::env::var_os("WEAVER_GF8_GFNI").is_some_and(|v| v == "0")
+            || !(std::arch::is_x86_feature_detected!("gfni")
+                && std::arch::is_x86_feature_detected!("avx2"))
+        {
+            GfniTier::None
+        } else if std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+        {
+            GfniTier::Avx512
+        } else {
+            GfniTier::Avx2
+        }
+    })
+}
+
+/// A (plan, source) pair for grouped-input multiply-accumulate into one
+/// destination.
+#[derive(Clone, Copy)]
+pub struct PlanSrc<'a> {
+    pub plan: &'a MulPlan,
+    pub src: &'a [u8],
+}
+
+/// Sources a grouped kernel streams per pass over the destination: the same
+/// bound on concurrent read streams the GF(2¹⁶) kernels settled on (eight
+/// keeps the strips of every stream inside a 32 KiB L1).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const BATCH_GROUP: usize = 8;
+
+/// How many sources a caller should hand [`mul_acc_input_batch`] per call:
+/// the group a host kernel folds per pass over the destination, or 1 where
+/// no grouped kernel exists (the call then folds source by source through
+/// [`MulPlan::accumulate`]), so a caller whose grouping costs anything can
+/// skip it there. Setting `WEAVER_GF8_BATCH=0` reports 1 on every host, so a
+/// caller's one-source walk can be A/B'd against the grouped kernel without
+/// a rebuild.
+#[must_use]
+pub fn input_batch_width() -> usize {
+    static WIDTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WIDTH.get_or_init(|| {
+        if std::env::var_os("WEAVER_GF8_BATCH").is_some_and(|v| v == "0") {
+            return 1;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                return BATCH_GROUP;
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if std::arch::is_aarch64_feature_detected!("neon") {
+                return BATCH_GROUP;
+            }
+        }
+        1
+    })
+}
+
+/// `destination[i] ^= Σ plan_k(source_k[i])` over every pair: the destination
+/// strip stays in registers while a group of sources streams past it, so it
+/// is read and written once per group instead of once per source. Every
+/// slice must have the destination's length.
+pub fn mul_acc_input_batch(destination: &mut [u8], inputs: &[PlanSrc<'_>]) {
+    for input in inputs {
+        assert_eq!(input.src.len(), destination.len());
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        match gfni_tier() {
+            GfniTier::Avx512 => {
+                // SAFETY: the tier was detected; the kernel bounds every load.
+                unsafe {
+                    if gf8_prefetch_enabled() {
+                        batch_gfni_avx512::<GF8_PREFETCH_BYTES>(destination, inputs)
+                    } else {
+                        batch_gfni_avx512::<0>(destination, inputs)
+                    }
+                };
+                return;
+            }
+            GfniTier::Avx2 => {
+                // SAFETY: as above.
+                unsafe { batch_gfni_avx2(destination, inputs) };
+                return;
+            }
+            GfniTier::None => {}
+        }
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 was detected; the kernel bounds every load.
+            unsafe { batch_avx2(destination, inputs) };
+            return;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        // SAFETY: NEON was detected; the kernel bounds every load.
+        unsafe { batch_neon(destination, inputs) };
+        return;
+    }
+    #[allow(unreachable_code)]
+    for input in inputs {
+        input.plan.accumulate(input.src, destination);
+    }
+}
+
+/// The grouped loop shared by every kernel: `$strip` bytes of the
+/// destination are held in `$lanes` vector registers while each source of a
+/// group of [`BATCH_GROUP`] streams past them; the remainder shorter than a
+/// strip goes to the one-source kernel `$tail`. `$load`, `$store` and `$xor`
+/// are the tier's vector operations, `$prepare` turns a plan into the
+/// operand `$map` applies to a loaded vector of source bytes. The closures
+/// are safe closures over raw pointers that carry their own `unsafe`
+/// blocks; that is sound only because they never leave this module-private
+/// macro, where every load and store is bounded by the strip arithmetic
+/// below and every tail by the equal lengths.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+macro_rules! grouped_accumulate {
+    (
+        $destination:expr, $inputs:expr, strip = $strip:literal, lanes = $lanes:literal,
+        vector = $vector:ty, load = $load:expr, store = $store:expr, xor = $xor:expr,
+        prepare = $prepare:expr, map = $map:expr, tail = $tail:expr
+        $(, prefetch = $prefetch:expr)? $(,)?
+    ) => {{
+        let destination: &mut [u8] = $destination;
+        let inputs: &[PlanSrc<'_>] = $inputs;
+        const LANE: usize = $strip / $lanes;
+        const _: () = assert!(
+            ($strip as usize).is_power_of_two()
+                && LANE * $lanes == $strip
+                && LANE == std::mem::size_of::<$vector>(),
+            "a strip is a power of two of whole vectors"
+        );
+        let vec_len = destination.len() & !($strip - 1);
+        for group in inputs.chunks(BATCH_GROUP) {
+            // One operand per source; the slots past a short group repeat the
+            // first source's operand and are never visited, since the walk
+            // below is bounded by the group. No allocation per call.
+            let prepared: [_; BATCH_GROUP] =
+                std::array::from_fn(|k| $prepare(group.get(k).unwrap_or(&group[0]).plan));
+            let mut at = 0;
+            while at < vec_len {
+                let mut acc: [$vector; $lanes] = std::array::from_fn(|lane| {
+                    $load(destination.as_ptr().wrapping_add(at + lane * LANE))
+                });
+                for (input, operand) in group.iter().zip(prepared.iter()) {
+                    $(
+                        // See `GF8_PREFETCH_BYTES`. A hint past the slice is
+                        // architecturally harmless, and the wrapping arithmetic
+                        // keeps the pointer unused.
+                        let prefetch: usize = $prefetch;
+                        if prefetch > 0 {
+                            let ahead = input.src.as_ptr().wrapping_add(at + prefetch);
+                            for line in 0..$strip / 64 {
+                                prefetch_line(ahead.wrapping_add(line * 64));
+                            }
+                        }
+                    )?
+                    for (lane, acc) in acc.iter_mut().enumerate() {
+                        let value = $load(input.src.as_ptr().wrapping_add(at + lane * LANE));
+                        *acc = $xor(*acc, $map(operand, value));
+                    }
+                }
+                for (lane, acc) in acc.iter().enumerate() {
+                    $store(
+                        destination.as_mut_ptr().wrapping_add(at + lane * LANE),
+                        *acc,
+                    );
+                }
+                at += $strip;
+            }
+        }
+        if vec_len < destination.len() {
+            for input in inputs {
+                $tail(
+                    input.plan,
+                    &input.src[vec_len..],
+                    &mut destination[vec_len..],
+                );
+            }
+        }
+    }};
+}
+
+/// Four affine transforms per 256-byte strip per source.
+///
+/// # Safety
+/// GFNI, AVX512BW and AVX512VL must be available and the slices must have
+/// equal lengths.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "gfni,avx512bw,avx512vl")]
+unsafe fn batch_gfni_avx512<const PREFETCH: usize>(destination: &mut [u8], inputs: &[PlanSrc<'_>]) {
+    use std::arch::x86_64::*;
+    #[inline]
+    #[target_feature(enable = "sse")]
+    fn prefetch_line(p: *const u8) {
+        _mm_prefetch::<_MM_HINT_T0>(p.cast());
+    }
+    grouped_accumulate!(
+        destination,
+        inputs,
+        strip = 256,
+        lanes = 4,
+        vector = __m512i,
+        // SAFETY: the strip arithmetic keeps every load and store in bounds.
+        load = |p: *const u8| unsafe { _mm512_loadu_si512(p.cast()) },
+        store = |p: *mut u8, v| unsafe { _mm512_storeu_si512(p.cast(), v) },
+        xor = _mm512_xor_si512,
+        // The matrix stays a qword and is broadcast at the use site: one
+        // register per strip instead of eight live operands.
+        prepare = |plan: &MulPlan| plan.affine() as i64,
+        map = |m: &i64, v| _mm512_gf2p8affine_epi64_epi8::<0>(v, _mm512_set1_epi64(*m)),
+        // SAFETY: the tier was detected by the caller; equal lengths.
+        tail = |plan: &MulPlan, s, d| unsafe { plan.accumulate_gfni_avx512(plan.affine(), s, d) },
+        prefetch = PREFETCH,
+    );
+}
+
+/// Whether the 512-bit grouped kernel prefetches each source two strips
+/// ahead of its loads. Setting `WEAVER_GF8_PF=0` pins the plain loop so a
+/// host can A/B the hint without a rebuild.
+#[cfg(target_arch = "x86_64")]
+fn gf8_prefetch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| !std::env::var_os("WEAVER_GF8_PF").is_some_and(|v| v == "0"))
+}
+
+/// Bytes ahead of its loads the 512-bit grouped kernel prefetches each
+/// source: two 256-byte strips, every line of the strip. One load
+/// instruction streaming eight sources defeats an IP-stride prefetcher.
+/// Measured at one worker, 1 GiB, 100 rows, 8 MiB blocks, against no hint
+/// (medians of three): create encode Sapphire Rapids 2.07 → 1.87 s and
+/// Zen 4 2.10 → 2.03 s; repair decode of 50 blocks Sapphire Rapids 1.97 →
+/// 1.87 s, Zen 4 1.58 → 1.58 s. One strip ahead took two thirds of the
+/// Sapphire Rapids gain and little of Zen 4's; four strips ahead tied with
+/// two on Sapphire Rapids and gave Zen 4 nothing. The kernel-ceiling bench
+/// shows the hint costing Zen 4 on resident data (72 → 62 GiB/s at 4 KiB
+/// strips, 30 → 19 at 16 MiB), which the short stripes of create and repair
+/// never reach: both measured at or below the plain loop there.
+#[cfg(target_arch = "x86_64")]
+const GF8_PREFETCH_BYTES: usize = 512;
+
+/// Four affine transforms per 128-byte strip per source.
+///
+/// # Safety
+/// GFNI and AVX2 must be available and the slices must have equal lengths.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "gfni,avx2")]
+unsafe fn batch_gfni_avx2(destination: &mut [u8], inputs: &[PlanSrc<'_>]) {
+    use std::arch::x86_64::*;
+    grouped_accumulate!(
+        destination,
+        inputs,
+        strip = 128,
+        lanes = 4,
+        vector = __m256i,
+        // SAFETY: the strip arithmetic keeps every load and store in bounds.
+        load = |p: *const u8| unsafe { _mm256_loadu_si256(p.cast()) },
+        store = |p: *mut u8, v| unsafe { _mm256_storeu_si256(p.cast(), v) },
+        xor = _mm256_xor_si256,
+        prepare = |plan: &MulPlan| fused_x86::matrix256(plan.affine()),
+        map = fused_x86::affine256,
+        // SAFETY: the tier was detected by the caller; equal lengths.
+        tail = |plan: &MulPlan, s, d| unsafe { plan.accumulate_gfni(plan.affine(), s, d) },
+    );
+}
+
+/// The split-nibble map, two shuffles and an XOR, per 32 bytes per source.
+///
+/// # Safety
+/// AVX2 must be available and the slices must have equal lengths.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn batch_avx2(destination: &mut [u8], inputs: &[PlanSrc<'_>]) {
+    use std::arch::x86_64::*;
+    grouped_accumulate!(
+        destination,
+        inputs,
+        strip = 128,
+        lanes = 4,
+        vector = __m256i,
+        // SAFETY: the strip arithmetic keeps every load and store in bounds.
+        load = |p: *const u8| unsafe { _mm256_loadu_si256(p.cast()) },
+        store = |p: *mut u8, v| unsafe { _mm256_storeu_si256(p.cast(), v) },
+        xor = _mm256_xor_si256,
+        prepare = fused_x86::tables256,
+        map = fused_x86::map256,
+        // SAFETY: AVX2 was detected by the caller; equal lengths.
+        tail = |plan: &MulPlan, s, d| unsafe { plan.avx2(s, d) },
+    );
+}
+
+/// The split-nibble map, two table lookups and an XOR, per 16 bytes per
+/// source.
+///
+/// # Safety
+/// NEON must be available and the slices must have equal lengths.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn batch_neon(destination: &mut [u8], inputs: &[PlanSrc<'_>]) {
+    use std::arch::aarch64::*;
+    grouped_accumulate!(
+        destination,
+        inputs,
+        strip = 64,
+        lanes = 4,
+        vector = uint8x16_t,
+        // SAFETY: the strip arithmetic keeps every load and store in bounds.
+        load = |p: *const u8| unsafe { vld1q_u8(p) },
+        store = |p: *mut u8, v| unsafe { vst1q_u8(p, v) },
+        xor = veorq_u8,
+        prepare = fused_neon::tables,
+        map = fused_neon::map,
+        // SAFETY: NEON was detected by the caller; equal lengths.
+        tail = |plan: &MulPlan, s, d| unsafe { plan.neon(s, d) },
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -981,6 +1362,14 @@ mod tests {
                     unsafe { plan.accumulate_gfni(affine, input, &mut actual) };
                     plan.scalar(input, &mut expected);
                     assert_eq!(actual, expected, "accumulate, {what}");
+                    if std::arch::is_x86_feature_detected!("avx512bw")
+                        && std::arch::is_x86_feature_detected!("avx512vl")
+                    {
+                        let mut actual = seed[offset..offset + length].to_vec();
+                        // SAFETY: AVX512BW/VL were detected too; equal lengths.
+                        unsafe { plan.accumulate_gfni_avx512(affine, input, &mut actual) };
+                        assert_eq!(actual, expected, "accumulate avx512, {what}");
+                    }
 
                     let mut actual = input.to_vec();
                     let mut expected = actual.clone();
@@ -989,6 +1378,86 @@ mod tests {
                     plan.map_scalar(&mut actual[done..]);
                     plan.map_scalar(&mut expected);
                     assert_eq!(actual, expected, "map, {what}");
+                }
+            }
+        }
+    }
+
+    /// The dispatched grouped kernel and every grouped kernel the host can
+    /// run against the per-source scalar walk: group widths either side of
+    /// `BATCH_GROUP`, factors including 0 (source 0) and 1 (source 1),
+    /// lengths either side of every strip width, and unaligned starts that
+    /// differ between the destination and each source.
+    #[test]
+    fn grouped_kernels_match_the_scalar_sum_at_every_alignment() {
+        let sources: Vec<Vec<u8>> = (0..19u32)
+            .map(|k| (0..1400u32).map(|i| (i * (3 + 7 * k) + k) as u8).collect())
+            .collect();
+        let seed: Vec<u8> = (0..1400u32).map(|i| (i * 53 + 7) as u8).collect();
+        let plans: Vec<MulPlan> = (0..19u8)
+            .map(|k| MulPlan::new(if k == 1 { 1 } else { k.wrapping_mul(37) }))
+            .collect();
+        for count in [1usize, 2, 3, 7, 8, 9, 16, 17, 19] {
+            for offset in [0usize, 1, 3] {
+                for length in [
+                    0, 1, 15, 16, 17, 63, 64, 65, 127, 128, 129, 255, 256, 257, 300, 1024, 1281,
+                ] {
+                    let what = format!("count {count}, offset {offset}, length {length}");
+                    let inputs: Vec<PlanSrc<'_>> = (0..count)
+                        .map(|k| {
+                            let start = (offset + 5 * k) % 7;
+                            PlanSrc {
+                                plan: &plans[k],
+                                src: &sources[k][start..start + length],
+                            }
+                        })
+                        .collect();
+                    let mut expected = seed[offset..offset + length].to_vec();
+                    for input in &inputs {
+                        input.plan.scalar(input.src, &mut expected);
+                    }
+                    let mut actual = seed[offset..offset + length].to_vec();
+                    mul_acc_input_batch(&mut actual, &inputs);
+                    assert_eq!(actual, expected, "dispatched, {what}");
+
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        if std::arch::is_x86_feature_detected!("avx2") {
+                            let mut actual = seed[offset..offset + length].to_vec();
+                            // SAFETY: AVX2 was detected; equal lengths.
+                            unsafe { batch_avx2(&mut actual, &inputs) };
+                            assert_eq!(actual, expected, "avx2, {what}");
+                        }
+                        if std::arch::is_x86_feature_detected!("gfni")
+                            && std::arch::is_x86_feature_detected!("avx2")
+                        {
+                            let mut actual = seed[offset..offset + length].to_vec();
+                            // SAFETY: GFNI and AVX2 were detected; equal lengths.
+                            unsafe { batch_gfni_avx2(&mut actual, &inputs) };
+                            assert_eq!(actual, expected, "gfni avx2, {what}");
+                            if std::arch::is_x86_feature_detected!("avx512bw")
+                                && std::arch::is_x86_feature_detected!("avx512vl")
+                            {
+                                let mut actual = seed[offset..offset + length].to_vec();
+                                // SAFETY: AVX512BW/VL were detected too; equal lengths.
+                                unsafe { batch_gfni_avx512::<0>(&mut actual, &inputs) };
+                                assert_eq!(actual, expected, "gfni avx512, {what}");
+                                let mut actual = seed[offset..offset + length].to_vec();
+                                // SAFETY: as above.
+                                unsafe {
+                                    batch_gfni_avx512::<GF8_PREFETCH_BYTES>(&mut actual, &inputs)
+                                };
+                                assert_eq!(actual, expected, "gfni avx512 prefetch, {what}");
+                            }
+                        }
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    if std::arch::is_aarch64_feature_detected!("neon") {
+                        let mut actual = seed[offset..offset + length].to_vec();
+                        // SAFETY: NEON was detected; equal lengths.
+                        unsafe { batch_neon(&mut actual, &inputs) };
+                        assert_eq!(actual, expected, "neon, {what}");
+                    }
                 }
             }
         }

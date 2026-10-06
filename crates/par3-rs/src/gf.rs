@@ -549,23 +549,31 @@ impl MulAccBatch for Gf8 {
         for src in sources {
             check_regions(dst, src, 1);
         }
-        // There is no grouped GF(2^8) kernel, so the group is folded one tile
-        // of the destination at a time: the tile stays in L1 while each
-        // source's matching slice streams past it once.
-        const TILE: usize = 8 << 10;
+        use reedsolomon_rs::gf8::{MulPlan, PlanSrc, mul_acc_input_batch};
+        let grouped = reedsolomon_rs::gf8::input_batch_width() >= 2;
         for (sources, factors) in sources
             .chunks(BATCH_SOURCES)
             .zip(factors.chunks(BATCH_SOURCES))
         {
-            // A plan per source the chunk holds, none for the slots past it.
-            let plans: [Option<reedsolomon_rs::gf8::MulPlan>; BATCH_SOURCES] =
-                std::array::from_fn(|k| {
-                    factors
-                        .get(k)
-                        .map(|&f| reedsolomon_rs::gf8::MulPlan::new(f))
+            // A plan per source on the stack; the slots past a short chunk
+            // repeat its last plan and are never visited.
+            let last = sources.len() - 1;
+            let plans: [MulPlan; BATCH_SOURCES] =
+                std::array::from_fn(|k| MulPlan::new(factors[k.min(last)]));
+            if grouped {
+                let inputs: [PlanSrc<'_>; BATCH_SOURCES] = std::array::from_fn(|k| PlanSrc {
+                    plan: &plans[k.min(last)],
+                    src: sources[k.min(last)],
                 });
+                mul_acc_input_batch(dst, &inputs[..sources.len()]);
+                continue;
+            }
+            // No grouped kernel: fold the chunk one tile of the destination
+            // at a time, so the tile stays in L1 while each source's
+            // matching slice streams past it once.
+            const TILE: usize = 8 << 10;
             for (tile, at) in dst.chunks_mut(TILE).zip((0..).step_by(TILE)) {
-                for (plan, src) in plans.iter().flatten().zip(sources) {
+                for (plan, src) in plans.iter().zip(sources) {
                     plan.accumulate(&src[at..at + tile.len()], tile);
                 }
             }

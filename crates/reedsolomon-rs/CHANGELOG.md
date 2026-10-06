@@ -55,6 +55,27 @@
   multiply-accumulate folds per destination pass on this host, or 1 where the
   single-source kernel is faster than the grouped one (AVX-512 without GFNI,
   AVX2 without GFNI), so a caller can fold source by source there.
+- The planar AVX-512 kernel prefetches each source four strips ahead of its
+  loads: one load instruction streaming eight sources defeats an IP-stride
+  prefetcher, and the loads outrun the L1 fill at 64 KiB blocks on Sapphire
+  Rapids. `WEAVER_GF16_VBMI_PF=0` pins the plain loop. Create encode at one
+  worker, 1 GiB, 100 rows: Sapphire Rapids 2.48 → 2.21 s at 1 MiB blocks and
+  2.62 → 2.25 s at 64 KiB; Zen 4, whose hardware prefetcher keeps up, 2.09 →
+  2.12 s and 2.04 → 2.10 s.
+- `gf8::mul_acc_input_batch` is the grouped GF(2^8) multiply-accumulate:
+  the destination strip stays in registers while eight sources stream past
+  it, so it is read and written once per group instead of once per source.
+  GFNI AVX-512 and AVX2 kernels apply one `vgf2p8affineqb` per vector per
+  source; the AVX2 and NEON kernels apply the split-nibble map; every other
+  tier folds source by source through `MulPlan::accumulate`, which
+  `gf8::input_batch_width` reports as width 1 (`WEAVER_GF8_BATCH=0` pins
+  that answer everywhere). `MulPlan::accumulate` itself
+  now takes the GFNI form on x86_64 hosts that have it, 512-bit where
+  AVX512BW/VL are present; `WEAVER_GF8_GFNI=0` pins the nibble shuffles for
+  both. The 512-bit grouped kernel prefetches each source two strips ahead
+  (`WEAVER_GF8_PF=0` pins the plain loop): create encode at one worker,
+  1 GiB, 100 rows, 8 MiB blocks, Sapphire Rapids 2.07 → 1.87 s and Zen 4
+  2.10 → 2.03 s on top of the grouping. Output is bit-identical.
 
 ## 0.4.7
 

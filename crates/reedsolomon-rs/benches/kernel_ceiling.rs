@@ -143,6 +143,7 @@ mod imp {
             "xor".to_owned(),
             "gf8::mul_acc_region".to_owned(),
             "gf8::MulPlan::accumulate".to_owned(),
+            format!("gf8 mul_acc_input_batch x{WIDE}"),
             "gf16 mul_acc_region".to_owned(),
             format!("gf16 mul_acc_input_batch x{NARROW}"),
             format!("gf16 mul_acc_input_batch x{WIDE}"),
@@ -179,6 +180,18 @@ mod imp {
             let plan = gf8::MulPlan::new(0x8e);
             cell(measure(len, floor, || {
                 plan.accumulate(black_box(src), dst);
+                black_box(&mut *dst);
+            }));
+            let plans: Vec<gf8::MulPlan> = (0..WIDE)
+                .map(|at| gf8::MulPlan::new((at as u8).wrapping_mul(29).wrapping_add(3)))
+                .collect();
+            let batch8: Vec<gf8::PlanSrc<'_>> = plans
+                .iter()
+                .zip(&sources)
+                .map(|(plan, src)| gf8::PlanSrc { plan, src })
+                .collect();
+            cell(measure(WIDE * len, floor, || {
+                gf8::mul_acc_input_batch(dst, black_box(&batch8));
                 black_box(&mut *dst);
             }));
             cell(measure(len, floor, || {

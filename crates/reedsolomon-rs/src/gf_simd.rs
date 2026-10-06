@@ -2380,6 +2380,26 @@ fn folded_avx512_enabled() -> bool {
     })
 }
 
+/// Whether the planar kernel prefetches each source four strips ahead of its
+/// loads. Setting `WEAVER_GF16_VBMI_PF=0` pins the plain loop so a host can
+/// A/B the hint without a rebuild.
+#[cfg(target_arch = "x86_64")]
+fn vbmi_prefetch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| !std::env::var_os("WEAVER_GF16_VBMI_PF").is_some_and(|v| v == "0"))
+}
+
+/// Bytes ahead of its loads the planar kernel prefetches each source: four
+/// 128-byte strips. One load instruction streaming eight sources defeats an
+/// IP-stride prefetcher, and the kernel's loads outrun the L1 fill at 64 KiB
+/// blocks on Sapphire Rapids. Measured at one worker, 1 GiB, 100 rows, encode
+/// seconds against no hint: Sapphire Rapids 2.48 → 2.21 at 1 MiB blocks and
+/// 2.62 → 2.25 at 64 KiB; Zen 4, whose hardware prefetcher keeps up, 2.09 →
+/// 2.12 and 2.04 → 2.10. Two strips ahead measured the same on both; one
+/// strip ahead took half of the Sapphire Rapids gain.
+#[cfg(target_arch = "x86_64")]
+const VBMI_PREFETCH_BYTES: usize = 512;
+
 /// Whether the planar grouped-input GFNI kernel
 /// ([`mul_acc_input_batch_gfni_avx512vbmi_prepared`]) can run: it needs
 /// AVX512-VBMI's byte permute on top of GFNI+AVX512BW/VL. Setting
@@ -5680,7 +5700,7 @@ const MERGE_INDEX: [[u8; 64]; 2] = {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "gfni,avx512bw,avx512vl,avx512vbmi")]
-unsafe fn mul_acc_input_batch_gfni_avx512vbmi_prepared(
+unsafe fn mul_acc_input_batch_gfni_avx512vbmi_prepared<const PREFETCH: usize>(
     dst: &mut [u8],
     factors_and_srcs: &[PreparedFactorSrc<'_>],
 ) {
@@ -5766,6 +5786,14 @@ unsafe fn mul_acc_input_batch_gfni_avx512vbmi_prepared(
                 let mut acc_hi = _mm512_permutex2var_epi8(acc0, idx_hi, acc1);
 
                 for input in group {
+                    // See `VBMI_PREFETCH_BYTES`. A hint past the slice is
+                    // architecturally harmless, and the wrapping arithmetic
+                    // keeps the pointer unused.
+                    if PREFETCH > 0 {
+                        let ahead = input.src.as_ptr().wrapping_add(offset + PREFETCH);
+                        _mm_prefetch::<_MM_HINT_T0>(ahead as *const i8);
+                        _mm_prefetch::<_MM_HINT_T0>(ahead.wrapping_add(64) as *const i8);
+                    }
                     let s0 = _mm512_loadu_si512(input.src.as_ptr().add(offset) as *const __m512i);
                     let s1 =
                         _mm512_loadu_si512(input.src.as_ptr().add(offset + 64) as *const __m512i);
@@ -5829,7 +5857,16 @@ unsafe fn mul_acc_input_batch_gfni_avx512_best(
     factors_and_srcs: &[PreparedFactorSrc<'_>],
 ) {
     if gfni_vbmi_batch_enabled() {
-        unsafe { mul_acc_input_batch_gfni_avx512vbmi_prepared(dst, factors_and_srcs) }
+        if vbmi_prefetch_enabled() {
+            unsafe {
+                mul_acc_input_batch_gfni_avx512vbmi_prepared::<VBMI_PREFETCH_BYTES>(
+                    dst,
+                    factors_and_srcs,
+                )
+            }
+        } else {
+            unsafe { mul_acc_input_batch_gfni_avx512vbmi_prepared::<0>(dst, factors_and_srcs) }
+        }
     } else {
         unsafe { mul_acc_input_batch_gfni_avx512_prepared(dst, factors_and_srcs) }
     }
@@ -8456,7 +8493,18 @@ mod tests {
                     })
                     .collect();
                 let mut planar = vec![0x6Bu8; len];
-                unsafe { mul_acc_input_batch_gfni_avx512vbmi_prepared(&mut planar, &pairs) };
+                unsafe { mul_acc_input_batch_gfni_avx512vbmi_prepared::<0>(&mut planar, &pairs) };
+                let mut prefetched = vec![0x6Bu8; len];
+                unsafe {
+                    mul_acc_input_batch_gfni_avx512vbmi_prepared::<VBMI_PREFETCH_BYTES>(
+                        &mut prefetched,
+                        &pairs,
+                    )
+                };
+                assert_eq!(
+                    prefetched, reference,
+                    "gfni avx512vbmi prefetch count={count} len={len}"
+                );
                 assert_eq!(
                     planar, reference,
                     "gfni avx512vbmi batch count={count} len={len}"
