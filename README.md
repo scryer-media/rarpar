@@ -464,7 +464,8 @@ Status: **Landed** ships; **Building** has an owner now; **Exploring** is a meas
 | Column-tiled FFT execution, budget-sized FFT stripes, contiguous aligned banks | PAR3 FFT | Building | |
 | Planning hashes fused with the encode read; redundant zero-fills and coverage scans removed; repair validation fused into the codec read | PAR3 disk work | Building | |
 | par3cmdline-compatible command-line facade | rarpar CLI | Building | |
-| SME2 GF(2) outer-product GEMM (`BMOPA`) for Cauchy and Vandermonde encode and solve | PAR2, PAR3 | Exploring | bench-first spike on Apple M4-class silicon |
+| SME2 GF(2) outer-product GEMM (`BMOPA`) for Cauchy and Vandermonde encode and solve | PAR2, PAR3 | Watch | spike measured: slower than NEON at the 12–16 source groups the engines issue and at 8–18 workers (SME unit shared per cluster); wins 2–3x only at 64 or more sources per product; kept as an opt-in `kernel_ceiling` lane |
+| Wide-K engine restructure: stage 64 or more source stripes per matrix product instead of 16 | PAR2, PAR3 Cauchy, matrix-unit ISAs | Watch | pays only on outer-product units (SME2 today, AVX512BMM if it has the same shape); changes the memory planner and read pattern; a wash for lookup kernels |
 | AVX512BMM GF(2^16) tier (Zen 6 `VBMACXOR16x16x16`) | PAR2, PAR3 | Watch | no Zen 6 instances on EC2 yet |
 | AVX10.2 and APX | every x86 kernel | Watch | Diamond Rapids and Nova Lake; EVEX kernels carry over |
 | AVX-512 FFT linear map tier | PAR3 FFT | Watch | depends on the GF(2^8) AVX-512 result |
