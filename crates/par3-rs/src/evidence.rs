@@ -781,11 +781,19 @@ pub(crate) fn verify_source_in_pool(
     };
     let mut end = snapshot.len;
     let mut whole = None;
+    let whole_first = description.fingerprint != [0; 16] && {
+        let kind = access.mount_kind(source);
+        let whole_first = options
+            .disk_verify_whole_first
+            .unwrap_or_else(|| crate::mount::whole_file_first(kind));
+        options.diagnostics.note_verify_order(kind, whole_first);
+        whole_first
+    };
     if description.fingerprint == [0; 16] {
         // Nothing can promote extents without a whole-file hash, so skip
         // computing one; `finish` would seal `None` either way.
         verifier.whole_ordered = false;
-    } else if options.disk_verify_whole_first != Some(false)
+    } else if whole_first
         && unprotected_between(description, snapshot.len, description.len)
         && match &start {
             // A first available range that leaves protected bytes out means
@@ -1217,9 +1225,13 @@ mod whole_file_first_tests {
         inner: MemorySourceAccess,
         hole: Option<Range<u64>>,
         forward: bool,
+        kind: crate::mount::MountKind,
     }
 
     impl SourceAccess for Holey {
+        fn mount_kind(&self, _source: SourceId) -> crate::mount::MountKind {
+            self.kind
+        }
         fn snapshot(&self, source: SourceId) -> std::io::Result<Option<SourceSnapshot>> {
             self.inner.snapshot(source)
         }
@@ -1315,6 +1327,34 @@ mod whole_file_first_tests {
         forward: bool,
         whole_first: Option<bool>,
     ) -> (FileEvidence, u64, u64, u64) {
+        let (evidence, read, calls, hashed, _) = run_on(
+            layout,
+            file,
+            bytes,
+            hole,
+            forward,
+            whole_first,
+            crate::mount::MountKind::Unknown,
+        );
+        (evidence, read, calls, hashed)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn run_on(
+        layout: &Arc<BlockLayout>,
+        file: usize,
+        bytes: &[u8],
+        hole: Option<Range<u64>>,
+        forward: bool,
+        whole_first: Option<bool>,
+        kind: crate::mount::MountKind,
+    ) -> (
+        FileEvidence,
+        u64,
+        u64,
+        u64,
+        crate::runtime::VerifyOrderSnapshot,
+    ) {
         let options = ExecutionOptions {
             stripe_bytes: 1000,
             disk_verify_whole_first: whole_first,
@@ -1326,6 +1366,7 @@ mod whole_file_first_tests {
             inner: memory,
             hole,
             forward,
+            kind,
         };
         let evidence =
             verify_source(Arc::clone(layout), file, &access, SourceId(1), &options).unwrap();
@@ -1334,6 +1375,7 @@ mod whole_file_first_tests {
             options.diagnostics.source_io().read_bytes,
             options.diagnostics.source_io().read_calls,
             options.diagnostics.stage(Stage::Verify).completed,
+            options.diagnostics.verify_order(),
         )
     }
 
@@ -1474,6 +1516,51 @@ mod whole_file_first_tests {
                 assert_eq!(found.whole_matches(), expected.whole_matches(), "{case}");
                 assert_eq!(read, data.len() as u64, "{case}: more than one pass");
                 assert_eq!(hashed, data.len() as u64, "{case}");
+            }
+        }
+    }
+
+    /// The mount kind picks the order only when none is forced: a forced
+    /// order wins over every kind, and the evidence is the same either way.
+    #[test]
+    fn a_forced_order_wins_over_the_mount_kind() {
+        use crate::mount::MountKind::{Local, Remote, Unknown};
+        let tree = TempTree::new("order-by-mount");
+        let (layout, bytes) = many_layout(&tree);
+        let mut damaged = bytes.clone();
+        damaged[5 * 1024 + 3] ^= 0x40;
+        let expected = single_pass(&layout, 0, &damaged, None);
+        for (kind, forced, whole_first) in [
+            (Local, None, true),
+            (Unknown, None, true),
+            (Remote, None, false),
+            (Remote, Some(true), true),
+            (Local, Some(false), false),
+            (Unknown, Some(false), false),
+            (Remote, Some(false), false),
+            (Local, Some(true), true),
+        ] {
+            let case = format!("{kind:?} forced {forced:?}");
+            let (found, read, _, _, order) =
+                run_on(&layout, 0, &damaged, None, false, forced, kind);
+            assert_eq!(found.verdicts(), expected.verdicts(), "{case}");
+            assert_eq!(found.whole_matches(), expected.whole_matches(), "{case}");
+            let detected = [
+                (Local, order.local),
+                (Remote, order.remote),
+                (Unknown, order.unknown),
+            ];
+            for (counted, count) in detected {
+                assert_eq!(count, u64::from(counted == kind), "{case}: {counted:?}");
+            }
+            assert_eq!(order.whole_first, u64::from(whole_first), "{case}");
+            assert_eq!(order.single_pass, u64::from(!whole_first), "{case}");
+            // A damaged file read whole first is read a second time for its
+            // extents; side by side it is read once.
+            if whole_first {
+                assert!(read > damaged.len() as u64, "{case}: one pass");
+            } else {
+                assert_eq!(read, damaged.len() as u64, "{case}: two passes");
             }
         }
     }

@@ -16,7 +16,7 @@ pub(crate) use diagnostics::StageGuard;
 pub use diagnostics::{
     AdmissionSnapshot, AmplificationSnapshot, CacheSnapshot, CodecSnapshot, ExecutionDiagnostics,
     IoSnapshot, ProgressCallback, ProgressEvent, ProgressPhase, RefusalSnapshot, Stage,
-    StageSnapshot, WaitSnapshot,
+    StageSnapshot, VerifyOrderSnapshot, WaitSnapshot,
 };
 
 /// Failure of an incremental engine operation. Missing bytes are not I/O errors.
@@ -749,11 +749,13 @@ pub struct ExecutionOptions {
     #[doc(hidden)]
     pub fft_fused_decode: Option<bool>,
     /// Whether disk verification hashes a file whole before its extents.
-    /// `None`, the default, does: an intact file is read once, and a file the
-    /// whole-file hash does not settle is read a second time to hash its
-    /// extents. `Some(false)` hashes the extents and the whole file side by
-    /// side in one pass, so a damaged file is read once and an intact one
-    /// pays for both hashes. A forced value exists so benchmarks can measure
+    /// Whole first, an intact file is read once, and a file the whole-file
+    /// hash does not settle is read a second time to hash its extents. Side
+    /// by side, the extents and the whole file are hashed in one pass, so a
+    /// damaged file is read once and an intact one pays for both hashes.
+    /// `None`, the default, picks by [`crate::source::SourceAccess::mount_kind`]:
+    /// side by side on a remote mount, whole first on a local or unknown one.
+    /// A forced value wins over the mount kind, so benchmarks can measure
     /// both orders on the same build; the evidence is identical either way.
     #[doc(hidden)]
     pub disk_verify_whole_first: Option<bool>,

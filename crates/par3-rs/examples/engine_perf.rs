@@ -70,6 +70,9 @@ impl SourceAccess for Counted {
     fn open_file(&self, source: SourceId) -> std::io::Result<Option<par3_rs::source::SourceFile>> {
         self.0.open_file(source)
     }
+    fn mount_kind(&self, source: SourceId) -> par3_rs::mount::MountKind {
+        self.0.mount_kind(source)
+    }
 }
 
 fn files(directory: &Path, extension: &str) -> Result<Vec<PathBuf>> {
@@ -121,10 +124,6 @@ fn main() -> Result<()> {
         Ok("0") => Some(false),
         _ => return Err("invalid PAR3_BENCH_WHOLE_FILE_FIRST".into()),
     };
-    println!(
-        "{{\"whole_file_first\":{}}}",
-        options.disk_verify_whole_first != Some(false)
-    );
     let mut access = DiskSourceAccess::with_options(options.clone());
     let mut sources = Vec::new();
     for (index, path) in files(data, "bin")?.into_iter().enumerate() {
@@ -423,6 +422,29 @@ fn main() -> Result<()> {
         options.memory.limit(),
         options.workers
     );
+    // The verification order that ran and the mount kinds that chose it;
+    // `whole_file_first` and `mount_kind` appear when every file agreed.
+    let order = options.diagnostics.verify_order();
+    let mut line = format!(
+        "{{\"mount_local\":{},\"mount_remote\":{},\"mount_unknown\":{},\"verify_whole_first\":{},\"verify_single_pass\":{}",
+        order.local, order.remote, order.unknown, order.whole_first, order.single_pass
+    );
+    match (order.whole_first, order.single_pass) {
+        (0, 0) => {}
+        (_, 0) => line.push_str(",\"whole_file_first\":true"),
+        (0, _) => line.push_str(",\"whole_file_first\":false"),
+        _ => {}
+    }
+    for (name, count) in [
+        ("local", order.local),
+        ("remote", order.remote),
+        ("unknown", order.unknown),
+    ] {
+        if count != 0 && count == order.local + order.remote + order.unknown {
+            line.push_str(&format!(",\"mount_kind\":\"{name}\""));
+        }
+    }
+    println!("{line}}}");
     let source = options.diagnostics.source_io();
     let admission = options.diagnostics.admission();
     println!(

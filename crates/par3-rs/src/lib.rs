@@ -234,6 +234,7 @@ pub mod hash;
 pub mod ingest;
 pub mod inside;
 pub mod layout;
+pub mod mount;
 pub mod placement;
 #[cfg(not(target_os = "wasi"))]
 mod repair_tree;

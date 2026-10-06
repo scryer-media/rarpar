@@ -221,6 +221,23 @@ pub struct WaitSnapshot {
     pub batch_narrowed: u64,
 }
 
+/// The order disk verification hashed files in, and the mount kinds that
+/// chose it. Counted once per file whose description carries a whole-file
+/// hash, the only files the order applies to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VerifyOrderSnapshot {
+    /// Files whose source reported [`crate::mount::MountKind::Local`].
+    pub local: u64,
+    /// Files whose source reported [`crate::mount::MountKind::Remote`].
+    pub remote: u64,
+    /// Files whose source reported [`crate::mount::MountKind::Unknown`].
+    pub unknown: u64,
+    /// Files hashed whole before their extents.
+    pub whole_first: u64,
+    /// Files hashed whole and by extent side by side in one pass.
+    pub single_pass: u64,
+}
+
 /// Work a bounded working set moved onto the I/O layer. A memory reduction that
 /// only pushed cost here is not a reduction, so these are reported beside it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -334,6 +351,8 @@ struct State {
     sync: StageCounters,
     next: AtomicU64,
     admission: AdmissionCounters,
+    /// Local, remote and unknown mounts, then whole-first and single-pass files.
+    verify_order: [AtomicU64; 5],
     /// The budget these diagnostics report on, learned from the first stage
     /// opened against them. Written at most once and never read on the hot
     /// path; the link runs one way so the two `Arc`s cannot form a cycle.
@@ -483,6 +502,27 @@ impl ExecutionDiagnostics {
             workers_refused: get(&counters.workers_refused),
             batch_narrowed: get(&counters.batch_narrowed),
         }
+    }
+
+    /// The order disk verification hashed files in, and the mount kinds
+    /// behind it.
+    #[must_use]
+    pub fn verify_order(&self) -> VerifyOrderSnapshot {
+        let get = |v: &AtomicU64| v.load(Ordering::Relaxed);
+        let [local, remote, unknown, whole_first, single_pass] = &self.0.verify_order;
+        VerifyOrderSnapshot {
+            local: get(local),
+            remote: get(remote),
+            unknown: get(unknown),
+            whole_first: get(whole_first),
+            single_pass: get(single_pass),
+        }
+    }
+
+    pub(crate) fn note_verify_order(&self, kind: crate::mount::MountKind, whole_first: bool) {
+        let counters = &self.0.verify_order;
+        add(&counters[kind as usize], 1);
+        add(&counters[if whole_first { 3 } else { 4 }], 1);
     }
 
     /// Bytes bounded working sets moved onto the I/O layer.

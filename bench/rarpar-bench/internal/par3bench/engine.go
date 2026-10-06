@@ -33,8 +33,13 @@ type EngineCounters struct {
 	// SyncSeconds is the time the engine spent in fsync.
 	SyncSeconds  float64 `json:"sync_seconds"`
 	StripePasses int64   `json:"stripe_passes"`
-	// WholeFileFirst is the disk verification order the process ran with.
+	// WholeFileFirst is the disk verification order the process ran with,
+	// when every verified file ran in the same one.
 	WholeFileFirst *bool `json:"whole_file_first,omitempty"`
+	// MountKind is the filesystem kind ("local", "remote", "unknown") the
+	// engine detected for the verified files, when they all agreed; it picks
+	// the order unless a variant forces one.
+	MountKind string `json:"mount_kind,omitempty"`
 	// Status is the assessment engine_perf printed ("Complete", "Ready").
 	Status string `json:"status,omitempty"`
 }
@@ -84,6 +89,9 @@ func ParseEngineOutput(stdout string) (EngineCounters, bool) {
 			if json.Unmarshal(raw, &value) == nil {
 				counters.WholeFileFirst = &value
 			}
+		}
+		if raw, ok := fields["mount_kind"]; ok {
+			_ = json.Unmarshal(raw, &counters.MountKind)
 		}
 		if raw, ok := fields["status"]; ok {
 			_ = json.Unmarshal(raw, &counters.Status)
