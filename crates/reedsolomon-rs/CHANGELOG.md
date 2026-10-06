@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.8 (Unreleased)
+
+- `gf_simd::LinearMap8` is an 8-bit linear map beside `LinearMap16`: two
+  nibble tables built from the caller's basis images, run through the existing
+  `gf8` NEON, AVX2, SSSE3 and scalar kernels. `TransformField` gains
+  `scale_u8_with_backend`, `transform_u8_with_backend`, `transform_u8_in_pool`
+  and `derivative_u8`, so a GF(2^8) FFT codec works on byte rows instead of
+  zero-extended `u16` rows. The 16-bit methods are unchanged.
+- Fused butterfly and radix-4 kernels for every tier on both lanes: each
+  butterfly loads and stores its row pair once, and two levels of the transform
+  run per sweep when the vector maps run. Output is bit-identical to the
+  radix-2 sequence; the scalar oracle still runs radix-2.
+- `transform_known_zero_with_backend`, `transform_u8_known_zero_with_backend`,
+  `transform_known_zero_in_pool` and `transform_u8_known_zero_in_pool` take one
+  flag per row that the caller knows to be zero (padding past the inputs,
+  erased rows before an inverse transform) and skip or reduce the butterflies
+  those rows feed. Flags come from the layout; rows are never scanned.
+- Benches: `kernel_ceiling` reports single-thread GiB/s for the GF(2^8) and
+  GF(2^16) multiply-accumulate kernels, the fused batch kernels and memory
+  baselines; `fft_transform` gains the u8-vs-u16, pooled and known-zero groups.
+
 ## 0.4.7
 
 - `gf8::MulPlan` has a wasm tier. The GF(2^8) multiply-accumulate carried NEON,
