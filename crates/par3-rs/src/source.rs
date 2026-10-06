@@ -860,6 +860,20 @@ impl OwedChecks {
         owed.clear();
         Ok(())
     }
+
+    /// [`Self::settle`], passing over `skip`: sources whose bytes are proven
+    /// some other way.
+    pub(crate) fn settle_except(
+        &self,
+        access: &dyn SourceAccess,
+        skip: &[SourceId],
+    ) -> EngineResult<()> {
+        if skip.is_empty() {
+            return self.settle(access);
+        }
+        self.lock().retain(|(source, _, _)| !skip.contains(source));
+        self.settle(access)
+    }
 }
 
 #[cfg(test)]

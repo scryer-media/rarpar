@@ -67,6 +67,11 @@ impl std::fmt::Debug for PayloadRef {
 }
 
 impl PayloadRef {
+    /// Whether this payload is read from `source` of `access`.
+    pub(crate) fn reads_from(&self, access: &Arc<dyn SourceAccess>, source: SourceId) -> bool {
+        Arc::ptr_eq(&self.access, access) && self.source == source
+    }
+
     pub(crate) fn same_binding(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.access, &other.access)
             && self.source == other.source
