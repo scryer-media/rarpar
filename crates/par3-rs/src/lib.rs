@@ -153,8 +153,10 @@
 //!
 //! Windows scanners pin a budgeted read-only carrier handle through
 //! [`source::SourceAccess::pin`]. Drop the scanner and its authenticated packets
-//! before replacing that carrier. Pinning hashes once; all generation hashes consume scan-work
-//! budget. [`session::Par3RepairSession::validate_repair`] checks readiness and
+//! before replacing that carrier. Disk generations come from file identity and
+//! change time on Unix and Windows; where those are unavailable they hash the
+//! file, and that hashing consumes scan-work budget.
+//! [`session::Par3RepairSession::validate_repair`] checks readiness and
 //! configured codec/handle ceilings without staging output.
 //!
 //! Convenience APIs instead use [`ScanLimits`], [`SetLimits`], [`CodecLimits`],
@@ -162,8 +164,8 @@
 //! [`scan_packets_from_path`] reads an entire carrier before applying packet
 //! limits; use [`ingest::PacketScanner`] when that allocation must be bounded.
 //!
-//! Unsafe Rust is confined to the native Windows filesystem-security wrapper;
-//! other targets forbid it. Shared arithmetic uses CPU-specific kernels.
+//! Unsafe Rust is confined to the native Windows filesystem-security and
+//! file-identity wrapper; other targets forbid it. Shared arithmetic uses CPU-specific kernels.
 //! Set construction bounds directory expansion and rejects cycles. Parsed path
 //! components reject traversal names and separators. These are lexical checks,
 //! not a filesystem sandbox: callers must control destination links and changes

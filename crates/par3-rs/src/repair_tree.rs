@@ -7,7 +7,7 @@ use cap_std::fs::{Dir, OpenOptions};
 #[cfg(windows)]
 #[path = "repair_tree_windows.rs"]
 #[allow(unsafe_code)]
-mod windows;
+pub(crate) mod windows;
 #[cfg(unix)]
 use cap_std::fs::DirBuilderExt;
 use std::collections::HashSet;

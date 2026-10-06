@@ -136,6 +136,10 @@ impl EngineFile {
     pub(crate) fn metadata(&self) -> io::Result<Metadata> {
         self.file.metadata()
     }
+    #[cfg(windows)]
+    pub(crate) fn as_std(&self) -> &File {
+        &self.file
+    }
     pub(crate) fn set_len(&self, len: u64) -> io::Result<()> {
         self.file.set_len(len)
     }

@@ -46,8 +46,19 @@
   budget and read with positioned I/O; repair stages hold one write handle per
   output per pass. A heavy repair opens files tens of times instead of tens of
   thousands. Idle cached handles yield their leases to other openers, a
-  replaced file is detected at the next snapshot, and Windows and WASI keep
-  opening per read. `ExecutionDiagnostics::file_opens()` counts opens.
+  replaced file is detected at the next snapshot, and WASI keeps opening per
+  read. `ExecutionDiagnostics::file_opens()` counts opens.
+- Windows source identity comes from the opened handle: the volume serial and
+  128-bit file ID (`FILE_ID_INFO`, with the 64-bit index as the fallback) and
+  the NTFS change time stand in for the Unix device/inode pair and ctime. A
+  source snapshot on Windows is now a zero-byte metadata query instead of a
+  re-hash of the file, the read-handle cache applies on Windows too, and the
+  identity, handle-budget and snapshot tests that were Unix-only run on
+  Windows. A 1 GiB repair that previously rescanned the source on every
+  snapshot and gave up after minutes completes in seconds with identical
+  output; create and verify run about twice as fast. Filesystems without a
+  change time (FAT, some SMB shares) fall back to the previous content
+  snapshot.
 - Sources are snapshot-checked once per read-ahead refill in the scanner and
   once per stripe pass in creation, carrier regeneration and repair, always
   after the last read a write depends on and before that write, instead of

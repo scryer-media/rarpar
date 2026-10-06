@@ -10,6 +10,7 @@
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use par3_rs::ScanLimits;
@@ -18,9 +19,47 @@ use par3_rs::ingest::{PacketScanner, ScanEvent};
 use par3_rs::placement::{PlacementOptions, search_extent};
 use par3_rs::runtime::{ExecutionOptions, IoSnapshot, MemoryBudget, Stage};
 use par3_rs::session::{Par3RepairSession, RepairStatus};
-use par3_rs::source::{DiskSourceAccess, SourceId};
+use par3_rs::source::{DiskSourceAccess, SourceAccess, SourceId, SourceSnapshot};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
+
+/// Snapshots the engine asked of the disk registry, directly or through
+/// `next_available`; pinned carrier views answer theirs from memory.
+static SNAPSHOTS: AtomicU64 = AtomicU64::new(0);
+
+/// The disk registry, counting its snapshots.
+struct Counted(DiskSourceAccess);
+
+impl SourceAccess for Counted {
+    fn pin(
+        &self,
+        source: SourceId,
+        options: &ExecutionOptions,
+    ) -> std::io::Result<Option<Arc<dyn SourceAccess>>> {
+        self.0.pin(source, options)
+    }
+    fn snapshot(&self, source: SourceId) -> std::io::Result<Option<SourceSnapshot>> {
+        SNAPSHOTS.fetch_add(1, Ordering::Relaxed);
+        self.0.snapshot(source)
+    }
+    fn read_at(&self, source: SourceId, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read_at(source, offset, out)
+    }
+    fn next_available(
+        &self,
+        source: SourceId,
+        offset: u64,
+    ) -> std::io::Result<Option<std::ops::Range<u64>>> {
+        SNAPSHOTS.fetch_add(1, Ordering::Relaxed);
+        self.0.next_available(source, offset)
+    }
+    fn open_sequential(
+        &self,
+        source: SourceId,
+    ) -> std::io::Result<Option<Box<dyn std::io::Read + Send>>> {
+        self.0.open_sequential(source)
+    }
+}
 
 fn files(directory: &Path, extension: &str) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
@@ -37,12 +76,14 @@ fn files(directory: &Path, extension: &str) -> Result<Vec<PathBuf>> {
 fn metric(name: &str, started: Instant, before: IoSnapshot, options: &ExecutionOptions) {
     let after = options.diagnostics.source_io();
     println!(
-        "{{\"stage\":\"{name}\",\"seconds\":{:.9},\"source_read_bytes\":{},\"source_read_calls\":{},\"reserved_peak\":{},\"handle_peak\":{}}}",
+        "{{\"stage\":\"{name}\",\"seconds\":{:.9},\"source_read_bytes\":{},\"source_read_calls\":{},\"reserved_peak\":{},\"handle_peak\":{},\"file_opens\":{},\"snapshots\":{}}}",
         started.elapsed().as_secs_f64(),
         after.read_bytes - before.read_bytes,
         after.read_calls - before.read_calls,
         options.memory.peak(),
         options.handles.peak(),
+        options.diagnostics.file_opens(),
+        SNAPSHOTS.load(Ordering::Relaxed),
     );
 }
 
@@ -102,7 +143,7 @@ fn main() -> Result<()> {
             execution: options.clone(),
             ..CreationOptions::default()
         };
-        let access = Arc::new(access);
+        let access = Arc::new(Counted(access));
         let before = options.diagnostics.source_io();
         let start = Instant::now();
         let plan = CreationPlan::build(access, &sources, settings)?;
@@ -137,7 +178,7 @@ fn main() -> Result<()> {
             access.insert(id, path);
             carrier_ids.push(id);
         }
-        let access = Arc::new(access);
+        let access = Arc::new(Counted(access));
         let before = options.diagnostics.source_io();
         let start = Instant::now();
         let mut session = None;
@@ -236,7 +277,19 @@ fn main() -> Result<()> {
                 "repair" if status == RepairStatus::Ready => {
                     let before = options.diagnostics.source_io();
                     let start = Instant::now();
-                    let report = session.repair(output, false)?;
+                    let report = session.repair(output, false).inspect_err(|_| {
+                        let io = options.diagnostics.file_io();
+                        eprintln!(
+                            "{{\"failed_repair_seconds\":{:.3},\"file_read_bytes\":{},\"file_read_calls\":{},\"file_write_bytes\":{},\"file_opens\":{},\"snapshots\":{},\"scan_work_used\":{}}}",
+                            start.elapsed().as_secs_f64(),
+                            io.read_bytes,
+                            io.read_calls,
+                            io.write_bytes,
+                            options.diagnostics.file_opens(),
+                            SNAPSHOTS.load(Ordering::Relaxed),
+                            options.scan_work.used()
+                        );
+                    })?;
                     metric("repair", start, before, &options);
                     println!(
                         "{{\"installed\":{},\"reconstructed_blocks\":{}}}",
@@ -274,11 +327,14 @@ fn main() -> Result<()> {
     );
     let io = options.diagnostics.file_io();
     println!(
-        "{{\"file_read_bytes\":{},\"file_read_calls\":{},\"file_write_bytes\":{},\"file_write_calls\":{},\"memory_limit\":{},\"workers\":{}}}",
+        "{{\"file_read_bytes\":{},\"file_read_calls\":{},\"file_write_bytes\":{},\"file_write_calls\":{},\"file_opens\":{},\"snapshots\":{},\"scan_work_used\":{},\"memory_limit\":{},\"workers\":{}}}",
         io.read_bytes,
         io.read_calls,
         io.write_bytes,
         io.write_calls,
+        options.diagnostics.file_opens(),
+        SNAPSHOTS.load(Ordering::Relaxed),
+        options.scan_work.used(),
         options.memory.limit(),
         options.workers
     );

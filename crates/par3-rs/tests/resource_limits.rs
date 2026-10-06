@@ -103,9 +103,9 @@ fn sequential_readers_share_a_ceiling_and_release_on_drop() {
     assert_eq!(options.handles.used(), 0);
 }
 
-// Read handles are cached only on Unix, where a file identity tells a cached
-// handle on a replaced file from one on the file the path names.
-#[cfg(unix)]
+// Read handles are cached on Unix and Windows, where a file identity tells a
+// cached handle on a replaced file from one on the file the path names.
+#[cfg(any(unix, windows))]
 #[test]
 fn disk_reads_open_each_source_once_and_close_with_the_registry() {
     let tree = common::TempTree::new("cached-reads");
@@ -133,7 +133,7 @@ fn disk_reads_open_each_source_once_and_close_with_the_registry() {
     assert_eq!(options.handles.used(), 0);
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn idle_cached_reads_yield_their_leases_to_other_openers() {
     let tree = common::TempTree::new("reclaimed-reads");
@@ -167,7 +167,10 @@ fn idle_cached_reads_yield_their_leases_to_other_openers() {
     assert_eq!(options.diagnostics.file_opens(), 6);
 }
 
-// Windows scans a pinned carrier that denies writers, so it cannot change.
+// Unix only: a Windows scanner reads through a pinned carrier handle that
+// denies writers, deletion and renames for the scan's lifetime, so the carrier
+// cannot be truncated or replaced mid-scan there; that is checked by the
+// source unit tests instead.
 #[cfg(unix)]
 #[test]
 fn disk_scans_reject_a_carrier_replaced_or_truncated_mid_scan() {
@@ -483,18 +486,15 @@ fn creation_rejects_a_source_changed_within_or_between_stripe_passes() {
     // first pass's rows are already in the spool. A replaced file still reads
     // through the old handle and is caught when that pass settles; a
     // truncated one fails at block 16, the first read past its new end. The
-    // read counts show neither waits for the check before installation.
+    // read counts show neither waits for the check before installation. The
+    // replacement is a copy, which keeps its bytes and, on Windows, its mtime;
+    // only the file identity tells it apart.
     for (at, truncate, reads) in [
         (5, false, 32),
         (5, true, 17),
         (32, false, 64),
         (32, true, 49),
     ] {
-        if !truncate && !cfg!(unix) {
-            // A copy keeps its bytes and, on Windows, its mtime; only a Unix
-            // file identity tells the replacement apart.
-            continue;
-        }
         let run = create_watched(32, Some((at, truncate)), false);
         assert!(
             matches!(run.result, Err(EngineError::SourceChanged(SourceId(1)))),
@@ -523,9 +523,6 @@ fn creation_planning_checks_each_source_once_and_rejects_a_changed_file() {
     assert_eq!(run.snapshots, 2 + 6);
     // Read 5 is early in planning's first block.
     for truncate in [false, true] {
-        if !truncate && !cfg!(unix) {
-            continue;
-        }
         let run = create_watched(32, Some((5, truncate)), true);
         assert!(
             matches!(run.result, Err(EngineError::SourceChanged(SourceId(1)))),
@@ -550,9 +547,6 @@ fn repair_rejects_a_source_changed_within_or_between_stripe_passes() {
     // caught by the check before that write, one read later.
     for at in [5, 30] {
         for truncate in [false, true] {
-            if !truncate && !cfg!(unix) {
-                continue;
-            }
             let run = repair_watched(
                 &set,
                 &[(0, 4096 + 5), (0, 9 * 4096 + 7)],
@@ -589,7 +583,7 @@ fn repair_checks_sources_it_does_not_write_once_per_pass() {
     assert_eq!(run.snapshots, 32 + 15 + 7);
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn disk_repair_opens_do_not_grow_with_the_number_of_reads() {
     let mut opens = Vec::new();

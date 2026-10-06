@@ -1,4 +1,5 @@
-//! Private directory creation and identity checks through Windows handles.
+//! Private directory creation and file and directory identity checks through
+//! Windows handles.
 //!
 //! This is the sole unsafe-code boundary in the crate. All callers use owned
 //! directory capabilities and safe wrappers; no pointer escapes this module.
@@ -166,35 +167,116 @@ struct FileIdInfo {
     id: [u8; 16],
 }
 
-pub(super) fn same_directory(first: &Dir, second: &Dir) -> io::Result<bool> {
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetFileInformationByHandleEx(
-            handle: *mut c_void,
-            class: i32,
-            information: *mut FileIdInfo,
-            size: u32,
-        ) -> i32;
+/// FILE_BASIC_INFO; only the change time is read.
+#[repr(C)]
+#[derive(Default)]
+struct FileBasicInfo {
+    _times: [i64; 3],
+    change: i64,
+    _attributes: u32,
+}
+
+/// BY_HANDLE_FILE_INFORMATION; only the volume and file index are read.
+#[repr(C)]
+#[derive(Default)]
+struct ByHandleFileInformation {
+    _attributes: u32,
+    _times: [u32; 6],
+    volume: u32,
+    _size: [u32; 2],
+    _links: u32,
+    index_high: u32,
+    index_low: u32,
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetFileInformationByHandleEx(
+        handle: *mut c_void,
+        class: i32,
+        information: *mut c_void,
+        size: u32,
+    ) -> i32;
+    fn GetFileInformationByHandle(
+        handle: *mut c_void,
+        information: *mut ByHandleFileInformation,
+    ) -> i32;
+}
+
+/// Query one fixed-size information class of a live handle.
+///
+/// # Safety
+///
+/// `T` must have the documented layout of information class `class`.
+unsafe fn query<T: Default>(handle: &impl AsRawHandle, class: i32) -> io::Result<T> {
+    let mut information = T::default();
+    // SAFETY: the caller guarantees `T` is the class's layout; the buffer is
+    // writable and correctly sized, and the borrowed handle stays live
+    // throughout the synchronous query.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle.as_raw_handle(),
+            class,
+            (&raw mut information).cast(),
+            size_of::<T>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
     }
-    let identity = |directory: &Dir| -> io::Result<FileIdInfo> {
-        let mut information = FileIdInfo::default();
-        // SAFETY: FileIdInfo has the documented FILE_ID_INFO layout, the
-        // buffer is writable and correctly sized, and the borrowed handle
-        // stays live throughout the synchronous query. FileIdInfo is class 18.
-        if unsafe {
-            GetFileInformationByHandleEx(
-                directory.as_raw_handle(),
-                18,
-                &mut information,
-                size_of::<FileIdInfo>() as u32,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(information)
-    };
+    Ok(information)
+}
+
+pub(super) fn same_directory(first: &Dir, second: &Dir) -> io::Result<bool> {
+    // SAFETY: FileIdInfo has the documented FILE_ID_INFO layout, class 18.
+    let identity = |directory: &Dir| unsafe { query::<FileIdInfo>(directory, 18) };
     Ok(identity(first)? == identity(second)?)
+}
+
+/// The file an open handle reads, and the last time it changed.
+pub(crate) struct FileStamp {
+    /// Volume serial number.
+    pub(crate) volume: u64,
+    /// File id within the volume. ReFS uses all 128 bits; NTFS the low 64.
+    pub(crate) id: [u8; 16],
+    /// FILE_BASIC_INFO's ChangeTime, which every data or metadata write
+    /// moves; unlike the last write time, ordinary APIs do not set it back.
+    pub(crate) change: i64,
+}
+
+/// The volume and 128-bit id of the file `file` reads, or `None` where the
+/// filesystem reports none. Filesystems without FILE_ID_INFO, such as some
+/// network shares, fall back to the 64-bit index every handle reports.
+pub(crate) fn file_id(file: &std::fs::File) -> io::Result<Option<(u64, [u8; 16])>> {
+    // SAFETY: FileIdInfo has the documented FILE_ID_INFO layout, class 18.
+    let (volume, id) = match unsafe { query::<FileIdInfo>(file, 18) } {
+        Ok(information) => (information.volume, information.id),
+        Err(_) => {
+            let mut information = ByHandleFileInformation::default();
+            // SAFETY: the struct has the documented BY_HANDLE_FILE_INFORMATION
+            // layout and the borrowed handle stays live for the call.
+            if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let index =
+                (u64::from(information.index_high) << 32) | u64::from(information.index_low);
+            let mut id = [0; 16];
+            id[..8].copy_from_slice(&index.to_le_bytes());
+            (u64::from(information.volume), id)
+        }
+    };
+    Ok((id != [0; 16]).then_some((volume, id)))
+}
+
+/// [`file_id`] and the change time of the file `file` reads, or `None` where
+/// the filesystem reports either as zero.
+pub(crate) fn file_stamp(file: &std::fs::File) -> io::Result<Option<FileStamp>> {
+    let Some((volume, id)) = file_id(file)? else {
+        return Ok(None);
+    };
+    // SAFETY: FileBasicInfo has the documented FILE_BASIC_INFO layout, class 0.
+    let change = unsafe { query::<FileBasicInfo>(file, 0) }?.change;
+    Ok((change != 0).then_some(FileStamp { volume, id, change }))
 }
 
 #[cfg(test)]

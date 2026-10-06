@@ -64,21 +64,28 @@ pub trait SourceAccess: Send + Sync {
 
 /// Disk source registry. Sequential readers hold one shared lease until dropped.
 /// Windows scanners use [`SourceAccess::pin`] to retain a budgeted read-only
-/// sharing lock and hash the carrier once. Drop the scanner and all scanned
-/// packets to release that carrier lock.
+/// sharing lock for the scan. Drop the scanner and all scanned packets to
+/// release that carrier lock.
 ///
-/// On Unix, positioned reads keep a few read handles open between calls, at
-/// most a quarter of the handle budget. Each stays charged to the budget, is
-/// closed for any acquirer the budget would otherwise refuse, and is closed as
-/// soon as a snapshot finds the path naming a different file; dropping the
-/// registry closes them all. Elsewhere every positioned read opens the file.
+/// On Unix and Windows, positioned reads keep a few read handles open between
+/// calls, at most a quarter of the handle budget. Each stays charged to the
+/// budget, is closed for any acquirer the budget would otherwise refuse, and is
+/// closed as soon as a snapshot finds the path naming a different file;
+/// dropping the registry closes them all. Windows opens them, like sequential
+/// readers, sharing reads, writes and deletion: a cached handle admits writers,
+/// renames and deletes, which the next snapshot sees, and refuses only an
+/// opener that denies reads, as any open read handle does. Elsewhere every
+/// positioned read opens the file.
 ///
-/// Unix generations include device, inode and change time. On other platforms,
-/// snapshots hash the file through bounded buffers because length and mtime do
-/// not identify replaced content. These reads consume the scan-work budget.
-/// Unpinned snapshots cost a full read each; callers
-/// with immutable backing objects should implement [`SourceAccess`] with their
-/// own stable generations to retain read-free reassessment.
+/// Unix generations include device, inode and change time. Windows generations
+/// include the volume serial number, the 128-bit file id and the change time,
+/// read through one attribute-only open. Other platforms, and Windows
+/// filesystems which report no file id or change time, hash the file through
+/// bounded buffers because length and mtime do not identify replaced content.
+/// These reads consume the scan-work budget and cost a full read per unpinned
+/// snapshot; callers with immutable backing objects should implement
+/// [`SourceAccess`] with their own stable generations to retain read-free
+/// reassessment.
 #[derive(Debug, Default)]
 pub struct DiskSourceAccess {
     paths: BTreeMap<SourceId, PathBuf>,
@@ -111,7 +118,7 @@ impl DiskSourceAccess {
     }
 
     fn cached_handles(&self) -> usize {
-        if cfg!(unix) {
+        if cfg!(any(unix, windows)) {
             CACHED_READ_HANDLES.min(self.options.open_handles.min(self.options.handles.limit()) / 4)
         } else {
             0
@@ -133,9 +140,100 @@ fn file_identity(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
     Some((metadata.dev(), metadata.ino()))
 }
 
-#[cfg(not(unix))]
-fn file_identity(_metadata: &std::fs::Metadata) -> Option<FileIdentity> {
-    None
+/// Fold a volume serial number and 128-bit file id into a [`FileIdentity`].
+/// ReFS ids use all 128 bits, so the whole of both is hashed rather than
+/// truncated: equal identities name the same file but for a 2^-128 collision.
+#[cfg(windows)]
+fn file_identity(volume: u64, id: &[u8; 16]) -> FileIdentity {
+    let mut hash = blake3::Hasher::new();
+    hash.update(&volume.to_le_bytes());
+    hash.update(id);
+    let bytes = hash.finalize();
+    let (first, second) = bytes.as_bytes()[..16].split_at(8);
+    (
+        u64::from_le_bytes(first.try_into().expect("eight bytes")),
+        u64::from_le_bytes(second.try_into().expect("eight bytes")),
+    )
+}
+
+/// The file an open handle reads.
+fn handle_identity(file: &File) -> Option<FileIdentity> {
+    #[cfg(unix)]
+    {
+        file.metadata().ok().as_ref().and_then(file_identity)
+    }
+    #[cfg(windows)]
+    {
+        crate::repair_tree::windows::file_id(file.as_std())
+            .ok()
+            .flatten()
+            .map(|(volume, id)| file_identity(volume, &id))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        None
+    }
+}
+
+/// What a snapshot learns about the file a path names.
+struct DiskStat {
+    metadata: std::fs::Metadata,
+    /// Identity and change time, `None` where the filesystem reports neither.
+    #[cfg(windows)]
+    stamp: Option<crate::repair_tree::windows::FileStamp>,
+}
+
+impl DiskStat {
+    #[cfg(not(windows))]
+    fn of(path: &std::path::Path) -> io::Result<Self> {
+        Ok(Self {
+            metadata: std::fs::metadata(path)?,
+        })
+    }
+
+    // One attribute-only open, as `std::fs::metadata` itself makes on Windows,
+    // so the metadata, identity and change time all describe one file. No data
+    // access is requested, so no sharing mode can refuse it or be refused by it.
+    // Backup semantics open a directory too, refused as not a file like on Unix.
+    #[cfg(windows)]
+    fn of(path: &std::path::Path) -> io::Result<Self> {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_ALL: u32 = 7;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        let file = std::fs::OpenOptions::new()
+            .access_mode(0)
+            .share_mode(FILE_SHARE_ALL)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        let stamp = if metadata.is_file() {
+            crate::repair_tree::windows::file_stamp(&file)?
+        } else {
+            None
+        };
+        Ok(Self { metadata, stamp })
+    }
+
+    fn identity(&self) -> Option<FileIdentity> {
+        if !self.metadata.is_file() {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            file_identity(&self.metadata)
+        }
+        #[cfg(windows)]
+        {
+            self.stamp
+                .as_ref()
+                .map(|stamp| file_identity(stamp.volume, &stamp.id))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            None
+        }
+    }
 }
 
 /// Positioned-read handles kept open between calls, least recently used closed
@@ -211,7 +309,7 @@ impl ReadHandles {
         capacity: usize,
         budget: &crate::runtime::HandleBudget,
     ) {
-        let Some(identity) = file.metadata().ok().as_ref().and_then(file_identity) else {
+        let Some(identity) = handle_identity(file) else {
             return;
         };
         let mut slots = self.lock();
@@ -342,9 +440,13 @@ impl SourceAccess for DiskSourceAccess {
                 "PAR3 source is not a regular file",
             ));
         }
+        // The same generation an unpinned snapshot computes, from this handle.
         let mut hash = disk_metadata_hash(&metadata);
-        hash_open_disk_contents(&mut file, source, &metadata, options, &mut hash)
-            .map_err(EngineError::into_io)?;
+        match crate::repair_tree::windows::file_stamp(file.as_std())? {
+            Some(stamp) => hash_file_stamp(&stamp, &mut hash),
+            None => hash_open_disk_contents(&mut file, source, &metadata, options, &mut hash)
+                .map_err(EngineError::into_io)?,
+        }
         let generation = u64::from_le_bytes(
             hash.finalize().as_bytes()[..8]
                 .try_into()
@@ -365,19 +467,17 @@ impl SourceAccess for DiskSourceAccess {
         let Some(path) = self.paths.get(&source) else {
             return Ok(None);
         };
-        let metadata = std::fs::metadata(path);
+        let stat = DiskStat::of(path);
         if self.cached_handles() != 0 {
-            let identity = match &metadata {
-                Ok(metadata) if metadata.is_file() => file_identity(metadata),
-                _ => None,
-            };
+            let identity = stat.as_ref().ok().and_then(DiskStat::identity);
             self.handles.observe(source, identity);
         }
-        let metadata = match metadata {
+        let stat = match stat {
             Ok(value) => value,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
+        let metadata = &stat.metadata;
         if !metadata.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -385,9 +485,15 @@ impl SourceAccess for DiskSourceAccess {
             ));
         }
         #[allow(unused_mut)]
-        let mut hash = disk_metadata_hash(&metadata);
-        #[cfg(not(unix))]
-        hash_disk_contents(path, source, &metadata, &self.options, &mut hash)
+        let mut hash = disk_metadata_hash(metadata);
+        #[cfg(windows)]
+        match &stat.stamp {
+            Some(stamp) => hash_file_stamp(stamp, &mut hash),
+            None => hash_disk_contents(path, source, metadata, &self.options, &mut hash)
+                .map_err(EngineError::into_io)?,
+        }
+        #[cfg(not(any(unix, windows)))]
+        hash_disk_contents(path, source, metadata, &self.options, &mut hash)
             .map_err(EngineError::into_io)?;
         let generation = u64::from_le_bytes(
             hash.finalize().as_bytes()[..8]
@@ -459,8 +565,18 @@ fn disk_metadata_hash(metadata: &std::fs::Metadata) -> blake3::Hasher {
     hash
 }
 
-// Stable Rust exposes no portable file identity/change counter outside Unix.
-// Hash bytes there rather than reuse evidence based only on length and mtime.
+/// Fold a Windows file's identity and change time into its generation, the
+/// counterpart of Unix's device, inode and ctime.
+#[cfg(windows)]
+fn hash_file_stamp(stamp: &crate::repair_tree::windows::FileStamp, hash: &mut blake3::Hasher) {
+    hash.update(&stamp.volume.to_le_bytes());
+    hash.update(&stamp.id);
+    hash.update(&stamp.change.to_le_bytes());
+}
+
+// Without a file identity and change counter, as on WASI or a Windows
+// filesystem reporting neither, hash bytes rather than reuse evidence based
+// only on length and mtime.
 #[cfg(any(not(unix), test))]
 fn hash_disk_contents(
     path: &std::path::Path,
@@ -473,6 +589,10 @@ fn hash_disk_contents(
     hash_open_disk_contents(&mut file, source, expected, options, hash)
 }
 
+/// The scan-work refusal of a generation hash.
+#[cfg(any(not(unix), test))]
+const GENERATION_HASH_WORK: &str = "cumulative scanning work (source generation hashes)";
+
 #[cfg(any(not(unix), test))]
 fn hash_open_disk_contents(
     file: &mut File,
@@ -481,6 +601,14 @@ fn hash_open_disk_contents(
     options: &ExecutionOptions,
     hash: &mut blake3::Hasher,
 ) -> EngineResult<()> {
+    // Name what spent the scan-work budget: a repair stopped here ran out
+    // hashing source generations, not scanning carriers.
+    let charge = |bytes| {
+        options
+            .scan_work
+            .charge(bytes)
+            .map_err(|_| EngineError::resource_limit(GENERATION_HASH_WORK))
+    };
     let size = options.stripe_bytes.min(64 << 10);
     let _memory = options
         .memory
@@ -490,7 +618,7 @@ fn hash_open_disk_contents(
     while remaining != 0 {
         options.cancel.check()?;
         let take = remaining.min(size as u64) as usize;
-        options.scan_work.charge(take)?;
+        charge(take)?;
         let count = file.read(&mut buffer[..take])?;
         if count == 0 {
             return Err(EngineError::SourceChanged(source));
@@ -499,7 +627,7 @@ fn hash_open_disk_contents(
         remaining -= count as u64;
     }
     let current = file.metadata()?;
-    options.scan_work.charge(1)?;
+    charge(1)?;
     if file.read(&mut [0])? != 0
         || current.len() != expected.len()
         || current.modified()? != expected.modified()?
@@ -509,7 +637,7 @@ fn hash_open_disk_contents(
     Ok(())
 }
 
-// Hash once under the sharing lock, which keeps that generation immutable.
+// Settle the generation once under the sharing lock, which keeps it immutable.
 #[cfg(windows)]
 struct PinnedDiskSource {
     source: SourceId,
@@ -705,8 +833,10 @@ mod tests {
         let directory = TestDirectory::new();
         let path = directory.path().join("untrusted.par3");
         let size = 4 << 20;
-        let expected_reads = if cfg!(windows) { 2 * size } else { size } as u64;
-        let expected_work = expected_reads + u64::from(cfg!(windows));
+        // Pinning a Windows carrier settles its generation from its identity
+        // and change time, so it reads no more than an unpinned Unix scan.
+        let expected_reads = size as u64;
+        let expected_work = expected_reads;
         std::fs::write(&path, vec![0; size]).unwrap();
         let options = ExecutionOptions {
             open_handles: 1,
@@ -767,7 +897,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(EngineError::ResourceLimit(crate::runtime::ResourceLimit {
-                what: "cumulative scanning work",
+                what: GENERATION_HASH_WORK,
                 ..
             }))
         ));
@@ -833,5 +963,50 @@ mod tests {
         assert_eq!(options.memory.used(), 0);
         assert_eq!(options.handles.used(), 0);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn disk_snapshots_read_nothing_and_see_rewrites_keeping_length_and_mtime() {
+        use std::io::Write;
+        let directory = TestDirectory::new();
+        let path = directory.path().join("source");
+        std::fs::write(&path, b"original").unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        // A snapshot that read the file would exceed this budget.
+        let options = ExecutionOptions {
+            scan_work: crate::runtime::ScanWorkBudget::new(0),
+            ..ExecutionOptions::default()
+        };
+        let mut access = DiskSourceAccess::with_options(options.clone());
+        access.insert(SourceId(1), path.clone());
+        let before = access.snapshot(SourceId(1)).unwrap().unwrap();
+        assert_eq!(access.snapshot(SourceId(1)).unwrap(), Some(before));
+        let mut out = [0; 8];
+        assert_eq!(access.read_at(SourceId(1), 0, &mut out).unwrap(), 8);
+        // Change times move at the clock's granularity. The cached read
+        // handle does not refuse this writer.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_all(b"rewrite!").unwrap();
+        file.set_modified(modified).unwrap();
+        drop(file);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        let after = access.snapshot(SourceId(1)).unwrap().unwrap();
+        assert_eq!(after.len, before.len);
+        assert_ne!(after.generation, before.generation);
+        // Still the same file, so the cached handle stays and reads the new bytes.
+        assert_eq!(access.read_at(SourceId(1), 0, &mut out).unwrap(), 8);
+        assert_eq!(&out, b"rewrite!");
+        assert_eq!(options.diagnostics.file_opens(), 1);
+        assert_eq!(options.diagnostics.file_io().read_bytes, 16);
+        assert_eq!(options.scan_work.used(), 0);
+        // Nor does it keep the file from being deleted.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(access.snapshot(SourceId(1)).unwrap(), None);
+        assert_eq!(options.handles.used(), 0);
     }
 }
