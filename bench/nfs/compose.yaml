@@ -1,0 +1,78 @@
+# The PAR3 network-mount rig. Drive it with `rarpar-bench nfs run` from
+# bench/rarpar-bench, which supplies RIG_SOURCE and RIG_RESULTS; see
+# docs/benchmarking.md. Server and client share the VM's kernel: the client
+# switches NFS LOCALIO off so its I/O crosses the protocol.
+
+x-image-build: &build
+  context: ../rarpar-bench
+  dockerfile: ../nfs/Dockerfile
+
+x-client: &client
+  build:
+    <<: *build
+    target: client
+  image: rarpar-bench-nfs-client:local
+  privileged: true
+  depends_on:
+    nfs-server:
+      condition: service_healthy
+  environment:
+    NFS_SERVER: nfs-server
+    NFS_VERS: ${NFS_VERS:-4.1}
+    NFS_PROTO: ${NFS_PROTO:-tcp}
+    NFS_RSIZE: ${NFS_RSIZE:-1048576}
+    NFS_WSIZE: ${NFS_WSIZE:-1048576}
+    NFS_HARD: ${NFS_HARD:-hard}
+    NFS_ACTIMEO: ${NFS_ACTIMEO:-}
+    NFS_CLIENT_SYNC: ${NFS_CLIENT_SYNC:-async}
+    NFS_NCONNECT: ${NFS_NCONNECT:-}
+    NFS_EXTRA_OPTS: ${NFS_EXTRA_OPTS:-}
+    NFS_LOCALIO: ${NFS_LOCALIO:-off}
+    RIG_BUILD: ${RIG_BUILD:-on}
+    RIG_REFERENCE: ${RIG_REFERENCE:-on}
+    RARPAR_TOOL_MIRROR_BASE: ${RARPAR_TOOL_MIRROR_BASE:-}
+  volumes:
+    - /lib/modules:/lib/modules:ro
+    - ${RIG_SOURCE:?run through rarpar-bench nfs run}:/src:ro
+    - ${RIG_RESULTS:?run through rarpar-bench nfs run}:/results
+    - local-work:/w
+    - cache:/cache
+  profiles: [client]
+
+services:
+  nfs-server:
+    build:
+      <<: *build
+      target: server
+    image: rarpar-bench-nfs-server:local
+    privileged: true
+    environment:
+      NFS_THREADS: ${NFS_THREADS:-8}
+      NFS_SERVER_VERSIONS: ${NFS_SERVER_VERSIONS:-3,4.1,4.2}
+    # The NFSv4 pseudo-root (fsid=0) must be exportable, which the image's
+    # overlay is not; a tmpfs holds the two export volumes' mount points.
+    tmpfs:
+      - /export
+    volumes:
+      - /lib/modules:/lib/modules:ro
+      - export-async:/export/async
+      - export-sync:/export/sync
+    healthcheck:
+      test: ["CMD", "rarpar-bench", "nfs", "ready"]
+      interval: 2s
+      retries: 60
+    stop_grace_period: 30s
+
+  bench-client: *client
+
+  # A client whose memory cgroup (which charges page cache) is smaller than
+  # the largest set file, so a second read pass cannot be served from cache.
+  bench-client-lowmem:
+    <<: *client
+    mem_limit: ${RIG_LOWMEM_LIMIT:-768m}
+
+volumes:
+  export-async:
+  export-sync:
+  local-work:
+  cache:

@@ -11,6 +11,9 @@
 //! the default is sync-files. The selected policy is recorded in metrics.
 //! PAR3_BENCH_REPAIR_DURABILITY=buffered does the same for repair.
 //! PAR3_BENCH_CREATOR replaces the Creator packet text of `create`.
+//! PAR3_BENCH_WHOLE_FILE_FIRST=0 makes disk verification hash extents and the
+//! whole file in one pass instead of the whole file first; `1` or unset keeps
+//! the default. The selected order is recorded in metrics.
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -111,6 +114,17 @@ fn main() -> Result<()> {
     options.workers = args[4].parse()?;
     options.memory = MemoryBudget::new(args[5].parse::<usize>()? * (1 << 20));
     options.retained_bytes = options.retained_bytes.min(options.memory.limit() / 2);
+    options.disk_verify_whole_first = match std::env::var("PAR3_BENCH_WHOLE_FILE_FIRST").as_deref()
+    {
+        Err(std::env::VarError::NotPresent) => None,
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => return Err("invalid PAR3_BENCH_WHOLE_FILE_FIRST".into()),
+    };
+    println!(
+        "{{\"whole_file_first\":{}}}",
+        options.disk_verify_whole_first != Some(false)
+    );
     let mut access = DiskSourceAccess::with_options(options.clone());
     let mut sources = Vec::new();
     for (index, path) in files(data, "bin")?.into_iter().enumerate() {

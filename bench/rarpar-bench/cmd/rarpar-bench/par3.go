@@ -24,6 +24,8 @@ const par3Usage = `Usage:
         [--ops create,verify,repair] [--warmups N] [--repeats N] [--workers 1,8] [--pin-cpus 0-7]
         [--durability durable,buffered] [--kernel-variant NAME:VAR=V[,VAR=V]]... [--iocount] [--engine-perf PATH]
         [--candidate-arg ARG]... [--machine LABEL] [--timeout 20m] [--reference-timeout DURATION] [--keep-stages]
+        [--target NAME=DIR]... [--target-meta NAME:KEY=V[,KEY=V]]... [--rows reference,rarpar,engine]
+        [--engine-workers 8] [--engine-variant NAME:VAR=V[,VAR=V]]... [--drop-caches]
   rarpar-bench par3 report --input results.json [--out report.md]
 
 The PAR3 suite benchmarks the shipped rarpar CLI against the pinned par3cmdline
@@ -255,7 +257,13 @@ func runPAR3Suite(ctx context.Context, args []string, stdout io.Writer) error {
 	referenceTimeout := flags.Duration("reference-timeout", 0, "per-run timeout for reference processes (default: --timeout)")
 	durability := flags.String("durability", strings.Join(par3bench.KnownDurabilities, ","), "rarpar durability rows for create and repair (durable is the default and always runs)")
 	keep := flags.Bool("keep-stages", false, "keep per-run stage directories")
-	var sets, kernels, candidateArgs stringList
+	engineWorkers := flags.String("engine-workers", "", "add timed engine_perf rows at these worker counts (needs --engine-perf)")
+	rows := flags.String("rows", "", "timed row kinds: "+strings.Join(par3bench.KnownRowKinds, ",")+" (default: reference,rarpar, plus engine with --engine-workers)")
+	dropCaches := flags.Bool("drop-caches", false, "drop the page cache before every timed run (Linux, root)")
+	var sets, kernels, candidateArgs, targets, targetMeta, engineVariants stringList
+	flags.Var(&targets, "target", "storage target NAME=DIR; every row runs on every target, interleaved (repeatable; replaces --work)")
+	flags.Var(&targetMeta, "target-meta", "facts about a target the client cannot see, NAME:key=value[,key=value] (repeatable)")
+	flags.Var(&engineVariants, "engine-variant", "extra engine row NAME:VAR=value[,VAR=value] (repeatable)")
 	flags.Var(&sets, "set", "restrict to a set ID (repeatable)")
 	flags.Var(&kernels, "kernel-variant", "extra rarpar row NAME:VAR=value[,VAR=value] (repeatable)")
 	flags.Var(&candidateArgs, "candidate-arg", "extra global rarpar argument for every candidate run (repeatable)")
@@ -281,6 +289,31 @@ func runPAR3Suite(ctx context.Context, args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	var targetList []par3bench.Target
+	for _, text := range targets {
+		target, err := par3bench.ParseTarget(text)
+		if err != nil {
+			return err
+		}
+		target.Work = workspacePath(target.Work)
+		targetList = append(targetList, target)
+	}
+	for _, text := range targetMeta {
+		if err := par3bench.ApplyTargetMeta(targetList, text); err != nil {
+			return err
+		}
+	}
+	if len(targetList) > 0 && *work != "" {
+		return fmt.Errorf("--work and --target are exclusive; name the work directory as a target")
+	}
+	engineWorkerList, err := parseIntList(*engineWorkers)
+	if err != nil {
+		return err
+	}
+	engineVariantList, err := parseKernelVariants(engineVariants)
+	if err != nil {
+		return err
+	}
 	// Every timed process runs in its own process group so a timeout can kill
 	// its whole tree; that also keeps it out of the terminal's group, so an
 	// interrupt or a SIGTERM to the harness must cancel the context (which
@@ -298,6 +331,8 @@ func runPAR3Suite(ctx context.Context, args []string, stdout io.Writer) error {
 		Warmups: *warmups, Repeats: *repeats, Workers: workerList, PinCPUs: *pin, KernelVariants: variants,
 		IOCount: *iocount, MachineLabel: *machine, CandidateArgs: candidateArgs, EnginePerfMemoryMiB: *memory,
 		KeepStages: *keep, Timeout: *timeout, ReferenceTimeout: *referenceTimeout, Durabilities: durabilities, Log: os.Stderr,
+		Targets: targetList, Rows: splitList(*rows), EngineWorkers: engineWorkerList, EngineVariants: engineVariantList,
+		DropCaches: *dropCaches,
 	})
 	if err != nil {
 		return err

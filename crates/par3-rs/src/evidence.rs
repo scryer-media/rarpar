@@ -789,7 +789,8 @@ pub(crate) fn verify_source_in_pool(
         // Nothing can promote extents without a whole-file hash, so skip
         // computing one; `finish` would seal `None` either way.
         verifier.whole_ordered = false;
-    } else if unprotected_between(description, snapshot.len, description.len)
+    } else if options.disk_verify_whole_first != Some(false)
+        && unprotected_between(description, snapshot.len, description.len)
         && match &start {
             // A first available range that leaves protected bytes out means
             // the whole-file hash can never settle the file. The extent pass
@@ -1303,8 +1304,20 @@ mod whole_file_first_tests {
         hole: Option<Range<u64>>,
         forward: bool,
     ) -> (FileEvidence, u64, u64, u64) {
+        run_ordered(layout, file, bytes, hole, forward, None)
+    }
+
+    fn run_ordered(
+        layout: &Arc<BlockLayout>,
+        file: usize,
+        bytes: &[u8],
+        hole: Option<Range<u64>>,
+        forward: bool,
+        whole_first: Option<bool>,
+    ) -> (FileEvidence, u64, u64, u64) {
         let options = ExecutionOptions {
             stripe_bytes: 1000,
+            disk_verify_whole_first: whole_first,
             ..ExecutionOptions::default()
         };
         let mut memory = MemorySourceAccess::default();
@@ -1441,6 +1454,27 @@ mod whole_file_first_tests {
             );
             assert_eq!(read, 2 * bytes.len() as u64, "operator decision D2");
             assert_eq!(hashed, bytes.len() as u64, "progress overshoot");
+        }
+    }
+
+    /// The forced single-pass order reads intact and damaged files once and
+    /// reaches the same evidence as the default whole-file-first order.
+    #[test]
+    fn the_single_pass_order_reads_once_with_the_same_evidence() {
+        let tree = TempTree::new("whole-first-off");
+        let (layout, bytes) = many_layout(&tree);
+        let mut damaged = bytes.clone();
+        damaged[5 * 1024 + 3] ^= 0x40;
+        for (case, data) in [("intact", &bytes), ("damaged", &damaged)] {
+            for forward in [false, true] {
+                let (expected, ..) = run(&layout, 0, data, None, forward);
+                let (found, read, _, hashed) =
+                    run_ordered(&layout, 0, data, None, forward, Some(false));
+                assert_eq!(found.verdicts(), expected.verdicts(), "{case}");
+                assert_eq!(found.whole_matches(), expected.whole_matches(), "{case}");
+                assert_eq!(read, data.len() as u64, "{case}: more than one pass");
+                assert_eq!(hashed, data.len() as u64, "{case}");
+            }
         }
     }
 }

@@ -744,6 +744,15 @@ pub struct ExecutionOptions {
     /// identical either way.
     #[doc(hidden)]
     pub fft_fused_decode: Option<bool>,
+    /// Whether disk verification hashes a file whole before its extents.
+    /// `None`, the default, does: an intact file is read once, and a file the
+    /// whole-file hash does not settle is read a second time to hash its
+    /// extents. `Some(false)` hashes the extents and the whole file side by
+    /// side in one pass, so a damaged file is read once and an intact one
+    /// pays for both hashes. A forced value exists so benchmarks can measure
+    /// both orders on the same build; the evidence is identical either way.
+    #[doc(hidden)]
+    pub disk_verify_whole_first: Option<bool>,
     /// Maximum concurrently open engine-owned handles.
     pub open_handles: usize,
     /// Shared handle ceiling across cloned options and cooperating providers.
@@ -771,6 +780,7 @@ impl Default for ExecutionOptions {
             workers: std::thread::available_parallelism().map_or(1, usize::from),
             fft_backend: reedsolomon_rs::gf_simd::LinearBackend::Auto,
             fft_fused_decode: None,
+            disk_verify_whole_first: None,
             open_handles: 32,
             handles: HandleBudget::new(32),
             stripe_bytes: 64 << 10,

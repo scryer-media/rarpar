@@ -2,6 +2,12 @@
 
 ## 0.4.5
 
+- `ExecutionOptions` gains a hidden, bench-only `disk_verify_whole_first`
+  switch. `Some(false)` makes disk verification hash a file's extents and the
+  whole file side by side in one pass instead of trying the whole file first;
+  the default (`None`) is unchanged. The `engine_perf` example exposes it as
+  `PAR3_BENCH_WHOLE_FILE_FIRST=0` so the cost of the second read pass can be
+  measured on remote mounts.
 - **Behaviour change:** the streaming creation engine (`creation::CreationPlan`)
   now derives the InputSetID the way the reference does — and the way
   `create::create` already did, through the same code — from each file's full
