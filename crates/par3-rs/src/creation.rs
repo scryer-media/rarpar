@@ -190,7 +190,11 @@ pub struct CreationRequirements {
     pub reused_blocks: u64,
     /// Exact recovery scratch size.
     pub scratch_bytes: u64,
-    /// Complete metadata bytes repeated in each carrier.
+    /// Bytes of one complete copy of the metadata: the whole index file, and
+    /// the first copy at the head of each carrier. A carrier of `n` rows
+    /// (recovery) or blocks (data) also repeats every metadata packet but the
+    /// Creator packet `floor(log2(n))` more times between its payload packets,
+    /// as the reference does; `output_sizes` counts those copies.
     pub metadata_bytes: u64,
     /// Exact index and carrier lengths, in execution order.
     pub output_sizes: Vec<u64>,
@@ -218,6 +222,9 @@ pub struct CreationPlan {
     /// Data carriers as `(first block, blocks)`. Blocks are not interleaved, so
     /// these stay in block terms whatever the codec is.
     data_volumes: Vec<(u64, u64)>,
+    /// Whether carriers repeat the metadata between their payload packets.
+    /// An embedded carrier keeps the single copy its container layout sized.
+    repeat_metadata: bool,
     requirements: CreationRequirements,
     _reservation: Reservation,
 }
@@ -605,6 +612,7 @@ impl CreationPlan {
             matrix: [0; 16],
             volumes: Vec::new(),
             data_volumes: Vec::new(),
+            repeat_metadata: true,
             requirements,
             _reservation: reservation,
         };
@@ -755,6 +763,7 @@ impl CreationPlan {
             ));
         }
         self.options.volumes = VolumeLayout::Uniform(self.options.recovery_count);
+        self.repeat_metadata = false;
         self.volumes.clear();
         self.data_volumes.clear();
         self.requirements.output_sizes.clear();
@@ -992,6 +1001,21 @@ impl CreationPlan {
         for packet in &self.metadata {
             out.write_all(packet)?;
         }
+        // After the first copy, a carrier repeats the metadata after the
+        // Creator packet as the reference spreads it: after each of its
+        // `units` rows or blocks, cycling through the packets.
+        let common = self.metadata.get(1..).unwrap_or_default();
+        let repeats = |units: u64| MetadataRepeats {
+            common,
+            total: if self.repeat_metadata {
+                metadata_repeats(units) * common.len() as u64
+            } else {
+                0
+            },
+            units,
+            emitted: 0,
+            cursor: 0,
+        };
         // A payload held whole is read once, then hashed and written from
         // the same bytes; without room for one it streams twice, as it
         // always did. Resident recovery rows are already whole.
@@ -1007,6 +1031,7 @@ impl CreationPlan {
             let cohorts = self.requirements.cohorts;
             let first = first_row * cohorts;
             let count = rows * cohorts;
+            let mut repeats = repeats(rows);
             for index in first..first + count {
                 let mut prefix = Vec::with_capacity(40);
                 prefix.extend_from_slice(&self.root);
@@ -1035,9 +1060,13 @@ impl CreationPlan {
                         },
                     )?,
                 }
+                if (index - first + 1).is_multiple_of(cohorts) {
+                    repeats.after((index - first + 1) / cohorts, out)?;
+                }
             }
         } else if number > self.volumes.len() {
             let (first, count) = self.data_volumes[number - self.volumes.len() - 1];
+            let mut repeats = repeats(count);
             for index in first..first + count {
                 self.write_payload(
                     out,
@@ -1046,6 +1075,7 @@ impl CreationPlan {
                     whole.as_mut().map(|(body, _)| body.as_mut_slice()),
                     |offset, bytes| self.read_block(index as usize, offset, bytes, None),
                 )?;
+                repeats.after(index - first + 1, out)?;
             }
         }
         Ok(())
@@ -1711,6 +1741,13 @@ impl CreationPlan {
         self.requirements
             .output_sizes
             .push(self.requirements.metadata_bytes);
+        let metadata_bytes = self.requirements.metadata_bytes;
+        let common_bytes = metadata_bytes
+            - self
+                .metadata
+                .first()
+                .map_or(0, |packet| packet.len() as u64);
+        let repeat = self.repeat_metadata;
         for (extra, per_unit, mut first, mut remaining, volumes) in [
             (
                 88,
@@ -1736,13 +1773,39 @@ impl CreationPlan {
                 .block_size
                 .checked_add(extra)
                 .ok_or(EngineError::resource_limit("payload packet size"))?;
+            // A carrier of `count` units: the payload, one metadata copy,
+            // and the further copies spread between its units.
+            let carrier = |count: u64| -> Option<u64> {
+                let copies = if repeat {
+                    common_bytes.checked_mul(metadata_repeats(count))?
+                } else {
+                    0
+                };
+                packet
+                    .checked_mul(count)?
+                    .checked_mul(per_unit)?
+                    .checked_add(metadata_bytes)?
+                    .checked_add(copies)
+            };
             // Both layout limits are stated in payload packets, so they are
-            // divided down into whole units before anything is cut.
+            // divided down into whole units before anything is cut. A size
+            // limit takes the most units whose carrier, repeated metadata
+            // included, still fits; carriers only grow with their unit count.
             let cap = match self.options.volumes {
                 VolumeLayout::Variable => u64::MAX,
                 VolumeLayout::Uniform(count) => count / per_unit,
                 VolumeLayout::SizeLimited(bytes) => {
-                    bytes.saturating_sub(self.requirements.metadata_bytes) / packet / per_unit
+                    let (mut low, mut high) =
+                        (0, bytes.saturating_sub(metadata_bytes) / packet / per_unit);
+                    while low < high {
+                        let middle = low + (high - low).div_ceil(2);
+                        if carrier(middle).is_some_and(|size| size <= bytes) {
+                            low = middle;
+                        } else {
+                            high = middle - 1;
+                        }
+                    }
+                    low
                 }
             };
             if cap == 0 && remaining != 0 {
@@ -1759,17 +1822,9 @@ impl CreationPlan {
                     cap
                 });
                 volumes.push((first, count));
-                self.requirements.output_sizes.push(
-                    self.requirements
-                        .metadata_bytes
-                        .checked_add(
-                            packet
-                                .checked_mul(count)
-                                .and_then(|bytes| bytes.checked_mul(per_unit))
-                                .ok_or(EngineError::resource_limit("volume size"))?,
-                        )
-                        .ok_or(EngineError::resource_limit("volume size"))?,
-                );
+                self.requirements
+                    .output_sizes
+                    .push(carrier(count).ok_or(EngineError::resource_limit("volume size"))?);
                 first += count;
                 remaining -= count;
                 growth = growth.saturating_mul(2);
@@ -1785,6 +1840,42 @@ fn sorted_children(children: Option<Vec<Fingerprint>>) -> Vec<Fingerprint> {
     let mut children = children.unwrap_or_default();
     children.sort_unstable();
     children
+}
+
+/// How many further copies of the metadata a carrier of `units` rows or blocks
+/// holds after its first: one per doubling, `floor(log2(units))`, as the
+/// reference writes them.
+fn metadata_repeats(units: u64) -> u64 {
+    units.checked_ilog2().map_or(0, u64::from)
+}
+
+/// The metadata copies a carrier spreads between its payload packets.
+///
+/// The reference writes the packets after the Creator packet `total` times
+/// over in all, one packet at a time, cycling through them: after the `k`th of
+/// `units` rows or blocks, as many as bring the running count to
+/// `total * k / units`. The last unit therefore ends on a whole number of
+/// copies, and where the counts do not divide evenly a copy is split across
+/// the gaps between units.
+struct MetadataRepeats<'a> {
+    common: &'a [Vec<u8>],
+    total: u64,
+    units: u64,
+    emitted: u64,
+    cursor: usize,
+}
+
+impl MetadataRepeats<'_> {
+    /// Write what is due once `done` units have been written.
+    fn after(&mut self, done: u64, out: &mut impl Write) -> std::io::Result<()> {
+        let target = (u128::from(self.total) * u128::from(done) / u128::from(self.units)) as u64;
+        while self.emitted < target {
+            out.write_all(&self.common[self.cursor])?;
+            self.cursor = (self.cursor + 1) % self.common.len();
+            self.emitted += 1;
+        }
+        Ok(())
+    }
 }
 
 /// Refuse a source name the engine would later refuse to repair.
@@ -2351,5 +2442,57 @@ impl PlanningReader<'_> {
             None => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_carrier_repeats_its_metadata_once_per_doubling() {
+        // Rows in a carrier against the copies the reference writes in all.
+        for (units, copies) in [
+            (1, 1),
+            (2, 2),
+            (4, 3),
+            (8, 4),
+            (15, 4),
+            (16, 5),
+            (32, 6),
+            (40, 6),
+            (64, 7),
+            (821, 10),
+            (2048, 12),
+        ] {
+            assert_eq!(1 + metadata_repeats(units), copies, "{units} units");
+        }
+        assert_eq!(metadata_repeats(0), 0);
+    }
+
+    #[test]
+    fn repeated_packets_cycle_and_spread_between_the_units() {
+        let common: Vec<Vec<u8>> = (b'a'..=b'c').map(|byte| vec![byte]).collect();
+        let layout = |units: u64| {
+            let mut repeats = MetadataRepeats {
+                common: &common,
+                total: metadata_repeats(units) * common.len() as u64,
+                units,
+                emitted: 0,
+                cursor: 0,
+            };
+            let mut out = Vec::new();
+            for done in 1..=units {
+                out.push(b'|');
+                repeats.after(done, &mut out).unwrap();
+            }
+            String::from_utf8(out).unwrap()
+        };
+        // `|` stands for a unit's payload packets.
+        assert_eq!(layout(1), "|");
+        assert_eq!(layout(2), "|a|bc");
+        assert_eq!(layout(4), "|a|bc|a|bc");
+        assert_eq!(layout(3), "|a|b|c");
+        assert_eq!(layout(5), "|a|b|c|a|bc");
     }
 }

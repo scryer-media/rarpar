@@ -831,3 +831,77 @@ fn a_source_read_in_pieces_narrower_than_its_blocks_still_matches_whole() {
         "the whole-file match did not promote every extent"
     );
 }
+
+/// The streaming engine (`par3_rs::creation`) builds the same set from the
+/// same inputs, for every case inside its reach.
+///
+/// The engine writes no Comment packet, stores files in name order and packs
+/// each chunk tail into the most recent tail block, where the reference (and
+/// `create`) stores the longest tails first and packs each into the first
+/// block with room, and it writes a File packet per input even when two inputs
+/// are identical. Every case with more than one chunk tail, a comment or a
+/// duplicate file differs on those counts and is left to
+/// `every_set_is_created_again_byte_for_byte`. For the cases in reach, the
+/// InputSetID and every file written — the index and each volume with its
+/// repeated metadata copies — match the reference's bytes.
+#[test]
+fn the_streaming_engine_creates_every_set_in_reach_byte_for_byte() {
+    use par3_rs::creation::{CreationCodec, CreationOptions, CreationPlan, CreationSource};
+    use par3_rs::source::{DiskSourceAccess, SourceId};
+    use std::sync::Arc;
+
+    if !hydrated() {
+        return;
+    }
+    const IN_REACH: &[&str] = &["gf16_by_recovery", "large_stream"];
+    for case in CASES.iter().filter(|case| IN_REACH.contains(&case.name)) {
+        let tree = TempTree::new(&format!("corpus-streaming-{}", case.name));
+        let base = case.lay_out(&tree);
+        let options = CreationOptions {
+            block_size: case.expected_block_size,
+            recovery_count: case.recovery_count,
+            codec: CreationCodec::Cauchy,
+            creator: REFERENCE_CREATOR.to_owned(),
+            ..CreationOptions::default()
+        };
+        let mut access = DiskSourceAccess::with_options(options.execution.clone());
+        let mut sources = Vec::new();
+        for (index, path) in case.inputs.iter().enumerate() {
+            let id = SourceId(index as u64);
+            let mut file = base.clone();
+            for component in path.split('/') {
+                file.push(component);
+            }
+            access.insert(id, file);
+            sources.push(CreationSource {
+                name: (*path).to_owned(),
+                source: id,
+            });
+        }
+        let plan = CreationPlan::build(Arc::new(access), &sources, options)
+            .unwrap_or_else(|error| panic!("{} plans: {error}", case.name));
+        let out = tree.path().join("out");
+        std::fs::create_dir_all(&out).expect("output directory");
+        let paths = plan
+            .execute(&out.join("set"), tree.path())
+            .unwrap_or_else(|error| panic!("{} is created: {error}", case.name));
+        let names: Vec<String> = paths
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, case.written, "{}: file names", case.name);
+        assert_eq!(
+            plan.input_set_id(),
+            case.load().input_set_id(),
+            "{}: the streaming engine derives the reference's InputSetID",
+            case.name
+        );
+        for name in case.written {
+            assert_block_eq(
+                &std::fs::read(out.join(name)).expect("a written file"),
+                &case.reference_output(name),
+                &format!("{}/{name} from the streaming engine", case.name),
+            );
+        }
+    }
+}
