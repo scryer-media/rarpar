@@ -3,6 +3,72 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.5.5
+
+### CLI Changes
+
+- rarpar accepts par3cmdline command lines. Started under the name `par3`
+  (a link or copy of the binary), it reads par3cmdline's whole command line:
+  `c`/`create`, `tc`, `v`/`verify`, `r`/`repair`, `l`/`list`, `e`/`extend`,
+  `te`, `i`/`insert`, `ti`, `d`/`delete`, `vs`, `rs`, `-h`, `-V` and `-VV`,
+  and every option, with par3cmdline's messages for malformed and conflicting
+  options and its exit codes (0, 3, 4, 6, 7, 8). Started as `rarpar`, it takes
+  a command line whose first word is one of those commands and whose PAR file
+  argument ends in `.par3` (`.zip` or `.7z` for `i`, `ti`, `d`, `vs` and
+  `rs`). Such command lines previously reached the unrar front end, which
+  refused `c`, `v`, `r`, `d` and `i` and treated `l` and `e` as RAR commands;
+  all other command lines are routed as before.
+- `c` writes the same packets as par3cmdline, except the Creator packet,
+  for the default Cauchy codes, FFT codes (`-e8`, interleaved with `-i`),
+  `-r`, `-rm` on FFT, `-b`, `-s`, `-c`, `-cf`, `-cm` on FFT, `-u`, `-u -n`,
+  `-R`, `-d0`/`-d1`/`-d2`, comments (`-C`) and empty directories. The
+  Creator text stays rarpar's own. `tc` prints par3cmdline's size and
+  efficiency report without writing anything. `v`, `r` and `l` print
+  par3cmdline's verification, repair and listing reports.
+- Where they differ from par3cmdline:
+  - `e`, `te`, `i`, `ti`, `d`, `vs` and `rs` are refused, after par3cmdline's
+    own checks (so `vs` on a file that is not a ZIP or 7z still exits 6).
+  - These options are refused: `-fu`, `-ff` and `-lp`; `-abs` on `c`; `-l`
+    in either form; `-n` without `-u`; `-u -nN` when N does not divide the
+    recovery block count; `-cm` and `-rm` with Cauchy codes; a comment or an
+    empty directory together with `-D`, `-d1`, `-d2`, `-e8`, `-cf` or `-u`;
+    and an unimplemented `-e` code when no recovery blocks are asked for
+    (par3cmdline writes such a set with an empty field). Every refusal exits 3
+    with a message that names rarpar and the option.
+  - With `-D`, the archive file holding the last, partly filled input block
+    stores that block whole; par3cmdline cuts it. The set verifies and
+    repairs the same way.
+  - A set of 129 to 256 blocks in total made with `-D`, `-d1`, `-d2`, `-cf`
+    or `-u` uses an 8-bit Galois field; par3cmdline uses a 16-bit one.
+    Without those options rarpar matches it.
+  - Repair is all or nothing: rarpar never repairs part of a set.
+    "Repair is possible partially." is never printed; a repair that is not
+    possible changes nothing.
+  - A misnamed input found among the extra files is used as a source and the
+    file is rebuilt under its own name; par3cmdline renames it. "files have
+    the wrong name" is never printed.
+  - `-m` sets the engine's memory budget, and a budget too small for the work
+    fails with exit code 8; par3cmdline treats it as a hint. Without `-m` the
+    budget is 256 MiB, as for `rarpar par3`.
+  - `-S` is checked between the extents searched in extra files, not inside
+    one.
+  - Permissions and timestamps are not checked or restored.
+  - Recovery files beside the named PAR file are loaded in name order, not
+    directory order.
+  - Timing lines, the per-file "input file =" lines, "Number of chunk
+    description", "Computing hash" and the `-v` packet statistics are not
+    printed. With `-d1` or `-d2`, "Actual block count" carries no tail-packing
+    or deduplication count.
+  - `-V` prints "par3cmdline version 0.0.1 (rarpar facade)", and `-VV`
+    prints a rarpar notice instead of par3cmdline's copyright.
+
+### Library versions
+
+- par3-rs 0.4.5 (pinned exactly): the streaming creation engine writes
+  par3cmdline's InputSetID, packet repetition and tail packing, which the
+  facade's byte-identical creation relies on. It needs reedsolomon-rs 0.4.8.
+  par2-rs and unrar-rs are unchanged.
+
 ## rarpar 0.5.4 (Unreleased)
 
 ### CLI Changes
