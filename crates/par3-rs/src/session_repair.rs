@@ -1854,31 +1854,97 @@ fn verify_staged(
     tree: Option<&RepairTree>,
     target: &StagedFile,
 ) -> EngineResult<()> {
+    // A large output is hashed in mebibyte reads split across a small
+    // admitted pool, as disk verification hashes a large source; the
+    // fingerprint is the same either way.
+    let large = layout.files[target.index].len >= crate::hash::PARALLEL_SOURCE_BYTES;
+    let pool = if large {
+        match crate::runtime::WorkerPool::for_work(
+            &session.options,
+            crate::hash::PARALLEL_HASH_WORKERS,
+            crate::hash::PARALLEL_HASH_BYTES + (128 << 10),
+        ) {
+            Ok(pool) => pool,
+            Err(EngineError::ResourceLimit(_)) => None,
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    match &pool {
+        Some(pool) => pool
+            .pool()
+            .install(|| read_back(session, layout, tree, target, true)),
+        None => read_back(session, layout, tree, target, false),
+    }
+}
+
+/// [`verify_staged`]'s read: `parallel` only from inside an admitted pool.
+fn read_back(
+    session: &Par3RepairSession,
+    layout: &BlockLayout,
+    tree: Option<&RepairTree>,
+    target: &StagedFile,
+    parallel: bool,
+) -> EngineResult<()> {
     let mut progress = session.options.stage(crate::runtime::Stage::Verify)?;
     let expected = &layout.files[target.index];
-    let size = session.options.stripe_bytes.min(64 << 10);
-    let _buffer = session
-        .options
-        .memory
-        .reserve_as(MemoryCategory::SourceScratch, size)?;
+    let memory = &session.options.memory;
+    let wide = crate::hash::PARALLEL_HASH_BYTES;
+    let reservation = match parallel {
+        true => match memory.reserve_as(MemoryCategory::SourceScratch, wide) {
+            Ok(reservation) if memory.available() >= 128 << 10 => Some(reservation),
+            Ok(_) | Err(EngineError::ResourceLimit(_)) => None,
+            Err(error) => return Err(error),
+        },
+        false => None,
+    };
+    let (_buffer, size) = match reservation {
+        Some(reservation) => (reservation, wide),
+        None => {
+            let size = session.options.stripe_bytes.min(64 << 10);
+            (
+                memory.reserve_as(MemoryCategory::SourceScratch, size)?,
+                size,
+            )
+        }
+    };
+    let parallel = parallel && size >= wide;
     let mut buffer = vec![0u8; size];
     let mut file = open_staged(tree, target, true, false, &session.options)?;
     let mut hash = crate::FingerprintHasher::new();
-    for index in 0..expected.extents.len() {
-        if expected.extents.is_unprotected(index) {
-            continue;
-        }
-        let range = expected.extents.range(index).expect("bounded extent");
+    // Adjacent protected extents are read as one run, so a run of small
+    // blocks still fills the buffer.
+    let mut read_run = |range: std::ops::Range<u64>| -> EngineResult<()> {
         file.seek(SeekFrom::Start(range.start))?;
         let mut remaining = range.end - range.start;
         while remaining != 0 {
             session.options.cancel.check()?;
             let take = remaining.min(size as u64) as usize;
             file.read_exact(&mut buffer[..take])?;
-            hash.update(&buffer[..take]);
+            hash.update_admitted(&buffer[..take], parallel);
             progress.advance(take as u64);
             remaining -= take as u64;
         }
+        Ok(())
+    };
+    let mut run: Option<std::ops::Range<u64>> = None;
+    for index in 0..expected.extents.len() {
+        if expected.extents.is_unprotected(index) {
+            continue;
+        }
+        let range = expected.extents.range(index).expect("bounded extent");
+        match &mut run {
+            Some(open) if open.end == range.start => open.end = range.end,
+            _ => {
+                if let Some(done) = run.replace(range) {
+                    read_run(done)?;
+                }
+            }
+        }
+    }
+    if let Some(done) = run {
+        read_run(done)?;
     }
     if file.metadata()?.len() != expected.len
         || expected.fingerprint == [0; 16]

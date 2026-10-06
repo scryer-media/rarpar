@@ -358,6 +358,13 @@
   directory is still staged and copied as before; Windows is unchanged.
   `ExecutionDiagnostics::file_in_place_repairs()` counts patched files, and
   `engine_perf` reports it as `file_in_place`.
+- A repaired output that is read back before installation (a file patched in
+  place, or a staged one whose writes did not prove it) is now read in runs
+  of adjacent protected extents rather than one extent at a time. An output
+  of 8 MiB or more is read in 1 MiB pieces hashed across up to four workers
+  of an admitted pool, as disk verification already hashes a large source;
+  it falls back to the serial 64 KiB read when memory or the worker budget
+  refuses. The fingerprint and its verdict are unchanged.
 - macOS and Linux builds take `libc` as a regular dependency, and permit
   `unsafe` only in the two file-clone calls. Every other non-Windows target
   keeps `forbid(unsafe_code)`.
