@@ -65,9 +65,17 @@ impl FftGeometry {
         (self.bits / 8) as usize
     }
 
+    /// Check the field a set's Start packet declares against this geometry.
+    ///
+    /// The transform's field follows from the geometry alone, so the declared
+    /// field is a label rather than an input. The reference labels a set with
+    /// no field (size and generator zero) whenever it carries a single recovery
+    /// block, even when the FFT matrix reserves a wider capacity; that block is
+    /// still the first transform parity of the declared capacity, computed in
+    /// the geometry's own field. Any other label must name that field exactly.
     pub(crate) fn validate_field(self, field: crate::packet::GaloisField) -> EngineResult<()> {
         let compatible = if field.size == 0 {
-            self.is_trivial() && field.generator == 0
+            field.generator == 0
         } else {
             field.size as usize == self.field_bytes()
                 && matches!((field.size, field.generator), (1, 0x1d) | (2, 0x2d))
@@ -1580,12 +1588,19 @@ mod tests {
                     Err(EngineError::Unsupported("FFT field representation"))
                 ));
             }
+            // The reference's label for a set holding one recovery block,
+            // whatever capacity the matrix reserves.
             assert!(
                 geometry
                     .validate_field(GaloisField {
                         size: 0,
                         generator: 0
                     })
+                    .is_ok()
+            );
+            assert!(
+                geometry
+                    .validate_field(GaloisField { size: 0, generator })
                     .is_err()
             );
         }

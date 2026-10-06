@@ -152,6 +152,7 @@ input file once, and preserves the reference-compatible default output.
 
 For advanced creation, inspect `CreationPlan::requirements()` before execution.
 It reports block counts, recovery geometry, output sizes, and scratch space.
+Output sizes include each carrier's repeated metadata copies.
 File and chunk hashes share one planning pass; sliding deduplication can read
 additional candidate windows. Encoding reads sources again. Destinations must
 be absent; execution uses a caller-selected scratch directory.
@@ -360,7 +361,32 @@ reference. The deviations affecting interpretation are:
 - **Start packet:** no leading random bytes. The older layout is detected by
   body length and preserved.
 - **InputSetID:** an opaque grouping key; it cannot be recomputed from stored
-  bytes as the draft describes.
+  bytes as the draft describes. Both creation APIs derive it the way the
+  reference does, from the file names, sizes, hashes and chunk layout and
+  the Start packet body.
+- **Metadata repetition:** a recovery volume carries one copy of every
+  metadata packet up front and, as the reference writes it, `floor(log2(n))`
+  further copies of all but the Creator packet spread between its `n`
+  recovery rows; the index file carries one copy.
+- **Storage order:** both creation APIs store the inputs as the reference
+  does: longest file tail (size modulo block size) first, then largest file,
+  then by name. File packets follow the same order.
+- **Tail packing:** as the reference does, without deduplication (`-d0`) a
+  tail goes behind the first earlier tail, in placement order, that is still
+  the last in its block and has room; with aligned or sliding deduplication
+  (`-d1`, `-d2`) it goes into the first block, by block index, with room.
+  Either way it opens a new block only when nothing fits.
+- **Shared packets:** File or Directory packets with identical contents, such
+  as empty files of one name in two directories, are written once and listed
+  by every parent.
+- **Comment:** the reference writes a Comment packet only when given `-C`
+  text. The streaming engine writes none; `create` writes one only when given
+  comment text.
+- **Streaming-engine data volumes:** the reference cuts every tail block's
+  Data packet to the bytes in use and, for an interleaved set, splits data
+  volumes and spreads their metadata copies by rows of cohort blocks. The
+  engine stores whole blocks and counts data blocks singly. The index and
+  recovery volumes are unaffected.
 - **File hash:** a 16-byte BLAKE3 hash, absent from the draft, over protected
   chunks concatenated in file order. Unprotected bytes are omitted.
 - **Chunks:** no per-chunk fingerprint from the draft layout.
@@ -368,8 +394,10 @@ reference. The deviations affecting interpretation are:
 - **External Data:** full-size blocks only; packed tail blocks are omitted.
 - **FFT:** low-rate Cantor-field semantics follow the pinned appendix.
   GF16 uses `0x1002D`, distinct from Cauchy's `0x1100B`.
-- **Trivial FFT:** field size zero represents one-input copy recovery or
-  capacity-one XOR, without transform tables.
+- **FFT field size zero:** the reference records no field for a set with one
+  recovery block or a capacity of one. The field still follows from the
+  geometry: only one input (a copy) or a capacity of one (XOR) needs no
+  transform tables.
 - **ZIP64 insertion:** the pinned reference requires ZIP size/offset sentinel
   fields too; member count alone is insufficient. Corpus recipes normalize
   those original ZIP fields before official insertion.

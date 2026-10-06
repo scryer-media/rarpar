@@ -2,6 +2,59 @@
 
 ## 0.4.4 (Unreleased)
 
+- **Behaviour change:** the streaming creation engine (`creation::CreationPlan`)
+  now derives the InputSetID the way the reference does — and the way
+  `create::create` already did, through the same code — from each file's full
+  name, size, hash and chunk layout, the directory names, and the Start packet
+  body. It previously digested the block size, field and File packets, so sets
+  it writes now carry a different InputSetID than before for the same inputs.
+- **Behaviour change:** streaming-engine recovery and data volumes now repeat
+  the metadata the way the reference does: after one full copy up front, every
+  packet but the Creator packet is written `floor(log2(n))` more times, one
+  packet at a time and cycling through them, spread between the volume's `n`
+  rows (or data blocks). A volume previously held a single copy.
+  `CreationRequirements::output_sizes` counts the copies, and a
+  `VolumeLayout::SizeLimited` carrier still fits its limit with them included.
+  The index file and embedded (PAR-inside) carriers keep one copy. Directory
+  and Root packets now list their children sorted by packet hash, and Directory
+  packets are written in the reference's order.
+  The carrier authenticator proves each repeated copy by comparing it with
+  the copy of that packet it hashed first, instead of hashing and parsing it
+  again; the copies still go out through the same buffered writes.
+- **Behaviour change:** the streaming engine stores, packs and shares packets
+  as the reference does. Inputs are stored longest file tail (size modulo
+  block size) first, then largest file, then by name, whatever order the
+  sources are listed in; the order comes from the source sizes, so it costs no
+  extra I/O. Embedded (PAR-inside) carriers keep their listed order. Without
+  deduplication a tail is packed behind the first earlier tail, in placement
+  order, that is still the last in its block and has room, rather than only
+  behind the latest; with aligned or sliding deduplication it goes into the
+  first block, by block index, with room, as the reference's `-d1` and `-d2`
+  place it. File and Directory
+  packets with identical contents, such as empty files of one name in two
+  directories, are written once and listed by every parent. With these, the
+  engine writes `par3cmdline`'s bytes for the reference's default creation
+  (no `-C` comment, which is the only way the reference writes a Comment
+  packet) over single files, multi-file sets and directory trees, verified for
+  Cauchy and FFT (interleaved too) recovery volumes, at every deduplication
+  mode. Data volumes still store a tail block whole, where the reference cuts
+  its Data packet to the bytes in use, and an interleaved set's data volumes
+  count blocks singly where the reference counts rows of cohort blocks.
+- **Behaviour change:** a streaming-engine FFT set now records no Galois field
+  in its Start packet when it carries a single recovery block, as the
+  reference does, whatever capacity its matrix reserves. It previously
+  recorded GF(2^8) or GF(2^16) unless the capacity was one, and recorded no
+  field for a capacity-one set without recovery blocks, where the reference
+  records the geometry's field. (The reference also records none for a
+  requested capacity of one with no recovery blocks, which these options
+  cannot express.) Only a capacity of one makes that block the
+  XOR of the inputs; under a wider capacity it is still the first transform
+  parity of that capacity, computed in the field the geometry implies.
+- Verification and repair now accept an FFT set that records no Galois field
+  whatever capacity its matrix reserves, such as the reference's
+  `par3 c -c1 -cm4`. They previously refused every such set but the
+  capacity-one one as an unsupported field.
+- `engine_perf` takes `PAR3_BENCH_CREATOR` to replace the Creator packet text.
 - **Behaviour change:** repair output on native targets is now confined to an
   opened directory capability. Replacing the output-root path or swapping a
   destination parent during repair cannot redirect rebuild reads or installs

@@ -7,6 +7,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::create::{MetadataRepeats, metadata_repeats};
 use crate::fft::{FftCodec, FftGeometry};
 use crate::gf::MulAccBatch;
 use crate::packet::{
@@ -190,7 +191,11 @@ pub struct CreationRequirements {
     pub reused_blocks: u64,
     /// Exact recovery scratch size.
     pub scratch_bytes: u64,
-    /// Complete metadata bytes repeated in each carrier.
+    /// Bytes of one complete copy of the metadata: the whole index file, and
+    /// the first copy at the head of each carrier. A carrier of `n` rows
+    /// (recovery) or blocks (data) also repeats every metadata packet but the
+    /// Creator packet `floor(log2(n))` more times between its payload packets,
+    /// as the reference does; `output_sizes` counts those copies.
     pub metadata_bytes: u64,
     /// Exact index and carrier lengths, in execution order.
     pub output_sizes: Vec<u64>,
@@ -218,6 +223,9 @@ pub struct CreationPlan {
     /// Data carriers as `(first block, blocks)`. Blocks are not interleaved, so
     /// these stay in block terms whatever the codec is.
     data_volumes: Vec<(u64, u64)>,
+    /// Whether carriers repeat the metadata between their payload packets.
+    /// An embedded carrier keeps the single copy its container layout sized.
+    repeat_metadata: bool,
     requirements: CreationRequirements,
     _reservation: Reservation,
 }
@@ -228,10 +236,34 @@ impl CreationPlan {
     /// File, quick-prefix, block, and tail hashes share one source pass; sliding
     /// deduplication additionally reads candidate windows. Forward readers are
     /// used when available, with at most one retained input handle per file.
+    ///
+    /// The inputs are stored in the reference's order — longest file tail
+    /// (size modulo block size) first, then largest file, then name — whatever order `sources` lists
+    /// them in. That order is decided from the source sizes alone, before any
+    /// byte is read, so it costs no extra I/O.
     pub fn build(
         access: Arc<dyn SourceAccess>,
         sources: &[CreationSource],
         options: CreationOptions,
+    ) -> EngineResult<Self> {
+        Self::build_ordered(access, sources, options, true)
+    }
+
+    /// Plan the sources in the order given. An embedded carrier lays its body
+    /// out ahead of its footer, so it keeps the order its views were listed in.
+    pub(crate) fn build_in_source_order(
+        access: Arc<dyn SourceAccess>,
+        sources: &[CreationSource],
+        options: CreationOptions,
+    ) -> EngineResult<Self> {
+        Self::build_ordered(access, sources, options, false)
+    }
+
+    fn build_ordered(
+        access: Arc<dyn SourceAccess>,
+        sources: &[CreationSource],
+        options: CreationOptions,
+        reference_order: bool,
     ) -> EngineResult<Self> {
         let _progress = options.execution.stage(crate::runtime::Stage::Create)?;
         if options.block_size == 0 {
@@ -346,10 +378,33 @@ impl CreationPlan {
         let rolling = (options.deduplication == Deduplication::Sliding)
             .then(|| SlidingCrc::new(options.block_size));
         let mut tails = BTreeMap::<(u64, Fingerprint), (u64, u64)>::new();
-        let mut packing: Option<usize> = None;
+        let mut packing = if options.deduplication == Deduplication::None {
+            TailSlots::default()
+        } else {
+            TailSlots::by_block()
+        };
         let mut reused = 0;
         let mut names = BTreeMap::new();
-        for (source, snapshot) in sources.iter().zip(snapshots) {
+        let mut order: Vec<usize> = (0..sources.len()).collect();
+        if reference_order {
+            let block_size = options.block_size;
+            order.sort_by(|&left, &right| {
+                let (one, other) = (snapshots[left].len, snapshots[right].len);
+                (other % block_size)
+                    .cmp(&(one % block_size))
+                    .then_with(|| other.cmp(&one))
+                    .then_with(|| {
+                        sources[left]
+                            .name
+                            .as_bytes()
+                            .cmp(sources[right].name.as_bytes())
+                    })
+            });
+        }
+        for (source, snapshot) in order
+            .into_iter()
+            .map(|index| (&sources[index], snapshots[index]))
+        {
             if names.insert(source.name.clone(), ()).is_some() {
                 return Err(EngineError::InvalidState("duplicate creation path"));
             }
@@ -449,21 +504,18 @@ impl CreationPlan {
                     let (index, offset) = if let Some(alias) = alias {
                         alias
                     } else {
-                        let index = packing
-                            .filter(|index| options.block_size - blocks[*index].used >= length)
-                            .unwrap_or_else(|| {
-                                let index = blocks.len();
-                                blocks.push(Block {
-                                    pieces: Vec::new(),
-                                    used: 0,
-                                    checksum: None,
-                                });
-                                packing = Some(index);
-                                index
+                        let index = packing.take(length).unwrap_or_else(|| {
+                            blocks.push(Block {
+                                pieces: Vec::new(),
+                                used: 0,
+                                checksum: None,
                             });
+                            blocks.len() - 1
+                        });
                         let offset = blocks[index].used;
                         blocks[index].pieces.push(Piece { offset, ..piece });
                         blocks[index].used += length;
+                        packing.place(index, options.block_size - blocks[index].used);
                         tails.insert((length, hash), (index as u64, offset));
                         (index as u64, offset)
                     };
@@ -500,7 +552,6 @@ impl CreationPlan {
                 },
             });
         }
-        files.sort_by(|left, right| left.name.cmp(&right.name));
         for file in &files {
             let mut ancestor = parent(&file.name);
             while !ancestor.is_empty() {
@@ -561,13 +612,36 @@ impl CreationPlan {
                         "requested recovery exceeds FFT capacity",
                     ));
                 }
-                GaloisField {
-                    size: geometry.field_bytes() as u8,
-                    generator: if geometry.field_bytes() == 1 {
-                        0x1d
-                    } else {
-                        0x2d
-                    },
+                if geometry.field_bytes() == 2
+                    && !geometry.is_trivial()
+                    && !options.block_size.is_multiple_of(2)
+                {
+                    return Err(EngineError::InvalidState(
+                        "creation block is not field aligned",
+                    ));
+                }
+                if last == 1 {
+                    // The reference records no field when the set carries a
+                    // single recovery block, whatever capacity the matrix
+                    // reserves. (Its other case, a requested capacity of one
+                    // with no recovery blocks, is not expressible here: a set
+                    // without recovery records the geometry's field.) The block
+                    // is still the first transform parity of the reserved
+                    // capacity: the XOR of the inputs only when that capacity
+                    // is one.
+                    GaloisField {
+                        size: 0,
+                        generator: 0,
+                    }
+                } else {
+                    GaloisField {
+                        size: geometry.field_bytes() as u8,
+                        generator: if geometry.field_bytes() == 1 {
+                            0x1d
+                        } else {
+                            0x2d
+                        },
+                    }
                 }
             }
         };
@@ -605,6 +679,7 @@ impl CreationPlan {
             matrix: [0; 16],
             volumes: Vec::new(),
             data_volumes: Vec::new(),
+            repeat_metadata: true,
             requirements,
             _reservation: reservation,
         };
@@ -755,6 +830,7 @@ impl CreationPlan {
             ));
         }
         self.options.volumes = VolumeLayout::Uniform(self.options.recovery_count);
+        self.repeat_metadata = false;
         self.volumes.clear();
         self.data_volumes.clear();
         self.requirements.output_sizes.clear();
@@ -860,7 +936,8 @@ impl CreationPlan {
                     file,
                     self.id,
                     self.options.execution.clone(),
-                ),
+                )
+                .with_known(&self.metadata),
             );
             self.write_output(number, &mut spool, &mut out)?;
             let out = out
@@ -992,6 +1069,11 @@ impl CreationPlan {
         for packet in &self.metadata {
             out.write_all(packet)?;
         }
+        // After the first copy, a carrier repeats the metadata after the
+        // Creator packet as the reference spreads it: after each of its
+        // `units` rows or blocks, cycling through the packets.
+        let common = self.metadata.get(1..).unwrap_or_default();
+        let repeats = |units: u64| MetadataRepeats::new(common, units, self.repeat_metadata);
         // A payload held whole is read once, then hashed and written from
         // the same bytes; without room for one it streams twice, as it
         // always did. Resident recovery rows are already whole.
@@ -1007,6 +1089,7 @@ impl CreationPlan {
             let cohorts = self.requirements.cohorts;
             let first = first_row * cohorts;
             let count = rows * cohorts;
+            let mut repeats = repeats(rows);
             for index in first..first + count {
                 let mut prefix = Vec::with_capacity(40);
                 prefix.extend_from_slice(&self.root);
@@ -1035,9 +1118,13 @@ impl CreationPlan {
                         },
                     )?,
                 }
+                if (index - first + 1).is_multiple_of(cohorts) {
+                    repeats.after((index - first + 1) / cohorts, out)?;
+                }
             }
         } else if number > self.volumes.len() {
             let (first, count) = self.data_volumes[number - self.volumes.len() - 1];
+            let mut repeats = repeats(count);
             for index in first..first + count {
                 self.write_payload(
                     out,
@@ -1046,6 +1133,7 @@ impl CreationPlan {
                     whole.as_mut().map(|(body, _)| body.as_mut_slice()),
                     |offset, bytes| self.read_block(index as usize, offset, bytes, None),
                 )?;
+                repeats.after(index - first + 1, out)?;
             }
         }
         Ok(())
@@ -1540,32 +1628,41 @@ impl CreationPlan {
     }
 
     fn build_metadata(&mut self) -> EngineResult<()> {
-        let mut identity = FingerprintHasher::new();
-        identity.update(&self.options.block_size.to_le_bytes());
-        identity.update(&[self.requirements.field.size]);
-        identity.update(&self.requirements.field.generator.to_le_bytes());
-        for file in &self.files {
-            identity.update(file.name.as_bytes());
-            identity.update(
-                &Packet::new(InputSetId::ZERO, PacketBody::File(file.packet.clone())).to_bytes(),
-            );
-        }
-        self.id = InputSetId(identity.finalize()[..8].try_into().expect("eight bytes"));
+        let start = StartPacket {
+            parent_input_set_id: InputSetId::ZERO,
+            parent_root_hash: [0; 16],
+            block_size: self.options.block_size,
+            galois_field: self.requirements.field,
+            legacy_random: None,
+        };
+        // Every directory the set describes is an ancestor of a file name,
+        // ordered the way the reference lists them: a directory after the
+        // directories beneath it. The Directory packets go out in this order
+        // too.
+        let directories =
+            crate::create::directory_names(self.files.iter().map(|file| file.name.as_str()), &[]);
+        self.id = crate::create::input_set_id(
+            self.files.iter().map(|file| crate::create::SetIdFile {
+                name: &file.name,
+                size: file
+                    .packet
+                    .chunks
+                    .iter()
+                    .map(ChunkDescription::length)
+                    .sum(),
+                fingerprint: &file.packet.fingerprint,
+                chunks: &file.packet.chunks,
+            }),
+            directories.iter().map(String::as_str),
+            self.options.block_size,
+            &start.to_body_bytes(),
+        );
         let mut packets = vec![
             Packet::new(
                 self.id,
                 PacketBody::Creator(CreatorPacket::new(&self.options.creator)),
             ),
-            Packet::new(
-                self.id,
-                PacketBody::Start(StartPacket {
-                    parent_input_set_id: InputSetId::ZERO,
-                    parent_root_hash: [0; 16],
-                    block_size: self.options.block_size,
-                    galois_field: self.requirements.field,
-                    legacy_random: None,
-                }),
-            ),
+            Packet::new(self.id, PacketBody::Start(start)),
         ];
         if self.options.recovery_count != 0 {
             let body = match self.options.codec {
@@ -1592,6 +1689,10 @@ impl CreationPlan {
             packets.push(packet);
         }
         let mut children: BTreeMap<String, Vec<Fingerprint>> = BTreeMap::new();
+        // Two inputs can describe themselves identically — empty files of one
+        // name in different directories — and then share one packet, as the
+        // reference does: each parent lists the hash, the packet goes out once.
+        let mut written = std::collections::BTreeSet::new();
         for file in &self.files {
             let packet = Packet::new(self.id, PacketBody::File(file.packet.clone()));
             let parent = parent(&file.name);
@@ -1599,33 +1700,26 @@ impl CreationPlan {
                 .entry(parent.to_owned())
                 .or_default()
                 .push(packet.hash());
-            packets.push(packet);
-            let mut ancestor = parent;
-            while !ancestor.is_empty() {
-                children.entry(ancestor.to_owned()).or_default();
-                ancestor = parent_of(ancestor);
+            if written.insert(packet.hash()) {
+                packets.push(packet);
             }
         }
-        let mut directories: Vec<String> = children
-            .keys()
-            .filter(|name| !name.is_empty())
-            .cloned()
-            .collect();
-        directories.sort_by_key(|name| std::cmp::Reverse(name.matches('/').count()));
         for directory in directories {
             let packet = Packet::new(
                 self.id,
                 PacketBody::Directory(DirectoryPacket {
                     name: directory.rsplit('/').next().expect("directory").to_owned(),
                     option_hashes: Vec::new(),
-                    children: children.remove(&directory).unwrap_or_default(),
+                    children: sorted_children(children.remove(&directory)),
                 }),
             );
             children
                 .entry(parent(&directory).to_owned())
                 .or_default()
                 .push(packet.hash());
-            packets.push(packet);
+            if written.insert(packet.hash()) {
+                packets.push(packet);
+            }
         }
         let root = Packet::new(
             self.id,
@@ -1633,7 +1727,7 @@ impl CreationPlan {
                 lowest_unused_block_index: self.blocks.len() as u64,
                 attributes: 0,
                 option_hashes: Vec::new(),
-                children: children.remove("").unwrap_or_default(),
+                children: sorted_children(children.remove("")),
             }),
         );
         self.root = root.hash();
@@ -1701,6 +1795,13 @@ impl CreationPlan {
         self.requirements
             .output_sizes
             .push(self.requirements.metadata_bytes);
+        let metadata_bytes = self.requirements.metadata_bytes;
+        let common_bytes = metadata_bytes
+            - self
+                .metadata
+                .first()
+                .map_or(0, |packet| packet.len() as u64);
+        let repeat = self.repeat_metadata;
         for (extra, per_unit, mut first, mut remaining, volumes) in [
             (
                 88,
@@ -1726,13 +1827,39 @@ impl CreationPlan {
                 .block_size
                 .checked_add(extra)
                 .ok_or(EngineError::resource_limit("payload packet size"))?;
+            // A carrier of `count` units: the payload, one metadata copy,
+            // and the further copies spread between its units.
+            let carrier = |count: u64| -> Option<u64> {
+                let copies = if repeat {
+                    common_bytes.checked_mul(metadata_repeats(count))?
+                } else {
+                    0
+                };
+                packet
+                    .checked_mul(count)?
+                    .checked_mul(per_unit)?
+                    .checked_add(metadata_bytes)?
+                    .checked_add(copies)
+            };
             // Both layout limits are stated in payload packets, so they are
-            // divided down into whole units before anything is cut.
+            // divided down into whole units before anything is cut. A size
+            // limit takes the most units whose carrier, repeated metadata
+            // included, still fits; carriers only grow with their unit count.
             let cap = match self.options.volumes {
                 VolumeLayout::Variable => u64::MAX,
                 VolumeLayout::Uniform(count) => count / per_unit,
                 VolumeLayout::SizeLimited(bytes) => {
-                    bytes.saturating_sub(self.requirements.metadata_bytes) / packet / per_unit
+                    let (mut low, mut high) =
+                        (0, bytes.saturating_sub(metadata_bytes) / packet / per_unit);
+                    while low < high {
+                        let middle = low + (high - low).div_ceil(2);
+                        if carrier(middle).is_some_and(|size| size <= bytes) {
+                            low = middle;
+                        } else {
+                            high = middle - 1;
+                        }
+                    }
+                    low
                 }
             };
             if cap == 0 && remaining != 0 {
@@ -1749,17 +1876,9 @@ impl CreationPlan {
                     cap
                 });
                 volumes.push((first, count));
-                self.requirements.output_sizes.push(
-                    self.requirements
-                        .metadata_bytes
-                        .checked_add(
-                            packet
-                                .checked_mul(count)
-                                .and_then(|bytes| bytes.checked_mul(per_unit))
-                                .ok_or(EngineError::resource_limit("volume size"))?,
-                        )
-                        .ok_or(EngineError::resource_limit("volume size"))?,
-                );
+                self.requirements
+                    .output_sizes
+                    .push(carrier(count).ok_or(EngineError::resource_limit("volume size"))?);
                 first += count;
                 remaining -= count;
                 growth = growth.saturating_mul(2);
@@ -1767,6 +1886,102 @@ impl CreationPlan {
         }
         Ok(())
     }
+}
+
+/// Where packed tails may go, in the order the reference searches them.
+///
+/// Without deduplication (`-d0`) the reference puts a tail behind the first
+/// earlier tail, in placement order, that is still the last one in its block
+/// and leaves room for it. A block only grows at its end, so a tail with
+/// another placed behind it closes for good. With deduplication (`-d1` and
+/// `-d2`) it instead takes the first block, by block index, with room for the
+/// tail. Either way a tail opens a new block only when nothing fits.
+///
+/// The slots — one per placed tail, or one per block — sit under a max tree
+/// of their spare room, so the first one that fits is found in logarithmic
+/// time rather than by scanning; a closed slot or a full block has no room.
+/// The tree and the slot list stay under 48 bytes per placed tail or block,
+/// inside the 1024 bytes per block the plan reserves before it starts.
+#[derive(Default)]
+struct TailSlots {
+    /// Leaves from `tree.len() / 2`, one per slot; each inner node holds the
+    /// larger of its children.
+    tree: Vec<u64>,
+    /// Each placement-order slot's block; unused when slots are blocks.
+    blocks: Vec<usize>,
+    /// Slots are blocks, searched by block index (`-d1` and `-d2`).
+    by_block: bool,
+}
+
+impl TailSlots {
+    /// Slots searched by block index, as the reference's deduplicating modes do.
+    fn by_block() -> Self {
+        Self {
+            by_block: true,
+            ..Self::default()
+        }
+    }
+
+    /// The block of the first slot with at least `length` bytes spare. In
+    /// placement order that slot closes: the tail about to go there becomes its
+    /// block's last.
+    fn take(&mut self, length: u64) -> Option<usize> {
+        if self.tree.get(1).is_none_or(|&room| room < length) {
+            return None;
+        }
+        let mut node = 1;
+        while node < self.tree.len() / 2 {
+            node = if self.tree[2 * node] >= length {
+                2 * node
+            } else {
+                2 * node + 1
+            };
+        }
+        let slot = node - self.tree.len() / 2;
+        if self.by_block {
+            return Some(slot);
+        }
+        self.set(slot, 0);
+        Some(self.blocks[slot])
+    }
+
+    /// Record a tail just placed in `block`, leaving `room` bytes behind it.
+    fn place(&mut self, block: usize, room: u64) {
+        let slot = if self.by_block {
+            block
+        } else {
+            self.blocks.push(block);
+            self.blocks.len() - 1
+        };
+        let leaves = self.tree.len() / 2;
+        if slot >= leaves {
+            let grown = (slot + 1).next_power_of_two().max(16);
+            let mut tree = vec![0; 2 * grown];
+            tree[grown..grown + leaves].copy_from_slice(&self.tree[leaves..]);
+            for node in (1..grown).rev() {
+                tree[node] = tree[2 * node].max(tree[2 * node + 1]);
+            }
+            self.tree = tree;
+        }
+        self.set(slot, room);
+    }
+
+    fn set(&mut self, slot: usize, room: u64) {
+        let mut node = slot + self.tree.len() / 2;
+        self.tree[node] = room;
+        while node > 1 {
+            node /= 2;
+            self.tree[node] = self.tree[2 * node].max(self.tree[2 * node + 1]);
+        }
+    }
+}
+
+/// A Directory or Root packet's children, in the order the reference writes
+/// them.
+fn sorted_children(children: Option<Vec<Fingerprint>>) -> Vec<Fingerprint> {
+    let mut children = children.unwrap_or_default();
+    crate::create::sort_children(&mut children);
+    children
 }
 
 /// Refuse a source name the engine would later refuse to repair.
@@ -1795,9 +2010,6 @@ fn suffix(stem: &Path, suffix: &str) -> PathBuf {
 }
 fn parent(name: &str) -> &str {
     name.rsplit_once('/').map_or("", |(parent, _)| parent)
-}
-fn parent_of(name: &str) -> &str {
-    parent(name)
 }
 fn append_full(chunks: &mut Vec<ChunkDescription>, index: u64, size: u64) {
     if let Some(ChunkDescription::Protected {
@@ -2333,5 +2545,105 @@ impl PlanningReader<'_> {
             None => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tail_goes_behind_the_first_placed_tail_with_room() {
+        let mut slots = TailSlots::default();
+        // Blocks 0 and 1 each take a tail, leaving 100 and 300 bytes spare.
+        slots.place(0, 100);
+        slots.place(1, 300);
+        // 80 bytes fit behind the first tail placed, though block 1 is newer
+        // and roomier; that tail is now closed behind the new one.
+        assert_eq!(slots.take(80), Some(0));
+        slots.place(0, 20);
+        assert_eq!(slots.take(50), Some(1));
+        slots.place(1, 250);
+        // Only the newest tail in each block is open.
+        assert_eq!(slots.take(260), None);
+        // Block 0's open tail was placed before block 1's, so it is first.
+        assert_eq!(slots.take(20), Some(0));
+        slots.place(0, 0);
+        assert_eq!(slots.take(20), Some(1));
+        slots.place(1, 230);
+        // The tree grows past its first sixteen leaves without losing any.
+        for block in 2..40 {
+            slots.place(block, block as u64);
+        }
+        assert_eq!(slots.take(200), Some(1));
+        // Block 1's new tail is the newest placed, behind blocks 2 to 39.
+        slots.place(1, 30);
+        assert_eq!(slots.take(39), Some(39));
+        assert_eq!(slots.take(5), Some(5));
+        assert_eq!(slots.take(30), Some(30));
+        assert_eq!(slots.take(39), None);
+    }
+
+    #[test]
+    fn a_deduplicating_tail_goes_into_the_first_block_by_index_with_room() {
+        let mut slots = TailSlots::by_block();
+        // Block 1 took a tail first, then block 0's room was set later; the
+        // lower index still wins, and a block stays open after taking a tail.
+        slots.place(1, 500);
+        slots.place(0, 100);
+        assert_eq!(slots.take(90), Some(0));
+        slots.place(0, 10);
+        assert_eq!(slots.take(90), Some(1));
+        slots.place(1, 410);
+        assert_eq!(slots.take(10), Some(0));
+        assert_eq!(slots.take(411), None);
+        // Blocks never given room, such as whole-data blocks, have none, and
+        // the tree grows to a far block index without losing any.
+        slots.place(100, 700);
+        assert_eq!(slots.take(600), Some(100));
+        assert_eq!(slots.take(400), Some(1));
+        slots.place(1, 0);
+        assert_eq!(slots.take(400), Some(100));
+    }
+
+    #[test]
+    fn a_carrier_repeats_its_metadata_once_per_doubling() {
+        // Rows in a carrier against the copies the reference writes in all.
+        for (units, copies) in [
+            (1, 1),
+            (2, 2),
+            (4, 3),
+            (8, 4),
+            (15, 4),
+            (16, 5),
+            (32, 6),
+            (40, 6),
+            (64, 7),
+            (821, 10),
+            (2048, 12),
+        ] {
+            assert_eq!(1 + metadata_repeats(units), copies, "{units} units");
+        }
+        assert_eq!(metadata_repeats(0), 0);
+    }
+
+    #[test]
+    fn repeated_packets_cycle_and_spread_between_the_units() {
+        let common: Vec<Vec<u8>> = (b'a'..=b'c').map(|byte| vec![byte]).collect();
+        let layout = |units: u64| {
+            let mut repeats = MetadataRepeats::new(&common, units, true);
+            let mut out = Vec::new();
+            for done in 1..=units {
+                out.push(b'|');
+                repeats.after(done, &mut out).unwrap();
+            }
+            String::from_utf8(out).unwrap()
+        };
+        // `|` stands for a unit's payload packets.
+        assert_eq!(layout(1), "|");
+        assert_eq!(layout(2), "|a|bc");
+        assert_eq!(layout(4), "|a|bc|a|bc");
+        assert_eq!(layout(3), "|a|b|c");
+        assert_eq!(layout(5), "|a|b|c|a|bc");
     }
 }

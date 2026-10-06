@@ -80,7 +80,7 @@ impl InsertionPlan {
                 source: SourceId(1),
             });
         }
-        let mut plan = CreationPlan::build(views, &sources, options.clone())?;
+        let mut plan = CreationPlan::build_in_source_order(views, &sources, options.clone())?;
         let protection_bytes = plan.embedded_layout()?;
         let output_bytes = layout
             .snapshot()

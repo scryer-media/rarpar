@@ -125,6 +125,17 @@ pub(crate) fn compare_directory_names(left: &str, right: &str) -> Ordering {
 /// Every directory the set describes: the ancestors of each file name, the
 /// names the caller listed, and the ancestors of those.
 pub(crate) fn directories_of(files: &[PlannedFile], extra: &[String]) -> Vec<String> {
+    directory_names(files.iter().map(|file| file.name.as_str()), extra)
+}
+
+/// Every directory above the `/`-separated `file_names`, plus the `extra`
+/// directory names and their ancestors, in [`compare_directory_names`] order:
+/// a directory after the directories beneath it, which is also the order the
+/// reference writes their packets in.
+pub(crate) fn directory_names<'a>(
+    file_names: impl IntoIterator<Item = &'a str>,
+    extra: &[String],
+) -> Vec<String> {
     let mut names: BTreeSet<String> = BTreeSet::new();
     let mut ancestors = |name: &str, include_self: bool| {
         let mut prefix = String::new();
@@ -142,8 +153,8 @@ pub(crate) fn directories_of(files: &[PlannedFile], extra: &[String]) -> Vec<Str
             names.insert(prefix.clone());
         }
     };
-    for file in files {
-        ancestors(&file.name, false);
+    for name in file_names {
+        ancestors(name, false);
     }
     for name in extra {
         ancestors(name, true);

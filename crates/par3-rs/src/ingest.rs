@@ -543,7 +543,14 @@ enum Admission {
 /// bytes the inner writer accepted are authenticated, so what is proven is what
 /// was written; whether storage then keeps them is the synchronization
 /// barrier's contract and a later verification's question.
-pub(crate) struct AuthenticatingWriter<W> {
+///
+/// A carrier repeats its metadata. The caller may name the packets it will
+/// repeat ([`Self::with_known`]): once a copy of one has been authenticated
+/// in full here and found byte-identical to that entry, every later copy is
+/// compared against the entry byte for byte instead of being hashed and
+/// parsed again. Equal bytes carry the same proof, so the guarantee is
+/// unchanged; the bytes still reach the inner writer through the same writes.
+pub(crate) struct AuthenticatingWriter<'k, W> {
     inner: W,
     id: InputSetId,
     options: ExecutionOptions,
@@ -555,6 +562,13 @@ pub(crate) struct AuthenticatingWriter<W> {
     header: [u8; HEADER_SIZE],
     header_len: usize,
     packet: Option<WrittenPacket>,
+    known: &'k [Vec<u8>],
+    /// The known packets by the hash their header claims, each with whether a
+    /// copy has been authenticated in full and matched it.
+    claimed: BTreeMap<Fingerprint, (usize, bool)>,
+    /// Packets proven by comparison rather than by their hash.
+    #[cfg(test)]
+    compared: usize,
 }
 
 struct WrittenPacket {
@@ -564,9 +578,12 @@ struct WrittenPacket {
     hash: FingerprintHasher,
     /// The whole wire packet, for metadata only; payloads are never retained.
     retained: Option<(Vec<u8>, Reservation)>,
+    /// The proven known packet this one is compared against, instead of
+    /// being hashed.
+    copy_of: Option<usize>,
 }
 
-impl<W: std::io::Write> AuthenticatingWriter<W> {
+impl<'k, W: std::io::Write> AuthenticatingWriter<'k, W> {
     pub(crate) fn new(inner: W, id: InputSetId, options: ExecutionOptions) -> Self {
         Self {
             inner,
@@ -579,7 +596,25 @@ impl<W: std::io::Write> AuthenticatingWriter<W> {
             header: [0; HEADER_SIZE],
             header_len: 0,
             packet: None,
+            known: &[],
+            claimed: BTreeMap::new(),
+            #[cfg(test)]
+            compared: 0,
         }
+    }
+
+    /// Name the metadata packets the caller will write more than once; see
+    /// the type's documentation.
+    pub(crate) fn with_known(mut self, known: &'k [Vec<u8>]) -> Self {
+        for (index, packet) in known.iter().enumerate() {
+            if let Some(hash) = packet.get(8..24) {
+                self.claimed
+                    .entry(hash.try_into().expect("16 bytes"))
+                    .or_insert((index, false));
+            }
+        }
+        self.known = known;
+        self
     }
 
     pub(crate) fn get_ref(&self) -> &W {
@@ -615,9 +650,18 @@ impl<W: std::io::Write> AuthenticatingWriter<W> {
                 continue;
             };
             let take = (packet.header.length - packet.consumed).min(bytes.len() as u64) as usize;
-            packet.hash.update(&bytes[..take]);
-            if let Some((retained, _)) = &mut packet.retained {
-                retained.extend_from_slice(&bytes[..take]);
+            if let Some(index) = packet.copy_of {
+                let at = packet.consumed as usize;
+                if bytes[..take] != self.known[index][at..at + take] {
+                    return Err(EngineError::InvalidState(
+                        "staged carrier has unauthenticated bytes",
+                    ));
+                }
+            } else {
+                packet.hash.update(&bytes[..take]);
+                if let Some((retained, _)) = &mut packet.retained {
+                    retained.extend_from_slice(&bytes[..take]);
+                }
             }
             packet.consumed += take as u64;
             bytes = &bytes[take..];
@@ -647,6 +691,31 @@ impl<W: std::io::Write> AuthenticatingWriter<W> {
         };
         if header.length < (HEADER_SIZE + prefix_len) as u64 {
             return Err(unauthenticated);
+        }
+        let empty = header.length == HEADER_SIZE as u64;
+        if prefix_len == 0
+            && let Some(&(index, true)) = self.claimed.get(&header.hash)
+        {
+            let known = &self.known[index];
+            if known.len() as u64 != header.length || known[..HEADER_SIZE] != self.header {
+                return Err(unauthenticated);
+            }
+            self.packet = Some(WrittenPacket {
+                header,
+                offset,
+                consumed: HEADER_SIZE as u64,
+                hash: FingerprintHasher::new(),
+                retained: None,
+                copy_of: Some(index),
+            });
+            #[cfg(test)]
+            {
+                self.compared += 1;
+            }
+            if empty {
+                self.close_packet()?;
+            }
+            return Ok(());
         }
         let retained = if prefix_len == 0 {
             // The scanner's charge for the wire copy, doubled for the parsed
@@ -681,13 +750,13 @@ impl<W: std::io::Write> AuthenticatingWriter<W> {
         };
         let mut hash = FingerprintHasher::new();
         hash.update(&self.header[24..]);
-        let empty = header.length == HEADER_SIZE as u64;
         self.packet = Some(WrittenPacket {
             header,
             offset,
             consumed: HEADER_SIZE as u64,
             hash,
             retained,
+            copy_of: None,
         });
         if empty {
             self.close_packet()?;
@@ -697,7 +766,7 @@ impl<W: std::io::Write> AuthenticatingWriter<W> {
 
     fn close_packet(&mut self) -> EngineResult<()> {
         let packet = self.packet.take().expect("open packet");
-        if packet.hash.finalize() != packet.header.hash {
+        if packet.copy_of.is_none() && packet.hash.finalize() != packet.header.hash {
             return Err(EngineError::InvalidState(
                 "staged carrier has unauthenticated bytes",
             ));
@@ -707,6 +776,12 @@ impl<W: std::io::Write> AuthenticatingWriter<W> {
         }
         if let Some((retained, _reservation)) = packet.retained {
             Packet::parse(&retained, packet.offset, &ParseContext::new())?;
+            if let Some((index, proven)) = self.claimed.get_mut(&packet.header.hash)
+                && !*proven
+                && self.known[*index] == retained
+            {
+                *proven = true;
+            }
         }
         self.packets += 1;
         self.next_packet = packet.offset + packet.header.length;
@@ -714,7 +789,7 @@ impl<W: std::io::Write> AuthenticatingWriter<W> {
     }
 }
 
-impl<W: std::io::Write> std::io::Write for AuthenticatingWriter<W> {
+impl<W: std::io::Write> std::io::Write for AuthenticatingWriter<'_, W> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         let written = self.inner.write(bytes)?;
         self.authenticate(&bytes[..written])
@@ -2059,6 +2134,61 @@ mod authenticating_writer_tests {
             (set16_vol0_par3(), SET16_ID),
             (set16_vol1_par3(), SET16_ID),
         ]
+    }
+
+    /// The packets of a carrier, split at their header lengths.
+    fn split_packets(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let length = u64::from_le_bytes(bytes[at + 24..at + 32].try_into().unwrap()) as usize;
+            out.push(bytes[at..at + length].to_vec());
+            at += length;
+        }
+        out
+    }
+
+    #[test]
+    fn repeated_known_packets_are_proven_by_comparison_and_still_refuse_damage() {
+        let index = set_par3();
+        let known = split_packets(&index);
+        // The index, then every packet again in reverse, the way a volume
+        // repeats its metadata after the first copy.
+        let mut carrier = index.clone();
+        for packet in known.iter().rev() {
+            carrier.extend_from_slice(packet);
+        }
+        let write = |bytes: &[u8], known: &[Vec<u8>], piece: usize| -> EngineResult<usize> {
+            let mut writer =
+                AuthenticatingWriter::new(Vec::new(), SET_ID, ExecutionOptions::default())
+                    .with_known(known);
+            for chunk in bytes.chunks(piece) {
+                writer.write_all(chunk).map_err(EngineError::from)?;
+            }
+            assert_eq!(writer.get_ref().as_slice(), bytes);
+            writer.finish(carrier.len() as u64)?;
+            Ok(writer.compared)
+        };
+        // The first copy of each packet is hashed; every repeat is compared.
+        for piece in [1, 7, 48, 49, 4096, carrier.len()] {
+            assert_eq!(write(&carrier, &known, piece).unwrap(), known.len());
+        }
+        // Every byte of every repeated copy is still covered: by the header
+        // parse, or by the comparison with the copy proven first.
+        for at in index.len()..carrier.len() {
+            let mut damaged = carrier.clone();
+            damaged[at] ^= 0x01;
+            assert!(
+                write(&damaged, &known, 4096).is_err(),
+                "a flip at byte {at} of a repeat was accepted"
+            );
+        }
+        // A known entry that differs from what was written is never proven,
+        // so the copies are hashed as before and still authenticate.
+        let mut wrong = known.clone();
+        let last = wrong[0].len() - 1;
+        wrong[0][last] ^= 0x01;
+        assert_eq!(write(&carrier, &wrong, 4096).unwrap(), known.len() - 1);
     }
 
     #[test]

@@ -10,6 +10,7 @@
 //! PAR3_BENCH_CREATE_DURABILITY=buffered opts creation into buffered output;
 //! the default is sync-files. The selected policy is recorded in metrics.
 //! PAR3_BENCH_REPAIR_DURABILITY=buffered does the same for repair.
+//! PAR3_BENCH_CREATOR replaces the Creator packet text of `create`.
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -183,10 +184,18 @@ fn main() -> Result<()> {
             },
             _ => return Err("unknown codec".into()),
         };
+        // PAR3_BENCH_CREATOR replaces the Creator packet text, so a set can
+        // be compared byte for byte with another tool's output.
+        let creator = match std::env::var("PAR3_BENCH_CREATOR") {
+            Ok(text) => text,
+            Err(std::env::VarError::NotPresent) => CreationOptions::default().creator,
+            Err(_) => return Err("invalid PAR3_BENCH_CREATOR".into()),
+        };
         let settings = CreationOptions {
             block_size: args[7].parse()?,
             recovery_count,
             codec,
+            creator,
             execution: options.clone(),
             ..CreationOptions::default()
         };
