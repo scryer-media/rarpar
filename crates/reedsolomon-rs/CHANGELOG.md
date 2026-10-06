@@ -76,61 +76,78 @@
   (`WEAVER_GF8_PF=0` pins the plain loop): create encode at one worker,
   1 GiB, 100 rows, 8 MiB blocks, Sapphire Rapids 2.07 → 1.87 s and Zen 4
   2.10 → 2.03 s on top of the grouping. Output is bit-identical.
-- Pooled transforms and derivatives walk the bank in slabs. When a bank of
-  three levels or more outgrows `fft::TRANSFORM_SCRATCH_BYTES` (512 KiB)
-  and every pass of the walk has at least one slab per thread, each worker
-  gathers the rows of a slab into its own contiguous scratch, runs every
-  sweep of a pass over that slab and scatters the result back, in one pass
-  when a window of the scratch holds 2 KiB rows and otherwise in two passes
-  split at the middle level — the low levels over blocks of consecutive
-  rows, the high levels over rows a block apart — so each sweep reads its
-  rows from cache instead of streaming the whole bank per level. A slab's
-  window is no wider than the rows split across the workers, so their
-  slabs together never hold more than the bank, rounded up to whole
-  64-symbol runs. Rows flagged zero before a
-  pass are not gathered and rows still zero after it are not put back. A
-  walked transform keeps the butterflies of every sweep while it runs,
-  prepared once for all the slabs: `walk_units_bytes` says how much that
-  is and `walks` whether a transform walks at all; a bank the pool would
-  not walk is still swept a level at a time across the workers, which on
-  the Alder Lake cores beats transforming banks of a mebibyte side by side
-  on sibling threads. The derivative gathers a window of every row the
-  same way and differentiates bit-major into a second copy, so each worker
-  takes at most the scratch and all of them together at most twice the
-  bank. The sequential
-  `transform` and `derivative` sweep whole rows as before: alone, the
-  kernels are bound by their own work and the copies would be pure cost.
-  `fft::POOL_GATHERS` is false on Apple silicon, whose memory system
-  streams the whole-row sweeps faster than the copies cost (walk 1.5 times
-  and derivative twice as long as the row-parallel sweeps on an M-series),
-  so there the pooled paths stay as they were and take no scratch. Output
-  is bit-identical. Decode of 2048 data rows of 1 MiB over GF(2^16), 50
-  lost, eight workers on four Alder Lake P-cores: 1.67 → 1.34 s, CPU
-  11.3 → 8.3 s; one worker unchanged.
+- Transforms and derivatives run a bank in column tiles, in place. On a
+  target that tiles (`fft::COLUMN_TILES`: every target but Apple silicon),
+  a bank of three levels or more beyond `fft::TRANSFORM_TILE_BYTES`
+  (512 KiB) runs a pass at a time, each pass a tile at a time: a group of
+  rows at a window of columns, which takes every sweep of the pass while
+  it stays in the cache. One pass over every row when the domain is short
+  enough for a window of 2 KiB rows, otherwise two split at the middle
+  level, the low levels over blocks of consecutive rows and the high levels
+  over rows a block apart. With a pool the workers take the tiles of a
+  pass; without one the calling thread runs them, so a lone worker tiles
+  too. A tiled transform takes no scratch: it keeps the butterflies of
+  every sweep, prepared once for all the tiles, which `walk_units_bytes`
+  reports, and `walks` says whether a transform tiles at all. A tiled
+  derivative differentiates each tile into scratch as large as the tile,
+  at most half of `TRANSFORM_TILE_BYTES` a worker and the bank across all
+  of them. Rows flagged zero before a pass are not visited. Apple silicon
+  streams the whole-row sweeps about as fast as the tiles run, on one
+  worker and on a pool, so there every transform and derivative sweeps
+  whole rows as before, a level at a time across a pool's workers, and
+  takes no scratch. Output is bit-identical.
+- `fft::RowBank` holds equally wide rows of 8- or 16-bit symbols in one
+  zeroed, page-aligned allocation, and hands out one slice per row:
+  `zeroed`, `rows_mut`, `row` and `allocation_bytes`, which a caller can
+  charge before it allocates. A row a whole multiple of 512 bytes wide is
+  followed by one cache line of padding (`RowBank::ROW_PAD` at most), so
+  rows a power of two apart, which a tile holds, do not all start in the
+  same cache set. On Linux x86_64 a bank of 2 MiB or more is mapped on its
+  own and asks for transparent huge pages, so the rows of a tile, each a
+  page of its own at base pages, share a few translations: without that,
+  the tiled erasure decode below ran 6–16% slower than the slab walk it
+  replaces. The row-slice methods take a bank's rows as well as `Vec`s:
+  `transform_rows` and `transform_u8_rows` (with `zero` flags, a pool or
+  none), `transform_rows_adding` and `transform_u8_rows_adding`, which add
+  each tile of the result into a second bank as the last pass leaves it,
+  so an encoder's running sum costs no pass of its own, and
+  `differentiate_rows` and `differentiate_u8_rows`; `derivative_at` and
+  `derivative_u8_at` take any row slices too.
+- Against the slab walk that gathered rows into per-worker scratch, which
+  this release carried until the tiles replaced it, on Sapphire Rapids
+  (GF(2^16), 1.5 GiB of 32 KiB blocks, 4916 recovery blocks, 2000 lost):
+  create 4.09 → 3.27 s and CPU 3.25 → 2.43 s at one worker, 2.87 → 2.42 s
+  and CPU 4.46 → 3.88 s at eight; the repair's decode 6.37 → 6.05 s at one
+  worker and 4.06 → 3.56 s at eight. GF(2^8), 512 MiB of 4 MiB blocks,
+  eight lost: decode 0.86 → 0.69 s and 0.74 → 0.68 s, CPU 1.26 → 1.09 s and
+  2.31 → 1.88 s. The AVX2 and GFNI tier the same host takes without
+  AVX-512 moves the same way. On an M-series, which does not tile, the same
+  creates and repairs stay within 3% of the slab-walk build's wall and CPU
+  at 1, 8 and 18 workers.
 - `TransformField::derivative_at` and `derivative_u8_at` run an erasure
   decode's inverse transform, formal derivative and forward transform as
   one step and return only the rows the caller asks for. With the levels
-  split at the middle, the steps regroup into three slab passes over the
+  split at the middle, the steps regroup into three tiled passes over the
   bank: blocks of consecutive rows (the low half of the inverse, and for a
   block holding a requested row the whole low-level term), classes of rows
   a block apart (the high halves of both transforms around the high-level
   derivative), then only the blocks holding a requested row (the last low
-  half, added into the output). The derivative never leaves the workers'
+  half, added into the output). The derivative never leaves the tile's
   scratch, so the bank is read and written once per pass instead of once
   per transform pass plus once per set bit of a row index; every butterfly
   takes the factor and order the separate steps take, and the rows returned
   are bit-identical to theirs. `derivative_at_bytes` is what it keeps
-  beside the rows: its prepared sweeps, flags, each worker's slab scratch
-  and window list, and the call's and the pool's bookkeeping, measured at
+  beside the rows: its prepared sweeps, flags, each worker's tile scratch
+  and row list, and the call's and the pool's bookkeeping, measured at
   no more than that on every engaged shape. `fft::derivative_at_walks` says
   whether a bank is large enough for the fused passes (from 16 rows of 1-
-  or 2-byte symbols, beyond `TRANSFORM_SCRATCH_BYTES`); both return nothing
+  or 2-byte symbols, beyond `TRANSFORM_TILE_BYTES`); both return nothing
   for any other symbol size and saturate rather than overflow. The
   non-exhaustive `DerivativeWork` counts the transforms and butterflies it
   performed: the inverse once, the forward once per class and twice per
   block holding a requested row, so where most blocks hold one it runs
   more butterflies than the two whole transforms. Smaller domains run the
-  separate steps. `POOL_GATHERS` is the default for whether a caller takes
+  separate steps. `COLUMN_TILES` is the default for whether a caller takes
   the fused passes at all, on one worker as on a pool.
 - `TransformField::le_image` and `le_image_mut` view a `u16` row as its
   bytes on a little-endian target, where a symbol's little-endian pair is
