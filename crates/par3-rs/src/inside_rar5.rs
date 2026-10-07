@@ -1424,27 +1424,30 @@ fn open_set(
             .iter()
             .find(|c| c.source == source)
             .expect("bound");
+        // One pass over the host's packets indexes them by where they sit,
+        // so each expected slot is a lookup rather than a scan: a host with
+        // many small recovery packets stays linear.
+        let mut hashes_at = BTreeSet::new();
+        let mut recovery_at = BTreeSet::new();
+        for p in candidate.packets.iter().filter(|p| p.input_set_id() == id) {
+            let offset = p.origin().offset;
+            hashes_at.insert((offset, p.hash()));
+            if let Some(PayloadKind::Recovery { index, .. }) = p.payload().map(|p| p.kind()) {
+                recovery_at.insert((offset, index));
+            }
+        }
         let at = host.gap.start + host.prefix;
         let mut found = 0;
         let mut offset = at;
         for bytes in &metadata {
             let hash: Fingerprint = bytes[8..24].try_into().expect("hash");
-            if candidate
-                .packets
-                .iter()
-                .any(|p| p.input_set_id() == id && p.hash() == hash && p.origin().offset == offset)
-            {
+            if hashes_at.contains(&(offset, hash)) {
                 found += 1;
             }
             offset += bytes.len() as u64;
         }
         for index in host.recovery.clone() {
-            if candidate.packets.iter().any(|p| {
-                p.input_set_id() == id
-                    && p.origin().offset == offset
-                    && matches!(p.payload().map(|p| p.kind()),
-                        Some(PayloadKind::Recovery { index: found, .. }) if found == index)
-            }) {
+            if recovery_at.contains(&(offset, index)) {
                 found += 1;
             }
             offset += packet;

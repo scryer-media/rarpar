@@ -29,6 +29,9 @@
   - A rebuilt host staged on another filesystem than its destination is
     installed by a copy beside the destination, compared byte for byte, then
     linked in; it no longer fails with a cross-device link error.
+  - `open` indexes a host's packets by offset once and checks each expected
+    region slot with a lookup, so verify, repair and remove over a region of
+    tens of thousands of small recovery packets are no longer quadratic.
 - A derived carrier (`CarrierPlan::derived`) looks up its available Recovery
   Data packets in one pass over the payloads instead of one pass per
   recovery index, so regenerating a region of a set with tens of thousands

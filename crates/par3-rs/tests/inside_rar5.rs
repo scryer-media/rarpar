@@ -261,6 +261,55 @@ fn region_damage_is_reported_and_the_region_is_regenerated() {
     }
 }
 
+/// A region of many small recovery packets is checked slot by slot: every
+/// packet at its slot counts, and two packets swapped out of their slots are
+/// both missed even though each is still a valid packet of the set.
+#[test]
+fn many_small_recovery_packets_are_each_checked_at_their_slot() {
+    let Some(source) = fixture("rar5", "rar5_lz.rar") else {
+        return;
+    };
+    const BLOCK: u64 = 64;
+    const RECOVERY: u64 = 1024;
+    // A Recovery Data packet: the 48-byte header, root and matrix
+    // fingerprints and the recovery index, then one block.
+    const PACKET: usize = (BLOCK + 48 + 16 + 16 + 8) as usize;
+    let tree = common::TempTree::new("rar5-many-recovery");
+    let inserted = insert(
+        tree.path(),
+        std::slice::from_ref(&source),
+        Rar5Layout::Trailing,
+        Rar5Placement::Spread,
+        BLOCK,
+        RECOVERY,
+    );
+    let set = open_one(&inserted);
+    let host = &set.hosts[0];
+    assert_eq!(host.recovery, 0..RECOVERY);
+    assert!(host.region_intact);
+    assert_eq!(host.packets_found, host.packets_expected);
+    assert!(host.packets_expected > RECOVERY);
+    let gap = host.gap.clone();
+    drop(set);
+
+    let mut bytes = std::fs::read(&inserted[0]).unwrap();
+    let last = gap.end as usize - PACKET;
+    let before = last - PACKET;
+    let (head, tail) = bytes.split_at_mut(last);
+    head[before..].swap_with_slice(&mut tail[..PACKET]);
+    let path = tree
+        .path()
+        .join("swapped")
+        .join(inserted[0].file_name().unwrap());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    let set = open_one(std::slice::from_ref(&path));
+    let host = &set.hosts[0];
+    assert!(host.complete, "protected data is unaffected");
+    assert!(!host.region_intact);
+    assert_eq!(host.packets_found + 2, host.packets_expected);
+}
+
 #[test]
 fn any_lost_volume_is_rebuilt_from_the_other_regions() {
     let Some(sources) = volumes("generated_matrix_rar5_store_plain", 7) else {
