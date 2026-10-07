@@ -17,6 +17,11 @@ documented in each crate's own changelog so those notes ship with the crate.
 - The `par3` facade keeps a path holding a literal character in
   U+10FF00–U+10FFFF on Unix: such a name now opens that file instead of one
   with a single raw byte in the character's place.
+- The 7-Zip facade opens the volumes of a split (`.001`) set as reads reach
+  them and keeps at most four open, so a set with more volumes than the
+  process may hold open lists and extracts instead of failing with "too
+  many open files". A volume that changed size since the set was found is
+  an error.
 - The 7-Zip facade keeps archive, output-folder (`-o`), list-file and
   archive-include (`-ai`/`-ax`) paths exactly as given on Unix: a path that
   is not valid UTF-8 now names the same file instead of one with U+FFFD in

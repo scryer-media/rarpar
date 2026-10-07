@@ -7,34 +7,78 @@ use std::path::{Path, PathBuf};
 
 use sevenz_turbo::{Archive, Error as SevenZError, Password};
 
-/// Volumes read back to back as one seekable stream.
+/// How many volume handles a [`Volumes`] keeps open at once. Decoding reads
+/// the volume holding the current position, and a seek pattern rarely
+/// alternates among more than a couple; a set of any size never needs more
+/// descriptors than this.
+const OPEN_VOLUMES: usize = 4;
+
+/// Volumes read back to back as one seekable stream. Each volume is opened
+/// when a read reaches it, and only the few most recently read stay open.
 pub(super) struct Volumes {
-    files: Vec<File>,
+    paths: Vec<PathBuf>,
+    sizes: Vec<u64>,
     starts: Vec<u64>,
+    /// Open handles by volume index, most recently used last.
+    open: Vec<(usize, File)>,
     len: u64,
     pos: u64,
 }
 
 impl Volumes {
     fn open(paths: &[PathBuf], sizes: &[u64]) -> io::Result<Self> {
-        let mut files = Vec::with_capacity(paths.len());
         let mut starts = Vec::with_capacity(paths.len());
         let mut at = 0u64;
-        for (path, size) in paths.iter().zip(sizes) {
-            files.push(File::open(path)?);
+        for size in sizes {
             starts.push(at);
             at += size;
         }
-        Ok(Self {
-            files,
+        let mut volumes = Self {
+            paths: paths.to_vec(),
+            sizes: sizes.to_vec(),
             starts,
+            open: Vec::new(),
             len: at,
             pos: 0,
-        })
+        };
+        // The first volume is the archive named: fail as before when it
+        // cannot be opened at all.
+        if !paths.is_empty() {
+            volumes.handle(0)?;
+        }
+        Ok(volumes)
     }
 
     pub fn len(&self) -> u64 {
         self.len
+    }
+
+    /// The handle of volume `index`, opened (and checked against the size it
+    /// had when the set was found) if it is not already open.
+    fn handle(&mut self, index: usize) -> io::Result<&mut File> {
+        if let Some(at) = self.open.iter().position(|(open, _)| *open == index) {
+            let entry = self.open.remove(at);
+            self.open.push(entry);
+        } else {
+            let file = File::open(&self.paths[index])?;
+            if file.metadata()?.len() != self.sizes[index] {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "volume changed size since the set was found",
+                ));
+            }
+            if self.open.len() >= OPEN_VOLUMES {
+                self.open.remove(0);
+            }
+            self.open.push((index, file));
+        }
+        Ok(&mut self.open.last_mut().expect("just pushed").1)
+    }
+
+    /// How many volume handles are open now.
+    #[cfg(test)]
+    fn open_handles(&self) -> usize {
+        self.open.len()
     }
 }
 
@@ -47,10 +91,15 @@ impl Read for Volumes {
             Ok(index) => index,
             Err(index) => index - 1,
         };
+        // Skip empty volumes: they share their start with the next one.
+        let index = (index..self.starts.len())
+            .find(|&at| self.sizes[at] > 0)
+            .unwrap_or(index);
         let end = self.starts.get(index + 1).copied().unwrap_or(self.len);
         let want = buf.len().min((end - self.pos) as usize);
-        let file = &mut self.files[index];
-        file.seek(SeekFrom::Start(self.pos - self.starts[index]))?;
+        let offset = self.pos - self.starts[index];
+        let file = self.handle(index)?;
+        file.seek(SeekFrom::Start(offset))?;
         let read = file.read(&mut buf[..want])?;
         if read == 0 {
             return Err(io::Error::new(
@@ -215,4 +264,50 @@ pub(super) fn open_archive(
         physical_size,
         stream_len,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A set of many volumes reads back whole while at most
+    /// [`OPEN_VOLUMES`] handles are ever open, in order and out of order.
+    #[test]
+    fn volumes_open_on_demand_within_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let count = 40;
+        let mut paths = Vec::new();
+        let mut sizes = Vec::new();
+        let mut whole = Vec::new();
+        for number in 0..count {
+            let bytes: Vec<u8> = (0..(number % 5) * 7)
+                .map(|at| (at * 31 + number) as u8)
+                .collect();
+            let path = dir.path().join(format!("ledger.7z.{:03}", number + 1));
+            std::fs::write(&path, &bytes).unwrap();
+            whole.extend_from_slice(&bytes);
+            sizes.push(bytes.len() as u64);
+            paths.push(path);
+        }
+        let mut volumes = Volumes::open(&paths, &sizes).unwrap();
+        assert_eq!(volumes.open_handles(), 1);
+        let mut read = Vec::new();
+        let mut buf = [0u8; 5];
+        loop {
+            let got = volumes.read(&mut buf).unwrap();
+            if got == 0 {
+                break;
+            }
+            read.extend_from_slice(&buf[..got]);
+            assert!(volumes.open_handles() <= OPEN_VOLUMES);
+        }
+        assert_eq!(read, whole);
+        for at in [whole.len() - 1, 0, whole.len() / 2, 3, whole.len() - 9] {
+            volumes.seek(SeekFrom::Start(at as u64)).unwrap();
+            let mut byte = [0u8; 1];
+            volumes.read_exact(&mut byte).unwrap();
+            assert_eq!(byte[0], whole[at], "byte {at}");
+            assert!(volumes.open_handles() <= OPEN_VOLUMES);
+        }
+    }
 }
