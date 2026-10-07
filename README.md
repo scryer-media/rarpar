@@ -443,6 +443,33 @@ Continuous fuzzing — targets, seed corpora and the nightly schedule — is in
 [docs/fuzzing.md](docs/fuzzing.md).
 Versioned CLI and library migration notes are in [CHANGELOG.md](CHANGELOG.md).
 
+## Technology Radar
+
+Engine-side kernel and platform work for the PAR2, PAR3 and RAR crates. Weaver's README carries the product-side radar.
+
+Rules that govern every row: one binary with runtime dispatch; a kernel tier is never dropped because no local host has its instruction set; a tier is kept when it materially moves wall clock or CPU time where it engages without adding significant risk or code, and regresses nothing else by more than 1%; there is no minimum percentage; disk work (fsyncs, opens, read and write calls) is a regression axis on its own.
+
+Status: **Landed** ships; **Building** has an owner now; **Exploring** is a measured spike before a decision; **Watch** waits on hardware or evidence.
+
+| Item | Serves | Status | Needs |
+|---|---|---|---|
+| GFNI affine tiers on AVX2 for GF(2^8), GF(2^16) and the FFT linear maps | PAR2, PAR3 | Landed | |
+| Native 8-bit FFT lane, fused butterflies and radix-4, zero truncation, in-place scaling | PAR3 FFT | Landed | |
+| Fused FFT decode (`derivative_at`), pass-count admission, proof frontiers before decode | PAR3 repair | Landed | |
+| Grouped multi-source Cauchy kernels, resident recovery rows, clone-based staging, no read-back, spool never fsynced | PAR3 create and repair | Landed | |
+| Reference comparison fleet and PAR3 bench suite (`rarpar-bench par3`) | measurement | Landed | live Windows and SSM runs |
+| GF(2^8) AVX-512 tiers (GFNI on zmm, VBMI nibble form), cached multiply plans, factor 0 and 1 short-circuits | PAR2, PAR3 | Building | Zen 4 and Sapphire Rapids via the fleet |
+| SVE2 tiers for GF(2^8), the FFT linear maps and the fused Cauchy kernels | PAR2, PAR3 on Graviton 4 | Building | c8g via the fleet |
+| wasm simd128 tiers for the FFT linear maps and grouped GF(2^8); GF(2^16) wasm widened to all lanes | PAR3, PAR2 on wasm | Building | wasmtime benches |
+| Column-tiled FFT execution, budget-sized FFT stripes, contiguous aligned banks | PAR3 FFT | Building | |
+| Planning hashes fused with the encode read; redundant zero-fills and coverage scans removed; repair validation fused into the codec read | PAR3 disk work | Building | |
+| par3cmdline-compatible command-line facade | rarpar CLI | Building | |
+| SME2 GF(2) outer-product GEMM (`BMOPA`) for Cauchy and Vandermonde encode and solve | PAR2, PAR3 | Exploring | bench-first spike on Apple M4-class silicon |
+| AVX512BMM GF(2^16) tier (Zen 6 `VBMACXOR16x16x16`) | PAR2, PAR3 | Watch | no Zen 6 instances on EC2 yet |
+| AVX10.2 and APX | every x86 kernel | Watch | Diamond Rapids and Nova Lake; EVEX kernels carry over |
+| AVX-512 FFT linear map tier | PAR3 FFT | Watch | depends on the GF(2^8) AVX-512 result |
+
+
 ## License
 
 The workspace is GPL-3.0-or-later, with the UnRAR restriction carried wherever
