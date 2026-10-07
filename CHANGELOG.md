@@ -3,19 +3,12 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
-## rarpar 0.5.4 (Unreleased)
+## Unreleased
+
+The CLI version for these changes is assigned when the CLI is released.
 
 ### CLI Changes
 
-- PAR2 inspection and repair retain valid recovery packets following a corrupt
-  packet length and prefer valid copies over corrupt duplicate exponents.
-- PAR2 repair analysis reports a source-changed error instead of panicking when
-  a source file grows between parallel scan phases; shrinking files also reject
-  the stale scan.
-- PAR3 repair confines output to the opened destination tree, rejects unsafe
-  destination links and filesystem aliases, and uses exclusively created private
-  staging directories. Ordinary source-file verification keeps its existing link
-  behavior.
 - The format probes that read the first bytes of every file in a directory
   (PAR3 sibling discovery and `auto` classification) no longer pull in
   read-ahead (random-access advice on Linux, `F_RDAHEAD` off on macOS). A
@@ -29,11 +22,29 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ### Library versions
 
+- par3-rs 0.4.5: mebibyte source reads and the verification order by mount
+  kind above.
+  Other library versions are unchanged.
+
+## rarpar 0.5.4
+
+### CLI Changes
+
+- PAR2 inspection and repair retain valid recovery packets following a corrupt
+  packet length and prefer valid copies over corrupt duplicate exponents.
+- PAR2 repair analysis reports a source-changed error instead of panicking when
+  a source file grows between parallel scan phases; shrinking files also reject
+  the stale scan.
+- PAR3 repair confines output to the opened destination tree, rejects unsafe
+  destination links and filesystem aliases, and uses exclusively created private
+  staging directories. Ordinary source-file verification keeps its existing link
+  behavior.
+
+### Library versions
+
 - par2-rs 0.10.7: authenticate recovery packets during the bounded file scan
   and reject changed source extents during parallel repair analysis.
 - par3-rs 0.4.4: confine repair reads and installs to the opened output tree.
-- par3-rs 0.4.5: mebibyte source reads and the verification order by mount
-  kind above.
   Other library versions are unchanged.
 
 ## rarpar 0.5.3
