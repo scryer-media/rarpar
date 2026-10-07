@@ -205,7 +205,16 @@ pub struct CreationRequirements {
     pub cohorts: u64,
 }
 
-/// A plan retains metadata and source slices, never complete source blocks.
+/// Source bytes a plan kept from its hash pass, charged to the budget until
+/// the encode that reads them has run.
+struct ResidentSources {
+    sources: BTreeMap<SourceId, Vec<u8>>,
+    _reservation: Reservation,
+}
+
+/// A plan retains metadata and source slices. It holds complete sources only
+/// when all of them fit under the retained ceiling, and only until execution
+/// has encoded from them.
 pub struct CreationPlan {
     access: Arc<dyn SourceAccess>,
     options: CreationOptions,
@@ -227,6 +236,9 @@ pub struct CreationPlan {
     /// An embedded carrier keeps the single copy its container layout sized.
     repeat_metadata: bool,
     requirements: CreationRequirements,
+    /// Every source as the hash pass read it, when all of them fit; the
+    /// encode then reads them from here rather than from the provider.
+    resident: std::sync::Mutex<Option<ResidentSources>>,
     _reservation: Reservation,
 }
 
@@ -236,6 +248,12 @@ impl CreationPlan {
     /// File, quick-prefix, block, and tail hashes share one source pass; sliding
     /// deduplication additionally reads candidate windows. Forward readers are
     /// used when available, with at most one retained input handle per file.
+    ///
+    /// When every source fits beside the plan under
+    /// [`ExecutionOptions::retained_bytes`] and the budget has room for it,
+    /// the hash pass keeps the bytes it reads and execution encodes from
+    /// them, so each source is read once. Otherwise execution reads the
+    /// sources again. The packets and recovery data are the same either way.
     ///
     /// The inputs are stored in the reference's order — longest file tail
     /// (size modulo block size) first, then largest file, then name — whatever order `sources` lists
@@ -369,6 +387,26 @@ impl CreationPlan {
             }
         }
         let pool = pool.filter(|_| !ahead_buffers.is_empty());
+        // Taken after the planning buffers, so keeping the sources never
+        // narrows the hash pass.
+        let resident = match usize::try_from(source_bytes).ok().filter(|&bytes| {
+            bytes != 0
+                && estimate
+                    .checked_add(bytes)
+                    .is_some_and(|need| need <= options.execution.retained_bytes)
+        }) {
+            Some(bytes) => match options
+                .execution
+                .memory
+                .reserve_as(MemoryCategory::Caches, bytes)
+            {
+                Ok(reservation) => Some(reservation),
+                Err(EngineError::ResourceLimit(_)) => None,
+                Err(error) => return Err(error),
+            },
+            None => None,
+        };
+        let mut kept = BTreeMap::new();
         let mut files = Vec::new();
         let mut blocks: Vec<Block> = Vec::new();
         let mut full = BTreeMap::<Fingerprint, u64>::new();
@@ -423,6 +461,8 @@ impl CreationPlan {
                 position: 0,
                 file_hash: FingerprintHasher::new(),
                 quick_crc: RollingHasher::new(),
+                keep: (resident.is_some() && !kept.contains_key(&source.source))
+                    .then(|| vec![0; snapshot.len as usize]),
                 ahead: pool
                     .as_ref()
                     .filter(|_| snapshot.len >= crate::hash::PARALLEL_SOURCE_BYTES)
@@ -534,6 +574,9 @@ impl CreationPlan {
                 at += length;
             }
             ensure_snapshot(access.as_ref(), source.source, snapshot)?;
+            if let Some(bytes) = reader.keep.take() {
+                kept.insert(source.source, bytes);
+            }
             files.push(PlannedFile {
                 name: source.name.clone(),
                 source: source.source,
@@ -681,6 +724,10 @@ impl CreationPlan {
             data_volumes: Vec::new(),
             repeat_metadata: true,
             requirements,
+            resident: std::sync::Mutex::new(resident.map(|reservation| ResidentSources {
+                sources: kept,
+                _reservation: reservation,
+            })),
             _reservation: reservation,
         };
         plan.build_metadata()?;
@@ -1095,7 +1142,7 @@ impl CreationPlan {
                 Err(error) => return Err(error.into()),
             }
         }
-        let mut spool = self.encode(scratch_directory)?;
+        let mut spool = self.encode_sources(scratch_directory)?;
         // The spool is scratch this process reads back and deletes; no policy
         // makes it durable.
         let mut staged = Vec::new();
@@ -1140,6 +1187,7 @@ impl CreationPlan {
             staged.push(temporary);
         }
         drop(spool);
+        self.release_resident();
         for file in &self.files {
             ensure_snapshot(self.access.as_ref(), file.source, file.snapshot)?;
         }
@@ -1162,6 +1210,32 @@ impl CreationPlan {
             progress.advance(1);
         }
         Ok(destinations)
+    }
+
+    /// [`Self::encode`], from the resident sources when the plan kept them.
+    /// An encode the budget refuses beside them runs again reading the
+    /// sources, so keeping them never refuses a creation. They stay only
+    /// while data carriers still need their blocks.
+    fn encode_sources(&self, scratch_directory: &Path) -> EngineResult<RecoverySpool> {
+        let spool = match self.encode(scratch_directory) {
+            Err(EngineError::ResourceLimit(_)) if self.release_resident() => {
+                self.encode(scratch_directory)
+            }
+            spool => spool,
+        }?;
+        if self.data_volumes.is_empty() {
+            self.release_resident();
+        }
+        Ok(spool)
+    }
+
+    /// Drop the resident sources, returning whether there were any.
+    fn release_resident(&self) -> bool {
+        self.resident
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .is_some()
     }
 
     /// Encode the recovery rows into a spool: resident when they fit the
@@ -1348,9 +1422,10 @@ impl CreationPlan {
         for file in &self.files {
             ensure_snapshot(self.access.as_ref(), file.source, file.snapshot)?;
         }
-        let mut spool = self.encode(scratch_directory)?;
+        let mut spool = self.encode_sources(scratch_directory)?;
         self.write_output(1, &mut spool, out)?;
         drop(spool);
+        self.release_resident();
         for file in &self.files {
             ensure_snapshot(self.access.as_ref(), file.source, file.snapshot)?;
         }
@@ -1365,7 +1440,9 @@ impl CreationPlan {
 
     /// Read one stripe of an input block. Each piece read is checked against
     /// its snapshot afterwards, or, given `owed`, recorded there for the
-    /// caller to settle before writing anything derived from it.
+    /// caller to settle before writing anything derived from it. A resident
+    /// source is copied from the bytes the plan hashed, and execution checks
+    /// its snapshot before and after.
     fn read_block(
         &self,
         index: usize,
@@ -1374,10 +1451,23 @@ impl CreationPlan {
         owed: Option<&OwedChecks>,
     ) -> EngineResult<()> {
         out.fill(0);
+        let resident = self
+            .resident
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for piece in &self.blocks[index].pieces {
             let start = offset.max(piece.offset);
             let end = (offset + out.len() as u64).min(piece.offset + piece.length);
             if start >= end {
+                continue;
+            }
+            if let Some(bytes) = resident
+                .as_ref()
+                .and_then(|resident| resident.sources.get(&piece.source))
+            {
+                let at = (piece.at + start - piece.offset) as usize;
+                out[(start - offset) as usize..(end - offset) as usize]
+                    .copy_from_slice(&bytes[at..at + (end - start) as usize]);
                 continue;
             }
             // Only a check after the read vouches for the bytes; a failed
@@ -1672,18 +1762,25 @@ impl CreationPlan {
         scratch_directory: &Path,
     ) -> EngineResult<RecoverySpool> {
         let memory = &self.options.execution.memory;
-        if let Ok(bytes) = usize::try_from(self.requirements.scratch_bytes)
-            && bytes
-                .checked_add(encode)
-                .and_then(|need| need.checked_add(self.carrier_stage_bytes()))
-                .is_some_and(|need| need <= memory.available())
-            && let Ok(reservation) = memory.reserve_as(MemoryCategory::OutputStaging, bytes)
-        {
-            tracing::debug!(bytes, "PAR3 recovery rows held resident");
-            return Ok(RecoverySpool::Memory {
-                rows: vec![0; bytes],
-                _reservation: reservation,
-            });
+        // Resident sources never push the rows out to a scratch file: rows
+        // that would fit without them are kept, and the sources read again.
+        loop {
+            if let Ok(bytes) = usize::try_from(self.requirements.scratch_bytes)
+                && bytes
+                    .checked_add(encode)
+                    .and_then(|need| need.checked_add(self.carrier_stage_bytes()))
+                    .is_some_and(|need| need <= memory.available())
+                && let Ok(reservation) = memory.reserve_as(MemoryCategory::OutputStaging, bytes)
+            {
+                tracing::debug!(bytes, "PAR3 recovery rows held resident");
+                return Ok(RecoverySpool::Memory {
+                    rows: vec![0; bytes],
+                    _reservation: reservation,
+                });
+            }
+            if !self.release_resident() {
+                break;
+            }
         }
         let path = crate::session_repair::ScratchFile::new(
             &scratch_directory.join("recovery-spool"),
@@ -2314,8 +2411,17 @@ struct PlanningReader<'a> {
     position: u64,
     file_hash: FingerprintHasher,
     quick_crc: RollingHasher,
+    /// The whole source, filled as it is read, when the plan keeps it.
+    keep: Option<Vec<u8>>,
     /// Set only while a pool is held; otherwise every read is the walk's own.
     ahead: Option<HashAhead<'a>>,
+}
+
+/// Copy bytes just read at `start` into the kept source, if there is one.
+fn keep_read(keep: &mut Option<Vec<u8>>, start: u64, bytes: &[u8]) {
+    if let Some(keep) = keep {
+        keep[start as usize..start as usize + bytes.len()].copy_from_slice(bytes);
+    }
 }
 
 /// Fill `out` from `start`, through the forward reader while it lasts and
@@ -2494,6 +2600,7 @@ impl PlanningReader<'_> {
             start,
             out,
         )?;
+        keep_read(&mut self.keep, start, out);
         self.file_hash.update(out);
         let quick = (16384u64.saturating_sub(start)).min(out.len() as u64) as usize;
         self.quick_crc.update(&out[..quick]);
@@ -2616,8 +2723,12 @@ impl PlanningReader<'_> {
     fn step(&mut self) -> EngineResult<()> {
         let (access, source, options, len) =
             (self.access, self.source, self.options, self.snapshot.len);
-        let forward = &mut self.forward;
-        let mut read = |at: u64, out: &mut [u8]| fetch(access, source, options, forward, at, out);
+        let (forward, keep) = (&mut self.forward, &mut self.keep);
+        let mut read = |at: u64, out: &mut [u8]| {
+            fetch(access, source, options, forward, at, out)?;
+            keep_read(keep, at, out);
+            Ok(())
+        };
         let file_hash = &mut self.file_hash;
         let quick_crc = &mut self.quick_crc;
         let ahead = self.ahead.as_mut().expect("pooled planning");

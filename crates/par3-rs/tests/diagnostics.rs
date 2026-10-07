@@ -148,7 +148,14 @@ fn cancelling_encoding_from_progress_cleans_spool_and_staging_for_both_codecs() 
         assert!(matches!(error, EngineError::Cancelled), "{error}");
         assert_eq!(std::fs::read_dir(tree.path()).unwrap().count(), 0);
         assert_eq!(options.handles.used(), 0);
-        assert_eq!(options.memory.used(), retained);
+        // Spooled rows push out the source the plan kept from its hash pass,
+        // to be read again; nothing else the execute took is still held.
+        let released = if memory.is_some() {
+            common::a_bin().len()
+        } else {
+            0
+        };
+        assert_eq!(options.memory.used(), retained - released);
         assert_eq!(
             options.diagnostics.file_io().write_bytes > 0,
             memory.is_some(),

@@ -115,6 +115,14 @@
   snapshot once instead of once per recovery payload it holds, so a carrier
   of many recovery blocks costs one stat per assessment rather than one per
   block.
+- `CreationPlan` reads each source once instead of twice when every source,
+  beside the plan itself, fits under `ExecutionOptions::retained_bytes` and the
+  memory budget grants it: the hash pass keeps the bytes it read, charged to
+  `MemoryCategory::Caches`, and the encode and data volumes use them. The kept
+  bytes are released once the encode has run, or earlier if the encode or the
+  recovery rows need the room. The snapshot checks around execution are
+  unchanged, and the carriers are byte-identical to a two-pass create. Over
+  that ceiling the encode reads every source again, as before.
 
 ## 0.5.0
 

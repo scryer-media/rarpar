@@ -559,12 +559,12 @@ mod tests {
             let len = original.len() as u64;
             assert_eq!(len + protection + footer, expected.len() as u64);
 
-            // Encoding and the footer copy read between the archive and the
-            // archive plus its footer once more. A refused clone also copies
-            // the archive, read and written, after the open that creates the
-            // stage name and the one that writes it.
+            // The plan kept the archive from its hash pass, so encoding reads
+            // nothing and only the footer copy reads the footer once more. A
+            // refused clone also copies the archive, read and written, after
+            // the open that creates the stage name and the one that writes it.
             let encoding = copy.read_bytes - len;
-            assert!((len..=len + footer).contains(&encoding), "{fixture}");
+            assert_eq!(encoding, footer, "{fixture}");
             let copy_expected = Run {
                 read_bytes: encoding + len,
                 write_bytes: len + protection + footer,
