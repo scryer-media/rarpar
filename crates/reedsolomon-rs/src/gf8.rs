@@ -1585,6 +1585,12 @@ pub fn kernel_name() -> &'static str {
         X86Tier::Ssse3 => "ssse3",
         X86Tier::Scalar => "scalar",
     };
+    // The same gate, in the same order, as `MulPlan::accumulate` and
+    // `mul_acc_input_batch`.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    if crate::sve2::enabled() {
+        return "sve2";
+    }
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("neon") {
         return "neon";
@@ -2019,6 +2025,16 @@ unsafe fn batch_sve2(destination: &mut [u8], inputs: &[PlanSrc<'_>]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reported tier is the one dispatch picks: SVE2 whenever its gate
+    /// is open, NEON only below it.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[test]
+    fn kernel_name_follows_the_sve2_dispatch_gate() {
+        let expected = if crate::sve2::enabled() { "sve2" } else { "neon" };
+        assert_eq!(kernel_name(), expected);
+    }
+
     #[test]
     fn dispatched_arithmetic_matches_scalar_for_all_coefficients_and_tails() {
         let source: Vec<u8> = (0..1027).map(|i| (i * 103 + i / 19) as u8).collect();
