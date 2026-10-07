@@ -14,6 +14,10 @@ package fleet
 //     runs it (secrets such as an ECR token never land in command history);
 //   - every file moves as a tar object under s3://<bucket>/<prefix>/ and is
 //     deleted right after the transfer;
+//   - every object the orchestrator stages is also deleted from the
+//     orchestrator once the command ends, whatever its result: an invocation
+//     that fails, times out, or is cancelled before the instance runs it
+//     never runs the instance-side deletion;
 //   - only small control output (sentinels, probes) is read from RunCommand.
 //
 // UNVALIDATED against a live instance in this harness: the commands match the
@@ -63,6 +67,18 @@ func (channel *ssmChannel) key(kind string) string {
 }
 
 func (channel *ssmChannel) url(key string) string { return "s3://" + channel.bucket + "/" + key }
+
+// discardTimeout bounds the orchestrator-side deletion of a staged object.
+const discardTimeout = time.Minute
+
+// discard deletes a staged object from the orchestrator, best effort. It runs
+// even after ctx is cancelled, since a cancelled command is exactly the one
+// whose instance-side deletion never ran.
+func (channel *ssmChannel) discard(ctx context.Context, key string) {
+	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), discardTimeout)
+	defer cancel()
+	_, _ = channel.aws.run(cleanup, "s3", "rm", "--quiet", channel.url(key))
+}
 
 // invoke sends one AWS-RunShellScript command and waits for it to finish.
 func (channel *ssmChannel) invoke(ctx context.Context, commands []string) (string, string, error) {
@@ -130,8 +146,12 @@ func (channel *ssmChannel) run(ctx context.Context, script string) (string, stri
 	}
 	defer os.Remove(local)
 	if _, err := channel.aws.run(ctx, "s3", "cp", "--quiet", local, channel.url(key)); err != nil {
+		// A failed copy can still have left the object; never leave a
+		// script (which may carry a token) behind.
+		channel.discard(ctx, key)
 		return "", "", fmt.Errorf("machine %s: staging a command in S3: %w", channel.machine, err)
 	}
+	defer channel.discard(ctx, key)
 	fetched := "/tmp/rarpar-fleet-" + filepath.Base(key) + ".sh"
 	return channel.invoke(ctx, []string{
 		fmt.Sprintf("aws s3 cp --quiet %s %s && aws s3 rm --quiet %s", shellQuote(channel.url(key)), shellQuote(fetched), shellQuote(channel.url(key))),
@@ -156,6 +176,7 @@ func (channel *ssmChannel) uploadDir(ctx context.Context, localDir, remoteDir st
 		return fmt.Errorf("machine %s: packing %s: %w: %s", channel.machine, localDir, err, strings.TrimSpace(string(output)))
 	}
 	defer os.Remove(archive)
+	defer channel.discard(ctx, key)
 	if _, err := channel.aws.run(ctx, "s3", "cp", "--quiet", archive, channel.url(key)); err != nil {
 		return fmt.Errorf("machine %s: upload of %s to S3: %w", channel.machine, localDir, err)
 	}
@@ -169,6 +190,8 @@ func (channel *ssmChannel) downloadPath(ctx context.Context, remotePath, localDi
 		return err
 	}
 	key := channel.key("down") + ".tar"
+	// The instance writes this object; whatever happens next, it goes.
+	defer channel.discard(ctx, key)
 	if _, _, err := channel.run(ctx, fmt.Sprintf("set -e\ntar -cf - -C %s %s | aws s3 cp --quiet - %s\n",
 		shellQuote(posixDir(remotePath)), shellQuote(posixBase(remotePath)), shellQuote(channel.url(key)))); err != nil {
 		return err
@@ -178,7 +201,6 @@ func (channel *ssmChannel) downloadPath(ctx context.Context, remotePath, localDi
 	if _, err := channel.aws.run(ctx, "s3", "cp", "--quiet", channel.url(key), archive); err != nil {
 		return fmt.Errorf("machine %s: download of %s from S3: %w", channel.machine, remotePath, err)
 	}
-	_, _ = channel.aws.run(ctx, "s3", "rm", "--quiet", channel.url(key))
 	unpack := exec.CommandContext(ctx, "tar", "-xf", archive, "-C", localDir)
 	var stderr bytes.Buffer
 	unpack.Stderr = &stderr
