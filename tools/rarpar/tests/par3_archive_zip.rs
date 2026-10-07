@@ -542,3 +542,99 @@ fn zip_sets_match_par3cmdline_both_ways() {
     );
     assert!(std::fs::read(root.join("theirs/crowd.zip")).unwrap() == ours);
 }
+
+/// The zip crate keeps only a mode's permission bits; setuid, setgid and
+/// sticky still reach the central directory, as Info-ZIP records them.
+#[cfg(unix)]
+#[test]
+fn special_permission_bits_survive_in_the_zip() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let input = root.join("in");
+    std::fs::create_dir_all(input.join("shelf")).unwrap();
+    std::fs::write(input.join("lever.sh"), b"#!/bin/sh\n").unwrap();
+    std::fs::write(input.join("plain.txt"), b"pebble\n").unwrap();
+    std::fs::set_permissions(
+        input.join("lever.sh"),
+        std::fs::Permissions::from_mode(0o4755),
+    )
+    .unwrap();
+    std::fs::set_permissions(input.join("shelf"), std::fs::Permissions::from_mode(0o1777)).unwrap();
+    archive(
+        root,
+        &[],
+        &["out/bits.zip", "lever.sh", "plain.txt", "shelf"],
+    );
+    let file = std::fs::File::open(root.join("out/bits.zip")).unwrap();
+    let mut reader = zip::ZipArchive::new(file).unwrap();
+    let mut modes = std::collections::BTreeMap::new();
+    for index in 0..reader.len() {
+        let entry = reader.by_index(index).unwrap();
+        modes.insert(
+            entry.name().trim_end_matches('/').to_owned(),
+            entry.unix_mode().unwrap() & 0o7777,
+        );
+    }
+    assert_eq!(modes["lever.sh"], 0o4755, "{modes:?}");
+    assert_eq!(modes["shelf"], 0o1777, "{modes:?}");
+    assert_eq!(modes["plain.txt"] & 0o7000, 0, "{modes:?}");
+}
+
+/// DOS times are local times: each member's hour follows the zone's offset
+/// at its own mtime, so a winter and a summer file differ by daylight saving.
+#[cfg(unix)]
+#[test]
+fn zip_times_are_local_to_each_members_date() {
+    use std::time::{Duration, UNIX_EPOCH};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let input = root.join("in");
+    std::fs::create_dir_all(&input).unwrap();
+    // 2025-01-15 and 2025-07-15, both 12:00:00 UTC.
+    for (name, secs) in [
+        ("winter.txt", 1_736_942_400u64),
+        ("summer.txt", 1_752_580_800),
+    ] {
+        std::fs::write(input.join(name), name).unwrap();
+        let file = std::fs::File::options()
+            .write(true)
+            .open(input.join(name))
+            .unwrap();
+        file.set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap();
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_rarpar"))
+        .current_dir(root)
+        .env("TZ", "EST5EDT,M3.2.0,M11.1.0")
+        .args([
+            "--json",
+            "par3",
+            "archive",
+            "--format",
+            "zip",
+            "--base-path",
+            "in",
+        ])
+        .args(["out/times.zip", "winter.txt", "summer.txt"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let file = std::fs::File::open(root.join("out/times.zip")).unwrap();
+    let mut reader = zip::ZipArchive::new(file).unwrap();
+    let hour = |reader: &mut zip::ZipArchive<std::fs::File>, name: &str| {
+        reader
+            .by_name(name)
+            .unwrap()
+            .last_modified()
+            .unwrap()
+            .hour()
+    };
+    assert_eq!(hour(&mut reader, "winter.txt"), 7);
+    assert_eq!(hour(&mut reader, "summer.txt"), 8);
+}

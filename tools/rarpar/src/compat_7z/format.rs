@@ -332,6 +332,87 @@ pub(crate) fn local_civil(secs: i64) -> [i64; 6] {
     utc_civil(secs)
 }
 
+/// Local wall time at `secs`, with the offset in effect on that date (DST
+/// included), as a ZIP's DOS time records it. Returns year, month, day, hour,
+/// minute and second.
+#[cfg(unix)]
+pub(crate) fn local_civil_at(secs: i64) -> [i64; 6] {
+    // `time_t` is 64 bits on every target rarpar ships.
+    let time = secs as libc::time_t;
+    // SAFETY: `tm` is plain data and `localtime_r` only writes into it.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: both pointers are valid for the call.
+    if unsafe { libc::localtime_r(&time, &mut tm) }.is_null() {
+        return utc_civil(secs);
+    }
+    [
+        i64::from(tm.tm_year) + 1900,
+        i64::from(tm.tm_mon) + 1,
+        i64::from(tm.tm_mday),
+        i64::from(tm.tm_hour),
+        i64::from(tm.tm_min),
+        i64::from(tm.tm_sec),
+    ]
+}
+
+/// Local wall time at `secs` through the system's time zone rules for that
+/// date, as Windows' own ZIP writers record it.
+#[cfg(windows)]
+pub(crate) fn local_civil_at(secs: i64) -> [i64; 6] {
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemTime {
+        year: u16,
+        month: u16,
+        day_of_week: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        milliseconds: u16,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SystemTimeToTzSpecificLocalTime(
+            zone: *const std::ffi::c_void,
+            universal: *const SystemTime,
+            local: *mut SystemTime,
+        ) -> i32;
+    }
+    let [year, month, day, hour, minute, second] = utc_civil(secs);
+    if !(1601..=30_827).contains(&year) {
+        return utc_civil(secs);
+    }
+    let universal = SystemTime {
+        year: year as u16,
+        month: month as u16,
+        day: day as u16,
+        hour: hour as u16,
+        minute: minute as u16,
+        second: second as u16,
+        ..SystemTime::default()
+    };
+    let mut local = SystemTime::default();
+    // SAFETY: a null zone selects the current one; both structs are valid
+    // SYSTEMTIME layouts for the call.
+    if unsafe { SystemTimeToTzSpecificLocalTime(std::ptr::null(), &universal, &mut local) } == 0 {
+        return utc_civil(secs);
+    }
+    [
+        i64::from(local.year),
+        i64::from(local.month),
+        i64::from(local.day),
+        i64::from(local.hour),
+        i64::from(local.minute),
+        i64::from(local.second),
+    ]
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn local_civil_at(secs: i64) -> [i64; 6] {
+    utc_civil(secs)
+}
+
 fn utc_civil(secs: i64) -> [i64; 6] {
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);

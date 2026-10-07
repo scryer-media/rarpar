@@ -199,6 +199,12 @@ struct OpenTail {
     data: Vec<u8>,
 }
 
+/// Memory a lane keeps for every input block: its `full` flag and checksum
+/// slot, and the checksum's copy when the set is built from them.
+pub(crate) const LANE_BYTES_PER_BLOCK: u64 = (1
+    + std::mem::size_of::<Option<BlockChecksum>>()
+    + std::mem::size_of::<BlockChecksum>()) as u64;
+
 /// One block size's view of the file: block checksums, chunk descriptions and
 /// the recovery rows of every field it is coding in.
 pub(crate) struct Lane {

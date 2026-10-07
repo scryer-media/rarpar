@@ -37,7 +37,7 @@ use sevenz_turbo::{
     ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod, SourceReader,
 };
 
-use crate::compat_7z::local_civil;
+use crate::compat_7z::local_civil_at;
 use crate::error::RarparError;
 use crate::par3::{parent, reject_symlinks};
 use crate::par3_stream::{
@@ -239,10 +239,15 @@ struct Candidate {
 }
 
 impl Candidate {
-    fn bytes(&self) -> u64 {
-        self.block_size
+    /// Memory this lane needs over an archive of up to `length` bytes: its
+    /// recovery rows, and the state it keeps for every input block.
+    fn bytes(&self, length: u64) -> u64 {
+        let rows = self
+            .block_size
             .saturating_mul(self.rows)
-            .saturating_mul(self.fields.len() as u64)
+            .saturating_mul(self.fields.len() as u64);
+        let blocks = length.div_ceil(self.block_size.max(1)).saturating_add(1);
+        rows.saturating_add(blocks.saturating_mul(par3_stream::LANE_BYTES_PER_BLOCK))
     }
 }
 
@@ -366,7 +371,10 @@ impl Protect {
         let low = self.len;
         let high = self.outlook.high(self.len).max(low);
         let candidates = self.plan.candidates(low, high);
-        let needed: u64 = candidates.iter().map(Candidate::bytes).sum();
+        let needed: u64 = candidates
+            .iter()
+            .map(|candidate| candidate.bytes(high))
+            .fold(0, u64::saturating_add);
         if needed > self.budget {
             return Err(self.fail(memory_error(needed, self.budget)));
         }
@@ -544,7 +552,10 @@ struct Member {
     size: u64,
 }
 
-fn collect(base: &Path, inputs: &[PathBuf]) -> Result<Vec<Member>, RarparError> {
+/// Every member the inputs name, refusing as soon as the members found plus
+/// those still to visit pass `max_files`, before the walk takes more.
+fn collect(base: &Path, inputs: &[PathBuf], max_files: usize) -> Result<Vec<Member>, RarparError> {
+    let too_many = || RarparError::Resource("archiving exceeded --max-files".into());
     let mut members = Vec::new();
     let mut pending: Vec<PathBuf> = inputs
         .iter()
@@ -557,6 +568,9 @@ fn collect(base: &Path, inputs: &[PathBuf]) -> Result<Vec<Member>, RarparError> 
         })
         .collect();
     pending.reverse();
+    if pending.len() > max_files {
+        return Err(too_many());
+    }
     while let Some(path) = pending.pop() {
         reject_symlinks(&path)?;
         let meta = std::fs::metadata(&path).map_err(|error| {
@@ -584,9 +598,14 @@ fn collect(base: &Path, inputs: &[PathBuf]) -> Result<Vec<Member>, RarparError> 
             ));
         }
         if meta.is_dir() {
-            let mut children: Vec<PathBuf> = std::fs::read_dir(&canonical)?
-                .map(|entry| entry.map(|entry| entry.path()))
-                .collect::<Result<_, _>>()?;
+            let mut children: Vec<PathBuf> = Vec::new();
+            for entry in std::fs::read_dir(&canonical)? {
+                children.push(entry?.path());
+                // This folder, what came before, and what waits.
+                if members.len() + 1 + pending.len() + children.len() > max_files {
+                    return Err(too_many());
+                }
+            }
             children.sort();
             members.push(Member {
                 path: canonical,
@@ -608,6 +627,9 @@ fn collect(base: &Path, inputs: &[PathBuf]) -> Result<Vec<Member>, RarparError> 
                 path.display()
             )));
         }
+    }
+    if members.len() > max_files {
+        return Err(too_many());
     }
     let mut seen = std::collections::BTreeSet::new();
     for member in &members {
@@ -660,12 +682,7 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
     let base = args.base_path.clone().unwrap_or(std::env::current_dir()?);
     reject_symlinks(&base)?;
     let base = base.canonicalize()?;
-    let members = collect(&base, &args.inputs)?;
-    if members.len() > cli.max_files {
-        return Err(RarparError::Resource(
-            "archiving exceeded --max-files".into(),
-        ));
-    }
+    let members = collect(&base, &args.inputs, cli.max_files)?;
 
     let output = &args.output;
     reject_symlinks(output)?;
@@ -1132,12 +1149,28 @@ fn write_zip(
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
 
-    let mut writer = ZipWriter::new_stream(tee);
+    // Each member's metadata once, so the special bits patched into the
+    // central directory are the ones its options were built from.
+    let metas = members
+        .iter()
+        .map(|member| std::fs::metadata(&member.path))
+        .collect::<io::Result<Vec<_>>>()?;
+    #[cfg(unix)]
+    let special = {
+        use std::os::unix::fs::PermissionsExt;
+        metas
+            .iter()
+            .map(|meta| ((meta.permissions().mode() >> 8) & 0o16) as u8)
+            .collect()
+    };
+    #[cfg(not(unix))]
+    let special = vec![0; metas.len()];
+    let active = std::rc::Rc::new(std::cell::Cell::new(false));
+    let mut writer = ZipWriter::new_stream(SpecialBits::new(tee, special, active.clone()));
     let mut buffer = vec![0u8; 256 << 10];
-    for member in members {
-        let meta = std::fs::metadata(&member.path)?;
+    for (member, meta) in members.iter().zip(&metas) {
         let mut options = SimpleFileOptions::default()
-            .last_modified_time(dos_time(&meta))
+            .last_modified_time(dos_time(meta))
             .large_file(member.size >= ZIP64_MEMBER);
         options = if level == 0 || member.directory {
             options.compression_method(CompressionMethod::Stored)
@@ -1174,9 +1207,102 @@ fn write_zip(
             writer.write_all(&buffer[..read])?;
         }
     }
-    let mut tee = writer.finish().map_err(zip_error)?.into_inner();
+    // Only the central directory follows; its headers get the special bits.
+    active.set(true);
+    let mut tee = writer.finish().map_err(zip_error)?.into_inner().finish()?;
     tee.flush()?;
     Ok(tee)
+}
+
+/// The setuid, setgid and sticky bits, put back into each central directory
+/// header's external attributes: the zip crate masks a mode to its
+/// permission bits. Bytes pass straight through until `active` is set, just
+/// before `finish`; what follows (the last member's tail, the central
+/// directory and the end records) is held, patched, then passed on.
+struct SpecialBits<W> {
+    inner: W,
+    /// Per member, in order: the bits to OR into the attributes' top byte.
+    bits: Vec<u8>,
+    active: std::rc::Rc<std::cell::Cell<bool>>,
+    tail: Vec<u8>,
+}
+
+impl<W: Write> SpecialBits<W> {
+    fn new(inner: W, bits: Vec<u8>, active: std::rc::Rc<std::cell::Cell<bool>>) -> Self {
+        Self {
+            inner,
+            bits,
+            active,
+            tail: Vec::new(),
+        }
+    }
+
+    /// Patch the held tail and pass it on.
+    fn finish(mut self) -> Result<W, RarparError> {
+        patch_special_bits(&mut self.tail, &self.bits).ok_or_else(|| {
+            RarparError::Data("ZIP writer: unexpected central directory layout".into())
+        })?;
+        self.inner.write_all(&self.tail)?;
+        Ok(self.inner)
+    }
+}
+
+impl<W: Write> Write for SpecialBits<W> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if self.active.get() {
+            self.tail.extend_from_slice(data);
+            return Ok(data.len());
+        }
+        self.inner.write(data)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// OR `bits[i]` into the top byte of the i-th central directory header's
+/// external attributes. `tail` ends with the end records the zip crate
+/// writes (no comment); the central directory sits just before them. `None`
+/// when the layout is not that, or the header count differs from `bits`.
+fn patch_special_bits(tail: &mut [u8], bits: &[u8]) -> Option<()> {
+    const END: usize = 22;
+    const ZIP64_LOCATOR: usize = 20;
+    const ZIP64_END: usize = 56;
+    const CENTRAL_FIXED: usize = 46;
+    let u16_at = |data: &[u8], at: usize| {
+        u64::from(u16::from_le_bytes(data[at..at + 2].try_into().unwrap()))
+    };
+    let u32_at = |data: &[u8], at: usize| {
+        u64::from(u32::from_le_bytes(data[at..at + 4].try_into().unwrap()))
+    };
+    let end = tail.len().checked_sub(END)?;
+    if u32_at(tail, end) != 0x0605_4b50 {
+        return None;
+    }
+    let mut records = END;
+    let mut size = u32_at(tail, end + 12);
+    if size == u64::from(u32::MAX) || u16_at(tail, end + 10) == u64::from(u16::MAX) {
+        let zip64 = end.checked_sub(ZIP64_LOCATOR + ZIP64_END)?;
+        if u32_at(tail, zip64) != 0x0606_4b50 || u32_at(tail, end - ZIP64_LOCATOR) != 0x0706_4b50 {
+            return None;
+        }
+        size = u64::from_le_bytes(tail[zip64 + 40..zip64 + 48].try_into().unwrap());
+        records += ZIP64_LOCATOR + ZIP64_END;
+    }
+    let stop = tail.len() - records;
+    let mut at = stop.checked_sub(usize::try_from(size).ok()?)?;
+    let mut member = 0;
+    while at < stop {
+        if at + CENTRAL_FIXED > stop || u32_at(tail, at) != 0x0201_4b50 {
+            return None;
+        }
+        tail[at + 41] |= *bits.get(member)?;
+        member += 1;
+        let names = u16_at(tail, at + 28) + u16_at(tail, at + 30) + u16_at(tail, at + 32);
+        at += CENTRAL_FIXED + usize::try_from(names).ok()?;
+    }
+    (at == stop && member == bits.len()).then_some(())
 }
 
 /// A file's modification time as a ZIP stores it: local time, clamped to the
@@ -1191,7 +1317,7 @@ fn dos_time(meta: &std::fs::Metadata) -> zip::DateTime {
                 .ok()
         })
         .unwrap_or(0);
-    let [year, month, day, hour, minute, second] = local_civil(secs);
+    let [year, month, day, hour, minute, second] = local_civil_at(secs);
     if year < 1980 {
         return zip::DateTime::default();
     }
@@ -1220,6 +1346,35 @@ fn archive_error(error: sevenz_turbo::Error) -> RarparError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collection_stops_at_max_files_before_walking_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("crate")).unwrap();
+        for index in 0..50 {
+            std::fs::write(base.join(format!("crate/slip-{index}.txt")), b"x").unwrap();
+        }
+        let inputs = [PathBuf::from("crate")];
+        assert_eq!(collect(&base, &inputs, 51).unwrap().len(), 51);
+        let error = collect(&base, &inputs, 50).err().expect("over the limit");
+        assert!(matches!(error, RarparError::Resource(_)), "{error}");
+        assert!(collect(&base, &inputs, 3).is_err());
+    }
+
+    #[test]
+    fn lane_budgets_count_the_state_kept_per_block() {
+        let candidate = Candidate {
+            block_size: 40,
+            fields: vec![reference_field(1, 0, 1, 0)],
+            rows: 1,
+        };
+        // One recovery row is 40 bytes; the per-block state of a 1 GiB
+        // archive in 40-byte blocks is hundreds of MiB.
+        let needed = candidate.bytes(1 << 30);
+        assert!(needed > 500 * MIB, "{needed}");
+        assert!(candidate.bytes(0) < 1024);
+    }
 
     fn inside(redundancy: u64, footers: &'static [u64]) -> Plan {
         Plan::Inside {
