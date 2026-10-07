@@ -7,6 +7,7 @@ use bytes::Bytes;
 
 use crate::checksum::Md5State;
 use crate::error::{Par2Error, Result};
+use crate::evidence::FileStatFingerprint;
 use crate::types::{CancellationToken, RecoveryExponent};
 
 #[derive(Debug, Clone)]
@@ -24,6 +25,14 @@ pub enum RecoverySliceData {
         /// re-validated against on-disk damage before repair uses them.
         /// `None` means the payload was already validated (or is synthetic).
         packet_hash: Option<[u8; 16]>,
+        /// The volume's stat fingerprint at the moment the scanner opened it
+        /// to authenticate this payload against `packet_hash`. While the path
+        /// still fingerprints identically, [`RecoverySliceData::validate_packet_hash`]
+        /// accepts that authentication instead of reading and hashing the
+        /// payload again. `None` — every constructor but the scanner's — means
+        /// the hash was never checked against these bytes, so validation
+        /// always reads them.
+        authenticated_at: Option<FileStatFingerprint>,
     },
 }
 
@@ -57,6 +66,29 @@ impl RecoverySliceData {
             offset,
             len,
             packet_hash,
+            authenticated_at: None,
+        }
+    }
+
+    /// A file-backed slice whose payload the scanner has just authenticated
+    /// against `packet_hash`, with the volume fingerprinted as it was opened.
+    ///
+    /// The fingerprint is taken before any byte is read, so a write that
+    /// lands during or after the scan moves it and sends validation back to
+    /// the bytes.
+    pub(crate) fn file_backed_authenticated(
+        path: Arc<Path>,
+        offset: u64,
+        len: usize,
+        packet_hash: [u8; 16],
+        fingerprint: FileStatFingerprint,
+    ) -> Self {
+        Self::FileBacked {
+            path,
+            offset,
+            len,
+            packet_hash: Some(packet_hash),
+            authenticated_at: Some(fingerprint),
         }
     }
 
@@ -64,9 +96,17 @@ impl RecoverySliceData {
     ///
     /// In-memory payloads were hash-validated when the packet was parsed, and
     /// file-backed payloads recorded without a hash are trusted as-is.
-    /// File-backed payloads captured by the streaming scanner (which skips
-    /// payload hashing for speed) are re-hashed from disk here: the packet
+    /// Other file-backed payloads are re-hashed from disk here: the packet
     /// hash covers `recovery_set_id || type || exponent || payload`.
+    ///
+    /// The bounded file scanner authenticates every recovery payload as it
+    /// reads it and records the volume's stat fingerprint (length, mtime and,
+    /// on Unix, device and inode). A payload whose volume still fingerprints
+    /// identically keeps that verdict without being read again; one whose
+    /// volume changed, vanished or stopped being a regular file is read and
+    /// hashed as before. What the fingerprint cannot see — a same-length
+    /// in-place rewrite that also restores the mtime — is left to the
+    /// verification of the repaired files that follows every repair.
     pub fn validate_packet_hash(
         &self,
         recovery_set_id: &[u8; 16],
@@ -103,10 +143,16 @@ impl RecoverySliceData {
             offset,
             len,
             packet_hash: Some(expected),
+            authenticated_at,
         } = self
         else {
             return Ok(true);
         };
+        if let Some(authenticated_at) = authenticated_at
+            && FileStatFingerprint::capture_path(path).as_ref() == Some(authenticated_at)
+        {
+            return Ok(true);
+        }
 
         let mut hasher = Md5State::new();
         hasher.update(recovery_set_id);
