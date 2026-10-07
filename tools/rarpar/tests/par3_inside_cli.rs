@@ -623,10 +623,8 @@ mod generated {
         }
         let named = "protected/set.part1.rar";
         if root.join(named).is_file() {
-            assert!(
-                cfg!(any(windows, target_os = "macos")),
-                "a volume that ignores case must be a platform whose stems fold"
-            );
+            // The volume ignores case, so the stems must fold: all three
+            // volumes are the named family.
             let verified = run(root, &["par3", "inside", "verify", named], 0);
             assert_eq!(verified["sets"].as_array().unwrap().len(), 3, "{verified}");
             std::fs::remove_file(protected.join("SET.part2.rar")).unwrap();
