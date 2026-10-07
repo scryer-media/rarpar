@@ -215,14 +215,14 @@ pub fn discover_sets(
     Ok(result)
 }
 
-fn parent(path: &Path) -> PathBuf {
+pub(crate) fn parent(path: &Path) -> PathBuf {
     path.parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
         .to_path_buf()
 }
 
-fn reject_symlinks(path: &Path) -> Result<(), RarparError> {
+pub(crate) fn reject_symlinks(path: &Path) -> Result<(), RarparError> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => {
             return Err(RarparError::Unsafe(format!(
@@ -400,6 +400,7 @@ fn load_selected(
 
 pub fn run_command(cli: &Cli, command: Par3Command) -> Result<u8, RarparError> {
     let result = match command {
+        Par3Command::Inside(command) => return crate::par3_inside::run(cli, command),
         Par3Command::Create(args) => create(cli, &args),
         Par3Command::Verify(args) => {
             verify_repair(cli, &args, false).map(|outcome| (outcome.success, outcome.report))
@@ -407,6 +408,8 @@ pub fn run_command(cli: &Cli, command: Par3Command) -> Result<u8, RarparError> {
         Par3Command::Repair(args) => {
             verify_repair(cli, &args, true).map(|outcome| (outcome.success, outcome.report))
         }
+        #[cfg(feature = "sevenz")]
+        Par3Command::Archive(args) => crate::archive::run(cli, &args),
     };
     match result {
         Ok((success, report)) => {
@@ -468,7 +471,27 @@ fn emit(cli: &Cli, report: &Value) -> Result<(), RarparError> {
                 ""
             }
         );
-        if let Some(outputs) = report["outputs"].as_array() {
+        if report["operation"] == "par3_archive" {
+            if report["dry_run"] != true {
+                println!(
+                    "  {}: {} member(s), {} bytes, {} protected",
+                    report["archive"].as_str().unwrap_or_default(),
+                    report["members"],
+                    report["archive_bytes"],
+                    report["protected_bytes"]
+                );
+                println!(
+                    "  {} block(s) of {} bytes, {} recovery block(s), PAR3 set {}",
+                    report["blocks"],
+                    report["block_size"],
+                    report["recovery_blocks"],
+                    report["mode"].as_str().unwrap_or_default()
+                );
+            }
+            for path in report["outputs"].as_array().into_iter().flatten() {
+                println!("  {}", path.as_str().unwrap_or_default());
+            }
+        } else if let Some(outputs) = report["outputs"].as_array() {
             println!(
                 "  {} block(s), {} cohort(s), {} scratch bytes",
                 report["blocks"], report["cohorts"], report["scratch_bytes"]

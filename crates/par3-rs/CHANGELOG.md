@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.5
+## 0.5.1
 
 - `ExecutionOptions` gains a hidden, bench-only `disk_verify_whole_first`
   switch. `Some(false)` makes disk verification hash a file's extents and the
@@ -39,6 +39,50 @@
   `ExecutionDiagnostics::verify_order` reports the order that ran and the
   mount kinds behind it, and `engine_perf` prints them. Evidence is
   unchanged.
+- Repair no longer reads every selected recovery and data packet twice, once
+  to reauthenticate it and again to use it, when one stripe covers the block.
+  The codec's own read of the whole payload is hashed, together with the
+  header and identity fields authenticated at admission, and its bytes are
+  used only once the packet's hash matches. A mismatch refuses the repair
+  with the same `PacketHashMismatch`, charges `failed_hash_bytes` and
+  `rejected_packets` as before, and removes the outputs it had staged.
+  Payloads the codec never reads are still authenticated before anything is
+  installed. A stripe narrower than the block, configured or narrowed by the
+  budget, authenticates every payload in its own pass before the walk, as
+  before, through the stripe buffer when the budget refuses that pass its
+  own. Apple M5 Max, ten 30 MiB files in 64 KiB blocks with 328 lost: file
+  reads 702.2 → 680.6 MB in 11,047 → 10,391 calls, opens 54 → 45, snapshot
+  checks 2,751 → 2,423 (Cauchy); 709.7 → 688.2 MB in 11,163 → 10,507 calls,
+  opens 57 → 48 (FFT). Wall and CPU are unchanged at one and eight workers
+  with a warm cache; on AMD Zen 4 (EPYC 9R14, eight cores) the same counts
+  fall by the same amounts, Cauchy wall 2.21 → 2.20 s at one worker and
+  0.46 → 0.44 s at eight, FFT 0.91 → 0.90 s and 0.61 → 0.59 s, CPU
+  unchanged. Repairs in 1 MiB blocks at the default 64 KiB stripe read
+  exactly what they did.
+
+## 0.5.0
+
+- **Experimental:** `inside::rar5` adds PAR-inside for RAR5 archives and RAR5
+  volume sets made by RARLAB rar. The region layout is not part of the PAR3
+  specification yet; it may change before it is stable, and regions written
+  by this version may not verify with a later one.
+  - `inspect` walks a RAR5 archive's block headers (no member is
+    decompressed), refuses RAR4, non-RAR input and unknown trailing data, and
+    finds an existing region.
+  - `prepare_hosts`, `placement_counts` and `insert_set` write one input set
+    across every volume, with a region per volume in the `Trailing`, `Service`
+    or `Block` layout and recovery packets placed by `Spread`, `Last` or
+    `Independent`. Each File's chunks are the bytes before the region, one
+    unprotected chunk for the region, and the bytes after it.
+  - `open` finds a set's volumes by recorded name, recovery indices, volume
+    number or stem change, and returns `Rar5Set`, whose `repair` rebuilds
+    data and regions byte-exactly and whose `remove` writes the originals
+    back, checked against the File hash.
+- **Breaking:** `carrier::CarrierRestoration` gains `Derived`, for a carrier
+  rebuilt from a derived packet order with regenerated recovery packets.
+
+## 0.4.5
+
 - **Behaviour change:** the streaming creation engine (`creation::CreationPlan`)
   now derives the InputSetID the way the reference does — and the way
   `create::create` already did, through the same code — from each file's full
@@ -453,26 +497,6 @@
 - On x86_64 hosts with GFNI, the FFT codec's byte maps run as affine
   transforms and the formal derivative as one AVX2 pass (`reedsolomon-rs`
   0.4.8); carriers and repaired bytes are identical.
-- Repair no longer reads every selected recovery and data packet twice, once
-  to reauthenticate it and again to use it, when one stripe covers the block.
-  The codec's own read of the whole payload is hashed, together with the
-  header and identity fields authenticated at admission, and its bytes are
-  used only once the packet's hash matches. A mismatch refuses the repair
-  with the same `PacketHashMismatch`, charges `failed_hash_bytes` and
-  `rejected_packets` as before, and removes the outputs it had staged.
-  Payloads the codec never reads are still authenticated before anything is
-  installed. A stripe narrower than the block, configured or narrowed by the
-  budget, authenticates every payload in its own pass before the walk, as
-  before, through the stripe buffer when the budget refuses that pass its
-  own. Apple M5 Max, ten 30 MiB files in 64 KiB blocks with 328 lost: file
-  reads 702.2 → 680.6 MB in 11,047 → 10,391 calls, opens 54 → 45, snapshot
-  checks 2,751 → 2,423 (Cauchy); 709.7 → 688.2 MB in 11,163 → 10,507 calls,
-  opens 57 → 48 (FFT). Wall and CPU are unchanged at one and eight workers
-  with a warm cache; on AMD Zen 4 (EPYC 9R14, eight cores) the same counts
-  fall by the same amounts, Cauchy wall 2.21 → 2.20 s at one worker and
-  0.46 → 0.44 s at eight, FFT 0.91 → 0.90 s and 0.61 → 0.59 s, CPU
-  unchanged. Repairs in 1 MiB blocks at the default 64 KiB stripe read
-  exactly what they did.
 
 ## 0.4.4
 

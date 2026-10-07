@@ -14,6 +14,9 @@ pub use create::{InsertionPlan, InsertionRequirements};
 mod repair;
 pub use repair::{SelfRepairPlan, SelfRepairReport};
 
+#[path = "inside_rar5.rs"]
+pub mod rar5;
+
 use crc_fast::{CrcAlgorithm, Digest};
 
 use crate::runtime::{EngineError, EngineResult, ExecutionOptions, MemoryCategory};

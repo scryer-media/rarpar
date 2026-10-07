@@ -516,6 +516,24 @@ pub(crate) fn stage_embedded(
     temporary: &Path,
     durability: RepairDurability,
 ) -> EngineResult<u64> {
+    if session
+        .layout()?
+        .is_some_and(|layout| layout.files.len() != 1)
+    {
+        return Err(EngineError::Unsupported(
+            "embedded repair requires one file",
+        ));
+    }
+    stage_embedded_files(session, &[temporary.to_owned()], durability)
+}
+
+/// Stage every file of an embedded set, file `k` to `temporaries[k]`, which
+/// must already exist. Unprotected gaps are left zero for the caller to fill.
+pub(crate) fn stage_embedded_files(
+    session: &mut Par3RepairSession,
+    temporaries: &[std::path::PathBuf],
+    durability: RepairDurability,
+) -> EngineResult<u64> {
     session.options.validate()?;
     if !matches!(
         session.assess()?.status,
@@ -529,10 +547,8 @@ pub(crate) fn stage_embedded(
         ));
     }
     let layout = session.layout.as_ref().expect("assessed layout");
-    if layout.files.len() != 1 {
-        return Err(EngineError::Unsupported(
-            "embedded repair requires one file",
-        ));
+    if layout.files.len() != temporaries.len() {
+        return Err(EngineError::InvalidState("embedded repair targets"));
     }
     let assessment = session.assessment.as_ref().expect("assessment");
     for evidence in session.evidence.values() {
@@ -546,18 +562,24 @@ pub(crate) fn stage_embedded(
     // that consumes it where that read takes the whole payload.
     let checks = PayloadChecks::new(session);
     checks.before_walk(session.options.stripe_bytes, layout.block_size, None)?;
-    let targets = [StagedFile {
-        index: 0,
-        destination: None,
-        stage_name: None,
-        temporary: temporary.to_owned(),
-        cloned: None,
-        in_place: None,
-    }];
-    OpenOptions::new()
-        .write(true)
-        .open_budgeted(temporary, &session.options)?
-        .set_len(layout.files[0].len)?;
+    let targets: Vec<StagedFile> = temporaries
+        .iter()
+        .enumerate()
+        .map(|(index, temporary)| StagedFile {
+            index,
+            destination: None,
+            stage_name: None,
+            temporary: temporary.clone(),
+            cloned: None,
+            in_place: None,
+        })
+        .collect();
+    for (file, temporary) in layout.files.iter().zip(temporaries) {
+        OpenOptions::new()
+            .write(true)
+            .open_budgeted(temporary, &session.options)?
+            .set_len(file.len)?;
+    }
     let proof = StagedProof::new(layout, &targets, &session.options);
     if assessment.lost_blocks.is_empty() {
         copy_available(session, &checks, layout, None, &targets, &proof)?;
