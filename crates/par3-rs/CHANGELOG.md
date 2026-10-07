@@ -61,6 +61,10 @@
   - A service header whose name length runs past the header, up to
     `u64::MAX`, is refused with `EngineError::Unsupported` instead of
     overflowing the slice bound and panicking.
+  - `open` refuses an authenticated Recovery Data packet whose index puts a
+    host's recovery range past `u64::MAX` (`EngineError::Unsupported`)
+    instead of panicking in a debug build or wrapping and misbinding hosts in
+    a release one.
 - A derived carrier (`CarrierPlan::derived`) looks up its available Recovery
   Data packets in one pass over the payloads instead of one pass per
   recovery index, so regenerating a region of a set with tens of thousands
