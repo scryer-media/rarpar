@@ -566,3 +566,14 @@ func TestDuplicateRowsAreRefused(t *testing.T) {
 		t.Fatal("kernel variant \"buffered\" collides with rarpar-w1-buffered and must be refused")
 	}
 }
+
+func TestPortPatchAppliesOffX86Linux(t *testing.T) {
+	for _, c := range []struct {
+		goos, goarch string
+		want         bool
+	}{{"darwin", "arm64", true}, {"darwin", "amd64", true}, {"linux", "arm64", true}, {"linux", "amd64", false}, {"windows", "amd64", false}} {
+		if got := portPatchApplies(c.goos, c.goarch); got != c.want {
+			t.Errorf("portPatchApplies(%s, %s) = %v", c.goos, c.goarch, got)
+		}
+	}
+}

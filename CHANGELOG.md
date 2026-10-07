@@ -16,12 +16,24 @@ documented in each crate's own changelog so those notes ship with the crate.
   destination links and filesystem aliases, and uses exclusively created private
   staging directories. Ordinary source-file verification keeps its existing link
   behavior.
+- The format probes that read the first bytes of every file in a directory
+  (PAR3 sibling discovery and `auto` classification) no longer pull in
+  read-ahead (random-access advice on Linux, `F_RDAHEAD` off on macOS). A
+  Linux NFS client that had cached a probed file's read-ahead split every
+  later mebibyte read of that file into two requests; `par3 verify` now
+  reads a file over NFS in whole-mebibyte requests.
+- `par3 verify` and `par3 repair` verify a source on an NFS or SMB mount in
+  one pass, hashing it whole and by block together, so a damaged file is not
+  read over the network twice; files on a local disk are still hashed whole
+  first.
 
 ### Library versions
 
 - par2-rs 0.10.7: authenticate recovery packets during the bounded file scan
   and reject changed source extents during parallel repair analysis.
 - par3-rs 0.4.4: confine repair reads and installs to the opened output tree.
+- par3-rs 0.4.5: mebibyte source reads and the verification order by mount
+  kind above.
   Other library versions are unchanged.
 
 ## rarpar 0.5.3

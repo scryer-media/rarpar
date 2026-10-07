@@ -730,7 +730,7 @@ fn a_large_source_verifies_identically_serial_parallel_and_under_pressure() {
 
     let mut expected: Option<([u8; 32], Vec<u8>)> = None;
     for (workers, memory, read_size) in [
-        (1, 64 << 20, 64 << 10),
+        (1, 64 << 20, 1 << 20),
         (8, 64 << 20, 1 << 20),
         (8, 1 << 20, 64 << 10),
     ] {

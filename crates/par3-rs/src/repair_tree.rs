@@ -122,6 +122,11 @@ impl BudgetedDir {
     }
 }
 
+/// The device and inode of a file a repair patches in place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+pub(crate) struct FileIdentity(u64, u64);
+
 pub(crate) struct Destination {
     pub(crate) relative: PathBuf,
     pub(crate) display: PathBuf,
@@ -451,6 +456,96 @@ impl RepairTree {
         }
     }
 
+    /// Prepare `destination` to be repaired in place, or say it cannot be:
+    /// `None` leaves the destination untouched. It must be the very file the
+    /// registry hands over for `id`, unchanged since `source` was snapshotted,
+    /// writable through the tree, and its only link, so no other name sees
+    /// the patch. It is cut or zero-extended to `len`, and the returned
+    /// identity is what every later open of it must match.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn prepare_in_place(
+        &self,
+        destination: &Destination,
+        len: u64,
+        options: &ExecutionOptions,
+        (access, id, source): (&dyn SourceAccess, SourceId, SourceSnapshot),
+    ) -> EngineResult<Option<FileIdentity>> {
+        use std::os::unix::fs::MetadataExt;
+        let Some(original) = access.open_file(id).ok().flatten() else {
+            return Ok(None);
+        };
+        let registered = original.0.metadata()?;
+        drop(original);
+        if !clone::is_source(&registered, source) {
+            return Ok(None);
+        }
+        let identity = FileIdentity(registered.dev(), registered.ino());
+        // Any refusal to open it for writing leaves the staged path, which
+        // reports whatever that refusal means for the install.
+        let Ok(file) = self.open_destination_with(destination, true, true, options) else {
+            return Ok(None);
+        };
+        let metadata = file.metadata()?;
+        if FileIdentity(metadata.dev(), metadata.ino()) != identity
+            || metadata.nlink() != 1
+            || !clone::is_source(&metadata, source)
+        {
+            return Ok(None);
+        }
+        if metadata.len() != len {
+            file.set_len(len)?;
+        }
+        Ok(Some(identity))
+    }
+
+    /// Open the file [`Self::prepare_in_place`] prepared, refusing anything
+    /// that has since taken its name.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn open_in_place(
+        &self,
+        destination: &Destination,
+        identity: FileIdentity,
+        read: bool,
+        write: bool,
+        options: &ExecutionOptions,
+    ) -> EngineResult<EngineFile> {
+        use std::os::unix::fs::MetadataExt;
+        let file = self.open_destination_with(destination, read, write, options)?;
+        let metadata = file.metadata()?;
+        if FileIdentity(metadata.dev(), metadata.ino()) != identity {
+            return Err(EngineError::InvalidState(
+                "a file being repaired in place was replaced",
+            ));
+        }
+        Ok(file)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn open_destination_with(
+        &self,
+        destination: &Destination,
+        read: bool,
+        write: bool,
+        options: &ExecutionOptions,
+    ) -> EngineResult<EngineFile> {
+        // Resolved inside the tree's own capability, and the callers check
+        // the file's identity, so no extra directory handle is held.
+        let mut open = OpenOptions::new();
+        open.read(read).write(write);
+        EngineFile::open_with(options, || {
+            self.root
+                .open_with(&destination.relative, &open)
+                .map(cap_std::fs::File::into_std)
+        })
+    }
+
+    /// Remove a staged file nothing will use, as a refused stage is removed.
+    pub(crate) fn discard_stage(&self, name: &OsStr, display: &Path, outputs: &mut Vec<PathBuf>) {
+        if self.stage().remove_file(name).is_ok() {
+            outputs.retain(|path| path != display);
+        }
+    }
+
     pub(crate) fn create_stage_file(
         &self,
         index: usize,
@@ -713,6 +808,19 @@ impl RepairTree {
             }
         }
         Ok(())
+    }
+
+    /// Remove staged outputs a refused repair leaves no host a reason to keep,
+    /// through the staging capability. A path that cannot be removed stays in
+    /// `outputs`, so the host is still told about it.
+    pub(crate) fn discard_temporary_outputs(&self, outputs: &mut Vec<PathBuf>) {
+        outputs.retain(|path| {
+            path.file_name()
+                .is_none_or(|name| match self.stage().remove_file(name) {
+                    Ok(()) => false,
+                    Err(error) => error.kind() != io::ErrorKind::NotFound,
+                })
+        });
     }
 
     fn stage(&self) -> &BudgetedDir {

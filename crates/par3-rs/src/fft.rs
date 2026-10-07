@@ -297,7 +297,7 @@ impl ForwardPlan {
 /// through one byte buffer elsewhere. The `u16` lane also accepts 8-bit
 /// symbols, zero-extended, which is how GF(2^8) used to run; the tests keep
 /// it as the reference the byte lane must match.
-trait Lane: Copy + Default + Send + Sync + std::ops::BitXorAssign + 'static {
+trait Lane: reedsolomon_rs::fft::Symbol + std::ops::BitXorAssign {
     /// Rows of `unit`-byte symbols are the stripe's byte image; no
     /// conversion buffer is needed.
     fn is_direct(unit: usize) -> bool;
@@ -306,26 +306,20 @@ trait Lane: Copy + Default + Send + Sync + std::ops::BitXorAssign + 'static {
     fn direct_ref(unit: usize, row: &[Self]) -> Option<&[u8]>;
     fn unpack(unit: usize, bytes: &[u8], row: &mut [Self]);
     fn pack(unit: usize, row: &[Self], bytes: &mut [u8]);
-    /// `zero` flags rows the layout leaves all zero; see
+    /// [`TransformField::transform_rows`], or with `sum`
+    /// [`TransformField::transform_rows_adding`]. `zero` flags rows the
+    /// layout leaves all zero; see
     /// [`TransformField::transform_known_zero_with_backend`].
+    #[allow(clippy::too_many_arguments)]
     fn transform(
         field: &TransformField,
-        rows: &mut [Vec<Self>],
+        rows: &mut [&mut [Self]],
         zero: Option<&[bool]>,
         origin: usize,
         inverse: bool,
         backend: LinearBackend,
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<(), TransformError>;
-    #[allow(clippy::too_many_arguments)]
-    fn transform_in_pool(
-        field: &TransformField,
-        rows: &mut [Vec<Self>],
-        zero: Option<&[bool]>,
-        origin: usize,
-        inverse: bool,
-        backend: LinearBackend,
-        pool: &rayon::ThreadPool,
+        pool: Option<&rayon::ThreadPool>,
+        sum: Option<&mut [&mut [Self]]>,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<(), TransformError>;
     fn scale(
@@ -346,15 +340,11 @@ trait Lane: Copy + Default + Send + Sync + std::ops::BitXorAssign + 'static {
         backend: LinearBackend,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), TransformError>;
+    /// [`TransformField::differentiate_rows`].
     fn derivative(
         field: &TransformField,
-        rows: &mut [Vec<Self>],
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<(), TransformError>;
-    fn derivative_in_pool(
-        field: &TransformField,
-        rows: &mut [Vec<Self>],
-        pool: &rayon::ThreadPool,
+        rows: &mut [&mut [Self]],
+        pool: Option<&rayon::ThreadPool>,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<(), TransformError>;
     /// The rows `at` a decode reads after its inverse transform, derivative
@@ -363,10 +353,10 @@ trait Lane: Copy + Default + Send + Sync + std::ops::BitXorAssign + 'static {
     #[allow(clippy::too_many_arguments)]
     fn derivative_at(
         field: &TransformField,
-        rows: &mut [Vec<Self>],
+        rows: &mut [&mut [Self]],
         zero: Option<&[bool]>,
         at: &[usize],
-        out: &mut [Vec<Self>],
+        out: &mut [&mut [Self]],
         backend: LinearBackend,
         pool: Option<&rayon::ThreadPool>,
         cancelled: &(dyn Fn() -> bool + Sync),
@@ -399,34 +389,19 @@ impl Lane for u16 {
     }
     fn transform(
         field: &TransformField,
-        rows: &mut [Vec<Self>],
+        rows: &mut [&mut [Self]],
         zero: Option<&[bool]>,
         origin: usize,
         inverse: bool,
         backend: LinearBackend,
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<(), TransformError> {
-        match zero {
-            Some(zero) => field
-                .transform_known_zero_with_backend(rows, zero, origin, inverse, backend, cancelled),
-            None => field.transform_with_backend(rows, origin, inverse, backend, cancelled),
-        }
-    }
-    fn transform_in_pool(
-        field: &TransformField,
-        rows: &mut [Vec<Self>],
-        zero: Option<&[bool]>,
-        origin: usize,
-        inverse: bool,
-        backend: LinearBackend,
-        pool: &rayon::ThreadPool,
+        pool: Option<&rayon::ThreadPool>,
+        sum: Option<&mut [&mut [Self]]>,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<(), TransformError> {
-        match zero {
-            Some(zero) => field.transform_known_zero_in_pool(
-                rows, zero, origin, inverse, backend, pool, cancelled,
-            ),
-            None => field.transform_in_pool(rows, origin, inverse, backend, pool, cancelled),
+        match sum {
+            Some(sum) => field
+                .transform_rows_adding(rows, zero, origin, inverse, backend, pool, sum, cancelled),
+            None => field.transform_rows(rows, zero, origin, inverse, backend, pool, cancelled),
         }
     }
     fn scale(
@@ -456,25 +431,18 @@ impl Lane for u16 {
     }
     fn derivative(
         field: &TransformField,
-        rows: &mut [Vec<Self>],
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<(), TransformError> {
-        field.derivative(rows, cancelled)
-    }
-    fn derivative_in_pool(
-        field: &TransformField,
-        rows: &mut [Vec<Self>],
-        pool: &rayon::ThreadPool,
+        rows: &mut [&mut [Self]],
+        pool: Option<&rayon::ThreadPool>,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<(), TransformError> {
-        field.derivative_in_pool(rows, pool, cancelled)
+        field.differentiate_rows(rows, pool, cancelled)
     }
     fn derivative_at(
         field: &TransformField,
-        rows: &mut [Vec<Self>],
+        rows: &mut [&mut [Self]],
         zero: Option<&[bool]>,
         at: &[usize],
-        out: &mut [Vec<Self>],
+        out: &mut [&mut [Self]],
         backend: LinearBackend,
         pool: Option<&rayon::ThreadPool>,
         cancelled: &(dyn Fn() -> bool + Sync),
@@ -501,35 +469,20 @@ impl Lane for u8 {
     }
     fn transform(
         field: &TransformField,
-        rows: &mut [Vec<Self>],
+        rows: &mut [&mut [Self]],
         zero: Option<&[bool]>,
         origin: usize,
         inverse: bool,
         backend: LinearBackend,
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<(), TransformError> {
-        match zero {
-            Some(zero) => field.transform_u8_known_zero_with_backend(
-                rows, zero, origin, inverse, backend, cancelled,
-            ),
-            None => field.transform_u8_with_backend(rows, origin, inverse, backend, cancelled),
-        }
-    }
-    fn transform_in_pool(
-        field: &TransformField,
-        rows: &mut [Vec<Self>],
-        zero: Option<&[bool]>,
-        origin: usize,
-        inverse: bool,
-        backend: LinearBackend,
-        pool: &rayon::ThreadPool,
+        pool: Option<&rayon::ThreadPool>,
+        sum: Option<&mut [&mut [Self]]>,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<(), TransformError> {
-        match zero {
-            Some(zero) => field.transform_u8_known_zero_in_pool(
-                rows, zero, origin, inverse, backend, pool, cancelled,
+        match sum {
+            Some(sum) => field.transform_u8_rows_adding(
+                rows, zero, origin, inverse, backend, pool, sum, cancelled,
             ),
-            None => field.transform_u8_in_pool(rows, origin, inverse, backend, pool, cancelled),
+            None => field.transform_u8_rows(rows, zero, origin, inverse, backend, pool, cancelled),
         }
     }
     fn scale(
@@ -554,25 +507,18 @@ impl Lane for u8 {
     }
     fn derivative(
         field: &TransformField,
-        rows: &mut [Vec<Self>],
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<(), TransformError> {
-        field.derivative_u8(rows, cancelled)
-    }
-    fn derivative_in_pool(
-        field: &TransformField,
-        rows: &mut [Vec<Self>],
-        pool: &rayon::ThreadPool,
+        rows: &mut [&mut [Self]],
+        pool: Option<&rayon::ThreadPool>,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<(), TransformError> {
-        field.derivative_u8_in_pool(rows, pool, cancelled)
+        field.differentiate_u8_rows(rows, pool, cancelled)
     }
     fn derivative_at(
         field: &TransformField,
-        rows: &mut [Vec<Self>],
+        rows: &mut [&mut [Self]],
         zero: Option<&[bool]>,
         at: &[usize],
-        out: &mut [Vec<Self>],
+        out: &mut [&mut [Self]],
         backend: LinearBackend,
         pool: Option<&rayon::ThreadPool>,
         cancelled: &(dyn Fn() -> bool + Sync),
@@ -591,7 +537,7 @@ fn workspace_per_byte<L: Lane>(rows: usize, unit: usize) -> Option<usize> {
 
 /// Move row handles so that a `rows`-by-`columns` row-major arrangement becomes
 /// a `columns`-by-`rows` one. Only the handles move; no symbol is copied.
-fn transpose<T>(handles: &mut [Vec<T>], rows: usize, columns: usize, visited: &mut [u64]) {
+fn transpose<H: Default>(handles: &mut [H], rows: usize, columns: usize, visited: &mut [u64]) {
     debug_assert_eq!(handles.len(), rows * columns);
     let mark = |visited: &mut [u64], at: usize| visited[at / 64] |= 1 << (at % 64);
     let seen = |visited: &[u64], at: usize| visited[at / 64] >> (at % 64) & 1 == 1;
@@ -612,6 +558,22 @@ fn transpose<T>(handles: &mut [Vec<T>], rows: usize, columns: usize, visited: &m
             at = to;
         }
     }
+}
+
+/// What the two banks of a codec's rows may round up to whole pages beyond
+/// their symbols; see [`reedsolomon_rs::fft::RowBank::allocation_bytes`].
+const BANK_SLACK: usize = 2 * reedsolomon_rs::fft::RowBank::<u8>::ALIGN;
+
+/// What each row of a codec's banks costs beside its symbols: its handle,
+/// with room to spare, and the cache line of padding a bank may put after
+/// it; see [`reedsolomon_rs::fft::RowBank::ROW_PAD`].
+const ROW_BYTES: usize = 32 + reedsolomon_rs::fft::RowBank::<u8>::ROW_PAD;
+
+/// A zeroed page-aligned bank of `rows` rows of `width` symbols; see
+/// [`reedsolomon_rs::fft::RowBank`].
+fn bank<L: Lane>(rows: usize, width: usize) -> EngineResult<reedsolomon_rs::fft::RowBank<L>> {
+    reedsolomon_rs::fft::RowBank::zeroed(rows, width)
+        .ok_or(EngineError::resource_limit("FFT transform rows"))
 }
 
 /// Bounded synchronous FFT execution. Byte streams use the PAR3 on-disk layout:
@@ -720,23 +682,27 @@ impl FftCodec {
     /// the diagnostics still count the transform's full butterfly total.
     fn transform<L: Lane>(
         &self,
-        rows: &mut [Vec<L>],
+        rows: &mut [&mut [L]],
         zero: Option<&[bool]>,
         origin: usize,
         inverse: bool,
     ) -> EngineResult<()> {
-        self.transform_counted(rows, zero, origin, inverse, 0)
+        self.transform_counted(rows, zero, origin, inverse, None, 0)
     }
 
     /// One additive transform, counted. `skipped` is the butterflies a plan
     /// removed from what this call would otherwise have had to perform, so the
     /// diagnostics can report the pruned and unpruned costs side by side.
+    /// With `sum`, every row of the result is added into the same row of it
+    /// as the transform leaves it; see
+    /// [`TransformField::transform_rows_adding`].
     fn transform_counted<L: Lane>(
         &self,
-        rows: &mut [Vec<L>],
+        rows: &mut [&mut [L]],
         zero: Option<&[bool]>,
         origin: usize,
         inverse: bool,
+        sum: Option<&mut [&mut [L]]>,
         skipped: u64,
     ) -> EngineResult<()> {
         let field = self.field.as_ref().expect("nontrivial FFT field");
@@ -748,29 +714,18 @@ impl FftCodec {
         // find out why an operation cost what it did. The pruned path below
         // has always reported afterwards; these two now agree.
         let performed = butterflies(rows.len());
-        let symbols = rows.first().map_or(0, Vec::len);
-        if let Some(workers) = &self.workers {
-            L::transform_in_pool(
-                field,
-                rows,
-                zero,
-                origin,
-                inverse,
-                self.options.fft_backend,
-                workers.pool(),
-                &cancelled,
-            )
-        } else {
-            L::transform(
-                field,
-                rows,
-                zero,
-                origin,
-                inverse,
-                self.options.fft_backend,
-                &cancelled,
-            )
-        }
+        let symbols = rows.first().map_or(0, |row| row.len());
+        L::transform(
+            field,
+            rows,
+            zero,
+            origin,
+            inverse,
+            self.options.fft_backend,
+            self.workers.as_ref().map(crate::runtime::WorkerPool::pool),
+            sum,
+            &cancelled,
+        )
         .map_err(transform_error)?;
         self.options
             .diagnostics
@@ -789,12 +744,12 @@ impl FftCodec {
     /// so the rows the caller reads come out byte for byte identical.
     fn transform_forward<L: Lane>(
         &self,
-        rows: &mut [Vec<L>],
+        rows: &mut [&mut [L]],
         plan: &mut ForwardPlan,
     ) -> EngineResult<()> {
         use rayon::prelude::*;
         if plan.block_log2 == 0 {
-            return self.transform_counted(rows, None, 0, false, 0);
+            return self.transform_counted(rows, None, 0, false, None, 0);
         }
         let field = self.field.as_ref().expect("nontrivial FFT field");
         let backend = self.options.fft_backend;
@@ -803,47 +758,36 @@ impl FftCodec {
         // the `span` rows that share its low bits.
         let width = 1usize << plan.block_log2;
         let span = rows.len() >> plan.block_log2;
-        let symbols = rows.first().map_or(0, Vec::len);
+        let symbols = rows.first().map_or(0, |row| row.len());
         let blocks = &plan.blocks;
-        // With workers that gather, each class and block beyond the pool's
-        // scratch is one pooled transform, run one after another: the pool
-        // walks it in slabs, or where it has too few for that, sweeps it a
-        // level at a time across the workers, and either way the rows of
-        // one class at a time stream through the workers' caches, which
-        // classes transformed side by side, each sweeping its whole rows
-        // through one worker's, would not. Smaller ones run side by side,
-        // as all do on a target whose pools do not gather, where the
-        // sweeps of one small class at a time cost far more than they save.
-        let run = |rows: &mut [Vec<L>], origin: usize| {
-            match &self.workers {
-                Some(workers) => L::transform_in_pool(
-                    field,
-                    rows,
-                    None,
-                    origin,
-                    false,
-                    backend,
-                    workers.pool(),
-                    &cancelled,
-                ),
-                None => L::transform(field, rows, None, origin, false, backend, &cancelled),
-            }
+        // With workers on a target that tiles, each class and block beyond
+        // a tile is one pooled transform, run one after another: the pool
+        // takes its column tiles, so the rows of one class at a time stream
+        // through the workers' caches, which classes transformed side by
+        // side, each sweeping its whole rows through one worker's, would
+        // not. Smaller ones run side by side, as all do on a target that
+        // does not tile, where the sweeps of one small class at a time cost
+        // far more than they save.
+        let pool = self.workers.as_ref().map(crate::runtime::WorkerPool::pool);
+        let run = |rows: &mut [&mut [L]], origin: usize, pool| {
+            L::transform(
+                field, rows, None, origin, false, backend, pool, None, &cancelled,
+            )
             .map_err(transform_error)
         };
         let pooled = |rows: usize| {
-            self.workers.is_some()
-                && reedsolomon_rs::fft::POOL_GATHERS
+            pool.is_some()
+                && reedsolomon_rs::fft::COLUMN_TILES
                 && rows.saturating_mul(symbols).saturating_mul(size_of::<L>())
-                    > reedsolomon_rs::fft::TRANSFORM_SCRATCH_BYTES
+                    > reedsolomon_rs::fft::TRANSFORM_TILE_BYTES
         };
-        let wide = |rows: &mut [Vec<L>]| -> EngineResult<()> {
+        let wide = |rows: &mut [&mut [L]]| -> EngineResult<()> {
             if pooled(span) {
-                return rows.chunks_mut(span).try_for_each(|class| run(class, 0));
+                return rows
+                    .chunks_mut(span)
+                    .try_for_each(|class| run(class, 0, pool));
             }
-            let run = |class: &mut [Vec<L>]| {
-                L::transform(field, class, None, 0, false, backend, &cancelled)
-                    .map_err(transform_error)
-            };
+            let run = |class: &mut [&mut [L]]| run(class, 0, None);
             match &self.workers {
                 Some(workers) => workers
                     .pool()
@@ -851,21 +795,20 @@ impl FftCodec {
                 None => rows.chunks_mut(span).try_for_each(run),
             }
         };
-        let narrow = |rows: &mut [Vec<L>]| -> EngineResult<()> {
+        let narrow = |rows: &mut [&mut [L]]| -> EngineResult<()> {
             let kept = |block: &usize| blocks.binary_search(block).is_ok();
             if pooled(width) {
                 return rows
                     .chunks_mut(width)
                     .enumerate()
                     .filter(|(block, _)| kept(block))
-                    .try_for_each(|(block, at)| run(at, block * width));
+                    .try_for_each(|(block, at)| run(at, block * width, pool));
             }
-            let run = |(block, at): (usize, &mut [Vec<L>])| {
+            let run = |(block, at): (usize, &mut [&mut [L]])| {
                 if !kept(&block) {
                     return Ok(());
                 }
-                L::transform(field, at, None, block * width, false, backend, &cancelled)
-                    .map_err(transform_error)
+                run(at, block * width, None)
             };
             match &self.workers {
                 Some(workers) => workers
@@ -940,8 +883,9 @@ impl FftCodec {
             .ok_or(EngineError::resource_limit("FFT encoder rows"))?;
         let (stripe, _buffers) = self.buffers::<L>(block_size, rows)?;
         let symbols = stripe / g.field_bytes();
-        let mut work = vec![vec![L::default(); symbols]; g.capacity];
-        let mut sum = vec![vec![L::default(); symbols]; g.capacity];
+        let mut work = bank::<L>(g.capacity, symbols)?;
+        let mut sum = bank::<L>(g.capacity, symbols)?;
+        let (mut work, mut sum) = (work.rows_mut(), sum.rows_mut());
         let mut bytes = vec![
             0;
             if L::is_direct(g.field_bytes()) {
@@ -966,6 +910,7 @@ impl FftCodec {
                 // which therefore need no clearing and no addition.
                 let rows = if base == 0 { &mut sum } else { &mut work };
                 for (at, row) in rows.iter_mut().enumerate() {
+                    let row: &mut [L] = row;
                     self.options.cancel.check()?;
                     if base + at >= g.inputs {
                         row.fill(L::default());
@@ -981,14 +926,19 @@ impl FftCodec {
                     row[used..].fill(L::default());
                 }
                 let zero = (base + g.capacity > g.inputs).then_some(tail.as_slice());
-                self.transform(rows, zero, g.capacity + base, true)?;
                 if base == 0 {
-                    continue;
-                }
-                for (to, from) in sum.iter_mut().zip(&work) {
-                    for (to, from) in to.iter_mut().zip(from) {
-                        *to ^= *from;
-                    }
+                    self.transform(&mut sum, zero, g.capacity, true)?;
+                } else {
+                    // Each tile of the chunk is added into the sum as the
+                    // transform finishes it, while it is still in the cache.
+                    self.transform_counted(
+                        &mut work,
+                        zero,
+                        g.capacity + base,
+                        true,
+                        Some(&mut sum),
+                        0,
+                    )?;
                 }
             }
             self.transform(&mut sum, None, 0, false)?;
@@ -1142,7 +1092,7 @@ impl FftCodec {
             match self.fused_buffers::<L>(block_size, lost.len(), spare)? {
                 Some(buffers) => Ok((buffers.0, buffers.1, true)),
                 None => {
-                    let buffers = self.buffers_leaving::<L>(block_size, g.domain, spare)?;
+                    let buffers = self.buffers_leaving::<L>(block_size, g.domain, spare, true)?;
                     Ok((buffers.0, buffers.1, false))
                 }
             }
@@ -1171,12 +1121,10 @@ impl FftCodec {
         } else {
             Some(ForwardPlan::new(g, lost, symbols, &self.options)?)
         };
-        let mut rows = vec![vec![L::default(); symbols]; g.domain];
-        let mut found = if fused {
-            vec![vec![L::default(); symbols]; at.len()]
-        } else {
-            Vec::new()
-        };
+        let mut rows = bank::<L>(g.domain, symbols)?;
+        let mut rows = rows.rows_mut();
+        let mut found = bank::<L>(if fused { at.len() } else { 0 }, symbols)?;
+        let mut found = found.rows_mut();
         let mut bytes = vec![
             0;
             if L::is_direct(g.field_bytes()) {
@@ -1238,6 +1186,7 @@ impl FftCodec {
             let used = take.div_ceil(unit);
             if batch == 0 {
                 for (index, row) in rows.iter_mut().enumerate() {
+                    let row: &mut [L] = row;
                     self.options.cancel.check()?;
                     if zero[index] {
                         row.fill(L::default());
@@ -1282,27 +1231,31 @@ impl FftCodec {
                     .expect("batched reads have workers")
                     .pool();
                 let (zero, factors) = (&zero, &factors);
-                let mut read_batch =
-                    |rows: &mut [Vec<L>], first: usize, ring: &mut [Vec<u8>]| -> EngineResult<()> {
-                        for (at, row) in rows.iter_mut().enumerate() {
-                            self.options.cancel.check()?;
-                            if zero[first + at] {
-                                continue;
-                            }
-                            if let Some(direct) = L::direct(unit, row) {
-                                read(input(first + at), offset, &mut direct[..take])?;
-                            } else {
-                                let slot = &mut ring[at];
-                                read(input(first + at), offset, &mut slot[..take])?;
-                                slot[take..used * unit].fill(0);
-                            }
+                let mut read_batch = |rows: &mut [&mut [L]],
+                                      first: usize,
+                                      ring: &mut [Vec<u8>]|
+                 -> EngineResult<()> {
+                    for (at, row) in rows.iter_mut().enumerate() {
+                        let row: &mut [L] = row;
+                        self.options.cancel.check()?;
+                        if zero[first + at] {
+                            continue;
                         }
-                        Ok(())
-                    };
+                        if let Some(direct) = L::direct(unit, row) {
+                            read(input(first + at), offset, &mut direct[..take])?;
+                        } else {
+                            let slot = &mut ring[at];
+                            read(input(first + at), offset, &mut slot[..take])?;
+                            slot[take..used * unit].fill(0);
+                        }
+                    }
+                    Ok(())
+                };
                 let consume_batch =
-                    |rows: &mut [Vec<L>], first: usize, ring: &[Vec<u8>]| -> EngineResult<()> {
+                    |rows: &mut [&mut [L]], first: usize, ring: &[Vec<u8>]| -> EngineResult<()> {
                         rows.par_iter_mut().enumerate().try_for_each(
                             |(at, row)| -> EngineResult<()> {
+                                let row: &mut [L] = row;
                                 let index = first + at;
                                 if zero[index] {
                                     row.fill(L::default());
@@ -1373,12 +1326,12 @@ impl FftCodec {
             match &mut plan {
                 Some(plan) => {
                     self.transform(&mut rows, Some(&zero), 0, true)?;
-                    match &self.workers {
-                        Some(workers) => {
-                            L::derivative_in_pool(field, &mut rows, workers.pool(), &cancelled)
-                        }
-                        None => L::derivative(field, &mut rows, &cancelled),
-                    }
+                    L::derivative(
+                        field,
+                        &mut rows,
+                        self.workers.as_ref().map(crate::runtime::WorkerPool::pool),
+                        &cancelled,
+                    )
                     .map_err(transform_error)?;
                     self.transform_forward(&mut rows, plan)?;
                 }
@@ -1416,9 +1369,9 @@ impl FftCodec {
                     let slot = at
                         .binary_search(&(g.capacity + index))
                         .expect("every lost row is read");
-                    &mut found[slot]
+                    &mut *found[slot]
                 } else {
-                    &mut rows[g.capacity + index]
+                    &mut *rows[g.capacity + index]
                 };
                 L::scale(field, row, factor, self.options.fft_backend, &cancelled)
                     .map_err(transform_error)?;
@@ -1547,34 +1500,34 @@ impl FftCodec {
         let lane = if self.geometry.bits == 8 { 1 } else { 2 };
         (target / unit * unit)
             .saturating_mul(per_byte)
-            .saturating_add(rows.saturating_mul(32))
+            .saturating_add(rows.saturating_mul(ROW_BYTES))
+            .saturating_add(BANK_SLACK)
             .saturating_add(self.walk_units_bytes(rows, target, lane))
-            .saturating_add(self.walk_scratch_bytes(rows, target, lane))
     }
 
     /// Scratch the workers may take beside `rows` rows of `lane`-byte symbols
-    /// over a `stripe`-byte stripe: each gathers at most
-    /// [`reedsolomon_rs::fft::TRANSFORM_SCRATCH_BYTES`] when a pooled
-    /// transform or derivative walks the rows in slabs, and all of them
-    /// together never more than twice the bank they walk. Nothing without
-    /// workers, or on a target whose pools do not gather.
+    /// over a `stripe`-byte stripe when a pooled derivative runs them in
+    /// column tiles: each copies its tile, at most half
+    /// [`reedsolomon_rs::fft::TRANSFORM_TILE_BYTES`], and all of them
+    /// together never more than the bank, and each lists the rows of its
+    /// tile. The transforms tile in place and take none; their lists are
+    /// [`Self::walk_units_bytes`]. Nothing without a derivative, with one
+    /// worker, or on a target that does not tile.
     fn walk_scratch_bytes(&self, rows: usize, stripe: usize, lane: usize) -> usize {
-        let Some(workers) = &self.workers else {
-            return 0;
-        };
-        if !reedsolomon_rs::fft::POOL_GATHERS {
+        let threads = self.worker_count();
+        if threads == 1 || !reedsolomon_rs::fft::COLUMN_TILES {
             return 0;
         }
         let unit = self.geometry.field_bytes();
-        let bank = rows
-            .saturating_mul(stripe / unit)
-            .saturating_mul(lane)
-            .saturating_mul(2);
-        workers
-            .pool()
-            .current_num_threads()
-            .saturating_mul(reedsolomon_rs::fft::TRANSFORM_SCRATCH_BYTES)
+        let bank = rows.saturating_mul(stripe / unit).saturating_mul(lane);
+        threads
+            .saturating_mul(reedsolomon_rs::fft::TRANSFORM_TILE_BYTES / 2)
             .min(bank)
+            .saturating_add(
+                threads
+                    .saturating_mul(rows)
+                    .saturating_mul(size_of::<&mut [u8]>()),
+            )
     }
 
     /// What a walked transform of `rows` rows of `lane`-byte symbols over a
@@ -1583,10 +1536,9 @@ impl FftCodec {
     /// over every row. A narrower stripe never needs more of them under the
     /// same sweeps, but rows under 64 symbols take radix-2 sweeps, which
     /// keep different units and may walk where the wider rows would not, so
-    /// the wider of the two is charged. Nothing when the pool would walk
-    /// neither.
+    /// the wider of the two is charged. Nothing when neither tiles.
     fn walk_units_bytes(&self, rows: usize, stripe: usize, lane: usize) -> usize {
-        let (Some(workers), Some(field)) = (&self.workers, &self.field) else {
+        let Some(field) = &self.field else {
             return 0;
         };
         let unit = self.geometry.field_bytes();
@@ -1597,7 +1549,7 @@ impl FftCodec {
                 lane,
                 true,
                 self.options.fft_backend,
-                workers.pool().current_num_threads(),
+                self.worker_count(),
             )
         };
         units(stripe).max(units(stripe.min(63 * unit)))
@@ -1625,12 +1577,12 @@ impl FftCodec {
 
     /// Admit a decode's rows for [`TransformField::derivative_at`]: the
     /// domain's rows and one more per lost row for what it reads, the
-    /// conversion buffer, the units of its sweeps, its flags, and the slab
+    /// conversion buffer, the units of its sweeps, its flags, and the tile
     /// scratch of every worker. None, for the separate steps and
     /// [`Self::buffers`], when the bank the configured stripe would admit
-    /// fits the scratch and the passes the fused steps save cost nothing,
-    /// when the budget cannot hold them, and on a target whose pools do not
-    /// gather, where the slabs cost more than the passes over whole rows.
+    /// fits a transform tile and the passes the fused steps save cost
+    /// nothing, when the budget cannot hold them, and on a target that does
+    /// not tile, where the tiles cost more than the passes over whole rows.
     /// `spare` bytes of the budget must stay free beside them, or they are
     /// declined too: what the caller holds back for itself is never taken by
     /// the extra rows.
@@ -1672,7 +1624,8 @@ impl FftCodec {
         // The rows' headers, the index of each lost row, and the steps'
         // own keep.
         let overhead = rows
-            .saturating_mul(32)
+            .saturating_mul(ROW_BYTES)
+            .saturating_add(BANK_SLACK)
             .saturating_add(lost.saturating_mul(size_of::<usize>()))
             .saturating_add(field.derivative_at_bytes(
                 g.domain,
@@ -1684,7 +1637,7 @@ impl FftCodec {
             .saturating_add(spare);
         let available = self.options.memory.available();
         let fused = crate::runtime::stripe_within(available, target, per_byte, unit, overhead);
-        let (charges, _) = self.bank_charges::<L>(g.domain, target, spare)?;
+        let (charges, _) = self.bank_charges::<L>(g.domain, target, spare, true)?;
         let separate = charges
             .iter()
             .map(|&(per_byte, overhead)| {
@@ -1724,16 +1677,18 @@ impl FftCodec {
     /// Byte rows charge one byte per stripe byte, so a GF(2^8) cohort gets
     /// twice the stripe the same budget admitted for zero-extended rows.
     fn buffers<L: Lane>(&self, block_size: u64, rows: usize) -> EngineResult<(usize, Reservation)> {
-        self.buffers_leaving::<L>(block_size, rows, 0)
+        self.buffers_leaving::<L>(block_size, rows, 0, false)
     }
 
     /// [`Self::buffers`], narrowing the stripe until `spare` bytes of the
-    /// budget stay free beside them.
+    /// budget stay free beside them; with `derivative`, for rows a pooled
+    /// derivative runs over as well.
     fn buffers_leaving<L: Lane>(
         &self,
         block_size: u64,
         rows: usize,
         spare: usize,
+        derivative: bool,
     ) -> EngineResult<(usize, Reservation)> {
         self.options.validate()?;
         let unit = self.geometry.field_bytes();
@@ -1744,7 +1699,7 @@ impl FftCodec {
             .options
             .stripe_bytes
             .min(usize::try_from(block_size).unwrap_or(usize::MAX));
-        let (charges, walk) = self.bank_charges::<L>(rows, target, spare)?;
+        let (charges, walk) = self.bank_charges::<L>(rows, target, spare, derivative)?;
         let mut attempts = charges;
         let available = self.options.memory.available();
         let stripe = |(per_byte, overhead): &(usize, usize)| {
@@ -1780,54 +1735,71 @@ impl FftCodec {
     }
 
     /// Whether this codec decodes through [`TransformField::derivative_at`]
-    /// where the bank is large enough: where pools gather, unless the
+    /// where the bank is large enough: where transforms tile, unless the
     /// options say otherwise.
     fn fuses_decode(&self) -> bool {
         self.options
             .fft_fused_decode
-            .unwrap_or(reedsolomon_rs::fft::POOL_GATHERS)
+            .unwrap_or(reedsolomon_rs::fft::COLUMN_TILES)
     }
 
     /// What [`Self::buffers`] charges for `rows` rows of lane `L` at the
     /// configured `target`, `spare` included in each overhead, as its two
-    /// forms of (bytes per stripe byte, fixed overhead), and the walk scratch
-    /// the first form charges; with none, only the first form applies, and
-    /// the second repeats it.
+    /// forms of (bytes per stripe byte, fixed overhead), and the derivative
+    /// scratch the first form charges, with `derivative` only; with none,
+    /// only the first form applies, and the second repeats it.
     fn bank_charges<L: Lane>(
         &self,
         rows: usize,
         target: usize,
         spare: usize,
+        derivative: bool,
     ) -> EngineResult<([(usize, usize); 2], usize)> {
         let unit = self.geometry.field_bytes();
         let per_byte = workspace_per_byte::<L>(rows, unit)
             .ok_or(EngineError::resource_limit("FFT stripes"))?;
-        // The row handles and the units a walked transform keeps are what
-        // the rows cost whatever the stripe. The slab scratch the workers may
-        // take beside them is charged either as what the configured stripe
-        // would let them gather, a fixed amount, or as twice the bank the
-        // admitted stripe holds, per stripe byte, which bounds it however
-        // narrow the stripe becomes: whichever leaves the wider stripe
-        // first, the other when that one does not fit at all.
+        // The row handles, the pages the banks round up to, and the units a
+        // tiled transform keeps are what the rows cost whatever the stripe.
+        // The tile copies a pooled derivative's workers may take beside
+        // them are charged either as what the configured stripe would let
+        // them take, a fixed amount, or as the bank the admitted stripe
+        // holds once more, per stripe byte, which bounds it however narrow
+        // the stripe becomes: whichever leaves the wider stripe first, the
+        // other when that one does not fit at all.
+        let lists = if derivative {
+            self.worker_count()
+                .checked_mul(rows)
+                .and_then(|lists| lists.checked_mul(size_of::<&mut [u8]>()))
+                .ok_or(EngineError::resource_limit("FFT rows"))?
+        } else {
+            0
+        };
         let kept = rows
-            .checked_mul(32)
+            .checked_mul(ROW_BYTES)
+            .and_then(|handles| handles.checked_add(BANK_SLACK))
             .and_then(|handles| {
                 handles.checked_add(self.walk_units_bytes(rows, target, size_of::<L>()))
             })
             .and_then(|kept| kept.checked_add(spare))
             .ok_or(EngineError::resource_limit("FFT rows"))?;
-        let walk = self.walk_scratch_bytes(rows, target, size_of::<L>());
+        let walk = if derivative {
+            self.walk_scratch_bytes(rows, target, size_of::<L>())
+        } else {
+            0
+        };
+        let kept = if walk == 0 { kept } else { kept + lists };
+        let walk = walk.saturating_sub(lists);
         let overhead = kept
             .checked_add(walk)
             .ok_or(EngineError::resource_limit("FFT rows"))?;
-        let twice = rows
-            .checked_mul(2 * size_of::<L>() / unit)
+        let again = rows
+            .checked_mul(size_of::<L>() / unit)
             .and_then(|bank| per_byte.checked_add(bank))
             .ok_or(EngineError::resource_limit("FFT stripes"))?;
         if walk == 0 {
             return Ok(([(per_byte, kept), (per_byte, kept)], walk));
         }
-        Ok(([(per_byte, overhead), (twice, kept)], walk))
+        Ok(([(per_byte, overhead), (again, kept)], walk))
     }
 }
 
@@ -2087,6 +2059,11 @@ mod plan_tests {
     use super::*;
     use crate::runtime::MemoryBudget;
 
+    /// The row slices the codec's transforms take, over test rows.
+    fn slices(rows: &mut [Vec<u16>]) -> Vec<&mut [u16]> {
+        rows.iter_mut().map(Vec::as_mut_slice).collect()
+    }
+
     fn rows(count: usize, symbols: usize, bits: u32, seed: u64) -> Vec<Vec<u16>> {
         let mut state = seed | 1;
         let mask = if bits == 8 { 0xff } else { 0xffff };
@@ -2179,7 +2156,7 @@ mod plan_tests {
         options.cancel.cancel();
         assert!(
             matches!(
-                codec.transform_forward(&mut workspace, &mut plan),
+                codec.transform_forward(&mut slices(&mut workspace), &mut plan),
                 Err(EngineError::Cancelled)
             ),
             "a cancelled transform did not report it"
@@ -2211,7 +2188,7 @@ mod plan_tests {
         // One transform that does run, so the test is measuring a difference
         // and not an engine that never counts anything.
         codec
-            .transform(&mut workspace, None, 0, false)
+            .transform(&mut slices(&mut workspace), None, 0, false)
             .expect("runs");
         let ran = options.diagnostics.codec();
         assert!(ran.transform_calls > 0 && ran.butterflies > 0, "{ran:?}");
@@ -2219,7 +2196,7 @@ mod plan_tests {
         options.cancel.cancel();
         assert!(
             matches!(
-                codec.transform(&mut workspace, None, 0, false),
+                codec.transform(&mut slices(&mut workspace), None, 0, false),
                 Err(EngineError::Cancelled)
             ),
             "a cancelled transform did not report it"
@@ -2254,7 +2231,9 @@ mod plan_tests {
             let levels = geometry.domain.trailing_zeros();
             let start = rows(geometry.domain, symbols, geometry.bits, 0x9e37 + inputs);
             let mut expected = start.clone();
-            codec.transform(&mut expected, None, 0, false).unwrap();
+            codec
+                .transform(&mut slices(&mut expected), None, 0, false)
+                .unwrap();
             for block_log2 in 1..=levels {
                 let width = 1usize << block_log2;
                 for first in [0usize, 1, geometry.domain / 2] {
@@ -2270,7 +2249,9 @@ mod plan_tests {
                         _reservation: options.memory.reserve(0).unwrap(),
                     };
                     let mut actual = start.clone();
-                    codec.transform_forward(&mut actual, &mut plan).unwrap();
+                    codec
+                        .transform_forward(&mut slices(&mut actual), &mut plan)
+                        .unwrap();
                     let kept = block * width..block * width + width;
                     assert_eq!(
                         actual[kept.clone()],

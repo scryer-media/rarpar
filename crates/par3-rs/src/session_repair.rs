@@ -63,9 +63,21 @@ struct StagedFile {
     destination: Option<Destination>,
     stage_name: Option<OsString>,
     temporary: PathBuf,
-    /// When the staged file is a clone of this output's verified source, that
-    /// source's verdicts: see [`Self::holds`].
+    /// When the staged file is a clone of this output's verified source, or
+    /// is that source itself patched in place, that source's verdicts: see
+    /// [`Self::holds`].
     cloned: Option<Arc<crate::evidence::ExtentVerdicts>>,
+    /// Set when the output is its own source, repaired in place: see
+    /// [`in_place_source`].
+    in_place: Option<InPlace>,
+}
+
+/// An output repaired in place: the file it is, and the source it was read
+/// as, whose snapshots this repair's own writes move on.
+#[derive(Clone, Copy)]
+struct InPlace {
+    identity: crate::repair_tree::FileIdentity,
+    source: crate::source::SourceId,
 }
 
 impl StagedFile {
@@ -127,6 +139,46 @@ fn clone_source<'a>(
         .then_some(evidence)
 }
 
+/// Whether output `index`, staged from `evidence` by [`clone_source`] and
+/// not cloned, may instead be repaired in place, writing only the extents
+/// that evidence does not hold intact. With `backup` off its destination is
+/// to be replaced anyway; [`RepairTree::prepare_in_place`] then settles that
+/// the destination is that very source.
+///
+/// Nothing else this repair reads may come from that source: no placed
+/// extent and no other file's evidence, which could name the ranges the
+/// patch rewrites, and no payload. The extents read from it as intact are
+/// never written, so its own reads are unaffected by the patch. Its snapshot
+/// moves with the repair's own writes, so it no longer vouches for the file;
+/// instead the output is read back whole against the File packet before it
+/// is reported (see [`StagedProof::new`]).
+///
+/// A patch interrupted part way leaves the file with some damaged extents
+/// already rewritten and every intact extent as it was: it verifies as
+/// damaged, and repairs, exactly as before.
+fn in_place_source(
+    session: &Par3RepairSession,
+    evidence: &crate::evidence::FileEvidence,
+    backup: bool,
+) -> bool {
+    !backup
+        && session
+            .placements
+            .values()
+            .all(|placed| placed.source != evidence.source)
+        && session
+            .evidence
+            .values()
+            .all(|other| other.file == evidence.file || other.source != evidence.source)
+        && session.assessment.as_ref().is_some_and(|assessment| {
+            assessment
+                .recovery
+                .iter()
+                .chain(session.data_payloads().values())
+                .all(|payload| !payload.reads_from(&session.access, evidence.source))
+        })
+}
+
 /// Whether some output being staged still needs bytes of `block` written:
 /// it names the block in an extent its clone does not already hold.
 fn needs_write(layout: &BlockLayout, outputs: &[StagedFile], block: u64) -> bool {
@@ -137,6 +189,15 @@ fn needs_write(layout: &BlockLayout, outputs: &[StagedFile], block: u64) -> bool
                     && !target.holds(&layout.files[location.file].extents, location.extent)
             })
         })
+    })
+}
+
+/// Whether one of `outputs` is `source` patched in place.
+fn patched_in_place(outputs: &[StagedFile], source: crate::source::SourceId) -> bool {
+    outputs.iter().any(|target| {
+        target
+            .in_place
+            .is_some_and(|in_place| in_place.source == source)
     })
 }
 
@@ -216,13 +277,10 @@ fn repair_inner(
             evidence.snapshot,
         )?;
     }
-    for payload in assessment
-        .recovery
-        .iter()
-        .chain(session.data_payloads().values())
-    {
-        session.input.validate_payload(payload, &session.options)?;
-    }
+    // Every payload is authenticated before its bytes are used, by the read
+    // that consumes it where that read takes the whole payload.
+    let checks = PayloadChecks::new(session);
+    checks.before_walk(session.options.stripe_bytes, layout.block_size, None)?;
     let path_cost = assessment
         .files
         .iter()
@@ -307,12 +365,42 @@ fn repair_inner(
                 }
                 _ => None,
             };
+            // Where the file cannot be cloned and is to be replaced without
+            // a backup, it is patched where it stands: only the extents its
+            // evidence does not hold are written, instead of the whole file.
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            if cloned.is_none()
+                && let Some(evidence) = source
+                && in_place_source(session, evidence, backup)
+                && let Some(identity) = tree.prepare_in_place(
+                    &destination,
+                    layout.files[index].len,
+                    &session.options,
+                    (session.access.as_ref(), evidence.source, evidence.snapshot),
+                )?
+            {
+                tree.discard_stage(&stage_name, &temporary, temporary_outputs);
+                session.options.diagnostics.note_in_place();
+                staged.push(StagedFile {
+                    index,
+                    temporary: destination.display.clone(),
+                    destination: Some(destination),
+                    stage_name: None,
+                    cloned: Some(Arc::clone(&evidence.verdicts)),
+                    in_place: Some(InPlace {
+                        identity,
+                        source: evidence.source,
+                    }),
+                });
+                continue;
+            }
             staged.push(StagedFile {
                 index,
                 destination: Some(destination),
                 stage_name: Some(stage_name),
                 temporary,
                 cloned,
+                in_place: None,
             });
         }
         let proof = StagedProof::new(layout, &staged, &session.options);
@@ -327,11 +415,19 @@ fn repair_inner(
             }
         }
         if assessment.lost_blocks.is_empty() {
-            copy_available(session, layout, Some(&tree), &staged, &proof)?;
+            copy_available(session, &checks, layout, Some(&tree), &staged, &proof)?;
         } else if let Some(PacketBody::FftMatrix(matrix)) =
             assessment.matrix.as_ref().map(|packet| packet.body())
         {
-            reconstruct_fft(session, layout, Some(&tree), &staged, &proof, matrix)?;
+            reconstruct_fft(
+                session,
+                &checks,
+                layout,
+                Some(&tree),
+                &staged,
+                &proof,
+                matrix,
+            )?;
         } else {
             let field_bytes = crate::gf::construction_cost(
                 &session.set.as_ref().expect("ready set").galois_field(),
@@ -343,17 +439,33 @@ fn repair_inner(
             let field =
                 crate::gf::for_set(&session.set.as_ref().expect("ready set").galois_field())?;
             match field {
-                crate::gf::AnyField::Gf8(field) => {
-                    reconstruct(session, layout, Some(&tree), &staged, &proof, field)?
-                }
-                crate::gf::AnyField::Gf16(field) => {
-                    reconstruct(session, layout, Some(&tree), &staged, &proof, field)?
-                }
+                crate::gf::AnyField::Gf8(field) => reconstruct(
+                    session,
+                    &checks,
+                    layout,
+                    Some(&tree),
+                    &staged,
+                    &proof,
+                    field,
+                )?,
+                crate::gf::AnyField::Gf16(field) => reconstruct(
+                    session,
+                    &checks,
+                    layout,
+                    Some(&tree),
+                    &staged,
+                    &proof,
+                    field,
+                )?,
             }
         }
+        checks.finish()?;
         finish_staged(session, layout, Some(&tree), &staged, &proof, durability)?;
         drop(proof);
         for evidence in session.evidence.values() {
+            if patched_in_place(&staged, evidence.source) {
+                continue;
+            }
             crate::source::ensure_snapshot(
                 session.access.as_ref(),
                 evidence.source,
@@ -362,6 +474,14 @@ fn repair_inner(
         }
         for target in staged {
             session.options.cancel.check()?;
+            // Patched, synchronized and read back where it stands.
+            if target.in_place.is_some() {
+                installed.push(InstalledFile {
+                    path: target.destination.expect("tree destination").display,
+                    backup: None,
+                });
+                continue;
+            }
             let saved = tree.install(
                 target.stage_name.as_deref().expect("tree staging name"),
                 target.destination.as_ref().expect("tree destination"),
@@ -377,6 +497,13 @@ fn repair_inner(
         Ok(assessment.lost_blocks.len() as u64)
     })();
     if result.is_err() {
+        if checks.refused() {
+            // A payload that no longer matches its packet refuses the repair
+            // as it did when every payload was authenticated before anything
+            // was staged: nothing was installed, and the staged outputs are
+            // removed rather than handed to the host to clean up.
+            tree.discard_temporary_outputs(temporary_outputs);
+        }
         tree.sanitize_temporary_outputs(temporary_outputs)?;
     }
     result
@@ -415,19 +542,17 @@ pub(crate) fn stage_embedded(
             evidence.snapshot,
         )?;
     }
-    for payload in assessment
-        .recovery
-        .iter()
-        .chain(session.data_payloads().values())
-    {
-        session.input.validate_payload(payload, &session.options)?;
-    }
+    // Every payload is authenticated before its bytes are used, by the read
+    // that consumes it where that read takes the whole payload.
+    let checks = PayloadChecks::new(session);
+    checks.before_walk(session.options.stripe_bytes, layout.block_size, None)?;
     let targets = [StagedFile {
         index: 0,
         destination: None,
         stage_name: None,
         temporary: temporary.to_owned(),
         cloned: None,
+        in_place: None,
     }];
     OpenOptions::new()
         .write(true)
@@ -435,7 +560,7 @@ pub(crate) fn stage_embedded(
         .set_len(layout.files[0].len)?;
     let proof = StagedProof::new(layout, &targets, &session.options);
     if assessment.lost_blocks.is_empty() {
-        copy_available(session, layout, None, &targets, &proof)?;
+        copy_available(session, &checks, layout, None, &targets, &proof)?;
     } else if layout.block_count != 0 {
         let set = session.set.as_ref().expect("assessed set");
         let _field = session.options.memory.reserve_as(
@@ -444,13 +569,14 @@ pub(crate) fn stage_embedded(
         )?;
         match crate::gf::for_set(&set.galois_field())? {
             crate::gf::AnyField::Gf8(field) => {
-                reconstruct(session, layout, None, &targets, &proof, field)?
+                reconstruct(session, &checks, layout, None, &targets, &proof, field)?
             }
             crate::gf::AnyField::Gf16(field) => {
-                reconstruct(session, layout, None, &targets, &proof, field)?
+                reconstruct(session, &checks, layout, None, &targets, &proof, field)?
             }
         }
     }
+    checks.finish()?;
     finish_staged(session, layout, None, &targets, &proof, durability)?;
     drop(proof);
     for evidence in session.evidence.values() {
@@ -463,8 +589,181 @@ pub(crate) fn stage_embedded(
     Ok(assessment.lost_blocks.len() as u64)
 }
 
+/// The payloads one repair consumes, each authenticated once before any of its
+/// bytes are used.
+///
+/// A read that takes a whole payload, which is every read of it once one
+/// stripe covers the block, is authenticated over the bytes it read, so the
+/// packet is fetched once rather than once to hash and again to use. Any other
+/// read authenticates its packet first, in a pass of its own, as every payload
+/// once was before the repair began; later stripes of that payload then read
+/// it as before. Nothing is decoded or written from a payload before its hash
+/// has matched, and a mismatch refuses the repair as it always has.
+/// [`Self::finish`] authenticates whatever the codec never read, so a repair
+/// still refuses a set carrying a payload that no longer matches its packet.
+struct PayloadChecks<'a> {
+    session: &'a Par3RepairSession,
+    /// Payloads already authenticated: `(is data, block or recovery index)`.
+    done: Mutex<std::collections::BTreeSet<(bool, u64)>>,
+    /// Whether an authentication refused the repair.
+    refused: AtomicBool,
+}
+
+impl<'a> PayloadChecks<'a> {
+    fn new(session: &'a Par3RepairSession) -> Self {
+        Self {
+            session,
+            done: Mutex::new(std::collections::BTreeSet::new()),
+            refused: AtomicBool::new(false),
+        }
+    }
+
+    fn key(payload: &crate::ingest::PayloadRef) -> (bool, u64) {
+        match payload.kind() {
+            crate::ingest::PayloadKind::Data { index } => (true, index),
+            crate::ingest::PayloadKind::Recovery { index, .. } => (false, index),
+        }
+    }
+
+    /// Whether a payload's authentication is what ended the repair.
+    fn refused(&self) -> bool {
+        self.refused.load(Ordering::Relaxed)
+    }
+
+    fn refusing(&self, checked: EngineResult<()>) -> EngineResult<()> {
+        if checked.is_err() {
+            self.refused.store(true, Ordering::Relaxed);
+        }
+        checked
+    }
+
+    fn checked(&self, key: (bool, u64)) -> bool {
+        self.done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&key)
+    }
+
+    fn note(&self, key: (bool, u64)) {
+        self.done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key);
+    }
+
+    /// Read `payload` from `offset` into `out`, zero past its end, once the
+    /// packet is known to match its hash.
+    fn read(
+        &self,
+        payload: &crate::ingest::PayloadRef,
+        offset: u64,
+        out: &mut [u8],
+    ) -> EngineResult<()> {
+        let session = self.session;
+        let key = Self::key(payload);
+        if !self.checked(key) {
+            if offset == 0 && out.len() as u64 >= payload.len() {
+                self.refusing(session.input.read_payload(payload, &session.options, out))?;
+                self.note(key);
+                return Ok(());
+            }
+            self.authenticate(payload, Some(out))?;
+        }
+        out.fill(0);
+        payload.read_at(offset, out)?;
+        Ok(())
+    }
+
+    /// Authenticate `payload` in a pass of its own. The codec's stripes may
+    /// hold the budget that pass reserves its buffer from, so `scratch`, a
+    /// buffer the codec already holds, serves instead when it is refused.
+    fn authenticate(
+        &self,
+        payload: &crate::ingest::PayloadRef,
+        scratch: Option<&mut [u8]>,
+    ) -> EngineResult<()> {
+        let session = self.session;
+        let checked = match (
+            session.input.validate_payload(payload, &session.options),
+            scratch,
+        ) {
+            (Err(EngineError::ResourceLimit(_)), Some(scratch)) => session
+                .input
+                .validate_payload_in(payload, &session.options, scratch),
+            (checked, _) => checked,
+        };
+        self.refusing(checked)?;
+        self.note(Self::key(payload));
+        Ok(())
+    }
+
+    /// Before a codec walking `stripe`-wide reads starts: a stripe narrower
+    /// than the block reads no payload whole, so every payload is
+    /// authenticated now, in the order and passes it always was, rather than
+    /// one at a time between the codec's reads. A repair configured narrower
+    /// than its block calls this before it stages anything, with no scratch,
+    /// exactly where every payload was once authenticated.
+    fn before_walk(
+        &self,
+        stripe: usize,
+        block_size: u64,
+        mut scratch: Option<&mut [u8]>,
+    ) -> EngineResult<()> {
+        if stripe as u64 >= block_size {
+            return Ok(());
+        }
+        let session = self.session;
+        let assessment = session.assessment.as_ref().expect("assessment");
+        for payload in assessment
+            .recovery
+            .iter()
+            .chain(session.data_payloads().values())
+        {
+            if !self.checked(Self::key(payload)) {
+                self.authenticate(payload, scratch.as_deref_mut())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Par3RepairSession::read_block`], with a block carried in a data
+    /// packet read through [`Self::read`].
+    fn read_block(
+        &self,
+        block: u64,
+        offset: u64,
+        out: &mut [u8],
+        covered: &mut [u8],
+        owed: Option<&OwedChecks>,
+    ) -> EngineResult<()> {
+        match self.session.data_payloads().get(&block) {
+            Some(payload) => self.read(payload, offset, out),
+            None => self.session.read_block(block, offset, out, covered, owed),
+        }
+    }
+
+    /// Authenticate every payload the repair selected and never read.
+    fn finish(&self) -> EngineResult<()> {
+        let session = self.session;
+        let assessment = session.assessment.as_ref().expect("assessment");
+        for payload in assessment
+            .recovery
+            .iter()
+            .chain(session.data_payloads().values())
+        {
+            let key = Self::key(payload);
+            if !self.checked(key) {
+                self.refusing(session.input.validate_payload(payload, &session.options))?;
+                self.note(key);
+            }
+        }
+        Ok(())
+    }
+}
+
 fn copy_available(
     session: &Par3RepairSession,
+    checks: &PayloadChecks<'_>,
     layout: &BlockLayout,
     tree: Option<&RepairTree>,
     outputs: &[StagedFile],
@@ -481,7 +780,7 @@ fn copy_available(
     let mut bytes = vec![0; size];
     let mut covered = vec![0; size];
     let mut copied = false;
-    let writers = StageWriters::new(tree, session, proof);
+    let writers = StageWriters::new(tree, session, outputs, proof);
     for (block, _) in layout.blocks() {
         // A block every staged clone already holds is not read at all.
         if !needs_write(layout, outputs, block) {
@@ -492,7 +791,7 @@ fn copy_available(
         while offset < layout.block_size {
             session.options.cancel.check()?;
             let take = (layout.block_size - offset).min(size as u64) as usize;
-            session.read_block(
+            checks.read_block(
                 block,
                 offset,
                 &mut bytes[..take],
@@ -545,6 +844,7 @@ fn cauchy_coefficient_bytes<F: Field>(n: usize) -> Option<usize> {
 
 fn reconstruct<F>(
     session: &Par3RepairSession,
+    checks: &PayloadChecks<'_>,
     layout: &BlockLayout,
     tree: Option<&RepairTree>,
     outputs: &[StagedFile],
@@ -792,7 +1092,7 @@ where
         None
     };
     let sets = 1 + usize::from(_read_ahead.is_some());
-    let writers = StageWriters::new(tree, session, proof);
+    let writers = StageWriters::new(tree, session, outputs, proof);
     // With both, and every output held open ahead, the workers also scatter
     // each set they fold: its writes and the proof's hashing of them leave the
     // calling thread, which then only reads, and the hashing of the set's
@@ -805,6 +1105,7 @@ where
     let mut recovered = vec![vec![0u8; stripe]; tile];
     let mut inputs = vec![vec![0u8; stripe]; group * sets];
     let mut covered = vec![0u8; stripe];
+    checks.before_walk(stripe, layout.block_size, Some(&mut covered))?;
     let parallel = pool.as_ref().map(crate::runtime::WorkerPool::pool);
     let mut offset = 0;
     while offset < layout.block_size {
@@ -933,7 +1234,7 @@ where
                 if !coverage.contains(&block) && !needs_write(layout, outputs, block) {
                     continue;
                 }
-                session.read_block(
+                checks.read_block(
                     block,
                     offset,
                     &mut set[held][..take],
@@ -968,8 +1269,7 @@ where
                 let Some(payload) = assessment.recovery.get(next_row) else {
                     break;
                 };
-                input[..take].fill(0);
-                payload.read_at(offset, &mut input[..take])?;
+                checks.read(payload, offset, &mut input[..take])?;
                 next_row += 1;
             }
             Ok((next_row != first).then_some(StagedWork::Recovery {
@@ -1077,6 +1377,7 @@ fn fft_codec_with_source_stripes(
 
 fn reconstruct_fft(
     session: &Par3RepairSession,
+    checks: &PayloadChecks<'_>,
     layout: &BlockLayout,
     tree: Option<&RepairTree>,
     outputs: &[StagedFile],
@@ -1103,7 +1404,8 @@ fn reconstruct_fft(
     )?;
     let mut covered = vec![0; stripe];
     let mut bytes = vec![0; stripe];
-    let writers = StageWriters::new(tree, session, proof);
+    checks.before_walk(stripe, layout.block_size, Some(&mut bytes))?;
+    let writers = StageWriters::new(tree, session, outputs, proof);
     // The proof's frontiers are reserved by the first decode, once its
     // stripe is known and before it reads anything: the first stripe pass
     // opens one for every extent the stripes split and only the last closes
@@ -1132,7 +1434,7 @@ fn reconstruct_fft(
         while offset < layout.block_size {
             session.options.cancel.check()?;
             let take = (layout.block_size - offset).min(stripe as u64) as usize;
-            session.read_block(
+            checks.read_block(
                 block,
                 offset,
                 &mut bytes[..take],
@@ -1195,7 +1497,7 @@ fn reconstruct_fft(
                             if block >= coverage.end {
                                 out.fill(0);
                             } else {
-                                session.read_block(
+                                checks.read_block(
                                     block,
                                     offset,
                                     out,
@@ -1208,8 +1510,7 @@ fn reconstruct_fft(
                             }
                         }
                         FftInput::Recovery(index) => {
-                            out.fill(0);
-                            recovery[&index].read_at(offset, out)?;
+                            checks.read(recovery[&index], offset, out)?;
                         }
                     }
                     Ok(())
@@ -1266,6 +1567,12 @@ fn open_staged(
     write: bool,
     options: &ExecutionOptions,
 ) -> EngineResult<File> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let (Some(tree), Some(in_place), Some(destination)) =
+        (tree, target.in_place, target.destination.as_ref())
+    {
+        return tree.open_in_place(destination, in_place.identity, read, write, options);
+    }
     match (tree, target.stage_name.as_deref()) {
         (Some(tree), Some(name)) => tree.open_stage(name, read, write, options),
         (None, None) => OpenOptions::new()
@@ -1295,6 +1602,9 @@ struct StageWriters<'a> {
     options: &'a ExecutionOptions,
     access: &'a dyn SourceAccess,
     owed: OwedChecks,
+    /// Sources this repair patches in place, whose snapshots its own writes
+    /// move on; their outputs are read back instead.
+    patched: Vec<crate::source::SourceId>,
     capacity: usize,
     open: Arc<OpenWriters>,
     proof: &'a StagedProof<'a>,
@@ -1341,6 +1651,7 @@ impl<'a> StageWriters<'a> {
     fn new(
         tree: Option<&'a RepairTree>,
         session: &'a Par3RepairSession,
+        outputs: &[StagedFile],
         proof: &'a StagedProof<'a>,
     ) -> Self {
         let options = &session.options;
@@ -1352,6 +1663,10 @@ impl<'a> StageWriters<'a> {
             options,
             access: session.access.as_ref(),
             owed: OwedChecks::default(),
+            patched: outputs
+                .iter()
+                .filter_map(|target| target.in_place.map(|in_place| in_place.source))
+                .collect(),
             capacity: (options.open_handles.min(options.handles.limit()) / 4).max(1),
             open,
             proof,
@@ -1364,7 +1679,7 @@ impl<'a> StageWriters<'a> {
     }
 
     fn settle(&self) -> EngineResult<()> {
-        self.owed.settle(self.access)
+        self.owed.settle_except(self.access, &self.patched)
     }
 
     /// Hold every output open for a walk whose workers write them, so that no
@@ -1539,39 +1854,107 @@ fn verify_staged(
     tree: Option<&RepairTree>,
     target: &StagedFile,
 ) -> EngineResult<()> {
+    // A large output is hashed in mebibyte reads split across a small
+    // admitted pool, as disk verification hashes a large source; the
+    // fingerprint is the same either way.
+    let large = layout.files[target.index].len >= crate::hash::PARALLEL_SOURCE_BYTES;
+    let pool = if large {
+        match crate::runtime::WorkerPool::for_work(
+            &session.options,
+            crate::hash::PARALLEL_HASH_WORKERS,
+            crate::hash::PARALLEL_HASH_BYTES + (128 << 10),
+        ) {
+            Ok(pool) => pool,
+            Err(EngineError::ResourceLimit(_)) => None,
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    match &pool {
+        Some(pool) => pool
+            .pool()
+            .install(|| read_back(session, layout, tree, target, true)),
+        None => read_back(session, layout, tree, target, false),
+    }
+}
+
+/// [`verify_staged`]'s read: `parallel` only from inside an admitted pool.
+fn read_back(
+    session: &Par3RepairSession,
+    layout: &BlockLayout,
+    tree: Option<&RepairTree>,
+    target: &StagedFile,
+    parallel: bool,
+) -> EngineResult<()> {
     let mut progress = session.options.stage(crate::runtime::Stage::Verify)?;
     let expected = &layout.files[target.index];
-    let size = session.options.stripe_bytes.min(64 << 10);
-    let _buffer = session
-        .options
-        .memory
-        .reserve_as(MemoryCategory::SourceScratch, size)?;
+    let memory = &session.options.memory;
+    let wide = crate::hash::PARALLEL_HASH_BYTES;
+    let reservation = match parallel {
+        true => match memory.reserve_as(MemoryCategory::SourceScratch, wide) {
+            Ok(reservation) if memory.available() >= 128 << 10 => Some(reservation),
+            Ok(_) | Err(EngineError::ResourceLimit(_)) => None,
+            Err(error) => return Err(error),
+        },
+        false => None,
+    };
+    let (_buffer, size) = match reservation {
+        Some(reservation) => (reservation, wide),
+        None => {
+            let size = session.options.stripe_bytes.min(64 << 10);
+            (
+                memory.reserve_as(MemoryCategory::SourceScratch, size)?,
+                size,
+            )
+        }
+    };
+    let parallel = parallel && size >= wide;
     let mut buffer = vec![0u8; size];
     let mut file = open_staged(tree, target, true, false, &session.options)?;
     let mut hash = crate::FingerprintHasher::new();
-    for index in 0..expected.extents.len() {
-        if expected.extents.is_unprotected(index) {
-            continue;
-        }
-        let range = expected.extents.range(index).expect("bounded extent");
+    // Adjacent protected extents are read as one run, so a run of small
+    // blocks still fills the buffer.
+    let mut read_run = |range: std::ops::Range<u64>| -> EngineResult<()> {
         file.seek(SeekFrom::Start(range.start))?;
         let mut remaining = range.end - range.start;
         while remaining != 0 {
             session.options.cancel.check()?;
             let take = remaining.min(size as u64) as usize;
             file.read_exact(&mut buffer[..take])?;
-            hash.update(&buffer[..take]);
+            hash.update_admitted(&buffer[..take], parallel);
             progress.advance(take as u64);
             remaining -= take as u64;
         }
+        Ok(())
+    };
+    let mut run: Option<std::ops::Range<u64>> = None;
+    for index in 0..expected.extents.len() {
+        if expected.extents.is_unprotected(index) {
+            continue;
+        }
+        let range = expected.extents.range(index).expect("bounded extent");
+        match &mut run {
+            Some(open) if open.end == range.start => open.end = range.end,
+            _ => {
+                if let Some(done) = run.replace(range) {
+                    read_run(done)?;
+                }
+            }
+        }
+    }
+    if let Some(done) = run {
+        read_run(done)?;
     }
     if file.metadata()?.len() != expected.len
         || expected.fingerprint == [0; 16]
         || hash.finalize() != expected.fingerprint
     {
-        return Err(EngineError::InvalidState(
-            "rebuilt file failed protected-data verification; temporary retained",
-        ));
+        return Err(EngineError::InvalidState(if target.in_place.is_some() {
+            "file repaired in place failed protected-data verification"
+        } else {
+            "rebuilt file failed protected-data verification; temporary retained"
+        }));
     }
     Ok(())
 }
@@ -1739,7 +2122,12 @@ impl<'a> StagedProof<'a> {
                 let mut unproven = (0..file.extents.len())
                     .filter(|&index| !file.extents.is_unprotected(index))
                     .count();
-                let doubt = reservation.is_none() || unproven == 0 || file.fingerprint == [0; 16];
+                // A file patched in place is read back whole: its snapshot no
+                // longer vouches for the extents the patch did not write.
+                let doubt = reservation.is_none()
+                    || unproven == 0
+                    || file.fingerprint == [0; 16]
+                    || target.in_place.is_some();
                 let mut proven = if doubt {
                     Vec::new()
                 } else {
@@ -2775,6 +3163,7 @@ mod proof_tests {
                 stage_name: None,
                 temporary: PathBuf::new(),
                 cloned: None,
+                in_place: None,
             });
             let mut protected = Vec::new();
             for extent in 0..file.extents.len() {
@@ -3111,8 +3500,19 @@ mod clone_tests {
     use crate::source::{DiskSourceAccess, SourceId};
     use crate::test_reference::{TempTree, cauchy_block_set, scanned_packets};
 
-    /// Repair a damaged `input.bin` in place: (clones, bytes written).
-    fn repair_in_place(refuse: bool) -> (u64, u64) {
+    /// What one repair of a damaged `input.bin` cost.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Outcome {
+        clones: u64,
+        in_place: u64,
+        read: u64,
+        written: u64,
+    }
+
+    /// Repair a damaged `input.bin` (one 64 KiB block of 16 flipped) into its
+    /// own directory, with or without a backup, while `linked` keeps a second
+    /// name for it that must keep the damaged bytes.
+    fn repair_in_place(refuse: bool, backup: bool, linked: bool) -> Outcome {
         let block = 64u64 << 10;
         let tree = TempTree::new("clone-refused");
         let set = cauchy_block_set(16, block, 2, b"PAR3 refused clone", &tree);
@@ -3125,7 +3525,12 @@ mod clone_tests {
             ..ExecutionOptions::default()
         };
         let mut access = DiskSourceAccess::with_options(options.clone());
-        access.insert(SourceId(1), inputs.write("input.bin", &damaged));
+        let source = inputs.write("input.bin", &damaged);
+        let link = TempTree::new("clone-refused-link");
+        if linked {
+            std::fs::hard_link(&source, link.path().join("other.bin")).unwrap();
+        }
+        access.insert(SourceId(1), source);
         let mut session =
             Par3RepairSession::new(set.id, Arc::new(access), options.clone()).unwrap();
         session.bind_file("input.bin", SourceId(1)).unwrap();
@@ -3137,7 +3542,7 @@ mod clone_tests {
         assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
         let before = options.diagnostics.file_io();
         REFUSE_CLONES.with(|refused| refused.set(refuse));
-        let report = session.repair(inputs.path(), false);
+        let report = session.repair(inputs.path(), backup);
         REFUSE_CLONES.with(|refused| refused.set(false));
         assert_eq!(report.unwrap().installed.len(), 1);
         let after = options.diagnostics.file_io();
@@ -3145,26 +3550,80 @@ mod clone_tests {
             &std::fs::read(inputs.path().join("input.bin")).unwrap(),
             bytes
         );
-        assert_eq!(
-            after.read_bytes - before.read_bytes,
-            bytes.len() as u64 - block,
-            "the surviving blocks once, and nothing read back"
-        );
-        (
-            options.diagnostics.file_clones(),
-            after.write_bytes - before.write_bytes,
-        )
+        if linked {
+            assert_eq!(
+                std::fs::read(link.path().join("other.bin")).unwrap(),
+                damaged,
+                "a second name for the source was changed"
+            );
+        }
+        Outcome {
+            clones: options.diagnostics.file_clones(),
+            in_place: options.diagnostics.file_in_place_repairs(),
+            read: after.read_bytes - before.read_bytes,
+            written: after.write_bytes - before.write_bytes,
+        }
     }
 
+    /// Without a clone or a backup to keep, only the damaged block is written,
+    /// into the source itself, which is then read back whole.
     #[test]
-    fn a_refused_clone_falls_back_to_a_full_copy_with_the_same_bytes() {
-        let len = 16u64 * (64 << 10);
-        assert_eq!(repair_in_place(true), (0, len));
-        let (clones, written) = repair_in_place(false);
-        if cfg!(target_os = "macos") || clones == 1 {
-            assert_eq!((clones, written), (1, 64 << 10));
+    fn a_refused_clone_without_a_backup_patches_only_the_damaged_block() {
+        let (len, block) = (16u64 * (64 << 10), 64u64 << 10);
+        let expected = if cfg!(any(target_os = "macos", target_os = "linux")) {
+            Outcome {
+                clones: 0,
+                in_place: 1,
+                read: len - block + len,
+                written: block,
+            }
         } else {
-            assert_eq!(written, len);
+            Outcome {
+                clones: 0,
+                in_place: 0,
+                read: len - block,
+                written: len,
+            }
+        };
+        assert_eq!(repair_in_place(true, false, false), expected);
+    }
+
+    /// A backup keeps the damaged file under its own name, so a refused clone
+    /// still copies the whole file, with the same bytes.
+    #[test]
+    fn a_refused_clone_with_a_backup_falls_back_to_a_full_copy() {
+        let (len, block) = (16u64 * (64 << 10), 64u64 << 10);
+        let outcome = repair_in_place(true, true, false);
+        assert_eq!(
+            outcome,
+            Outcome {
+                clones: 0,
+                in_place: 0,
+                read: len - block,
+                written: len,
+            },
+            "the surviving blocks once, and nothing read back"
+        );
+    }
+
+    /// A source with a second name is never patched: that name keeps the
+    /// damaged bytes and the repaired file is a full copy.
+    #[test]
+    fn a_hard_linked_source_is_copied_rather_than_patched() {
+        let len = 16u64 * (64 << 10);
+        let outcome = repair_in_place(true, false, true);
+        assert_eq!((outcome.in_place, outcome.written), (0, len));
+    }
+
+    /// A clone the filesystem takes still wins over a patch.
+    #[test]
+    fn a_clone_is_preferred_to_a_patch() {
+        let outcome = repair_in_place(false, false, false);
+        if cfg!(target_os = "macos") || outcome.clones == 1 {
+            assert_eq!(
+                (outcome.clones, outcome.in_place, outcome.written),
+                (1, 0, 64 << 10)
+            );
         }
     }
 
@@ -3198,7 +3657,7 @@ mod clone_tests {
 
     /// Repair a damaged `input.bin` in place through a registry that hands
     /// over its file or not: (files opened by the repair, clones).
-    fn repair_opens(hand_over: bool, refuse: bool) -> (u64, u64) {
+    fn repair_opens(hand_over: bool, refuse: bool, backup: bool) -> (u64, u64) {
         let block = 64u64 << 10;
         let tree = TempTree::new("clone-opens");
         let set = cauchy_block_set(16, block, 2, b"PAR3 clone opens", &tree);
@@ -3226,12 +3685,17 @@ mod clone_tests {
         assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
         let opens = options.diagnostics.file_opens();
         REFUSE_CLONES.with(|refused| refused.set(refuse));
-        let report = session.repair(inputs.path(), false);
+        let report = session.repair(inputs.path(), backup);
         REFUSE_CLONES.with(|refused| refused.set(false));
         assert_eq!(report.unwrap().installed.len(), 1);
         assert_eq!(
             &std::fs::read(inputs.path().join("input.bin")).unwrap(),
             &set.contents[0].1
+        );
+        assert_eq!(
+            options.diagnostics.file_in_place_repairs(),
+            0,
+            "a file the registry did not hand over was patched"
         );
         (
             options.diagnostics.file_opens() - opens,
@@ -3244,10 +3708,17 @@ mod clone_tests {
     /// that never tries a clone does.
     #[test]
     fn a_refused_clone_opens_no_more_files_than_the_copy_it_falls_back_to() {
-        let refused = repair_opens(true, true);
-        let never_tried = repair_opens(false, false);
+        let refused = repair_opens(true, true, true);
+        let never_tried = repair_opens(false, false, true);
         assert_eq!(refused, never_tried);
         assert_eq!(refused.1, 0);
+    }
+
+    /// Only a file the registry hands over can be patched; one it serves by
+    /// reads alone is copied even without a backup.
+    #[test]
+    fn a_source_not_handed_over_is_never_patched() {
+        assert_eq!(repair_opens(false, false, false).1, 0);
     }
 
     /// A reflink filesystem can refuse one file with `EINVAL` (an inline

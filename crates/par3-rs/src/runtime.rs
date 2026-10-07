@@ -16,7 +16,7 @@ pub(crate) use diagnostics::StageGuard;
 pub use diagnostics::{
     AdmissionSnapshot, AmplificationSnapshot, CacheSnapshot, CodecSnapshot, ExecutionDiagnostics,
     IoSnapshot, ProgressCallback, ProgressEvent, ProgressPhase, RefusalSnapshot, Stage,
-    StageSnapshot, WaitSnapshot,
+    StageSnapshot, VerifyOrderSnapshot, WaitSnapshot,
 };
 
 /// Failure of an incremental engine operation. Missing bytes are not I/O errors.
@@ -718,6 +718,10 @@ impl ScanWorkBudget {
             .map(|_| ())
             .map_err(|_| EngineError::resource_limit("cumulative scanning work"))
     }
+    /// Return part of a charge whose request came back short.
+    pub(crate) fn refund(&self, bytes: usize) {
+        self.0.used.fetch_sub(bytes as u64, Ordering::AcqRel);
+    }
 }
 
 /// Synchronous execution controls for a session.
@@ -735,15 +739,26 @@ pub struct ExecutionOptions {
     /// FFT butterfly CPU selection; `kernel()` reports the detected shuffle ISA.
     /// This does not change the independent Cauchy dispatch.
     pub fft_backend: reedsolomon_rs::gf_simd::LinearBackend,
-    /// Whether an FFT decode whose bank outgrows the transform scratch runs
+    /// Whether an FFT decode whose bank outgrows a transform tile runs
     /// its inverse transform, derivative and forward transform fused
     /// (`reedsolomon_rs`'s `TransformField::derivative_at`). `None`, the
-    /// default, fuses where `reedsolomon_rs::fft::POOL_GATHERS` holds, which
+    /// default, fuses where `reedsolomon_rs::fft::COLUMN_TILES` holds, which
     /// is every target but Apple silicon, at every worker count. A forced
     /// value exists so every target's tests run both decodes; output is
     /// identical either way.
     #[doc(hidden)]
     pub fft_fused_decode: Option<bool>,
+    /// Whether disk verification hashes a file whole before its extents.
+    /// Whole first, an intact file is read once, and a file the whole-file
+    /// hash does not settle is read a second time to hash its extents. Side
+    /// by side, the extents and the whole file are hashed in one pass, so a
+    /// damaged file is read once and an intact one pays for both hashes.
+    /// `None`, the default, picks by [`crate::source::SourceAccess::mount_kind`]:
+    /// side by side on a remote mount, whole first on a local or unknown one.
+    /// A forced value wins over the mount kind, so benchmarks can measure
+    /// both orders on the same build; the evidence is identical either way.
+    #[doc(hidden)]
+    pub disk_verify_whole_first: Option<bool>,
     /// Maximum concurrently open engine-owned handles.
     pub open_handles: usize,
     /// Shared handle ceiling across cloned options and cooperating providers.
@@ -771,6 +786,7 @@ impl Default for ExecutionOptions {
             workers: std::thread::available_parallelism().map_or(1, usize::from),
             fft_backend: reedsolomon_rs::gf_simd::LinearBackend::Auto,
             fft_fused_decode: None,
+            disk_verify_whole_first: None,
             open_handles: 32,
             handles: HandleBudget::new(32),
             stripe_bytes: 64 << 10,

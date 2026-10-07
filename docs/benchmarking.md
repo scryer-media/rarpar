@@ -204,6 +204,7 @@ The same inputs and damage are produced on every host:
 | `a-fft` | 1 GiB | 1 MiB | 1024 / 103 | FFT | 50 lost blocks |
 | `b-gf16` | 300 MiB, many files | 1 MiB | 300 / 30 | Cauchy GF(2^16) | 10 lost blocks in 5 of 10 files |
 | `c-gf16` | 1.5 GiB | 32 KiB | 49152 / 4916 | Cauchy GF(2^16) | 2000 lost blocks |
+| `c-fft` | 1.5 GiB | 32 KiB | 49152 / 4916 | FFT | 2000 lost blocks |
 | `smoke-*` | 8 MiB | 16-128 KiB | 65-514 / 7-52 | GF8, GF16, FFT | 6-30 lost blocks |
 
 `--profile full` runs sets A, B and C and then the smoke sets.
@@ -324,8 +325,10 @@ and counts differ.
   `build-reference` applies
   `internal/par3bench/patches/par3cmdline-2971702e-macos.patch`, a bench-only
   port that is labelled in its header, and fetches a pinned `sse2neon.h` on
-  arm64. Linux and Windows build or use the unmodified source. The patch
-  digest is recorded in `reference.json` and in the results.
+  arm64. Linux arm64 gets the same patch, since upstream's x86-only SIMD
+  flags fail there; its Darwin hunks are guarded, so Linux code paths are
+  unchanged. Linux x86-64 and Windows build or use the unmodified source. The
+  patch digest is recorded in `reference.json` and in the results.
 - **Work-path length.** The reference stores pointers into its list of
   recovery file names, then reallocates the list once it outgrows 1 KiB. It
   reopens the volumes through those dangling pointers and fails with
@@ -367,6 +370,55 @@ changing any existing field, so the schema name stays v1), `runs.jsonl`
 and the reference's canonical sets are cached under `--work`; delete it to
 reclaim the space. `--keep-stages` keeps the per-run directories for
 inspection.
+
+### Storage targets and engine rows
+
+`--target NAME=DIR` (repeatable, instead of `--work`) runs every row on every
+target, interleaved, so a remote mount and its local control come from one
+run. Each record carries the target's mount (filesystem, mount options,
+`--target-meta NAME:key=value` facts the harness cannot see) and, on Linux NFS
+mounts, the per-run delta of `/proc/self/mountstats` (READ, WRITE, COMMIT and
+metadata ops, bytes, RTT). `--engine-workers 8` adds timed `engine_perf` rows
+that report the engine's disk-work counters (opens, read/write calls and
+bytes, fsyncs); `--engine-variant NAME:VAR=V` adds rows with `PAR3_BENCH_*`
+switches, for example `wff-off:PAR3_BENCH_WHOLE_FILE_FIRST=0` for single-pass
+disk verification. `--rows engine` keeps only those rows. `--drop-caches`
+drops the page cache before every timed run (Linux, root). Engine rows have no
+reference ratio.
+
+### Network-mount rig
+
+`bench/nfs` is a compose project: a kernel nfsd server exporting one `async`
+and one `sync` export, and a privileged Linux client with the pinned Rust
+toolchain that builds the tree under test from a read-only source mount and
+runs the suite on three targets: `local` (the client's volume), `nfs-async`
+and `nfs-sync`. Run it from `bench/rarpar-bench`:
+
+```sh
+rarpar-bench nfs run --context desktop-linux --label run1 \
+  --env NFS_VERS=4.1 --env NFS_ACTIMEO=0 \
+  -- --profile full --set a-gf16 --engine-workers 8 --repeats 3
+rarpar-bench nfs down --context desktop-linux
+```
+
+Mount options are client environment variables (`NFS_VERS`, `NFS_PROTO`,
+`NFS_RSIZE`, `NFS_WSIZE`, `NFS_HARD`, `NFS_ACTIMEO`, `NFS_CLIENT_SYNC`,
+`NFS_NCONNECT`, `NFS_EXTRA_OPTS`) and are recorded in every row with the
+server type and export mode. `--service bench-client-lowmem` runs in a client
+whose memory limit (`RIG_LOWMEM_LIMIT`, default 768m) is below the largest
+set file, so a second read pass cannot come from the page cache. `--env
+RIG_EXT4=8G` adds a `local-ext4` target, a fresh loop-mounted ext4 image of
+that size: a local filesystem without file clones. Evidence goes
+to `target/bench/nfs/<label>/`, with the host's load average sampled into
+`host-load.jsonl`. The cache volume keeps builds and datasets between runs;
+`nfs down --volumes` removes it.
+
+Server and client share one kernel, so the client turns NFS LOCALIO off
+before mounting (else I/O would bypass the protocol) and restores it after.
+The network is a container bridge with no real latency, and the exports sit
+on the same virtual disk as the local control: the rig shows protocol cost
+(extra round trips, commits, cache behaviour), not a NAS's disks or a WAN.
+Compare NFS rows with local rows from the same run only.
 
 ## Evidence And Charts
 

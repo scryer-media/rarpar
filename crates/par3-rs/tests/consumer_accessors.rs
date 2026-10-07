@@ -190,6 +190,13 @@ fn a_carrier_that_rots_under_the_reader_is_charged_to_the_set_that_trusted_it() 
     );
     assert_eq!(session.failed_hash_bytes(), packet_length);
     assert_eq!(session.rejected_packets(), 1);
+    // The payload is authenticated by the read that consumes it, after the
+    // outputs were staged; the refusal still leaves nothing behind.
+    assert_eq!(
+        std::fs::read_dir(output.path()).unwrap().count(),
+        0,
+        "a refused repair left staged output behind"
+    );
 
     // Monotonic: a second attempt adds its own failure rather than resetting.
     assert!(session.repair(output.path(), false).is_err());
