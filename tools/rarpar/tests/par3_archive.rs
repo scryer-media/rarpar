@@ -178,6 +178,21 @@ fn an_inside_set_repairs_the_archive_that_carries_it() {
     assert_eq!(output.status.code(), Some(0), "{stdout}");
     assert!(stdout.contains("protected data was repaired"), "{stdout}");
     assert_eq!(std::fs::read(&archive).unwrap(), original);
+
+    // A second repair replaces the first one's `.1` backup, as par3cmdline
+    // does, on every platform.
+    let backup = root.join("out/inner.7z.1");
+    assert!(backup.exists());
+    damage(&archive, 200, 2000);
+    let damaged = std::fs::read(&archive).unwrap();
+    let output = Command::new(&par3)
+        .current_dir(root.join("out"))
+        .args(["rs", "inner.7z"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(std::fs::read(&archive).unwrap(), original);
+    assert_eq!(std::fs::read(&backup).unwrap(), damaged);
 }
 
 /// Archives larger than the in-memory head take the multi-lane path; the set
@@ -341,7 +356,14 @@ fn taken_or_linked_volume_names_stop_the_archive_first() {
         let output = rarpar(
             root,
             &with_args(
-                &["par3", "archive", "--overwrite", "--base-path", "in", "set.7z"],
+                &[
+                    "par3",
+                    "archive",
+                    "--overwrite",
+                    "--base-path",
+                    "in",
+                    "set.7z",
+                ],
                 &MEMBERS,
             ),
         );

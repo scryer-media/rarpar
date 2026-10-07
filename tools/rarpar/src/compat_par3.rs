@@ -159,6 +159,8 @@ struct Options {
     ecc: u32,
     interleave: u32,
     file_system: u32,
+    /// `-fu` was given, whatever its masked value.
+    unix_permissions_given: bool,
     repetition_limit: u32,
     comment: Option<String>,
     absolute: u8,
@@ -227,11 +229,67 @@ pub fn dispatch(args: &[OsString], full: bool) -> Option<u8> {
     if !full && !claims(args) {
         return None;
     }
-    let args: Vec<String> = args
-        .iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
+    let args: Vec<String> = args.iter().map(|arg| escape(arg)).collect();
     Some(run(&args))
+}
+
+/// First code point of the range that carries a native path's non-UTF-8
+/// bytes through the parser's text: U+10FF00 + byte, in plane 16's private
+/// use area.
+#[cfg(unix)]
+const ESCAPE_BASE: u32 = 0x10_FF00;
+
+/// A native argument or file name as the parser's text. On Unix any byte
+/// that is not UTF-8 becomes a private-use character that [`native`] turns
+/// back into the same byte, so a path is never altered on its way through.
+#[cfg(unix)]
+fn escape(text: &OsStr) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = String::new();
+    for chunk in text.as_bytes().utf8_chunks() {
+        out.push_str(chunk.valid());
+        for &byte in chunk.invalid() {
+            out.push(char::from_u32(ESCAPE_BASE + u32::from(byte)).expect("private use"));
+        }
+    }
+    out
+}
+
+#[cfg(not(unix))]
+fn escape(text: &OsStr) -> String {
+    text.to_string_lossy().into_owned()
+}
+
+/// The native path text [`escape`] made.
+#[cfg(unix)]
+fn native(text: &str) -> OsString {
+    use std::os::unix::ffi::OsStringExt;
+    let mut bytes = Vec::with_capacity(text.len());
+    for c in text.chars() {
+        let code = u32::from(c);
+        if (ESCAPE_BASE..ESCAPE_BASE + 0x100).contains(&code) {
+            bytes.push((code - ESCAPE_BASE) as u8);
+        } else {
+            let mut buffer = [0; 4];
+            bytes.extend_from_slice(c.encode_utf8(&mut buffer).as_bytes());
+        }
+    }
+    OsString::from_vec(bytes)
+}
+
+#[cfg(not(unix))]
+fn native(text: &str) -> OsString {
+    OsString::from(text)
+}
+
+/// Where the last path separator of a native path argument is: `/`, and on
+/// Windows `\` too.
+fn last_separator(text: &str) -> Option<usize> {
+    if cfg!(windows) {
+        text.rfind(['/', '\\'])
+    } else {
+        text.rfind('/')
+    }
 }
 
 /// Under the `rarpar` name the facade takes a command line only when its first
@@ -628,6 +686,7 @@ fn parse(args: &[String]) -> Result<Parsed, Failure> {
             }
             options.interleave = number32(&option[1..]);
         } else if first == b'f' && second == b'u' && bytes.get(2).is_none_or(u8::is_ascii_digit) {
+            options.unix_permissions_given = true;
             if options.file_system & 7 != 0 {
                 return Err(fail(
                     &notices,
@@ -697,9 +756,9 @@ fn parse(args: &[String]) -> Result<Parsed, Failure> {
             notices.push(format!("Found wildcard in PAR filename, {argument}"));
         } else {
             par_filename = argument.clone();
-            if Path::new(argument).is_absolute() {
+            if Path::new(&native(argument)).is_absolute() {
                 if options.base_path.is_empty()
-                    && let Some(slash) = argument.rfind('/')
+                    && let Some(slash) = last_separator(argument)
                 {
                     options.base_path = argument[..slash].to_owned();
                 }
@@ -710,7 +769,7 @@ fn parse(args: &[String]) -> Result<Parsed, Failure> {
                         "Failed to convert PAR filename to absolute path",
                     )
                 })?;
-                par_filename = current.join(argument).to_string_lossy().into_owned();
+                par_filename = escape(current.join(native(argument)).as_os_str());
             }
         }
     }
@@ -718,7 +777,7 @@ fn parse(args: &[String]) -> Result<Parsed, Failure> {
         return Err(fail(&notices, "PAR filename is not specified"));
     }
     if matches!(operation, Operation::Insert | Operation::Delete) || self_target {
-        match par_filename.rfind('/') {
+        match last_separator(&par_filename) {
             Some(slash) if slash > 0 => {
                 options.base_path = par_filename[..slash].to_owned();
                 par_filename = par_filename[slash + 1..].to_owned();
@@ -763,6 +822,8 @@ struct Context {
 }
 
 fn prepare(invocation: &Invocation) -> Result<Context, Failure> {
+    // What the facade refuses is refused before any path is looked at.
+    refuse_unsupported(invocation)?;
     let options = &invocation.options;
     let current = std::env::current_dir().map_err(|error| {
         Failure::new(
@@ -773,7 +834,7 @@ fn prepare(invocation: &Invocation) -> Result<Context, Failure> {
     let base = if options.base_path.is_empty() {
         current.clone()
     } else {
-        let base = current.join(&options.base_path);
+        let base = current.join(native(&options.base_path));
         if !base.is_dir() {
             return Err(Failure {
                 code: RET_FILE_IO_ERROR,
@@ -793,8 +854,7 @@ fn prepare(invocation: &Invocation) -> Result<Context, Failure> {
     if options.noise >= 1 {
         print_option_summary(invocation);
     }
-    refuse_unsupported(invocation)?;
-    let par_path = current.join(&invocation.par_filename);
+    let par_path = current.join(native(&invocation.par_filename));
     Ok(Context {
         base,
         par_path,
@@ -925,7 +985,7 @@ fn refuse_unsupported(invocation: &Invocation) -> Result<(), Failure> {
         _ => {}
     }
     // par3cmdline accepts these with any command; they only shape creation.
-    if options.file_system & 0x10007 != 0 {
+    if options.unix_permissions_given || options.file_system & 0x10007 != 0 {
         return refuse(
             "rarpar does not create PAR3 files through the par3cmdline facade, so -fu and -ff are not supported.",
         );
@@ -979,15 +1039,24 @@ fn wildcard_match(pattern: &[u8], name: &[u8]) -> bool {
 fn visible_entries(directory: &Path) -> std::io::Result<Vec<(String, bool)>> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+        // An entry that cannot be read, or a link that leads nowhere, is
+        // skipped on its own; it never hides its siblings.
+        let Ok(entry) = entry else {
             continue;
         };
-        if name.starts_with('.') {
+        let Ok(kind) = entry.file_type() else {
             continue;
-        }
-        let is_dir = std::fs::metadata(entry.path())?.is_dir();
-        entries.push((name, is_dir));
+        };
+        let is_dir = if kind.is_symlink() {
+            match std::fs::metadata(entry.path()) {
+                Ok(meta) => meta.is_dir(),
+                Err(_) => continue,
+            }
+        } else {
+            kind.is_dir()
+        };
+        // `read_dir` never yields `.` or `..`; dot files are ordinary names.
+        entries.push((escape(&entry.file_name()), is_dir));
     }
     entries.sort();
     Ok(entries)
@@ -1018,7 +1087,7 @@ impl InputList {
 /// Split `argument` into its directory, relative to `base`, and its name
 /// pattern, refusing a directory outside `base` as par3cmdline does.
 fn split_search(base: &Path, argument: &str) -> Result<(String, String), Failure> {
-    let Some(slash) = argument.rfind('/') else {
+    let Some(slash) = last_separator(argument) else {
         return Ok((String::new(), argument.to_owned()));
     };
     let directory = &argument[..slash];
@@ -1026,7 +1095,7 @@ fn split_search(base: &Path, argument: &str) -> Result<(String, String), Failure
     let joined = if directory.is_empty() {
         PathBuf::from("/")
     } else {
-        base.join(directory)
+        base.join(native(directory))
     };
     let outside = || {
         Failure::new(
@@ -1046,7 +1115,7 @@ fn split_search(base: &Path, argument: &str) -> Result<(String, String), Failure
         let Component::Normal(part) = component else {
             return Err(outside());
         };
-        parts.push(part.to_string_lossy().into_owned());
+        parts.push(escape(part));
     }
     Ok((parts.join("/"), pattern))
 }
@@ -1074,7 +1143,7 @@ fn path_search(base: &Path, argument: &str, list: &mut InputList) -> Result<(), 
     }
     let io =
         |error: std::io::Error| Failure::new(RET_FILE_IO_ERROR, format!("{argument}: {error}"));
-    let entries = visible_entries(&base.join(&directory)).map_err(io)?;
+    let entries = visible_entries(&base.join(native(&directory))).map_err(io)?;
     for (name, is_dir) in entries {
         if !wildcard_match(pattern.as_bytes(), name.as_bytes()) {
             continue;
@@ -1103,9 +1172,7 @@ fn engine_failure(error: impl Into<EngineError>, trailer: &str) -> Failure {
 }
 
 fn file_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default()
+    path.file_name().map(escape).unwrap_or_default()
 }
 
 struct Loaded {
@@ -1129,7 +1196,21 @@ fn find_carriers(
     }
     let others = invocation.operation != Operation::List && !invocation.self_target;
     if others {
+        let directory = named.parent().unwrap_or(Path::new("."));
+        let entries = visible_entries(directory).ok();
         let mut stem = file_name(named);
+        // On a case-insensitive filesystem the named file may be spelled
+        // differently on disk; its siblings match the on-disk spelling.
+        if let Some(entries) = &entries
+            && !carriers.is_empty()
+            && !entries.iter().any(|(name, _)| *name == stem)
+            && let Some((actual, _)) = entries
+                .iter()
+                .find(|(name, is_dir)| !is_dir && name.eq_ignore_ascii_case(&stem))
+        {
+            carriers[0].0 = directory.join(native(actual));
+            stem = actual.clone();
+        }
         if stem.to_ascii_lowercase().ends_with(".par3") {
             stem.truncate(stem.len() - 5);
         }
@@ -1140,13 +1221,10 @@ fn find_carriers(
             }
         }
         let prefix = format!("{stem}.");
-        let directory = named.parent().unwrap_or(Path::new("."));
-        let shown_directory = invocation
-            .par_filename
-            .rfind('/')
+        let shown_directory = last_separator(&invocation.par_filename)
             .map(|slash| invocation.par_filename[..=slash].to_owned())
             .unwrap_or_default();
-        if let Ok(entries) = visible_entries(directory) {
+        if let Some(entries) = entries {
             for (name, is_dir) in entries {
                 let lower = name.to_ascii_lowercase();
                 if is_dir
@@ -1156,7 +1234,7 @@ fn find_carriers(
                 {
                     continue;
                 }
-                let path = directory.join(&name);
+                let path = directory.join(native(&name));
                 if carriers.iter().any(|(known, _)| *known == path) {
                     continue;
                 }
@@ -1260,6 +1338,9 @@ fn tree_order(set: &Par3Set) -> (Vec<usize>, Vec<usize>) {
         .collect();
     let mut file_order = Vec::new();
     let mut directory_order = Vec::new();
+    // Membership in constant time: a set may hold many thousands of entries.
+    let mut file_seen = vec![false; set.files().len()];
+    let mut directory_seen = vec![false; set.directories().len()];
     let mut stack: Vec<std::vec::IntoIter<Fingerprint>> =
         vec![set.root().children.clone().into_iter()];
     while let Some(level) = stack.last_mut() {
@@ -1268,11 +1349,11 @@ fn tree_order(set: &Par3Set) -> (Vec<usize>, Vec<usize>) {
             continue;
         };
         if let Some(&index) = files.get(&child) {
-            if !file_order.contains(&index) {
+            if !std::mem::replace(&mut file_seen[index], true) {
                 file_order.push(index);
             }
         } else if let Some(&index) = directories.get(&child)
-            && !directory_order.contains(&index)
+            && !std::mem::replace(&mut directory_seen[index], true)
         {
             directory_order.push(index);
             stack.push(
@@ -1285,16 +1366,8 @@ fn tree_order(set: &Par3Set) -> (Vec<usize>, Vec<usize>) {
         }
     }
     // Anything the walk missed keeps the engine's order at the end.
-    for index in 0..set.files().len() {
-        if !file_order.contains(&index) {
-            file_order.push(index);
-        }
-    }
-    for index in 0..set.directories().len() {
-        if !directory_order.contains(&index) {
-            directory_order.push(index);
-        }
-    }
+    file_order.extend((0..set.files().len()).filter(|&index| !file_seen[index]));
+    directory_order.extend((0..set.directories().len()).filter(|&index| !directory_seen[index]));
     (file_order, directory_order)
 }
 
@@ -1688,7 +1761,7 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
     let (extra_carriers, extra_files): (Vec<_>, Vec<_>) = extra
         .files
         .iter()
-        .map(|name| (context.base.join(name), name.clone()))
+        .map(|name| (context.base.join(native(name)), name.clone()))
         .partition(|(_, name)| name.to_ascii_lowercase().ends_with(".par3"));
     let extra_files: Vec<PathBuf> = extra_files.into_iter().map(|(path, _)| path).collect();
 
@@ -1763,7 +1836,7 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
                 Err(_) => " - missing.",
             };
             if state != " - found." {
-                missing_directories.push(path);
+                missing_directories.push((name.to_owned(), path));
             }
             if noise >= -1 {
                 println!("Target: \"{name}\"{state}");
@@ -1782,10 +1855,16 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
     for file in set.files() {
         let path =
             member_path(base, file.path()).map_err(|failure| failure.with_trailer(trailer))?;
-        let source = SourceId(bindings.len() as u64);
-        disk.insert(source, path.clone());
+        // Only a regular file (or a link to one) is a source; anything else
+        // at the name is left unbound, so its contents count as missing and
+        // it is reported as "not file" below.
+        let regular = std::fs::metadata(&path).is_ok_and(|meta| meta.is_file());
+        if regular {
+            let source = SourceId(bindings.len() as u64);
+            disk.insert(source, path.clone());
+            bindings.push((file.path().to_owned(), source));
+        }
         destinations.insert(file.path().to_owned(), path);
-        bindings.push((file.path().to_owned(), source));
     }
     let mut candidates = Vec::new();
     for path in &extra_files {
@@ -2040,8 +2119,10 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
         return Ok(());
     }
 
-    for directory in &missing_directories {
-        std::fs::create_dir_all(directory).map_err(|error| {
+    for (name, directory) in &missing_directories {
+        // Made the way repair installs files: relative to a handle on the
+        // base, never through a link swapped in since the check above.
+        par3_rs::session_repair::create_directory(base, name).map_err(|error| {
             Failure::new(
                 RET_FILE_IO_ERROR,
                 format!("rarpar: {}: {error}", directory.display()),
@@ -2147,7 +2228,7 @@ fn search_candidates(
     let Some(layout) = session.layout()? else {
         return Ok(());
     };
-    let mut limits = PlacementOptions::default();
+    let mut limits = search_limits();
     for (file_index, file) in layout.files().iter().enumerate() {
         for (extent_index, extent) in file.extents.iter().enumerate() {
             if search_limit > 0 && started.elapsed().as_millis() >= u128::from(search_limit) {
@@ -2184,6 +2265,16 @@ fn search_candidates(
         }
     }
     Ok(())
+}
+
+/// par3cmdline searches every byte of every name it is given; only `-S`
+/// bounds the search, by time. The API's safety defaults do not apply.
+fn search_limits() -> PlacementOptions {
+    PlacementOptions {
+        max_read_bytes: u64::MAX,
+        max_candidates: usize::MAX,
+        ..PlacementOptions::default()
+    }
 }
 
 #[cfg(test)]
@@ -2490,8 +2581,20 @@ mod tests {
         assert_eq!(invocation.par_filename, "a.bin.par3");
         assert_eq!(invocation.par_argument, "a.bin");
         assert!(invocation.files.is_empty());
-        let invocation = parsed(&["v", "/data/sets/set.par3"]);
-        assert_eq!(invocation.options.base_path, "/data/sets");
+        // An absolute PAR filename gives the base path; what counts as
+        // absolute, and which separators split it, is the platform's.
+        if cfg!(windows) {
+            let invocation = parsed(&["v", r"C:\data\sets\set.par3"]);
+            assert_eq!(invocation.options.base_path, r"C:\data\sets");
+            let invocation = parsed(&["v", "C:/data/sets/set.par3"]);
+            assert_eq!(invocation.options.base_path, "C:/data/sets");
+            // Rooted without a drive is not absolute there.
+            let invocation = parsed(&["v", "/data/sets/set.par3"]);
+            assert_eq!(invocation.options.base_path, "");
+        } else {
+            let invocation = parsed(&["v", "/data/sets/set.par3"]);
+            assert_eq!(invocation.options.base_path, "/data/sets");
+        }
         let invocation = parsed(&["rs", "dir/set.zip"]);
         assert_eq!(invocation.options.base_path, "dir");
         assert_eq!(invocation.par_filename, "set.zip");
@@ -2526,6 +2629,59 @@ mod tests {
         assert!(!wildcard_match(b"*.txt", b"alpha.bin"));
         assert!(wildcard_match(b"alpha.bin", b"alpha.bin"));
         assert!(!wildcard_match(b"alpha", b"alpha.bin"));
+    }
+
+    #[test]
+    fn moved_file_searches_carry_no_byte_or_candidate_ceiling() {
+        let limits = search_limits();
+        assert_eq!(limits.max_read_bytes, u64::MAX);
+        assert_eq!(limits.max_candidates, usize::MAX);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_arguments_survive_the_parser_byte_for_byte() {
+        use std::os::unix::ffi::OsStrExt;
+        for bytes in [
+            &b"plain.par3"[..],
+            b"caf\xe9.par3",
+            b"\xff\xfe/\x80set",
+            b"ok\xc3",
+        ] {
+            let original = OsStr::from_bytes(bytes);
+            assert_eq!(native(&escape(original)), original, "{bytes:?}");
+        }
+        assert_eq!(escape(OsStr::new("set.par3")), "set.par3");
+        let invocation = parsed(&["v", &escape(OsStr::from_bytes(b"sub\xff/set.par3"))]);
+        assert_eq!(
+            native(&invocation.par_filename).as_bytes(),
+            b"sub\xff/set.par3"
+        );
+    }
+
+    #[test]
+    fn self_targets_split_on_native_separators() {
+        let invocation = parsed(&["vs", "sub/set.zip"]);
+        assert_eq!(invocation.options.base_path, "sub");
+        assert_eq!(invocation.par_filename, "set.zip");
+        #[cfg(windows)]
+        {
+            let invocation = parsed(&["vs", "sub\\set.zip"]);
+            assert_eq!(invocation.options.base_path, "sub");
+            assert_eq!(invocation.par_filename, "set.zip");
+        }
+        #[cfg(not(windows))]
+        assert_eq!(last_separator("sub\\set.zip"), None);
+    }
+
+    #[test]
+    fn every_unix_permissions_spelling_is_remembered() {
+        for option in ["-fu", "-fu0", "-fu8", "-fu7"] {
+            assert!(
+                parsed(&["v", option, "set"]).options.unix_permissions_given,
+                "{option}"
+            );
+        }
     }
 
     #[test]

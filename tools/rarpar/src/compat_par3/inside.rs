@@ -154,6 +154,12 @@ pub(super) fn self_repair(
     // replacing any earlier backup of that name.
     let mut backup = path.as_os_str().to_owned();
     backup.push(".1");
+    // Windows' rename does not replace an existing file; clear the old
+    // backup first so a second repair behaves as on every other platform.
+    match std::fs::remove_file(&backup) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
+    }
     std::fs::rename(path, &backup)?;
     std::fs::rename(&temporary, path)?;
     Ok(true)
@@ -161,19 +167,26 @@ pub(super) fn self_repair(
 
 /// Copy every complete packet found in `source` to `output`, in file order,
 /// until `limit` bytes have been copied, as par3cmdline's `copy_inside_data`
-/// does: it reads a buffer the size of the packet region rounded up to 4 KiB,
+/// does: it reads a window the size of the packet region rounded up to 4 KiB,
 /// skipping intact input slices that start a read, and checks each packet's
 /// fingerprint before copying it.
+///
+/// The window is followed exactly but never held in memory: the region can be
+/// far larger than the archive, and its size comes from untrusted metadata.
+/// Bytes are read through a bounded cache, and a packet is hashed and then
+/// copied in bounded pieces.
 fn copy_complete_packets(
     source: &Path,
     output: &mut File,
     limit: u64,
     found: &[Range<u64>],
 ) -> io::Result<u64> {
-    let capacity = usize::try_from((limit + 4095) & !4095)
-        .map_err(|_| io::Error::other("packet region too large"))?;
-    let mut buffer = vec![0u8; capacity];
-    let mut input = File::open(source)?;
+    let capacity = limit
+        .checked_add(4095)
+        .map(|size| size & !4095)
+        .ok_or_else(|| io::Error::other("packet region too large"))?;
+    let mut input = Reader::open(source)?;
+    let file_len = input.len;
     let mut file_offset = 0u64;
     let mut total = 0u64;
     while total < limit {
@@ -188,48 +201,115 @@ fn copy_complete_packets(
             }
             index += 1;
         }
-        input.seek(SeekFrom::Start(file_offset))?;
-        let (mut filled, mut at_end) = fill(&mut input, &mut buffer)?;
-        let mut offset = 0usize;
-        while offset + HEADER < filled {
-            if &buffer[offset..offset + 8] != MAGIC {
+        // The window `fread` would fill: `filled` bytes from `file_offset`.
+        let remaining = file_len.saturating_sub(file_offset);
+        let mut filled = remaining.min(capacity);
+        let mut at_end = remaining < capacity || filled == 0;
+        let mut offset = 0u64;
+        while offset + (HEADER as u64) < filled {
+            let header = input.bytes(file_offset + offset, HEADER)?;
+            if &header[..8] != MAGIC {
                 offset += 1;
                 continue;
             }
-            let length = u64::from_le_bytes(buffer[offset + 24..offset + 32].try_into().unwrap());
+            let length = u64::from_le_bytes(header[24..32].try_into().unwrap());
+            let stored: [u8; 16] = header[8..24].try_into().unwrap();
             if length <= HEADER as u64 {
                 offset += 8;
                 continue;
             }
-            if (offset as u64).saturating_add(length) > filled as u64 {
-                buffer.copy_within(offset..filled, 0);
-                file_offset += offset as u64;
-                let kept = filled - offset;
-                let (more, end) = fill(&mut input, &mut buffer[kept..kept + offset])?;
-                at_end |= end;
-                filled = kept + more;
+            if offset.saturating_add(length) > filled {
+                // Slide the window to start at this header, keeping its size.
+                file_offset += offset;
+                let left = file_len.saturating_sub(file_offset);
+                // `fread` topping the window back up hit the end of the file.
+                at_end |= left < filled;
+                filled = filled.min(left);
                 offset = 0;
-                if length > filled as u64 {
+                if length > filled {
                     offset += 8;
                     continue;
                 }
             }
-            let end = offset + length as usize;
-            let hash = par3_rs::fingerprint(&buffer[offset + 24..end]);
-            if hash[..] != buffer[offset + 8..offset + 24] {
+            let at = file_offset + offset;
+            let mut hash = par3_rs::hash::FingerprintHasher::new();
+            input.stream(at + 24, length - 24, |piece| {
+                hash.update(piece);
+                Ok(())
+            })?;
+            if hash.finalize()[..] != stored[..] {
                 offset += 8;
                 continue;
             }
-            output.write_all(&buffer[offset..end])?;
+            input.stream(at, length, |piece| output.write_all(piece))?;
             total += length;
-            offset = end;
+            offset += length;
         }
-        file_offset += offset as u64;
+        file_offset += offset;
         if at_end {
             break;
         }
     }
     Ok(total)
+}
+
+/// Bounded reads at any offset of the damaged file.
+struct Reader {
+    file: File,
+    len: u64,
+    /// File offset of `cache[0]`.
+    start: u64,
+    cache: Vec<u8>,
+}
+
+/// The most of the damaged file held at once.
+const READ_CHUNK: usize = 1 << 20;
+
+impl Reader {
+    fn open(path: &Path) -> io::Result<Self> {
+        let file = File::open(path)?;
+        let len = file.metadata()?.len();
+        Ok(Self {
+            file,
+            len,
+            start: 0,
+            cache: Vec::new(),
+        })
+    }
+
+    /// `count` bytes at `at`, which the caller knows lie within the file.
+    fn bytes(&mut self, at: u64, count: usize) -> io::Result<&[u8]> {
+        let end = at + count as u64;
+        if at < self.start || end > self.start + self.cache.len() as u64 {
+            self.start = at;
+            let take = (self.len - at).min(READ_CHUNK as u64) as usize;
+            self.cache.resize(take.max(count), 0);
+            self.file.seek(SeekFrom::Start(at))?;
+            let (read, _) = fill(&mut self.file, &mut self.cache)?;
+            self.cache.truncate(read);
+            if read < count {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+        }
+        let from = (at - self.start) as usize;
+        Ok(&self.cache[from..from + count])
+    }
+
+    /// Hand `length` bytes from `at` to `each`, a bounded piece at a time.
+    fn stream(
+        &mut self,
+        mut at: u64,
+        length: u64,
+        mut each: impl FnMut(&[u8]) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let end = at + length;
+        while at < end {
+            let take = (end - at).min(READ_CHUNK as u64) as usize;
+            each(self.bytes(at, take)?)?;
+            at += take as u64;
+        }
+        Ok(())
+    }
 }
 
 /// Read until `buffer` is full or the file ends, as `fread` does.

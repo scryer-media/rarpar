@@ -249,6 +249,8 @@ fn create_only_switches_are_rejected_on_verify_repair_and_list() {
                 "rarpar does not create PAR3 files through the par3cmdline facade, so -fu and -ff are not supported.",
             ),
             ("-fu7", "so -fu and -ff are not supported."),
+            ("-fu0", "so -fu and -ff are not supported."),
+            ("-fu8", "so -fu and -ff are not supported."),
             ("-ff", "so -fu and -ff are not supported."),
             (
                 "-abs",
@@ -292,6 +294,12 @@ fn create_side_commands_are_refused_after_the_argument_checks() {
         (&["i", "bundle.zip"], "(i, ti and d are not supported)"),
         (&["ti", "bundle.zip"], "(i, ti and d are not supported)"),
         (&["d", "bundle.zip"], "(i, ti and d are not supported)"),
+        // Refused before the missing base path is looked at.
+        (
+            &["c", "-Bnowhere", "new.par3", "pebble.txt"],
+            "(c is not supported)",
+        ),
+        (&["e", "-Bnowhere", "set.par3"], "(e is not supported)"),
     ] {
         par3.run(root, args).code(3).says(message);
     }
@@ -434,6 +442,75 @@ fn moved_input_data_is_found_among_extra_files() {
         .code(0)
         .says("Repair complete.");
     assert_eq!(std::fs::read(root.join("orchard.bin")).unwrap(), original);
+}
+
+/// A hidden set loads its hidden recovery volumes, and a dangling link
+/// beside them hides none of them.
+#[test]
+fn hidden_sets_and_broken_entries_still_load_every_volume() {
+    let par3 = Par3::new();
+    let dir = fixture();
+    let root = dir.path();
+    rarpar(
+        root,
+        &[
+            "par3",
+            "create",
+            "--quiet",
+            "-s",
+            "500",
+            "-c",
+            "2",
+            ".set.par3",
+            "lantern.bin",
+        ],
+    )
+    .code(0);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("nowhere", root.join("dangling")).unwrap();
+    let original = std::fs::read(root.join("lantern.bin")).unwrap();
+    damage(&root.join("lantern.bin"), 10, 400);
+    par3.run(root, &["r", ".set.par3"])
+        .code(0)
+        .says("Loading \".set.vol")
+        .says("Repair complete.");
+    assert_eq!(std::fs::read(root.join("lantern.bin")).unwrap(), original);
+}
+
+/// On a case-insensitive filesystem a PAR filename spelled in another case
+/// still finds its recovery volumes by the on-disk spelling.
+#[test]
+fn a_differently_cased_par_name_finds_its_volumes() {
+    let par3 = Par3::new();
+    let dir = fixture();
+    let root = dir.path();
+    create(root, "500", "2", &["lantern.bin"]);
+    if !root.join("SET.PAR3").is_file() {
+        eprintln!("skipping: the filesystem is case-sensitive");
+        return;
+    }
+    let original = std::fs::read(root.join("lantern.bin")).unwrap();
+    damage(&root.join("lantern.bin"), 10, 400);
+    par3.run(root, &["r", "SET.PAR3"])
+        .code(0)
+        .says("Loading \"set.vol")
+        .says("Repair complete.");
+    assert_eq!(std::fs::read(root.join("lantern.bin")).unwrap(), original);
+}
+
+/// A protected name that is now a directory is reported, not an I/O abort.
+#[test]
+fn a_directory_at_a_protected_name_is_not_file() {
+    let par3 = Par3::new();
+    let dir = fixture();
+    let root = dir.path();
+    create(root, "500", "2", &["lantern.bin", "pebble.txt"]);
+    std::fs::remove_file(root.join("pebble.txt")).unwrap();
+    std::fs::create_dir(root.join("pebble.txt")).unwrap();
+    par3.run(root, &["v", "set.par3"])
+        .code(0)
+        .says("Target: \"pebble.txt\" - not file.")
+        .says("Repair is possible.");
 }
 
 #[test]
