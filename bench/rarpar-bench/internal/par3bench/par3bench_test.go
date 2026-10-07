@@ -638,3 +638,18 @@ func TestVersionProbeProblem(t *testing.T) {
 		t.Error("a probe that did not start must not identify the binary")
 	}
 }
+
+// A set named twice would run twice under one row key and double its samples.
+func TestSelectRejectsADuplicateSet(t *testing.T) {
+	profile, err := LookupProfile("smoke")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := profile.Select([]string{"smoke-gf8", "smoke-gf8"}); err == nil || !strings.Contains(err.Error(), "more than once") {
+		t.Fatalf("Select with a repeated set = %v, want a duplicate error", err)
+	}
+	selected, err := profile.Select([]string{"smoke-gf8"})
+	if err != nil || len(selected.Configs) != 1 {
+		t.Fatalf("Select of one set = %d configs, %v", len(selected.Configs), err)
+	}
+}
