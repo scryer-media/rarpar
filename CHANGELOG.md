@@ -65,7 +65,8 @@ documented in each crate's own changelog so those notes ship with the crate.
   walk as soon as the limit is passed, the streaming lanes' memory budget
   counts the state kept per block, ZIP member times are local times (DOS
   time has no zone), and setuid, setgid and sticky bits are kept in ZIP
-  external attributes.
+  external attributes. An odd `--block-size` too large to round up to an
+  even size is refused as a usage error instead of aborting.
 - `par3 inside repair` puts a lost host beside the surviving hosts of its
   own set when one command repairs sets from several directories, and a
   `--dry-run` repair reports `"status": "planned"` with `"dry_run": true`

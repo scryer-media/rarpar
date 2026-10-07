@@ -315,6 +315,8 @@ fn existing_outputs_and_bad_switches_are_refused() {
         &["--level", "10"][..],
         &["-mx=9"][..],
         &["--inside", "-r", "251"][..],
+        // The largest odd block size has no even size to round up to.
+        &["-s", "18446744073709551615"][..],
     ] {
         let mut args = vec!["par3", "archive", "--base-path", "in", "other.7z"];
         args.extend(MEMBERS);
