@@ -577,23 +577,22 @@ impl ScanReadAhead {
                 take = take.min(self.unit);
                 options.scan_work.charge(take)?;
             }
-            let read = match options.diagnostics.read_at(
-                access,
-                source,
-                offset,
-                &mut self.bytes[..take],
-            ) {
-                Ok(read) => read,
-                // A source that vanished or was rewritten under the refill
-                // reports that, not the I/O error it caused: the poll-level
-                // generation check this read would have been settled by
-                // never runs once the error is returned.
-                Err(error) => {
-                    ensure_snapshot(access, source, snapshot)?;
-                    self.unchecked = false;
-                    return Err(error.into());
-                }
-            };
+            let read =
+                match options
+                    .diagnostics
+                    .read_at(access, source, offset, &mut self.bytes[..take])
+                {
+                    Ok(read) => read,
+                    // A source that vanished or was rewritten under the refill
+                    // reports that, not the I/O error it caused: the poll-level
+                    // generation check this read would have been settled by
+                    // never runs once the error is returned.
+                    Err(error) => {
+                        ensure_snapshot(access, source, snapshot)?;
+                        self.unchecked = false;
+                        return Err(error.into());
+                    }
+                };
             if read > take {
                 return Err(EngineError::InvalidState("invalid source read length"));
             }
