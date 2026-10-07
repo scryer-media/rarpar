@@ -1588,3 +1588,85 @@ fn sdel_keeps_an_archive_whose_every_member_was_skipped() {
         b"also archived"
     );
 }
+
+/// Splits `whole` into `<name>.001`, `<name>.002`, ... under `dir`.
+fn write_volumes(dir: &Path, name: &str, whole: &[u8]) -> Vec<PathBuf> {
+    whole
+        .chunks(40_000)
+        .enumerate()
+        .map(|(index, piece)| {
+            let path = dir.join(format!("{name}.{:03}", index + 1));
+            std::fs::write(&path, piece).unwrap();
+            path
+        })
+        .collect()
+}
+
+/// `-sdel` deletes every volume of a split set it extracted.
+#[test]
+fn sdel_deletes_every_volume_of_a_split_set() {
+    let dir = tempfile::tempdir().unwrap();
+    write_archive(&dir.path().join("whole.7z"), SOLID);
+    let whole = std::fs::read(dir.path().join("whole.7z")).unwrap();
+    let inbox = dir.path().join("inbox");
+    std::fs::create_dir(&inbox).unwrap();
+    let volumes = write_volumes(&inbox, "crate.7z", &whole);
+    assert!(volumes.len() > 1);
+    let out_arg = format!("-o{}", dir.path().join("out").display());
+    let (out, _) = expect(
+        &facade(&inbox, &["x", "-sdel", "-y", &out_arg, "crate.7z.001"], b""),
+        0,
+    );
+    assert!(out.contains("Everything is Ok"), "{out}");
+    for volume in &volumes {
+        assert!(!volume.exists(), "{} survived", volume.display());
+    }
+    assert_tree(&dir.path().join("out"));
+}
+
+/// A volume `-sdel` cannot delete is an error of its archive: it is named
+/// with the system's reason, the archive is not counted OK, and the command
+/// exits 2 rather than 0.
+#[cfg(unix)]
+#[test]
+fn sdel_reports_volumes_it_cannot_delete() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    write_archive(&dir.path().join("whole.7z"), SOLID);
+    let whole = std::fs::read(dir.path().join("whole.7z")).unwrap();
+    let inbox = dir.path().join("inbox");
+    std::fs::create_dir(&inbox).unwrap();
+    let volumes = write_volumes(&inbox, "crate.7z", &whole);
+    // A folder nobody may write: its entries cannot be removed.
+    std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let probe = inbox.join("probe");
+    if std::fs::write(&probe, b"").is_ok() {
+        // Permissions do not bind this process (root): nothing to test.
+        let _ = std::fs::remove_file(&probe);
+        std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let out_arg = format!("-o{}", dir.path().join("out").display());
+    let output = facade(&inbox, &["x", "-sdel", "-y", &out_arg, "crate.7z.001"], b"");
+    std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (out, err) = expect(&output, 2);
+    for volume in &volumes {
+        assert!(volume.is_file(), "{} went", volume.display());
+        assert!(
+            err.contains(&format!(
+                "ERROR: Cannot delete file : errno={} : ",
+                libc::EACCES
+            )) && err.contains(&format!(
+                " : {}\n",
+                volume.file_name().unwrap().to_string_lossy()
+            )),
+            "{err}"
+        );
+    }
+    assert!(out.contains("Archives with Errors: 1\n"), "{out}");
+    assert!(
+        out.contains(&format!("Sub items Errors: {}\n", volumes.len())),
+        "{out}"
+    );
+    assert_tree(&dir.path().join("out"));
+}

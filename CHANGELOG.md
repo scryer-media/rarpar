@@ -164,6 +164,9 @@ documented in each crate's own changelog so those notes ship with the crate.
   longer hides it, so the run reports it and fails.
 - `par3 inside` lists each volume family's directory once and opens each
   volume once, however many volumes of the family are named.
+- 7-Zip facade: a volume `-sdel` cannot delete is reported with its path and
+  the system's reason, and counts as an error of its archive, so the summary
+  lists the archive with errors and the command exits 2 instead of 0.
 
 ### Library versions
 

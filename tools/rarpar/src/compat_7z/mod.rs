@@ -1102,9 +1102,28 @@ fn run_extract(session: &mut Session, options: Options, archives: Vec<(String, u
                 // An archive is deleted only when something was written from
                 // it: not when the filters selected nothing, nor when the
                 // overwrite policy skipped every destination.
+                // A volume that cannot be deleted is an error of this archive:
+                // it is named with the system's reason, and the archive is no
+                // longer counted as OK, so the command does not exit 0.
                 if delete_after && !setup.test && written > 0 {
+                    let mut failed = 0u64;
                     for volume in &set.paths {
-                        let _ = fs::remove_file(volume);
+                        match fs::remove_file(volume) {
+                            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                                failed += 1;
+                                session.err(&format!(
+                                    "ERROR: Cannot delete file : {} : {}\n",
+                                    errno_text(&error),
+                                    volume.display()
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if failed != 0 {
+                        ok -= 1;
+                        with_errors += 1;
+                        file_errors += failed;
                     }
                 }
             }
