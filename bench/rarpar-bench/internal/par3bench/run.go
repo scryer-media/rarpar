@@ -758,6 +758,9 @@ func validateOptions(options *Options) error {
 		}
 		target.Work = absolute
 	}
+	if err := distinctTargets(options.Targets); err != nil {
+		return err
+	}
 	if options.Work == "" {
 		options.Work = options.Targets[0].Work
 	}
@@ -1922,4 +1925,44 @@ func CollectMachine(ctx context.Context, label string) bench.Machine {
 		machine.Kernel = runtime.GOOS
 	}
 	return machine
+}
+
+// resolvedWork is an absolute work path with the symbolic links of its
+// longest existing prefix resolved, so two spellings of one directory compare
+// equal before either has been created.
+func resolvedWork(path string) string {
+	rest := ""
+	for current := path; ; {
+		if resolved, err := filepath.EvalSymlinks(current); err == nil {
+			return filepath.Join(resolved, rest)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return path
+		}
+		rest = filepath.Join(filepath.Base(current), rest)
+		current = parent
+	}
+}
+
+// distinctTargets refuses two targets whose work paths name one directory.
+// Each target gets its own copy of the canonical set, and a copy whose source
+// and destination are the same directory would wipe the set it copies.
+func distinctTargets(targets []Target) error {
+	for i := range targets {
+		for j := 0; j < i; j++ {
+			a, b := resolvedWork(targets[j].Work), resolvedWork(targets[i].Work)
+			same := a == b
+			if !same {
+				// A case-insensitive filesystem names one directory two ways.
+				first, errFirst := os.Stat(a)
+				second, errSecond := os.Stat(b)
+				same = errFirst == nil && errSecond == nil && os.SameFile(first, second)
+			}
+			if same {
+				return fmt.Errorf("targets %q and %q resolve to the same work directory %s", targets[j].Name, targets[i].Name, b)
+			}
+		}
+	}
+	return nil
 }
