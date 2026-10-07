@@ -327,6 +327,36 @@ fn existing_outputs_and_bad_switches_are_refused() {
     }
 }
 
+/// With `--overwrite`, a previous archive and index under an input directory
+/// are not packed into their replacement.
+#[test]
+fn an_overwritten_archive_under_an_input_is_not_its_own_member() {
+    let dir = fixture(1000);
+    let root = dir.path();
+    let names = |archive: &str| {
+        let mut names = Vec::new();
+        let mut reader =
+            sevenz_turbo::ArchiveReader::open(root.join(archive), sevenz_turbo::Password::empty())
+                .unwrap();
+        reader
+            .for_each_entries(|entry, _| {
+                names.push(entry.name().to_owned());
+                Ok(true)
+            })
+            .unwrap();
+        names.sort();
+        names
+    };
+    archive(root, &["in/cellar/set.7z", "cellar", "-c", "1"]);
+    let first = names("in/cellar/set.7z");
+    assert!(root.join("in/cellar/set.par3").is_file());
+    archive(
+        root,
+        &["--overwrite", "in/cellar/set.7z", "cellar", "-c", "1"],
+    );
+    assert_eq!(names("in/cellar/set.7z"), first);
+}
+
 /// An archive named like its own PAR3 index is refused before anything is
 /// written, with or without `--overwrite`, in either case of the extension.
 #[test]

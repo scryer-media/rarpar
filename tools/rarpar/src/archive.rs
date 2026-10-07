@@ -242,9 +242,7 @@ impl Candidate {
     /// Memory this lane needs over an archive of up to `length` bytes: its
     /// recovery rows, and the state it keeps for every input block.
     fn bytes(&self, length: u64) -> u64 {
-        let rows = self
-            .block_size
-            .saturating_mul(self.rows)
+        let rows = par3_stream::coding_bytes(self.block_size, self.rows)
             .saturating_mul(self.fields.len() as u64);
         let blocks = length.div_ceil(self.block_size.max(1)).saturating_add(1);
         rows.saturating_add(blocks.saturating_mul(par3_stream::LANE_BYTES_PER_BLOCK))
@@ -710,6 +708,55 @@ fn refuse_aliases(paths: &[PathBuf]) -> Result<(), RarparError> {
     Ok(())
 }
 
+/// Drop from `members` the outputs of a previous run this one replaces (with
+/// `--overwrite`, under an input directory): the archive, the index, and,
+/// for a sibling set, recovery volumes of the index's name whatever their row
+/// count. A previous output is never packed into its own replacement.
+fn exclude_outputs(
+    members: &mut Vec<Member>,
+    outputs: &[PathBuf],
+    index: Option<&Path>,
+) -> Result<(), RarparError> {
+    let mut existing = Vec::new();
+    for path in outputs {
+        if path.try_exists()? {
+            existing.push(path.canonicalize()?);
+        }
+    }
+    let mut volumes = None;
+    if let Some(index) = index
+        && let Some(base) = index
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".par3"))
+        && parent(index).try_exists()?
+    {
+        volumes = Some((parent(index).canonicalize()?, format!("{base}.vol")));
+    }
+    let is_volume = |path: &Path| {
+        let Some((directory, base)) = &volumes else {
+            return false;
+        };
+        let Some(rest) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix(base.as_str()))
+            .and_then(|rest| rest.strip_suffix(".par3"))
+        else {
+            return false;
+        };
+        let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+        path.parent() == Some(directory.as_path())
+            && rest
+                .split_once('+')
+                .is_some_and(|(start, count)| digits(start) && digits(count))
+    };
+    members.retain(|member| {
+        member.directory || !(existing.contains(&member.path) || is_volume(&member.path))
+    });
+    Ok(())
+}
+
 pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparError> {
     // An odd block size rounds up to even; the largest odd size has no even
     // size above it.
@@ -722,7 +769,7 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
     let base = args.base_path.clone().unwrap_or(std::env::current_dir()?);
     reject_symlinks(&base)?;
     let base = base.canonicalize()?;
-    let members = collect(&base, &args.inputs, cli.max_files)?;
+    let mut members = collect(&base, &args.inputs, cli.max_files)?;
 
     let output = &args.output;
     reject_symlinks(output)?;
@@ -783,6 +830,7 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
             )));
         }
     }
+    exclude_outputs(&mut members, &outputs, outputs.get(1).map(PathBuf::as_path))?;
     let input_bytes: u64 = members.iter().map(|member| member.size).sum();
     if cli.dry_run {
         return Ok((
@@ -907,7 +955,7 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
             "the archive is too small to hold an input block".into(),
         ));
     }
-    let needed = geometry.block_size.saturating_mul(geometry.rows);
+    let needed = par3_stream::coding_bytes(geometry.block_size, geometry.rows);
     let mut reread = false;
     let mut lane = if protect.buffering {
         let peak = needed.saturating_add(protect.head.len() as u64);
@@ -1037,11 +1085,18 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
             }
         }
     }
+    // The index and volumes are written and synced beside their names before
+    // the archive is installed, so a failed write replaces nothing.
+    let sibling = if geometry.inside.is_none() {
+        Some(write_sibling(&stem, &set, rows, cli.overwrite)?)
+    } else {
+        None
+    };
     staged
         .persist(output)
         .map_err(|error| RarparError::Io(error.error))?;
-    if geometry.inside.is_none() {
-        written.extend(write_sibling(&stem, &set, rows, cli.overwrite)?);
+    if let Some(sibling) = sibling {
+        written.extend(sibling.install()?);
     }
     Ok((
         true,
@@ -1405,6 +1460,20 @@ mod tests {
         let error = collect(&base, &inputs, 50).err().expect("over the limit");
         assert!(matches!(error, RarparError::Resource(_)), "{error}");
         assert!(collect(&base, &inputs, 3).is_err());
+    }
+
+    /// Four million 40-byte rows are 160 MB of row bytes, but each row is its
+    /// own allocation: the estimate counts that too, so the default 256 MiB
+    /// budget refuses the lane before it is allocated.
+    #[test]
+    fn lane_budgets_count_each_recovery_row_allocation() {
+        let candidate = Candidate {
+            block_size: 40,
+            fields: vec![reference_field(1, 0, 1, 0)],
+            rows: 4_000_000,
+        };
+        assert!(candidate.bytes(0) > 256 * MIB, "{}", candidate.bytes(0));
+        assert!(par3_stream::coding_bytes(40, 4_000_000) > 256 * MIB);
     }
 
     #[test]

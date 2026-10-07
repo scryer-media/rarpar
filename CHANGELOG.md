@@ -112,6 +112,16 @@ documented in each crate's own changelog so those notes ship with the crate.
   set protects when looking for renamed carriers beside it: the `.par3`
   carriers are scanned first and only the other siblings are sniffed. Ten
   protected files beside the set: verify opens 14 files instead of 24.
+- `par3 archive --overwrite` with the archive under an input directory no
+  longer packs the previous archive, its PAR3 index or its recovery volumes
+  into the new archive.
+- `par3 archive` counts each recovery row's own allocation against
+  `--par3-memory-mib`, so many recovery blocks of a small block size are refused
+  before they are allocated instead of overrunning the budget.
+- `par3 archive` writes and syncs the sibling index and recovery volumes
+  beside their names before it installs anything, so a failed write (a full
+  disk, say) no longer leaves the archive replaced and the previous set
+  truncated.
 
 ### Library versions
 
