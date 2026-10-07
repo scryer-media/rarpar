@@ -1380,6 +1380,34 @@ fn recursive_archive_includes_descend() {
     assert!(!out.contains("low.7z"), "{out}");
 }
 
+/// With wildcard matching off (`-aiw-`, or `-spd` for the archive name), `*`
+/// is a character of the name: only the archive literally called `set*.7z`
+/// is opened, and `-sdel` never reaches the archives the wildcard would match.
+#[cfg(unix)]
+#[test]
+fn literal_archive_names_are_not_expanded() {
+    let dir = tempfile::tempdir().unwrap();
+    let literal = dir.path().join("set*.7z");
+    let other = dir.path().join("setalpha.7z");
+    for (args, out) in [
+        (&["x", "-an", "-aiw-!set*.7z"][..], "one"),
+        (&["x", "-spd", "set*.7z"][..], "two"),
+    ] {
+        write_archive(&literal, SOLID);
+        write_archive(&other, SOLID);
+        let out_switch = format!("-o{out}");
+        let mut args = args.to_vec();
+        args.extend(["-sdel", "-y", out_switch.as_str()]);
+        let (stdout, _) = expect(&facade(dir.path(), &args, b""), 0);
+        assert!(stdout.contains("1 file, "), "{stdout}");
+        assert!(stdout.contains("Extracting archive: set*.7z\n"), "{stdout}");
+        assert!(!stdout.contains("setalpha.7z"), "{stdout}");
+        assert!(!literal.exists(), "{stdout}");
+        assert!(other.is_file());
+        assert_tree(&dir.path().join(out));
+    }
+}
+
 /// `-sdel` deletes an archive only when something was extracted from it: a
 /// filter that matches nothing leaves the archive in place.
 #[test]

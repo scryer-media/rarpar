@@ -16,7 +16,7 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
-use censor::{Censor, MarkMode, NameOption, Recursion, has_wildcard, wildcard_match};
+use censor::{Censor, MarkMode, NameOption, Recursion, has_wildcard, names_equal, wildcard_match};
 use extract::{Ending, HashSums, Overwrite, Setup, Stats};
 use format::{archive_method, smart_size};
 use switches::{LineError, Parsed};
@@ -222,19 +222,17 @@ enum Command {
     List,
 }
 
-/// One `-i`/`-x`/`-ai` argument: its options and its names.
+/// One `-i`/`-x`/`-ai` argument: its options and its names. `base` carries
+/// the defaults its own `r`, `m` and `w` modifiers override: the recursion,
+/// and the `-spd`/`-spm` matching and mark mode.
 fn wildcard_switch(
     text: &str,
     include: bool,
-    default: Recursion,
+    base: NameOption,
     names: &mut Vec<(NameOption, String)>,
 ) -> Result<(), LineError> {
     let invalid = |message: &str| LineError::new(message, text.to_owned());
-    let mut option = NameOption {
-        include,
-        recursion: default,
-        ..NameOption::default()
-    };
+    let mut option = NameOption { include, ..base };
     let chars: Vec<char> = text.chars().collect();
     let mut at = 0;
     if chars.len() < 2 {
@@ -392,19 +390,24 @@ fn parse_options(parsed: &Parsed, session: &mut Session) -> Result<Options, Line
 
     // The archive names: `-ai` and `-ax` keep their own recursion, and
     // nothing ever recurses for the archive name itself, `-r` included.
+    // `-spd` and `-spm` reach them all, as 7-Zip's `nopArc` takes them.
+    let archive_option = NameOption {
+        recursion: Recursion::None,
+        ..default_option
+    };
     let mut archive_names = Vec::new();
     if !parsed.has("an") {
         match words.next() {
-            Some(name) => archive_names.push((NameOption::default(), name.clone())),
+            Some(name) => archive_names.push((archive_option, name.clone())),
             None => return Err(LineError::new("Cannot find archive name", "")),
         }
     }
     for text in &parsed.get("ai").strings {
-        wildcard_switch(text, true, Recursion::None, &mut archive_names)?;
+        wildcard_switch(text, true, archive_option, &mut archive_names)?;
     }
     let mut archive_excluded = Vec::new();
     for text in &parsed.get("ax").strings {
-        wildcard_switch(text, false, Recursion::None, &mut archive_excluded)?;
+        wildcard_switch(text, false, archive_option, &mut archive_excluded)?;
     }
     let mut archive_excludes = Censor::new(case_sensitive);
     archive_excludes.add_name(
@@ -423,7 +426,7 @@ fn parse_options(parsed: &Parsed, session: &mut Session) -> Result<Options, Line
 
     let mut names: Vec<(NameOption, String)> = Vec::new();
     for text in &parsed.get("i").strings {
-        wildcard_switch(text, true, recursion, &mut names)?;
+        wildcard_switch(text, true, default_option, &mut names)?;
     }
     let has_includes = !names.is_empty();
     for text in &parsed.get("x").strings {
@@ -431,7 +434,7 @@ fn parse_options(parsed: &Parsed, session: &mut Session) -> Result<Options, Line
         if rest == "td" || rest == "tf" {
             continue;
         }
-        wildcard_switch(text, false, recursion, &mut names)?;
+        wildcard_switch(text, false, default_option, &mut names)?;
     }
     let mut positional = Vec::new();
     // `--` ends `@listfile` reading for every word after it: judge each
@@ -455,7 +458,9 @@ fn parse_options(parsed: &Parsed, session: &mut Session) -> Result<Options, Line
         }
     }
     if positional.is_empty() && !has_includes {
-        censor.add_name(&default_option, "*");
+        // 7-Zip's universal wildcard takes the default options, so `-spd`
+        // never turns it into a member literally named `*`.
+        censor.add_name(&NameOption::default(), "*");
     }
     for (option, name) in positional.iter().chain(names.iter()) {
         if name.is_empty() {
@@ -633,17 +638,23 @@ fn find_archives(
             Recursion::WildcardOnly => has_wildcard(file),
             Recursion::None => false,
         };
+        // `-spd` or `w-`: `*` and `?` are the name's own characters.
+        let mask = Mask {
+            name: file,
+            wildcards: option.wildcards,
+            case_sensitive,
+        };
         if recursive {
             // `-air`: the name is matched in its folder and every folder
             // under it.
             wildcard_names = true;
             let mut matches = Vec::new();
-            folders += walk(dir, Some((file, case_sensitive)), &mut matches);
+            folders += walk(dir, Some(mask), &mut matches);
             matches.sort();
             found.extend(matches);
             continue;
         }
-        if has_wildcard(file) {
+        if option.wildcards && has_wildcard(file) {
             wildcard_names = true;
             let listing = fs::read_dir(if dir.is_empty() { "." } else { dir });
             let mut matches = Vec::new();
@@ -698,13 +709,32 @@ fn find_archives(
     Ok((found, folders))
 }
 
+/// A file name to look for while walking: a wildcard, or with wildcard
+/// matching off, the literal name.
+#[derive(Clone, Copy)]
+struct Mask<'a> {
+    name: &'a str,
+    wildcards: bool,
+    case_sensitive: bool,
+}
+
+impl Mask<'_> {
+    fn matches(&self, name: &str) -> bool {
+        if self.wildcards {
+            wildcard_match(self.name, name, self.case_sensitive)
+        } else {
+            names_equal(self.name, name, self.case_sensitive)
+        }
+    }
+}
+
 /// Every file under the folder `prefix` names (`""` is the current one)
 /// whose name matches `mask`, returning how many folders it passed.
 ///
 /// Links are never followed: a linked folder such as `loop -> .` would
 /// recurse without end, and a link out of the folder would reach archives
 /// outside the one that was named.
-fn walk(prefix: &str, mask: Option<(&str, bool)>, found: &mut Vec<(String, u64)>) -> u64 {
+fn walk(prefix: &str, mask: Option<Mask>, found: &mut Vec<(String, u64)>) -> u64 {
     let mut folders = 0;
     let Ok(listing) = fs::read_dir(if prefix.is_empty() { "." } else { prefix }) else {
         return 0;
@@ -718,9 +748,7 @@ fn walk(prefix: &str, mask: Option<(&str, bool)>, found: &mut Vec<(String, u64)>
         if meta.is_dir() {
             let inner = format!("{path}{}", std::path::MAIN_SEPARATOR);
             folders += 1 + walk(&inner, mask, found);
-        } else if meta.is_file()
-            && mask.is_none_or(|(mask, cs)| wildcard_match(mask, &entry_name, cs))
-        {
+        } else if meta.is_file() && mask.is_none_or(|mask| mask.matches(&entry_name)) {
             found.push((path, meta.len()));
         }
     }

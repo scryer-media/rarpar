@@ -41,6 +41,11 @@ documented in each crate's own changelog so those notes ship with the crate.
   below; and a folder named as the archive is walked without following
   links, so a self-referential link ends the walk and a link out of the
   folder finds nothing outside it.
+- 7-Zip facade name matching follows `-spd`, `-spm` and the `w-` modifier
+  everywhere 7-Zip does: the archive name, `-ai`/`-ax` and `-i`/`-x` all take
+  them, so `-aiw-!set*.7z` or `-spd set*.7z` opens (and under `-sdel`
+  deletes) only the archive literally named `set*.7z`, and the implicit `*`
+  that selects every member stays a wildcard under `-spd`.
 - par3cmdline facade: the block-map report is counted from ranges, so a set
   with a huge block count no longer walks every block; non-UTF-8 arguments
   reach the files they name byte for byte on Unix; `\` separates path
