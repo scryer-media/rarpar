@@ -474,7 +474,9 @@
   reported repaired, since its own writes move its snapshot; a mismatch fails
   the repair. The first write re-checks that snapshot, so a file rewritten
   while its syndromes were read ends in `SourceChanged` with nothing patched,
-  as a cloned source does. A patch cut short leaves the intact extents untouched, so the
+  as a cloned source does; writers to one output serialize on that check, so
+  the repair's own first write cannot move the snapshot under a check still
+  in progress. A patch cut short leaves the intact extents untouched, so the
   file still verifies as damaged and repairs again. Where the filesystem has
   no clones, a file with a few lost blocks now costs those blocks' writes and
   one read-back instead of a full rewrite, which on a network mount is most of

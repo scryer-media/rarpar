@@ -95,6 +95,9 @@ func Run(ctx context.Context, options Options) (Summary, error) {
 	if options.Log == nil {
 		options.Log = os.Stderr
 	}
+	if err := ValidateRunID(options.RunID); err != nil {
+		return Summary{}, err
+	}
 	runDir := filepath.Join(options.Config.Fleet.ResultsRoot, options.RunID)
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		return Summary{}, err
@@ -147,6 +150,9 @@ func Run(ctx context.Context, options Options) (Summary, error) {
 func Resume(ctx context.Context, options Options) (Summary, error) {
 	if options.Log == nil {
 		options.Log = os.Stderr
+	}
+	if err := ValidateRunID(options.RunID); err != nil {
+		return Summary{}, err
 	}
 	runDir := filepath.Join(options.Config.Fleet.ResultsRoot, options.RunID)
 	state, err := LoadRunState(runDir)
