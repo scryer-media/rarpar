@@ -376,10 +376,15 @@ fn service_name(header: &[u8], mut field: usize) -> EngineResult<&[u8]> {
     }
     read_vint(header, &mut field)?;
     read_vint(header, &mut field)?;
-    let length = read_vint(header, &mut field)? as usize;
-    header
-        .get(field..field + length)
-        .ok_or(EngineError::Unsupported("truncated RAR5 service name"))
+    let length = read_vint(header, &mut field)?;
+    let truncated = EngineError::Unsupported("truncated RAR5 service name");
+    let Some(end) = usize::try_from(length)
+        .ok()
+        .and_then(|length| field.checked_add(length))
+    else {
+        return Err(truncated);
+    };
+    header.get(field..end).ok_or(truncated)
 }
 
 /// One host prepared for insertion.
@@ -1929,6 +1934,35 @@ impl Rar5Set {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A service header whose name length is past anything the header holds,
+    /// up to `u64::MAX`, is refused as truncated, never sliced.
+    #[test]
+    fn oversized_service_name_lengths_are_refused() {
+        // Flags, two fields, then the two fields every service header has.
+        let fields = [0u8, 0, 0, 0, 0];
+        let lengths: [&[u8]; 3] = [
+            // u64::MAX: nine 7-bit groups of ones and a final 1.
+            &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01],
+            // 2^63: wraps a 64-bit `usize` when added to the offset.
+            &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01],
+            // Merely longer than the header.
+            &[0x10],
+        ];
+        for length in lengths {
+            let mut header = fields.to_vec();
+            header.extend_from_slice(length);
+            header.extend_from_slice(b"QO");
+            assert!(matches!(
+                service_name(&header, 0),
+                Err(EngineError::Unsupported("truncated RAR5 service name"))
+            ));
+        }
+        let mut header = fields.to_vec();
+        header.extend_from_slice(&[0x02]);
+        header.extend_from_slice(b"QO");
+        assert_eq!(service_name(&header, 0).unwrap(), b"QO");
+    }
 
     #[test]
     fn stem_changes_split_on_character_boundaries() {

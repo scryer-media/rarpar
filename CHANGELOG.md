@@ -164,6 +164,19 @@ documented in each crate's own changelog so those notes ship with the crate.
   longer hides it, so the run reports it and fails.
 - `par3 inside` lists each volume family's directory once and opens each
   volume once, however many volumes of the family are named.
+- 7-Zip facade extraction on Unix is anchored to an open handle on the
+  output folder: every folder on a member's way is opened (or made) relative
+  to the folder above it without following links, and the member's file,
+  link, overwrite removal and rename, and metadata go through the handle of
+  the folder it lands in. A folder swapped for a link while extraction runs
+  can no longer redirect a member outside the output folder, and a new file
+  is created exclusively, so a link or hard link planted at its name is
+  refused rather than truncated. On Windows the folders are still checked
+  and then opened by path, which keeps a member inside the output folder
+  only while no untrusted party can write to that tree during extraction.
+- 7-Zip facade: a volume `-sdel` cannot delete is reported with its path and
+  the system's reason, and counts as an error of its archive, so the summary
+  lists the archive with errors and the command exits 2 instead of 0.
 
 ### Library versions
 
