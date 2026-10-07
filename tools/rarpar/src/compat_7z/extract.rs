@@ -855,11 +855,22 @@ impl Extractor<'_> {
     }
 }
 
-/// Which items of `archive` the censor selects.
+/// Which items of `archive` the censor selects: what a listing shows,
+/// anti-items included.
+pub(super) fn listed(files: &[ArchiveEntry], censor: &Censor) -> Vec<bool> {
+    files
+        .iter()
+        .map(|entry| censor.selects(&entry.name, entry.is_directory))
+        .collect()
+}
+
+/// Which items of `archive` extraction writes: the listed ones, except
+/// anti-items, which only record a deletion and have nothing to write.
 pub(super) fn selection(files: &[ArchiveEntry], censor: &Censor) -> Vec<bool> {
     files
         .iter()
-        .map(|entry| !entry.is_anti_item && censor.selects(&entry.name, entry.is_directory))
+        .zip(listed(files, censor))
+        .map(|(entry, listed)| listed && !entry.is_anti_item)
         .collect()
 }
 

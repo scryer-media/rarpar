@@ -254,7 +254,7 @@ pub(super) fn run(session: &mut Session, options: &Options, archives: Vec<(PathB
             text.push_str(&info_block(path, &set, &opened));
             text.push('\n');
         }
-        let selected = super::extract::selection(&opened.archive.files, &options.censor);
+        let selected = super::extract::listed(&opened.archive.files, &options.censor);
         let packed = packed_sizes(&opened);
         if options.technical {
             text.push_str("----------\n");

@@ -1369,6 +1369,43 @@ fn sdel_keeps_an_archive_nothing_was_extracted_from() {
     assert_tree(&dir.path().join("out"));
 }
 
+/// An anti-item (a recorded deletion) is listed, with `Anti = +` under
+/// `-slt`, but extraction writes nothing for it.
+#[test]
+fn anti_items_are_listed_but_not_extracted() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut out = Vec::new();
+    {
+        let mut writer = ArchiveWriter::new(Cursor::new(&mut out)).unwrap();
+        writer
+            .push_archive_entry(ArchiveEntry::new_file("keep.txt"), Some(&b"kept bytes"[..]))
+            .unwrap();
+        let mut gone = ArchiveEntry::new_file("gone.txt");
+        gone.is_anti_item = true;
+        writer.push_archive_entry::<&[u8]>(gone, None).unwrap();
+        writer.finish().unwrap();
+    }
+    std::fs::write(dir.path().join("delta.7z"), out).unwrap();
+    let (listing, _) = expect(&facade(dir.path(), &["l", "delta.7z"], b""), 0);
+    assert!(listing.contains("gone.txt"), "{listing}");
+    assert!(listing.contains("keep.txt"), "{listing}");
+    let (technical, _) = expect(&facade(dir.path(), &["l", "-slt", "delta.7z"], b""), 0);
+    assert!(technical.contains("Path = gone.txt\n"), "{technical}");
+    let gone = &technical[technical.find("Path = gone.txt\n").unwrap()..];
+    assert!(gone.contains("Anti = +\n"), "{technical}");
+    let keep = &technical[technical.find("Path = keep.txt\n").unwrap()..];
+    assert!(keep.contains("Anti = -\n"), "{technical}");
+    expect(
+        &facade(dir.path(), &["x", "-y", "-oout", "delta.7z"], b""),
+        0,
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("out/keep.txt")).unwrap(),
+        b"kept bytes"
+    );
+    assert!(!dir.path().join("out/gone.txt").exists());
+}
+
 /// An archive `-sdel` cannot delete is an archive with errors: the run says
 /// which volumes are left instead of "Everything is Ok", and exits 2.
 #[cfg(unix)]

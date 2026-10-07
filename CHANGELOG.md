@@ -17,6 +17,8 @@ documented in each crate's own changelog so those notes ship with the crate.
 - The `par3` facade keeps a path holding a literal character in
   U+10FF00–U+10FFFF on Unix: such a name now opens that file instead of one
   with a single raw byte in the character's place.
+- The 7-Zip facade lists anti-items (recorded deletions) in `l` and
+  `l -slt`, with `Anti = +`; only extraction leaves them out.
 - The 7-Zip facade reports an archive `-sdel` could not delete: each
   volume left behind is named on stderr (with a count for a split set), the
   archive counts as one with errors instead of "Everything is Ok", and the
