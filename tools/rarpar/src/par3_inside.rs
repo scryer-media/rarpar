@@ -206,23 +206,25 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
         Par3InsidePlacement::Last => Rar5Placement::Last,
         Par3InsidePlacement::Independent => Rar5Placement::Independent,
     };
-    let (output_dir, staging) = if args.in_place {
-        let directory = paths[0]
-            .parent()
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .unwrap_or(Path::new("."))
-            .to_owned();
-        let stage = tempfile::tempdir_in(&directory)?;
-        (stage.path().to_owned(), Some(stage))
+    // In place, each output is staged in its own volume's directory, so the
+    // final rename never crosses a filesystem.
+    let mut staging = Vec::new();
+    let outputs: Vec<PathBuf> = if args.in_place {
+        let stages = stage_directories(&paths, &mut staging)?;
+        hosts
+            .iter()
+            .zip(&stages)
+            .map(|(host, stage)| stage.join(&host.name))
+            .collect()
     } else {
         let directory = args.output_dir.clone().expect("required by clap");
         std::fs::create_dir_all(&directory)?;
-        (directory, None)
+        hosts
+            .iter()
+            .map(|host| directory.join(&host.name))
+            .collect()
     };
-    let outputs: Vec<PathBuf> = hosts
-        .iter()
-        .map(|host| output_dir.join(&host.name))
-        .collect();
+    let output_dir = outputs[0].parent().expect("joined").to_owned();
     for output in &outputs {
         if output.exists() {
             return Err(RarparError::Unsafe(format!(
@@ -277,7 +279,7 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
                 .map(|host| blocks_of(host.archive.length))
                 .sum(),
         );
-        let counts = rar5::placement_counts(placement, hosts.len(), count);
+        let counts = rar5::placement_counts(placement, hosts.len(), count)?;
         inserted = rar5::insert_set(
             &hosts,
             &outputs,
@@ -303,6 +305,35 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
         true,
         json!({"operation":"par3_inside_insert","status":"inserted","block_size":block_size,"layout":layout_name(region_layout),"outputs":written}),
     ))
+}
+
+/// The directory `path` is in.
+fn directory_of(path: &Path) -> PathBuf {
+    path.parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .to_owned()
+}
+
+/// A staging directory beside each of `paths`, one per distinct directory,
+/// kept alive in `holders`; the result lists each path's own.
+fn stage_directories(
+    paths: &[PathBuf],
+    holders: &mut Vec<(PathBuf, tempfile::TempDir)>,
+) -> Result<Vec<PathBuf>, RarparError> {
+    paths
+        .iter()
+        .map(|path| {
+            let directory = directory_of(path);
+            if let Some((_, stage)) = holders.iter().find(|(dir, _)| *dir == directory) {
+                return Ok(stage.path().to_owned());
+            }
+            let stage = tempfile::tempdir_in(&directory)?;
+            let staged = stage.path().to_owned();
+            holders.push((directory, stage));
+            Ok(staged)
+        })
+        .collect()
 }
 
 fn set_report(set: &Rar5Set) -> Value {
@@ -439,12 +470,8 @@ fn verify(cli: &Cli, args: &Par3InsideArgs) -> Result<(bool, Value), RarparError
 
 fn repair(cli: &Cli, args: &Par3InsideRepairArgs) -> Result<(bool, Value), RarparError> {
     let mut sets = open(cli, &args.inputs)?;
-    let home = args.inputs.archives[0]
-        .parent()
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .unwrap_or(Path::new("."))
-        .to_owned();
     let mut outputs = Vec::new();
+    let mut planned = false;
     let uncovered = uncovered_volumes(cli, &args.inputs, &sets);
     let mut success = uncovered.is_empty();
     for set in &mut sets {
@@ -457,8 +484,16 @@ fn repair(cli: &Cli, args: &Par3InsideRepairArgs) -> Result<(bool, Value), Rarpa
             continue;
         }
         if cli.dry_run {
+            planned = true;
             continue;
         }
+        // A missing host goes beside this set's surviving hosts.
+        let home = set
+            .hosts
+            .iter()
+            .find_map(|host| host.path.as_deref())
+            .map(directory_of)
+            .unwrap_or_else(|| directory_of(&args.inputs.archives[0]));
         let names = set.current_names();
         let finals: Vec<PathBuf> = set
             .hosts
@@ -470,14 +505,22 @@ fn repair(cli: &Cli, args: &Par3InsideRepairArgs) -> Result<(bool, Value), Rarpa
                 (None, None) => home.join(name),
             })
             .collect();
-        let target_dir = args.output_dir.clone().unwrap_or_else(|| home.clone());
-        std::fs::create_dir_all(&target_dir)?;
-        let stage = tempfile::tempdir_in(&target_dir)?;
+        if let Some(dir) = &args.output_dir {
+            std::fs::create_dir_all(dir)?;
+        }
+        // Each output is staged in its final directory, so the rename into
+        // place never crosses a filesystem.
+        let mut holders = Vec::new();
+        let stages = stage_directories(&finals, &mut holders)?;
         let scratch = args
             .scratch_dir
             .clone()
-            .unwrap_or_else(|| stage.path().to_owned());
-        let staged: Vec<PathBuf> = names.iter().map(|name| stage.path().join(name)).collect();
+            .unwrap_or_else(|| holders[0].1.path().to_owned());
+        let staged: Vec<PathBuf> = names
+            .iter()
+            .zip(&stages)
+            .map(|(name, stage)| stage.join(name))
+            .collect();
         for (index, path) in finals.iter().enumerate() {
             if needed.contains(&index) && args.output_dir.is_some() && path.exists() {
                 return Err(RarparError::Unsafe(format!(
@@ -499,15 +542,18 @@ fn repair(cli: &Cli, args: &Par3InsideRepairArgs) -> Result<(bool, Value), Rarpa
     }
     let status = if !success {
         "some damage is not repairable"
-    } else if outputs.is_empty() && !cli.dry_run {
+    } else if planned {
+        "planned"
+    } else if outputs.is_empty() {
         "nothing to repair"
     } else {
         "repaired"
     };
-    Ok((
-        success,
-        json!({"operation":"par3_inside_repair","status":status,"unprotected_missing_volumes":uncovered,"sets":sets.iter().map(set_report).collect::<Vec<_>>(),"outputs":outputs}),
-    ))
+    let mut report = json!({"operation":"par3_inside_repair","status":status,"unprotected_missing_volumes":uncovered,"sets":sets.iter().map(set_report).collect::<Vec<_>>(),"outputs":outputs});
+    if cli.dry_run {
+        report["dry_run"] = json!(true);
+    }
+    Ok((success, report))
 }
 
 fn numbered_backup(path: &Path) -> PathBuf {
@@ -525,25 +571,32 @@ fn remove(cli: &Cli, args: &Par3InsideRemoveArgs) -> Result<(bool, Value), Rarpa
     let mut sets = open(cli, &args.inputs)?;
     let mut outputs = Vec::new();
     for set in &mut sets {
+        // A dry run makes the checks a removal would, and writes nothing.
+        set.removable()?;
         if cli.dry_run {
             continue;
         }
         let names = set.current_names();
-        let (directory, stage) = if args.in_place {
-            let home = set.hosts[0]
-                .path
-                .as_deref()
-                .and_then(Path::parent)
-                .unwrap_or(Path::new("."))
-                .to_owned();
-            let stage = tempfile::tempdir_in(&home)?;
-            (stage.path().to_owned(), Some(stage))
+        let mut stage = Vec::new();
+        let directories = if args.in_place {
+            // Each host is staged in its own directory, so the rename back
+            // over it never crosses a filesystem.
+            let hosts: Vec<PathBuf> = set
+                .hosts
+                .iter()
+                .map(|host| host.path.clone().unwrap_or_default())
+                .collect();
+            stage_directories(&hosts, &mut stage)?
         } else {
             let directory = args.output_dir.clone().expect("required by clap");
             std::fs::create_dir_all(&directory)?;
-            (directory, None)
+            vec![directory; names.len()]
         };
-        let destinations: Vec<PathBuf> = names.iter().map(|name| directory.join(name)).collect();
+        let destinations: Vec<PathBuf> = names
+            .iter()
+            .zip(&directories)
+            .map(|(name, directory)| directory.join(name))
+            .collect();
         let written = set.remove(&destinations)?;
         for (path, host) in written.iter().zip(&set.hosts) {
             let destination = if args.in_place {
@@ -556,6 +609,12 @@ fn remove(cli: &Cli, args: &Par3InsideRemoveArgs) -> Result<(bool, Value), Rarpa
             outputs.push(json!(destination));
         }
         drop(stage);
+    }
+    if cli.dry_run {
+        return Ok((
+            true,
+            json!({"operation":"par3_inside_remove","status":"planned","dry_run":true,"outputs":outputs}),
+        ));
     }
     Ok((
         true,

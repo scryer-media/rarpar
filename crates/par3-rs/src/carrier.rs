@@ -310,6 +310,23 @@ impl CarrierPlan {
             .map(|packet| packet.len() as u64)
             .sum::<u64>();
         let mut entries: Vec<Entry> = metadata.into_iter().map(Entry::Metadata).collect();
+        // One pass over the payloads, not one per regenerated index.
+        let mut available = std::collections::BTreeMap::new();
+        for payload in session.input.payloads() {
+            if let PayloadKind::Recovery {
+                root,
+                matrix: packet_matrix,
+                index,
+            } = payload.kind()
+                && root == set.root_hash()
+                && packet_matrix == matrix
+                && indices.contains(&index)
+            {
+                available
+                    .entry(index)
+                    .or_insert_with(|| payload.packet_hash());
+            }
+        }
         let mut known = true;
         for index in indices {
             let kind = PayloadKind::Recovery {
@@ -317,11 +334,7 @@ impl CarrierPlan {
                 matrix,
                 index,
             };
-            let expected = session
-                .input
-                .payloads()
-                .find(|payload| payload.kind() == kind)
-                .map(|payload| payload.packet_hash());
+            let expected = available.get(&index).copied();
             known &= expected.is_some();
             entries.push(Entry::Payload {
                 kind,

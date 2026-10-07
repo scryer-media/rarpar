@@ -391,6 +391,8 @@ pub struct Rar5Host {
     pub name: String,
     /// Framing of the host.
     pub archive: Rar5Archive,
+    /// The revision `archive` describes; insertion refuses any other.
+    snapshot: SourceSnapshot,
 }
 
 /// Bytes added to one host.
@@ -416,7 +418,18 @@ pub fn prepare_hosts(
     let disk: Arc<dyn SourceAccess> = Arc::new(disk_access(paths, options));
     let mut hosts = Vec::new();
     for (index, path) in paths.iter().enumerate() {
+        let snapshot = disk
+            .snapshot(SourceId(index as u64))?
+            .ok_or(EngineError::Unavailable {
+                source_id: SourceId(index as u64),
+                offset: 0,
+            })?;
         let archive = inspect(disk.as_ref(), SourceId(index as u64), options)?;
+        if disk.snapshot(SourceId(index as u64))? != Some(snapshot) {
+            return Err(EngineError::Unsupported(
+                "host changed while it was inspected",
+            ));
+        }
         if archive.region.is_some() {
             return Err(EngineError::Unsupported(
                 "archive already holds a PAR3 region",
@@ -449,7 +462,17 @@ pub fn prepare_hosts(
             path: path.clone(),
             name,
             archive,
+            snapshot,
         });
+    }
+    // Header-encrypted volumes hide their volume numbers and end flags, so a
+    // family missing its last parts cannot be told from a complete one.
+    if hosts.iter().any(|host| host.archive.encrypted_headers)
+        && (hosts.len() > 1 || hosts.iter().any(|host| looks_like_volume(&host.name)))
+    {
+        return Err(EngineError::Unsupported(
+            "completeness of a header-encrypted RAR5 volume set cannot be checked",
+        ));
     }
     let volumes: Vec<_> = hosts.iter().map(|host| host.archive.volume).collect();
     if hosts.len() > 1 || volumes[0].is_some() {
@@ -474,21 +497,46 @@ pub fn prepare_hosts(
     Ok(hosts)
 }
 
-/// Recovery counts per host for a placement and a total.
-pub fn placement_counts(placement: Rar5Placement, hosts: usize, total: u64) -> Vec<u64> {
+/// A `.partN.rar` name: one volume of a family.
+fn looks_like_volume(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower
+        .strip_suffix(".rar")
+        .and_then(|stem| stem.rsplit_once(".part"))
+        .is_some_and(|(_, digits)| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Recovery counts per host of one shared set, for a placement and a total.
+///
+/// # Errors
+///
+/// [`EngineError::Unsupported`] for [`Rar5Placement::Independent`], which is
+/// one set per host: call [`insert_set`] once per host with that host's own
+/// recovery count instead.
+pub fn placement_counts(
+    placement: Rar5Placement,
+    hosts: usize,
+    total: u64,
+) -> EngineResult<Vec<u64>> {
+    if hosts == 0 {
+        return Err(EngineError::InvalidState("insert host count"));
+    }
     match placement {
         Rar5Placement::Last => {
             let mut counts = vec![0; hosts];
             counts[hosts - 1] = total;
-            counts
+            Ok(counts)
         }
-        Rar5Placement::Spread | Rar5Placement::Independent => {
+        Rar5Placement::Spread => {
             let base = total / hosts as u64;
             let extra = total % hosts as u64;
-            (0..hosts as u64)
+            Ok((0..hosts as u64)
                 .map(|index| base + u64::from(index < extra))
-                .collect()
+                .collect())
         }
+        Rar5Placement::Independent => Err(EngineError::Unsupported(
+            "independent placement inserts one set per host",
+        )),
     }
 }
 
@@ -512,6 +560,13 @@ pub fn insert_set(
     if hosts.len() != outputs.len() || hosts.len() != counts.len() || hosts.is_empty() {
         return Err(EngineError::InvalidState("insert host count"));
     }
+    // The region records no recovery-index base; opening a set whose
+    // recovery packets are all lost assumes zero.
+    if options.first_recovery != 0 {
+        return Err(EngineError::Unsupported(
+            "PAR-inside recovery indices start at zero",
+        ));
+    }
     let execution = options.execution.clone();
     let mut disk = DiskSourceAccess::with_options(execution.clone());
     for (index, host) in hosts.iter().enumerate() {
@@ -529,6 +584,12 @@ pub fn insert_set(
                 source_id: SourceId(index as u64),
                 offset: 0,
             })?;
+        // The framing offsets belong to the inspected revision.
+        if snapshot != host.snapshot {
+            return Err(EngineError::Unsupported(
+                "host changed since it was inspected",
+            ));
+        }
         let split = match layout {
             Rar5Layout::Trailing => host.archive.archive_end,
             _ => {
@@ -720,6 +781,70 @@ fn stage(
         .write(true)
         .open_budgeted(&temporary, options)?;
     Ok((output, false))
+}
+
+/// Install the verified `temporary` at the absent `destination` without
+/// replacing anything there. A hard link when both are on one filesystem;
+/// across filesystems, a copy staged beside `destination` and compared byte
+/// for byte with `temporary` before it is linked into place.
+fn install(temporary: &Path, destination: &Path, options: &ExecutionOptions) -> EngineResult<()> {
+    match std::fs::hard_link(temporary, destination) {
+        Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
+            install_by_copy(temporary, destination, options)
+        }
+        result => Ok(result?),
+    }
+}
+
+fn install_by_copy(
+    temporary: &Path,
+    destination: &Path,
+    options: &ExecutionOptions,
+) -> EngineResult<()> {
+    let staged = crate::session_repair::stage_path(destination, options)?;
+    let result = (|| -> EngineResult<()> {
+        use std::io::Read;
+        let mut from = File::open(temporary, options)?;
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open_budgeted(&staged, options)?;
+        let length = from.metadata()?.len();
+        let size = options.stripe_bytes.clamp(1, 64 << 10);
+        let mut buffer = vec![0; size];
+        let mut check = vec![0; size];
+        let mut at = 0;
+        while at < length {
+            options.cancel.check()?;
+            let take = (length - at).min(size as u64) as usize;
+            from.read_exact(&mut buffer[..take])?;
+            output.write_all(&buffer[..take])?;
+            at += take as u64;
+        }
+        output.sync_all()?;
+        drop((from, output));
+        let mut from = File::open(temporary, options)?;
+        let mut copied = File::open(&staged, options)?;
+        if copied.metadata()?.len() != length {
+            return Err(EngineError::InvalidState("installed copy differs"));
+        }
+        at = 0;
+        while at < length {
+            options.cancel.check()?;
+            let take = (length - at).min(size as u64) as usize;
+            from.read_exact(&mut buffer[..take])?;
+            copied.read_exact(&mut check[..take])?;
+            if buffer[..take] != check[..take] {
+                return Err(EngineError::InvalidState("installed copy differs"));
+            }
+            at += take as u64;
+        }
+        drop((from, copied));
+        std::fs::hard_link(&staged, destination)?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&staged);
+    result
 }
 
 struct HostViews {
@@ -1170,11 +1295,20 @@ fn open_set(
     let region_layout = region_layout.expect("at least one host");
     // Bind files: recorded name, then recovery indices, then volume number,
     // then a lone host and a lone file.
+    // Among files of the recorded name, one carrying this set's packets wins;
+    // one carrying only another set's packets is never this set's host.
     let mut used = BTreeSet::new();
     for host in &mut hosts {
+        let named = |c: &&Candidate| {
+            file_name(&c.path) == Some(host.name.as_str()) && !used.contains(&c.source)
+        };
+        let ours = |c: &&Candidate| c.packets.iter().any(|p| p.input_set_id() == id);
+        let foreign = |c: &&Candidate| c.packets.iter().any(|p| p.input_set_id() != id);
         if let Some(candidate) = candidates
             .iter()
-            .find(|c| file_name(&c.path) == Some(host.name.as_str()) && !used.contains(&c.source))
+            .filter(named)
+            .find(ours)
+            .or_else(|| candidates.iter().filter(named).find(|c| !foreign(c)))
         {
             used.insert(candidate.source);
             host.source = Some(candidate.source);
@@ -1488,28 +1622,49 @@ impl Rar5Set {
         }
         let size = options.stripe_bytes.min(64 << 10);
         let mut buffer = vec![0; size];
-        let mut reports = Vec::new();
-        for &index in &needed {
-            let host = self.hosts[index].clone();
-            let carrier_marker = crate::session_repair::ScratchFile::new(
-                &scratch_directory.join("carrier"),
-                &options,
-            )?;
-            let carrier_path = carrier_marker.path().with_extension("carrier");
-            let plan =
-                CarrierPlan::derived(&mut verified, self.metadata.clone(), host.recovery.clone())?;
-            let carrier_bytes = host.gap.end - host.gap.start - host.prefix;
-            if plan.output_bytes() != carrier_bytes {
-                return Err(EngineError::InvalidState("derived region length differs"));
+        // Every carrier first: writing a region into a temporary changes the
+        // generation `verified` bound, so no carrier can be derived after it.
+        let mut carriers = Vec::new();
+        let mut markers = Vec::new();
+        let mut reports_pending = Vec::new();
+        let generated = (|| -> EngineResult<()> {
+            for &index in &needed {
+                let host = &self.hosts[index];
+                let marker = crate::session_repair::ScratchFile::new(
+                    &scratch_directory.join(format!("carrier-{index}")),
+                    &options,
+                )?;
+                let carrier_path = marker.path().with_extension("carrier");
+                markers.push(marker);
+                let plan = CarrierPlan::derived(
+                    &mut verified,
+                    self.metadata.clone(),
+                    host.recovery.clone(),
+                )?;
+                if plan.output_bytes() != host.gap.end - host.gap.start - host.prefix {
+                    return Err(EngineError::InvalidState("derived region length differs"));
+                }
+                carriers.push(carrier_path.clone());
+                reports_pending.push(plan.execute(
+                    &mut verified,
+                    &carrier_path,
+                    scratch_directory,
+                )?);
             }
-            let report = plan.execute(&mut verified, &carrier_path, scratch_directory);
-            let result = (|| -> EngineResult<Rar5Repaired> {
-                let report = report?;
+            Ok(())
+        })();
+        let mut reports = Vec::new();
+        let result = generated.and_then(|()| {
+            for ((&index, carrier_path), report) in
+                needed.iter().zip(&carriers).zip(reports_pending.drain(..))
+            {
+                let host = self.hosts[index].clone();
+                let carrier_bytes = host.gap.end - host.gap.start - host.prefix;
                 let output = std::fs::OpenOptions::new()
                     .write(true)
                     .open_budgeted(&temporaries[host.file], &options)?;
                 output.write_all_at(host.gap.start, &region_header(self.layout, carrier_bytes))?;
-                let carrier = File::open(&carrier_path, &options)?;
+                let carrier = File::open(carrier_path, &options)?;
                 let mut at = 0;
                 while at < carrier_bytes {
                     options.cancel.check()?;
@@ -1535,19 +1690,40 @@ impl Rar5Set {
                         "repaired host failed verification",
                     ));
                 }
-                std::fs::hard_link(&temporaries[host.file], &destinations[index])?;
-                Ok(Rar5Repaired {
+                install(&temporaries[host.file], &destinations[index], &options)?;
+                reports.push(Rar5Repaired {
                     name: host.name.clone(),
                     path: destinations[index].clone(),
                     data_rebuilt: !host.complete,
                     regenerated: report.recovery_packets,
                     restoration: report.restoration,
-                })
-            })();
-            let _ = std::fs::remove_file(&carrier_path);
-            reports.push(result?);
+                });
+            }
+            Ok(())
+        });
+        for carrier in &carriers {
+            let _ = std::fs::remove_file(carrier);
         }
-        Ok(reports)
+        drop(markers);
+        result.map(|()| reports)
+    }
+
+    /// Whether [`Self::remove`] can run: every host present and verified.
+    /// Nothing is written.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Unsupported`] naming a missing or damaged host.
+    pub fn removable(&self) -> EngineResult<()> {
+        match self.hosts.iter().find(|host| !host.complete) {
+            Some(host) if host.source.is_none() => Err(EngineError::Unsupported(
+                "a host is missing; repair before removing",
+            )),
+            Some(_) => Err(EngineError::Unsupported(
+                "a host is damaged; repair before removing",
+            )),
+            None => Ok(()),
+        }
     }
 
     /// Write every host without its region to `destinations[k]` (absent).
@@ -1557,13 +1733,7 @@ impl Rar5Set {
         if destinations.len() != self.hosts.len() {
             return Err(EngineError::InvalidState("remove destination count"));
         }
-        if let Some(host) = self.hosts.iter().find(|host| !host.complete) {
-            return Err(EngineError::Unsupported(if host.source.is_none() {
-                "a host is missing; repair before removing"
-            } else {
-                "a host is damaged; repair before removing"
-            }));
-        }
+        self.removable()?;
         let options = self.session.options.clone();
         let layout = self.session.layout()?.expect("layout");
         let size = options.stripe_bytes.min(64 << 10);
@@ -1640,5 +1810,31 @@ mod tests {
         );
         assert_eq!(stem_change("same.rar", "same.rar"), None);
         assert_eq!(stem_change("\u{e9}", "\u{129}"), None);
+    }
+
+    /// Across filesystems a repaired host is copied beside its destination,
+    /// compared, then linked in; an existing destination is never replaced.
+    #[test]
+    fn hosts_install_by_verified_copy() {
+        let dir = std::env::temp_dir().join(format!("par3-install-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let temporary = dir.join("rebuilt");
+        let contents: Vec<u8> = (0..200_000u32).map(|value| (value * 7) as u8).collect();
+        std::fs::write(&temporary, &contents).unwrap();
+        let options = ExecutionOptions {
+            stripe_bytes: 4096,
+            ..ExecutionOptions::default()
+        };
+        let destination = dir.join("host.rar");
+        install_by_copy(&temporary, &destination, &options).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), contents);
+        assert!(install_by_copy(&temporary, &destination, &options).is_err());
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["host.rar", "rebuilt"], "no staged copy is left");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -203,3 +203,183 @@ fn inside_reports_a_missing_volume_no_independent_set_covers() {
         serde_json::json!([name(3)])
     );
 }
+
+/// One repair over two sets in two directories: a lost volume comes back
+/// beside its own set's survivors, and a dry run reports a plan and writes
+/// nothing.
+#[test]
+fn inside_repairs_each_set_in_its_own_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let Some(sources) = originals(root) else {
+        return;
+    };
+    let single = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/unrar-rs/tests/fixtures/rar5/rar5_store.rar");
+    if !single.is_file() {
+        eprintln!("skipping: fixture {} is not present", single.display());
+        return;
+    }
+    let lone = root.join("original/lone-host.rar");
+    std::fs::copy(&single, &lone).unwrap();
+    let insert = |archive: &Path, into: &str| {
+        run(
+            root,
+            &[
+                "par3",
+                "inside",
+                "insert",
+                archive.to_str().unwrap(),
+                "-d",
+                into,
+                "-s",
+                "4096",
+                "-c",
+                "56",
+            ],
+            0,
+        );
+    };
+    insert(&lone, "west");
+    insert(&sources[0], "east");
+    let east = root.join("east");
+    let pristine = std::fs::read(east.join(name(1))).unwrap();
+    std::fs::remove_file(east.join(name(1))).unwrap();
+    let west_entry = root.join("west/lone-host.rar");
+    let east_entry = east.join(name(2));
+    let args = |dry: bool| {
+        let mut args = Vec::new();
+        if dry {
+            args.push("--dry-run");
+        }
+        args.extend(["par3", "inside", "repair"]);
+        args.push(west_entry.to_str().unwrap());
+        args.push(east_entry.to_str().unwrap());
+        args
+    };
+    let planned = run(root, &args(true), 0);
+    assert_eq!(planned["status"], "planned");
+    assert_eq!(planned["dry_run"], true);
+    assert!(!east.join(name(1)).exists());
+    let repaired = run(root, &args(false), 0);
+    assert_eq!(repaired["status"], "repaired");
+    assert_eq!(std::fs::read(east.join(name(1))).unwrap(), pristine);
+    assert!(!root.join("west").join(name(1)).exists());
+}
+
+/// In place, insertion and removal stage beside each volume and leave
+/// nothing behind but the volumes, byte-exact after the round trip.
+#[test]
+fn inside_in_place_round_trip_leaves_only_the_volumes() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let Some(sources) = originals(root) else {
+        return;
+    };
+    let pristine: Vec<Vec<u8>> = sources
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    let first = sources[0].to_str().unwrap();
+    run(
+        root,
+        &[
+            "par3",
+            "inside",
+            "insert",
+            first,
+            "--in-place",
+            "-s",
+            "4096",
+            "-c",
+            "14",
+        ],
+        0,
+    );
+    let listing = || {
+        let mut names: Vec<_> = std::fs::read_dir(root.join("original"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    };
+    let expected: Vec<String> = (1..=7).map(name).collect();
+    assert_eq!(listing(), expected);
+    assert_ne!(std::fs::read(&sources[0]).unwrap(), pristine[0]);
+    run(root, &["par3", "inside", "verify", first], 0);
+    run(root, &["par3", "inside", "remove", first, "--in-place"], 0);
+    assert_eq!(listing(), expected);
+    for (path, bytes) in sources.iter().zip(&pristine) {
+        assert_eq!(&std::fs::read(path).unwrap(), bytes);
+    }
+}
+
+/// A dry-run removal makes the checks a removal would: a damaged host is
+/// refused with the same exit code, and an intact set is reported as a plan
+/// with nothing written.
+#[test]
+fn inside_dry_run_removal_checks_like_a_removal() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let Some(sources) = originals(root) else {
+        return;
+    };
+    let first = sources[0].to_str().unwrap();
+    run(
+        root,
+        &[
+            "par3",
+            "inside",
+            "insert",
+            first,
+            "-d",
+            "protected",
+            "-s",
+            "4096",
+            "-c",
+            "14",
+        ],
+        0,
+    );
+    let entry = root.join("protected").join(name(1));
+    let entry = entry.to_str().unwrap();
+    let planned = run(
+        root,
+        &[
+            "--dry-run",
+            "par3",
+            "inside",
+            "remove",
+            entry,
+            "-d",
+            "stripped",
+        ],
+        0,
+    );
+    assert_eq!(planned["status"], "planned");
+    assert_eq!(planned["dry_run"], true);
+    assert!(!root.join("stripped").exists());
+
+    let damaged = root.join("protected").join(name(3));
+    let mut bytes = std::fs::read(&damaged).unwrap();
+    bytes[5000] ^= 0x5a;
+    std::fs::write(&damaged, bytes).unwrap();
+    let code = |dry: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rarpar"));
+        command.current_dir(root).args(["--json", "--quiet"]);
+        if dry {
+            command.arg("--dry-run");
+        }
+        command
+            .args(["par3", "inside", "remove", entry, "-d", "stripped"])
+            .output()
+            .unwrap()
+            .status
+            .code()
+    };
+    let dry = code(true);
+    assert_ne!(dry, Some(0));
+    assert_eq!(dry, code(false));
+    assert!(!root.join("stripped").join(name(3)).exists());
+}

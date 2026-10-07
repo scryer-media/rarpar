@@ -77,7 +77,7 @@ fn insert(
             .unwrap();
         }
     } else {
-        let counts = rar5::placement_counts(placement, hosts.len(), recovery);
+        let counts = rar5::placement_counts(placement, hosts.len(), recovery).unwrap();
         rar5::insert_set(
             &hosts,
             &outputs,
@@ -483,4 +483,175 @@ fn encrypted_headers_take_only_the_trailing_layout() {
             "archive already holds PAR3 packets"
         ))
     ));
+}
+
+/// A lost volume and damage in another: every carrier is derived before any
+/// rebuilt host changes, so both come back.
+#[test]
+fn a_lost_volume_and_a_damaged_one_are_rebuilt_together() {
+    let Some(sources) = volumes("generated_matrix_rar5_store_plain", 7) else {
+        return;
+    };
+    for layout in LAYOUTS {
+        let tree = common::TempTree::new(&format!("rar5-two-{layout:?}"));
+        let inserted = insert(
+            tree.path(),
+            &sources,
+            layout,
+            Rar5Placement::Spread,
+            4096,
+            70,
+        );
+        let clean: Vec<Vec<u8>> = inserted
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect();
+        let dir = tree.path().join("two");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (index, path) in inserted.iter().enumerate() {
+            let copy = dir.join(path.file_name().unwrap());
+            match index {
+                2 => {}
+                5 => {
+                    let mut bytes = clean[5].clone();
+                    bytes[9000] ^= 0x33;
+                    std::fs::write(&copy, bytes).unwrap();
+                }
+                _ => {
+                    std::fs::copy(path, &copy).unwrap();
+                }
+            }
+        }
+        let mut set = open_one(&[dir.join(inserted[0].file_name().unwrap())]);
+        assert_eq!(set.status, RepairStatus::Ready, "{layout:?}");
+        assert_eq!(set.needs_repair(), vec![2, 5]);
+        let report = repair_into(&mut set, tree.path(), "two");
+        assert_eq!(report.len(), 2);
+        for (repaired, index) in report.iter().zip([2, 5]) {
+            assert_eq!(
+                std::fs::read(&repaired.path).unwrap(),
+                clean[index],
+                "{layout:?} {index}"
+            );
+        }
+    }
+}
+
+/// Header-encrypted volumes hide their numbers and end flags: a family, or
+/// a lone `.partN.rar`, is refused rather than protected incomplete.
+#[test]
+fn header_encrypted_volume_families_are_refused() {
+    let Some(parts) = volumes("rar5_hp_recovery_volumes", 5) else {
+        return;
+    };
+    let options = ExecutionOptions::default();
+    for hosts in [&parts[..], &parts[..4], &parts[..1]] {
+        assert!(matches!(
+            rar5::prepare_hosts(hosts, Rar5Layout::Trailing, &options),
+            Err(EngineError::Unsupported(
+                "completeness of a header-encrypted RAR5 volume set cannot be checked"
+            ))
+        ));
+    }
+}
+
+#[test]
+fn independent_placement_has_no_shared_counts() {
+    assert!(rar5::placement_counts(Rar5Placement::Independent, 3, 9).is_err());
+    assert_eq!(
+        rar5::placement_counts(Rar5Placement::Spread, 3, 7).unwrap(),
+        [3, 2, 2]
+    );
+    assert_eq!(
+        rar5::placement_counts(Rar5Placement::Last, 3, 7).unwrap(),
+        [0, 0, 7]
+    );
+}
+
+/// Insertion refuses a recovery base the region cannot record, and a host
+/// that changed after `prepare_hosts` read its framing.
+#[test]
+fn insertion_refuses_a_recovery_base_and_a_changed_host() {
+    let Some(source) = fixture("rar5", "rar5_store.rar") else {
+        return;
+    };
+    let tree = common::TempTree::new("rar5-refusals");
+    let path = tree.path().join("host.rar");
+    std::fs::copy(&source, &path).unwrap();
+    let options = ExecutionOptions::default();
+    let hosts =
+        rar5::prepare_hosts(std::slice::from_ref(&path), Rar5Layout::Block, &options).unwrap();
+    let output = tree.path().join("out.rar");
+    let insert = |first_recovery| {
+        rar5::insert_set(
+            &hosts,
+            std::slice::from_ref(&output),
+            &[2],
+            Rar5Layout::Block,
+            CreationOptions {
+                block_size: 64,
+                recovery_count: 2,
+                first_recovery,
+                ..CreationOptions::default()
+            },
+            tree.path(),
+            CreationDurability::Buffered,
+        )
+    };
+    assert!(matches!(
+        insert(5),
+        Err(EngineError::Unsupported(
+            "PAR-inside recovery indices start at zero"
+        ))
+    ));
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend_from_slice(&[0; 32]);
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(matches!(
+        insert(0),
+        Err(EngineError::Unsupported(
+            "host changed since it was inspected"
+        ))
+    ));
+    assert!(!output.exists());
+}
+
+/// Two sets in two directories whose hosts share a name each bind their own
+/// file, so both open complete.
+#[test]
+fn same_name_hosts_bind_to_their_own_set() {
+    let (Some(first), Some(second)) = (
+        fixture("rar5", "rar5_store.rar"),
+        fixture("rar5", "rar5_lz.rar"),
+    ) else {
+        return;
+    };
+    let tree = common::TempTree::new("rar5-same-name");
+    let mut paths = Vec::new();
+    for (label, source) in [("north", &first), ("south", &second)] {
+        let dir = tree.path().join(label);
+        std::fs::create_dir_all(&dir).unwrap();
+        let named = dir.join("shared-name.rar");
+        std::fs::copy(source, &named).unwrap();
+        let inserted = insert(
+            &dir,
+            &[named],
+            Rar5Layout::Trailing,
+            Rar5Placement::Spread,
+            256,
+            2,
+        );
+        paths.push(inserted[0].clone());
+    }
+    let sets = rar5::open(&paths, &ExecutionOptions::default()).unwrap();
+    assert_eq!(sets.len(), 2);
+    for set in &sets {
+        assert_eq!(set.status, RepairStatus::Complete);
+        assert!(set.needs_repair().is_empty());
+    }
+    let bound: std::collections::BTreeSet<_> = sets
+        .iter()
+        .map(|set| set.hosts[0].path.clone().unwrap())
+        .collect();
+    assert_eq!(bound.len(), 2);
 }
