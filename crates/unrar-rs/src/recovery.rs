@@ -659,8 +659,10 @@ fn refuse_existing_restored(path: &Path) -> RarError {
 /// output, and the file at it is left as it was.
 ///
 /// A filesystem that cannot hard-link (FAT, some network shares) reports an
-/// error other than `AlreadyExists`; there the install falls back to checking
-/// for `target` and renaming, which narrows the window but cannot close it.
+/// error other than `AlreadyExists`. There `target` is created exclusively,
+/// which every filesystem refuses atomically when the name is taken, the
+/// partial's bytes are copied into it, and the partial is removed. That costs
+/// one extra copy of the volume on such filesystems but never a replaced file.
 fn install_partial(partial: &Path, target: &Path, overwrite_existing: bool) -> RarResult<()> {
     if overwrite_existing {
         return std::fs::rename(partial, target).map_err(RarError::Io);
@@ -670,13 +672,31 @@ fn install_partial(partial: &Path, target: &Path, overwrite_existing: bool) -> R
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             Err(refuse_existing_restored(target))
         }
-        Err(_) => {
-            if target.symlink_metadata().is_ok() {
-                return Err(refuse_existing_restored(target));
-            }
-            std::fs::rename(partial, target).map_err(RarError::Io)
-        }
+        Err(_) => copy_partial_exclusively(partial, target),
     }
+}
+
+/// Install `partial` at `target` by exclusive create and copy, for
+/// filesystems without hard links. A name taken before or during the install
+/// is refused and left as it was; a copy that fails part way removes the
+/// incomplete `target` and keeps the partial for the caller's cleanup.
+fn copy_partial_exclusively(partial: &Path, target: &Path) -> RarResult<()> {
+    let mut output = match OpenOptions::new().write(true).create_new(true).open(target) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(refuse_existing_restored(target));
+        }
+        Err(error) => return Err(RarError::Io(error)),
+    };
+    let copied = File::open(partial)
+        .and_then(|mut input| std::io::copy(&mut input, &mut output))
+        .and_then(|_| output.sync_all());
+    drop(output);
+    if let Err(error) = copied {
+        let _ = std::fs::remove_file(target);
+        return Err(RarError::Io(error));
+    }
+    std::fs::remove_file(partial).map_err(RarError::Io)
 }
 
 /// How many names [`create_partial`] tries before it gives up.
@@ -2807,6 +2827,34 @@ mod tests {
         );
         assert_eq!(std::fs::read(&target).unwrap(), b"arrived meanwhile");
         assert_eq!(std::fs::read(&partial).unwrap(), b"restored bytes");
+    }
+
+    /// The copy install for filesystems without hard links refuses a name
+    /// taken before it starts and leaves that file alone, and otherwise
+    /// copies the partial's bytes into place and removes the partial.
+    #[test]
+    fn copying_a_partial_exclusively_never_replaces_a_taken_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("fixture_zeta.part1.rar");
+        let (partial, mut file) = create_partial(&target).unwrap();
+        file.write_all(b"restored bytes").unwrap();
+        drop(file);
+        std::fs::write(&target, b"arrived meanwhile").unwrap();
+
+        let error = copy_partial_exclusively(&partial, &target).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to overwrite existing restored volume"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"arrived meanwhile");
+        assert_eq!(std::fs::read(&partial).unwrap(), b"restored bytes");
+
+        std::fs::remove_file(&target).unwrap();
+        copy_partial_exclusively(&partial, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"restored bytes");
+        assert!(!partial.exists());
     }
 
     /// Without a file in the way the install moves the partial into place
