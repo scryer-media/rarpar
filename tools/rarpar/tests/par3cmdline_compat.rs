@@ -18,10 +18,7 @@ impl Par3 {
         let binary = dir
             .path()
             .join(format!("par3{}", std::env::consts::EXE_SUFFIX));
-        let source = Path::new(env!("CARGO_BIN_EXE_rarpar"));
-        // A copy, not a link: macOS kills a process whose binary's inode is
-        // rewritten under it, and cargo may relink the original meanwhile.
-        std::fs::copy(source, &binary).unwrap();
+        name_binary(Path::new(env!("CARGO_BIN_EXE_rarpar")), &binary);
         Self { _dir: dir, binary }
     }
 
@@ -35,6 +32,21 @@ impl Par3 {
             args,
         )
     }
+}
+
+/// Make `source` reachable under `target`, which names the persona.
+///
+/// On Unix this is a symbolic link, so `argv[0]` carries the new name while
+/// the original inode runs, exactly as every direct `rarpar` run does. A copy
+/// would race the other tests: a child forked by any of them between its
+/// `fork` and `exec` still holds the copy's write descriptor, and the copy's
+/// own `exec` then fails with `ETXTBSY`. Windows has no symbolic links
+/// without privilege and no inherited-descriptor window, so it copies.
+fn name_binary(source: &Path, target: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(source, target).unwrap();
+    #[cfg(windows)]
+    std::fs::copy(source, target).unwrap();
 }
 
 fn rarpar(root: &Path, args: &[&str]) -> Run {
