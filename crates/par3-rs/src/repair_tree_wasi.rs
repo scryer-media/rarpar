@@ -19,6 +19,12 @@ thread_local! {
     pub(crate) static REFUSE_CLONES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// The device and inode of a file a repair patches in place. WASI never
+/// repairs in place; the type exists so the shared staging code builds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct FileIdentity(u64, u64);
+
 pub(crate) struct Destination {
     pub(crate) relative: PathBuf,
     pub(crate) display: PathBuf,

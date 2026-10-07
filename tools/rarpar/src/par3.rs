@@ -997,9 +997,12 @@ mod tests {
         assert_eq!(sets.len(), 16);
         let scanned = options.scan_work.used();
         let read_bytes = options.diagnostics.file_io().read_bytes;
-        let expected_reads = carrier.len() as u64 * if cfg!(windows) { 2 } else { 1 };
+        // The carrier is read once on every platform: a Windows snapshot
+        // takes the file's identity and change time from its stamp instead
+        // of hashing its contents, so it reads nothing.
+        let expected_reads = carrier.len() as u64;
         assert_eq!(read_bytes, expected_reads);
-        assert_eq!(scanned, expected_reads + u64::from(cfg!(windows)));
+        assert_eq!(scanned, expected_reads);
         let cli = Cli::try_parse_from(["rarpar", "auto", path.to_str().unwrap()]).unwrap();
         for set in &sets {
             assert_eq!(

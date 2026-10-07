@@ -131,6 +131,9 @@ mod platform {
     }
 
     pub(super) fn probe(dir: &Path) -> Option<MountKind> {
+        // GetVolumePathNameW resolves the volume of a path that does not
+        // exist; a missing directory is a failure here as it is on statfs.
+        std::fs::metadata(dir).ok()?;
         let path: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
         let mut root = vec![0u16; path.len().max(4) + 1];
         // SAFETY: `path` is NUL-terminated; `root` holds `root.len()` units,
