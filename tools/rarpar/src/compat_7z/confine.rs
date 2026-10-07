@@ -222,11 +222,14 @@ mod unix {
             // SAFETY: `fstatat` succeeded.
             let stat = unsafe { stat.assume_init() };
             let kind = stat.st_mode & libc::S_IFMT;
+            // `time_t` is narrower than 64 bits on some targets.
+            #[allow(clippy::useless_conversion)]
+            let modified = i64::from(stat.st_mtime);
             Ok(Entry {
                 dir: kind == libc::S_IFDIR,
                 link: kind == libc::S_IFLNK,
                 len: stat.st_size as u64,
-                modified: Some(stat.st_mtime as i64),
+                modified: Some(modified),
             })
         }
 

@@ -688,7 +688,7 @@ fn removal_installs_nothing_when_a_later_destination_exists() {
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .collect();
-    assert_eq!(left, [squatter.clone()]);
+    assert_eq!(left.as_slice(), std::slice::from_ref(squatter));
     assert_eq!(std::fs::read(squatter).unwrap(), b"already here");
 
     // A destination named twice is refused the same way.
