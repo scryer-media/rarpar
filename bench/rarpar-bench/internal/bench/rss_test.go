@@ -191,6 +191,28 @@ func TestReportRejectsSuccessWithoutPeakRSS(t *testing.T) {
 	}
 }
 
+// A run schema 1 record predates mandatory peak RSS: it is refused by its
+// number, with the reason, even when its executions happen to carry a peak.
+func TestReportRefusesRunSchemaWithoutRSS(t *testing.T) {
+	raw := fixtureRunRecord()
+	raw.SchemaVersion = 1
+	path := filepath.Join(t.TempDir(), "raw.json")
+	if err := writeJSON(path, raw); err != nil {
+		t.Fatal(err)
+	}
+	_, err := BuildReport(path)
+	if err == nil || !strings.Contains(err.Error(), "run schema 1, which predates the required per-execution peak RSS") {
+		t.Fatalf("got %v, want a run schema 1 refusal naming the missing peak RSS", err)
+	}
+	raw.SchemaVersion = RunSchemaVersion + 1
+	if err := writeJSON(path, raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := BuildReport(path); err == nil || !strings.Contains(err.Error(), "unsupported run schema") {
+		t.Fatalf("got %v, want an unsupported run schema error", err)
+	}
+}
+
 func rssRunRecord() RunRecord {
 	raw := fixtureRunRecord()
 	raw.Plan.Repeats = 3
