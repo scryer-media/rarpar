@@ -313,7 +313,11 @@ jobs:
           sccache --start-server || true
           sccache --zero-stats || true
       - name: Hydrate the test corpus (unit)
-        run: cargo run --locked -p xtask -- test-corpus hydrate --profile unit
+        # The par3-rs insertion unit tests install into the original PAR-inside
+        # containers from the advanced corpus. The published `unit` profile
+        # predates them, so the `par3` profile rides along until a corpus
+        # revision carrying the widened `unit` profile is pinned.
+        run: cargo run --locked -p xtask -- test-corpus hydrate --profile unit --profile par3
       - name: Run no-fixture Rust tests
         # `--features unrar-rs/unstable-internals`: see the clippy lane. Without
         # it the `probe_volumes` example is skipped rather than compiled.
@@ -968,7 +972,11 @@ jobs:
           sccache --start-server || true
           sccache --zero-stats || true
       - name: Hydrate the test corpus (unit)
-        run: cargo run --locked -p xtask -- test-corpus hydrate --profile unit
+        # The par3-rs insertion unit tests install into the original PAR-inside
+        # containers from the advanced corpus. The published `unit` profile
+        # predates them, so the `par3` profile rides along until a corpus
+        # revision carrying the widened `unit` profile is pinned.
+        run: cargo run --locked -p xtask -- test-corpus hydrate --profile unit --profile par3
       - name: Run platform unit tests
         run: cargo test --locked --workspace --lib --bins --no-fail-fast
       - name: Show sccache stats
