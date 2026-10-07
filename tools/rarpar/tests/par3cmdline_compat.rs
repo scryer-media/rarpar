@@ -88,6 +88,17 @@ impl Run {
     }
 
     #[track_caller]
+    fn silent(self) -> Self {
+        assert!(
+            self.stdout.is_empty(),
+            "args={} expected no output, got\n{}",
+            self.args,
+            self.stdout
+        );
+        self
+    }
+
+    #[track_caller]
     fn lacks(self, text: &str) -> Self {
         assert!(
             !self.stdout.contains(text),
@@ -413,6 +424,13 @@ fn list_verify_repair_round_trip() {
     par3.run(root, &["v", "-qq", "set.par3"])
         .code(0)
         .lacks("All files");
+
+    // -qq repairs in silence, final summary included.
+    damage(&root.join("lantern.bin"), 10, 600);
+    par3.run(root, &["r", "-qq", "set.par3"])
+        .code(0)
+        .silent();
+    assert_eq!(std::fs::read(root.join("lantern.bin")).unwrap(), original);
 }
 
 #[test]

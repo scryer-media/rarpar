@@ -2205,11 +2205,13 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
         .iter()
         .filter(|(_, state)| !matches!(state, FileState::Complete | FileState::Found))
         .all(|(name, _)| repaired.contains(name));
-    println!();
-    if all_fixed {
-        println!("Repair complete.");
-    } else {
-        println!("Repair failed.");
+    if noise >= -1 {
+        println!();
+        if all_fixed {
+            println!("Repair complete.");
+        } else {
+            println!("Repair failed.");
+        }
     }
     Ok(())
 }

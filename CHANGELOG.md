@@ -3,6 +3,14 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## Unreleased
+
+### Fixes
+
+- The `par3` facade (par3cmdline compatibility) is silent at `-qq` when it
+  repairs: the final "Repair complete." or "Repair failed." line follows the
+  same noise level as the rest of the output.
+
 ## rarpar 0.8.1
 
 ### CLI Changes
