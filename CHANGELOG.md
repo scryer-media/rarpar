@@ -108,6 +108,10 @@ documented in each crate's own changelog so those notes ship with the crate.
   file that could carry its real name is resolved. A six-volume set beside
   eight unrelated files goes from 27 path resolutions (14 of the first
   volume) to 1.
+- `par3 verify` and `repair` of a named carrier no longer sniff the files the
+  set protects when looking for renamed carriers beside it: the `.par3`
+  carriers are scanned first and only the other siblings are sniffed. Ten
+  protected files beside the set: verify opens 14 files instead of 24.
 
 ### Library versions
 
