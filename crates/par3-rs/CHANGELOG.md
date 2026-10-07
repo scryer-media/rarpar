@@ -111,6 +111,10 @@
   0.46 → 0.44 s at eight, FFT 0.91 → 0.90 s and 0.61 → 0.59 s, CPU
   unchanged. Repairs in 1 MiB blocks at the default 64 KiB stripe read
   exactly what they did.
+- The changed-carrier sweep before each assessment asks each carrier for its
+  snapshot once instead of once per recovery payload it holds, so a carrier
+  of many recovery blocks costs one stat per assessment rather than one per
+  block.
 
 ## 0.5.0
 

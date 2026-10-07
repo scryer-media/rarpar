@@ -1635,16 +1635,28 @@ impl IncrementalSet {
 
     /// Forget lazy payloads whose published source generation disappeared or
     /// changed. Authenticated metadata is self-contained and remains usable.
-    /// This checks source snapshots without reading carrier or protected bytes.
+    /// This checks source snapshots without reading carrier or protected bytes:
+    /// one per carrier per sweep, however many payloads it holds.
     pub fn discard_changed_payloads(&mut self) -> EngineResult<usize> {
         self.options.cancel.check()?;
         let mut removed = 0;
         let mut failure = None;
+        // A carrier holds many payloads; asking its provider once per sweep is
+        // the same instantaneous check as asking once per payload.
+        let mut seen: std::collections::HashMap<(*const (), SourceId), Option<SourceSnapshot>> =
+            std::collections::HashMap::new();
         self.packets.retain(|_, packet| {
             let Some(payload) = packet.payload() else {
                 return true;
             };
-            match payload.access.snapshot(payload.source) {
+            let key = (Arc::as_ptr(&payload.access).cast::<()>(), payload.source);
+            let current = match seen.get(&key) {
+                Some(snapshot) => Ok(*snapshot),
+                None => payload.access.snapshot(payload.source).inspect(|snapshot| {
+                    seen.insert(key, *snapshot);
+                }),
+            };
+            match current {
                 Ok(snapshot) if snapshot != Some(payload.snapshot) => {
                     self.retained -= packet.retained_bytes();
                     removed += 1;
@@ -2258,6 +2270,98 @@ mod admission_tests {
         assert!(
             !matches!(error, EngineError::SourceChanged(_)),
             "an unchanged source reported a change: {error:?}"
+        );
+    }
+
+    /// A provider that counts how often it is asked for a snapshot.
+    struct CountedSnapshots {
+        inner: MemorySourceAccess,
+        snapshots: std::sync::atomic::AtomicU64,
+    }
+
+    impl crate::source::SourceAccess for CountedSnapshots {
+        fn snapshot(
+            &self,
+            source: SourceId,
+        ) -> std::io::Result<Option<crate::source::SourceSnapshot>> {
+            self.snapshots
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.snapshot(source)
+        }
+
+        fn read_at(&self, source: SourceId, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read_at(source, offset, out)
+        }
+
+        fn next_available(
+            &self,
+            source: SourceId,
+            offset: u64,
+        ) -> std::io::Result<Option<std::ops::Range<u64>>> {
+            self.inner.next_available(source, offset)
+        }
+    }
+
+    /// Every assess sweeps the lazy payloads for a changed carrier. On disk a
+    /// snapshot is a stat, and the sweep used to ask once per payload, so a
+    /// carrier holding a hundred recovery blocks cost a hundred stats per
+    /// assess for one instantaneous answer. One carrier is one question.
+    #[test]
+    fn a_changed_payload_sweep_asks_each_carrier_once() {
+        // Recovery blocks from this crate's own creation engine, all on one carrier.
+        let tree = crate::test_reference::TempTree::new("payload-sweep");
+        let (id, _, paths) =
+            crate::test_reference::many_block_carriers(16, 2, b"payload sweep", &tree);
+        let archive = paths
+            .iter()
+            .map(|path| std::fs::read(path).expect("a written carrier"))
+            .max_by_key(Vec::len)
+            .expect("creation wrote carriers");
+        let options = ExecutionOptions::default();
+        let mut inner = MemorySourceAccess::default();
+        inner.insert(SourceId(1), 1, archive.into());
+        let access = Arc::new(CountedSnapshots {
+            inner,
+            snapshots: std::sync::atomic::AtomicU64::new(0),
+        });
+        let mut scanner = PacketScanner::new(
+            Arc::clone(&access) as Arc<dyn crate::source::SourceAccess>,
+            SourceId(1),
+            options.clone(),
+            ScanLimits::default(),
+        )
+        .expect("a scanner over the archive");
+        let mut set = super::IncrementalSet::new(id, options).expect("a set");
+        let mut payloads = 0;
+        loop {
+            match scanner.poll().expect("the archive scans") {
+                ScanEvent::Packet(packet) => {
+                    if matches!(packet.contents, IngestedContents::Payload(_)) {
+                        payloads += 1;
+                    }
+                    set.merge(packet).expect("every packet is admitted");
+                }
+                ScanEvent::End => break,
+                other => panic!("the whole archive is present: {other:?}"),
+            }
+        }
+        assert!(
+            payloads > 1,
+            "the carrier must hold several payloads, it holds {payloads}"
+        );
+
+        access
+            .snapshots
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            set.discard_changed_payloads()
+                .expect("an unchanged carrier sweeps cleanly"),
+            0
+        );
+        assert_eq!(
+            access.snapshots.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "{payloads} payloads on one carrier are one snapshot"
         );
     }
 
