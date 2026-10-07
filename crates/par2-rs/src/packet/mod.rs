@@ -1377,7 +1377,9 @@ mod tests {
             settled_scan_fingerprint(before.clone(), &opened, settled),
             before
         );
-        let racy = settled - Duration::from_nanos(1);
+        // One millisecond, not one nanosecond: Windows `SystemTime` ticks in
+        // 100 ns units, so a 1 ns step truncates to no step at all.
+        let racy = settled - Duration::from_millis(1);
         assert_eq!(
             settled_scan_fingerprint(before.clone(), &opened, racy),
             None
