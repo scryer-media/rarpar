@@ -784,6 +784,17 @@ fn find_archives(
         session.err(&format!("\n\nSystem ERROR:\n{}\n", errno_text(&error)));
         return Err(EXIT_FATAL);
     }
+    // Overlapping selectors (`-ai!a.7z -ai!a.7z`, a name and a wildcard
+    // matching it) name one archive once, where it was first found: a second
+    // pass would reopen an archive `-sdel` already deleted.
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|(path, _)| {
+        let key: PathBuf = path
+            .components()
+            .filter(|part| *part != std::path::Component::CurDir)
+            .collect();
+        seen.insert(key)
+    });
     // `-ax`: an excluded archive is never opened, so never deleted.
     found.retain(|(path, _)| {
         options

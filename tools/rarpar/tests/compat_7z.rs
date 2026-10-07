@@ -1369,6 +1369,36 @@ fn sdel_keeps_an_archive_nothing_was_extracted_from() {
     assert_tree(&dir.path().join("out"));
 }
 
+/// Overlapping archive selectors name one archive once: under `-sdel` it
+/// is extracted and deleted once, and the run succeeds.
+#[test]
+fn overlapping_selectors_process_an_archive_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("crate.7z");
+    write_archive(&archive, SOLID);
+    let (out, _) = expect(
+        &facade(
+            dir.path(),
+            &[
+                "x",
+                "-an",
+                "-ai!crate.7z",
+                "-ai!crate.7z",
+                "-ai!./*.7z",
+                "-sdel",
+                "-y",
+                "-oout",
+            ],
+            b"",
+        ),
+        0,
+    );
+    assert_eq!(out.matches("Extracting archive:").count(), 1, "{out}");
+    assert!(out.contains("Everything is Ok"), "{out}");
+    assert!(!archive.exists());
+    assert_tree(&dir.path().join("out"));
+}
+
 /// An anti-item (a recorded deletion) is listed, with `Anti = +` under
 /// `-slt`, but extraction writes nothing for it.
 #[test]
