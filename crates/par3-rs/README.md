@@ -16,7 +16,7 @@ clean-room software, not official Parchive tooling.
 
 ```toml
 [dependencies]
-par3-rs = "0.4"
+par3-rs = "0.5"
 ```
 
 ## Choose an API
@@ -29,7 +29,8 @@ par3-rs = "0.4"
 - **Advanced creation:** use `creation::CreationPlan` to select a codec,
   interleaving, deduplication, Data packets, and recovery-volume layout.
 - **Recovery carriers or embedded protection:** use `carrier::CarrierPlan`
-  and `inside::{InsertionPlan, SelfRepairPlan}`.
+  and `inside::{InsertionPlan, SelfRepairPlan}`; for RAR5 hosts,
+  `inside::rar5` (experimental).
 
 See the [API documentation](https://docs.rs/par3-rs/latest/par3_rs/) and
 [streaming engine contract](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/ENGINE.md).
@@ -330,6 +331,11 @@ The incremental engine supports:
   requested replacement when original packet order is unknown.
 - Cauchy PAR-inside insertion and self-repair for supported ZIP, ZIP64, and 7z
   layouts, preserving existing archive member bytes and compression.
+- Experimental PAR-inside for RAR5 archives and volume sets (`inside::rar5`):
+  a region after the archive, or framed as a RAR5 block or service header
+  before the end header, with byte-exact self-repair and removal. RAR4 hosts,
+  a recovery-index base other than zero, and header-encrypted volume sets
+  (whose completeness cannot be checked) are refused.
 
 Packed tail blocks have no invented block checksum: each described tail is
 verified against its own fingerprint. CRC64 localizes candidates; BLAKE3
@@ -344,9 +350,14 @@ Still outside scope:
 - Inferring an unknown carrier's original byte order or missing set metadata.
 
 The workspace's `rarpar` CLI provides `par3 create`, `par3 verify`, `par3 repair`,
-and PAR3 discovery/repair in `auto` mode. Install it from the workspace or use
-its binary distribution; this crate remains a library. The `par3rs` example
-demonstrates the older convenience APIs.
+`par3 archive` (a 7z or ZIP archive protected in the same pass), the
+experimental `par3 inside` for RAR5 hosts, and PAR3 discovery/repair in `auto`
+mode. Invoked as `par3`, or under its own name with a par3cmdline command line,
+it is also a par3cmdline-compatible facade for verification, listing and
+repair (`v`, `l`, `r` and the PAR-inside `vs`/`rs` forms); par3cmdline's
+creation, insertion and deletion commands are refused there. Install it from
+the workspace or use its binary distribution; this crate remains a library.
+The `par3rs` example demonstrates the older convenience APIs.
 
 Ordinary repair does not silently remove embedded protection. Use the explicit
 PAR-inside APIs; exact carrier restoration requires an authenticated manifest.

@@ -81,7 +81,9 @@
 //!   RARLAB rar: one set across every volume, a region per volume, insertion,
 //!   verification, byte-exact self-repair of lost volumes and regions, and
 //!   byte-exact removal ([`inside::rar5`]). The region layout is not yet
-//!   specified by PAR3 and may change in a later release.
+//!   specified by PAR3 and may change in a later release. RAR4 hosts, a
+//!   recovery-index base other than zero, and header-encrypted volume sets
+//!   (whose completeness cannot be checked) are refused.
 //!
 //! # What is not
 //!
@@ -94,8 +96,14 @@
 //!   report replacement separately from protected-data completeness.
 //!
 //! The workspace's `rarpar` binary exposes `par3 create`, `par3 verify`,
-//! `par3 repair`, and PAR3 processing in `auto` mode through the session engine.
-//! This crate remains a library; `par3rs` is a convenience-API example.
+//! `par3 repair`, `par3 archive` (a 7z or ZIP archive protected in the same
+//! pass), the experimental `par3 inside` for RAR5 hosts, and PAR3 processing in
+//! `auto` mode through the session engine. Invoked as `par3`, or under its own
+//! name with a par3cmdline command line, it is also a par3cmdline-compatible
+//! facade for verification, listing and repair (`v`, `l`, `r` and the
+//! PAR-inside `vs`/`rs` forms); par3cmdline's creation, insertion and deletion
+//! commands are refused there. This crate remains a library; `par3rs` is a
+//! convenience-API example.
 //!
 //! Ordinary repair does not silently strip embedded protection. Use [`inside`]
 //! for those carriers. The convenience verifier reports unprotected chunks as
