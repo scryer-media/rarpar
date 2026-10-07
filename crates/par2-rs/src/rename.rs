@@ -4,7 +4,7 @@
 //! takedowns. PAR2 file descriptions contain the original filename and a 16KB
 //! MD5 hash, which can be used to identify and rename obfuscated files.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -117,9 +117,46 @@ pub fn scan_for_renames(dir: &Path, par2_set: &Par2FileSet) -> io::Result<Vec<Re
 /// Reads the first 64 bytes of each file to check for PAR2 magic and extract
 /// the recovery set ID. Returns paths of files that match `expected_set_id`
 /// but may have obfuscated names.
+///
+/// This opens every regular file in `dir`, the set's own data files included.
+/// When the set's file descriptions are at hand, prefer
+/// [`identify_par2_files_for_set`], which leaves those alone.
 pub fn identify_par2_files(
     dir: &Path,
     expected_set_id: &RecoverySetId,
+) -> io::Result<Vec<PathBuf>> {
+    identify_par2_files_skipping(dir, expected_set_id, &HashSet::new(), &mut |path| {
+        read_first_n_bytes(path, header::HEADER_SIZE)
+    })
+}
+
+/// [`identify_par2_files`] for `par2_set`'s recovery set, without opening the
+/// files the set protects.
+///
+/// A file whose name is one of the set's file descriptions is the set's data,
+/// so it is skipped by name instead of read: on a set of many large volumes
+/// that is one open and one read saved per protected file. The match itself is
+/// unchanged — every other regular file is still identified by its first
+/// packet header, so a renamed or obfuscated volume is found as before.
+pub fn identify_par2_files_for_set(dir: &Path, par2_set: &Par2FileSet) -> io::Result<Vec<PathBuf>> {
+    let protected: HashSet<&str> = par2_set
+        .files
+        .values()
+        .map(|desc| desc.filename.as_str())
+        .collect();
+    identify_par2_files_skipping(dir, &par2_set.recovery_set_id, &protected, &mut |path| {
+        read_first_n_bytes(path, header::HEADER_SIZE)
+    })
+}
+
+/// The directory walk behind both identify entry points. `read_head` reads a
+/// candidate's first packet header; it is a parameter so tests can count what
+/// the walk opens.
+fn identify_par2_files_skipping(
+    dir: &Path,
+    expected_set_id: &RecoverySetId,
+    skip_names: &HashSet<&str>,
+    read_head: &mut dyn FnMut(&Path) -> io::Result<Vec<u8>>,
 ) -> io::Result<Vec<PathBuf>> {
     let mut matches = Vec::new();
 
@@ -136,11 +173,11 @@ pub fn identify_par2_files(
             continue;
         };
 
-        if is_generated_par2_artifact_name(file_name) {
+        if is_generated_par2_artifact_name(file_name) || skip_names.contains(file_name) {
             continue;
         }
 
-        let data = read_first_n_bytes(&path, header::HEADER_SIZE)?;
+        let data = read_head(&path)?;
         if data.len() < header::HEADER_SIZE {
             continue;
         }
@@ -433,6 +470,79 @@ mod tests {
         let expected_id = RecoverySetId::from_bytes([0x42; 16]);
         let matches = identify_par2_files(dir.path(), &expected_id).unwrap();
         assert!(matches.is_empty());
+    }
+
+    /// The set-aware walk finds exactly the volumes the plain walk finds and
+    /// opens none of the files the set protects. A real set is created in a
+    /// tempdir, so the volumes carry real headers.
+    #[test]
+    fn identify_par2_files_for_set_skips_protected_files_and_finds_the_same_volumes() {
+        let dir = TempDir::new().unwrap();
+        let sources: Vec<PathBuf> = ["alpha.bin", "beta.bin", "gamma.bin"]
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let path = dir.path().join(name);
+                fs::write(&path, vec![index as u8 + 1; 4096]).unwrap();
+                path
+            })
+            .collect();
+        let mut options = crate::create::Par2CreatorOptions::with_output(
+            dir.path().join("invented-set"),
+            Some(dir.path().to_path_buf()),
+            sources,
+        );
+        options.block_sizing = crate::create::BlockSizing::Bytes(1024);
+        options.recovery_amount = crate::create::RecoveryAmount::Count(4);
+        let creator = crate::create::Par2Creator::new(options);
+        let plan = creator.plan().unwrap();
+        creator.create(&plan).unwrap();
+        // An obfuscated volume and an unrelated file are still candidates.
+        let index = dir.path().join("invented-set.par2");
+        fs::copy(&index, dir.path().join("obfuscated-7f3a")).unwrap();
+        fs::write(dir.path().join("notes.txt"), b"not a volume").unwrap();
+        let set = Par2FileSet::from_paths(&[&index]).unwrap();
+        let regular_files = fs::read_dir(dir.path()).unwrap().count();
+
+        let mut opened = Vec::new();
+        let mut plain = identify_par2_files_skipping(
+            dir.path(),
+            &set.recovery_set_id,
+            &HashSet::new(),
+            &mut |path| {
+                opened.push(path.to_path_buf());
+                read_first_n_bytes(path, header::HEADER_SIZE)
+            },
+        )
+        .unwrap();
+        assert_eq!(opened.len(), regular_files);
+
+        let protected: HashSet<&str> = set.files.values().map(|d| d.filename.as_str()).collect();
+        assert_eq!(protected.len(), 3);
+        let mut opened_for_set = Vec::new();
+        let mut for_set = identify_par2_files_skipping(
+            dir.path(),
+            &set.recovery_set_id,
+            &protected,
+            &mut |path| {
+                opened_for_set.push(path.to_path_buf());
+                read_first_n_bytes(path, header::HEADER_SIZE)
+            },
+        )
+        .unwrap();
+        assert_eq!(opened_for_set.len(), regular_files - 3);
+        assert!(opened_for_set.iter().all(|path| {
+            let name = path.file_name().and_then(|name| name.to_str()).unwrap();
+            !protected.contains(name)
+        }));
+
+        plain.sort();
+        for_set.sort();
+        assert_eq!(plain, for_set);
+        assert!(for_set.contains(&dir.path().join("obfuscated-7f3a")));
+        let mut public = identify_par2_files_for_set(dir.path(), &set).unwrap();
+        public.sort();
+        assert_eq!(public, for_set);
     }
 
     #[test]

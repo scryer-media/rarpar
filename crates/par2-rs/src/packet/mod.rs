@@ -11,11 +11,13 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use tracing::{debug, trace, warn};
 
 use crate::checksum::Md5State;
 use crate::error::{Par2Error, Result};
+use crate::evidence::FileStatFingerprint;
 use crate::types::{CancellationToken, MAX_FILES_PER_SET, RecoverySetId};
 
 pub use budget::{
@@ -515,6 +517,7 @@ fn parse_recovery_packet_from_reader(
     header_bytes: &[u8; HEADER_SIZE],
     offset: u64,
     path: &Arc<Path>,
+    authenticated_at: Option<&FileStatFingerprint>,
     budget: &PacketScanBudget,
 ) -> Result<Packet> {
     let body_len =
@@ -545,17 +548,59 @@ fn parse_recovery_packet_from_reader(
         return Err(Par2Error::PacketHashMismatch { offset });
     }
 
-    Ok(Packet::RecoverySlice(RecoverySlicePacket {
-        exponent,
-        // Keep the hash for repair-time revalidation: the file may change
-        // after this authenticated scan without changing its retained span.
-        data: RecoverySliceData::file_backed_shared(
+    // Keep the hash for repair-time revalidation: the file may change after
+    // this authenticated scan without changing its retained span. The
+    // fingerprint lets that revalidation skip the read while it has not.
+    let data = match authenticated_at {
+        Some(fingerprint) => RecoverySliceData::file_backed_authenticated(
+            Arc::clone(path),
+            payload_offset,
+            payload_len,
+            header.packet_hash,
+            fingerprint.clone(),
+        ),
+        None => RecoverySliceData::file_backed_shared(
             Arc::clone(path),
             payload_offset,
             payload_len,
             Some(header.packet_hash),
         ),
+    };
+    Ok(Packet::RecoverySlice(RecoverySlicePacket {
+        exponent,
+        data,
     }))
+}
+
+/// How long a volume's mtime must have stood still before a scan may vouch
+/// for its recovery payloads by fingerprint. Two seconds is the coarsest
+/// mtime granularity in common use (FAT); below it, a write landing in the
+/// same tick as the scan would leave the fingerprint unchanged.
+const SCAN_FINGERPRINT_SETTLE: Duration = Duration::from_secs(2);
+
+/// The fingerprint a scan may record next to the recovery payloads it
+/// authenticates, or `None` when it may not record one.
+///
+/// `before_open` is the path's fingerprint taken before the scan opened it and
+/// `opened` the open handle's metadata. They must agree — a path replaced
+/// between the two is not vouched for — and the mtime must exist and be at
+/// least [`SCAN_FINGERPRINT_SETTLE`] older than `scan_started`. That last rule
+/// is what makes an unchanged fingerprint mean unchanged bytes: any write at
+/// or after `scan_started` stamps an mtime at least one granule newer than
+/// the recorded one, so a later stat sees it and validation reads the bytes
+/// again. A volume still being written, or written moments ago, is therefore
+/// re-hashed at repair time exactly as before.
+fn settled_scan_fingerprint(
+    before_open: Option<FileStatFingerprint>,
+    opened: &std::fs::Metadata,
+    scan_started: SystemTime,
+) -> Option<FileStatFingerprint> {
+    let fingerprint = before_open?;
+    if fingerprint != FileStatFingerprint::from_metadata(opened) {
+        return None;
+    }
+    let age = scan_started.duration_since(fingerprint.modified()?).ok()?;
+    (age >= SCAN_FINGERPRINT_SETTLE).then_some(fingerprint)
 }
 
 /// Collect every packet of an on-disk PAR2 file under the default limits.
@@ -605,8 +650,16 @@ pub fn scan_packets_from_path_bounded(
     budget: &PacketScanBudget,
     sink: &mut dyn PacketSink,
 ) -> Result<()> {
+    // Fingerprinted before the open (see `settled_scan_fingerprint`), so the
+    // fingerprint can only describe the bytes this scan reads or a state from
+    // before them.
+    let scan_started = SystemTime::now();
+    let fingerprint_before_open = FileStatFingerprint::capture_path(path);
     let file = File::open(path).map_err(Par2Error::Io)?;
-    let file_len = file.metadata().map_err(Par2Error::Io)?.len();
+    let metadata = file.metadata().map_err(Par2Error::Io)?;
+    let file_len = metadata.len();
+    let authenticated_at =
+        settled_scan_fingerprint(fingerprint_before_open, &metadata, scan_started);
     crate::file_cache::advise_sequential(&file, path, file_len);
     let mut reader = BufReader::with_capacity(256 * 1024, file);
     let shared_path: Arc<Path> = Arc::from(path);
@@ -657,6 +710,7 @@ pub fn scan_packets_from_path_bounded(
                 &header_bytes,
                 packet_offset,
                 &shared_path,
+                authenticated_at.as_ref(),
                 budget,
             )
             .map(Some),
@@ -1296,5 +1350,59 @@ mod tests {
         corrupted[last] ^= 0xFF;
         std::fs::write(file.path(), &corrupted).unwrap();
         assert!(!slice.data.validate_packet_hash(&rsid, 7).unwrap());
+    }
+
+    /// A scan vouches for a volume's payloads only when the stat it took
+    /// before opening the volume matches the opened handle and the mtime is
+    /// old enough that any later write must stamp a newer one. The clock is
+    /// passed in, so the boundary is exercised exactly.
+    #[test]
+    fn a_scan_vouches_only_for_a_settled_volume_it_actually_opened() {
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let volume = NamedTempFile::new().unwrap();
+        volume
+            .as_file()
+            .write_all(b"invented volume bytes")
+            .unwrap();
+        volume
+            .as_file()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let opened = volume.as_file().metadata().unwrap();
+        let before = FileStatFingerprint::capture_path(volume.path());
+        assert!(before.is_some());
+
+        let settled = modified + SCAN_FINGERPRINT_SETTLE;
+        assert_eq!(
+            settled_scan_fingerprint(before.clone(), &opened, settled),
+            before
+        );
+        let racy = settled - Duration::from_nanos(1);
+        assert_eq!(
+            settled_scan_fingerprint(before.clone(), &opened, racy),
+            None
+        );
+        let clock_behind_mtime = modified - Duration::from_secs(1);
+        assert_eq!(
+            settled_scan_fingerprint(before.clone(), &opened, clock_behind_mtime),
+            None
+        );
+        assert_eq!(settled_scan_fingerprint(None, &opened, settled), None);
+
+        // The path named another file when it was stat'ed than the one opened.
+        let other = NamedTempFile::new().unwrap();
+        other
+            .as_file()
+            .write_all(b"a different invented volume")
+            .unwrap();
+        other
+            .as_file()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let other_opened = other.as_file().metadata().unwrap();
+        assert_eq!(
+            settled_scan_fingerprint(before, &other_opened, settled),
+            None
+        );
     }
 }

@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.10.8
+
+Fewer redundant reads on the verify and repair paths.
+
+### Changed
+
+- Strict verify reads a damaged file once. Its first pass now checks every
+  slice's CRC32 and MD5 alongside the 16 KiB and whole-file MD5 chain and runs
+  to the end of the file, so the per-slice verdicts of a damaged file come out
+  of that read instead of a second full pass; verdicts are unchanged. On a
+  page-cached 255 MiB file damaged in its last slice (Apple M-series, release
+  build) a verify reads 255 MiB instead of 510 MiB and takes 298-308 ms
+  instead of 495-633 ms. The cost lands on clean files: the slice checks run
+  on a second rayon worker beside the serial chain, so with a worker free
+  wall time moves by -1% to +4%, but process CPU rises by 64-107% (the top
+  of that range for 4 MiB slices, which are too large to share SIMD lanes).
+  Where no worker is free — a loaded host, or many files verified in
+  parallel — the slice checks cannot hide and wall time follows CPU; on a
+  loaded host a clean verify measured up to 48% slower with 4 MiB slices. `VerifyOptions::single_read = false` restores the two-pass behaviour;
+  it is on by default for `verify_all`, `verify_selected_file_ids` and their
+  `_with_options` and `_parallel` variants.
+- Planning a repair (`plan_repair_with_memory_limit`) and discarding unusable
+  recovery packets after `InsufficientRecoveryData` no longer re-read and
+  re-hash recovery payloads that the bounded file scan already authenticated.
+  The scan records each volume's stat fingerprint — length, mtime and, on
+  Unix, device and inode — taken before it opens the volume and kept only
+  when the opened handle agrees and the mtime is at least two seconds old.
+  `RecoverySliceData::validate_packet_hash` accepts the scan's verdict while
+  the path still fingerprints the same, and reads and hashes the payload as
+  before when the volume changed, was replaced, is no longer a regular file,
+  or was too fresh to vouch for. Payloads built by any other constructor
+  are always re-hashed. A same-length rewrite that also restores the mtime is
+  invisible to the fingerprint and is left to the verification of the
+  repaired files.
+
+### Added
+
+- `identify_par2_files_for_set(dir, &Par2FileSet)`: `identify_par2_files` for
+  the set's recovery set ID that skips the files the set protects instead of
+  opening each one and reading its first 64 bytes. `identify_par2_files` is
+  unchanged.
+
+### API
+
+- `VerifyOptions` has a new `single_read: bool` field, `true` by default (see
+  above). `VerifyOptions::default()` is now written out by hand rather than
+  derived; every other field keeps its default.
+- `RecoverySliceData::FileBacked` has a new `authenticated_at:
+  Option<FileStatFingerprint>` field. Patterns that use `..` are unaffected;
+  code that builds the variant literally adds `authenticated_at: None` or uses
+  the existing constructors, which set it to `None`.
+
 ## 0.10.7 (Unreleased)
 
 ### Fixed
