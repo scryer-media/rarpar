@@ -57,6 +57,9 @@ documented in each crate's own changelog so those notes ship with the crate.
   switched off on a Unix terminal and on the Windows console while the
   password is read, and restored after; the Windows prompt already said it
   would not be echoed. Input that is not a terminal is read as before.
+- 7-Zip facade: a link member refused as dangerous leaves nothing at its
+  name, as 7-Zip's does, instead of the empty placeholder opened when its
+  data began.
 - par3cmdline facade: the block-map report is counted from ranges, so a set
   with a huge block count no longer walks every block; non-UTF-8 arguments
   reach the files they name byte for byte on Unix; `\` separates path

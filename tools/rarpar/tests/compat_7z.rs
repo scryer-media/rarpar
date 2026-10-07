@@ -599,6 +599,33 @@ fn links_are_judged_from_where_they_are_created() {
     assert!(!std::fs::symlink_metadata(&pivot).unwrap().is_symlink());
 }
 
+/// A refused link leaves nothing at its name, as 7-Zip's does: not an empty
+/// placeholder in place of the file `-y` overwrote.
+#[cfg(unix)]
+#[test]
+fn refused_links_leave_no_placeholder() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    std::fs::write(out.join("pivot"), b"older copy").unwrap();
+    write_entries(
+        &dir.path().join("pivot.7z"),
+        &[("pivot", b"../outside", true)],
+    );
+    let (_, err) = expect(
+        &facade(dir.path(), &["x", "-y", "-oout", "pivot.7z"], b""),
+        2,
+    );
+    assert!(
+        err.contains("Dangerous link path was ignored : pivot : ../outside"),
+        "{err}"
+    );
+    assert!(
+        std::fs::symlink_metadata(out.join("pivot"))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    );
+}
+
 /// A folder in the output tree that is already a symbolic link is never
 /// written through.
 #[cfg(unix)]

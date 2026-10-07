@@ -772,6 +772,10 @@ impl Extractor<'_> {
             }
             let link = String::from_utf8_lossy(&link_target).into_owned();
             let Some(link_path) = self.link_path(&item, &link) else {
+                // As 7-Zip does, the placeholder made when the member's data
+                // began goes before the link is judged: a refused link leaves
+                // nothing at its name.
+                let _ = fs::remove_file(&path);
                 let text = format!("Dangerous link path was ignored : {} : {link}", item.name);
                 self.errors += 1;
                 self.session.err(&format!("ERROR: {text}\n"));
