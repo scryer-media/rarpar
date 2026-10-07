@@ -32,8 +32,9 @@ documented in each crate's own changelog so those notes ship with the crate.
   through a link already in the output folder keeps its own mode. A member whose
   solid block failed is reported as failed even when its own CRC matched.
 - 7-Zip facade: after `--`, words starting with `@` are member names, not
-  list files, and `-sdel` no longer deletes an archive when the member
-  filters selected nothing from it.
+  list files, and `-sdel` deletes an archive only when something was written
+  from it: not when the member filters selected nothing, nor when the
+  overwrite policy (`-aos`) skipped every destination.
 - 7-Zip facade archive discovery: `-ax` excludes archives, so an excluded
   archive is never opened and never deleted by `-sdel`; `-ai`/`-ax` keep
   their own `r` recursion, so `-air!*.7z` finds archives in every folder

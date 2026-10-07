@@ -1400,3 +1400,54 @@ fn sdel_keeps_an_archive_nothing_was_extracted_from() {
     assert!(!archive.exists());
     assert_tree(&dir.path().join("out"));
 }
+
+/// `-aos -sdel` with every destination already present writes nothing, so
+/// the archive stays; once one member is written, it goes.
+#[test]
+fn sdel_keeps_an_archive_whose_every_member_was_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("hamper.7z");
+    write_entries(
+        &archive,
+        &[
+            ("rind.txt", b"from the archive", false),
+            ("pith.txt", b"also archived", false),
+        ],
+    );
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    std::fs::write(out.join("rind.txt"), b"already here").unwrap();
+    std::fs::write(out.join("pith.txt"), b"already here too").unwrap();
+    let output = facade(
+        dir.path(),
+        &["x", "-aos", "-sdel", "-oout", "hamper.7z"],
+        b"",
+    );
+    expect(&output, 0);
+    assert!(archive.is_file());
+    assert_eq!(
+        std::fs::read(out.join("rind.txt")).unwrap(),
+        b"already here"
+    );
+    assert_eq!(
+        std::fs::read(out.join("pith.txt")).unwrap(),
+        b"already here too"
+    );
+
+    std::fs::remove_file(out.join("pith.txt")).unwrap();
+    let output = facade(
+        dir.path(),
+        &["x", "-aos", "-sdel", "-oout", "hamper.7z"],
+        b"",
+    );
+    expect(&output, 0);
+    assert!(!archive.exists());
+    assert_eq!(
+        std::fs::read(out.join("rind.txt")).unwrap(),
+        b"already here"
+    );
+    assert_eq!(
+        std::fs::read(out.join("pith.txt")).unwrap(),
+        b"also archived"
+    );
+}

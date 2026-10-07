@@ -169,8 +169,15 @@ pub(super) struct Stats {
 
 /// How one archive's extraction ended.
 pub(super) enum Ending {
-    /// Every selected item was processed; the count is of item errors.
-    Done(u64),
+    /// Every selected item was processed.
+    Done {
+        /// Item errors.
+        errors: u64,
+        /// Outputs actually made: files and links written (or streamed to
+        /// stdout) and folders created. Items the overwrite policy skipped,
+        /// and folders that were already there, are not counted.
+        written: u64,
+    },
     /// The user quit at a prompt (7-Zip's E_ABORT).
     Abort,
     /// Output failed in a way 7-Zip stops the archive for.
@@ -237,6 +244,7 @@ struct Extractor<'a> {
     done: Vec<bool>,
     cursor: usize,
     errors: u64,
+    written: u64,
     overwrite: Overwrite,
     encrypted: bool,
     /// The member being written, and once its output is open, the path
@@ -470,8 +478,13 @@ impl Extractor<'_> {
         }
         let (path, parts) = self.out_path(item);
         let path = PathBuf::from(path);
+        let existed = fs::symlink_metadata(&path).is_ok();
         match confined_folders(&self.setup.out_dir, &parts) {
-            Ok(()) => {}
+            Ok(()) => {
+                if !existed {
+                    self.written += 1;
+                }
+            }
             Err(FolderError::Link) => {
                 self.item_error("Dangerous link via another link was ignored", &item.name);
                 return;
@@ -731,6 +744,9 @@ impl Extractor<'_> {
         }
         self.in_progress = None;
         let target = output.and_then(|output| output.path);
+        if self.setup.to_stdout {
+            self.written += 1;
+        }
         let crc = digest.finalize() as u32;
         if let Some(hash) = self.stats.hash.as_mut() {
             hash.finish(false, &item.name, crc);
@@ -769,6 +785,7 @@ impl Extractor<'_> {
             }
         }
         let _ = &link_target;
+        self.written += 1;
         set_metadata(Path::new(&path), &item);
         Ok(())
     }
@@ -870,7 +887,10 @@ pub(super) fn extract(
     }
     if !selected.iter().any(|&wanted| wanted) {
         session.out("\nNo files to process\n");
-        return Ending::Done(0);
+        return Ending::Done {
+            errors: 0,
+            written: 0,
+        };
     }
     let encrypted: Vec<bool> = archive.blocks.iter().map(block_is_encrypted).collect();
     let mut extractor = Extractor {
@@ -883,6 +903,7 @@ pub(super) fn extract(
         done: vec![false; count],
         cursor: 0,
         errors: 0,
+        written: 0,
         encrypted: false,
         in_progress: None,
         stop: None,
@@ -973,7 +994,10 @@ pub(super) fn extract(
         extractor.flush_until(count).err()
     };
     let ending = match ending {
-        None => Ending::Done(extractor.errors),
+        None => Ending::Done {
+            errors: extractor.errors,
+            written: extractor.written,
+        },
         Some(Stop::Abort) => Ending::Abort,
         Some(Stop::Write(error) | Stop::Read(error)) => Ending::Failed(error),
     };

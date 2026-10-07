@@ -920,19 +920,20 @@ fn run_extract(session: &mut Session, options: Options, archives: Vec<(String, u
             setup.out_dir = String::new();
         }
         let selected = extract::selection(&opened.archive.files, &options.censor);
-        // An archive is deleted only when something was extracted from it.
-        let any_selected = selected.iter().any(|&wanted| wanted);
         match extract::extract(session, &setup, &mut stats, opened, selected) {
-            Ending::Done(0) => {
+            Ending::Done { errors: 0, written } => {
                 ok += 1;
                 session.out("Everything is Ok\n");
-                if delete_after && !setup.test && any_selected {
+                // An archive is deleted only when something was written from
+                // it: not when the filters selected nothing, nor when the
+                // overwrite policy skipped every destination.
+                if delete_after && !setup.test && written > 0 {
                     for volume in &set.paths {
                         let _ = fs::remove_file(volume);
                     }
                 }
             }
-            Ending::Done(errors) => {
+            Ending::Done { errors, .. } => {
                 with_errors += 1;
                 file_errors += errors;
                 session.out(&format!("\nSub items Errors: {errors}\n"));
