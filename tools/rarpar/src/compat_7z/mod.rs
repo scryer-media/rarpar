@@ -16,7 +16,7 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
-use censor::{Censor, MarkMode, NameOption, Recursion, has_wildcard, wildcard_match};
+use censor::{Censor, MarkMode, NameOption, Recursion, has_wildcard, names_equal, wildcard_match};
 use extract::{Ending, HashSums, Overwrite, Setup, Stats};
 use format::{archive_method, smart_size};
 use switches::{LineError, Parsed};
@@ -40,17 +40,29 @@ pub(crate) fn invoked_as_7z(program: &OsStr) -> bool {
 
 /// Run a 7-Zip command line; the arguments follow the program name.
 pub(crate) fn dispatch(args: &[OsString]) -> u8 {
-    let args: Vec<String> = args
-        .iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
     let mut session = Session {
         out_target: 1,
         err_target: 2,
         log_level: 0,
         password: None,
     };
-    run(&mut session, &args)
+    // An argument that is not valid Unicode is refused, never read with
+    // U+FFFD in place of its bytes: that would name a different archive,
+    // output folder or member, which `-sdel` could then delete.
+    let mut text = Vec::with_capacity(args.len());
+    for arg in args {
+        match arg.to_str() {
+            Some(arg) => text.push(arg.to_owned()),
+            None => {
+                let shown = arg.to_string_lossy().into_owned();
+                return line_error(
+                    &mut session,
+                    &LineError::new("Unsupported argument that is not valid Unicode:", shown),
+                );
+            }
+        }
+    }
+    run(&mut session, &text)
 }
 
 /// Where messages go, and what the user has told us so far.
@@ -121,7 +133,10 @@ impl Session {
             },
             prompt,
         );
-        let line = self.read_line();
+        let line = {
+            let _quiet = EchoOff::stdin();
+            self.read_line()
+        };
         write_to(
             if self.out_target == 0 {
                 2
@@ -133,6 +148,100 @@ impl Session {
         let line = line?;
         self.password = Some(line.clone());
         Some(line)
+    }
+}
+
+/// Terminal echo switched off while a password is typed, and restored when
+/// this is dropped. 7-Zip does this on Windows; it is done on a Unix
+/// terminal too, so a typed password is never shown. Input that is not a
+/// terminal is left alone.
+struct EchoOff {
+    #[cfg(unix)]
+    fd: i32,
+    #[cfg(unix)]
+    saved: libc::termios,
+    #[cfg(windows)]
+    console: *mut std::ffi::c_void,
+    #[cfg(windows)]
+    saved: u32,
+}
+
+impl EchoOff {
+    fn stdin() -> Option<Self> {
+        #[cfg(unix)]
+        return Self::on(0);
+        #[cfg(windows)]
+        return Self::on_console();
+        #[cfg(not(any(unix, windows)))]
+        return None;
+    }
+
+    #[cfg(unix)]
+    fn on(fd: i32) -> Option<Self> {
+        // SAFETY: `termios` is plain data that `tcgetattr` fills; the calls
+        // only read and set the terminal state of `fd`.
+        unsafe {
+            if libc::isatty(fd) != 1 {
+                return None;
+            }
+            let mut saved: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut saved) != 0 {
+                return None;
+            }
+            let mut quiet = saved;
+            quiet.c_lflag &= !libc::ECHO;
+            (libc::tcsetattr(fd, libc::TCSANOW, &quiet) == 0).then_some(Self { fd, saved })
+        }
+    }
+
+    #[cfg(windows)]
+    fn on_console() -> Option<Self> {
+        const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+        const ENABLE_ECHO_INPUT: u32 = 0x0004;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetStdHandle(which: u32) -> *mut std::ffi::c_void;
+            fn GetConsoleMode(console: *mut std::ffi::c_void, mode: *mut u32) -> i32;
+        }
+        // SAFETY: the handle is the process's own standard input, checked
+        // before use; the mode is a plain integer.
+        unsafe {
+            let console = GetStdHandle(STD_INPUT_HANDLE);
+            if console.is_null() || console as isize == -1 {
+                return None;
+            }
+            let mut saved = 0u32;
+            if GetConsoleMode(console, &mut saved) == 0 {
+                return None;
+            }
+            (set_console_mode(console, saved & !ENABLE_ECHO_INPUT) != 0)
+                .then_some(Self { console, saved })
+        }
+    }
+}
+
+#[cfg(windows)]
+unsafe fn set_console_mode(console: *mut std::ffi::c_void, mode: u32) -> i32 {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetConsoleMode(console: *mut std::ffi::c_void, mode: u32) -> i32;
+    }
+    // SAFETY: the caller passes a console handle it read the mode from.
+    unsafe { SetConsoleMode(console, mode) }
+}
+
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        // SAFETY: restores the state read from the same terminal in `on`.
+        #[cfg(unix)]
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved);
+        }
+        // SAFETY: restores the mode read from the same console handle.
+        #[cfg(windows)]
+        unsafe {
+            set_console_mode(self.console, self.saved);
+        }
     }
 }
 
@@ -222,19 +331,17 @@ enum Command {
     List,
 }
 
-/// One `-i`/`-x`/`-ai` argument: its options and its names.
+/// One `-i`/`-x`/`-ai` argument: its options and its names. `base` carries
+/// the defaults its own `r`, `m` and `w` modifiers override: the recursion,
+/// and the `-spd`/`-spm` matching and mark mode.
 fn wildcard_switch(
     text: &str,
     include: bool,
-    default: Recursion,
+    base: NameOption,
     names: &mut Vec<(NameOption, String)>,
 ) -> Result<(), LineError> {
     let invalid = |message: &str| LineError::new(message, text.to_owned());
-    let mut option = NameOption {
-        include,
-        recursion: default,
-        ..NameOption::default()
-    };
+    let mut option = NameOption { include, ..base };
     let chars: Vec<char> = text.chars().collect();
     let mut at = 0;
     if chars.len() < 2 {
@@ -392,19 +499,24 @@ fn parse_options(parsed: &Parsed, session: &mut Session) -> Result<Options, Line
 
     // The archive names: `-ai` and `-ax` keep their own recursion, and
     // nothing ever recurses for the archive name itself, `-r` included.
+    // `-spd` and `-spm` reach them all, as 7-Zip's `nopArc` takes them.
+    let archive_option = NameOption {
+        recursion: Recursion::None,
+        ..default_option
+    };
     let mut archive_names = Vec::new();
     if !parsed.has("an") {
         match words.next() {
-            Some(name) => archive_names.push((NameOption::default(), name.clone())),
+            Some(name) => archive_names.push((archive_option, name.clone())),
             None => return Err(LineError::new("Cannot find archive name", "")),
         }
     }
     for text in &parsed.get("ai").strings {
-        wildcard_switch(text, true, Recursion::None, &mut archive_names)?;
+        wildcard_switch(text, true, archive_option, &mut archive_names)?;
     }
     let mut archive_excluded = Vec::new();
     for text in &parsed.get("ax").strings {
-        wildcard_switch(text, false, Recursion::None, &mut archive_excluded)?;
+        wildcard_switch(text, false, archive_option, &mut archive_excluded)?;
     }
     let mut archive_excludes = Censor::new(case_sensitive);
     archive_excludes.add_name(
@@ -423,7 +535,7 @@ fn parse_options(parsed: &Parsed, session: &mut Session) -> Result<Options, Line
 
     let mut names: Vec<(NameOption, String)> = Vec::new();
     for text in &parsed.get("i").strings {
-        wildcard_switch(text, true, recursion, &mut names)?;
+        wildcard_switch(text, true, default_option, &mut names)?;
     }
     let has_includes = !names.is_empty();
     for text in &parsed.get("x").strings {
@@ -431,7 +543,7 @@ fn parse_options(parsed: &Parsed, session: &mut Session) -> Result<Options, Line
         if rest == "td" || rest == "tf" {
             continue;
         }
-        wildcard_switch(text, false, recursion, &mut names)?;
+        wildcard_switch(text, false, default_option, &mut names)?;
     }
     let mut positional = Vec::new();
     // `--` ends `@listfile` reading for every word after it: judge each
@@ -455,7 +567,9 @@ fn parse_options(parsed: &Parsed, session: &mut Session) -> Result<Options, Line
         }
     }
     if positional.is_empty() && !has_includes {
-        censor.add_name(&default_option, "*");
+        // 7-Zip's universal wildcard takes the default options, so `-spd`
+        // never turns it into a member literally named `*`.
+        censor.add_name(&NameOption::default(), "*");
     }
     for (option, name) in positional.iter().chain(names.iter()) {
         if name.is_empty() {
@@ -633,17 +747,32 @@ fn find_archives(
             Recursion::WildcardOnly => has_wildcard(file),
             Recursion::None => false,
         };
+        // `-spd` or `w-`: `*` and `?` are the name's own characters.
+        let mask = Mask {
+            name: file,
+            wildcards: option.wildcards,
+            case_sensitive,
+        };
         if recursive {
             // `-air`: the name is matched in its folder and every folder
             // under it.
             wildcard_names = true;
             let mut matches = Vec::new();
-            folders += walk(dir, Some((file, case_sensitive)), &mut matches);
+            match walk(dir, Some(mask), &mut matches) {
+                Ok(passed) => folders += passed,
+                // A folder that is not there holds nothing to match.
+                Err((path, error)) if error.kind() == io::ErrorKind::NotFound && path == dir => {}
+                Err((path, error)) => {
+                    scan_error(session, &path, &error);
+                    missing = Some(error);
+                    continue;
+                }
+            }
             matches.sort();
             found.extend(matches);
             continue;
         }
-        if has_wildcard(file) {
+        if option.wildcards && has_wildcard(file) {
             wildcard_names = true;
             let listing = fs::read_dir(if dir.is_empty() { "." } else { dir });
             let mut matches = Vec::new();
@@ -673,12 +802,21 @@ fn find_archives(
                 } else {
                     format!("{name}{}", std::path::MAIN_SEPARATOR)
                 };
-                folders += walk(&prefix, None, &mut inside);
+                match walk(&prefix, None, &mut inside) {
+                    Ok(passed) => folders += passed,
+                    // A folder that cannot be read fails the scan, as
+                    // 7-Zip's does: never an empty, successful one.
+                    Err((path, error)) => {
+                        scan_error(session, &path, &error);
+                        missing = Some(error);
+                        continue;
+                    }
+                }
                 inside.sort();
                 found.extend(inside);
             }
             Err(error) => {
-                session.err(&format!("\nERROR: {}\n{name}\n\n", errno_text(&error)));
+                scan_error(session, name, &error);
                 missing = Some(error);
             }
         }
@@ -698,33 +836,70 @@ fn find_archives(
     Ok((found, folders))
 }
 
+/// A file name to look for while walking: a wildcard, or with wildcard
+/// matching off, the literal name.
+#[derive(Clone, Copy)]
+struct Mask<'a> {
+    name: &'a str,
+    wildcards: bool,
+    case_sensitive: bool,
+}
+
+impl Mask<'_> {
+    fn matches(&self, name: &str) -> bool {
+        if self.wildcards {
+            wildcard_match(self.name, name, self.case_sensitive)
+        } else {
+            names_equal(self.name, name, self.case_sensitive)
+        }
+    }
+}
+
 /// Every file under the folder `prefix` names (`""` is the current one)
 /// whose name matches `mask`, returning how many folders it passed.
 ///
 /// Links are never followed: a linked folder such as `loop -> .` would
 /// recurse without end, and a link out of the folder would reach archives
 /// outside the one that was named.
-fn walk(prefix: &str, mask: Option<(&str, bool)>, found: &mut Vec<(String, u64)>) -> u64 {
+///
+/// A folder that cannot be read ends the walk with its path and the error.
+fn walk(
+    prefix: &str,
+    mask: Option<Mask>,
+    found: &mut Vec<(String, u64)>,
+) -> Result<u64, (String, io::Error)> {
     let mut folders = 0;
-    let Ok(listing) = fs::read_dir(if prefix.is_empty() { "." } else { prefix }) else {
-        return 0;
+    let fail = |error| Err((prefix.to_owned(), error));
+    let listing = match fs::read_dir(if prefix.is_empty() { "." } else { prefix }) {
+        Ok(listing) => listing,
+        Err(error) => return fail(error),
     };
-    for entry in listing.flatten() {
-        let Ok(meta) = fs::symlink_metadata(entry.path()) else {
-            continue;
+    for entry in listing {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => return fail(error),
         };
         let entry_name = entry.file_name().to_string_lossy().into_owned();
         let path = format!("{prefix}{entry_name}");
+        let meta = match fs::symlink_metadata(entry.path()) {
+            Ok(meta) => meta,
+            // Gone since the folder was listed.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err((path, error)),
+        };
         if meta.is_dir() {
             let inner = format!("{path}{}", std::path::MAIN_SEPARATOR);
-            folders += 1 + walk(&inner, mask, found);
-        } else if meta.is_file()
-            && mask.is_none_or(|(mask, cs)| wildcard_match(mask, &entry_name, cs))
-        {
+            folders += 1 + walk(&inner, mask, found)?;
+        } else if meta.is_file() && mask.is_none_or(|mask| mask.matches(&entry_name)) {
             found.push((path, meta.len()));
         }
     }
-    folders
+    Ok(folders)
+}
+
+/// 7-Zip's scan error: the system message and the path it hit.
+fn scan_error(session: &mut Session, path: &str, error: &io::Error) {
+    session.err(&format!("\nERROR: {}\n{path}\n\n", errno_text(error)));
 }
 
 /// The name 7-Zip shows for the archive inside a path, and its default
@@ -999,5 +1174,54 @@ fn run_extract(session: &mut Session, options: Options, archives: Vec<(String, u
         EXIT_FATAL
     } else {
         EXIT_OK
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The echo flag of the terminal `fd`.
+    #[cfg(unix)]
+    fn echoes(fd: i32) -> bool {
+        // SAFETY: reads the state of a terminal the test opened.
+        unsafe {
+            let mut state: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(fd, &mut state), 0);
+            state.c_lflag & libc::ECHO != 0
+        }
+    }
+
+    /// A password typed at a terminal is not echoed, and the terminal's own
+    /// state comes back afterwards; input that is not a terminal is left
+    /// alone.
+    #[cfg(unix)]
+    #[test]
+    fn echo_is_off_only_while_a_password_is_read() {
+        // SAFETY: a pseudo-terminal pair the test owns and closes.
+        unsafe {
+            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(master >= 0);
+            assert_eq!(libc::grantpt(master), 0);
+            assert_eq!(libc::unlockpt(master), 0);
+            let name = libc::ptsname(master);
+            assert!(!name.is_null());
+            let terminal = libc::open(name, libc::O_RDWR | libc::O_NOCTTY);
+            assert!(terminal >= 0);
+            assert!(echoes(terminal));
+            {
+                let _quiet = EchoOff::on(terminal).expect("a terminal");
+                assert!(!echoes(terminal));
+            }
+            assert!(echoes(terminal));
+            libc::close(terminal);
+            libc::close(master);
+
+            let mut pipe = [0i32; 2];
+            assert_eq!(libc::pipe(pipe.as_mut_ptr()), 0);
+            assert!(EchoOff::on(pipe[0]).is_none());
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
     }
 }

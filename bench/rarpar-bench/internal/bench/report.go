@@ -16,7 +16,14 @@ func BuildReport(rawPath string) (Report, error) {
 	if err := readJSON(rawPath, &raw); err != nil {
 		return Report{}, err
 	}
-	if raw.SchemaVersion != RunSchemaVersion || raw.Plan.SchemaVersion != PlanSchemaVersion || raw.CorpusDigest != raw.Plan.CorpusDigest {
+	switch raw.SchemaVersion {
+	case RunSchemaVersion:
+	case runSchemaWithoutRSS:
+		return Report{}, fmt.Errorf("raw benchmark record is run schema %d, which predates the required per-execution peak RSS (max_rss_bytes); rerun the benchmark to produce run schema %d", raw.SchemaVersion, RunSchemaVersion)
+	default:
+		return Report{}, fmt.Errorf("raw benchmark record has unsupported run schema %d; this harness reads run schema %d", raw.SchemaVersion, RunSchemaVersion)
+	}
+	if raw.Plan.SchemaVersion != PlanSchemaVersion || raw.CorpusDigest != raw.Plan.CorpusDigest {
 		return Report{}, fmt.Errorf("raw benchmark record has invalid provenance")
 	}
 	collectorMode := raw.CollectorMode

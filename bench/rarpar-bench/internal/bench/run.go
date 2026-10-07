@@ -3,6 +3,7 @@ package bench
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -661,6 +662,9 @@ func timedCommand(ctx context.Context, program string, args []string, directory 
 	} else {
 		command = exec.CommandContext(ctx, program, args...)
 	}
+	// A cancelled run ends the whole tree: under perf that is perf, the
+	// rss-exec shim and the tool, not perf alone.
+	procmeasure.ConfigureKill(command)
 	if perfWriter != nil {
 		defer perfReader.Close()
 		defer perfWriter.Close()
@@ -688,6 +692,11 @@ func timedCommand(ctx context.Context, program string, args []string, directory 
 		}
 		err = command.Wait()
 		tracker.Finish(command, &tracked)
+		if errors.Is(err, exec.ErrWaitDelay) {
+			// The command itself exited; only an orphaned descendant still
+			// held the output pipes, which WaitDelay then closed.
+			err = nil
+		}
 	}
 	var perfOutput []byte
 	var perfReadErr error
@@ -709,8 +718,7 @@ func timedCommand(ctx context.Context, program string, args []string, directory 
 	}
 	if command.ProcessState != nil && collectPerf && ctx.Err() == nil {
 		// The shim's report is the tool's own CPU time and peak. A cancelled
-		// run killed only perf; the orphaned shim may not report soon, so it
-		// is not waited for.
+		// run killed the shim with perf, so there is no report to read.
 		if report, reportErr := procmeasure.ReadShimReport(rssReader); reportErr == nil {
 			measurement.UserNanos = secondsToNanos(report.UserSeconds)
 			measurement.SystemNanos = secondsToNanos(report.SysSeconds)

@@ -48,6 +48,27 @@ documented in each crate's own changelog so those notes ship with the crate.
   below; and a folder named as the archive is walked without following
   links, so a self-referential link ends the walk and a link out of the
   folder finds nothing outside it.
+- 7-Zip facade name matching follows `-spd`, `-spm` and the `w-` modifier
+  everywhere 7-Zip does: the archive name, `-ai`/`-ax` and `-i`/`-x` all take
+  them, so `-aiw-!set*.7z` or `-spd set*.7z` opens (and under `-sdel`
+  deletes) only the archive literally named `set*.7z`, and the implicit `*`
+  that selects every member stays a wildcard under `-spd`.
+- 7-Zip facade: a folder that cannot be read while scanning for archives
+  (the folder named as the archive, anything below it, or an `-air` walk)
+  fails the command with 7-Zip's scan error and exit code 2, instead of
+  counting as empty and exiting 0 with nothing processed.
+- 7-Zip facade: a command-line argument that is not valid Unicode is a
+  command-line error (exit code 7). It was read with U+FFFD in place of its
+  bytes, so it could name a different archive, which `-sdel` then deleted.
+- 7-Zip facade: a password typed at the prompt is no longer echoed. Echo is
+  switched off on a Unix terminal and on the Windows console while the
+  password is read, and restored after; the Windows prompt already said it
+  would not be echoed. Input that is not a terminal is read as before.
+- 7-Zip facade: a link member refused as dangerous leaves nothing at its
+  name, as 7-Zip's does, instead of the empty placeholder opened when its
+  data began.
+- 7-Zip facade: a Unix link target that is not UTF-8 is created byte for
+  byte, not rewritten with U+FFFD into a link to a different name.
 - par3cmdline facade: the block-map report is counted from ranges, so a set
   with a huge block count no longer walks every block; non-UTF-8 arguments
   reach the files they name byte for byte on Unix; `\` separates path

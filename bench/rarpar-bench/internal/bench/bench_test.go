@@ -955,7 +955,7 @@ func validCorpusConfig() CorpusConfig {
 
 func fixtureRunRecord() RunRecord {
 	plan := Plan{SchemaVersion: PlanSchemaVersion, ID: "plan-1", CorpusDigest: "corpus-digest", Seed: "seed", Warmups: 0, Repeats: 1, Lane: "cpu", Par2Placement: "canonical", Cases: []PlanCase{{ID: "case-1", Order: 1}}}
-	return RunRecord{SchemaVersion: 1, CollectorMode: wallClockCollector, Plan: plan, CorpusDigest: "corpus-digest", Machine: Machine{Label: "test-machine", Architecture: "arm64"}, Candidate: BinaryIdentity{Label: "rarpar", SHA256: "candidate"}, Reference: &BinaryIdentity{Label: "reference", SHA256: "reference"}, Executions: []Execution{
+	return RunRecord{SchemaVersion: RunSchemaVersion, CollectorMode: wallClockCollector, Plan: plan, CorpusDigest: "corpus-digest", Machine: Machine{Label: "test-machine", Architecture: "arm64"}, Candidate: BinaryIdentity{Label: "rarpar", SHA256: "candidate"}, Reference: &BinaryIdentity{Label: "reference", SHA256: "reference"}, Executions: []Execution{
 		{Subject: "rarpar", Role: "candidate", CaseID: "case-1", Family: "rar", Workload: "RAR <unsafe>", Run: 1, Success: true, Backend: "cpu", Measurement: Measurement{WallNanos: 500_000_000, MaxRSSBytes: 48 << 20, RSSSource: "rusage"}},
 		{Subject: "reference", Role: "reference", CaseID: "case-1", Family: "rar", Workload: "RAR <unsafe>", Run: 1, Success: true, Backend: "reference", Measurement: Measurement{WallNanos: 1_000_000_000, MaxRSSBytes: 32 << 20, RSSSource: "rusage"}},
 	}}

@@ -126,6 +126,15 @@ func (t *Tracker) Finish(cmd *exec.Cmd, measurement *Measurement) {
 	}
 }
 
+// ConfigureKill makes cancelling cmd's context end the whole tree it starts,
+// not only the direct child: the platform hook kills the process group
+// (POSIX), and WaitDelay closes the pipes so a surviving grandchild cannot
+// hold Wait open. Call it before Start.
+func ConfigureKill(cmd *exec.Cmd) {
+	configureKill(cmd)
+	cmd.WaitDelay = killWaitDelay
+}
+
 // Run executes a command and measures it.
 func Run(ctx context.Context, command Command) Result {
 	if command.Timeout > 0 {
@@ -137,11 +146,8 @@ func Run(ctx context.Context, command Command) Result {
 	cmd := exec.CommandContext(ctx, path, args...)
 	cmd.Dir = command.Dir
 	cmd.Env = append(os.Environ(), command.Env...)
-	// A timeout must end the whole tree, not only the direct child: the
-	// platform hook kills the process group (POSIX) and WaitDelay closes the
-	// pipes so a surviving grandchild cannot hold Wait open.
-	configureKill(cmd)
-	cmd.WaitDelay = killWaitDelay
+	// A timeout must end the whole tree, not only the direct child.
+	ConfigureKill(cmd)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

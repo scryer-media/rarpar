@@ -599,6 +599,49 @@ fn links_are_judged_from_where_they_are_created() {
     assert!(!std::fs::symlink_metadata(&pivot).unwrap().is_symlink());
 }
 
+/// A link target that is not UTF-8 keeps its own bytes: it is never rewritten
+/// with U+FFFD into a link to some other name.
+#[cfg(unix)]
+#[test]
+fn link_targets_keep_their_bytes() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().unwrap();
+    write_entries(
+        &dir.path().join("raw.7z"),
+        &[("raw.lnk", b"caf\xe9.txt", true)],
+    );
+    expect(&facade(dir.path(), &["x", "-y", "-oout", "raw.7z"], b""), 0);
+    let target = std::fs::read_link(dir.path().join("out/raw.lnk")).unwrap();
+    assert_eq!(target.as_os_str().as_bytes(), b"caf\xe9.txt");
+}
+
+/// A refused link leaves nothing at its name, as 7-Zip's does: not an empty
+/// placeholder in place of the file `-y` overwrote.
+#[cfg(unix)]
+#[test]
+fn refused_links_leave_no_placeholder() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    std::fs::write(out.join("pivot"), b"older copy").unwrap();
+    write_entries(
+        &dir.path().join("pivot.7z"),
+        &[("pivot", b"../outside", true)],
+    );
+    let (_, err) = expect(
+        &facade(dir.path(), &["x", "-y", "-oout", "pivot.7z"], b""),
+        2,
+    );
+    assert!(
+        err.contains("Dangerous link path was ignored : pivot : ../outside"),
+        "{err}"
+    );
+    assert!(
+        std::fs::symlink_metadata(out.join("pivot"))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    );
+}
+
 /// A folder in the output tree that is already a symbolic link is never
 /// written through.
 #[cfg(unix)]
@@ -1378,6 +1421,94 @@ fn recursive_archive_includes_descend() {
     );
     assert!(out.contains("Listing archive: top.7z\n"), "{out}");
     assert!(!out.contains("low.7z"), "{out}");
+}
+
+/// An argument that is not valid Unicode is a command-line error: it is never
+/// read with U+FFFD in place of its bytes, which would name the archive
+/// beside it, and `-sdel` deletes nothing.
+#[cfg(unix)]
+#[test]
+fn non_unicode_arguments_are_refused() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().unwrap();
+    let lookalike = dir.path().join("crate\u{fffd}.7z");
+    write_archive(&lookalike, SOLID);
+    let output = Command::new(env!("CARGO_BIN_EXE_rarpar"))
+        .current_dir(dir.path())
+        .args(["7z", "x", "-sdel", "-y", "-oout"])
+        .arg(OsStr::from_bytes(b"crate\xff.7z"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let (_, err) = expect(&output, 7);
+    assert!(
+        err.contains("Command Line Error:\nUnsupported argument that is not valid Unicode:\n"),
+        "{err}"
+    );
+    assert!(lookalike.is_file());
+    assert!(!dir.path().join("out").exists());
+}
+
+/// A folder under the named one that cannot be read fails the scan with
+/// 7-Zip's scan error and exit 2, rather than counting as empty: the archive
+/// beside it is not processed, so `-sdel` deletes nothing.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_folder_fails_the_archive_scan() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let locked = dir.path().join("inbox/locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    write_archive(&dir.path().join("inbox/open.7z"), SOLID);
+    write_archive(&locked.join("hidden.7z"), SOLID);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // A privileged user reads the folder anyway: nothing to test there.
+    let readable = std::fs::read_dir(&locked).is_ok();
+    let output = facade(dir.path(), &["x", "-sdel", "-y", "-oout", "inbox"], b"");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if readable {
+        return;
+    }
+    let (out, err) = expect(&output, 2);
+    assert!(
+        err.contains("\nERROR: errno=13 : Permission denied\ninbox/locked/\n\n"),
+        "{err}"
+    );
+    assert!(
+        err.contains("System ERROR:\nerrno=13 : Permission denied\n"),
+        "{err}"
+    );
+    assert!(!out.contains("Extracting archive"), "{out}");
+    assert!(dir.path().join("inbox/open.7z").is_file());
+}
+
+/// With wildcard matching off (`-aiw-`, or `-spd` for the archive name), `*`
+/// is a character of the name: only the archive literally called `set*.7z`
+/// is opened, and `-sdel` never reaches the archives the wildcard would match.
+#[cfg(unix)]
+#[test]
+fn literal_archive_names_are_not_expanded() {
+    let dir = tempfile::tempdir().unwrap();
+    let literal = dir.path().join("set*.7z");
+    let other = dir.path().join("setalpha.7z");
+    for (args, out) in [
+        (&["x", "-an", "-aiw-!set*.7z"][..], "one"),
+        (&["x", "-spd", "set*.7z"][..], "two"),
+    ] {
+        write_archive(&literal, SOLID);
+        write_archive(&other, SOLID);
+        let out_switch = format!("-o{out}");
+        let mut args = args.to_vec();
+        args.extend(["-sdel", "-y", out_switch.as_str()]);
+        let (stdout, _) = expect(&facade(dir.path(), &args, b""), 0);
+        assert!(stdout.contains("1 file, "), "{stdout}");
+        assert!(stdout.contains("Extracting archive: set*.7z\n"), "{stdout}");
+        assert!(!stdout.contains("setalpha.7z"), "{stdout}");
+        assert!(!literal.exists(), "{stdout}");
+        assert!(other.is_file());
+        assert_tree(&dir.path().join(out));
+    }
 }
 
 /// `-sdel` deletes an archive only when something was extracted from it: a

@@ -771,7 +771,11 @@ impl Extractor<'_> {
                 return Ok(());
             }
             let link = String::from_utf8_lossy(&link_target).into_owned();
-            let Some(link_path) = self.link_path(&item, &link) else {
+            let Some(link_path) = self.link_path(&item, &link_target) else {
+                // As 7-Zip does, the placeholder made when the member's data
+                // began goes before the link is judged: a refused link leaves
+                // nothing at its name.
+                let _ = fs::remove_file(&path);
                 let text = format!("Dangerous link path was ignored : {} : {link}", item.name);
                 self.errors += 1;
                 self.session.err(&format!("ERROR: {text}\n"));
@@ -792,10 +796,16 @@ impl Extractor<'_> {
 
     /// Where a link points once extracted: relative targets must stay in
     /// the output folder, absolute ones are re-rooted there, as 7-Zip does.
+    ///
+    /// The target keeps its own bytes: a Unix link target is a byte string,
+    /// and one that is not UTF-8 must not be rewritten. It is judged on its
+    /// text, which is as safe: a replaced byte is never `/` or `.`, so the
+    /// parts and their `..`s are the same.
     #[cfg(unix)]
-    fn link_path(&self, item: &Item, link: &str) -> Option<String> {
-        if let Some(rest) = link.strip_prefix('/') {
-            if !link_is_safe(&[String::new()], rest) {
+    fn link_path(&self, item: &Item, link: &[u8]) -> Option<std::ffi::OsString> {
+        use std::os::unix::ffi::OsStringExt;
+        if let Some(rest) = link.strip_prefix(b"/") {
+            if !link_is_safe(&[String::new()], &String::from_utf8_lossy(rest)) {
                 return None;
             }
             let base = if self.setup.out_dir.is_empty() {
@@ -803,18 +813,18 @@ impl Extractor<'_> {
             } else {
                 self.setup.out_dir.clone()
             };
-            let base = std::path::absolute(&base).ok()?;
-            let mut text = base.to_string_lossy().into_owned();
-            if !text.ends_with('/') {
-                text.push('/');
+            let mut target = std::path::absolute(&base).ok()?.into_os_string().into_vec();
+            if !target.ends_with(b"/") {
+                target.push(b'/');
             }
-            text.push_str(rest);
-            return Some(text);
+            target.extend_from_slice(rest);
+            return Some(std::ffi::OsString::from_vec(target));
         }
         // Judge the link from where it is actually created: the sanitised
         // path, not the archive's own name, whose `..` parts are dropped.
         let (_, parts) = self.out_path(item);
-        link_is_safe(&parts, link).then(|| link.to_owned())
+        link_is_safe(&parts, &String::from_utf8_lossy(link))
+            .then(|| std::ffi::OsString::from_vec(link.to_vec()))
     }
 
     fn drain(&mut self, data: &mut dyn Read) -> Result<(), Stop> {

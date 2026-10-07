@@ -10,9 +10,14 @@ import (
 const (
 	CorpusSchemaVersion = 1
 	PlanSchemaVersion   = 2
-	RunSchemaVersion    = 1
+	RunSchemaVersion    = 2
 	ReportSchemaVersion = 1
 )
+
+// runSchemaWithoutRSS is the run schema before every successful execution
+// had to carry max_rss_bytes. Its records cannot be reported and are refused
+// by number.
+const runSchemaWithoutRSS = 1
 
 // ToolchainLock is the shared generator-toolchain lock. Schema 2 pins the
 // source archives by BLAKE3; schema 1 pinned them by SHA-256 and is not read.
