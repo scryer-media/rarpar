@@ -111,6 +111,37 @@ func TestClientConfigExt4Size(t *testing.T) {
 	}
 }
 
+func TestClientConfigRateAndShaping(t *testing.T) {
+	config, err := ClientConfigFromEnv(env(map[string]string{"RIG_RATE_MBPS": "80"}))
+	if err != nil || config.RateMBps != 80 {
+		t.Fatalf("config = %+v, err = %v", config, err)
+	}
+	for _, bad := range []string{"0", "-1", "80M", "fast", "100001"} {
+		if _, err := ClientConfigFromEnv(env(map[string]string{"RIG_RATE_MBPS": bad})); err == nil {
+			t.Errorf("accepted RIG_RATE_MBPS=%q", bad)
+		}
+	}
+	var lines []string
+	for _, args := range ShapeCommands("eth0", 80) {
+		lines = append(lines, strings.Join(args, " "))
+	}
+	got := strings.Join(lines, "\n")
+	for _, want := range []string{
+		"tc qdisc replace dev eth0 root tbf rate 640mbit burst 1mbit latency 50ms",
+		"tc filter add dev eth0 parent ffff: matchall action mirred egress redirect dev " + ifbDevice,
+		"tc qdisc replace dev " + ifbDevice + " root tbf rate 640mbit burst 1mbit latency 50ms",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("shape commands lack %q:\n%s", want, got)
+		}
+	}
+	args := withLinkMeta([]string{"--target-meta", "local:storage=x", "--target-meta", "nfs-async:server=k"},
+		LinkCheck{RateMBps: 80, ReadMBps: 79.5, WriteMBps: 78.25})
+	if args[1] != "local:storage=x" || args[3] != "nfs-async:server=k,rate_mbps=80,link_read_mbps=79.5,link_write_mbps=78.2" {
+		t.Errorf("link meta = %v", args)
+	}
+}
+
 func TestTargetArgsPutLocalFirstAndRecordTheServer(t *testing.T) {
 	markers := map[string]ServerMarker{}
 	for _, export := range Exports() {
