@@ -27,7 +27,7 @@
 //! plain-XOR path for those. Dense factors are almost never 1. That advantage
 //! is real rather than an artifact — it is part of what the factorisation buys.
 //!
-//! Run: `cargo bench -p reedsolomon-rs --bench gf16_dft`
+//! Run: `cargo bench --locked -p reedsolomon-rs --bench gf16_dft`
 //! Knobs: `RS_DFT_THREADS` (default: 6), `RS_DFT_STRIPE` (default: 65536).
 
 #[cfg(not(target_family = "wasm"))]

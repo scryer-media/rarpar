@@ -21,7 +21,7 @@
 //! four rows (one sweep each) that together hold the cell's bytes. With the
 //! `Scalar` backend a transform takes the log-table oracle instead.
 //!
-//! Run: `cargo bench -p reedsolomon-rs --bench kernel_ceiling`
+//! Run: `cargo bench --locked -p reedsolomon-rs --bench kernel_ceiling`
 //! Knob: `RS_CEILING_MS` (per-repetition floor in milliseconds, default: 60).
 //!
 //! The bench also builds for `wasm32-wasip1`, where a portable build and a
