@@ -24,6 +24,14 @@ documented in each crate's own changelog so those notes ship with the crate.
   place it makes no staging or scratch files beside the volumes (so a
   read-only source directory no longer fails a dry run). An existing output
   is still refused.
+- 7-Zip facade extraction on Unix reaches the output tree through
+  directory handles: the output folder is opened once, each folder under it
+  is opened from its parent's handle without following a link, and members
+  are created, replaced, renamed and given their times and modes relative
+  to those handles. Swapping a checked folder for a link while an archive
+  extracts can no longer redirect a write outside the output folder.
+  Extracted links get their own times and no longer change their target's
+  mode.
 
 ## rarpar 0.8.1
 

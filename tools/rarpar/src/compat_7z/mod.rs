@@ -3,6 +3,7 @@
 //! `l`, with 7-Zip's switches, messages and exit codes for those commands.
 
 mod censor;
+mod confine;
 mod extract;
 mod format;
 mod list;
