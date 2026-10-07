@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.10.8
+
+Fewer redundant reads on the verify and repair paths.
+
+### Changed
+
+- Planning a repair (`plan_repair_with_memory_limit`) and discarding unusable
+  recovery packets after `InsufficientRecoveryData` no longer re-read and
+  re-hash recovery payloads that the bounded file scan already authenticated.
+  The scan records each volume's stat fingerprint — length, mtime and, on
+  Unix, device and inode — taken before it opens the volume and kept only
+  when the opened handle agrees and the mtime is at least two seconds old.
+  `RecoverySliceData::validate_packet_hash` accepts the scan's verdict while
+  the path still fingerprints the same, and reads and hashes the payload as
+  before when the volume changed, was replaced, is no longer a regular file,
+  or was too fresh to vouch for. Payloads built by any other constructor
+  are always re-hashed. A same-length rewrite that also restores the mtime is
+  invisible to the fingerprint and is left to the verification of the
+  repaired files.
+
+### Added
+
+- `identify_par2_files_for_set(dir, &Par2FileSet)`: `identify_par2_files` for
+  the set's recovery set ID that skips the files the set protects instead of
+  opening each one and reading its first 64 bytes. `identify_par2_files` is
+  unchanged.
+
+### API
+
+- `RecoverySliceData::FileBacked` has a new `authenticated_at:
+  Option<FileStatFingerprint>` field. Patterns that use `..` are unaffected;
+  code that builds the variant literally adds `authenticated_at: None` or uses
+  the existing constructors, which set it to `None`.
+
 ## 0.10.7 (Unreleased)
 
 ### Fixed
