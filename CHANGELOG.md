@@ -381,10 +381,13 @@ documented in each crate's own changelog so those notes ship with the crate.
   recovery blocks, verify drops from 181 path stats to 60 and repair from 324
   to 111, with the same bytes read.
 - `par verify` and `repair` read and hash the PAR2 volumes once instead of
-  twice, and volume discovery no longer opens the files the set protects
-  (a protected name at its recorded length) to look for renamed volumes,
-  while a protected name at another length is still sniffed; on ten 3 MiB files with 10% recovery, verify
-  reads 34.7 MB in 23 opens instead of 37.9 MB in 38.
+  twice; on ten 3 MiB files with 10% recovery, verify reads 34.7 MB instead
+  of 37.9 MB. Volume discovery no longer opens a file the set protects at its
+  recorded length when no PAR2 volume can have that length (under 64 bytes
+  or not a multiple of 4), as `par2_rs::identify_par2_files_for_set` does;
+  any other protected file has only its 64-byte header read, so an
+  obfuscated volume renamed onto a missing file's name and exact length is
+  still found and the set repaired.
 - `par verify` and `repair` of a set whose named `.par2` is its only file
   build the set from the parse volume discovery already made, so that file
   is parsed once instead of twice. With other volumes the whole list is
@@ -402,7 +405,9 @@ documented in each crate's own changelog so those notes ship with the crate.
   protected files beside the set: verify opens 14 files instead of 24.
 - `par3 archive --overwrite` with the archive under an input directory no
   longer packs the previous archive, its PAR3 index or its recovery volumes
-  into the new archive.
+  into the new archive. On Windows and macOS the recovery volumes match
+  without regard to case, as their default volumes name files, so `SET.7z`
+  rebuilt beside `set.vol0+1.par3` no longer packs that stale volume.
 - `par3 archive` counts each recovery row's own allocation against
   `--par3-memory-mib`, so many recovery blocks of a small block size are
   refused before they are allocated instead of overrunning the budget.
@@ -458,6 +463,11 @@ documented in each crate's own changelog so those notes ship with the crate.
   preflight only saw the name before the build began.
 - rarpar requires unrar-rs 0.10.9, the version that carries the restore and
   decoder fixes it advertises, so a lockfile cannot resolve an older one.
+- `par3 inside insert --placement independent -d DIR` removes the outputs of
+  the sets it already inserted when a later volume's set fails, so a failed
+  run no longer leaves earlier volumes behind for a retry to refuse. A
+  shared set, `par3 inside repair` and a host bound across directories get
+  the matching par3-rs fixes below.
 
 ### Library versions
 

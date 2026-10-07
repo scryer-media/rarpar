@@ -145,7 +145,7 @@ fn volume_set(paths: &[PathBuf]) -> Result<Vec<PathBuf>, RarparError> {
 /// NTFS's upcase table does; one with a longer uppercase (`ß`) stays itself.
 /// A case-sensitive volume on either platform is rare enough that two
 /// families differing only by case are treated as one there too.
-fn name_key(stem: &str) -> String {
+pub(crate) fn name_key(stem: &str) -> String {
     if !cfg!(any(windows, target_os = "macos")) {
         return stem.to_owned();
     }
@@ -301,7 +301,7 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
     if placement == Rar5Placement::Independent {
         for (host, output) in hosts.iter().zip(&outputs) {
             let count = count_for(blocks_of(host.archive.length));
-            inserted.extend(rar5::insert_set(
+            match rar5::insert_set(
                 std::slice::from_ref(host),
                 std::slice::from_ref(output),
                 &[count],
@@ -309,7 +309,17 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
                 creation(count),
                 &scratch,
                 durability,
-            )?);
+            ) {
+                Ok(entries) => inserted.extend(entries),
+                Err(error) => {
+                    // The sets inserted before this one are this run's own
+                    // outputs; a failed insertion leaves none of them behind.
+                    for entry in &inserted {
+                        let _ = std::fs::remove_file(&entry.path);
+                    }
+                    return Err(error.into());
+                }
+            }
         }
     } else {
         let count = count_for(

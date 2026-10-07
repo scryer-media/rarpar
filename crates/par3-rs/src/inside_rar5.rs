@@ -719,7 +719,6 @@ pub fn insert_set(
                 file.sync_all()?;
             }
             drop(file);
-            std::fs::hard_link(&staged[index], &outputs[index])?;
             reports.push(Rar5Inserted {
                 path: outputs[index].clone(),
                 region_bytes: gaps[index].0 + gaps[index].1,
@@ -727,12 +726,50 @@ pub fn insert_set(
                 set: plan.input_set_id(),
             });
         }
+        // Every host is finished and verified before any is linked into
+        // place, and a failed link removes the outputs linked before it, so
+        // a failed insertion leaves no final output behind.
+        link_all(&staged, outputs)?;
         Ok(reports)
     })();
     for path in staged {
         let _ = std::fs::remove_file(path);
     }
     result
+}
+
+/// Link each finished `staged[k]` to the absent `outputs[k]`. On a failure,
+/// remove the outputs this call already linked, so none is left behind.
+fn link_all(staged: &[PathBuf], outputs: &[PathBuf]) -> EngineResult<()> {
+    for (position, (temporary, output)) in staged.iter().zip(outputs).enumerate() {
+        let linked =
+            injected_install_failure(position).and_then(|()| std::fs::hard_link(temporary, output));
+        if let Err(error) = linked {
+            for earlier in &outputs[..position] {
+                let _ = std::fs::remove_file(earlier);
+            }
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Fails the install of the output at this position in its call, so
+    /// tests can reach the rollback of earlier installs.
+    static FAIL_INSTALL_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// A test-injected failure for the install at `position`; never fails
+/// outside tests.
+fn injected_install_failure(position: usize) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_INSTALL_AT.with(std::cell::Cell::get) == Some(position) {
+        return Err(io::Error::other("injected install failure"));
+    }
+    let _ = position;
+    Ok(())
 }
 
 fn copy(
@@ -1429,18 +1466,29 @@ fn open_set(
     // then a lone host and a lone file.
     // Among files of the recorded name, one carrying this set's packets wins;
     // one carrying only another set's packets is never this set's host.
+    // A file with no packets at all is taken by name only in a directory
+    // that holds a file carrying this set's packets: one invocation may span
+    // several directories, and a same-named file beside another set is not
+    // this set's host.
+    let tied: BTreeSet<&Path> = candidates
+        .iter()
+        .filter(|c| c.carries(id))
+        .filter_map(|c| c.path.parent())
+        .collect();
     let mut used = BTreeSet::new();
     for host in &mut hosts {
         let named = |c: &&Candidate| {
             file_name(&c.path) == Some(host.name.as_str()) && !used.contains(&c.source)
         };
         let ours = |c: &&Candidate| c.carries(id);
-        let foreign = |c: &&Candidate| c.carries_other_than(id);
+        let packetless_beside_ours = |c: &&Candidate| {
+            !c.carries_other_than(id) && c.path.parent().is_some_and(|dir| tied.contains(dir))
+        };
         if let Some(candidate) = candidates
             .iter()
             .filter(named)
             .find(ours)
-            .or_else(|| candidates.iter().filter(named).find(|c| !foreign(c)))
+            .or_else(|| candidates.iter().filter(named).find(packetless_beside_ours))
         {
             used.insert(candidate.source);
             host.source = Some(candidate.source);
@@ -1840,7 +1888,6 @@ impl Rar5Set {
                         "repaired host failed verification",
                     ));
                 }
-                install(&temporaries[host.file], &destinations[index], &options)?;
                 reports.push(Rar5Repaired {
                     name: host.name.clone(),
                     path: destinations[index].clone(),
@@ -1848,6 +1895,23 @@ impl Rar5Set {
                     regenerated: report.recovery_packets,
                     restoration: report.restoration,
                 });
+            }
+            // Every rebuilt host is verified before any is installed, and a
+            // failed install removes the destinations this call installed
+            // before it, so a failed repair leaves none of them behind.
+            let mut installed: Vec<&Path> = Vec::new();
+            for (position, &index) in needed.iter().enumerate() {
+                let file = self.hosts[index].file;
+                let done = injected_install_failure(position)
+                    .map_err(EngineError::from)
+                    .and_then(|()| install(&temporaries[file], &destinations[index], &options));
+                if let Err(error) = done {
+                    for path in installed {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    return Err(error);
+                }
+                installed.push(&destinations[index]);
             }
             Ok(())
         });
@@ -2275,6 +2339,128 @@ mod tests {
             .unwrap();
         assert_eq!(gamma.status, RepairStatus::Complete);
         drop(sets);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// When one invocation spans two directories, a missing host of the set
+    /// in one is never bound by name to an unrelated packetless RAR of that
+    /// name in the other.
+    #[test]
+    fn a_same_named_packetless_file_in_another_directory_is_not_bound() {
+        let dir = scratch_dir("other-directory");
+        let first = insert_synthetic(
+            &dir.join("alpha"),
+            &["set.part1.rar", "set.part2.rar"],
+            60,
+            false,
+        );
+        let second = insert_synthetic(&dir.join("beta"), &["beta-notes.rar"], 70, false);
+        std::fs::remove_file(&first[1]).unwrap();
+        let unrelated = dir.join("beta").join("set.part2.rar");
+        std::fs::write(&unrelated, synthetic_rar5(None, 80)).unwrap();
+        let paths = [first[0].clone(), second[0].clone()];
+        let sets = open(&paths, &ExecutionOptions::default()).unwrap();
+        let alpha = sets
+            .iter()
+            .find(|set| set.hosts[0].name == "set.part1.rar")
+            .unwrap();
+        assert_eq!(alpha.hosts[0].path.as_ref(), Some(&first[0]));
+        assert_eq!(alpha.hosts[1].path, None);
+        assert_eq!(alpha.needs_repair(), vec![1]);
+        drop(sets);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A shared set whose second host fails to install leaves no final
+    /// output behind, so the same insertion can be retried.
+    #[test]
+    fn a_failed_later_host_leaves_no_inserted_output_behind() {
+        let dir = scratch_dir("insert-rollback");
+        let originals = dir.join("original");
+        let scratch = dir.join("scratch");
+        std::fs::create_dir_all(&originals).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        let names = ["dunlin.part1.rar", "dunlin.part2.rar"];
+        let paths: Vec<PathBuf> = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let path = originals.join(name);
+                let volume = Some((index as u64, index == 0));
+                std::fs::write(&path, synthetic_rar5(volume, 90 + index as u8)).unwrap();
+                path
+            })
+            .collect();
+        let options = ExecutionOptions::default();
+        let hosts = prepare_hosts(&paths, Rar5Layout::Trailing, &options).unwrap();
+        let outputs: Vec<PathBuf> = names.iter().map(|name| dir.join(name)).collect();
+        let insert = || {
+            insert_set(
+                &hosts,
+                &outputs,
+                &[2, 2],
+                Rar5Layout::Trailing,
+                CreationOptions {
+                    block_size: 256,
+                    recovery_count: 4,
+                    ..CreationOptions::default()
+                },
+                &scratch,
+                CreationDurability::Buffered,
+            )
+        };
+        FAIL_INSTALL_AT.with(|at| at.set(Some(1)));
+        let failed = insert();
+        FAIL_INSTALL_AT.with(|at| at.set(None));
+        assert!(failed.is_err());
+        for output in &outputs {
+            assert!(!output.exists(), "{} is left behind", output.display());
+        }
+        let inserted = insert().unwrap();
+        assert_eq!(inserted.len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A repair of two damaged hosts whose second install fails leaves
+    /// neither destination behind, so the same repair can be retried.
+    #[test]
+    fn a_failed_later_repair_install_leaves_no_destination_behind() {
+        let dir = scratch_dir("repair-rollback");
+        let inserted =
+            insert_synthetic(&dir, &["godwit.part1.rar", "godwit.part2.rar"], 100, false);
+        for path in &inserted {
+            let mut bytes = std::fs::read(path).unwrap();
+            bytes[100] ^= 0x5a;
+            std::fs::write(path, bytes).unwrap();
+        }
+        let out = dir.join("repaired");
+        let work = dir.join("work");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        let destinations = [out.join("godwit.part1.rar"), out.join("godwit.part2.rar")];
+        let open_set = || {
+            open(&inserted, &ExecutionOptions::default())
+                .unwrap()
+                .pop()
+                .unwrap()
+        };
+        let mut set = open_set();
+        assert_eq!(set.needs_repair(), vec![0, 1]);
+        FAIL_INSTALL_AT.with(|at| at.set(Some(1)));
+        let failed = set.repair(&destinations, &work);
+        FAIL_INSTALL_AT.with(|at| at.set(None));
+        assert!(failed.is_err());
+        for destination in &destinations {
+            assert!(
+                !destination.exists(),
+                "{} is left behind",
+                destination.display()
+            );
+        }
+        drop(set);
+        let mut set = open_set();
+        assert_eq!(set.repair(&destinations, &work).unwrap().len(), 2);
+        drop(set);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

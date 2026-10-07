@@ -824,11 +824,12 @@ fn discover_matching_par2_paths(input: &Path) -> Result<(Vec<PathBuf>, SeedParse
 }
 
 /// [`par2_rs::identify_par2_files`] without opening the files the seed set
-/// protects. Any other sibling may be a renamed volume and has its first
-/// header read; a file at a protected name and its recorded length is taken
-/// as that data, and sniffing it cost an open and a read per data file before
-/// verification read it in full. A protected name at another length may be a
-/// volume renamed onto a missing file's name, so it is sniffed.
+/// protects at lengths no PAR2 volume can have, as
+/// [`par2_rs::identify_par2_files_for_set`] does. Any other sibling may be a
+/// renamed volume and has its first header read: a file at a protected name
+/// and its recorded length is skipped unread only when that length is under
+/// a packet header or not a multiple of 4, which spares an open and a read
+/// per such data file before verification reads it in full.
 fn identify_set_volumes(
     dir: &Path,
     seed: &par2_rs::Par2FileSet,
@@ -861,8 +862,13 @@ fn identify_set_volumes(
         if !(kind.is_file() || (kind.is_symlink() && path.is_file())) {
             continue;
         }
+        // Every PAR2 packet is at least a header long and a multiple of 4
+        // bytes, so a whole volume is too: a protected file at a length no
+        // volume can have is skipped unread, and any other is sniffed, since
+        // an obfuscated volume can sit at a missing file's name and length.
         if let Some(&length) = protected.get(name)
             && std::fs::metadata(&path)?.len() == length
+            && (length < HEADER_SIZE as u64 || !length.is_multiple_of(4))
         {
             continue;
         }
@@ -1187,6 +1193,14 @@ mod tests {
 
     /// A small PAR2 set in `dir`: three protected files and recovery volumes.
     fn create_small_set(dir: &Path) -> (Vec<PathBuf>, par2_rs::Par2CreateOutcome) {
+        create_small_set_of(dir, 3000)
+    }
+
+    /// As [`create_small_set`], with protected files of `length` bytes.
+    fn create_small_set_of(
+        dir: &Path,
+        length: usize,
+    ) -> (Vec<PathBuf>, par2_rs::Par2CreateOutcome) {
         let mut sources = Vec::new();
         for (index, name) in [
             "orchard-notes.part1.bin",
@@ -1197,7 +1211,7 @@ mod tests {
         .enumerate()
         {
             let path = dir.join(name);
-            std::fs::write(&path, vec![0x31 + index as u8; 3000]).unwrap();
+            std::fs::write(&path, vec![0x31 + index as u8; length]).unwrap();
             sources.push(path);
         }
         let mut options = Par2CreatorOptions::with_output(
@@ -1295,15 +1309,16 @@ mod tests {
 
     /// Volume discovery used to open and read the first 64 bytes of every
     /// sibling, the set's own data files included, before verification read
-    /// those files in full. A protected file is data by definition and is not
-    /// opened at all: one made unreadable here would fail the sniff. A
-    /// renamed volume under an unprotected name is still found.
+    /// those files in full. A protected file at its recorded length that no
+    /// PAR2 volume can have (not a multiple of 4) is data and is not opened
+    /// at all: one made unreadable here would fail the sniff. A renamed
+    /// volume under an unprotected name is still found.
     #[cfg(unix)]
     #[test]
-    fn volume_discovery_does_not_open_the_files_the_set_protects() {
+    fn volume_discovery_does_not_open_protected_files_no_volume_could_be() {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
-        let (sources, outcome) = create_small_set(temp.path());
+        let (sources, outcome) = create_small_set_of(temp.path(), 3001);
 
         let relocated = &outcome.volume_paths[0];
         std::fs::rename(relocated, temp.path().join("relocated-volume")).unwrap();
@@ -1344,6 +1359,29 @@ mod tests {
         let volume = &outcome.volume_paths[0];
         std::fs::rename(volume, renamed).unwrap();
         assert_ne!(std::fs::metadata(renamed).unwrap().len(), 3000);
+
+        let seed =
+            par2_rs::Par2FileSet::from_paths(std::slice::from_ref(&outcome.main_path)).unwrap();
+        let found = identify_set_volumes(temp.path(), &seed).unwrap();
+        assert!(found.contains(renamed), "{found:?}");
+    }
+
+    /// An obfuscated volume at a missing protected file's name and exactly
+    /// its recorded length is still a volume: a length a PAR2 file can have
+    /// is never skipped unread.
+    #[test]
+    fn a_volume_at_a_missing_protected_name_and_length_is_found() {
+        let temp = tempfile::tempdir().unwrap();
+        let (sources, outcome) = create_small_set(temp.path());
+        let renamed = &sources[1];
+        let recorded = std::fs::metadata(renamed).unwrap().len();
+        let volume = &outcome.volume_paths[0];
+        let mut bytes = std::fs::read(volume).unwrap();
+        assert!(bytes.len() as u64 <= recorded, "{} bytes", bytes.len());
+        // Trailing zeros after the packets, to the recorded length.
+        bytes.resize(recorded as usize, 0);
+        std::fs::remove_file(volume).unwrap();
+        std::fs::write(renamed, &bytes).unwrap();
 
         let seed =
             par2_rs::Par2FileSet::from_paths(std::slice::from_ref(&outcome.main_path)).unwrap();

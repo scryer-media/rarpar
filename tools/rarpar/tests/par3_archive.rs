@@ -357,6 +357,48 @@ fn an_overwritten_archive_under_an_input_is_not_its_own_member() {
     assert_eq!(names("in/cellar/set.7z"), first);
 }
 
+/// With `--overwrite`, an archive rebuilt under another case of its previous
+/// name: on a volume that ignores case (Windows, and macOS by default) the
+/// previous archive, index and recovery volume are the outputs being replaced
+/// and are not packed; on a case-sensitive volume they are other files, and
+/// are packed like any other input.
+#[test]
+fn an_overwritten_archive_in_another_case_is_not_its_own_member() {
+    let dir = fixture(1000);
+    let root = dir.path();
+    let names = |archive: &str| {
+        let mut names = Vec::new();
+        let mut reader =
+            sevenz_turbo::ArchiveReader::open(root.join(archive), sevenz_turbo::Password::empty())
+                .unwrap();
+        reader
+            .for_each_entries(|entry, _| {
+                names.push(entry.name().to_owned());
+                Ok(true)
+            })
+            .unwrap();
+        names.sort();
+        names
+    };
+    archive(root, &["in/cellar/set.7z", "cellar", "-c", "1"]);
+    let first = names("in/cellar/set.7z");
+    assert!(root.join("in/cellar/set.vol0+1.par3").is_file());
+    let folds = root.join("in/cellar/SET.7z").is_file();
+    archive(
+        root,
+        &["--overwrite", "in/cellar/SET.7z", "cellar", "-c", "1"],
+    );
+    let second = names("in/cellar/SET.7z");
+    if folds {
+        assert_eq!(second, first);
+    } else {
+        for previous in ["set.7z", "set.par3", "set.vol0+1.par3"] {
+            let member = format!("cellar/{previous}");
+            assert!(second.contains(&member), "{member} in {second:?}");
+        }
+    }
+}
+
 /// An archive named like its own PAR3 index is refused before anything is
 /// written, with or without `--overwrite`, in either case of the extension.
 #[test]

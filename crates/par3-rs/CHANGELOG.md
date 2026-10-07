@@ -87,6 +87,17 @@
     scan before rescanning through the final provider, so a set whose
     packets need a bit over half the memory budget is no longer refused for
     holding two packet inventories at once.
+  - `open` binds a host by name to a file carrying no packets only in a
+    directory that holds a file carrying the set's own packets, so when one
+    call spans several directories a missing volume is never bound to an
+    unrelated same-named archive beside another set.
+  - `insert_set` finishes and verifies every host before linking any into
+    its output, and a failed link removes the outputs linked before it, so a
+    failed multi-host insertion leaves no final output behind and can be
+    retried.
+  - `Rar5Set::repair` verifies every rebuilt host before installing any, and
+    a failed install removes the destinations this call installed before
+    it, as `Rar5Set::remove` does, so a failed repair can be retried.
 - A derived carrier (`CarrierPlan::derived`) looks up its available Recovery
   Data packets in one pass over the payloads instead of one pass per
   recovery index, so regenerating a region of a set with tens of thousands
