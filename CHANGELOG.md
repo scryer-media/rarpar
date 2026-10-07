@@ -27,7 +27,9 @@ documented in each crate's own changelog so those notes ship with the crate.
   written through a folder that an extracted link created ("Dangerous link
   via another link was ignored"), files are opened without following a link
   at their own name, a link is judged from the folder it is created in, and
-  a link target over 4096 bytes is refused while it streams. A member whose
+  a link target over 4096 bytes is refused while it streams. A link member's
+  recorded mode is never applied through the link, so a target reached
+  through a link already in the output folder keeps its own mode. A member whose
   solid block failed is reported as failed even when its own CRC matched.
 - 7-Zip facade: after `--`, words starting with `@` are member names, not
   list files, and `-sdel` no longer deletes an archive when the member

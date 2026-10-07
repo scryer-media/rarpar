@@ -626,6 +626,38 @@ fn members_are_never_written_through_a_linked_folder() {
     );
 }
 
+/// A link member's recorded mode is never applied through the link: a target
+/// that reaches outside the output folder through a link already there keeps
+/// its own mode.
+#[cfg(unix)]
+#[test]
+fn link_members_never_change_their_targets_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(work.join("out")).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    let victim = outside.join("ledger.txt");
+    std::fs::write(&victim, b"keep me").unwrap();
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::os::unix::fs::symlink(&outside, work.join("out/pivot")).unwrap();
+    write_entries(
+        &work.join("mode.7z"),
+        &[("link", b"pivot/ledger.txt", true)],
+    );
+    let output = facade(&work, &["x", "-y", "-oout", "mode.7z"], b"");
+    expect(&output, 0);
+    assert!(
+        std::fs::symlink_metadata(work.join("out/link"))
+            .unwrap()
+            .is_symlink()
+    );
+    let mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o600);
+    assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
+}
+
 /// A symlink member whose target is longer than any path is refused as it
 /// streams, not buffered whole.
 #[cfg(unix)]

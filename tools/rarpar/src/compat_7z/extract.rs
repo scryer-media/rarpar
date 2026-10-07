@@ -341,6 +341,14 @@ fn set_metadata(path: &Path, item: &Item) {
     let Some(attrib) = item.attrib else {
         return;
     };
+    // Setting permissions follows a link, and a link's target may sit outside
+    // the output folder (through a link already there), so a link keeps the
+    // mode it was made with.
+    if (item.symlink && cfg!(unix))
+        || fs::symlink_metadata(path).map_or(true, |meta| meta.file_type().is_symlink())
+    {
+        return;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
