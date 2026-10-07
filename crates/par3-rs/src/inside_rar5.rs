@@ -1888,7 +1888,6 @@ impl Rar5Set {
                         "repaired host failed verification",
                     ));
                 }
-                install(&temporaries[host.file], &destinations[index], &options)?;
                 reports.push(Rar5Repaired {
                     name: host.name.clone(),
                     path: destinations[index].clone(),
@@ -1896,6 +1895,23 @@ impl Rar5Set {
                     regenerated: report.recovery_packets,
                     restoration: report.restoration,
                 });
+            }
+            // Every rebuilt host is verified before any is installed, and a
+            // failed install removes the destinations this call installed
+            // before it, so a failed repair leaves none of them behind.
+            let mut installed: Vec<&Path> = Vec::new();
+            for (position, &index) in needed.iter().enumerate() {
+                let file = self.hosts[index].file;
+                let done = injected_install_failure(position)
+                    .map_err(EngineError::from)
+                    .and_then(|()| install(&temporaries[file], &destinations[index], &options));
+                if let Err(error) = done {
+                    for path in installed {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    return Err(error);
+                }
+                installed.push(&destinations[index]);
             }
             Ok(())
         });
@@ -2402,6 +2418,49 @@ mod tests {
         }
         let inserted = insert().unwrap();
         assert_eq!(inserted.len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A repair of two damaged hosts whose second install fails leaves
+    /// neither destination behind, so the same repair can be retried.
+    #[test]
+    fn a_failed_later_repair_install_leaves_no_destination_behind() {
+        let dir = scratch_dir("repair-rollback");
+        let inserted =
+            insert_synthetic(&dir, &["godwit.part1.rar", "godwit.part2.rar"], 100, false);
+        for path in &inserted {
+            let mut bytes = std::fs::read(path).unwrap();
+            bytes[100] ^= 0x5a;
+            std::fs::write(path, bytes).unwrap();
+        }
+        let out = dir.join("repaired");
+        let work = dir.join("work");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        let destinations = [out.join("godwit.part1.rar"), out.join("godwit.part2.rar")];
+        let open_set = || {
+            open(&inserted, &ExecutionOptions::default())
+                .unwrap()
+                .pop()
+                .unwrap()
+        };
+        let mut set = open_set();
+        assert_eq!(set.needs_repair(), vec![0, 1]);
+        FAIL_INSTALL_AT.with(|at| at.set(Some(1)));
+        let failed = set.repair(&destinations, &work);
+        FAIL_INSTALL_AT.with(|at| at.set(None));
+        assert!(failed.is_err());
+        for destination in &destinations {
+            assert!(
+                !destination.exists(),
+                "{} is left behind",
+                destination.display()
+            );
+        }
+        drop(set);
+        let mut set = open_set();
+        assert_eq!(set.repair(&destinations, &work).unwrap().len(), 2);
+        drop(set);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

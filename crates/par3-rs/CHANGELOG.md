@@ -95,6 +95,9 @@
     its output, and a failed link removes the outputs linked before it, so a
     failed multi-host insertion leaves no final output behind and can be
     retried.
+  - `Rar5Set::repair` verifies every rebuilt host before installing any, and
+    a failed install removes the destinations this call installed before
+    it, as `Rar5Set::remove` does, so a failed repair can be retried.
 - A derived carrier (`CarrierPlan::derived`) looks up its available Recovery
   Data packets in one pass over the payloads instead of one pass per
   recovery index, so regenerating a region of a set with tens of thousands
