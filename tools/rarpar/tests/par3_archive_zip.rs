@@ -114,6 +114,12 @@ fn damage(path: &Path, offset: usize, length: usize) {
 /// A copy of rarpar named `par3`, so that it takes par3cmdline's arguments.
 fn par3_facade(root: &Path) -> PathBuf {
     let par3 = root.join(format!("par3{}", std::env::consts::EXE_SUFFIX));
+    // A link on Unix: a copy's write descriptor, inherited by a child another
+    // test forked but has not yet exec'd, fails the copy's own exec with
+    // `ETXTBSY`. Windows has neither that window nor unprivileged links.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_rarpar"), &par3).unwrap();
+    #[cfg(windows)]
     std::fs::copy(env!("CARGO_BIN_EXE_rarpar"), &par3).unwrap();
     par3
 }

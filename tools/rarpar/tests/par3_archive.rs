@@ -167,6 +167,12 @@ fn an_inside_set_repairs_the_archive_that_carries_it() {
 
     // par3cmdline's `rs`, through the facade, finds the set inside the file.
     let par3 = root.join(format!("par3{}", std::env::consts::EXE_SUFFIX));
+    // A link on Unix: a copy's write descriptor, inherited by a child another
+    // test forked but has not yet exec'd, fails the copy's own exec with
+    // `ETXTBSY`. Windows has neither that window nor unprivileged links.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_rarpar"), &par3).unwrap();
+    #[cfg(windows)]
     std::fs::copy(env!("CARGO_BIN_EXE_rarpar"), &par3).unwrap();
     damage(&archive, 100, 3000);
     let output = Command::new(&par3)
