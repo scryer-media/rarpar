@@ -45,7 +45,15 @@ Fewer redundant reads on the verify and repair paths.
   to the fingerprint and is left to the verification of the repaired files.
   The scan's record is kept privately beside the payload, keyed by the
   volume's interned path, so `RecoverySliceData::FileBacked` keeps exactly
-  the fields it had in 0.10.7.
+  the fields it had in 0.10.7. Only the recovery packets a sink keeps are
+  recorded: the scan notes each settled volume's fingerprint in its
+  `PacketScanBudget`, and the record (length, packet hash, recovery set ID
+  and exponent) is written when the set builder, the repair inventory
+  loader or the collecting scanners retain the packet. A duplicate or
+  otherwise dropped packet leaves no record, so the records never outnumber
+  the retained packets the budget's metadata limit already bounds. Packets
+  delivered to a caller's own `PacketSink` are not recorded and are re-hashed
+  at repair time as before.
 
 ### Added
 

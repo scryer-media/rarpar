@@ -2049,10 +2049,14 @@ impl<'a> InventoryLoader<'a> {
     ///
     /// The budget is charged inside the builder, and only for what the builder
     /// actually keeps.
-    fn commit(&mut self, packet: Packet, file: usize) -> Result<()> {
+    fn commit(&mut self, packet: Packet, set_id: RecoverySetId, file: usize) -> Result<()> {
         self.diagnostics.packets_loaded += 1;
         self.files[file].contributed = true;
-        if self.builder.add_packet_budgeted(packet, 0, self.budget)? == PacketAdmission::Duplicate {
+        if self
+            .builder
+            .add_packet_budgeted(packet, 0, Some(set_id), self.budget)?
+            == PacketAdmission::Duplicate
+        {
             self.diagnostics.duplicate_packets += 1;
         }
         Ok(())
@@ -2076,7 +2080,7 @@ impl<'a> InventoryLoader<'a> {
                         self.diagnostics.conflicting_packets += 1;
                         continue;
                     }
-                    self.commit(packet, file)?;
+                    self.commit(packet, set_id, file)?;
                 }
                 StagedPacket::KnownDuplicate { set_id, file } => {
                     if self.active_set_id.is_some_and(|active| active != set_id) {
@@ -2149,7 +2153,7 @@ impl PacketSink for InventoryLoader<'_> {
         }
 
         if self.active_set_id.is_some() {
-            return self.commit(packet, file);
+            return self.commit(packet, recovery_set_id, file);
         }
 
         // Still waiting on the first Main packet. Stage the packet, unless the
