@@ -27,7 +27,7 @@
 //! - Factors are all >= 2, so every lane exercises a real GF multiply rather
 //!   than the `factor == 1` plain-XOR shortcut.
 //!
-//! Run: `cargo bench -p reedsolomon-rs --features wgpu --bench gf16_gpu_vs_cpu`
+//! Run: `cargo bench --locked -p reedsolomon-rs --features wgpu --bench gf16_gpu_vs_cpu`
 //! Pick a backend with `WGPU_BACKEND=vulkan|dx12|metal`; on Linux pin a specific
 //! Vulkan device with `VK_DRIVER_FILES=<icd.json>` (e.g. to keep wgpu off the
 //! llvmpipe software rasterizer, whose numbers mean nothing).

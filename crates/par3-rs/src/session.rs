@@ -10,7 +10,7 @@ use crate::ingest::{IncrementalSet, IngestedPacket, MergeEffect, PayloadKind, Pa
 use crate::layout::BlockLayout;
 use crate::packet::{BlockRange, PacketBody};
 use crate::runtime::{EngineError, EngineResult, ExecutionOptions, MemoryCategory, Reservation};
-use crate::source::{SourceAccess, SourceId, ensure_snapshot, read_exact_at};
+use crate::source::{OwedChecks, SourceAccess, SourceId, ensure_snapshot, read_exact_at};
 use crate::{Fingerprint, InputSetId, Packet, Par3Set};
 
 #[path = "session_data.rs"]
@@ -1284,17 +1284,41 @@ impl Par3RepairSession {
     }
 
     /// Reconstruct damaged files into an explicitly selected output directory.
-    /// Sources remain read-only; verified temporary outputs are installed only
-    /// after their complete protected-data hashes match.
+    /// A staged output is installed only after every protected extent matches
+    /// its authenticated checksum (and, when it is read back, the whole-file
+    /// fingerprint too). Each staged output is synchronized before
+    /// installation; see [`Self::repair_with_durability`]. Sources are only
+    /// read, except that on macOS and Linux, with `backup` off and no clone
+    /// available, a damaged file whose destination is that very file (single
+    /// link, handed over by its registry, read by nothing else in the repair)
+    /// is patched in place: only its damaged extents are written, and it is
+    /// then read back whole before it is reported repaired.
     pub fn repair(
         &mut self,
         output: &Path,
         backup: bool,
     ) -> EngineResult<crate::session_repair::SessionRepairReport> {
+        self.repair_with_durability(
+            output,
+            backup,
+            crate::session_repair::RepairDurability::SyncFiles,
+        )
+    }
+
+    /// [`Self::repair`] with an explicit file synchronization policy. Under
+    /// [`crate::session_repair::RepairDurability::Buffered`] every output is
+    /// still verified before installation, but a crash after installation can
+    /// leave a partial file under its name; the host owns the barrier.
+    pub fn repair_with_durability(
+        &mut self,
+        output: &Path,
+        backup: bool,
+        durability: crate::session_repair::RepairDurability,
+    ) -> EngineResult<crate::session_repair::SessionRepairReport> {
         let _progress = self.options.stage(crate::runtime::Stage::Repair)?;
         // `assess` already counts its own refusals; only the repair's are added.
         self.assess()?;
-        let outcome = crate::session_repair::repair(self, output, backup);
+        let outcome = crate::session_repair::repair(self, output, backup, durability);
         if let Err(error) = &outcome {
             self.options.diagnostics.note_refusal(error);
         }
@@ -1423,17 +1447,22 @@ impl Par3RepairSession {
         Ok(())
     }
 
+    /// Read one stripe of an input block. Each source range read is checked
+    /// against its snapshot afterwards, or, given `owed`, recorded there for
+    /// the caller to settle before writing anything derived from it.
+    /// `covered` is scratch, and what `out` holds after an error is
+    /// unspecified.
     pub(crate) fn read_block(
         &self,
         block: u64,
         offset: u64,
         out: &mut [u8],
         covered: &mut [u8],
+        owed: Option<&OwedChecks>,
     ) -> EngineResult<()> {
         let layout = self.layout.as_ref().expect("prepared layout");
-        out.fill(0);
-        covered.fill(0);
         if let Some(payload) = self.data_payloads().get(&block) {
+            out.fill(0);
             payload.read_at(offset, out)?;
             return Ok(());
         }
@@ -1441,14 +1470,12 @@ impl Par3RepairSession {
             .locations(block)
             .ok_or(EngineError::InvalidState("unresolved input block"))?;
         let stripe_end = offset + out.len() as u64;
-        for location in locations.iter() {
+        // Which bytes of the stripe an extent supplies, with where to read
+        // them from, for an extent that is placed or proven intact.
+        let supply = |location: &crate::layout::ExtentLocation| {
             let file = &layout.files[location.file];
-            let Some(extent) = file.extents.range(location.extent) else {
-                continue;
-            };
-            let Some((_, block_offset)) = file.extents.block_at(location.extent) else {
-                continue;
-            };
+            let extent = file.extents.range(location.extent)?;
+            let (_, block_offset) = file.extents.block_at(location.extent)?;
             let (source, snapshot, source_offset) =
                 if let Some(placement) = self.placements.get(&(location.file, location.extent)) {
                     (placement.source, placement.snapshot, placement.offset)
@@ -1457,58 +1484,118 @@ impl Par3RepairSession {
                 {
                     (proof.source, proof.snapshot, extent.start)
                 } else {
-                    continue;
+                    return None;
                 };
             let start = offset.max(block_offset);
             let end = stripe_end.min(block_offset + extent.end - extent.start);
-            if start >= end {
-                continue;
+            (start < end).then(|| {
+                (
+                    source,
+                    snapshot,
+                    source_offset + start - block_offset,
+                    start,
+                    end,
+                )
+            })
+        };
+        // Most stripes come whole from the one extent naming their block:
+        // nothing to zero, no coverage to keep, and the read itself fills
+        // `out`. The map below is only for stripes assembled from several
+        // extents, or padded past a file's end.
+        let mut resolved = None;
+        if let [location] = &*locations
+            && let Some((source, snapshot, source_offset, start, end)) =
+                *resolved.insert(supply(location))
+            && start == offset
+            && end == stripe_end
+        {
+            if let Err(error) = read_exact_at(
+                &self.options.diagnostics,
+                self.access.as_ref(),
+                source,
+                source_offset,
+                out,
+            ) {
+                if let Some(owed) = owed {
+                    owed.settle(self.access.as_ref())?;
+                }
+                ensure_snapshot(self.access.as_ref(), source, snapshot)?;
+                return Err(error);
             }
+            match owed {
+                Some(owed) => owed.owe(source, snapshot),
+                None => ensure_snapshot(self.access.as_ref(), source, snapshot)?,
+            }
+            return Ok(());
+        }
+        out.fill(0);
+        covered.fill(0);
+        for location in locations.iter() {
+            // A single extent not supplying the whole stripe was resolved above.
+            let supplied = resolved.take().unwrap_or_else(|| supply(location));
+            let Some((source, snapshot, source_offset, start, end)) = supplied else {
+                continue;
+            };
             let begin = (start - offset) as usize;
             let finish = (end - offset) as usize;
-            ensure_snapshot(self.access.as_ref(), source, snapshot)?;
-            if covered[begin..finish].iter().any(|value| *value != 0) {
-                // A second extent naming this block: its bytes are fetched
-                // again so they can be compared with what the first extent
-                // already supplied. These are the only bytes this engine
-                // genuinely reads twice.
-                self.options.diagnostics.note_reread(finish - begin);
-                let _scratch = self
-                    .options
-                    .memory
-                    .reserve_as(MemoryCategory::SourceScratch, 4096)?;
-                let mut scratch = [0; 4096];
-                let mut position = begin;
-                while position < finish {
-                    self.options.cancel.check()?;
-                    let take = (finish - position).min(scratch.len());
+            // Only the check after the read vouches for the bytes; a failed
+            // read is reported as the change that caused it, if one did.
+            let mut read = || -> EngineResult<()> {
+                // The map holds only zeros and ones, so this is one `memchr`.
+                if covered[begin..finish].contains(&1) {
+                    // A second extent naming this block: its bytes are fetched
+                    // again so they can be compared with what the first extent
+                    // already supplied. These are the only bytes this engine
+                    // genuinely reads twice.
+                    self.options.diagnostics.note_reread(finish - begin);
+                    let _scratch = self
+                        .options
+                        .memory
+                        .reserve_as(MemoryCategory::SourceScratch, 4096)?;
+                    let mut scratch = [0; 4096];
+                    let mut position = begin;
+                    while position < finish {
+                        self.options.cancel.check()?;
+                        let take = (finish - position).min(scratch.len());
+                        read_exact_at(
+                            &self.options.diagnostics,
+                            self.access.as_ref(),
+                            source,
+                            source_offset + (position - begin) as u64,
+                            &mut scratch[..take],
+                        )?;
+                        for (index, &byte) in scratch[..take].iter().enumerate() {
+                            if covered[position + index] != 0 && out[position + index] != byte {
+                                return Err(EngineError::InvalidState(
+                                    "contradictory authenticated alias bytes",
+                                ));
+                            }
+                            out[position + index] = byte;
+                        }
+                        position += take;
+                    }
+                } else {
                     read_exact_at(
                         &self.options.diagnostics,
                         self.access.as_ref(),
                         source,
-                        source_offset + start - block_offset + (position - begin) as u64,
-                        &mut scratch[..take],
+                        source_offset,
+                        &mut out[begin..finish],
                     )?;
-                    for (index, &byte) in scratch[..take].iter().enumerate() {
-                        if covered[position + index] != 0 && out[position + index] != byte {
-                            return Err(EngineError::InvalidState(
-                                "contradictory authenticated alias bytes",
-                            ));
-                        }
-                        out[position + index] = byte;
-                    }
-                    position += take;
                 }
-            } else {
-                read_exact_at(
-                    &self.options.diagnostics,
-                    self.access.as_ref(),
-                    source,
-                    source_offset + start - block_offset,
-                    &mut out[begin..finish],
-                )?;
+                Ok(())
+            };
+            if let Err(error) = read() {
+                if let Some(owed) = owed {
+                    owed.settle(self.access.as_ref())?;
+                }
+                ensure_snapshot(self.access.as_ref(), source, snapshot)?;
+                return Err(error);
             }
-            ensure_snapshot(self.access.as_ref(), source, snapshot)?;
+            match owed {
+                Some(owed) => owed.owe(source, snapshot),
+                None => ensure_snapshot(self.access.as_ref(), source, snapshot)?,
+            }
             covered[begin..finish].fill(1);
         }
         for location in locations.iter() {

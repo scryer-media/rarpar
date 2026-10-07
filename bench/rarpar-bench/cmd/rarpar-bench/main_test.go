@@ -196,3 +196,19 @@ func TestToolchainsPublishRequiresACompleteConfiguration(t *testing.T) {
 		})
 	}
 }
+
+func TestNFSPassthroughAndFlagValue(t *testing.T) {
+	own, suite := splitPassthrough([]string{"--label", "x", "--", "--out", "/r/x", "--set", "a"})
+	if strings.Join(own, " ") != "--label x" || strings.Join(suite, " ") != "--out /r/x --set a" {
+		t.Errorf("split = %v | %v", own, suite)
+	}
+	if own, suite := splitPassthrough([]string{"--label", "x"}); len(own) != 2 || suite != nil {
+		t.Errorf("split without -- = %v | %v", own, suite)
+	}
+	if got := flagValue([]string{"--out", "/a", "--out=/b"}, "out"); got != "/b" {
+		t.Errorf("flagValue = %q", got)
+	}
+	if got := flagValue([]string{"--outer", "/a"}, "out"); got != "" {
+		t.Errorf("flagValue matched a longer flag: %q", got)
+	}
+}

@@ -26,8 +26,8 @@ func TestExampleConfigLoads(t *testing.T) {
 	if config.SchemaVersion != ConfigSchemaVersion {
 		t.Fatalf("schema version = %d, want %d", config.SchemaVersion, ConfigSchemaVersion)
 	}
-	if len(config.Machines) != 4 {
-		t.Fatalf("machines = %d, want 4 (one of each kind plus the Windows example)", len(config.Machines))
+	if len(config.Machines) != 5 {
+		t.Fatalf("machines = %d, want 5 (one of each kind, an SSM cloud machine, and the Windows example)", len(config.Machines))
 	}
 	if config.SHA256 == "" {
 		t.Fatal("config digest must be recorded so a run can name the config it used")
@@ -36,7 +36,7 @@ func TestExampleConfigLoads(t *testing.T) {
 	for _, machine := range config.Machines {
 		kinds[machine.Kind]++
 	}
-	if kinds[KindAWSEC2] != 1 || kinds[KindLocalSSH] != 3 {
+	if kinds[KindAWSEC2] != 2 || kinds[KindLocalSSH] != 3 {
 		t.Fatalf("unexpected machine kinds: %v", kinds)
 	}
 }
@@ -244,6 +244,12 @@ func TestConfigValidation(t *testing.T) {
 			want: "unknown suite",
 		},
 		{
+			name: "windows host-path oracle with a cmd metacharacter is refused",
+			old:  "path = \"C:\\\\bench\\\\oracles\\\\UnRAR.exe\"",
+			new:  "path = \"C:\\\\bench\\\\100%\\\\UnRAR.exe\"",
+			want: "oracles.rar.path must not contain a double quote",
+		},
+		{
 			name: "windows host with perf is refused",
 			old:  "perf = \"none\"                            # enforced: Windows has no perf collector",
 			new:  "perf = \"linux-perf\"",
@@ -449,7 +455,7 @@ func TestBuildPlan(t *testing.T) {
 			}
 		}
 	}
-	if plan.Quota.Requested != 4 || !plan.Quota.Fits {
+	if plan.Quota.Requested != 12 || !plan.Quota.Fits {
 		t.Fatalf("unexpected quota check: %+v", plan.Quota)
 	}
 	var text strings.Builder
@@ -920,7 +926,8 @@ func TestCloudSSHPortCanBePinnedPerMachine(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, machine := range config.Machines {
-		if machine.Kind == KindAWSEC2 && machine.Connection.Port != 2200 {
+		// The substitution lands in the first cloud machine's block only.
+		if machine.Name == "ec2-graviton4" && machine.Connection.Port != 2200 {
 			t.Fatalf("machine %s: port = %d, want the per-machine pin 2200", machine.Name, machine.Connection.Port)
 		}
 	}
@@ -966,7 +973,7 @@ func TestWindowsRunScriptExecutesAFile(t *testing.T) {
 		t.Fatalf("the Windows runner must execute a script file: %s", layout.Script)
 	}
 	script := WindowsRunScript(windows, config.Fleet.Defaults, "fleet-testrun", layout, map[string]string{"rar": "C:\\bench\\oracles\\UnRAR.exe"})
-	for _, expected := range []string{"MANIFEST.json", "DONE", "Gate ", "tar.exe"} {
+	for _, expected := range []string{"MANIFEST.json", "DONE", "Gate ", "ZipFile]::CreateFromDirectory"} {
 		if !strings.Contains(script, expected) {
 			t.Fatalf("Windows run script is missing %q", expected)
 		}
@@ -1020,5 +1027,19 @@ func TestNativeBuildArchMapping(t *testing.T) {
 	}
 	if unameToGoArch("x86_64\n") != "amd64" || unameToGoArch("aarch64") != "arm64" {
 		t.Fatal("uname arch normalization is wrong")
+	}
+}
+
+func TestValidateRunID(t *testing.T) {
+	if err := ValidateRunID(NewRunID("")); err != nil {
+		t.Fatalf("a fresh run id must validate: %v", err)
+	}
+	if err := ValidateRunID("fleet-20261007T030000Z"); err != nil {
+		t.Fatalf("a plain run id must validate: %v", err)
+	}
+	for _, bad := range []string{"", ".", "..", "../shared", "a/b", `a\b`, "with space", "/abs"} {
+		if err := ValidateRunID(bad); err == nil {
+			t.Errorf("run id %q must be rejected", bad)
+		}
 	}
 }

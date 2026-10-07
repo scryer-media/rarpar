@@ -2,8 +2,9 @@
 mod common;
 
 use par3_rs::runtime::{EngineError, ExecutionOptions, HandleBudget, ResourceLimit};
-use par3_rs::source::{DiskSourceAccess, SourceAccess, SourceId};
-use std::sync::{Arc, Barrier};
+use par3_rs::source::{DiskSourceAccess, SourceAccess, SourceId, SourceSnapshot};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
 
 #[test]
 fn cauchy_loss_ceiling_is_enforced_before_staging_outputs() {
@@ -102,6 +103,653 @@ fn sequential_readers_share_a_ceiling_and_release_on_drop() {
     assert_eq!(options.handles.used(), 0);
 }
 
+// Read handles are cached on Unix and Windows, where a file identity tells a
+// cached handle on a replaced file from one on the file the path names. On a
+// Windows volume without POSIX unlink and rename none is cached, so the tests
+// counting cached opens skip there.
+#[cfg(any(unix, windows))]
+#[test]
+fn disk_reads_open_each_source_once_and_close_with_the_registry() {
+    if !common::temp_volume_has_posix_unlink_rename() {
+        return;
+    }
+    let tree = common::TempTree::new("cached-reads");
+    let files = [common::a_bin(), common::c_bin()];
+    let options = ExecutionOptions::default();
+    let mut disk = DiskSourceAccess::with_options(options.clone());
+    for (index, bytes) in files.iter().enumerate() {
+        let path = tree.path().join(format!("source{index}"));
+        std::fs::write(&path, bytes).unwrap();
+        disk.insert(SourceId(index as u64 + 1), path);
+    }
+    for round in 0..64 {
+        for (index, bytes) in files.iter().enumerate() {
+            let offset = round * 37 % bytes.len();
+            let mut out = [0; 31];
+            let read = disk
+                .read_at(SourceId(index as u64 + 1), offset as u64, &mut out)
+                .unwrap();
+            assert_eq!(out[..read], bytes[offset..][..read]);
+        }
+    }
+    assert_eq!(options.diagnostics.file_opens(), files.len() as u64);
+    assert_eq!(options.handles.used(), files.len());
+    drop(disk);
+    assert_eq!(options.handles.used(), 0);
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn idle_cached_reads_yield_their_leases_to_other_openers() {
+    if !common::temp_volume_has_posix_unlink_rename() {
+        return;
+    }
+    let tree = common::TempTree::new("reclaimed-reads");
+    let path = tree.path().join("source");
+    std::fs::write(&path, common::a_bin()).unwrap();
+    let mut options = ExecutionOptions::default();
+    options.open_handles = 4;
+    options.handles = HandleBudget::new(4);
+    let mut disk = DiskSourceAccess::with_options(options.clone());
+    disk.insert(SourceId(1), path);
+    disk.read_at(SourceId(1), 0, &mut [0; 1]).unwrap();
+    assert_eq!(options.handles.used(), 1);
+    // The fourth reader finds the ceiling held by three readers and the idle
+    // cached handle, and gets the cached handle's lease.
+    let readers: Vec<_> = (0..4)
+        .map(|_| disk.open_sequential(SourceId(1)).unwrap().unwrap())
+        .collect();
+    assert_eq!(options.handles.used(), 4);
+    assert_eq!(options.handles.peak(), 4);
+    let error = disk.read_at(SourceId(1), 0, &mut [0; 1]).unwrap_err();
+    assert!(matches!(
+        EngineError::from(error),
+        EngineError::ResourceLimit(ResourceLimit {
+            what: "open handles",
+            ..
+        })
+    ));
+    drop(readers);
+    assert_eq!(options.handles.used(), 0);
+    disk.read_at(SourceId(1), 0, &mut [0; 1]).unwrap();
+    assert_eq!(options.diagnostics.file_opens(), 6);
+}
+
+// Unix only: a Windows scanner reads through a pinned carrier handle that
+// denies writers, deletion and renames for the scan's lifetime, so the carrier
+// cannot be truncated or replaced mid-scan there; that is checked by the
+// source unit tests instead.
+#[cfg(unix)]
+#[test]
+fn disk_scans_reject_a_carrier_replaced_or_truncated_mid_scan() {
+    use par3_rs::ingest::{PacketScanner, ScanEvent};
+    let bytes = common::set_vol0_par3();
+    for truncate in [false, true] {
+        let tree = common::TempTree::new("changed-carrier");
+        let path = tree.path().join("carrier");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut options = ExecutionOptions::default();
+        // One packet header per refill, so the scan reads the file many times.
+        options.stripe_bytes = 48;
+        let mut disk = DiskSourceAccess::with_options(options.clone());
+        disk.insert(SourceId(1), path.clone());
+        let disk = Arc::new(disk);
+        let mut scanner = PacketScanner::new(
+            disk.clone(),
+            SourceId(1),
+            options.clone(),
+            par3_rs::ScanLimits::default(),
+        )
+        .unwrap();
+        assert!(matches!(scanner.poll().unwrap(), ScanEvent::Packet(_)));
+        assert!(matches!(scanner.poll().unwrap(), ScanEvent::Packet(_)));
+        assert_eq!(options.diagnostics.file_opens(), 1);
+        if truncate {
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_len(bytes.len() as u64 / 2).unwrap();
+        } else {
+            // Identical bytes in a new file: the cached handle still reads the
+            // old one, and only the path's identity tells them apart.
+            let replacement = tree.path().join("replacement");
+            std::fs::write(&replacement, &bytes).unwrap();
+            std::fs::rename(&replacement, &path).unwrap();
+        }
+        loop {
+            match scanner.poll() {
+                Ok(ScanEvent::Packet(_)) => {}
+                Err(EngineError::SourceChanged(SourceId(1))) => break,
+                Err(error) => panic!("unexpected scan error: {error}"),
+                Ok(event) => panic!("changed carrier was not rejected: {event:?}"),
+            }
+        }
+        drop(scanner);
+        let opens = options.diagnostics.file_opens();
+        let mut out = [0; 8];
+        assert_eq!(disk.read_at(SourceId(1), 0, &mut out).unwrap(), 8);
+        assert_eq!(out, bytes[..8]);
+        // A truncated file is still the cached one; a replaced one is opened
+        // again because the snapshot that saw it closed the stale handle.
+        assert_eq!(
+            options.diagnostics.file_opens(),
+            opens + u64::from(!truncate)
+        );
+        assert_eq!(options.handles.used(), 1);
+        drop(disk);
+        assert_eq!(options.handles.used(), 0);
+    }
+}
+
+/// Snapshot and read counts, and a file change armed for one read.
+#[derive(Default)]
+struct Watch {
+    snapshots: AtomicUsize,
+    reads: AtomicUsize,
+    change: Mutex<Option<(usize, std::path::PathBuf, bool)>>,
+}
+
+impl Watch {
+    /// Count a read, first making the armed change if this is its read.
+    fn read(&self) {
+        let read = self.reads.fetch_add(1, Ordering::Relaxed);
+        let mut change = self.change.lock().unwrap();
+        if change.as_ref().is_some_and(|(at, _, _)| *at == read) {
+            let (_, path, truncate) = change.take().unwrap();
+            if truncate {
+                let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                file.set_len(file.metadata().unwrap().len() / 2).unwrap();
+            } else {
+                let replacement = path.with_extension("replacement");
+                std::fs::copy(&path, &replacement).unwrap();
+                std::fs::rename(&replacement, &path).unwrap();
+            }
+        }
+    }
+}
+
+/// A disk registry that counts snapshots and reads, positioned or forward,
+/// and can change one of its files just before a chosen read.
+struct Watched {
+    disk: DiskSourceAccess,
+    watch: Arc<Watch>,
+}
+
+impl Watched {
+    fn new(disk: DiskSourceAccess) -> Self {
+        Self {
+            disk,
+            watch: Arc::default(),
+        }
+    }
+
+    /// Start counting afresh; before read `at` (from zero), replace `path`
+    /// with a copy of itself, or truncate it to half its length.
+    fn arm(&self, change: Option<(usize, std::path::PathBuf, bool)>) {
+        self.watch.snapshots.store(0, Ordering::Relaxed);
+        self.watch.reads.store(0, Ordering::Relaxed);
+        *self.watch.change.lock().unwrap() = change;
+    }
+
+    fn counts(&self) -> (usize, usize) {
+        (
+            self.watch.snapshots.load(Ordering::Relaxed),
+            self.watch.reads.load(Ordering::Relaxed),
+        )
+    }
+}
+
+struct WatchedReader(Box<dyn std::io::Read + Send>, Arc<Watch>);
+
+impl std::io::Read for WatchedReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        self.1.read();
+        self.0.read(out)
+    }
+}
+
+impl SourceAccess for Watched {
+    fn snapshot(&self, source: SourceId) -> std::io::Result<Option<SourceSnapshot>> {
+        self.watch.snapshots.fetch_add(1, Ordering::Relaxed);
+        self.disk.snapshot(source)
+    }
+    fn read_at(&self, source: SourceId, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
+        self.watch.read();
+        self.disk.read_at(source, offset, out)
+    }
+    fn next_available(
+        &self,
+        source: SourceId,
+        offset: u64,
+    ) -> std::io::Result<Option<std::ops::Range<u64>>> {
+        self.disk.next_available(source, offset)
+    }
+    fn open_sequential(
+        &self,
+        source: SourceId,
+    ) -> std::io::Result<Option<Box<dyn std::io::Read + Send>>> {
+        Ok(self.disk.open_sequential(source)?.map(|reader| {
+            Box::new(WatchedReader(reader, self.watch.clone())) as Box<dyn std::io::Read + Send>
+        }))
+    }
+}
+
+struct Run<T> {
+    result: Result<T, EngineError>,
+    /// Snapshots, reads and opens during the measured operation alone.
+    snapshots: usize,
+    reads: usize,
+    opens: u64,
+    output: common::TempTree,
+    inputs: common::TempTree,
+}
+
+/// Repair an input set from disk after flipping one byte at each
+/// `(file, offset)`, optionally changing input `file` before read `at`.
+fn repair_watched(
+    set: &common::ManyBlockSet,
+    damage: &[(usize, usize)],
+    options: &ExecutionOptions,
+    change: Option<(usize, usize, bool)>,
+) -> Run<u64> {
+    use par3_rs::session::{Par3RepairSession, RepairStatus};
+    // Leases the host holds on a shared budget stay held throughout.
+    let host = options.handles.used();
+    let inputs = common::TempTree::new("disk-repair-input");
+    let mut disk = DiskSourceAccess::with_options(options.clone());
+    for (index, (name, bytes)) in set.contents.iter().enumerate() {
+        let mut damaged = bytes.clone();
+        for &(_, at) in damage.iter().filter(|(file, _)| *file == index) {
+            damaged[at] ^= 0x80;
+        }
+        let path = inputs.path().join(name);
+        std::fs::write(&path, damaged).unwrap();
+        disk.insert(SourceId(index as u64 + 1), path);
+    }
+    let watched = Arc::new(Watched::new(disk));
+    let mut session = Par3RepairSession::new(set.id, watched.clone(), options.clone()).unwrap();
+    for (index, (name, _)) in set.contents.iter().enumerate() {
+        session.bind_file(name, SourceId(index as u64 + 1)).unwrap();
+    }
+    for path in &set.paths {
+        for packet in common::scanned_packets(std::fs::read(path).unwrap(), options) {
+            session.merge(packet).unwrap();
+        }
+    }
+    assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
+    let output = common::TempTree::new("disk-repair-output");
+    watched.arm(
+        change
+            .map(|(file, at, truncate)| (at, inputs.path().join(&set.contents[file].0), truncate)),
+    );
+    let opened = options.diagnostics.file_opens();
+    let result = session
+        .repair(output.path(), false)
+        .map(|report| report.reconstructed_blocks);
+    let opens = options.diagnostics.file_opens() - opened;
+    let (snapshots, reads) = watched.counts();
+    drop(session);
+    drop(watched);
+    // The session keeps to its own ceiling beside the host's leases, and the
+    // budget's limit binds them both.
+    assert!(
+        options.handles.peak() <= (host + options.open_handles).min(options.handles.limit()),
+        "peak {} with {host} host leases, {} open handles, limit {}",
+        options.handles.peak(),
+        options.open_handles,
+        options.handles.limit()
+    );
+    assert_eq!(options.handles.used(), host);
+    Run {
+        result,
+        snapshots,
+        reads,
+        opens,
+        output,
+        inputs,
+    }
+}
+
+/// Repair an input set from disk after flipping one byte at each
+/// `(file, offset)`, and check the repaired files and the handle ceiling.
+fn repair_from_disk(
+    set: &common::ManyBlockSet,
+    damage: &[(usize, usize)],
+    options: &ExecutionOptions,
+) -> Run<u64> {
+    let run = repair_watched(set, damage, options, None);
+    assert!(run.result.is_ok(), "repair failed: {:?}", run.result);
+    for &(file, _) in damage {
+        let (name, bytes) = &set.contents[file];
+        assert_eq!(&std::fs::read(run.output.path().join(name)).unwrap(), bytes);
+    }
+    run
+}
+
+/// Create a one-file Cauchy set from disk in four stripe passes, optionally
+/// changing the input before read `at` of planning or of execution, and
+/// counting from the start of that phase.
+fn create_watched(
+    blocks: usize,
+    change: Option<(usize, bool)>,
+    planning: bool,
+) -> Run<Vec<std::path::PathBuf>> {
+    use par3_rs::creation::{
+        CreationCodec, CreationOptions, CreationPlan, CreationSource, VolumeLayout,
+    };
+    let inputs = common::TempTree::new("disk-create-input");
+    let path = inputs.path().join("input.bin");
+    let mut bytes = vec![0; blocks * 4096];
+    blake3::Hasher::new()
+        .update(b"disk-create")
+        .finalize_xof()
+        .fill(&mut bytes);
+    std::fs::write(&path, bytes).unwrap();
+    let mut options = CreationOptions {
+        block_size: 4096,
+        recovery_count: 4,
+        volumes: VolumeLayout::Uniform(1),
+        codec: CreationCodec::Cauchy,
+        ..CreationOptions::default()
+    };
+    options.execution.workers = 1;
+    options.execution.stripe_bytes = 1024;
+    let mut disk = DiskSourceAccess::with_options(options.execution.clone());
+    disk.insert(SourceId(1), path.clone());
+    let watched = Arc::new(Watched::new(disk));
+    let output = common::TempTree::new("disk-create-output");
+    let scratch = output.path().join("scratch");
+    let carriers = output.path().join("carriers");
+    std::fs::create_dir(&scratch).unwrap();
+    std::fs::create_dir(&carriers).unwrap();
+    let change = change.map(|(at, truncate)| (at, path.clone(), truncate));
+    if planning {
+        watched.arm(change.clone());
+    }
+    let result = CreationPlan::build(
+        watched.clone(),
+        &[CreationSource {
+            name: "input.bin".into(),
+            source: SourceId(1),
+        }],
+        options.clone(),
+    )
+    .and_then(|plan| {
+        if !planning {
+            watched.arm(change);
+        }
+        plan.execute(&carriers.join("set"), &scratch)
+    });
+    let (snapshots, reads) = watched.counts();
+    Run {
+        result,
+        snapshots,
+        reads,
+        opens: options.execution.diagnostics.file_opens(),
+        output,
+        inputs,
+    }
+}
+
+#[test]
+fn creation_checks_each_source_once_per_stripe_pass() {
+    for blocks in [32, 256] {
+        let run = create_watched(blocks, None, false);
+        run.result.unwrap();
+        // Four stripe passes, each reading every block once.
+        assert_eq!(run.reads, 4 * blocks);
+        // One check before encoding, one after each pass's last read, and
+        // one before installation; it was two per read.
+        assert_eq!(run.snapshots, 6, "{blocks} blocks");
+        drop(run.inputs);
+    }
+}
+
+#[test]
+fn creation_rejects_a_source_changed_within_or_between_stripe_passes() {
+    // Read 5 is inside the first pass; read 32 opens the second, after the
+    // first pass's rows are already in the spool. A replaced file still reads
+    // through the old handle and is caught when that pass settles; a
+    // truncated one fails at block 16, the first read past its new end. The
+    // read counts show neither waits for the check before installation. The
+    // replacement is a copy, which keeps its bytes and, on Windows, its mtime;
+    // only the file identity tells it apart. Without POSIX rename the held
+    // reader refuses the replacement itself, so only truncation is tried.
+    for (at, truncate, reads) in [
+        (5, false, 32),
+        (5, true, 17),
+        (32, false, 64),
+        (32, true, 49),
+    ] {
+        if !truncate && !common::temp_volume_has_posix_unlink_rename() {
+            continue;
+        }
+        let run = create_watched(32, Some((at, truncate)), false);
+        assert!(
+            matches!(run.result, Err(EngineError::SourceChanged(SourceId(1)))),
+            "change before read {at} (truncate {truncate}): {:?}",
+            run.result
+        );
+        assert_eq!(
+            run.reads, reads,
+            "change before read {at} (truncate {truncate})"
+        );
+        let carriers = run.output.path().join("carriers");
+        assert_eq!(std::fs::read_dir(&carriers).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn creation_planning_checks_each_source_once_and_rejects_a_changed_file() {
+    let run = create_watched(32, None, true);
+    run.result.unwrap();
+    // Planning hashes the file through one forward reader in 1 KiB reads and
+    // the encode reads it again in four passes.
+    assert_eq!(run.reads, 128 + 128);
+    // Planning snapshots the file once to start and checks it once after its
+    // last chunk; execution adds the six counted above. Checking before and
+    // after every block's hash added 64.
+    assert_eq!(run.snapshots, 2 + 6);
+    // Read 5 is early in planning's first block. Without POSIX rename the
+    // forward reader refuses a replacement, so only truncation is tried.
+    for truncate in [false, true] {
+        if !truncate && !common::temp_volume_has_posix_unlink_rename() {
+            continue;
+        }
+        let run = create_watched(32, Some((5, truncate)), true);
+        assert!(
+            matches!(run.result, Err(EngineError::SourceChanged(SourceId(1)))),
+            "change during planning (truncate {truncate}): {:?}",
+            run.result
+        );
+        let carriers = run.output.path().join("carriers");
+        assert_eq!(std::fs::read_dir(&carriers).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn repair_rejects_a_source_changed_within_or_between_stripe_passes() {
+    let tree = common::TempTree::new("disk-repair-changed");
+    let set = common::cauchy_block_set(32, 4096, 4, b"disk-repair-changed", &tree);
+    let mut options = ExecutionOptions::default();
+    options.workers = 1;
+    options.stripe_bytes = 1024;
+    // Thirty surviving blocks are read per pass: read 5 is inside the first
+    // pass, read 30 opens the second, after the first pass was staged. A
+    // replaced file still reads through the old handle and is caught when
+    // that pass settles, after its thirtieth read; a truncated one fails at
+    // block 16, the fifteenth read of the pass, the first past its new end.
+    // Either way the staged temporary is never installed. Without POSIX
+    // rename a held handle refuses the replacement, so only truncation is
+    // tried.
+    for (at, truncate, reads) in [
+        (5, false, 30),
+        (5, true, 15),
+        (30, false, 60),
+        (30, true, 45),
+    ] {
+        if !truncate && !common::temp_volume_has_posix_unlink_rename() {
+            continue;
+        }
+        let run = repair_watched(
+            &set,
+            &[(0, 4096 + 5), (0, 9 * 4096 + 7)],
+            &options,
+            Some((0, at, truncate)),
+        );
+        // The staged temporary is handed to the host; nothing installed.
+        match &run.result {
+            Err(EngineError::RepairInterrupted {
+                installed, cause, ..
+            }) if installed.is_empty()
+                && matches!(**cause, EngineError::SourceChanged(SourceId(1))) => {}
+            result => panic!("change before read {at} (truncate {truncate}): {result:?}"),
+        }
+        assert_eq!(
+            run.reads, reads,
+            "change before read {at} (truncate {truncate})"
+        );
+        assert!(!run.output.path().join("input.bin").exists());
+    }
+}
+
+#[test]
+fn repair_checks_sources_it_does_not_write_once_per_pass() {
+    let tree = common::TempTree::new("disk-repair-checks");
+    let set = common::many_block_set(8, 16, 0, 4, b"disk-repair-checks", &tree);
+    let mut options = ExecutionOptions::default();
+    options.workers = 1;
+    let run = repair_from_disk(&set, &[(1, 70)], &options);
+    // One stripe pass reads all 127 surviving blocks in file order, and only
+    // the damaged second file is written. Each of the eight sources is checked
+    // once, when the pass settles; staging its writes no longer checks the
+    // reads before each one (that cost 15 + 7 more). The other 32 are the
+    // evidence checks before and after reconstruction, four per file.
+    // Checking every read cost 159.
+    assert_eq!(run.reads, 127);
+    assert_eq!(run.snapshots, 32 + 8);
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn disk_repair_opens_do_not_grow_with_the_number_of_reads() {
+    if !common::temp_volume_has_posix_unlink_rename() {
+        return;
+    }
+    let mut opens = Vec::new();
+    for blocks in [32, 256] {
+        let tree = common::TempTree::new("disk-repair-opens");
+        let set = common::cauchy_block_set(blocks, 1024, 4, b"disk-repair-opens", &tree);
+        let mut options = ExecutionOptions::default();
+        options.workers = 1;
+        options.stripe_bytes = 1024;
+        repair_from_disk(&set, &[(0, 5), (0, 3 * 1024 + 7)], &options);
+        opens.push(options.diagnostics.file_opens());
+    }
+    // Eight times the reads and staged writes, the same opens.
+    assert_eq!(opens[0], opens[1], "opens per run: {opens:?}");
+}
+
+#[test]
+fn disk_repair_completes_at_the_minimum_handle_budget() {
+    let tree = common::TempTree::new("disk-repair-minimum");
+    // Several sources and outputs, so the one cached reader and the one held
+    // stage writer are evicted and reopened as the repair moves between them.
+    let set = common::many_block_set(6, 16, 0, 4, b"disk-repair-minimum", &tree);
+    let mut options = ExecutionOptions::default();
+    options.open_handles = 5;
+    options.handles = HandleBudget::new(5);
+    repair_from_disk(&set, &[(1, 70), (4, 3)], &options);
+}
+
+/// With a pool, the Cauchy walk hands the group it folds to the workers to
+/// write and hash while the calling thread reads the next group, which puts
+/// a writer's handle beside the reader's. A writer opened on a worker at the
+/// budget's ceiling could neither close the reader being switched nor wait
+/// for it, and a repair that completes on one thread failed at random under
+/// a shared budget on which the host holds a lease. So the outputs are held
+/// open ahead of such a walk, or the walk writes on the calling thread; a
+/// worker never opens. Either way the repair completes and opens exactly what
+/// the one-thread walk opens, from a budget at the repair minimum up to the
+/// default, and whether or not the outputs fit the writer capacity. Only the
+/// repair's opens are compared: the assessment before it verifies the files
+/// on the pool, and under a budget this tight the readers those workers
+/// cache and evict for one another depend on their timing.
+#[test]
+fn a_walk_whose_workers_write_opens_nothing_on_a_worker() {
+    let tree = common::TempTree::new("worker-writes-handles");
+    let block = 4096usize;
+    // Six files of eight blocks and a tail: a group of sixteen surviving
+    // blocks spans files, and four outputs are staged fresh.
+    let set = common::cauchy_files_set(
+        6,
+        8 * block + 777,
+        block as u64,
+        12,
+        b"worker-writes-handles",
+        &tree,
+    );
+    workers_open_nothing(&set, block);
+}
+
+/// The FFT walk hands the writes of the blocks it reads to its workers the
+/// same way, in both field widths: a cohort of six files of eight blocks
+/// decodes over GF(2^8), one of six files of forty-eight blocks over GF(2^16),
+/// where the workers unpack the stripes they are handed from a ring.
+#[test]
+fn an_fft_walk_whose_workers_write_opens_nothing_on_a_worker() {
+    for (blocks, seed) in [(8, "fft-worker-writes-8"), (48, "fft-worker-writes-16")] {
+        let tree = common::TempTree::new(seed);
+        let set = common::many_block_set(6, blocks, 0, 12, seed.as_bytes(), &tree);
+        workers_open_nothing(&set, 64);
+    }
+}
+
+/// Repair `set` with two blocks of four of its files damaged, on one thread
+/// and on eight, across handle budgets that admit and refuse holding the
+/// outputs, and require the same opens either way.
+fn workers_open_nothing(set: &common::ManyBlockSet, block: usize) {
+    let damage: Vec<(usize, usize)> = (1..5)
+        .flat_map(|file| [(file, 5), (file, 3 * block + 9)])
+        .collect();
+    // Four outputs fit a writer capacity of four from sixteen handles: with
+    // headroom they are held and the workers write; at the ceiling the hold
+    // is refused and the calling thread writes.
+    for (open, limit, leases) in [
+        (5, 6, 1),
+        (6, 7, 2),
+        (8, 8, 0),
+        (16, 17, 1),
+        (16, 16, 11),
+        (32, 32, 0),
+    ] {
+        for stripe in [64 << 10, 1024] {
+            let opens = |workers: usize| -> Vec<u64> {
+                (0..4)
+                    .map(|_| {
+                        let mut options = ExecutionOptions::default();
+                        options.workers = workers;
+                        options.stripe_bytes = stripe;
+                        options.open_handles = open;
+                        options.handles = HandleBudget::new(limit);
+                        let held: Vec<_> = (0..leases)
+                            .map(|_| options.handles.acquire().unwrap())
+                            .collect();
+                        let run = repair_from_disk(set, &damage, &options);
+                        drop(held);
+                        run.opens
+                    })
+                    .collect()
+            };
+            let serial = opens(1);
+            let pooled = opens(8);
+            assert!(
+                pooled.iter().all(|count| *count == serial[0]),
+                "handles {open}/{limit} with {leases} held, stripe {stripe}: \
+                 opens on one thread {serial:?}, with workers {pooled:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn failed_disk_open_preserves_io_error_and_releases_its_lease() {
     let tree = common::TempTree::new("failed-open");
@@ -176,5 +824,219 @@ fn resolved_metadata_has_an_independent_budget_and_failed_admission_releases_it(
         assert!(options.memory.peak() <= options.memory.limit());
         drop(session);
         assert_eq!(options.memory.used(), 0);
+    }
+}
+
+/// Disk sources on Windows volumes with and without POSIX unlink and rename.
+/// The sources under test live under `std::env::temp_dir()`, so pointing `TMP`
+/// at an exFAT, FAT32 or SMB path runs these against that volume.
+#[cfg(windows)]
+mod windows_volumes {
+    use super::*;
+    use par3_rs::session::{Par3RepairSession, RepairStatus};
+
+    /// A disk registry mapping `SourceId(1)` to `path`.
+    fn registry(path: &std::path::Path, options: &ExecutionOptions) -> DiskSourceAccess {
+        let mut access = DiskSourceAccess::with_options(options.clone());
+        access.insert(SourceId(1), path.to_path_buf());
+        access
+    }
+
+    /// A scratch directory on the build volume, for the carriers and repair
+    /// output that are not under test, so only the source sits on `TMP`'s
+    /// volume.
+    fn build_tree(label: &str) -> common::TempTree {
+        common::TempTree::under(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")), label)
+    }
+
+    #[test]
+    fn rw_snapshot_of_a_source_deleted_under_a_cached_handle_is_absent() {
+        let tree = common::TempTree::new("deleted-after-read");
+        let path = tree.write("source", b"original");
+        let options = ExecutionOptions::default();
+        let access = registry(&path, &options);
+        access.snapshot(SourceId(1)).unwrap().unwrap();
+        assert_eq!(access.read_at(SourceId(1), 0, &mut [0; 8]).unwrap(), 8);
+        // A handle kept open would leave the file pending deletion, refusing
+        // the snapshot's open, on a volume without POSIX unlink.
+        std::fs::remove_file(&path).unwrap();
+        let snapshot = access.snapshot(SourceId(1));
+        assert!(
+            matches!(snapshot, Ok(None)),
+            "a deleted source must read as absent, not {snapshot:?}"
+        );
+    }
+
+    /// A registry that deletes the source just before read `at`.
+    struct Deleting {
+        disk: DiskSourceAccess,
+        path: std::path::PathBuf,
+        reads: AtomicUsize,
+        at: AtomicUsize,
+    }
+
+    impl SourceAccess for Deleting {
+        fn snapshot(&self, source: SourceId) -> std::io::Result<Option<SourceSnapshot>> {
+            self.disk.snapshot(source)
+        }
+        fn read_at(&self, source: SourceId, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.reads.fetch_add(1, Ordering::Relaxed) == self.at.load(Ordering::Relaxed) {
+                std::fs::remove_file(&self.path).unwrap();
+            }
+            self.disk.read_at(source, offset, out)
+        }
+        fn next_available(
+            &self,
+            source: SourceId,
+            offset: u64,
+        ) -> std::io::Result<Option<std::ops::Range<u64>>> {
+            self.disk.next_available(source, offset)
+        }
+    }
+
+    #[test]
+    fn rw_repair_of_a_source_deleted_mid_pass_ends_in_source_changed() {
+        let tree = build_tree("deleted-mid-repair-set");
+        let set = common::cauchy_block_set(32, 4096, 4, b"deleted-mid-repair", &tree);
+        let mut options = ExecutionOptions::default();
+        options.workers = 1;
+        options.stripe_bytes = 1024;
+        let inputs = common::TempTree::new("deleted-mid-repair-input");
+        let mut damaged = set.contents[0].1.clone();
+        damaged[4096 + 5] ^= 0x80;
+        let path = inputs.write("input.bin", &damaged);
+        let access = Arc::new(Deleting {
+            disk: registry(&path, &options),
+            path: path.clone(),
+            reads: AtomicUsize::new(0),
+            at: AtomicUsize::new(usize::MAX),
+        });
+        let mut session = Par3RepairSession::new(set.id, access.clone(), options.clone()).unwrap();
+        session.bind_file("input.bin", SourceId(1)).unwrap();
+        for carrier in &set.paths {
+            for packet in common::scanned_packets(std::fs::read(carrier).unwrap(), &options) {
+                session.merge(packet).unwrap();
+            }
+        }
+        assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
+        let output = build_tree("deleted-mid-repair-output");
+        // Delete inside the repair's first stripe pass.
+        access.reads.store(0, Ordering::Relaxed);
+        access.at.store(5, Ordering::Relaxed);
+        let result = session.repair(output.path(), false);
+        match &result {
+            Err(EngineError::RepairInterrupted {
+                installed, cause, ..
+            }) if installed.is_empty()
+                && matches!(**cause, EngineError::SourceChanged(SourceId(1))) => {}
+            other => panic!("a deleted source must end in SourceChanged: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rw_rename_over_a_source_the_registry_read() {
+        let tree = common::TempTree::new("rename-over-read");
+        let path = tree.write("source", b"original");
+        let options = ExecutionOptions::default();
+        let access = registry(&path, &options);
+        let before = access.snapshot(SourceId(1)).unwrap().unwrap();
+        assert_eq!(access.read_at(SourceId(1), 0, &mut [0; 8]).unwrap(), 8);
+        // The engine's own installs rename over sources the same way.
+        let replacement = tree.write("replacement", b"replaced");
+        std::fs::rename(&replacement, &path).unwrap();
+        let after = access.snapshot(SourceId(1)).unwrap().unwrap();
+        assert_ne!(before, after);
+        let mut out = [0; 8];
+        assert_eq!(access.read_at(SourceId(1), 0, &mut out).unwrap(), 8);
+        assert_eq!(&out, b"replaced");
+    }
+}
+
+/// The FFT codec on both fields ends a create whose source changes
+/// mid-operation in `SourceChanged`, with no carrier installed.
+#[test]
+fn fft_creation_rejects_a_source_changed_mid_operation() {
+    use par3_rs::creation::{
+        CreationCodec, CreationOptions, CreationPlan, CreationSource, VolumeLayout,
+    };
+    for (capacity_log2, recovery) in [(2i8, 4u64), (8, 256)] {
+        for (at, truncate) in [(5usize, false), (5, true), (40, false), (40, true)] {
+            let inputs = common::TempTree::new("fft-create-input");
+            let path = inputs.path().join("input.bin");
+            let mut bytes = vec![0; 32 * 4096 + 333];
+            blake3::Hasher::new()
+                .update(b"fft-create")
+                .finalize_xof()
+                .fill(&mut bytes);
+            std::fs::write(&path, bytes).unwrap();
+            let mut options = CreationOptions {
+                block_size: 4096,
+                recovery_count: recovery,
+                volumes: VolumeLayout::Uniform(1),
+                codec: CreationCodec::Fft {
+                    capacity_log2,
+                    interleave: 0,
+                },
+                ..CreationOptions::default()
+            };
+            options.execution.workers = 1;
+            options.execution.stripe_bytes = 1024;
+            let mut disk = DiskSourceAccess::with_options(options.execution.clone());
+            disk.insert(SourceId(1), path.clone());
+            let watched = Arc::new(Watched::new(disk));
+            let output = common::TempTree::new("fft-create-output");
+            let scratch = output.path().join("scratch");
+            let carriers = output.path().join("carriers");
+            std::fs::create_dir(&scratch).unwrap();
+            std::fs::create_dir(&carriers).unwrap();
+            let result = CreationPlan::build(
+                watched.clone(),
+                &[CreationSource {
+                    name: "input.bin".into(),
+                    source: SourceId(1),
+                }],
+                options.clone(),
+            )
+            .and_then(|plan| {
+                watched.arm(Some((at, path.clone(), truncate)));
+                plan.execute(&carriers.join("set"), &scratch)
+            });
+            assert!(
+                matches!(result, Err(EngineError::SourceChanged(SourceId(1)))),
+                "capacity 2^{capacity_log2}, change before read {at} (truncate {truncate}): {result:?}"
+            );
+            assert_eq!(std::fs::read_dir(&carriers).unwrap().count(), 0);
+            drop(inputs);
+        }
+    }
+}
+
+/// The FFT decode on both fields ends a repair whose source changes
+/// mid-operation in `SourceChanged`, with nothing installed.
+#[test]
+fn fft_repair_rejects_a_source_changed_mid_operation() {
+    for recovery in [4u64, 256] {
+        let tree = common::TempTree::new("fft-repair-changed");
+        let set = common::many_block_set(1, 40, 0, recovery, b"fft-repair", &tree);
+        let mut options = ExecutionOptions::default();
+        options.workers = 1;
+        for (at, truncate) in [(5usize, false), (5, true)] {
+            let run = repair_watched(
+                &set,
+                &[(0, 64 + 5), (0, 9 * 64 + 7), (0, 39 * 64 + 1)],
+                &options,
+                Some((0, at, truncate)),
+            );
+            match &run.result {
+                Err(EngineError::RepairInterrupted {
+                    installed, cause, ..
+                }) if installed.is_empty()
+                    && matches!(**cause, EngineError::SourceChanged(SourceId(1))) => {}
+                result => panic!(
+                    "recovery {recovery}, change before read {at} (truncate {truncate}): {result:?}"
+                ),
+            }
+            assert!(!run.output.path().join("input0.bin").exists());
+        }
     }
 }

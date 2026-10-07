@@ -7,7 +7,7 @@ use thiserror::Error;
 
 #[path = "runtime_handles.rs"]
 mod handles;
-pub(crate) use handles::{EngineFile, OpenBudgeted};
+pub(crate) use handles::{EngineFile, IdleHandles, OpenBudgeted};
 pub use handles::{HandleBudget, HandleLease};
 
 #[path = "runtime_diagnostics.rs"]
@@ -16,7 +16,7 @@ pub(crate) use diagnostics::StageGuard;
 pub use diagnostics::{
     AdmissionSnapshot, AmplificationSnapshot, CacheSnapshot, CodecSnapshot, ExecutionDiagnostics,
     IoSnapshot, ProgressCallback, ProgressEvent, ProgressPhase, RefusalSnapshot, Stage,
-    StageSnapshot, WaitSnapshot,
+    StageSnapshot, VerifyOrderSnapshot, WaitSnapshot,
 };
 
 /// Failure of an incremental engine operation. Missing bytes are not I/O errors.
@@ -426,6 +426,57 @@ struct BudgetState {
     ledger: [CategoryLedger; MEMORY_CATEGORIES],
 }
 
+/// Granules a budget-narrowed stripe is rounded down to, largest first.
+/// Stripes are read and written at whole multiples of their width from a
+/// block's start, so a width that is a multiple of the page keeps those
+/// transfers off partial pages, which the page cache would otherwise read back
+/// before modifying. The granule is chosen per compilation target, never
+/// probed: Apple targets page at 16 KiB, so a stripe cut to 4 KiB there stays
+/// on partial pages and the 16 KiB cut halved a budget-narrowed repair's wall
+/// time, with 4 KiB as the fallback when the room cannot hold 16 KiB. Every
+/// other target pages at 4 KiB, where 16 KiB only rounds further down and
+/// issues up to 1.75× more, smaller transfers for the same alignment. Every
+/// granule is a multiple of every field unit.
+#[cfg(target_vendor = "apple")]
+pub(crate) const STRIPE_GRANULES: &[usize] = &[16 << 10, 4 << 10];
+#[cfg(not(target_vendor = "apple"))]
+pub(crate) const STRIPE_GRANULES: &[usize] = &[4 << 10];
+
+/// The stripe width `room` bytes per buffer can hold when the budget, not the
+/// configured target, decides it. Rounding down never charges more than the
+/// room measured. A room smaller than every granule keeps the plain
+/// `alignment`-multiple, so a tight budget still runs rather than refuses.
+pub(crate) fn budget_stripe(room: usize, alignment: usize) -> usize {
+    let granule = STRIPE_GRANULES
+        .iter()
+        .copied()
+        .find(|granule| room >= *granule && granule.is_multiple_of(alignment))
+        .unwrap_or(alignment);
+    room / granule * granule
+}
+
+/// The stripe [`MemoryBudget::reserve_stripes_with_overhead`] admits for
+/// `count` buffers beside `overhead` bytes when `available` bytes are free:
+/// the configured `target` when it fits, else the budget's
+/// [`budget_stripe`], and 0 when not one `alignment` fits.
+pub(crate) fn stripe_within(
+    available: usize,
+    target: usize,
+    count: usize,
+    alignment: usize,
+    overhead: usize,
+) -> usize {
+    if count == 0 || alignment == 0 {
+        return 0;
+    }
+    let room = available.saturating_sub(overhead) / count;
+    if room < target {
+        budget_stripe(room, alignment)
+    } else {
+        target / alignment * alignment
+    }
+}
+
 /// A caller-owned allocation budget that may be shared across sessions.
 ///
 /// Reservations precede allocation and include conservative bookkeeping costs.
@@ -518,8 +569,7 @@ impl MemoryBudget {
             return Err(EngineError::InvalidState("invalid repair stripe layout"));
         }
         for attempt in 0..2 {
-            let room = self.available().saturating_sub(overhead) / count;
-            let stripe = target.min(room) / alignment * alignment;
+            let stripe = stripe_within(self.available(), target, count, alignment, overhead);
             if stripe == 0 {
                 break;
             }
@@ -668,6 +718,10 @@ impl ScanWorkBudget {
             .map(|_| ())
             .map_err(|_| EngineError::resource_limit("cumulative scanning work"))
     }
+    /// Return part of a charge whose request came back short.
+    pub(crate) fn refund(&self, bytes: usize) {
+        self.0.used.fetch_sub(bytes as u64, Ordering::AcqRel);
+    }
 }
 
 /// Synchronous execution controls for a session.
@@ -685,6 +739,26 @@ pub struct ExecutionOptions {
     /// FFT butterfly CPU selection; `kernel()` reports the detected shuffle ISA.
     /// This does not change the independent Cauchy dispatch.
     pub fft_backend: reedsolomon_rs::gf_simd::LinearBackend,
+    /// Whether an FFT decode whose bank outgrows a transform tile runs
+    /// its inverse transform, derivative and forward transform fused
+    /// (`reedsolomon_rs`'s `TransformField::derivative_at`). `None`, the
+    /// default, fuses where `reedsolomon_rs::fft::COLUMN_TILES` holds, which
+    /// is every target but Apple silicon, at every worker count. A forced
+    /// value exists so every target's tests run both decodes; output is
+    /// identical either way.
+    #[doc(hidden)]
+    pub fft_fused_decode: Option<bool>,
+    /// Whether disk verification hashes a file whole before its extents.
+    /// Whole first, an intact file is read once, and a file the whole-file
+    /// hash does not settle is read a second time to hash its extents. Side
+    /// by side, the extents and the whole file are hashed in one pass, so a
+    /// damaged file is read once and an intact one pays for both hashes.
+    /// `None`, the default, picks by [`crate::source::SourceAccess::mount_kind`]:
+    /// side by side on a remote mount, whole first on a local or unknown one.
+    /// A forced value wins over the mount kind, so benchmarks can measure
+    /// both orders on the same build; the evidence is identical either way.
+    #[doc(hidden)]
+    pub disk_verify_whole_first: Option<bool>,
     /// Maximum concurrently open engine-owned handles.
     pub open_handles: usize,
     /// Shared handle ceiling across cloned options and cooperating providers.
@@ -711,6 +785,8 @@ impl Default for ExecutionOptions {
             retained_bytes: 64 << 20,
             workers: std::thread::available_parallelism().map_or(1, usize::from),
             fft_backend: reedsolomon_rs::gf_simd::LinearBackend::Auto,
+            fft_fused_decode: None,
+            disk_verify_whole_first: None,
             open_handles: 32,
             handles: HandleBudget::new(32),
             stripe_bytes: 64 << 10,
@@ -721,6 +797,12 @@ impl Default for ExecutionOptions {
         }
     }
 }
+
+/// Budget a codec leaves untouched when it stages extra source stripes for
+/// grouped arithmetic: a widest stripe, which covers the small scratch a read
+/// may reserve part-way through a walk. Those stripes only ever come out of
+/// what is left beyond it, so staging them never refuses work that ran before.
+pub(crate) const SOURCE_GROUP_SLACK: usize = 64 << 10;
 
 /// Private pools join their workers before releasing stack reservations.
 pub(crate) struct WorkerPool {
@@ -743,6 +825,17 @@ impl WorkerPool {
             .min(maximum)
             .min(options.memory.available() / Self::WORKER_BYTES.saturating_add(per_worker));
         Self::for_work(options, workers, workers.saturating_mul(per_worker))
+    }
+
+    /// Stacks `for_work` charges for `maximum` units when memory does not
+    /// narrow it: zero when the stage would run on the calling thread anyway.
+    pub(crate) fn unnarrowed_bytes(options: &ExecutionOptions, maximum: usize) -> usize {
+        let workers = options.workers.min(maximum);
+        if workers < 2 {
+            0
+        } else {
+            workers.saturating_mul(Self::WORKER_BYTES)
+        }
     }
 
     pub(crate) fn for_work(
@@ -802,6 +895,11 @@ impl WorkerPool {
     /// fewer, because `for_work` narrows under memory pressure.
     pub(crate) fn current_num_threads(&self) -> usize {
         self.pool().current_num_threads()
+    }
+
+    /// Bytes this pool's stacks hold of the budget.
+    pub(crate) fn reserved_bytes(&self) -> usize {
+        self._memory.bytes()
     }
 }
 
@@ -885,6 +983,56 @@ mod stripe_tests {
         drop(scratch);
         drop(pool);
         assert_eq!(options.memory.used(), 0);
+    }
+
+    /// A stripe the budget narrows is cut to whole granules of the target's
+    /// page (16 KiB on Apple targets, falling back to 4 KiB; 4 KiB elsewhere),
+    /// so the reads and writes at multiples of it stay page-aligned; a budget
+    /// that cannot hold one granule, and a target the budget does not narrow,
+    /// keep the field-unit rounding they had.
+    #[test]
+    fn budget_narrowed_stripes_round_down_to_whole_granules() {
+        // 49_152 is a whole number of both 16 KiB and 4 KiB granules.
+        assert_eq!(budget_stripe(50_316, 2), 49_152);
+        assert_eq!(budget_stripe(50_317, 1), 49_152);
+        let narrow = if cfg!(target_vendor = "apple") {
+            16_384
+        } else {
+            28_672
+        };
+        assert_eq!(budget_stripe(30_000, 2), narrow);
+        assert_eq!(budget_stripe(16_384, 2), 16_384);
+        assert_eq!(budget_stripe(16_383, 2), 12_288);
+        assert_eq!(budget_stripe(4096, 2), 4096);
+        assert_eq!(budget_stripe(4095, 2), 4094);
+        assert_eq!(budget_stripe(4095, 1), 4095);
+        assert_eq!(budget_stripe(1, 2), 0);
+
+        // Narrowed by the budget: whole granules, never more than measured.
+        let memory = MemoryBudget::new(3 * 50_317 + 64);
+        let (stripe, reservation) = memory
+            .reserve_stripes_with_overhead(MemoryCategory::CodecScratch, 64 << 10, 3, 2, 64)
+            .unwrap();
+        assert_eq!(stripe, 49_152);
+        assert_eq!(memory.used(), 3 * 49_152 + 64);
+        drop(reservation);
+
+        // Too small for one granule: the GF(2^16) unit still decides.
+        let memory = MemoryBudget::new(3 * 4001);
+        let (stripe, reservation) = memory
+            .reserve_stripes(MemoryCategory::CodecScratch, 64 << 10, 3, 2)
+            .unwrap();
+        assert_eq!(stripe, 4000);
+        drop(reservation);
+
+        // Not narrowed: the configured target is used as given, unrounded.
+        let memory = MemoryBudget::new(1 << 20);
+        let (stripe, reservation) = memory
+            .reserve_stripes(MemoryCategory::CodecScratch, 5001, 3, 2)
+            .unwrap();
+        assert_eq!(stripe, 5000);
+        drop(reservation);
+        assert_eq!(memory.used(), 0);
     }
 
     #[test]

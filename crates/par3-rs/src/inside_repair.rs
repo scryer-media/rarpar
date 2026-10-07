@@ -187,7 +187,13 @@ impl SelfRepairPlan {
         let carrier_output = scratch_marker.path().with_extension("carrier");
         let mut carrier_installed = false;
         let result = (|| {
-            let reconstructed_blocks = crate::session_repair::stage_embedded(session, &temporary)?;
+            // The carrier is written into this same temporary below, and that
+            // one synchronization covers every byte staged here too.
+            let reconstructed_blocks = crate::session_repair::stage_embedded(
+                session,
+                &temporary,
+                crate::session_repair::RepairDurability::Buffered,
+            )?;
             let mut disk = DiskSourceAccess::with_options(options.clone());
             disk.insert(SourceId(0), temporary.clone());
             let disk = Arc::new(disk);

@@ -1,0 +1,3 @@
+$result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = 'cmd.exe /d /s /c ""powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\bench\fleet-stage\fleet-testrun\run.ps1" > "C:\bench\fleet-stage\fleet-testrun\run.log" 2>&1"'; CurrentDirectory = 'C:\bench\fleet-stage\fleet-testrun' }
+if ($result.ReturnValue -ne 0) { throw ("Win32_Process.Create returned {0}" -f $result.ReturnValue) }
+Write-Output ("pid={0}" -f $result.ProcessId)

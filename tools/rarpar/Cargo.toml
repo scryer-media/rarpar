@@ -27,6 +27,7 @@ runtime = [
     "dep:par2-rs",
     "dep:par3-rs",
     "dep:unrar-rs",
+    "dep:libc",
 ]
 # Crypto backend selection, forwarded to the libraries. `runtime` deliberately
 # forwards neither: a build that asks for the runtime without naming a backend
@@ -46,7 +47,7 @@ musl-allocator = ["dep:mimalloc"]
 
 [dependencies]
 par2-rs = { path = "../../crates/par2-rs", version = "=0.10.7", default-features = false, optional = true }
-par3-rs = { path = "../../crates/par3-rs", version = "=0.4.4", default-features = false, optional = true }
+par3-rs = { path = "../../crates/par3-rs", version = "=0.4.5", default-features = false, optional = true }
 unrar-rs = { path = "../../crates/unrar-rs", version = "0.10.8", default-features = false, optional = true }
 clap = { workspace = true }
 serde = { workspace = true, optional = true }
@@ -55,6 +56,10 @@ tempfile = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
+
+# Read-ahead advice for the format probes.
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))'.dependencies]
+libc = { workspace = true, optional = true }
 
 # musl's mallocng is markedly weaker than glibc's malloc under the
 # multithreaded allocation churn rayon generates. Only the musl distribution

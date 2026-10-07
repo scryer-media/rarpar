@@ -33,13 +33,13 @@ func (orch *orchestrator) collectMachine(ctx context.Context, machine Machine, h
 		}
 	}
 	orch.state.SetStatus(hostState, StatusCollecting)
-	transport, err := NewTransport(machine, orch.runDir)
+	transport, err := orch.transportFor(machine, hostState)
 	if err != nil {
 		return err
 	}
 	defer transport.Close()
 
-	layout := LayoutFor(machine, orch.options.RunID)
+	layout := HostLayout(machine, orch.options.RunID)
 	deadline := time.Now().Add(time.Duration(orch.options.Config.Fleet.HostTimeoutMinutes) * time.Minute)
 	if machine.Kind == KindAWSEC2 && machine.EC2 != nil {
 		// The cost cap is a hard deadline, not a target: past it the host is
@@ -89,7 +89,7 @@ func (orch *orchestrator) collectMachine(ctx context.Context, machine Machine, h
 	if err := transport.DownloadPath(ctx, layout.Log, resultsDir); err != nil {
 		orch.log("machine %s: could not pull run.log: %v", machine.Name, err)
 	}
-	tarball := filepath.Join(resultsDir, posixBase(layout.Tarball))
+	tarball := filepath.Join(resultsDir, remoteBase(layout.Tarball))
 	digest, err := fileSHA256(tarball)
 	if err != nil {
 		return err
@@ -101,7 +101,7 @@ func (orch *orchestrator) collectMachine(ctx context.Context, machine Machine, h
 	if err := os.MkdirAll(evidence, 0o755); err != nil {
 		return err
 	}
-	if err := extractTarGz(tarball, evidence); err != nil {
+	if err := extractEvidence(tarball, evidence); err != nil {
 		return err
 	}
 	manifest, err := verifyManifest(evidence)
@@ -126,7 +126,7 @@ func (orch *orchestrator) collectMachine(ctx context.Context, machine Machine, h
 			orch.teardownCloud(ctx, machine, hostState)
 		}
 	} else if machine.Paths.Cleanup {
-		if _, _, err := transport.RunScript(ctx, "rm -rf "+shellQuote(layout.Base)+" "+shellQuote(layout.Scratch)+"\n"); err != nil {
+		if err := transport.RemoveAll(ctx, layout.Base, layout.Scratch); err != nil {
 			orch.log("machine %s: staging cleanup reported: %v", machine.Name, err)
 		} else {
 			orch.state.Record(hostState, "cleanup", "removed %s and %s", layout.Base, layout.Scratch)
@@ -147,11 +147,11 @@ func (orch *orchestrator) collectMachine(ctx context.Context, machine Machine, h
 func (orch *orchestrator) readSentinel(ctx context.Context, transport *Transport, layout RemoteLayout) (map[string]string, error) {
 	attempt, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	stdout, _, err := transport.RunScript(attempt, "cat "+shellQuote(layout.Done)+" 2>/dev/null || echo __PENDING__\n")
+	stdout, found, err := transport.ReadOptionalFile(attempt, layout.Done)
 	if err != nil {
 		return nil, err
 	}
-	if strings.Contains(stdout, "__PENDING__") {
+	if !found {
 		return nil, nil
 	}
 	values := map[string]string{}
@@ -206,7 +206,13 @@ func verifyManifest(root string) (*HostManifest, error) {
 	}
 	var problems []string
 	for _, file := range manifest.Files {
-		path := filepath.Join(root, filepath.FromSlash(file.Path))
+		// The manifest is host data: a path that resolves outside the
+		// evidence directory is refused, never stat'ed or hashed.
+		path, err := containedPath(root, file.Path)
+		if err != nil {
+			problems = append(problems, err.Error())
+			continue
+		}
 		info, err := os.Stat(path)
 		if err != nil {
 			problems = append(problems, file.Path+": missing from the tarball")

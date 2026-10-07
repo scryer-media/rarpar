@@ -184,7 +184,8 @@ pub struct AdmissionSnapshot {
     pub stripe_bytes: u64,
     /// Stripe-sized buffers that admission covered.
     pub stripe_buffers: u64,
-    /// Lost rows solved and scattered per tile in the most recent Cauchy pass.
+    /// Lost rows solved and scattered per tile in the most recent Cauchy pass,
+    /// or recovery rows a carrier regenerates from each walk over the source.
     pub output_tile: u64,
     /// Files in the most recently admitted verification batch.
     pub verify_batch: u64,
@@ -220,6 +221,23 @@ pub struct WaitSnapshot {
     pub batch_narrowed: u64,
 }
 
+/// The order disk verification hashed files in, and the mount kinds that
+/// chose it. Counted once per file whose description carries a whole-file
+/// hash, the only files the order applies to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VerifyOrderSnapshot {
+    /// Files whose source reported [`crate::mount::MountKind::Local`].
+    pub local: u64,
+    /// Files whose source reported [`crate::mount::MountKind::Remote`].
+    pub remote: u64,
+    /// Files whose source reported [`crate::mount::MountKind::Unknown`].
+    pub unknown: u64,
+    /// Files hashed whole before their extents.
+    pub whole_first: u64,
+    /// Files hashed whole and by extent side by side in one pass.
+    pub single_pass: u64,
+}
+
 /// Work a bounded working set moved onto the I/O layer. A memory reduction that
 /// only pushed cost here is not a reduction, so these are reported beside it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -249,6 +267,13 @@ pub struct AmplificationSnapshot {
 /// would cost more than the arithmetic it measures. `skipped` is what a
 /// pruning plan decided not to compute, so `butterflies + skipped` is what the
 /// same decode would have cost without the plan.
+///
+/// An FFT decode that walks its domain in slabs runs the inverse transform
+/// as one call, then the forward transform as one call per class and two
+/// per block holding a lost row, each against that block's half of the
+/// derivative. `butterflies` is the work it performed and `skipped` what it
+/// saved against both transforms in full; where most blocks hold a lost
+/// row it performs more than that, and `skipped` is zero.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CodecSnapshot {
     /// Additive-transform invocations, including the ones a plan split.
@@ -320,10 +345,15 @@ struct StageCounters {
 struct State {
     source: IoCounters,
     files: IoCounters,
+    opens: AtomicU64,
+    clones: AtomicU64,
+    in_place: AtomicU64,
     stages: [StageCounters; STAGES],
     sync: StageCounters,
     next: AtomicU64,
     admission: AdmissionCounters,
+    /// Local, remote and unknown mounts, then whole-first and single-pass files.
+    verify_order: [AtomicU64; 5],
     /// The budget these diagnostics report on, learned from the first stage
     /// opened against them. Written at most once and never read on the hot
     /// path; the link runs one way so the two `Arc`s cannot form a cycle.
@@ -369,6 +399,35 @@ impl ExecutionDiagnostics {
     /// Disk provider bytes also appear in source_io; do not sum the two layers.
     pub fn file_io(&self) -> IoSnapshot {
         self.0.files.snapshot()
+    }
+    /// Successful file opens charged to the handle budget, by the engine and by
+    /// cooperating disk providers. Directory capabilities are not counted.
+    pub fn file_opens(&self) -> u64 {
+        self.0.opens.load(Ordering::Relaxed)
+    }
+    pub(crate) fn note_open(&self) {
+        add(&self.0.opens, 1);
+    }
+    /// Repair outputs staged as a clone of the file at their destination, so
+    /// that only the extents the repair writes are copied. Bytes a clone
+    /// already holds are neither read nor written, and are absent from
+    /// [`Self::file_io`].
+    pub fn file_clones(&self) -> u64 {
+        self.0.clones.load(Ordering::Relaxed)
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn note_clone(&self) {
+        add(&self.0.clones, 1);
+    }
+    /// Repair outputs that could not be cloned and were repaired in place,
+    /// with backups off: only the extents the repair rebuilt were written
+    /// into the existing file, which was then read back whole.
+    pub fn file_in_place_repairs(&self) -> u64 {
+        self.0.in_place.load(Ordering::Relaxed)
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn note_in_place(&self) {
+        add(&self.0.in_place, 1);
     }
     /// File synchronization barriers, including time waiting for storage.
     /// `calls` counts attempts and `completed` counts successes. Durations are
@@ -454,6 +513,27 @@ impl ExecutionDiagnostics {
             workers_refused: get(&counters.workers_refused),
             batch_narrowed: get(&counters.batch_narrowed),
         }
+    }
+
+    /// The order disk verification hashed files in, and the mount kinds
+    /// behind it.
+    #[must_use]
+    pub fn verify_order(&self) -> VerifyOrderSnapshot {
+        let get = |v: &AtomicU64| v.load(Ordering::Relaxed);
+        let [local, remote, unknown, whole_first, single_pass] = &self.0.verify_order;
+        VerifyOrderSnapshot {
+            local: get(local),
+            remote: get(remote),
+            unknown: get(unknown),
+            whole_first: get(whole_first),
+            single_pass: get(single_pass),
+        }
+    }
+
+    pub(crate) fn note_verify_order(&self, kind: crate::mount::MountKind, whole_first: bool) {
+        let counters = &self.0.verify_order;
+        add(&counters[kind as usize], 1);
+        add(&counters[if whole_first { 3 } else { 4 }], 1);
     }
 
     /// Bytes bounded working sets moved onto the I/O layer.

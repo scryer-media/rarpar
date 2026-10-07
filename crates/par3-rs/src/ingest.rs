@@ -67,6 +67,11 @@ impl std::fmt::Debug for PayloadRef {
 }
 
 impl PayloadRef {
+    /// Whether this payload is read from `source` of `access`.
+    pub(crate) fn reads_from(&self, access: &Arc<dyn SourceAccess>, source: SourceId) -> bool {
+        Arc::ptr_eq(&self.access, access) && self.source == source
+    }
+
     pub(crate) fn same_binding(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.access, &other.access)
             && self.source == other.source
@@ -116,16 +121,21 @@ impl PayloadRef {
     /// Read a payload range without allocation. Trailing trimmed bytes are not
     /// padded here: only the codec knows the logical block size.
     pub fn read_at(&self, offset: u64, out: &mut [u8]) -> EngineResult<usize> {
-        ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)?;
         let take = self.len().saturating_sub(offset).min(out.len() as u64) as usize;
-        if take != 0 {
-            read_exact_at(
+        // Only the check after the read makes the bytes trustworthy. A read
+        // that fails is checked too, so a changed carrier still reports the
+        // change rather than whatever the read ran into.
+        if take != 0
+            && let Err(error) = read_exact_at(
                 &self.diagnostics,
                 self.access.as_ref(),
                 self.source,
                 self.data_offset + offset,
                 &mut out[..take],
-            )?;
+            )
+        {
+            ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)?;
+            return Err(error);
         }
         ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)?;
         Ok(take)
@@ -150,15 +160,33 @@ impl PayloadRef {
         &self,
         options: &ExecutionOptions,
     ) -> Result<(), (EngineError, bool)> {
-        let spent = |error: EngineError| (error, false);
-        options.validate().map_err(spent)?;
-        ensure_snapshot(self.access.as_ref(), self.source, self.snapshot).map_err(spent)?;
+        options.validate().map_err(|error| (error, false))?;
         let size = options.stripe_bytes.min(64 << 10);
         let _buffer_reservation = options
             .memory
             .reserve_as(MemoryCategory::CarrierPackets, size)
-            .map_err(spent)?;
-        let mut buffer = vec![0; size];
+            .map_err(|error| (error, false))?;
+        self.reauthenticate_in(options, &mut vec![0; size])
+    }
+
+    /// [`Self::reauthenticate`] through a buffer the caller already holds, so
+    /// a codec whose stripes took the budget can still authenticate a payload
+    /// before it uses it. The packet is read in `buffer`-sized pieces, and
+    /// `buffer` holds nothing useful afterwards.
+    pub(crate) fn reauthenticate_in(
+        &self,
+        options: &ExecutionOptions,
+        buffer: &mut [u8],
+    ) -> Result<(), (EngineError, bool)> {
+        let spent = |error: EngineError| (error, false);
+        options.validate().map_err(spent)?;
+        ensure_snapshot(self.access.as_ref(), self.source, self.snapshot).map_err(spent)?;
+        if buffer.is_empty() {
+            return Err(spent(EngineError::InvalidState(
+                "empty reauthentication buffer",
+            )));
+        }
+        let size = buffer.len();
         let mut hash = FingerprintHasher::new();
         let mut offset = 24;
         while offset < self.header.length {
@@ -178,6 +206,74 @@ impl PayloadRef {
         // Everything from here on has cost a full pass over the packet.
         ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)
             .map_err(|error| (error, true))?;
+        if hash.finalize() != self.header.hash {
+            return Err((
+                Par3Error::PacketHashMismatch {
+                    offset: self.packet_offset,
+                }
+                .into(),
+                true,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Read the whole payload into the front of `out`, zero the rest, and
+    /// authenticate the packet over the bytes just read: one read in place of
+    /// [`Self::reauthenticate`] followed by [`Self::read_at`].
+    ///
+    /// The packet's header and the identity fields ahead of its payload were
+    /// authenticated when it was admitted and are held here; only the payload
+    /// is read again, and the hash over the two is the packet's own. The bytes
+    /// in `out` are the ones the hash vouched for, so a caller that consumes
+    /// them only after this returns `Ok` never uses an unverified byte. `out`
+    /// must be at least [`Self::len`] bytes; what it holds after an error is
+    /// unspecified. The error carries whether a whole pass was spent, as
+    /// [`Self::reauthenticate`]'s does.
+    pub(crate) fn read_authenticated(
+        &self,
+        options: &ExecutionOptions,
+        out: &mut [u8],
+    ) -> Result<(), (EngineError, bool)> {
+        let spent = |error: EngineError| (error, false);
+        options.validate().map_err(spent)?;
+        let len = usize::try_from(self.len())
+            .ok()
+            .filter(|len| *len <= out.len())
+            .ok_or_else(|| spent(EngineError::InvalidState("payload wider than its buffer")))?;
+        ensure_snapshot(self.access.as_ref(), self.source, self.snapshot).map_err(spent)?;
+        out[len..].fill(0);
+        if len != 0 {
+            read_exact_at(
+                &options.diagnostics,
+                self.access.as_ref(),
+                self.source,
+                self.data_offset,
+                &mut out[..len],
+            )
+            .map_err(spent)?;
+        }
+        // From here on the payload has been read, as a reauthentication would
+        // have read it.
+        ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)
+            .map_err(|error| (error, true))?;
+        let mut hash = FingerprintHasher::new();
+        hash.update(&self.header.length.to_le_bytes());
+        hash.update(self.header.input_set_id.as_bytes());
+        hash.update(&self.header.packet_type.signature());
+        match self.kind {
+            PayloadKind::Data { index } => hash.update(&index.to_le_bytes()),
+            PayloadKind::Recovery {
+                root,
+                matrix,
+                index,
+            } => {
+                hash.update(&root);
+                hash.update(&matrix);
+                hash.update(&index.to_le_bytes());
+            }
+        }
+        hash.update(&out[..len]);
         if hash.finalize() != self.header.hash {
             return Err((
                 Par3Error::PacketHashMismatch {
@@ -445,8 +541,14 @@ pub enum ScanEvent {
 
 struct ScanReadAhead {
     bytes: Vec<u8>,
+    /// The scanner's stripe: the least scanning work one fill is charged,
+    /// and the most a fill asks for once the work budget cannot cover more.
+    unit: usize,
     offset: u64,
     len: usize,
+    /// Bytes have been read from the source since its generation was last
+    /// confirmed.
+    unchecked: bool,
 }
 
 impl ScanReadAhead {
@@ -454,24 +556,49 @@ impl ScanReadAhead {
         &mut self,
         access: &dyn SourceAccess,
         source: SourceId,
-        source_len: u64,
+        snapshot: SourceSnapshot,
         offset: u64,
         out: &mut [u8],
         options: &ExecutionOptions,
     ) -> EngineResult<usize> {
         if offset < self.offset || offset - self.offset >= self.len as u64 {
             self.len = 0;
-            let take = source_len
+            self.unchecked = true;
+            let mut take = snapshot
+                .len
                 .saturating_sub(offset)
                 .min(self.bytes.len() as u64) as usize;
-            options.scan_work.charge(take)?;
+            // A fill is charged what it asks for, and handed back what a
+            // short read did not return beyond one stripe: a whole scan
+            // costs its bytes and an empty poll a stripe, whatever the
+            // read-ahead's size. A budget too low for a full fill still
+            // admits a stripe, as a stripe-sized read-ahead would.
+            if take <= self.unit || options.scan_work.charge(take).is_err() {
+                take = take.min(self.unit);
+                options.scan_work.charge(take)?;
+            }
             let read =
-                options
+                match options
                     .diagnostics
-                    .read_at(access, source, offset, &mut self.bytes[..take])?;
+                    .read_at(access, source, offset, &mut self.bytes[..take])
+                {
+                    Ok(read) => read,
+                    // A source that vanished or was rewritten under the refill
+                    // reports that, not the I/O error it caused: the poll-level
+                    // generation check this read would have been settled by
+                    // never runs once the error is returned.
+                    Err(error) => {
+                        ensure_snapshot(access, source, snapshot)?;
+                        self.unchecked = false;
+                        return Err(error.into());
+                    }
+                };
             if read > take {
                 return Err(EngineError::InvalidState("invalid source read length"));
             }
+            options
+                .scan_work
+                .refund(take - read.max(self.unit).min(take));
             self.offset = offset;
             self.len = read;
         }
@@ -522,15 +649,291 @@ enum Admission {
     Unusable(EngineError),
 }
 
+/// A carrier's packets authenticated from the bytes handed to its file, in the
+/// order they are handed to it.
+///
+/// This makes the checks a [`PacketScanner`] reading the finished file back
+/// would make, without the read: every byte belongs to a packet that starts
+/// where the previous one ended, whose header parses within the scan limits,
+/// names `id` and is long enough for its prefix, whose hash covers its body,
+/// and, for metadata, whose body parses. Packet count and metadata retention
+/// are held to the same limits and charged to the same budget as a scan. Only
+/// bytes the inner writer accepted are authenticated, so what is proven is what
+/// was written; whether storage then keeps them is the synchronization
+/// barrier's contract and a later verification's question.
+///
+/// A carrier repeats its metadata. The caller may name the packets it will
+/// repeat ([`Self::with_known`]): once a copy of one has been authenticated
+/// in full here and found byte-identical to that entry, every later copy is
+/// compared against the entry byte for byte instead of being hashed and
+/// parsed again. Equal bytes carry the same proof, so the guarantee is
+/// unchanged; the bytes still reach the inner writer through the same writes.
+pub(crate) struct AuthenticatingWriter<'k, W> {
+    inner: W,
+    id: InputSetId,
+    options: ExecutionOptions,
+    limits: ScanLimits,
+    written: u64,
+    packets: usize,
+    /// Offset of the packet after the last authenticated one.
+    next_packet: u64,
+    header: [u8; HEADER_SIZE],
+    header_len: usize,
+    packet: Option<WrittenPacket>,
+    known: &'k [Vec<u8>],
+    /// The known packets by the hash their header claims, each with whether a
+    /// copy has been authenticated in full and matched it.
+    claimed: BTreeMap<Fingerprint, (usize, bool)>,
+    /// Packets proven by comparison rather than by their hash.
+    #[cfg(test)]
+    compared: usize,
+}
+
+struct WrittenPacket {
+    header: PacketHeader,
+    offset: u64,
+    consumed: u64,
+    hash: FingerprintHasher,
+    /// The whole wire packet, for metadata only; payloads are never retained.
+    retained: Option<(Vec<u8>, Reservation)>,
+    /// The proven known packet this one is compared against, instead of
+    /// being hashed.
+    copy_of: Option<usize>,
+}
+
+impl<'k, W: std::io::Write> AuthenticatingWriter<'k, W> {
+    pub(crate) fn new(inner: W, id: InputSetId, options: ExecutionOptions) -> Self {
+        Self {
+            inner,
+            id,
+            options,
+            limits: ScanLimits::default(),
+            written: 0,
+            packets: 0,
+            next_packet: 0,
+            header: [0; HEADER_SIZE],
+            header_len: 0,
+            packet: None,
+            known: &[],
+            claimed: BTreeMap::new(),
+            #[cfg(test)]
+            compared: 0,
+        }
+    }
+
+    /// Name the metadata packets the caller will write more than once; see
+    /// the type's documentation.
+    pub(crate) fn with_known(mut self, known: &'k [Vec<u8>]) -> Self {
+        for (index, packet) in known.iter().enumerate() {
+            if let Some(hash) = packet.get(8..24) {
+                self.claimed
+                    .entry(hash.try_into().expect("16 bytes"))
+                    .or_insert((index, false));
+            }
+        }
+        self.known = known;
+        self
+    }
+
+    pub(crate) fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Require exactly `expected` bytes written, every one inside an
+    /// authenticated packet.
+    pub(crate) fn finish(&self, expected: u64) -> EngineResult<()> {
+        if self.written != expected {
+            return Err(EngineError::InvalidState("creation size differs from plan"));
+        }
+        if self.packet.is_some() || self.header_len != 0 {
+            return Err(EngineError::InvalidState(
+                "staged carrier authentication is incomplete",
+            ));
+        }
+        Ok(())
+    }
+
+    fn authenticate(&mut self, mut bytes: &[u8]) -> EngineResult<()> {
+        while !bytes.is_empty() {
+            let Some(packet) = self.packet.as_mut() else {
+                let take = (HEADER_SIZE - self.header_len).min(bytes.len());
+                self.header[self.header_len..self.header_len + take]
+                    .copy_from_slice(&bytes[..take]);
+                self.header_len += take;
+                bytes = &bytes[take..];
+                if self.header_len == HEADER_SIZE {
+                    self.header_len = 0;
+                    self.open_packet()?;
+                }
+                continue;
+            };
+            let take = (packet.header.length - packet.consumed).min(bytes.len() as u64) as usize;
+            if let Some(index) = packet.copy_of {
+                let at = packet.consumed as usize;
+                if bytes[..take] != self.known[index][at..at + take] {
+                    return Err(EngineError::InvalidState(
+                        "staged carrier has unauthenticated bytes",
+                    ));
+                }
+            } else {
+                packet.hash.update(&bytes[..take]);
+                if let Some((retained, _)) = &mut packet.retained {
+                    retained.extend_from_slice(&bytes[..take]);
+                }
+            }
+            packet.consumed += take as u64;
+            bytes = &bytes[take..];
+            if packet.consumed == packet.header.length {
+                self.close_packet()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn open_packet(&mut self) -> EngineResult<()> {
+        let offset = self.next_packet;
+        let unauthenticated = EngineError::InvalidState("staged carrier has unauthenticated bytes");
+        let header = match PacketHeader::parse(&self.header, offset) {
+            Ok(header)
+                if header.length <= self.limits.max_packet_len
+                    && header.input_set_id == self.id =>
+            {
+                header
+            }
+            _ => return Err(unauthenticated),
+        };
+        let prefix_len = match header.packet_type {
+            PacketType::Data => 8,
+            PacketType::RecoveryData => 40,
+            _ => 0,
+        };
+        if header.length < (HEADER_SIZE + prefix_len) as u64 {
+            return Err(unauthenticated);
+        }
+        let empty = header.length == HEADER_SIZE as u64;
+        if prefix_len == 0
+            && let Some(&(index, true)) = self.claimed.get(&header.hash)
+        {
+            let known = &self.known[index];
+            if known.len() as u64 != header.length || known[..HEADER_SIZE] != self.header {
+                return Err(unauthenticated);
+            }
+            self.packet = Some(WrittenPacket {
+                header,
+                offset,
+                consumed: HEADER_SIZE as u64,
+                hash: FingerprintHasher::new(),
+                retained: None,
+                copy_of: Some(index),
+            });
+            #[cfg(test)]
+            {
+                self.compared += 1;
+            }
+            if empty {
+                self.close_packet()?;
+            }
+            return Ok(());
+        }
+        let retained = if prefix_len == 0 {
+            // The scanner's charge for the wire copy, doubled for the parsed
+            // body it builds while the copy is still held.
+            let retained_len = usize::try_from(header.length)
+                .map_err(|_| EngineError::resource_limit("metadata packet size"))?;
+            let cost = retained_len
+                .checked_add(PACKET_OVERHEAD_BYTES)
+                .ok_or(EngineError::resource_limit("metadata packet size"))?;
+            let retention_ceiling = self
+                .options
+                .retained_bytes
+                .min(usize::try_from(self.limits.max_retained_bytes).unwrap_or(usize::MAX));
+            if cost > retention_ceiling {
+                return Err(EngineError::budget_limit(
+                    "metadata packet retention",
+                    cost,
+                    retention_ceiling,
+                    retention_ceiling,
+                ));
+            }
+            let reservation = self.options.memory.reserve_as(
+                MemoryCategory::CarrierPackets,
+                cost.checked_mul(2)
+                    .ok_or(EngineError::resource_limit("metadata packet size"))?,
+            )?;
+            let mut retained = Vec::with_capacity(retained_len);
+            retained.extend_from_slice(&self.header);
+            Some((retained, reservation))
+        } else {
+            None
+        };
+        let mut hash = FingerprintHasher::new();
+        hash.update(&self.header[24..]);
+        self.packet = Some(WrittenPacket {
+            header,
+            offset,
+            consumed: HEADER_SIZE as u64,
+            hash,
+            retained,
+            copy_of: None,
+        });
+        if empty {
+            self.close_packet()?;
+        }
+        Ok(())
+    }
+
+    fn close_packet(&mut self) -> EngineResult<()> {
+        let packet = self.packet.take().expect("open packet");
+        if packet.copy_of.is_none() && packet.hash.finalize() != packet.header.hash {
+            return Err(EngineError::InvalidState(
+                "staged carrier has unauthenticated bytes",
+            ));
+        }
+        if self.packets >= self.limits.max_packets {
+            return Err(EngineError::resource_limit("packet count"));
+        }
+        if let Some((retained, _reservation)) = packet.retained {
+            Packet::parse(&retained, packet.offset, &ParseContext::new())?;
+            if let Some((index, proven)) = self.claimed.get_mut(&packet.header.hash)
+                && !*proven
+                && self.known[*index] == retained
+            {
+                *proven = true;
+            }
+        }
+        self.packets += 1;
+        self.next_packet = packet.offset + packet.header.length;
+        Ok(())
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for AuthenticatingWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.authenticate(&bytes[..written])
+            .map_err(EngineError::into_io)?;
+        self.written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// A resumable scanner for one carrier and immutable content generation.
 ///
 /// Repeated `poll` calls preserve the packet hash frontier across partial
 /// arrivals. A hole returns `NeedData`; use `seek` to scan a later available
 /// range and a separate scanner to revisit the hole later. Neither operation
 /// assumes that holes contain zero bytes.
-/// A budgeted read-ahead stripe reuses bytes across packet boundaries. Seeking
-/// discards it; every poll still checks the source generation. The scanner
-/// reserves two stripes of at most 64 KiB each. A provider may also pin a
+/// A budgeted read-ahead reuses bytes across packet boundaries. Seeking
+/// discards it. The source generation is checked before any packet, end or
+/// missing-byte boundary is returned, unless no byte has been read since the
+/// last check, so packets parsed from bytes already confirmed cost no further
+/// check. The scanner reserves a stripe of at most 64 KiB and a read-ahead of
+/// at most a mebibyte, no larger than the source; a budget without room for
+/// that read-ahead gets a stripe-sized one. A provider may also pin a
 /// budgeted handle for the scanner and its authenticated packets' lifetime.
 pub struct PacketScanner {
     access: Arc<dyn SourceAccess>,
@@ -567,9 +970,30 @@ impl PacketScanner {
             offset: 0,
         })?;
         let size = options.stripe_bytes.clamp(HEADER_SIZE, 64 << 10);
-        let reservation = options
+        // The read-ahead is the scan's read size, sized for the source
+        // rather than the stripe, so that a carrier on a network mount is
+        // not fetched in small requests. A budget without room for it scans
+        // with a stripe-sized one instead.
+        let ahead = crate::source::sequential_read_bytes(&options, snapshot.len).max(size);
+        let wide = match options
             .memory
-            .reserve_as(MemoryCategory::CarrierPackets, size * 2)?;
+            .reserve_as(MemoryCategory::CarrierPackets, size + ahead)
+        {
+            Ok(reservation) if ahead == size || options.memory.available() >= 128 << 10 => {
+                Some(reservation)
+            }
+            Ok(_) | Err(EngineError::ResourceLimit(_)) => None,
+            Err(error) => return Err(error),
+        };
+        let (reservation, ahead) = match wide {
+            Some(reservation) => (reservation, ahead),
+            None => (
+                options
+                    .memory
+                    .reserve_as(MemoryCategory::CarrierPackets, size * 2)?,
+                size,
+            ),
+        };
         Ok(Self {
             access,
             source,
@@ -584,9 +1008,11 @@ impl PacketScanner {
             packets: 0,
             buffer: vec![0; size],
             read_ahead: ScanReadAhead {
-                bytes: vec![0; size],
+                bytes: vec![0; ahead],
+                unit: size,
                 offset: 0,
                 len: 0,
+                unchecked: false,
             },
             _buffer_reservation: reservation,
         })
@@ -617,15 +1043,17 @@ impl PacketScanner {
         let mut progress = self.options.stage(crate::runtime::Stage::Scan)?;
         loop {
             self.options.cancel.check()?;
-            ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)?;
             // A packet refused by a budget on the last poll is offered again
             // before anything new is read. Its bytes are already proven, so
             // this costs only the admission that failed.
-            if let Some(authenticated) = self.authenticated.take() {
+            if self.authenticated.is_some() {
+                self.confirm_generation()?;
+                let authenticated = self.authenticated.take().expect("pending packet");
                 return self.admit(authenticated);
             }
             if self.candidate.is_none() {
                 if self.offset >= self.snapshot.len {
+                    self.confirm_generation()?;
                     return Ok(ScanEvent::End);
                 }
                 let search_size = if self.at_packet_boundary {
@@ -636,6 +1064,7 @@ impl PacketScanner {
                 self.at_packet_boundary = false;
                 let take = (self.snapshot.len - self.offset).min(search_size as u64) as usize;
                 if take < 8 {
+                    self.confirm_generation()?;
                     self.offset = self.snapshot.len;
                     return Ok(ScanEvent::End);
                 }
@@ -644,7 +1073,7 @@ impl PacketScanner {
                     let count = self.read_ahead.read_at(
                         self.access.as_ref(),
                         self.source,
-                        self.snapshot.len,
+                        self.snapshot,
                         self.offset + read as u64,
                         &mut self.buffer[read..take],
                         &self.options,
@@ -654,6 +1083,7 @@ impl PacketScanner {
                         return Err(EngineError::InvalidState("invalid source read length"));
                     }
                     if count == 0 {
+                        self.confirm_generation()?;
                         return Ok(ScanEvent::NeedData {
                             offset: self.offset + read as u64,
                         });
@@ -669,6 +1099,7 @@ impl PacketScanner {
                 };
                 self.offset += found as u64;
                 if self.snapshot.len - self.offset < HEADER_SIZE as u64 {
+                    self.confirm_generation()?;
                     self.offset = self.snapshot.len;
                     return Ok(ScanEvent::End);
                 }
@@ -681,7 +1112,7 @@ impl PacketScanner {
                     let count = self.read_ahead.read_at(
                         self.access.as_ref(),
                         self.source,
-                        self.snapshot.len,
+                        self.snapshot,
                         self.offset + header_read as u64,
                         &mut header_bytes[header_read..],
                         &self.options,
@@ -691,6 +1122,7 @@ impl PacketScanner {
                         return Err(EngineError::InvalidState("invalid source read length"));
                     }
                     if count == 0 {
+                        self.confirm_generation()?;
                         return Ok(ScanEvent::NeedData {
                             offset: self.offset + header_read as u64,
                         });
@@ -773,13 +1205,15 @@ impl PacketScanner {
                 let read = self.read_ahead.read_at(
                     self.access.as_ref(),
                     self.source,
-                    self.snapshot.len,
+                    self.snapshot,
                     candidate.offset + candidate.consumed,
                     &mut self.buffer[..take],
                     &self.options,
                 )?;
                 progress.advance(read as u64);
                 if read == 0 {
+                    ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)?;
+                    self.read_ahead.unchecked = false;
                     return Ok(ScanEvent::NeedData {
                         offset: candidate.offset + candidate.consumed,
                     });
@@ -800,7 +1234,9 @@ impl PacketScanner {
                 }
                 candidate.consumed += read as u64;
             }
-            ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)?;
+            if self.read_ahead.unchecked {
+                self.confirm_generation()?;
+            }
             let candidate = self.candidate.take().expect("candidate present");
             if candidate.hash.finalize() != candidate.header.hash {
                 self.failed_hash_bytes = self
@@ -826,6 +1262,14 @@ impl PacketScanner {
                 reservation: candidate.reservation,
             });
         }
+    }
+
+    /// Fail if the source left the scanned generation. Every byte read before
+    /// a successful check is confirmed by it.
+    fn confirm_generation(&mut self) -> EngineResult<()> {
+        ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)?;
+        self.read_ahead.unchecked = false;
+        Ok(())
     }
 
     /// Offer one authenticated packet to the budget, and move the scan past it
@@ -1116,7 +1560,38 @@ impl IncrementalSet {
         payload: &PayloadRef,
         options: &ExecutionOptions,
     ) -> EngineResult<()> {
-        match payload.reauthenticate(options) {
+        self.charge(payload, payload.reauthenticate(options))
+    }
+
+    /// [`Self::validate_payload`] through a buffer the caller already holds:
+    /// see [`PayloadRef::reauthenticate_in`].
+    pub(crate) fn validate_payload_in(
+        &self,
+        payload: &PayloadRef,
+        options: &ExecutionOptions,
+        buffer: &mut [u8],
+    ) -> EngineResult<()> {
+        self.charge(payload, payload.reauthenticate_in(options, buffer))
+    }
+
+    /// [`Self::validate_payload`] fused with the read that consumes the
+    /// payload: see [`PayloadRef::read_authenticated`]. A failure is charged
+    /// exactly as a failed reauthentication is.
+    pub(crate) fn read_payload(
+        &self,
+        payload: &PayloadRef,
+        options: &ExecutionOptions,
+        out: &mut [u8],
+    ) -> EngineResult<()> {
+        self.charge(payload, payload.read_authenticated(options, out))
+    }
+
+    fn charge(
+        &self,
+        payload: &PayloadRef,
+        checked: Result<(), (EngineError, bool)>,
+    ) -> EngineResult<()> {
+        match checked {
             Ok(()) => Ok(()),
             Err((error, spent)) => {
                 // A pass was spent whenever the packet was read and hashed
@@ -1692,6 +2167,89 @@ mod admission_tests {
         );
     }
 
+    /// A provider whose reads fail once it is armed, and whose snapshot then
+    /// reports the source gone when `vanish` is set or unchanged otherwise.
+    struct FailingRefill {
+        inner: MemorySourceAccess,
+        armed: std::sync::atomic::AtomicBool,
+        vanish: bool,
+    }
+
+    impl crate::source::SourceAccess for FailingRefill {
+        fn snapshot(
+            &self,
+            source: SourceId,
+        ) -> std::io::Result<Option<crate::source::SourceSnapshot>> {
+            if self.vanish && self.armed.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(None);
+            }
+            self.inner.snapshot(source)
+        }
+
+        fn read_at(&self, source: SourceId, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.armed.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+            }
+            self.inner.read_at(source, offset, out)
+        }
+
+        fn next_available(
+            &self,
+            source: SourceId,
+            offset: u64,
+        ) -> std::io::Result<Option<std::ops::Range<u64>>> {
+            self.inner.next_available(source, offset)
+        }
+    }
+
+    fn poll_failing_refill(vanish: bool) -> EngineError {
+        let archive = crate::test_reference::set_vol0_par3();
+        let mut inner = MemorySourceAccess::default();
+        inner.insert(SourceId(1), 1, archive.into());
+        let access = Arc::new(FailingRefill {
+            inner,
+            armed: std::sync::atomic::AtomicBool::new(false),
+            vanish,
+        });
+        let mut scanner = PacketScanner::new(
+            Arc::clone(&access) as Arc<dyn crate::source::SourceAccess>,
+            SourceId(1),
+            ExecutionOptions::default(),
+            ScanLimits::default(),
+        )
+        .expect("a scanner over the archive");
+        access
+            .armed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        scanner
+            .poll()
+            .expect_err("the first refill cannot read the source")
+    }
+
+    /// PR #92 review: the scanner settles its generation check after a
+    /// refill, so a refill whose read fails used to return the provider's
+    /// I/O error even when the source had disappeared under it. It must
+    /// report the change, as every other optimized read path does.
+    #[test]
+    fn a_refill_that_fails_because_the_source_vanished_reports_the_change() {
+        let error = poll_failing_refill(true);
+        assert!(
+            matches!(error, EngineError::SourceChanged(SourceId(1))),
+            "a vanished source surfaced as {error:?}"
+        );
+    }
+
+    /// The same failed refill over a source that is still the scanned
+    /// generation keeps the read's own error.
+    #[test]
+    fn a_refill_that_fails_over_an_unchanged_source_keeps_its_error() {
+        let error = poll_failing_refill(false);
+        assert!(
+            !matches!(error, EngineError::SourceChanged(_)),
+            "an unchanged source reported a change: {error:?}"
+        );
+    }
+
     /// PR #73 round 5, finding A. A budget a peer is holding answers
     /// `PeerContention`, which the contract calls retryable: the host parks and
     /// polls again. The scanner used to count the packet and step its offset
@@ -1791,6 +2349,155 @@ mod admission_tests {
         assert_eq!(
             seen, remaining,
             "the contended scan lost or repeated a packet"
+        );
+    }
+}
+
+#[cfg(test)]
+mod authenticating_writer_tests {
+    //! Creation authenticates each carrier as it hands the bytes to the file
+    //! instead of scanning the file again. These feed the writer official
+    //! reference carriers, and damage made by flipping bytes of them in memory.
+    use super::AuthenticatingWriter;
+    use crate::InputSetId;
+    use crate::runtime::{EngineError, EngineResult, ExecutionOptions};
+    use crate::test_reference::{
+        SET_ID, SET16_ID, set_par3, set_vol0_par3, set_vol1_par3, set16_par3, set16_vol0_par3,
+        set16_vol1_par3,
+    };
+    use std::io::Write;
+
+    fn written(bytes: &[u8], id: InputSetId, piece: usize, expected: u64) -> EngineResult<()> {
+        let mut writer = AuthenticatingWriter::new(Vec::new(), id, ExecutionOptions::default());
+        for chunk in bytes.chunks(piece) {
+            writer.write_all(chunk).map_err(EngineError::from)?;
+        }
+        assert_eq!(
+            writer.get_ref().as_slice(),
+            bytes,
+            "the inner writer got every byte"
+        );
+        writer.finish(expected)
+    }
+
+    fn carriers() -> [(Vec<u8>, InputSetId); 6] {
+        [
+            (set_par3(), SET_ID),
+            (set_vol0_par3(), SET_ID),
+            (set_vol1_par3(), SET_ID),
+            (set16_par3(), SET16_ID),
+            (set16_vol0_par3(), SET16_ID),
+            (set16_vol1_par3(), SET16_ID),
+        ]
+    }
+
+    /// The packets of a carrier, split at their header lengths.
+    fn split_packets(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let length = u64::from_le_bytes(bytes[at + 24..at + 32].try_into().unwrap()) as usize;
+            out.push(bytes[at..at + length].to_vec());
+            at += length;
+        }
+        out
+    }
+
+    #[test]
+    fn repeated_known_packets_are_proven_by_comparison_and_still_refuse_damage() {
+        let index = set_par3();
+        let known = split_packets(&index);
+        // The index, then every packet again in reverse, the way a volume
+        // repeats its metadata after the first copy.
+        let mut carrier = index.clone();
+        for packet in known.iter().rev() {
+            carrier.extend_from_slice(packet);
+        }
+        let write = |bytes: &[u8], known: &[Vec<u8>], piece: usize| -> EngineResult<usize> {
+            let mut writer =
+                AuthenticatingWriter::new(Vec::new(), SET_ID, ExecutionOptions::default())
+                    .with_known(known);
+            for chunk in bytes.chunks(piece) {
+                writer.write_all(chunk).map_err(EngineError::from)?;
+            }
+            assert_eq!(writer.get_ref().as_slice(), bytes);
+            writer.finish(carrier.len() as u64)?;
+            Ok(writer.compared)
+        };
+        // The first copy of each packet is hashed; every repeat is compared.
+        for piece in [1, 7, 48, 49, 4096, carrier.len()] {
+            assert_eq!(write(&carrier, &known, piece).unwrap(), known.len());
+        }
+        // Every byte of every repeated copy is still covered: by the header
+        // parse, or by the comparison with the copy proven first.
+        for at in index.len()..carrier.len() {
+            let mut damaged = carrier.clone();
+            damaged[at] ^= 0x01;
+            assert!(
+                write(&damaged, &known, 4096).is_err(),
+                "a flip at byte {at} of a repeat was accepted"
+            );
+        }
+        // A known entry that differs from what was written is never proven,
+        // so the copies are hashed as before and still authenticate.
+        let mut wrong = known.clone();
+        let last = wrong[0].len() - 1;
+        wrong[0][last] ^= 0x01;
+        assert_eq!(write(&carrier, &wrong, 4096).unwrap(), known.len() - 1);
+    }
+
+    #[test]
+    fn reference_carriers_authenticate_however_their_writes_are_split() {
+        for (bytes, id) in carriers() {
+            // Pieces that split headers, prefixes and bodies, and one write.
+            for piece in [1, 7, 48, 49, 4096, bytes.len()] {
+                written(&bytes, id, piece, bytes.len() as u64)
+                    .unwrap_or_else(|error| panic!("{piece}-byte writes: {error:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_flipped_byte_anywhere_in_a_carrier_is_refused() {
+        // Magic, hash, length, set identity, type, prefix and body: the header
+        // parse or the packet hash covers every byte.
+        for (bytes, id) in carriers().into_iter().take(2) {
+            for at in 0..bytes.len() {
+                let mut damaged = bytes.clone();
+                damaged[at] ^= 0x01;
+                assert!(
+                    written(&damaged, id, 4096, bytes.len() as u64).is_err(),
+                    "a flip at byte {at} was accepted"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn another_set_a_short_carrier_or_stray_bytes_are_refused() {
+        let bytes = set_vol0_par3();
+        let len = bytes.len() as u64;
+        assert!(written(&bytes, SET16_ID, 4096, len).is_err(), "another set");
+        assert!(
+            written(&bytes, SET_ID, 4096, len + 1).is_err(),
+            "planned size"
+        );
+        assert!(
+            written(&bytes[..bytes.len() - 1], SET_ID, 4096, len - 1).is_err(),
+            "a packet cut short"
+        );
+        // The first packet's length, header included.
+        let first = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
+        assert!(
+            written(&bytes[..first + 20], SET_ID, 4096, first as u64 + 20).is_err(),
+            "a header cut short"
+        );
+        let mut stray = bytes[..first].to_vec();
+        stray.push(0);
+        stray.extend_from_slice(&bytes[first..]);
+        assert!(
+            written(&stray, SET_ID, 4096, len + 1).is_err(),
+            "a byte between packets"
         );
     }
 }

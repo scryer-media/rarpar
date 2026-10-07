@@ -52,6 +52,11 @@ harness = false
 name = "gf16_dft"
 harness = false
 
+# Hand-timed: one side-by-side table of single-thread kernel ceilings.
+[[bench]]
+name = "kernel_ceiling"
+harness = false
+
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 objc2 = { version = "0.6.4", default-features = false, features = ["std"], optional = true }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSRange", "NSString"], optional = true }

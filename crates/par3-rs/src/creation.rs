@@ -1,22 +1,29 @@
 //! Explicit advanced creation plans over stable source identities.
 
 use crate::runtime::{EngineFile as File, MemoryCategory, OpenBudgeted};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::create::{MetadataRepeats, metadata_repeats};
 use crate::fft::{FftCodec, FftGeometry};
-use crate::gf::Field;
+use crate::gf::MulAccBatch;
 use crate::packet::{
     BlockChecksum, BlockRange, CauchyMatrixPacket, ChunkDescription, ChunkTail, CreatorPacket,
     DirectoryPacket, ExternalDataPacket, FftMatrixPacket, FilePacket, GaloisField, PacketBody,
     PacketHeader, PacketType, RootPacket, StartPacket,
 };
+use crate::placement::{CrcFilter, SlidingCrc, SlidingWindow};
 use crate::runtime::{EngineError, EngineResult, ExecutionOptions, Reservation};
-use crate::source::{SourceAccess, SourceId, SourceSnapshot, ensure_snapshot, read_exact_at};
-use crate::{Fingerprint, FingerprintHasher, InputSetId, Packet, RollingHasher};
+use crate::source::{
+    OwedChecks, SourceAccess, SourceId, SourceSnapshot, ensure_snapshot, read_exact_at,
+};
+use crate::{
+    Fingerprint, FingerprintHasher, InputSetId, Packet, QUICK_HASH_LEN, RollingHasher,
+    TAIL_HASH_LEN,
+};
 
 /// Codec selection. Existing `create::create` defaults remain unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,9 +67,10 @@ pub enum VolumeLayout {
 /// File synchronization policy for standalone creation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CreationDurability {
-    /// Preserve the default: synchronize scratch and staged carrier files before
-    /// installation. This does not synchronize parent directories or promise
-    /// atomic installation of the complete set across a crash.
+    /// Preserve the default: synchronize each staged carrier file once before
+    /// installation. Scratch files are never synchronized. This does not
+    /// synchronize parent directories or promise atomic installation of the
+    /// complete set across a crash.
     #[default]
     SyncFiles,
     /// Flush application buffers without requesting durable storage barriers.
@@ -141,6 +149,37 @@ struct PlannedFile {
     packet: FilePacket,
 }
 
+/// Where encoded recovery rows wait for their carriers. Either way row `r`
+/// of the requested range starts at byte `r * block_size`.
+enum RecoverySpool {
+    /// Every row resident, charged to the budget until the carriers are built.
+    Memory {
+        rows: Vec<u8>,
+        _reservation: Reservation,
+    },
+    /// A scratch file. Fields drop in order, so it closes before its path goes.
+    File {
+        file: File,
+        _path: crate::session_repair::ScratchFile,
+    },
+}
+
+impl RecoverySpool {
+    fn write(&mut self, at: u64, bytes: &[u8]) -> EngineResult<()> {
+        match self {
+            Self::Memory { rows, .. } => {
+                let at = at as usize;
+                rows[at..at + bytes.len()].copy_from_slice(bytes);
+            }
+            Self::File { file, .. } => {
+                file.seek(SeekFrom::Start(at))?;
+                file.write_all(bytes)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Read-only requirements available before any output or scratch file is created.
 #[derive(Clone, Debug)]
 pub struct CreationRequirements {
@@ -152,7 +191,11 @@ pub struct CreationRequirements {
     pub reused_blocks: u64,
     /// Exact recovery scratch size.
     pub scratch_bytes: u64,
-    /// Complete metadata bytes repeated in each carrier.
+    /// Bytes of one complete copy of the metadata: the whole index file, and
+    /// the first copy at the head of each carrier. A carrier of `n` rows
+    /// (recovery) or blocks (data) also repeats every metadata packet but the
+    /// Creator packet `floor(log2(n))` more times between its payload packets,
+    /// as the reference does; `output_sizes` counts those copies.
     pub metadata_bytes: u64,
     /// Exact index and carrier lengths, in execution order.
     pub output_sizes: Vec<u64>,
@@ -180,6 +223,9 @@ pub struct CreationPlan {
     /// Data carriers as `(first block, blocks)`. Blocks are not interleaved, so
     /// these stay in block terms whatever the codec is.
     data_volumes: Vec<(u64, u64)>,
+    /// Whether carriers repeat the metadata between their payload packets.
+    /// An embedded carrier keeps the single copy its container layout sized.
+    repeat_metadata: bool,
     requirements: CreationRequirements,
     _reservation: Reservation,
 }
@@ -190,10 +236,34 @@ impl CreationPlan {
     /// File, quick-prefix, block, and tail hashes share one source pass; sliding
     /// deduplication additionally reads candidate windows. Forward readers are
     /// used when available, with at most one retained input handle per file.
+    ///
+    /// The inputs are stored in the reference's order — longest file tail
+    /// (size modulo block size) first, then largest file, then name — whatever order `sources` lists
+    /// them in. That order is decided from the source sizes alone, before any
+    /// byte is read, so it costs no extra I/O.
     pub fn build(
         access: Arc<dyn SourceAccess>,
         sources: &[CreationSource],
         options: CreationOptions,
+    ) -> EngineResult<Self> {
+        Self::build_ordered(access, sources, options, true)
+    }
+
+    /// Plan the sources in the order given. An embedded carrier lays its body
+    /// out ahead of its footer, so it keeps the order its views were listed in.
+    pub(crate) fn build_in_source_order(
+        access: Arc<dyn SourceAccess>,
+        sources: &[CreationSource],
+        options: CreationOptions,
+    ) -> EngineResult<Self> {
+        Self::build_ordered(access, sources, options, false)
+    }
+
+    fn build_ordered(
+        access: Arc<dyn SourceAccess>,
+        sources: &[CreationSource],
+        options: CreationOptions,
+        reference_order: bool,
     ) -> EngineResult<Self> {
         let _progress = options.execution.stage(crate::runtime::Stage::Create)?;
         if options.block_size == 0 {
@@ -260,15 +330,81 @@ impl CreationPlan {
             .memory
             .reserve_as(MemoryCategory::SourceScratch, stripe)?;
         let mut buffer = vec![0; stripe];
+        // A source of at least `PARALLEL_SOURCE_BYTES` may start one pool for
+        // the whole plan, admitted as verification admits one; a refusal, or
+        // no room left for a parallel-hash buffer, keeps the serial walk. A
+        // second buffer, taken only from what is left, lets the next read
+        // overlap the hash. Sliding deduplication searches between chunks,
+        // so its walk is not known in advance and stays serial.
+        let large = options.deduplication != Deduplication::Sliding
+            && snapshots
+                .iter()
+                .any(|snapshot| snapshot.len >= crate::hash::PARALLEL_SOURCE_BYTES);
+        let pool = if large {
+            match crate::runtime::WorkerPool::for_work(
+                &options.execution,
+                crate::hash::PARALLEL_HASH_WORKERS,
+                crate::hash::PARALLEL_HASH_BYTES + (128 << 10),
+            ) {
+                Ok(pool) => pool,
+                Err(EngineError::ResourceLimit(_)) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let mut ahead_buffers = Vec::new();
+        let mut _ahead_memory = Vec::new();
+        while pool.is_some() && ahead_buffers.len() < 2 {
+            match options.execution.memory.reserve_as(
+                MemoryCategory::SourceScratch,
+                crate::hash::PARALLEL_HASH_BYTES,
+            ) {
+                Ok(reservation) if options.execution.memory.available() >= 128 << 10 => {
+                    _ahead_memory.push(reservation);
+                    ahead_buffers.push(vec![0; crate::hash::PARALLEL_HASH_BYTES]);
+                }
+                Ok(_) | Err(EngineError::ResourceLimit(_)) => break,
+                Err(error) => return Err(error),
+            }
+        }
+        let pool = pool.filter(|_| !ahead_buffers.is_empty());
         let mut files = Vec::new();
         let mut blocks: Vec<Block> = Vec::new();
         let mut full = BTreeMap::<Fingerprint, u64>::new();
         let mut locators = BTreeMap::<u64, Vec<Fingerprint>>::new();
+        // At most 16 bytes per block, inside the per-block plan estimate above.
+        let mut filter = CrcFilter::new(std::iter::empty());
+        let rolling = (options.deduplication == Deduplication::Sliding)
+            .then(|| SlidingCrc::new(options.block_size));
         let mut tails = BTreeMap::<(u64, Fingerprint), (u64, u64)>::new();
-        let mut packing: Option<usize> = None;
+        let mut packing = if options.deduplication == Deduplication::None {
+            TailSlots::default()
+        } else {
+            TailSlots::by_block()
+        };
         let mut reused = 0;
         let mut names = BTreeMap::new();
-        for (source, snapshot) in sources.iter().zip(snapshots) {
+        let mut order: Vec<usize> = (0..sources.len()).collect();
+        if reference_order {
+            let block_size = options.block_size;
+            order.sort_by(|&left, &right| {
+                let (one, other) = (snapshots[left].len, snapshots[right].len);
+                (other % block_size)
+                    .cmp(&(one % block_size))
+                    .then_with(|| other.cmp(&one))
+                    .then_with(|| {
+                        sources[left]
+                            .name
+                            .as_bytes()
+                            .cmp(sources[right].name.as_bytes())
+                    })
+            });
+        }
+        for (source, snapshot) in order
+            .into_iter()
+            .map(|index| (&sources[index], snapshots[index]))
+        {
             if names.insert(source.name.clone(), ()).is_some() {
                 return Err(EngineError::InvalidState("duplicate creation path"));
             }
@@ -287,13 +423,19 @@ impl CreationPlan {
                 position: 0,
                 file_hash: FingerprintHasher::new(),
                 quick_crc: RollingHasher::new(),
+                ahead: pool
+                    .as_ref()
+                    .filter(|_| snapshot.len >= crate::hash::PARALLEL_SOURCE_BYTES)
+                    .map(|pool| {
+                        HashAhead::new(pool.pool(), &mut ahead_buffers, options.block_size, stripe)
+                    }),
             };
             let mut chunks = Vec::new();
             let mut at = 0;
             while at < snapshot.len {
                 options.execution.cancel.check()?;
                 let mut length = (snapshot.len - at).min(options.block_size);
-                if options.deduplication == Deduplication::Sliding
+                if let Some(rolling) = &rolling
                     && length == options.block_size
                     && !locators.is_empty()
                     && let Some(shift) = find_shift(
@@ -303,6 +445,8 @@ impl CreationPlan {
                         at,
                         options.block_size,
                         &locators,
+                        &filter,
+                        rolling,
                         &options.execution,
                     )?
                     && shift != 0
@@ -337,12 +481,15 @@ impl CreationPlan {
                         });
                         full.insert(hash, index);
                         locators.entry(rolling_hash).or_default().push(hash);
+                        if rolling.is_some() && !filter.insert(rolling_hash) {
+                            filter = CrcFilter::new(locators.keys().copied());
+                        }
                         index
                     };
                     append_full(&mut chunks, index, options.block_size);
                 } else if length < 40 {
                     let mut bytes = vec![0; length as usize];
-                    reader.read(at, &mut bytes)?;
+                    reader.read_inline(at, &mut bytes)?;
                     append_tail(
                         &mut chunks,
                         length,
@@ -357,21 +504,18 @@ impl CreationPlan {
                     let (index, offset) = if let Some(alias) = alias {
                         alias
                     } else {
-                        let index = packing
-                            .filter(|index| options.block_size - blocks[*index].used >= length)
-                            .unwrap_or_else(|| {
-                                let index = blocks.len();
-                                blocks.push(Block {
-                                    pieces: Vec::new(),
-                                    used: 0,
-                                    checksum: None,
-                                });
-                                packing = Some(index);
-                                index
+                        let index = packing.take(length).unwrap_or_else(|| {
+                            blocks.push(Block {
+                                pieces: Vec::new(),
+                                used: 0,
+                                checksum: None,
                             });
+                            blocks.len() - 1
+                        });
                         let offset = blocks[index].used;
                         blocks[index].pieces.push(Piece { offset, ..piece });
                         blocks[index].used += length;
+                        packing.place(index, options.block_size - blocks[index].used);
                         tails.insert((length, hash), (index as u64, offset));
                         (index as u64, offset)
                     };
@@ -408,7 +552,6 @@ impl CreationPlan {
                 },
             });
         }
-        files.sort_by(|left, right| left.name.cmp(&right.name));
         for file in &files {
             let mut ancestor = parent(&file.name);
             while !ancestor.is_empty() {
@@ -469,13 +612,36 @@ impl CreationPlan {
                         "requested recovery exceeds FFT capacity",
                     ));
                 }
-                GaloisField {
-                    size: geometry.field_bytes() as u8,
-                    generator: if geometry.field_bytes() == 1 {
-                        0x1d
-                    } else {
-                        0x2d
-                    },
+                if geometry.field_bytes() == 2
+                    && !geometry.is_trivial()
+                    && !options.block_size.is_multiple_of(2)
+                {
+                    return Err(EngineError::InvalidState(
+                        "creation block is not field aligned",
+                    ));
+                }
+                if last == 1 {
+                    // The reference records no field when the set carries a
+                    // single recovery block, whatever capacity the matrix
+                    // reserves. (Its other case, a requested capacity of one
+                    // with no recovery blocks, is not expressible here: a set
+                    // without recovery records the geometry's field.) The block
+                    // is still the first transform parity of the reserved
+                    // capacity: the XOR of the inputs only when that capacity
+                    // is one.
+                    GaloisField {
+                        size: 0,
+                        generator: 0,
+                    }
+                } else {
+                    GaloisField {
+                        size: geometry.field_bytes() as u8,
+                        generator: if geometry.field_bytes() == 1 {
+                            0x1d
+                        } else {
+                            0x2d
+                        },
+                    }
                 }
             }
         };
@@ -513,6 +679,7 @@ impl CreationPlan {
             matrix: [0; 16],
             volumes: Vec::new(),
             data_volumes: Vec::new(),
+            repeat_metadata: true,
             requirements,
             _reservation: reservation,
         };
@@ -663,6 +830,7 @@ impl CreationPlan {
             ));
         }
         self.options.volumes = VolumeLayout::Uniform(self.options.recovery_count);
+        self.repeat_metadata = false;
         self.volumes.clear();
         self.data_volumes.clear();
         self.requirements.output_sizes.clear();
@@ -741,81 +909,9 @@ impl CreationPlan {
                 Err(error) => return Err(error.into()),
             }
         }
-        let scratch_path = crate::session_repair::ScratchFile::new(
-            &scratch_directory.join("recovery-spool"),
-            &self.options.execution,
-        )?;
-        let mut scratch = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open_budgeted(scratch_path.path(), &self.options.execution)?;
-        scratch.set_len(self.requirements.scratch_bytes)?;
-        if self.options.recovery_count != 0 {
-            match self.options.codec {
-                CreationCodec::Cauchy => {
-                    // What building the field really peaks at, quoted by the
-                    // field itself rather than guessed, so creation and repair
-                    // refuse the same budget for the same set.
-                    let _field = self.options.execution.memory.reserve_as(
-                        MemoryCategory::CodecTables,
-                        crate::gf::construction_cost(&self.requirements.field),
-                    )?;
-                    match crate::gf::for_set(&self.requirements.field)? {
-                        crate::gf::AnyField::Gf8(field) => {
-                            self.encode_cauchy(field, &mut scratch)?
-                        }
-                        crate::gf::AnyField::Gf16(field) => {
-                            self.encode_cauchy(field, &mut scratch)?
-                        }
-                    }
-                }
-                CreationCodec::Fft { capacity_log2, .. } => {
-                    let cohorts = self.requirements.cohorts;
-                    let geometry = FftGeometry::new(
-                        (self.blocks.len() as u64).div_ceil(cohorts),
-                        capacity_log2,
-                    )?;
-                    let codec = FftCodec::new(geometry, self.options.execution.clone())?;
-                    let end = self.options.first_recovery + self.options.recovery_count;
-                    for cohort in 0..cohorts.min(self.options.recovery_count) {
-                        let cohort = (cohort + self.options.first_recovery) % cohorts;
-                        let first = self.options.first_recovery
-                            + (cohort + cohorts - self.options.first_recovery % cohorts) % cohorts;
-                        if first >= end {
-                            continue;
-                        }
-                        let count = (end - first).div_ceil(cohorts);
-                        codec.encode(
-                            self.options.block_size,
-                            (first / cohorts) as usize,
-                            count as usize,
-                            |index, offset, out| {
-                                let global = cohort + index as u64 * cohorts;
-                                if global >= self.blocks.len() as u64 {
-                                    out.fill(0);
-                                    Ok(())
-                                } else {
-                                    self.read_block(global as usize, offset, out)
-                                }
-                            },
-                            |index, offset, bytes| {
-                                let global = cohort + index as u64 * cohorts;
-                                scratch.seek(SeekFrom::Start(
-                                    (global - self.options.first_recovery)
-                                        * self.options.block_size
-                                        + offset,
-                                ))?;
-                                scratch.write_all(bytes)?;
-                                Ok(())
-                            },
-                        )?;
-                    }
-                }
-            }
-        }
-        if durability == CreationDurability::SyncFiles {
-            scratch.sync_all()?;
-        }
+        let mut spool = self.encode(scratch_directory)?;
+        // The spool is scratch this process reads back and deletes; no policy
+        // makes it durable.
         let mut staged = Vec::new();
         for (number, destination) in destinations.iter().enumerate() {
             self.options.execution.cancel.check()?;
@@ -830,97 +926,34 @@ impl CreationPlan {
             let file = OpenOptions::new()
                 .write(true)
                 .open_budgeted(temporary.path(), &self.options.execution)?;
-            let mut out = std::io::BufWriter::with_capacity(buffer_size, file);
-            for packet in &self.metadata {
-                out.write_all(packet)?;
-            }
-            if number > 0 && number <= self.volumes.len() {
-                // The carrier holds whole rows: every cohort's recovery index
-                // for each of its rows, which is one contiguous run of global
-                // indices because a row's indices are adjacent.
-                let (first_row, rows) = self.volumes[number - 1];
-                let cohorts = self.requirements.cohorts;
-                let first = first_row * cohorts;
-                let count = rows * cohorts;
-                for index in first..first + count {
-                    let mut prefix = Vec::with_capacity(40);
-                    prefix.extend_from_slice(&self.root);
-                    prefix.extend_from_slice(&self.matrix);
-                    prefix.extend_from_slice(&index.to_le_bytes());
-                    self.write_payload(
-                        &mut out,
-                        PacketType::RecoveryData,
-                        &prefix,
-                        |offset, bytes| {
-                            scratch.seek(SeekFrom::Start(
-                                (index - self.options.first_recovery) * self.options.block_size
-                                    + offset,
-                            ))?;
-                            scratch.read_exact(bytes)?;
-                            Ok(())
-                        },
-                    )?;
-                }
-            } else if number > self.volumes.len() {
-                let (first, count) = self.data_volumes[number - self.volumes.len() - 1];
-                for index in first..first + count {
-                    self.write_payload(
-                        &mut out,
-                        PacketType::Data,
-                        &index.to_le_bytes(),
-                        |offset, bytes| self.read_block(index as usize, offset, bytes),
-                    )?;
-                }
-            }
-            out.flush()?;
+            // Packets are authenticated as the buffer hands them to the file,
+            // so the staged carrier is never read back. A streamed payload is
+            // read twice, once to hash and once to write; this is what proves
+            // the second read wrote what the first one hashed.
+            let mut out = std::io::BufWriter::with_capacity(
+                buffer_size,
+                crate::ingest::AuthenticatingWriter::new(
+                    file,
+                    self.id,
+                    self.options.execution.clone(),
+                )
+                .with_known(&self.metadata),
+            );
+            self.write_output(number, &mut spool, &mut out)?;
+            let out = out
+                .into_inner()
+                .map_err(std::io::IntoInnerError::into_error)?;
+            // The temporary was created empty and written from its start, so
+            // the bytes counted are its length.
+            out.finish(self.requirements.output_sizes[number])?;
             if durability == CreationDurability::SyncFiles {
                 out.get_ref().sync_all()?;
             }
             drop(out);
             drop(_output_buffer);
-            if std::fs::metadata(temporary.path())?.len() != self.requirements.output_sizes[number]
-            {
-                return Err(EngineError::InvalidState("creation size differs from plan"));
-            }
-            let mut source =
-                crate::source::DiskSourceAccess::with_options(self.options.execution.clone());
-            source.insert(SourceId(0), temporary.path().to_owned());
-            let mut scanner = crate::ingest::PacketScanner::new(
-                Arc::new(source),
-                SourceId(0),
-                self.options.execution.clone(),
-                crate::ScanLimits::default(),
-            )?;
-            let mut authenticated_end = 0;
-            loop {
-                match scanner.poll()? {
-                    crate::ingest::ScanEvent::Packet(packet) => {
-                        let origin = packet.origin();
-                        if origin.offset != authenticated_end || packet.input_set_id() != self.id {
-                            return Err(EngineError::InvalidState(
-                                "staged carrier has unauthenticated bytes",
-                            ));
-                        }
-                        authenticated_end = origin
-                            .offset
-                            .checked_add(origin.length)
-                            .ok_or(EngineError::resource_limit("staged carrier length"))?;
-                    }
-                    crate::ingest::ScanEvent::End => break,
-                    crate::ingest::ScanEvent::NeedData { .. } => {
-                        return Err(EngineError::InvalidState(
-                            "created carrier has unavailable bytes",
-                        ));
-                    }
-                }
-            }
-            if authenticated_end != self.requirements.output_sizes[number] {
-                return Err(EngineError::InvalidState(
-                    "staged carrier authentication is incomplete",
-                ));
-            }
             staged.push(temporary);
         }
+        drop(spool);
         for file in &self.files {
             ensure_snapshot(self.access.as_ref(), file.source, file.snapshot)?;
         }
@@ -942,11 +975,218 @@ impl CreationPlan {
             installed.push(destination.clone());
             progress.advance(1);
         }
-        drop(scratch);
         Ok(destinations)
     }
 
-    fn read_block(&self, index: usize, offset: u64, out: &mut [u8]) -> EngineResult<()> {
+    /// Encode the recovery rows into a spool: resident when they fit the
+    /// budget, otherwise a scratch file in `scratch_directory`.
+    fn encode(&self, scratch_directory: &Path) -> EngineResult<RecoverySpool> {
+        Ok(match self.options.codec {
+            _ if self.options.recovery_count == 0 => RecoverySpool::Memory {
+                rows: Vec::new(),
+                _reservation: self
+                    .options
+                    .execution
+                    .memory
+                    .reserve_as(MemoryCategory::OutputStaging, 0)?,
+            },
+            CreationCodec::Cauchy => {
+                // What building the field really peaks at, quoted by the
+                // field itself rather than guessed, so creation and repair
+                // refuse the same budget for the same set.
+                let _field = self.options.execution.memory.reserve_as(
+                    MemoryCategory::CodecTables,
+                    crate::gf::construction_cost(&self.requirements.field),
+                )?;
+                match crate::gf::for_set(&self.requirements.field)? {
+                    crate::gf::AnyField::Gf8(field) => {
+                        self.encode_cauchy(field, scratch_directory)?
+                    }
+                    crate::gf::AnyField::Gf16(field) => {
+                        self.encode_cauchy(field, scratch_directory)?
+                    }
+                }
+            }
+            CreationCodec::Fft { capacity_log2, .. } => {
+                let cohorts = self.requirements.cohorts;
+                let geometry =
+                    FftGeometry::new((self.blocks.len() as u64).div_ceil(cohorts), capacity_log2)?;
+                let codec = FftCodec::new(geometry, self.options.execution.clone())?;
+                let mut spool = self.recovery_spool(
+                    codec.encode_stripe_bytes(self.options.block_size),
+                    scratch_directory,
+                )?;
+                let end = self.options.first_recovery + self.options.recovery_count;
+                for cohort in 0..cohorts.min(self.options.recovery_count) {
+                    let cohort = (cohort + self.options.first_recovery) % cohorts;
+                    let first = self.options.first_recovery
+                        + (cohort + cohorts - self.options.first_recovery % cohorts) % cohorts;
+                    if first >= end {
+                        continue;
+                    }
+                    let count = (end - first).div_ceil(cohorts);
+                    // Reads are settled before the next spool write, so a
+                    // write never precedes a check of the bytes before it.
+                    let owed = OwedChecks::default();
+                    codec.encode(
+                        self.options.block_size,
+                        (first / cohorts) as usize,
+                        count as usize,
+                        |index, offset, out| {
+                            let global = cohort + index as u64 * cohorts;
+                            if global >= self.blocks.len() as u64 {
+                                out.fill(0);
+                                Ok(())
+                            } else {
+                                self.read_block(global as usize, offset, out, Some(&owed))
+                            }
+                        },
+                        |index, offset, bytes| {
+                            let global = cohort + index as u64 * cohorts;
+                            owed.settle(self.access.as_ref())?;
+                            spool.write(
+                                (global - self.options.first_recovery) * self.options.block_size
+                                    + offset,
+                                bytes,
+                            )
+                        },
+                    )?;
+                    owed.settle(self.access.as_ref())?;
+                }
+                spool
+            }
+        })
+    }
+
+    /// Write output `number` — the index, a recovery volume or a data volume —
+    /// to `out`, whole: its metadata and then its packets.
+    fn write_output(
+        &self,
+        number: usize,
+        spool: &mut RecoverySpool,
+        out: &mut impl Write,
+    ) -> EngineResult<()> {
+        for packet in &self.metadata {
+            out.write_all(packet)?;
+        }
+        // After the first copy, a carrier repeats the metadata after the
+        // Creator packet as the reference spreads it: after each of its
+        // `units` rows or blocks, cycling through the packets.
+        let common = self.metadata.get(1..).unwrap_or_default();
+        let repeats = |units: u64| MetadataRepeats::new(common, units, self.repeat_metadata);
+        // A payload held whole is read once, then hashed and written from
+        // the same bytes; without room for one it streams twice, as it
+        // always did. Resident recovery rows are already whole.
+        let mut whole = (number > self.volumes.len()
+            || (number > 0 && matches!(spool, RecoverySpool::File { .. })))
+        .then(|| self.whole_payload())
+        .flatten();
+        if number > 0 && number <= self.volumes.len() {
+            // The carrier holds whole rows: every cohort's recovery index
+            // for each of its rows, which is one contiguous run of global
+            // indices because a row's indices are adjacent.
+            let (first_row, rows) = self.volumes[number - 1];
+            let cohorts = self.requirements.cohorts;
+            let first = first_row * cohorts;
+            let count = rows * cohorts;
+            let mut repeats = repeats(rows);
+            for index in first..first + count {
+                let mut prefix = Vec::with_capacity(40);
+                prefix.extend_from_slice(&self.root);
+                prefix.extend_from_slice(&self.matrix);
+                prefix.extend_from_slice(&index.to_le_bytes());
+                let at = (index - self.options.first_recovery) * self.options.block_size;
+                match spool {
+                    RecoverySpool::Memory { rows, .. } => {
+                        let at = at as usize;
+                        self.write_resident(
+                            out,
+                            PacketType::RecoveryData,
+                            &prefix,
+                            &rows[at..at + self.options.block_size as usize],
+                        )?;
+                    }
+                    RecoverySpool::File { file, .. } => self.write_payload(
+                        out,
+                        PacketType::RecoveryData,
+                        &prefix,
+                        whole.as_mut().map(|(body, _)| body.as_mut_slice()),
+                        |offset, bytes| {
+                            file.seek(SeekFrom::Start(at + offset))?;
+                            file.read_exact(bytes)?;
+                            Ok(())
+                        },
+                    )?,
+                }
+                if (index - first + 1).is_multiple_of(cohorts) {
+                    repeats.after((index - first + 1) / cohorts, out)?;
+                }
+            }
+        } else if number > self.volumes.len() {
+            let (first, count) = self.data_volumes[number - self.volumes.len() - 1];
+            let mut repeats = repeats(count);
+            for index in first..first + count {
+                self.write_payload(
+                    out,
+                    PacketType::Data,
+                    &index.to_le_bytes(),
+                    whole.as_mut().map(|(body, _)| body.as_mut_slice()),
+                    |offset, bytes| self.read_block(index as usize, offset, bytes, None),
+                )?;
+                repeats.after(index - first + 1, out)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the one carrier an embedded plan places inside its archive, the
+    /// metadata and every recovery packet, to `out` instead of to a file.
+    /// Sources are checked as [`Self::execute`] checks them.
+    pub(crate) fn write_embedded(
+        &self,
+        out: &mut impl Write,
+        scratch_directory: &Path,
+    ) -> EngineResult<()> {
+        let mut progress = self
+            .options
+            .execution
+            .stage(crate::runtime::Stage::Create)?;
+        if self.volumes.len() != 1 || !self.data_volumes.is_empty() {
+            return Err(EngineError::InvalidState("embedded carrier layout"));
+        }
+        if self.options.execution.open_handles < 3 {
+            return Err(EngineError::resource_limit(
+                "creation requires three open handles",
+            ));
+        }
+        for file in &self.files {
+            ensure_snapshot(self.access.as_ref(), file.source, file.snapshot)?;
+        }
+        let mut spool = self.encode(scratch_directory)?;
+        self.write_output(1, &mut spool, out)?;
+        drop(spool);
+        for file in &self.files {
+            ensure_snapshot(self.access.as_ref(), file.source, file.snapshot)?;
+        }
+        progress.advance(1);
+        Ok(())
+    }
+
+    /// The whole-file fingerprint of an embedded plan's protected bytes.
+    pub(crate) fn embedded_fingerprint(&self) -> [u8; 16] {
+        self.files[0].packet.fingerprint
+    }
+
+    /// Read one stripe of an input block. Each piece read is checked against
+    /// its snapshot afterwards, or, given `owed`, recorded there for the
+    /// caller to settle before writing anything derived from it.
+    fn read_block(
+        &self,
+        index: usize,
+        offset: u64,
+        out: &mut [u8],
+        owed: Option<&OwedChecks>,
+    ) -> EngineResult<()> {
         out.fill(0);
         for piece in &self.blocks[index].pieces {
             let start = offset.max(piece.offset);
@@ -954,20 +1194,32 @@ impl CreationPlan {
             if start >= end {
                 continue;
             }
-            ensure_snapshot(self.access.as_ref(), piece.source, piece.snapshot)?;
-            read_exact_at(
+            // Only a check after the read vouches for the bytes; a failed
+            // read is reported as the change that caused it, if one did.
+            if let Err(error) = read_exact_at(
                 &self.options.execution.diagnostics,
                 self.access.as_ref(),
                 piece.source,
                 piece.at + start - piece.offset,
                 &mut out[(start - offset) as usize..(end - offset) as usize],
-            )?;
-            ensure_snapshot(self.access.as_ref(), piece.source, piece.snapshot)?;
+            ) {
+                ensure_snapshot(self.access.as_ref(), piece.source, piece.snapshot)?;
+                return Err(error);
+            }
+            match owed {
+                Some(owed) => owed.owe(piece.source, piece.snapshot),
+                None => ensure_snapshot(self.access.as_ref(), piece.source, piece.snapshot)?,
+            }
         }
         Ok(())
     }
 
-    fn encode_cauchy<F: Field>(&self, field: F, scratch: &mut File) -> EngineResult<()> {
+    fn encode_cauchy<F: MulAccBatch + Sync>(
+        &self,
+        field: F,
+        scratch_directory: &Path,
+    ) -> EngineResult<RecoverySpool> {
+        use rayon::prelude::*;
         let mut progress = self
             .options
             .execution
@@ -987,56 +1239,305 @@ impl CreationPlan {
                 "minimum Cauchy encoding stripe",
             ));
         }
-        let batch = count.min(
-            self.options
-                .execution
-                .memory
-                .available()
-                .saturating_sub(stripe)
-                / (stripe + 64),
-        );
+        // Rows and workers meet once per group of source stripes, so a worker
+        // is only worth its fork and join with enough arithmetic behind it.
+        const MIN_WORKER_BYTES: usize = 1 << 20;
+        // Resident rows can accumulate where they are written from, so beside
+        // them the encode needs at least only a row table and one source
+        // stripe (staging and grouping below are taken only from spare room), and
+        // every row is in the one batch that walks the source once. They are
+        // admitted only with room for the pool that single pass asks for, so
+        // holding them never narrows the workers either.
+        let mut spool = self.recovery_spool(
+            count
+                .saturating_mul(64)
+                .saturating_add(stripe)
+                .saturating_add(crate::runtime::WorkerPool::unnarrowed_bytes(
+                    &self.options.execution,
+                    count.saturating_mul(stripe) / MIN_WORKER_BYTES,
+                )),
+            scratch_directory,
+        )?;
+        let resident_rows = matches!(spool, RecoverySpool::Memory { .. });
+        let per_row = if resident_rows { 64 } else { stripe + 64 };
+        // Rows that fit beside a group of `sources` source stripes, each also
+        // given a stripe buffer to accumulate in when `staged` asks for one.
+        let rows_that_fit = |sources: usize, staged: bool| {
+            count.min(
+                self.options
+                    .execution
+                    .memory
+                    .available()
+                    .saturating_sub(stripe.saturating_mul(sources))
+                    / (per_row + if staged { stripe } else { 0 }),
+            )
+        };
+        let serial = rows_that_fit(1, false);
+        if serial == 0 {
+            return Err(EngineError::resource_limit("Cauchy encoding buffers"));
+        }
+        // Recovery rows are independent, so each group of source stripes is
+        // spread over the batch's rows by a worker pool. Every batch is one
+        // more walk over the source, so the pool is admitted only into what is
+        // left after a batch wide enough for the serial pass count; workers
+        // never cost a read. If the batch still comes out narrower, the stacks
+        // go back.
+        let passes = count.div_ceil(serial);
+        let rows_per_pass = count.div_ceil(passes);
+        let headroom = rows_per_pass * per_row + stripe;
+        let work = |group: usize| {
+            rows_per_pass.saturating_mul(stripe).saturating_mul(group) / MIN_WORKER_BYTES
+        };
+        // Two optional widenings, both taken only from what is left once that
+        // batch and a pool as wide as the work asks for are set aside, plus a
+        // stripe of slack, so neither ever costs a read, a row or a worker.
+        //
+        // Staging: a resident row is a block-sized stride from the next, so a
+        // pass that accumulated in place would spread its working set over
+        // slices a power of two apart. Rows accumulate instead in one
+        // contiguous run of stripe buffers, as spooled rows always have, and
+        // each finished stripe is copied home once per pass. A block no wider
+        // than the stripe is already contiguous and is left in place.
+        //
+        // Grouping: workers meet once per group of source stripes rather than
+        // once per stripe, and fold the whole group into each row with one
+        // grouped multiply-accumulate.
+        //
+        // Staging is preferred, then the widest group. With room for neither,
+        // this is the in-place walk one stripe at a time, admitted as before.
+        let stageable = resident_rows && self.options.block_size > stripe as u64;
+        let available = self.options.execution.memory.available();
+        let widest = crate::gf::BATCH_SOURCES.min(self.blocks.len()).max(1);
+        let fits = |staged: bool, group: usize| {
+            headroom
+                .saturating_add(if staged { rows_per_pass * stripe } else { 0 })
+                .saturating_add((group - 1).saturating_mul(stripe))
+                .saturating_add(crate::runtime::SOURCE_GROUP_SLACK)
+                .saturating_add(crate::runtime::WorkerPool::unnarrowed_bytes(
+                    &self.options.execution,
+                    work(group),
+                ))
+                <= available
+        };
+        let (mut staged, mut group) = [true, false]
+            .into_iter()
+            .filter(|&staged| stageable || !staged)
+            .flat_map(|staged| (1..=widest).rev().map(move |group| (staged, group)))
+            .find(|&(staged, group)| (staged || group > 1) && fits(staged, group))
+            .unwrap_or((false, 1));
+        let extra = |staged: bool, group: usize| {
+            (group - 1) * stripe + if staged { rows_per_pass * stripe } else { 0 }
+        };
+        let mut pool = crate::runtime::WorkerPool::for_work(
+            &self.options.execution,
+            work(group),
+            headroom + extra(staged, group),
+        )?;
+        let mut batch = rows_that_fit(group, staged);
+        if batch < rows_per_pass && (pool.is_some() || group > 1 || staged) {
+            if pool.is_some() {
+                pool = None;
+                let wanted = self.options.execution.workers;
+                self.options.execution.diagnostics.note_workers(1, wanted);
+            }
+            (staged, group) = (false, 1);
+            batch = rows_that_fit(1, false);
+        }
         if batch == 0 {
             return Err(EngineError::resource_limit("Cauchy encoding buffers"));
         }
-        let _memory = self
-            .options
-            .execution
-            .memory
-            .reserve_as(MemoryCategory::CodecScratch, batch * (stripe + 64) + stripe)?;
-        let mut rows = vec![vec![0; stripe]; batch];
-        let mut bytes = vec![0; stripe];
+        let _memory = self.options.execution.memory.reserve_as(
+            MemoryCategory::CodecScratch,
+            batch * (per_row + if staged { stripe } else { 0 }) + stripe * group,
+        )?;
+        tracing::debug!(group, batch, staged, "PAR3 Cauchy encode admitted");
+        let (mut resident, mut file) = match &mut spool {
+            RecoverySpool::Memory { rows, .. } => (Some(rows), None),
+            RecoverySpool::File { file, .. } => (None, Some(file)),
+        };
+        // Spooled rows, and staged resident ones, accumulate here, one
+        // contiguous stripe per row.
+        let mut rows = vec![
+            0;
+            if resident.is_none() || staged {
+                batch * stripe
+            } else {
+                0
+            }
+        ];
+        let mut sources = vec![vec![0; stripe]; group];
+        // A stripe pass reads every block before writing any row, so each
+        // source is checked once per pass, after its last read.
+        let owed = OwedChecks::default();
         for first in (0..count).step_by(batch) {
             let amount = batch.min(count - first);
             let mut offset = 0;
             while offset < self.options.block_size {
                 let take = (self.options.block_size - offset).min(stripe as u64) as usize;
-                for row in &mut rows[..amount] {
+                // An unstaged resident row's stripe is accumulated in place;
+                // any other in its stripe buffer, copied home or written out
+                // once it is complete.
+                let at = offset as usize;
+                let mut active: Vec<&mut [u8]> = match resident.as_deref_mut() {
+                    Some(resident) if !staged => resident
+                        .chunks_exact_mut(self.options.block_size as usize)
+                        .skip(first)
+                        .take(amount)
+                        .map(|row| &mut row[at..at + take])
+                        .collect(),
+                    _ => rows
+                        .chunks_exact_mut(stripe)
+                        .take(amount)
+                        .map(|row| &mut row[..take])
+                        .collect(),
+                };
+                for row in &mut active {
                     row.fill(0);
                 }
-                for block in 0..self.blocks.len() {
-                    self.options.execution.cancel.check()?;
-                    self.read_block(block, offset, &mut bytes[..take])?;
-                    for (index, row) in rows[..amount].iter_mut().enumerate() {
-                        let factor = crate::cauchy::element(
-                            &field,
-                            block as u64,
-                            self.options.first_recovery + (first + index) as u64,
-                        )?;
-                        field.mul_acc(&mut row[..take], &bytes[..take], factor);
+                // The whole walk over the source runs inside the pool, so each
+                // block's rows fork from a worker that joins the arithmetic
+                // instead of from a caller parked on every block. The reads
+                // are the same reads, in the same order, on one thread.
+                let parallel = pool.is_some();
+                let mut accumulate = || -> EngineResult<()> {
+                    let mut start = 0;
+                    while start < self.blocks.len() {
+                        let end = (start + group).min(self.blocks.len());
+                        for (source, block) in sources.iter_mut().zip(start..end) {
+                            self.options.execution.cancel.check()?;
+                            self.read_block(block, offset, &mut source[..take], Some(&owed))?;
+                        }
+                        let mut inputs: [&[u8]; crate::gf::BATCH_SOURCES] =
+                            [&[]; crate::gf::BATCH_SOURCES];
+                        for (input, source) in inputs.iter_mut().zip(&sources[..end - start]) {
+                            *input = &source[..take];
+                        }
+                        let inputs = &inputs[..end - start];
+                        let apply = |(index, row): (usize, &mut &mut [u8])| -> EngineResult<()> {
+                            let recovery = self.options.first_recovery + (first + index) as u64;
+                            let mut factors = [F::Symbol::default(); crate::gf::BATCH_SOURCES];
+                            for (factor, block) in factors.iter_mut().zip(start..end) {
+                                *factor = crate::cauchy::element(&field, block as u64, recovery)?;
+                            }
+                            // A group of one, the one-stripe walk, calls the
+                            // single-source kernel itself: inlined through the
+                            // batch fallback it compiles to a slower loop.
+                            if let [input] = inputs {
+                                field.mul_acc(&mut row[..take], input, factors[0]);
+                            } else {
+                                field.mul_acc_batch(
+                                    &mut row[..take],
+                                    inputs,
+                                    &factors[..end - start],
+                                );
+                            }
+                            Ok(())
+                        };
+                        // Each task owns disjoint rows and reads the shared
+                        // stripes, so the bytes are the same for any worker
+                        // count and any group width.
+                        if parallel {
+                            active.par_iter_mut().enumerate().try_for_each(apply)?;
+                        } else {
+                            active.iter_mut().enumerate().try_for_each(apply)?;
+                        }
+                        start = end;
                     }
+                    Ok(())
+                };
+                match &pool {
+                    Some(pool) => pool.pool().install(accumulate)?,
+                    None => accumulate()?,
                 }
-                for (index, row) in rows[..amount].iter().enumerate() {
-                    scratch.seek(SeekFrom::Start(
-                        (first + index) as u64 * self.options.block_size + offset,
-                    ))?;
-                    scratch.write_all(&row[..take])?;
+                // Every block was read before any row leaves this pass, so
+                // each source is checked once per pass.
+                owed.settle(self.access.as_ref())?;
+                drop(active);
+                for index in 0..amount {
+                    let home = (first + index) as u64 * self.options.block_size + offset;
+                    // Empty when unstaged resident rows were filled in place.
+                    let row = rows
+                        .get(index * stripe..index * stripe + take)
+                        .unwrap_or(&[]);
+                    if let Some(file) = file.as_mut() {
+                        file.seek(SeekFrom::Start(home))?;
+                        file.write_all(row)?;
+                    } else if let Some(resident) = resident.as_deref_mut().filter(|_| staged) {
+                        let home = home as usize;
+                        resident[home..home + take].copy_from_slice(row);
+                    }
                     progress.advance(take as u64);
                     self.options.execution.cancel.check()?;
                 }
                 offset += take as u64;
             }
         }
-        Ok(())
+        Ok(spool)
+    }
+
+    /// Keep every recovery row in memory when all of them fit beside what the
+    /// encode (`encode` bytes) and then the carrier stage will reserve, so no
+    /// scratch file is made and no payload is written out and read back.
+    /// Otherwise spool them to a scratch file as before. Decided once, before
+    /// the encode, and never revisited part-way.
+    fn recovery_spool(
+        &self,
+        encode: usize,
+        scratch_directory: &Path,
+    ) -> EngineResult<RecoverySpool> {
+        let memory = &self.options.execution.memory;
+        if let Ok(bytes) = usize::try_from(self.requirements.scratch_bytes)
+            && bytes
+                .checked_add(encode)
+                .and_then(|need| need.checked_add(self.carrier_stage_bytes()))
+                .is_some_and(|need| need <= memory.available())
+            && let Ok(reservation) = memory.reserve_as(MemoryCategory::OutputStaging, bytes)
+        {
+            tracing::debug!(bytes, "PAR3 recovery rows held resident");
+            return Ok(RecoverySpool::Memory {
+                rows: vec![0; bytes],
+                _reservation: reservation,
+            });
+        }
+        let path = crate::session_repair::ScratchFile::new(
+            &scratch_directory.join("recovery-spool"),
+            &self.options.execution,
+        )?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open_budgeted(path.path(), &self.options.execution)?;
+        file.set_len(self.requirements.scratch_bytes)?;
+        Ok(RecoverySpool::File { file, _path: path })
+    }
+
+    /// What the carrier stage reserves at its peak while resident rows are
+    /// still held. Writing takes the staging buffer and a streamed packet's
+    /// stripe. Authentication runs as metadata is written, beside the staging
+    /// buffer alone, and takes the widest metadata packet twice over (wire
+    /// copy and parsed body, each with its bookkeeping); the second term was
+    /// sized for a scanner reading the carrier back and still bounds that.
+    fn carrier_stage_bytes(&self) -> usize {
+        let stripe = self.options.execution.stripe_bytes.min(64 << 10);
+        let packet = self.metadata.iter().map(Vec::len).max().unwrap_or(0);
+        let writing = stripe.saturating_mul(2).saturating_add(512);
+        let scanning = packet
+            .saturating_add(512)
+            .saturating_mul(2)
+            .saturating_add(3 * (64 << 10));
+        writing.max(scanning)
+    }
+
+    /// One payload-sized buffer, if the budget has room for it now.
+    fn whole_payload(&self) -> Option<(Vec<u8>, Reservation)> {
+        let size = usize::try_from(self.options.block_size).ok()?;
+        let reservation = self
+            .options
+            .execution
+            .memory
+            .reserve_as(MemoryCategory::OutputStaging, size)
+            .ok()?;
+        Some((vec![0; size], reservation))
     }
 
     fn write_payload(
@@ -1044,8 +1545,14 @@ impl CreationPlan {
         out: &mut impl Write,
         kind: PacketType,
         prefix: &[u8],
+        whole: Option<&mut [u8]>,
         mut read: impl FnMut(u64, &mut [u8]) -> EngineResult<()>,
     ) -> EngineResult<()> {
+        if let Some(body) = whole {
+            self.options.execution.cancel.check()?;
+            read(0, body)?;
+            return self.write_resident(out, kind, prefix, body);
+        }
         let size = self.options.execution.stripe_bytes.min(64 << 10);
         let _buffer = self
             .options
@@ -1053,17 +1560,7 @@ impl CreationPlan {
             .memory
             .reserve_as(MemoryCategory::OutputStaging, size + 512)?;
         let mut bytes = vec![0; size];
-        let mut header = PacketHeader {
-            hash: [0; 16],
-            length: 48 + prefix.len() as u64 + self.options.block_size,
-            input_set_id: self.id,
-            packet_type: kind,
-        };
-        let mut encoded = Vec::with_capacity(48);
-        header.write(&mut encoded);
-        let mut hash = FingerprintHasher::new();
-        hash.update(&encoded[24..]);
-        hash.update(prefix);
+        let (mut header, mut encoded, mut hash) = self.payload_header(kind, prefix);
         let mut offset = 0;
         while offset < self.options.block_size {
             self.options.execution.cancel.check()?;
@@ -1088,33 +1585,84 @@ impl CreationPlan {
         Ok(())
     }
 
+    /// Write one payload packet whose body is already in memory: hashed and
+    /// written from the same bytes.
+    fn write_resident(
+        &self,
+        out: &mut impl Write,
+        kind: PacketType,
+        prefix: &[u8],
+        body: &[u8],
+    ) -> EngineResult<()> {
+        let (mut header, mut encoded, mut hash) = self.payload_header(kind, prefix);
+        hash.update(body);
+        header.hash = hash.finalize();
+        encoded.clear();
+        header.write(&mut encoded);
+        out.write_all(&encoded)?;
+        out.write_all(prefix)?;
+        out.write_all(body)?;
+        Ok(())
+    }
+
+    /// A payload packet's header before its hash is known, its encoding, and
+    /// the packet hash fed with what precedes the body: the header fields
+    /// after the hash, then the prefix.
+    fn payload_header(
+        &self,
+        kind: PacketType,
+        prefix: &[u8],
+    ) -> (PacketHeader, Vec<u8>, FingerprintHasher) {
+        let header = PacketHeader {
+            hash: [0; 16],
+            length: 48 + prefix.len() as u64 + self.options.block_size,
+            input_set_id: self.id,
+            packet_type: kind,
+        };
+        let mut encoded = Vec::with_capacity(48);
+        header.write(&mut encoded);
+        let mut hash = FingerprintHasher::new();
+        hash.update(&encoded[24..]);
+        hash.update(prefix);
+        (header, encoded, hash)
+    }
+
     fn build_metadata(&mut self) -> EngineResult<()> {
-        let mut identity = FingerprintHasher::new();
-        identity.update(&self.options.block_size.to_le_bytes());
-        identity.update(&[self.requirements.field.size]);
-        identity.update(&self.requirements.field.generator.to_le_bytes());
-        for file in &self.files {
-            identity.update(file.name.as_bytes());
-            identity.update(
-                &Packet::new(InputSetId::ZERO, PacketBody::File(file.packet.clone())).to_bytes(),
-            );
-        }
-        self.id = InputSetId(identity.finalize()[..8].try_into().expect("eight bytes"));
+        let start = StartPacket {
+            parent_input_set_id: InputSetId::ZERO,
+            parent_root_hash: [0; 16],
+            block_size: self.options.block_size,
+            galois_field: self.requirements.field,
+            legacy_random: None,
+        };
+        // Every directory the set describes is an ancestor of a file name,
+        // ordered the way the reference lists them: a directory after the
+        // directories beneath it. The Directory packets go out in this order
+        // too.
+        let directories =
+            crate::create::directory_names(self.files.iter().map(|file| file.name.as_str()), &[]);
+        self.id = crate::create::input_set_id(
+            self.files.iter().map(|file| crate::create::SetIdFile {
+                name: &file.name,
+                size: file
+                    .packet
+                    .chunks
+                    .iter()
+                    .map(ChunkDescription::length)
+                    .sum(),
+                fingerprint: &file.packet.fingerprint,
+                chunks: &file.packet.chunks,
+            }),
+            directories.iter().map(String::as_str),
+            self.options.block_size,
+            &start.to_body_bytes(),
+        );
         let mut packets = vec![
             Packet::new(
                 self.id,
                 PacketBody::Creator(CreatorPacket::new(&self.options.creator)),
             ),
-            Packet::new(
-                self.id,
-                PacketBody::Start(StartPacket {
-                    parent_input_set_id: InputSetId::ZERO,
-                    parent_root_hash: [0; 16],
-                    block_size: self.options.block_size,
-                    galois_field: self.requirements.field,
-                    legacy_random: None,
-                }),
-            ),
+            Packet::new(self.id, PacketBody::Start(start)),
         ];
         if self.options.recovery_count != 0 {
             let body = match self.options.codec {
@@ -1141,6 +1689,10 @@ impl CreationPlan {
             packets.push(packet);
         }
         let mut children: BTreeMap<String, Vec<Fingerprint>> = BTreeMap::new();
+        // Two inputs can describe themselves identically — empty files of one
+        // name in different directories — and then share one packet, as the
+        // reference does: each parent lists the hash, the packet goes out once.
+        let mut written = std::collections::BTreeSet::new();
         for file in &self.files {
             let packet = Packet::new(self.id, PacketBody::File(file.packet.clone()));
             let parent = parent(&file.name);
@@ -1148,33 +1700,26 @@ impl CreationPlan {
                 .entry(parent.to_owned())
                 .or_default()
                 .push(packet.hash());
-            packets.push(packet);
-            let mut ancestor = parent;
-            while !ancestor.is_empty() {
-                children.entry(ancestor.to_owned()).or_default();
-                ancestor = parent_of(ancestor);
+            if written.insert(packet.hash()) {
+                packets.push(packet);
             }
         }
-        let mut directories: Vec<String> = children
-            .keys()
-            .filter(|name| !name.is_empty())
-            .cloned()
-            .collect();
-        directories.sort_by_key(|name| std::cmp::Reverse(name.matches('/').count()));
         for directory in directories {
             let packet = Packet::new(
                 self.id,
                 PacketBody::Directory(DirectoryPacket {
                     name: directory.rsplit('/').next().expect("directory").to_owned(),
                     option_hashes: Vec::new(),
-                    children: children.remove(&directory).unwrap_or_default(),
+                    children: sorted_children(children.remove(&directory)),
                 }),
             );
             children
                 .entry(parent(&directory).to_owned())
                 .or_default()
                 .push(packet.hash());
-            packets.push(packet);
+            if written.insert(packet.hash()) {
+                packets.push(packet);
+            }
         }
         let root = Packet::new(
             self.id,
@@ -1182,7 +1727,7 @@ impl CreationPlan {
                 lowest_unused_block_index: self.blocks.len() as u64,
                 attributes: 0,
                 option_hashes: Vec::new(),
-                children: children.remove("").unwrap_or_default(),
+                children: sorted_children(children.remove("")),
             }),
         );
         self.root = root.hash();
@@ -1250,6 +1795,13 @@ impl CreationPlan {
         self.requirements
             .output_sizes
             .push(self.requirements.metadata_bytes);
+        let metadata_bytes = self.requirements.metadata_bytes;
+        let common_bytes = metadata_bytes
+            - self
+                .metadata
+                .first()
+                .map_or(0, |packet| packet.len() as u64);
+        let repeat = self.repeat_metadata;
         for (extra, per_unit, mut first, mut remaining, volumes) in [
             (
                 88,
@@ -1275,13 +1827,39 @@ impl CreationPlan {
                 .block_size
                 .checked_add(extra)
                 .ok_or(EngineError::resource_limit("payload packet size"))?;
+            // A carrier of `count` units: the payload, one metadata copy,
+            // and the further copies spread between its units.
+            let carrier = |count: u64| -> Option<u64> {
+                let copies = if repeat {
+                    common_bytes.checked_mul(metadata_repeats(count))?
+                } else {
+                    0
+                };
+                packet
+                    .checked_mul(count)?
+                    .checked_mul(per_unit)?
+                    .checked_add(metadata_bytes)?
+                    .checked_add(copies)
+            };
             // Both layout limits are stated in payload packets, so they are
-            // divided down into whole units before anything is cut.
+            // divided down into whole units before anything is cut. A size
+            // limit takes the most units whose carrier, repeated metadata
+            // included, still fits; carriers only grow with their unit count.
             let cap = match self.options.volumes {
                 VolumeLayout::Variable => u64::MAX,
                 VolumeLayout::Uniform(count) => count / per_unit,
                 VolumeLayout::SizeLimited(bytes) => {
-                    bytes.saturating_sub(self.requirements.metadata_bytes) / packet / per_unit
+                    let (mut low, mut high) =
+                        (0, bytes.saturating_sub(metadata_bytes) / packet / per_unit);
+                    while low < high {
+                        let middle = low + (high - low).div_ceil(2);
+                        if carrier(middle).is_some_and(|size| size <= bytes) {
+                            low = middle;
+                        } else {
+                            high = middle - 1;
+                        }
+                    }
+                    low
                 }
             };
             if cap == 0 && remaining != 0 {
@@ -1298,17 +1876,9 @@ impl CreationPlan {
                     cap
                 });
                 volumes.push((first, count));
-                self.requirements.output_sizes.push(
-                    self.requirements
-                        .metadata_bytes
-                        .checked_add(
-                            packet
-                                .checked_mul(count)
-                                .and_then(|bytes| bytes.checked_mul(per_unit))
-                                .ok_or(EngineError::resource_limit("volume size"))?,
-                        )
-                        .ok_or(EngineError::resource_limit("volume size"))?,
-                );
+                self.requirements
+                    .output_sizes
+                    .push(carrier(count).ok_or(EngineError::resource_limit("volume size"))?);
                 first += count;
                 remaining -= count;
                 growth = growth.saturating_mul(2);
@@ -1316,6 +1886,102 @@ impl CreationPlan {
         }
         Ok(())
     }
+}
+
+/// Where packed tails may go, in the order the reference searches them.
+///
+/// Without deduplication (`-d0`) the reference puts a tail behind the first
+/// earlier tail, in placement order, that is still the last one in its block
+/// and leaves room for it. A block only grows at its end, so a tail with
+/// another placed behind it closes for good. With deduplication (`-d1` and
+/// `-d2`) it instead takes the first block, by block index, with room for the
+/// tail. Either way a tail opens a new block only when nothing fits.
+///
+/// The slots — one per placed tail, or one per block — sit under a max tree
+/// of their spare room, so the first one that fits is found in logarithmic
+/// time rather than by scanning; a closed slot or a full block has no room.
+/// The tree and the slot list stay under 48 bytes per placed tail or block,
+/// inside the 1024 bytes per block the plan reserves before it starts.
+#[derive(Default)]
+struct TailSlots {
+    /// Leaves from `tree.len() / 2`, one per slot; each inner node holds the
+    /// larger of its children.
+    tree: Vec<u64>,
+    /// Each placement-order slot's block; unused when slots are blocks.
+    blocks: Vec<usize>,
+    /// Slots are blocks, searched by block index (`-d1` and `-d2`).
+    by_block: bool,
+}
+
+impl TailSlots {
+    /// Slots searched by block index, as the reference's deduplicating modes do.
+    fn by_block() -> Self {
+        Self {
+            by_block: true,
+            ..Self::default()
+        }
+    }
+
+    /// The block of the first slot with at least `length` bytes spare. In
+    /// placement order that slot closes: the tail about to go there becomes its
+    /// block's last.
+    fn take(&mut self, length: u64) -> Option<usize> {
+        if self.tree.get(1).is_none_or(|&room| room < length) {
+            return None;
+        }
+        let mut node = 1;
+        while node < self.tree.len() / 2 {
+            node = if self.tree[2 * node] >= length {
+                2 * node
+            } else {
+                2 * node + 1
+            };
+        }
+        let slot = node - self.tree.len() / 2;
+        if self.by_block {
+            return Some(slot);
+        }
+        self.set(slot, 0);
+        Some(self.blocks[slot])
+    }
+
+    /// Record a tail just placed in `block`, leaving `room` bytes behind it.
+    fn place(&mut self, block: usize, room: u64) {
+        let slot = if self.by_block {
+            block
+        } else {
+            self.blocks.push(block);
+            self.blocks.len() - 1
+        };
+        let leaves = self.tree.len() / 2;
+        if slot >= leaves {
+            let grown = (slot + 1).next_power_of_two().max(16);
+            let mut tree = vec![0; 2 * grown];
+            tree[grown..grown + leaves].copy_from_slice(&self.tree[leaves..]);
+            for node in (1..grown).rev() {
+                tree[node] = tree[2 * node].max(tree[2 * node + 1]);
+            }
+            self.tree = tree;
+        }
+        self.set(slot, room);
+    }
+
+    fn set(&mut self, slot: usize, room: u64) {
+        let mut node = slot + self.tree.len() / 2;
+        self.tree[node] = room;
+        while node > 1 {
+            node /= 2;
+            self.tree[node] = self.tree[2 * node].max(self.tree[2 * node + 1]);
+        }
+    }
+}
+
+/// A Directory or Root packet's children, in the order the reference writes
+/// them.
+fn sorted_children(children: Option<Vec<Fingerprint>>) -> Vec<Fingerprint> {
+    let mut children = children.unwrap_or_default();
+    crate::create::sort_children(&mut children);
+    children
 }
 
 /// Refuse a source name the engine would later refuse to repair.
@@ -1344,9 +2010,6 @@ fn suffix(stem: &Path, suffix: &str) -> PathBuf {
 }
 fn parent(name: &str) -> &str {
     name.rsplit_once('/').map_or("", |(parent, _)| parent)
-}
-fn parent_of(name: &str) -> &str {
-    parent(name)
 }
 fn append_full(chunks: &mut Vec<ChunkDescription>, index: u64, size: u64) {
     if let Some(ChunkDescription::Protected {
@@ -1384,6 +2047,7 @@ fn append_tail(chunks: &mut Vec<ChunkDescription>, length: u64, tail: ChunkTail,
         tail,
     });
 }
+#[allow(clippy::too_many_arguments)]
 fn find_shift(
     access: &dyn SourceAccess,
     source: SourceId,
@@ -1391,9 +2055,10 @@ fn find_shift(
     start: u64,
     size: u64,
     locators: &BTreeMap<u64, Vec<Fingerprint>>,
+    filter: &CrcFilter,
+    rolling: &SlidingCrc,
     options: &ExecutionOptions,
 ) -> EngineResult<Option<u64>> {
-    use crate::placement::SlidingCrc;
     let window = usize::try_from(size)
         .map_err(|_| EngineError::resource_limit("sliding deduplication window"))?;
     let stripe = options.stripe_bytes.min(64 << 10);
@@ -1404,47 +2069,50 @@ fn find_shift(
             .and_then(|n| n.checked_add(4096))
             .ok_or(EngineError::resource_limit("sliding deduplication buffers"))?,
     )?;
-    let mut ring = vec![0; window];
+    let mut sliding = SlidingWindow::new(window);
     let mut input = vec![0; stripe];
-    read_exact_at(&options.diagnostics, access, source, start, &mut ring)?;
-    let rolling = SlidingCrc::new(size);
-    let mut state = SlidingCrc::raw(&ring);
+    sliding.start(rolling, |ring| {
+        read_exact_at(&options.diagnostics, access, source, start, ring)
+    })?;
     let maximum = (snapshot.len - start - size).min(size - 1);
     let mut shift = 0;
-    let mut cursor = 0;
     let mut buffered = 0;
     let mut consumed = 0;
+    let mut candidate = filter.contains(sliding.crc(rolling));
     loop {
-        if let Some(hashes) = locators.get(&rolling.finish(state)) {
+        if candidate && let Some(hashes) = locators.get(&sliding.crc(rolling)) {
             let mut hash = FingerprintHasher::new();
-            hash.update(&ring[cursor..]);
-            hash.update(&ring[..cursor]);
+            for piece in sliding.pieces(&input[..buffered], consumed) {
+                hash.update(piece);
+            }
             if hashes.contains(&hash.finalize()) {
                 ensure_snapshot(access, source, snapshot)?;
-                return Ok(Some(shift));
+                return Ok(Some(shift + consumed as u64));
             }
         }
+        if let Some(used) = sliding.scan(rolling, &input[..buffered], consumed, |value| {
+            filter.contains(value)
+        }) {
+            consumed = used;
+            candidate = true;
+            continue;
+        }
+        sliding.push(&input[..buffered]);
+        shift += buffered as u64;
         if shift == maximum {
             break;
         }
-        if consumed == buffered {
-            options.cancel.check()?;
-            buffered = (maximum - shift).min(stripe as u64) as usize;
-            read_exact_at(
-                &options.diagnostics,
-                access,
-                source,
-                start + size + shift,
-                &mut input[..buffered],
-            )?;
-            consumed = 0;
-        }
-        let byte = input[consumed];
-        consumed += 1;
-        state = rolling.advance(state, byte, ring[cursor]);
-        ring[cursor] = byte;
-        cursor = (cursor + 1) % window;
-        shift += 1;
+        options.cancel.check()?;
+        buffered = (maximum - shift).min(stripe as u64) as usize;
+        read_exact_at(
+            &options.diagnostics,
+            access,
+            source,
+            start + size + shift,
+            &mut input[..buffered],
+        )?;
+        consumed = 0;
+        candidate = false;
     }
     ensure_snapshot(access, source, snapshot)?;
     Ok(None)
@@ -1460,6 +2128,166 @@ struct PlanningReader<'a> {
     position: u64,
     file_hash: FingerprintHasher,
     quick_crc: RollingHasher,
+    /// Set only while a pool is held; otherwise every read is the walk's own.
+    ahead: Option<HashAhead<'a>>,
+}
+
+/// Fill `out` from `start`, through the forward reader while it lasts and
+/// positionally after it. Hashes nothing.
+fn fetch(
+    access: &dyn SourceAccess,
+    source: SourceId,
+    options: &ExecutionOptions,
+    forward: &mut Option<Box<dyn Read + Send>>,
+    start: u64,
+    out: &mut [u8],
+) -> EngineResult<()> {
+    let mut done = 0;
+    while done < out.len() {
+        options.cancel.check()?;
+        let Some(reader) = forward.as_mut() else {
+            break;
+        };
+        let read = options
+            .diagnostics
+            .read(reader.as_mut(), &mut out[done..])?;
+        if read > out.len() - done {
+            return Err(EngineError::InvalidState("invalid source read length"));
+        }
+        if read == 0 {
+            *forward = None;
+            break;
+        }
+        done += read;
+    }
+    if done < out.len() {
+        read_exact_at(
+            &options.diagnostics,
+            access,
+            source,
+            start + done as u64,
+            &mut out[done..],
+        )?;
+    }
+    Ok(())
+}
+
+/// Planning with an admitted worker pool: the chunk walk is fixed in advance
+/// (every chunk is a block, the last one short), so the reader reads ahead of
+/// it, packing the very reads the serial walk makes into parallel-hash
+/// buffers. The pool hashes one buffer, file hash and chunk hashes side by
+/// side, while the calling thread computes its CRCs and reads the next one.
+/// Finished chunks wait here until the walk asks for them, at most two
+/// buffers' worth, each inside the per-block plan estimate.
+struct HashAhead<'a> {
+    pool: &'a rayon::ThreadPool,
+    /// One or two buffers; reads overlap hashing only with two.
+    buffers: &'a mut [Vec<u8>],
+    block_size: u64,
+    /// The serial walk's read size.
+    stripe: usize,
+    /// A buffer read and not yet hashed: index, file offset and length.
+    filled: Option<(usize, u64, usize)>,
+    /// File offset of the next read.
+    read: u64,
+    /// Bytes of the file hashed so far.
+    hashed: u64,
+    chunk_hash: FingerprintHasher,
+    chunk_crc: RollingHasher,
+    /// Finished chunks as `(offset, fingerprint, rolling hash)`.
+    ready: VecDeque<(u64, Fingerprint, u64)>,
+    /// The file's inline tail, once it has been read.
+    inline: Option<(u64, Vec<u8>)>,
+    /// A read that failed ahead of the walk, returned when the walk gets there.
+    failed: Option<EngineError>,
+}
+
+impl<'a> HashAhead<'a> {
+    fn new(
+        pool: &'a rayon::ThreadPool,
+        buffers: &'a mut [Vec<u8>],
+        block_size: u64,
+        stripe: usize,
+    ) -> Self {
+        Self {
+            pool,
+            buffers,
+            block_size,
+            stripe,
+            filled: None,
+            read: 0,
+            hashed: 0,
+            chunk_hash: FingerprintHasher::new(),
+            chunk_crc: RollingHasher::new(),
+            ready: VecDeque::new(),
+            inline: None,
+            failed: None,
+        }
+    }
+}
+
+/// The chunks `filled` bytes at file offset `start` cover, as `(chunk offset,
+/// chunk length, range in the buffer)`. Chunks are blocks; the last is short.
+fn ahead_segments(
+    start: u64,
+    filled: usize,
+    len: u64,
+    block_size: u64,
+) -> impl Iterator<Item = (u64, u64, std::ops::Range<usize>)> {
+    let end = start + filled as u64;
+    let mut at = start;
+    std::iter::from_fn(move || {
+        if at >= end {
+            return None;
+        }
+        let chunk = at / block_size * block_size;
+        let length = (len - chunk).min(block_size);
+        let stop = end.min(chunk + length);
+        let segment = (
+            chunk,
+            length,
+            (at - start) as usize..(stop - start) as usize,
+        );
+        at = stop;
+        Some(segment)
+    })
+}
+
+/// Whether the walk reads the chunk of `length` as an inline tail rather
+/// than hashing it as a block: a tail shorter than [`TAIL_HASH_LEN`]. A full
+/// block shorter than that is still a block.
+fn inline_tail(length: u64, block_size: u64) -> bool {
+    length < TAIL_HASH_LEN as u64 && length != block_size
+}
+
+/// Read whole serial-walk reads from `*read` into `buffer` while they fit:
+/// a chunk is read a stripe at a time from its start, and an inline tail in
+/// one read, exactly as [`PlanningReader::hash_chunk`] and the walk do.
+fn fill_ahead(
+    fetch: &mut impl FnMut(u64, &mut [u8]) -> EngineResult<()>,
+    buffer: &mut [u8],
+    read: &mut u64,
+    len: u64,
+    block_size: u64,
+    stripe: usize,
+) -> EngineResult<usize> {
+    let mut filled = 0;
+    while *read < len {
+        let chunk = *read / block_size * block_size;
+        let length = (len - chunk).min(block_size);
+        let take = if length < TAIL_HASH_LEN as u64 {
+            length as usize
+        } else {
+            (chunk + length - *read).min(stripe as u64) as usize
+        };
+        if filled + take > buffer.len() {
+            break;
+        }
+        fetch(*read, &mut buffer[filled..filled + take])?;
+        filled += take;
+        *read += take as u64;
+    }
+    Ok(filled)
 }
 
 impl PlanningReader<'_> {
@@ -1469,38 +2297,32 @@ impl PlanningReader<'_> {
                 "creation hash frontier is discontinuous",
             ));
         }
-        let mut done = 0;
-        while done < out.len() {
-            self.options.cancel.check()?;
-            let Some(reader) = self.forward.as_mut() else {
-                break;
-            };
-            let read = self
-                .options
-                .diagnostics
-                .read(reader.as_mut(), &mut out[done..])?;
-            if read > out.len() - done {
-                return Err(EngineError::InvalidState("invalid source read length"));
-            }
-            if read == 0 {
-                self.forward = None;
-                break;
-            }
-            done += read;
+        if self.ahead.is_some() {
+            return self.read_inline_ahead(start, out);
         }
-        if done < out.len() {
-            read_exact_at(
-                &self.options.diagnostics,
-                self.access,
-                self.source,
-                start + done as u64,
-                &mut out[done..],
-            )?;
-        }
+        fetch(
+            self.access,
+            self.source,
+            self.options,
+            &mut self.forward,
+            start,
+            out,
+        )?;
         self.file_hash.update(out);
         let quick = (16384u64.saturating_sub(start)).min(out.len() as u64) as usize;
         self.quick_crc.update(&out[..quick]);
         self.position += out.len() as u64;
+        Ok(())
+    }
+
+    /// Read the file's inline tail. As with a chunk, a failed read, whether
+    /// made here or read ahead on a pool, is reported as the change behind
+    /// it, if any.
+    fn read_inline(&mut self, start: u64, out: &mut [u8]) -> EngineResult<()> {
+        if let Err(error) = self.read(start, out) {
+            ensure_snapshot(self.access, self.source, self.snapshot)?;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -1511,21 +2333,405 @@ impl PlanningReader<'_> {
         crc_length: u64,
         buffer: &mut [u8],
     ) -> EngineResult<(Fingerprint, u64)> {
+        // Planning writes nothing: the check after the file's last chunk
+        // vouches for every chunk hash, and execution checks again before
+        // reading. A failed read is reported as the change behind it, if any.
         let mut progress = self.options.stage(crate::runtime::Stage::Verify)?;
-        ensure_snapshot(self.access, self.source, self.snapshot)?;
+        if self.ahead.is_some() {
+            return self.hash_chunk_ahead(start, length, crc_length, &mut progress);
+        }
         let mut hash = FingerprintHasher::new();
         let mut crc = RollingHasher::new();
         let mut offset = 0;
         while offset < length {
             let take = (length - offset).min(buffer.len() as u64) as usize;
-            self.read(start + offset, &mut buffer[..take])?;
+            if let Err(error) = self.read(start + offset, &mut buffer[..take]) {
+                ensure_snapshot(self.access, self.source, self.snapshot)?;
+                return Err(error);
+            }
             hash.update(&buffer[..take]);
             let crc_take = crc_length.saturating_sub(offset).min(take as u64) as usize;
             crc.update(&buffer[..crc_take]);
             progress.advance(take as u64);
             offset += take as u64;
         }
-        ensure_snapshot(self.access, self.source, self.snapshot)?;
         Ok((hash.finalize(), crc.finalize()))
+    }
+
+    /// [`Self::hash_chunk`] with a pool: step the read-ahead until the chunk
+    /// at `start` is finished. The walk must ask for the chunks it derived.
+    fn hash_chunk_ahead(
+        &mut self,
+        start: u64,
+        length: u64,
+        crc_length: u64,
+        progress: &mut crate::runtime::StageGuard,
+    ) -> EngineResult<(Fingerprint, u64)> {
+        let block_size = self.ahead.as_ref().map_or(1, |ahead| ahead.block_size);
+        let full = length == block_size;
+        if start != self.position
+            || !start.is_multiple_of(block_size)
+            || length != (self.snapshot.len - start).min(block_size)
+            || crc_length != if full { length } else { TAIL_HASH_LEN as u64 }
+        {
+            return Err(EngineError::InvalidState(
+                "creation hash frontier is discontinuous",
+            ));
+        }
+        let mut reported = start;
+        loop {
+            let ahead = self.ahead.as_mut().expect("pooled planning");
+            let done = ahead.hashed.clamp(start, start + length);
+            if done > reported {
+                progress.advance(done - reported);
+                reported = done;
+            }
+            if let Some(&(at, fingerprint, rolling)) = ahead.ready.front() {
+                if at != start {
+                    return Err(EngineError::InvalidState(
+                        "creation hash frontier is discontinuous",
+                    ));
+                }
+                ahead.ready.pop_front();
+                self.position += length;
+                return Ok((fingerprint, rolling));
+            }
+            if let Err(error) = self.step() {
+                ensure_snapshot(self.access, self.source, self.snapshot)?;
+                return Err(error);
+            }
+        }
+    }
+
+    /// [`Self::read`] with a pool, which the walk calls only for the file's
+    /// inline tail.
+    fn read_inline_ahead(&mut self, start: u64, out: &mut [u8]) -> EngineResult<()> {
+        loop {
+            let ahead = self.ahead.as_mut().expect("pooled planning");
+            if let Some((at, bytes)) = ahead.inline.take() {
+                if at != start || bytes.len() != out.len() {
+                    return Err(EngineError::InvalidState(
+                        "creation hash frontier is discontinuous",
+                    ));
+                }
+                out.copy_from_slice(&bytes);
+                self.position += out.len() as u64;
+                return Ok(());
+            }
+            self.step()?;
+        }
+    }
+
+    /// Hash the oldest buffer read ahead: the pool runs the file hash and the
+    /// chunk hashes side by side while this thread takes the CRCs and, with a
+    /// second buffer, reads the next one. Reads stay on this thread, in the
+    /// serial walk's order and sizes. BLAKE3 gives the same digest however
+    /// its input is split, so the hashes are the serial walk's.
+    fn step(&mut self) -> EngineResult<()> {
+        let (access, source, options, len) =
+            (self.access, self.source, self.options, self.snapshot.len);
+        let forward = &mut self.forward;
+        let mut read = |at: u64, out: &mut [u8]| fetch(access, source, options, forward, at, out);
+        let file_hash = &mut self.file_hash;
+        let quick_crc = &mut self.quick_crc;
+        let ahead = self.ahead.as_mut().expect("pooled planning");
+        if let Some(error) = ahead.failed.take() {
+            return Err(error);
+        }
+        let (block_size, stripe) = (ahead.block_size, ahead.stripe);
+        let (index, start, filled) = match ahead.filled.take() {
+            Some(filled) => filled,
+            None => {
+                let start = ahead.read;
+                let buffer = &mut ahead.buffers[0];
+                let filled =
+                    fill_ahead(&mut read, buffer, &mut ahead.read, len, block_size, stripe)?;
+                (0, start, filled)
+            }
+        };
+        if filled == 0 {
+            return Err(EngineError::InvalidState(
+                "creation hash frontier is discontinuous",
+            ));
+        }
+        let (low, high) = ahead.buffers.split_at_mut(1);
+        let (current, spare) = if index == 0 {
+            (&low[0], high.first_mut())
+        } else {
+            (&high[0], Some(&mut low[0]))
+        };
+        let data = &current[..filled];
+        let mut chunk_hash = std::mem::take(&mut ahead.chunk_hash);
+        let mut fingerprints = Vec::new();
+        let mut finished = Vec::new();
+        let mut next = None;
+        ahead.pool.in_place_scope(|scope| {
+            scope.spawn(|_| {
+                rayon::join(
+                    || file_hash.update_admitted(data, true),
+                    || {
+                        use rayon::prelude::*;
+                        // Only the first segment can continue a chunk begun
+                        // in an earlier buffer, and only the last can stop
+                        // short of its chunk's end; both go through the
+                        // carried hash. Every chunk between starts and ends
+                        // here, so those are hashed side by side, in order.
+                        let segments: Vec<_> =
+                            ahead_segments(start, filled, len, block_size).collect();
+                        let ends = |(chunk, length, range): &(u64, u64, std::ops::Range<usize>)| {
+                            start + range.end as u64 == chunk + length
+                        };
+                        let head = segments
+                            .first()
+                            .is_some_and(|(chunk, _, range)| start + range.start as u64 != *chunk)
+                            as usize;
+                        let tail = (segments.len() > head
+                            && segments.last().is_some_and(|segment| !ends(segment)))
+                            as usize;
+                        for segment in &segments[..head] {
+                            chunk_hash.update_admitted(&data[segment.2.clone()], true);
+                            if ends(segment) {
+                                fingerprints.push(chunk_hash.finalize());
+                                chunk_hash = FingerprintHasher::new();
+                            }
+                        }
+                        fingerprints.par_extend(
+                            segments[head..segments.len() - tail].par_iter().map(
+                                |(_, _, range)| {
+                                    let mut hash = FingerprintHasher::new();
+                                    hash.update_admitted(&data[range.clone()], true);
+                                    hash.finalize()
+                                },
+                            ),
+                        );
+                        for segment in &segments[segments.len() - tail..] {
+                            chunk_hash.update_admitted(&data[segment.2.clone()], true);
+                        }
+                    },
+                );
+            });
+            if ahead.read < len
+                && let Some(spare) = spare
+            {
+                let at = ahead.read;
+                next = Some(
+                    fill_ahead(&mut read, spare, &mut ahead.read, len, block_size, stripe)
+                        .map(|filled| (at, filled)),
+                );
+            }
+            let quick = (QUICK_HASH_LEN as u64)
+                .saturating_sub(start)
+                .min(filled as u64) as usize;
+            quick_crc.update(&data[..quick]);
+            for (chunk, length, range) in ahead_segments(start, filled, len, block_size) {
+                let crc_length = if length == block_size {
+                    length
+                } else {
+                    TAIL_HASH_LEN as u64
+                };
+                let offset = start + range.start as u64 - chunk;
+                let take = crc_length.saturating_sub(offset).min(range.len() as u64) as usize;
+                ahead
+                    .chunk_crc
+                    .update(&data[range.start..range.start + take]);
+                if start + range.end as u64 == chunk + length {
+                    if inline_tail(length, block_size) {
+                        ahead.inline = Some((chunk, data[range].to_vec()));
+                    }
+                    finished.push((chunk, length, ahead.chunk_crc.finalize()));
+                    ahead.chunk_crc = RollingHasher::new();
+                }
+            }
+        });
+        ahead.chunk_hash = chunk_hash;
+        for ((chunk, length, rolling), fingerprint) in finished.into_iter().zip(fingerprints) {
+            if !inline_tail(length, block_size) {
+                ahead.ready.push_back((chunk, fingerprint, rolling));
+            }
+        }
+        ahead.hashed = start + filled as u64;
+        match next {
+            Some(Ok((at, filled))) => ahead.filled = Some((1 - index, at, filled)),
+            Some(Err(error)) => ahead.failed = Some(error),
+            None => {}
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A source that vanishes when its inline tail is read: the read fails
+    /// with `NotFound` and the source has no snapshot from then on.
+    struct VanishingTail {
+        inner: crate::source::MemorySourceAccess,
+        tail_at: u64,
+        gone: std::sync::atomic::AtomicBool,
+    }
+
+    impl SourceAccess for VanishingTail {
+        fn snapshot(&self, source: SourceId) -> std::io::Result<Option<SourceSnapshot>> {
+            if self.gone.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(None);
+            }
+            self.inner.snapshot(source)
+        }
+        fn read_at(&self, source: SourceId, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
+            if offset >= self.tail_at {
+                self.gone.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Err(std::io::ErrorKind::NotFound.into());
+            }
+            self.inner.read_at(source, offset, out)
+        }
+        fn next_available(
+            &self,
+            source: SourceId,
+            offset: u64,
+        ) -> std::io::Result<Option<std::ops::Range<u64>>> {
+            self.inner.next_available(source, offset)
+        }
+    }
+
+    #[test]
+    fn an_inline_tail_whose_source_vanished_is_reported_as_changed() {
+        // A source large enough for a planning pool, one byte block per
+        // buffer, so the 17-byte inline tail is read ahead on its own while
+        // the last block is hashed; the failure waits for the walk to reach
+        // the tail. The serial walk reads the tail itself.
+        let block_size = 1u64 << 20;
+        let large = crate::hash::PARALLEL_SOURCE_BYTES;
+        let bytes: Vec<u8> = (0..large + 17).map(|i| (i * 131 + i / 977) as u8).collect();
+        for workers in [1, 4] {
+            let mut inner = crate::source::MemorySourceAccess::default();
+            inner.insert(SourceId(1), 1, bytes.clone().into());
+            let mut options = CreationOptions {
+                block_size,
+                recovery_count: 2,
+                ..CreationOptions::default()
+            };
+            options.execution.workers = workers;
+            let execution = options.execution.clone();
+            let result = CreationPlan::build(
+                Arc::new(VanishingTail {
+                    inner,
+                    tail_at: large,
+                    gone: false.into(),
+                }),
+                &[CreationSource {
+                    name: "fixture.bin".into(),
+                    source: SourceId(1),
+                }],
+                options,
+            );
+            assert!(
+                matches!(result, Err(EngineError::SourceChanged(SourceId(1)))),
+                "{workers} workers: {:?}",
+                result.err()
+            );
+            let stacks = execution
+                .diagnostics
+                .memory()
+                .unwrap()
+                .category(crate::runtime::MemoryCategory::WorkerStacks)
+                .peak;
+            assert_eq!(stacks > 0, workers > 1, "{workers} workers: planning pool");
+        }
+    }
+
+    #[test]
+    fn a_tail_goes_behind_the_first_placed_tail_with_room() {
+        let mut slots = TailSlots::default();
+        // Blocks 0 and 1 each take a tail, leaving 100 and 300 bytes spare.
+        slots.place(0, 100);
+        slots.place(1, 300);
+        // 80 bytes fit behind the first tail placed, though block 1 is newer
+        // and roomier; that tail is now closed behind the new one.
+        assert_eq!(slots.take(80), Some(0));
+        slots.place(0, 20);
+        assert_eq!(slots.take(50), Some(1));
+        slots.place(1, 250);
+        // Only the newest tail in each block is open.
+        assert_eq!(slots.take(260), None);
+        // Block 0's open tail was placed before block 1's, so it is first.
+        assert_eq!(slots.take(20), Some(0));
+        slots.place(0, 0);
+        assert_eq!(slots.take(20), Some(1));
+        slots.place(1, 230);
+        // The tree grows past its first sixteen leaves without losing any.
+        for block in 2..40 {
+            slots.place(block, block as u64);
+        }
+        assert_eq!(slots.take(200), Some(1));
+        // Block 1's new tail is the newest placed, behind blocks 2 to 39.
+        slots.place(1, 30);
+        assert_eq!(slots.take(39), Some(39));
+        assert_eq!(slots.take(5), Some(5));
+        assert_eq!(slots.take(30), Some(30));
+        assert_eq!(slots.take(39), None);
+    }
+
+    #[test]
+    fn a_deduplicating_tail_goes_into_the_first_block_by_index_with_room() {
+        let mut slots = TailSlots::by_block();
+        // Block 1 took a tail first, then block 0's room was set later; the
+        // lower index still wins, and a block stays open after taking a tail.
+        slots.place(1, 500);
+        slots.place(0, 100);
+        assert_eq!(slots.take(90), Some(0));
+        slots.place(0, 10);
+        assert_eq!(slots.take(90), Some(1));
+        slots.place(1, 410);
+        assert_eq!(slots.take(10), Some(0));
+        assert_eq!(slots.take(411), None);
+        // Blocks never given room, such as whole-data blocks, have none, and
+        // the tree grows to a far block index without losing any.
+        slots.place(100, 700);
+        assert_eq!(slots.take(600), Some(100));
+        assert_eq!(slots.take(400), Some(1));
+        slots.place(1, 0);
+        assert_eq!(slots.take(400), Some(100));
+    }
+
+    #[test]
+    fn a_carrier_repeats_its_metadata_once_per_doubling() {
+        // Rows in a carrier against the copies the reference writes in all.
+        for (units, copies) in [
+            (1, 1),
+            (2, 2),
+            (4, 3),
+            (8, 4),
+            (15, 4),
+            (16, 5),
+            (32, 6),
+            (40, 6),
+            (64, 7),
+            (821, 10),
+            (2048, 12),
+        ] {
+            assert_eq!(1 + metadata_repeats(units), copies, "{units} units");
+        }
+        assert_eq!(metadata_repeats(0), 0);
+    }
+
+    #[test]
+    fn repeated_packets_cycle_and_spread_between_the_units() {
+        let common: Vec<Vec<u8>> = (b'a'..=b'c').map(|byte| vec![byte]).collect();
+        let layout = |units: u64| {
+            let mut repeats = MetadataRepeats::new(&common, units, true);
+            let mut out = Vec::new();
+            for done in 1..=units {
+                out.push(b'|');
+                repeats.after(done, &mut out).unwrap();
+            }
+            String::from_utf8(out).unwrap()
+        };
+        // `|` stands for a unit's payload packets.
+        assert_eq!(layout(1), "|");
+        assert_eq!(layout(2), "|a|bc");
+        assert_eq!(layout(4), "|a|bc|a|bc");
+        assert_eq!(layout(3), "|a|b|c");
+        assert_eq!(layout(5), "|a|b|c|a|bc");
     }
 }

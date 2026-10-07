@@ -2,7 +2,7 @@
 name = "par3-rs"
 description = "PAR3 (Parity Volume Set 3.0) packet parsing, set inspection, verification, creation and repair — work in progress"
 readme = "README.md"
-version = "0.4.4"
+version = "0.4.5"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -30,12 +30,17 @@ blake3 = { workspace = true, features = ["rayon"] }
 crc-fast = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-reedsolomon-rs = { path = "../reedsolomon-rs", version = "0.4.7", default-features = false }
+reedsolomon-rs = { path = "../reedsolomon-rs", version = "0.4.8", default-features = false }
 rayon = { workspace = true, default-features = false }
 unicode-normalization = { workspace = true }
 
 [target.'cfg(not(target_os = "wasi"))'.dependencies]
 cap-std = "4.0.3"
+
+# Repair stages a damaged file as a clone of itself where the filesystem can
+# share extents: `fclonefileat` on macOS, the `FICLONE` ioctl on Linux.
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+libc = { workspace = true }
 
 # Process CPU time for the verification timing probe, so its table reports a
 # measured number rather than wall time multiplied by a worker count. The probe

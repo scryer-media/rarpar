@@ -4,10 +4,14 @@ use cap_std::ambient_authority;
 #[cfg(unix)]
 use cap_std::fs::DirBuilder;
 use cap_std::fs::{Dir, OpenOptions};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[path = "repair_tree_clone.rs"]
+#[allow(unsafe_code)]
+pub(crate) mod clone;
 #[cfg(windows)]
 #[path = "repair_tree_windows.rs"]
 #[allow(unsafe_code)]
-mod windows;
+pub(crate) mod windows;
 #[cfg(unix)]
 use cap_std::fs::DirBuilderExt;
 use std::collections::HashSet;
@@ -15,12 +19,27 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File as StdFile;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::runtime::{EngineError, EngineFile, EngineResult, ExecutionOptions};
+use crate::session_repair::RepairDurability;
+use crate::source::{SourceAccess, SourceId, SourceSnapshot};
 
 static STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+// Makes every clone attempt on this thread fail as one across devices does,
+// so the copy fallback is exercised without a second filesystem.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static REFUSE_CLONES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// Makes only the next repair clone attempt on this thread fail with this error.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static REFUSE_NEXT_CLONE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
 
 // Directory capabilities consume the same budget as data files. Field order
 // closes the OS handle before its reservation is returned.
@@ -46,12 +65,11 @@ impl BudgetedDir {
         };
         // Cleanup and identity checks still need capabilities after cancellation.
         // Their leases obey the ceiling without restarting canceled data work.
-        let lease = options.handles.acquire().map_err(io::Error::other)?;
-        if options.handles.used() > options.open_handles {
-            return Err(io::Error::other(EngineError::resource_limit(
-                "open handles",
-            )));
-        }
+        // Idle cached handles are closed before a capability is refused.
+        let lease = options
+            .handles
+            .acquire_within(options.open_handles)
+            .map_err(io::Error::other)?;
         Ok(Some(lease))
     }
 
@@ -104,6 +122,11 @@ impl BudgetedDir {
     }
 }
 
+/// The device and inode of a file a repair patches in place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+pub(crate) struct FileIdentity(u64, u64);
+
 pub(crate) struct Destination {
     pub(crate) relative: PathBuf,
     pub(crate) display: PathBuf,
@@ -114,6 +137,9 @@ pub(crate) struct RepairTree {
     root: BudgetedDir,
     stage_component: OsString,
     stage: Option<BudgetedDir>,
+    /// The staging filesystem refused a clone outright; stop asking.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+    clones_refused: AtomicBool,
 }
 
 impl RepairTree {
@@ -156,6 +182,7 @@ impl RepairTree {
                         root,
                         stage_component: candidate.into(),
                         stage: Some(stage),
+                        clones_refused: AtomicBool::new(false),
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -264,6 +291,261 @@ impl RepairTree {
         Ok((name.into(), display))
     }
 
+    /// Stage output `index` as [`Self::create_stage_registered`] does, or, given
+    /// `clone_from`, as a clone of that source's local file when its registry
+    /// hands one over through [`SourceAccess::open_file`], it is the regular
+    /// file the snapshot describes, and the filesystem can share its extents.
+    /// Returns whether the staged file is such a clone; one holds the
+    /// snapshot's bytes, cut or zero-extended to `len`.
+    ///
+    /// The file is identified from the registry's own handle and the clone is
+    /// taken from the same handle, so neither a name swapped after the check
+    /// nor a file the registry did not hand over is ever cloned. The clone
+    /// holds the bytes as they were when it was taken, so the caller still
+    /// checks the source afterwards.
+    ///
+    /// [`SourceAccess::open_file`]: crate::source::SourceAccess::open_file
+    pub(crate) fn create_stage_from(
+        &self,
+        index: usize,
+        len: u64,
+        options: &ExecutionOptions,
+        outputs: &mut Vec<PathBuf>,
+        clone_from: Option<(&dyn SourceAccess, SourceId, SourceSnapshot)>,
+    ) -> EngineResult<(OsString, PathBuf, bool)> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some((access, id, source)) = clone_from
+            && let Some(staged) =
+                self.clone_stage(index, len, options, outputs, access, id, source)?
+        {
+            return Ok(staged);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let _ = clone_from;
+        let (name, display) = self.create_stage_registered(index, len, options, outputs)?;
+        Ok((name, display, false))
+    }
+
+    /// The clone half of [`Self::create_stage_from`]; `None` when nothing was
+    /// staged and the caller should create the file instead.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[allow(clippy::too_many_arguments)]
+    fn clone_stage(
+        &self,
+        index: usize,
+        len: u64,
+        options: &ExecutionOptions,
+        outputs: &mut Vec<PathBuf>,
+        access: &dyn SourceAccess,
+        id: SourceId,
+        source: SourceSnapshot,
+    ) -> EngineResult<Option<(OsString, PathBuf, bool)>> {
+        if self.clones_refused.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        // The registry's own handle: a disk registry returns the one it caches,
+        // so a clone costs no open and a refused one costs nothing.
+        let Some(original) = access.open_file(id).ok().flatten() else {
+            return Ok(None);
+        };
+        if !clone::is_source(&original.0.metadata()?, source) {
+            return Ok(None);
+        }
+        let name = format!(".par3-repair-{index}.tmp");
+        let display = self.base.join(&self.stage_component).join(&name);
+        #[cfg(test)]
+        let refused = REFUSE_NEXT_CLONE.with(std::cell::Cell::take).or_else(|| {
+            REFUSE_CLONES
+                .with(std::cell::Cell::get)
+                .then_some(libc::EXDEV)
+        });
+        #[cfg(not(test))]
+        let refused: Option<i32> = None;
+        let refusal = |error: &io::Error| {
+            tracing::debug!(%error, "PAR3 repair staging copies instead of cloning");
+            if clone::never(error) {
+                self.clones_refused.store(true, Ordering::Relaxed);
+            }
+        };
+        let discard = |file: Option<EngineFile>, outputs: &mut Vec<PathBuf>| {
+            drop(file);
+            if self.stage().remove_file(&name).is_ok() {
+                outputs.retain(|path| path != &display);
+            }
+        };
+        #[cfg(target_os = "macos")]
+        {
+            let cloned = if let Some(code) = refused {
+                Err(io::Error::from_raw_os_error(code))
+            } else {
+                clone::clone_new(&*original.0, &self.stage().dir, OsStr::new(&name))
+            };
+            drop(original);
+            match cloned {
+                Ok(()) => {}
+                Err(error) if clone::unsupported(&error) => {
+                    refusal(&error);
+                    return Ok(None);
+                }
+                Err(error) => return Err(error.into()),
+            }
+            outputs.push(display.clone());
+            if source.len != len {
+                let mut open = OpenOptions::new();
+                open.write(true);
+                let resized = EngineFile::open_with(options, || {
+                    self.stage()
+                        .open_with(&name, &open)
+                        .map(cap_std::fs::File::into_std)
+                })
+                .and_then(|file| Ok(file.set_len(len)?));
+                if let Err(error) = resized {
+                    discard(None, outputs);
+                    // A clone that kept something denying its owner writes,
+                    // once removed, is staged by copying instead.
+                    if matches!(&error, EngineError::Io(error) if error.kind() == io::ErrorKind::PermissionDenied)
+                        && !outputs.contains(&display)
+                    {
+                        return Ok(None);
+                    }
+                    return Err(error);
+                }
+            }
+            options.diagnostics.note_clone();
+            Ok(Some((name.into(), display, true)))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let mut open = OpenOptions::new();
+            open.write(true).create_new(true);
+            let file = EngineFile::open_with(options, || {
+                self.stage()
+                    .open_with(&name, &open)
+                    .map(cap_std::fs::File::into_std)
+            })?;
+            outputs.push(display.clone());
+            let cloned = if let Some(code) = refused {
+                Err(io::Error::from_raw_os_error(code))
+            } else {
+                clone::clone_into(&*original.0, &file)
+            };
+            drop(original);
+            // A refused clone leaves the file empty, exactly as a fresh stage
+            // is created, so it is kept and sized rather than made again.
+            let cloned = match cloned {
+                Ok(()) => true,
+                Err(error) if clone::unsupported(&error) => {
+                    refusal(&error);
+                    false
+                }
+                Err(error) => {
+                    discard(Some(file), outputs);
+                    return Err(error.into());
+                }
+            };
+            if (!cloned || source.len != len)
+                && let Err(error) = file.set_len(len)
+            {
+                discard(Some(file), outputs);
+                return Err(error.into());
+            }
+            if cloned {
+                options.diagnostics.note_clone();
+            }
+            Ok(Some((name.into(), display, cloned)))
+        }
+    }
+
+    /// Prepare `destination` to be repaired in place, or say it cannot be:
+    /// `None` leaves the destination untouched. It must be the very file the
+    /// registry hands over for `id`, unchanged since `source` was snapshotted,
+    /// writable through the tree, and its only link, so no other name sees
+    /// the patch. It is cut or zero-extended to `len`, and the returned
+    /// identity is what every later open of it must match.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn prepare_in_place(
+        &self,
+        destination: &Destination,
+        len: u64,
+        options: &ExecutionOptions,
+        (access, id, source): (&dyn SourceAccess, SourceId, SourceSnapshot),
+    ) -> EngineResult<Option<FileIdentity>> {
+        use std::os::unix::fs::MetadataExt;
+        let Some(original) = access.open_file(id).ok().flatten() else {
+            return Ok(None);
+        };
+        let registered = original.0.metadata()?;
+        drop(original);
+        if !clone::is_source(&registered, source) {
+            return Ok(None);
+        }
+        let identity = FileIdentity(registered.dev(), registered.ino());
+        // Any refusal to open it for writing leaves the staged path, which
+        // reports whatever that refusal means for the install.
+        let Ok(file) = self.open_destination_with(destination, true, true, options) else {
+            return Ok(None);
+        };
+        let metadata = file.metadata()?;
+        if FileIdentity(metadata.dev(), metadata.ino()) != identity
+            || metadata.nlink() != 1
+            || !clone::is_source(&metadata, source)
+        {
+            return Ok(None);
+        }
+        if metadata.len() != len {
+            file.set_len(len)?;
+        }
+        Ok(Some(identity))
+    }
+
+    /// Open the file [`Self::prepare_in_place`] prepared, refusing anything
+    /// that has since taken its name.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn open_in_place(
+        &self,
+        destination: &Destination,
+        identity: FileIdentity,
+        read: bool,
+        write: bool,
+        options: &ExecutionOptions,
+    ) -> EngineResult<EngineFile> {
+        use std::os::unix::fs::MetadataExt;
+        let file = self.open_destination_with(destination, read, write, options)?;
+        let metadata = file.metadata()?;
+        if FileIdentity(metadata.dev(), metadata.ino()) != identity {
+            return Err(EngineError::InvalidState(
+                "a file being repaired in place was replaced",
+            ));
+        }
+        Ok(file)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn open_destination_with(
+        &self,
+        destination: &Destination,
+        read: bool,
+        write: bool,
+        options: &ExecutionOptions,
+    ) -> EngineResult<EngineFile> {
+        // Resolved inside the tree's own capability, and the callers check
+        // the file's identity, so no extra directory handle is held.
+        let mut open = OpenOptions::new();
+        open.read(read).write(write);
+        EngineFile::open_with(options, || {
+            self.root
+                .open_with(&destination.relative, &open)
+                .map(cap_std::fs::File::into_std)
+        })
+    }
+
+    /// Remove a staged file nothing will use, as a refused stage is removed.
+    pub(crate) fn discard_stage(&self, name: &OsStr, display: &Path, outputs: &mut Vec<PathBuf>) {
+        if self.stage().remove_file(name).is_ok() {
+            outputs.retain(|path| path != display);
+        }
+    }
+
     pub(crate) fn create_stage_file(
         &self,
         index: usize,
@@ -316,6 +598,7 @@ impl RepairTree {
         stage_name: &OsStr,
         destination: &Destination,
         backup: bool,
+        durability: RepairDurability,
     ) -> EngineResult<Option<PathBuf>> {
         let (parent, filename) = self.destination_parent(&destination.relative, true)?;
         let mut saved = None;
@@ -348,7 +631,7 @@ impl RepairTree {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        if let Err(error) = self.move_stage(stage_name, &parent, &filename) {
+        if let Err(error) = self.move_stage(stage_name, &parent, &filename, durability) {
             if let Some(path) = &saved {
                 parent.remove_file(path.file_name().expect("backup filename"))?;
             }
@@ -392,7 +675,9 @@ impl RepairTree {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        if let Err(error) = self.move_stage(stage_name, &parent, &filename) {
+        if let Err(error) =
+            self.move_stage(stage_name, &parent, &filename, RepairDurability::SyncFiles)
+        {
             if let Some(path) = &saved {
                 parent.rename(
                     path.file_name().expect("backup filename"),
@@ -405,33 +690,44 @@ impl RepairTree {
         Ok(saved)
     }
 
-    fn move_stage(&self, name: &OsStr, parent: &BudgetedDir, filename: &OsStr) -> io::Result<()> {
+    fn move_stage(
+        &self,
+        name: &OsStr,
+        parent: &BudgetedDir,
+        filename: &OsStr,
+        durability: RepairDurability,
+    ) -> io::Result<()> {
         match self.stage().rename(name, parent, filename) {
             Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
-                self.copy_stage(name, parent, filename)
+                self.copy_stage(name, parent, filename, durability)
             }
             outcome => outcome,
         }
     }
 
     // A nested mount needs a destination-local temporary before atomic rename.
-    // Re-read its bytes against the copied source digest before publishing it.
-    fn copy_stage(&self, name: &OsStr, parent: &BudgetedDir, filename: &OsStr) -> io::Result<()> {
-        use std::io::{Read, Seek, SeekFrom, Write};
+    // The staged file was verified before installation began, and every byte
+    // read from it here is handed to `write_all`, which fails rather than
+    // writing less, so the copy is not read back.
+    fn copy_stage(
+        &self,
+        name: &OsStr,
+        parent: &BudgetedDir,
+        filename: &OsStr,
+        durability: RepairDurability,
+    ) -> io::Result<()> {
+        use std::io::{Read, Write};
         let local = PrivateInstall::new(parent, filename)?;
         let options = self.root.options.clone().unwrap_or_default();
         let _memory = options
             .memory
-            .reserve_as(
-                crate::runtime::MemoryCategory::OutputStaging,
-                8192 + 2 * size_of::<blake3::Hasher>(),
-            )
+            .reserve_as(crate::runtime::MemoryCategory::OutputStaging, 8192)
             .map_err(io::Error::other)?;
         let mut source = self
             .open_stage(name, true, false, &options)
             .map_err(io::Error::other)?;
         let mut open = OpenOptions::new();
-        open.read(true).write(true).create_new(true);
+        open.write(true).create_new(true);
         let mut output = EngineFile::open_with(&options, || {
             local
                 .dir()
@@ -440,36 +736,20 @@ impl RepairTree {
         })
         .map_err(io::Error::other)?;
         let mut buffer = [0u8; 8192];
-        let mut expected = blake3::Hasher::new();
         loop {
             options.cancel.check().map_err(io::Error::other)?;
             let read = source.read(&mut buffer)?;
             if read == 0 {
                 break;
             }
-            expected.update(&buffer[..read]);
             output.write_all(&buffer[..read])?;
         }
         drop(source);
-        output.sync_all()?;
-        output.seek(SeekFrom::Start(0))?;
-        let mut actual = blake3::Hasher::new();
-        loop {
-            options.cancel.check().map_err(io::Error::other)?;
-            let read = output.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            actual.update(&buffer[..read]);
-        }
-        if actual.finalize() != expected.finalize() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "destination-local staging verification failed",
-            ));
+        if durability == RepairDurability::SyncFiles {
+            output.sync_all()?;
         }
         drop(output);
-        // The verified local copy now owns the rebuilt bytes. Remove the
+        // The local copy now owns the rebuilt bytes. Remove the
         // original before installation so a cleanup error cannot hide an
         // already-installed output from the repair report.
         self.stage().remove_file(name)?;
@@ -528,6 +808,19 @@ impl RepairTree {
             }
         }
         Ok(())
+    }
+
+    /// Remove staged outputs a refused repair leaves no host a reason to keep,
+    /// through the staging capability. A path that cannot be removed stays in
+    /// `outputs`, so the host is still told about it.
+    pub(crate) fn discard_temporary_outputs(&self, outputs: &mut Vec<PathBuf>) {
+        outputs.retain(|path| {
+            path.file_name()
+                .is_none_or(|name| match self.stage().remove_file(name) {
+                    Ok(()) => false,
+                    Err(error) => error.kind() != io::ErrorKind::NotFound,
+                })
+        });
     }
 
     fn stage(&self) -> &BudgetedDir {
@@ -890,7 +1183,7 @@ mod tests {
     }
 
     #[test]
-    fn destination_local_copy_is_verified_and_installed_without_leaving_staging() {
+    fn destination_local_copy_is_installed_without_leaving_staging() {
         let root = TestRoot::new("local-copy");
         let options = ExecutionOptions {
             handles: crate::runtime::HandleBudget::new(6),
@@ -905,7 +1198,8 @@ mod tests {
         let (parent, filename) = tree
             .destination_parent(&destination.relative, true)
             .unwrap();
-        tree.copy_stage(&name, &parent, &filename).unwrap();
+        tree.copy_stage(&name, &parent, &filename, RepairDurability::SyncFiles)
+            .unwrap();
         assert_eq!(std::fs::read(&destination.display).unwrap(), bytes);
         assert!(!path.exists());
         assert_eq!(parent.entries().unwrap().count(), 1);
@@ -929,7 +1223,10 @@ mod tests {
         let (parent, filename) = tree
             .destination_parent(&destination.relative, true)
             .unwrap();
-        assert!(tree.copy_stage(&name, &parent, &filename).is_err());
+        assert!(
+            tree.copy_stage(&name, &parent, &filename, RepairDurability::SyncFiles)
+                .is_err()
+        );
         assert_eq!(std::fs::read(&path).unwrap(), b"safe");
         assert_eq!(parent.entries().unwrap().count(), 0);
         assert_eq!(options.handles.used(), 3);
@@ -945,8 +1242,13 @@ mod tests {
         let destination = tree.destination("file.bin").unwrap();
         std::fs::write(&destination.display, b"original").unwrap();
         assert!(
-            tree.install(OsStr::new("missing-stage"), &destination, true)
-                .is_err()
+            tree.install(
+                OsStr::new("missing-stage"),
+                &destination,
+                true,
+                RepairDurability::SyncFiles
+            )
+            .is_err()
         );
         assert_eq!(std::fs::read(&destination.display).unwrap(), b"original");
         assert!(!root.path().join("file.bin.1").exists());

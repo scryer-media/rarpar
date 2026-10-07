@@ -196,6 +196,10 @@ fn retained_interleaved_repair_requires_recovery_in_the_damaged_cohort() {
         std::fs::read(output.path().join("input.bin")).unwrap(),
         original
     );
+    // The decode's writes proved every protected extent of the staged output,
+    // so it was synchronized once and never read back.
+    assert_eq!(options.diagnostics.file_io().read_bytes, 0);
+    assert_eq!(options.diagnostics.file_sync().calls, 1);
 }
 
 fn recovery() -> BTreeMap<usize, Vec<u8>> {

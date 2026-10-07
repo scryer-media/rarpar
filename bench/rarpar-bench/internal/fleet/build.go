@@ -1,6 +1,7 @@
 package fleet
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -100,13 +101,18 @@ func (bundler *Bundler) SharedBuild(ctx context.Context, sharedName string, rep 
 	}
 
 	required := []string{"rarpar-bench"}
-	if rep.needsCorpus() {
+	if rep.needsCandidate() {
 		required = append(required, "rarpar")
 	}
 	if rep.hasSuite(SuiteCRCProbe) {
 		required = append(required, "crc_probe")
 	}
-	for _, name := range required {
+	for index, name := range required {
+		// Windows bundles are prebuilt PE binaries; the names carry .exe.
+		if rep.isWindows() {
+			name += ".exe"
+			required[index] = name
+		}
 		if _, err := os.Stat(filepath.Join(target, name)); err != nil {
 			return "", info, fmt.Errorf("bundle %s: bundle is missing %s (suites %s need it)",
 				sharedName, name, strings.Join(rep.Suites, ","))
@@ -163,6 +169,20 @@ func (bundler *Bundler) Assemble(machine Machine, sharedDir string, sharedInfo B
 	if len(machine.Oracles) > 0 {
 		info.Oracles = machine.Oracles
 	}
+	if machine.hasSuite(SuiteMacroPAR3) {
+		// The PAR3 suite reads the par3cmdline pin from the toolchain lock
+		// (the on-host reference build resolves and verifies the source with
+		// it); ship the orchestrator's copy so host and plan agree.
+		lock := filepath.Join(bundler.rarparPath(), "bench", "rarpar-bench", "config", "toolchains.json")
+		if err := copyFile(lock, filepath.Join(target, "toolchains.json")); err != nil {
+			return "", info, fmt.Errorf("machine %s: staging config/toolchains.json: %w", machine.Name, err)
+		}
+		digest, err := fileSHA256(filepath.Join(target, "toolchains.json"))
+		if err != nil {
+			return "", info, err
+		}
+		info.Notes = append(info.Notes, "toolchains.json sha256 "+digest+" shipped for the PAR3 reference pin")
+	}
 	if err := writeJSONFile(filepath.Join(target, "BUILDINFO.json"), info); err != nil {
 		return "", info, err
 	}
@@ -175,8 +195,11 @@ func (bundler *Bundler) Assemble(machine Machine, sharedDir string, sharedInfo B
 func buildKey(machine Machine) string {
 	bundle := machine.Bundle
 	features := []string{}
-	if machine.needsCorpus() {
+	if machine.needsCandidate() {
 		features = append(features, "rarpar")
+	}
+	if machine.hasSuite(SuiteMacroPAR3) {
+		features = append(features, "par3")
 	}
 	if machine.hasSuite(SuiteYencMicro) {
 		features = append(features, "yenc-micro")
@@ -718,6 +741,9 @@ func readJSONFile(path string, value any) error {
 	if err != nil {
 		return err
 	}
+	// Windows PowerShell 5.1 writes UTF-8 with a BOM, which encoding/json
+	// rejects; host evidence may carry one.
+	data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
 	return json.Unmarshal(data, value)
 }
 

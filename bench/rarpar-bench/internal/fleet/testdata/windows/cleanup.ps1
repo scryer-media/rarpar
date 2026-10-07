@@ -1,0 +1,2 @@
+if (Test-Path -LiteralPath 'C:\bench\fleet-stage\fleet-testrun') { Remove-Item -LiteralPath 'C:\bench\fleet-stage\fleet-testrun' -Recurse -Force }
+if (Test-Path -LiteralPath 'C:\bench\work\fleet-testrun') { Remove-Item -LiteralPath 'C:\bench\work\fleet-testrun' -Recurse -Force }

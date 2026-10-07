@@ -18,6 +18,46 @@ type RemoteLayout struct {
 	Script  string
 }
 
+// HostLayout is the layout the runner actually uses on this machine: the
+// backslash layout on Windows hosts, the POSIX one everywhere else.
+func HostLayout(machine Machine, runID string) RemoteLayout {
+	if machine.isWindows() {
+		return windowsLayout(machine, runID)
+	}
+	return LayoutFor(machine, runID)
+}
+
+// hostJoin joins remote path elements with the host's separator.
+func hostJoin(machine Machine, parts ...string) string {
+	if !machine.isWindows() {
+		return joinPosix(parts...)
+	}
+	cleaned := make([]string, 0, len(parts))
+	for index, part := range parts {
+		part = strings.ReplaceAll(part, "/", "\\")
+		if index == 0 {
+			// Keep the leading separators: they are what makes a UNC path
+			// (\\server\share) absolute.
+			part = strings.TrimRight(part, "\\")
+			if strings.Trim(part, "\\") == "" {
+				part = ""
+			}
+		} else {
+			part = strings.Trim(part, "\\")
+		}
+		if part != "" {
+			cleaned = append(cleaned, part)
+		}
+	}
+	return strings.Join(cleaned, "\\")
+}
+
+// par3ReferenceDir is where the par3cmdline-onhost recipe builds the
+// reference, under the run root so cleanup removes it with everything else.
+func par3ReferenceDir(machine Machine, layout RemoteLayout) string {
+	return hostJoin(machine, layout.Base, "par3-reference")
+}
+
 func LayoutFor(machine Machine, runID string) RemoteLayout {
 	base := joinPosix(machine.Paths.Staging, runID)
 	scratch := joinPosix(base, "work")
@@ -283,6 +323,11 @@ func RunScript(machine Machine, defaults RunDefaults, runID string, layout Remot
 		}
 	}
 
+	// ---- macro-par3 ------------------------------------------------------
+	if machine.hasSuite(SuiteMacroPAR3) {
+		script.WriteString(par3Section(machine, layout, oracles["par3"]))
+	}
+
 	// ---- perf diagnostic pass -------------------------------------------
 	script.WriteString(perfSection(machine, families))
 
@@ -337,6 +382,83 @@ func RunScript(machine Machine, defaults RunDefaults, runID string, layout Remot
 	write("# Rename last: the collector treats DONE as atomic proof the tarball is complete.")
 	write("mv \"$BASE/DONE.tmp\" %s", shellQuote(layout.Done))
 	write("log \"RUN COMPLETE status=$STATUS elapsed=${ELAPSED}s warnings:$WARNINGS\"")
+	return script.String()
+}
+
+// PAR3Work is the macro-par3 dataset and stage directory on the host. The
+// reference's name-buffer limit makes its length matter; the plan checks it.
+func PAR3Work(machine Machine, layout RemoteLayout) string {
+	if machine.PAR3.Work != "" {
+		return machine.PAR3.Work
+	}
+	return hostJoin(machine, layout.Scratch, "p3")
+}
+
+// par3Args is the `rarpar-bench par3 run` argument list after the paths, shared
+// by the POSIX and PowerShell runners so both measure the same matrix.
+func par3Args(machine Machine) []string {
+	plan := machine.PAR3
+	workers := make([]string, 0, len(plan.Workers))
+	for _, value := range plan.Workers {
+		workers = append(workers, fmt.Sprint(value))
+	}
+	args := []string{"--profile", plan.Profile, "--workers", strings.Join(workers, ","),
+		"--warmups", fmt.Sprint(plan.Warmups), "--repeats", fmt.Sprint(plan.Repeats),
+		"--timeout", fmt.Sprintf("%dm", plan.TimeoutMinutes)}
+	if plan.ReferenceTimeoutMinutes > 0 {
+		args = append(args, "--reference-timeout", fmt.Sprintf("%dm", plan.ReferenceTimeoutMinutes))
+	}
+	if len(plan.Ops) > 0 {
+		args = append(args, "--ops", strings.Join(plan.Ops, ","))
+	}
+	for _, set := range plan.Sets {
+		args = append(args, "--set", set)
+	}
+	if plan.PinCPUs != "" {
+		args = append(args, "--pin-cpus", plan.PinCPUs)
+	}
+	if plan.IOCount {
+		args = append(args, "--iocount")
+	}
+	for _, variant := range plan.KernelVariants {
+		args = append(args, "--kernel-variant", variant)
+	}
+	if len(plan.Durability) > 0 {
+		args = append(args, "--durability", strings.Join(plan.Durability, ","))
+	}
+	return args
+}
+
+func par3Section(machine Machine, layout RemoteLayout, reference string) string {
+	var script strings.Builder
+	write := func(format string, args ...any) { fmt.Fprintf(&script, format+"\n", args...) }
+	quoted := make([]string, 0)
+	for _, arg := range par3Args(machine) {
+		quoted = append(quoted, shellQuote(arg))
+	}
+	write("# ---- suite: macro-par3 (shipped CLI vs the pinned par3cmdline reference)")
+	write("P3_REFERENCE=%s", shellQuote(reference))
+	write("P3_WORK=%s", shellQuote(PAR3Work(machine, layout)))
+	if oracle, ok := machine.Oracles["par3"]; ok && oracle.Policy == OracleSourceBuild && oracle.Recipe == RecipePAR3CmdlineHost {
+		write("# par3cmdline publishes no Linux/macOS binary: build the toolchains.json pin here.")
+		write("log 'building the par3cmdline reference on this host'")
+		write("\"$BENCH\" par3 build-reference --out %s --toolchains \"$BIN/toolchains.json\" --cache \"$BASE/par3-cache\" \\",
+			shellQuote(par3ReferenceDir(machine, layout)))
+		write("  > \"$R/par3-build-reference.json\" 2> \"$R/par3-build-reference.log\" || fail par3-build-reference")
+	}
+	write("if [ -x \"$P3_REFERENCE\" ]; then")
+	write("  gate macro-par3")
+	write("  \"$BENCH\" par3 run --reference \"$P3_REFERENCE\" --candidate \"$CANDIDATE\" --work \"$P3_WORK\" \\")
+	write("    --out \"$R/par3\" --machine \"$MACHINE\" %s \\", strings.Join(quoted, " "))
+	write("    > \"$R/par3-run.stdout.log\" 2> \"$R/par3-run.stderr.log\"")
+	write("  rc=$?")
+	write("  log \"macro-par3 rc=$rc\"")
+	write("  [ \"$rc\" -eq 0 ] || fail macro-par3")
+	write("else")
+	write("  fail par3-reference-missing")
+	write("fi")
+	write("rm -rf \"$P3_WORK\"")
+	write("")
 	return script.String()
 }
 

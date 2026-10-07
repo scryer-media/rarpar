@@ -1,6 +1,7 @@
 //! Low-rate FFT geometry and bounded stripe execution.
 
-use reedsolomon_rs::fft::{TransformError, TransformField};
+use reedsolomon_rs::fft::{DerivativeWork, TransformError, TransformField};
+use reedsolomon_rs::gf_simd::LinearBackend;
 
 use crate::runtime::{EngineError, EngineResult, ExecutionOptions, MemoryCategory, Reservation};
 
@@ -64,9 +65,17 @@ impl FftGeometry {
         (self.bits / 8) as usize
     }
 
+    /// Check the field a set's Start packet declares against this geometry.
+    ///
+    /// The transform's field follows from the geometry alone, so the declared
+    /// field is a label rather than an input. The reference labels a set with
+    /// no field (size and generator zero) whenever it carries a single recovery
+    /// block, even when the FFT matrix reserves a wider capacity; that block is
+    /// still the first transform parity of the declared capacity, computed in
+    /// the geometry's own field. Any other label must name that field exactly.
     pub(crate) fn validate_field(self, field: crate::packet::GaloisField) -> EngineResult<()> {
         let compatible = if field.size == 0 {
-            self.is_trivial() && field.generator == 0
+            field.generator == 0
         } else {
             field.size as usize == self.field_bytes()
                 && matches!((field.size, field.generator), (1, 0x1d) | (2, 0x2d))
@@ -92,6 +101,25 @@ pub enum FftInput {
     Original(usize),
     /// Recovery index relative to this cohort.
     Recovery(usize),
+}
+
+/// A consumer of decoded input stripes, as [`FftCodec::decode_with`] hands
+/// them out: the row, the stripe's byte offset within the block, and the
+/// bytes the input callback filled.
+pub type FftConsumer<'a> = dyn Fn(FftInput, u64, &[u8]) -> EngineResult<()> + Sync + 'a;
+
+/// Budget a decode's caller needs beside the decode for as long as it runs,
+/// and which depends on the stripe the decode admits: a repair's proof of
+/// its staged writes holds a hash frontier for every extent the stripes
+/// split. The decode reserves it once its stripe is known, before it reads
+/// anything, and narrows the stripe to leave room for it when it does not
+/// fit beside the bank.
+pub(crate) trait StripeHold {
+    /// Bytes the caller needs at `stripe`, or `None` when they overflow.
+    fn bytes(&self, stripe: usize) -> Option<usize>;
+    /// Reserve what the caller needs at `stripe`; `false` when the budget
+    /// refuses it.
+    fn reserve(&self, stripe: usize) -> bool;
 }
 
 /// Butterflies one full additive transform over `rows` rows performs.
@@ -135,6 +163,14 @@ struct ForwardPlan {
 /// below it the plan stands aside and the full transform runs, which is what
 /// the same probe now measures for both pinned reference geometries.
 const PLAN_CALL_SYMBOLS: u64 = 8192;
+
+/// Rows a batched decode reads ahead where the rows are the stripes' own
+/// bytes and need no ring. Each batch is consumed and scaled on the pool
+/// while the next is read; a batch of a few rows a worker left the workers
+/// spinning between batches and burned more CPU than the scaling itself.
+/// A batch is at most a quarter of the domain, and at least 16 rows, so a
+/// short domain still reads its next batch while the last is scaled.
+const DIRECT_BATCH: usize = 256;
 
 impl ForwardPlan {
     /// Cost model, in butterflies: every wide stage in full, plus the narrow
@@ -253,9 +289,255 @@ impl ForwardPlan {
     }
 }
 
+/// Symbol storage for a cohort's transform rows.
+///
+/// GF(2^8) rows are `u8`: a row is the stripe's own bytes, read into and
+/// written from directly. GF(2^16) rows are `u16`, whose little-endian pairs
+/// on disk are the rows' own bytes on a little-endian target, and convert
+/// through one byte buffer elsewhere. The `u16` lane also accepts 8-bit
+/// symbols, zero-extended, which is how GF(2^8) used to run; the tests keep
+/// it as the reference the byte lane must match.
+trait Lane: reedsolomon_rs::fft::Symbol + std::ops::BitXorAssign {
+    /// Rows of `unit`-byte symbols are the stripe's byte image; no
+    /// conversion buffer is needed.
+    fn is_direct(unit: usize) -> bool;
+    /// The row's byte image when [`Self::is_direct`].
+    fn direct(unit: usize, row: &mut [Self]) -> Option<&mut [u8]>;
+    fn direct_ref(unit: usize, row: &[Self]) -> Option<&[u8]>;
+    fn unpack(unit: usize, bytes: &[u8], row: &mut [Self]);
+    fn pack(unit: usize, row: &[Self], bytes: &mut [u8]);
+    /// [`TransformField::transform_rows`], or with `sum`
+    /// [`TransformField::transform_rows_adding`]. `zero` flags rows the
+    /// layout leaves all zero; see
+    /// [`TransformField::transform_known_zero_with_backend`].
+    #[allow(clippy::too_many_arguments)]
+    fn transform(
+        field: &TransformField,
+        rows: &mut [&mut [Self]],
+        zero: Option<&[bool]>,
+        origin: usize,
+        inverse: bool,
+        backend: LinearBackend,
+        pool: Option<&rayon::ThreadPool>,
+        sum: Option<&mut [&mut [Self]]>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError>;
+    fn scale(
+        field: &TransformField,
+        row: &mut [Self],
+        factor: u16,
+        backend: LinearBackend,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError>;
+    /// [`Self::unpack`] then [`Self::scale`], in one pass where the field
+    /// allows it.
+    fn unpack_scaled(
+        field: &TransformField,
+        unit: usize,
+        bytes: &[u8],
+        row: &mut [Self],
+        factor: u16,
+        backend: LinearBackend,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError>;
+    /// [`TransformField::differentiate_rows`].
+    fn derivative(
+        field: &TransformField,
+        rows: &mut [&mut [Self]],
+        pool: Option<&rayon::ThreadPool>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError>;
+    /// The rows `at` a decode reads after its inverse transform, derivative
+    /// and forward transform, into `out`; see
+    /// [`TransformField::derivative_at`].
+    #[allow(clippy::too_many_arguments)]
+    fn derivative_at(
+        field: &TransformField,
+        rows: &mut [&mut [Self]],
+        zero: Option<&[bool]>,
+        at: &[usize],
+        out: &mut [&mut [Self]],
+        backend: LinearBackend,
+        pool: Option<&rayon::ThreadPool>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<DerivativeWork, TransformError>;
+}
+
+impl Lane for u16 {
+    fn is_direct(unit: usize) -> bool {
+        unit == 2 && cfg!(target_endian = "little")
+    }
+    fn direct(unit: usize, row: &mut [Self]) -> Option<&mut [u8]> {
+        if unit == 2 {
+            TransformField::le_image_mut(row)
+        } else {
+            None
+        }
+    }
+    fn direct_ref(unit: usize, row: &[Self]) -> Option<&[u8]> {
+        if unit == 2 {
+            TransformField::le_image(row)
+        } else {
+            None
+        }
+    }
+    fn unpack(unit: usize, bytes: &[u8], row: &mut [Self]) {
+        unpack(unit, bytes, row);
+    }
+    fn pack(unit: usize, row: &[Self], bytes: &mut [u8]) {
+        pack(unit, row, bytes);
+    }
+    fn transform(
+        field: &TransformField,
+        rows: &mut [&mut [Self]],
+        zero: Option<&[bool]>,
+        origin: usize,
+        inverse: bool,
+        backend: LinearBackend,
+        pool: Option<&rayon::ThreadPool>,
+        sum: Option<&mut [&mut [Self]]>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError> {
+        match sum {
+            Some(sum) => field
+                .transform_rows_adding(rows, zero, origin, inverse, backend, pool, sum, cancelled),
+            None => field.transform_rows(rows, zero, origin, inverse, backend, pool, cancelled),
+        }
+    }
+    fn scale(
+        field: &TransformField,
+        row: &mut [Self],
+        factor: u16,
+        backend: LinearBackend,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError> {
+        field.scale_with_backend(row, factor, backend, cancelled)
+    }
+    fn unpack_scaled(
+        field: &TransformField,
+        unit: usize,
+        bytes: &[u8],
+        row: &mut [Self],
+        factor: u16,
+        backend: LinearBackend,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError> {
+        if unit == 2 {
+            field.scale_le_bytes_with_backend(bytes, row, factor, backend, cancelled)
+        } else {
+            unpack(unit, bytes, row);
+            field.scale_with_backend(row, factor, backend, cancelled)
+        }
+    }
+    fn derivative(
+        field: &TransformField,
+        rows: &mut [&mut [Self]],
+        pool: Option<&rayon::ThreadPool>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError> {
+        field.differentiate_rows(rows, pool, cancelled)
+    }
+    fn derivative_at(
+        field: &TransformField,
+        rows: &mut [&mut [Self]],
+        zero: Option<&[bool]>,
+        at: &[usize],
+        out: &mut [&mut [Self]],
+        backend: LinearBackend,
+        pool: Option<&rayon::ThreadPool>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<DerivativeWork, TransformError> {
+        field.derivative_at(rows, zero, at, out, backend, pool, cancelled)
+    }
+}
+
+impl Lane for u8 {
+    fn is_direct(_: usize) -> bool {
+        true
+    }
+    fn direct(_: usize, row: &mut [Self]) -> Option<&mut [u8]> {
+        Some(row)
+    }
+    fn direct_ref(_: usize, row: &[Self]) -> Option<&[u8]> {
+        Some(row)
+    }
+    fn unpack(_: usize, _: &[u8], _: &mut [Self]) {
+        unreachable!("byte rows are read directly")
+    }
+    fn pack(_: usize, _: &[Self], _: &mut [u8]) {
+        unreachable!("byte rows are written directly")
+    }
+    fn transform(
+        field: &TransformField,
+        rows: &mut [&mut [Self]],
+        zero: Option<&[bool]>,
+        origin: usize,
+        inverse: bool,
+        backend: LinearBackend,
+        pool: Option<&rayon::ThreadPool>,
+        sum: Option<&mut [&mut [Self]]>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError> {
+        match sum {
+            Some(sum) => field.transform_u8_rows_adding(
+                rows, zero, origin, inverse, backend, pool, sum, cancelled,
+            ),
+            None => field.transform_u8_rows(rows, zero, origin, inverse, backend, pool, cancelled),
+        }
+    }
+    fn scale(
+        field: &TransformField,
+        row: &mut [Self],
+        factor: u16,
+        backend: LinearBackend,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError> {
+        field.scale_u8_with_backend(row, factor, backend, cancelled)
+    }
+    fn unpack_scaled(
+        _: &TransformField,
+        _: usize,
+        _: &[u8],
+        _: &mut [Self],
+        _: u16,
+        _: LinearBackend,
+        _: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError> {
+        unreachable!("byte rows are read directly")
+    }
+    fn derivative(
+        field: &TransformField,
+        rows: &mut [&mut [Self]],
+        pool: Option<&rayon::ThreadPool>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError> {
+        field.differentiate_u8_rows(rows, pool, cancelled)
+    }
+    fn derivative_at(
+        field: &TransformField,
+        rows: &mut [&mut [Self]],
+        zero: Option<&[bool]>,
+        at: &[usize],
+        out: &mut [&mut [Self]],
+        backend: LinearBackend,
+        pool: Option<&rayon::ThreadPool>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<DerivativeWork, TransformError> {
+        field.derivative_u8_at(rows, zero, at, out, backend, pool, cancelled)
+    }
+}
+
+/// Bytes of workspace per stripe byte for `rows` transform rows of lane `L`
+/// over a field of `unit` bytes: the rows themselves, the conversion buffer
+/// when the lane needs one, and one stripe of slack.
+fn workspace_per_byte<L: Lane>(rows: usize, unit: usize) -> Option<usize> {
+    rows.checked_mul(size_of::<L>() / unit)?
+        .checked_add(usize::from(!L::is_direct(unit)) + 1)
+}
+
 /// Move row handles so that a `rows`-by-`columns` row-major arrangement becomes
 /// a `columns`-by-`rows` one. Only the handles move; no symbol is copied.
-fn transpose(handles: &mut [Vec<u16>], rows: usize, columns: usize, visited: &mut [u64]) {
+fn transpose<H: Default>(handles: &mut [H], rows: usize, columns: usize, visited: &mut [u64]) {
     debug_assert_eq!(handles.len(), rows * columns);
     let mark = |visited: &mut [u64], at: usize| visited[at / 64] |= 1 << (at % 64);
     let seen = |visited: &[u64], at: usize| visited[at / 64] >> (at % 64) & 1 == 1;
@@ -276,6 +558,22 @@ fn transpose(handles: &mut [Vec<u16>], rows: usize, columns: usize, visited: &mu
             at = to;
         }
     }
+}
+
+/// What the two banks of a codec's rows may round up to whole pages beyond
+/// their symbols; see [`reedsolomon_rs::fft::RowBank::allocation_bytes`].
+const BANK_SLACK: usize = 2 * reedsolomon_rs::fft::RowBank::<u8>::ALIGN;
+
+/// What each row of a codec's banks costs beside its symbols: its handle,
+/// with room to spare, and the cache line of padding a bank may put after
+/// it; see [`reedsolomon_rs::fft::RowBank::ROW_PAD`].
+const ROW_BYTES: usize = 32 + reedsolomon_rs::fft::RowBank::<u8>::ROW_PAD;
+
+/// A zeroed page-aligned bank of `rows` rows of `width` symbols; see
+/// [`reedsolomon_rs::fft::RowBank`].
+fn bank<L: Lane>(rows: usize, width: usize) -> EngineResult<reedsolomon_rs::fft::RowBank<L>> {
+    reedsolomon_rs::fft::RowBank::zeroed(rows, width)
+        .ok_or(EngineError::resource_limit("FFT transform rows"))
 }
 
 /// Bounded synchronous FFT execution. Byte streams use the PAR3 on-disk layout:
@@ -338,17 +636,28 @@ impl FftCodec {
         } else {
             // Locator, row metadata, and the smallest field-aligned row/input
             // buffers. These are the same layouts admitted by decode/buffers.
-            g.domain * 32 + g.domain * 32 + (g.domain * (2 / unit) + 2) * unit
+            let per_byte = if g.bits == 8 {
+                workspace_per_byte::<u8>(g.domain, unit)
+            } else {
+                workspace_per_byte::<u16>(g.domain, unit)
+            }
+            .ok_or(EngineError::resource_limit("FFT stripes"))?;
+            g.domain * 32 + g.domain * 32 + per_byte * unit
         };
         let _decode = self
             .options
             .memory
             .reserve_as(MemoryCategory::CodecScratch, decode_floor)?;
-        let target = self
+        let wanted = self
             .options
             .stripe_bytes
-            .min(usize::try_from(block_size).unwrap_or(usize::MAX))
-            .min(self.options.memory.available() / 4);
+            .min(usize::try_from(block_size).unwrap_or(usize::MAX));
+        let room = self.options.memory.available() / 4;
+        let target = if room < wanted {
+            crate::runtime::budget_stripe(room, unit)
+        } else {
+            wanted
+        };
         let (stripe, reservation) =
             self.options
                 .memory
@@ -368,18 +677,32 @@ impl FftCodec {
             .map_or(1, |workers| workers.pool().current_num_threads())
     }
 
-    fn transform(&self, rows: &mut [Vec<u16>], origin: usize, inverse: bool) -> EngineResult<()> {
-        self.transform_counted(rows, origin, inverse, 0)
+    /// One additive transform. `zero` flags the rows the layout leaves all
+    /// zero, so the backend can skip the butterflies that cannot change them;
+    /// the diagnostics still count the transform's full butterfly total.
+    fn transform<L: Lane>(
+        &self,
+        rows: &mut [&mut [L]],
+        zero: Option<&[bool]>,
+        origin: usize,
+        inverse: bool,
+    ) -> EngineResult<()> {
+        self.transform_counted(rows, zero, origin, inverse, None, 0)
     }
 
     /// One additive transform, counted. `skipped` is the butterflies a plan
     /// removed from what this call would otherwise have had to perform, so the
     /// diagnostics can report the pruned and unpruned costs side by side.
-    fn transform_counted(
+    /// With `sum`, every row of the result is added into the same row of it
+    /// as the transform leaves it; see
+    /// [`TransformField::transform_rows_adding`].
+    fn transform_counted<L: Lane>(
         &self,
-        rows: &mut [Vec<u16>],
+        rows: &mut [&mut [L]],
+        zero: Option<&[bool]>,
         origin: usize,
         inverse: bool,
+        sum: Option<&mut [&mut [L]]>,
         skipped: u64,
     ) -> EngineResult<()> {
         let field = self.field.as_ref().expect("nontrivial FFT field");
@@ -391,25 +714,18 @@ impl FftCodec {
         // find out why an operation cost what it did. The pruned path below
         // has always reported afterwards; these two now agree.
         let performed = butterflies(rows.len());
-        let symbols = rows.first().map_or(0, Vec::len);
-        if let Some(workers) = &self.workers {
-            field.transform_in_pool(
-                rows,
-                origin,
-                inverse,
-                self.options.fft_backend,
-                workers.pool(),
-                &cancelled,
-            )
-        } else {
-            field.transform_with_backend(
-                rows,
-                origin,
-                inverse,
-                self.options.fft_backend,
-                &cancelled,
-            )
-        }
+        let symbols = rows.first().map_or(0, |row| row.len());
+        L::transform(
+            field,
+            rows,
+            zero,
+            origin,
+            inverse,
+            self.options.fft_backend,
+            self.workers.as_ref().map(crate::runtime::WorkerPool::pool),
+            sum,
+            &cancelled,
+        )
         .map_err(transform_error)?;
         self.options
             .diagnostics
@@ -426,10 +742,14 @@ impl FftCodec {
     /// butterfly this performs is one the full transform would have performed,
     /// with the same factor, in the same order relative to the rows it touches,
     /// so the rows the caller reads come out byte for byte identical.
-    fn transform_forward(&self, rows: &mut [Vec<u16>], plan: &mut ForwardPlan) -> EngineResult<()> {
+    fn transform_forward<L: Lane>(
+        &self,
+        rows: &mut [&mut [L]],
+        plan: &mut ForwardPlan,
+    ) -> EngineResult<()> {
         use rayon::prelude::*;
         if plan.block_log2 == 0 {
-            return self.transform_counted(rows, 0, false, 0);
+            return self.transform_counted(rows, None, 0, false, None, 0);
         }
         let field = self.field.as_ref().expect("nontrivial FFT field");
         let backend = self.options.fft_backend;
@@ -438,14 +758,36 @@ impl FftCodec {
         // the `span` rows that share its low bits.
         let width = 1usize << plan.block_log2;
         let span = rows.len() >> plan.block_log2;
-        let symbols = rows.first().map_or(0, Vec::len);
+        let symbols = rows.first().map_or(0, |row| row.len());
         let blocks = &plan.blocks;
-        let wide = |rows: &mut [Vec<u16>]| -> EngineResult<()> {
-            let run = |class: &mut [Vec<u16>]| {
-                field
-                    .transform_with_backend(class, 0, false, backend, &cancelled)
-                    .map_err(transform_error)
-            };
+        // With workers on a target that tiles, each class and block beyond
+        // a tile is one pooled transform, run one after another: the pool
+        // takes its column tiles, so the rows of one class at a time stream
+        // through the workers' caches, which classes transformed side by
+        // side, each sweeping its whole rows through one worker's, would
+        // not. Smaller ones run side by side, as all do on a target that
+        // does not tile, where the sweeps of one small class at a time cost
+        // far more than they save.
+        let pool = self.workers.as_ref().map(crate::runtime::WorkerPool::pool);
+        let run = |rows: &mut [&mut [L]], origin: usize, pool| {
+            L::transform(
+                field, rows, None, origin, false, backend, pool, None, &cancelled,
+            )
+            .map_err(transform_error)
+        };
+        let pooled = |rows: usize| {
+            pool.is_some()
+                && reedsolomon_rs::fft::COLUMN_TILES
+                && rows.saturating_mul(symbols).saturating_mul(size_of::<L>())
+                    > reedsolomon_rs::fft::TRANSFORM_TILE_BYTES
+        };
+        let wide = |rows: &mut [&mut [L]]| -> EngineResult<()> {
+            if pooled(span) {
+                return rows
+                    .chunks_mut(span)
+                    .try_for_each(|class| run(class, 0, pool));
+            }
+            let run = |class: &mut [&mut [L]]| run(class, 0, None);
             match &self.workers {
                 Some(workers) => workers
                     .pool()
@@ -453,14 +795,20 @@ impl FftCodec {
                 None => rows.chunks_mut(span).try_for_each(run),
             }
         };
-        let narrow = |rows: &mut [Vec<u16>]| -> EngineResult<()> {
-            let run = |(block, at): (usize, &mut [Vec<u16>])| {
-                if blocks.binary_search(&block).is_err() {
+        let narrow = |rows: &mut [&mut [L]]| -> EngineResult<()> {
+            let kept = |block: &usize| blocks.binary_search(block).is_ok();
+            if pooled(width) {
+                return rows
+                    .chunks_mut(width)
+                    .enumerate()
+                    .filter(|(block, _)| kept(block))
+                    .try_for_each(|(block, at)| run(at, block * width, pool));
+            }
+            let run = |(block, at): (usize, &mut [&mut [L]])| {
+                if !kept(&block) {
                     return Ok(());
                 }
-                field
-                    .transform_with_backend(at, block * width, false, backend, &cancelled)
-                    .map_err(transform_error)
+                run(at, block * width, None)
             };
             match &self.workers {
                 Some(workers) => workers
@@ -487,16 +835,19 @@ impl FftCodec {
 
     /// Encode a compatible recovery range. Input and output callbacks receive
     /// positioned byte stripes; neither whole input nor recovery blocks are kept.
+    /// The input callback must fill every byte of the stripe it is handed,
+    /// zeros past the end of a short input included: the stripe is not
+    /// cleared beforehand.
     pub fn encode(
         &self,
         block_size: u64,
         first: usize,
         count: usize,
-        mut read: impl FnMut(usize, u64, &mut [u8]) -> EngineResult<()>,
+        read: impl FnMut(usize, u64, &mut [u8]) -> EngineResult<()>,
         mut write: impl FnMut(usize, u64, &[u8]) -> EngineResult<()>,
     ) -> EngineResult<()> {
         let mut progress = self.options.stage(crate::runtime::Stage::Encode)?;
-        let mut write = |index, offset, bytes: &[u8]| {
+        let write = |index, offset, bytes: &[u8]| {
             write(index, offset, bytes)?;
             progress.advance(bytes.len() as u64);
             self.options.cancel.check()
@@ -510,44 +861,96 @@ impl FftCodec {
         if g.is_trivial() {
             return self.encode_trivial(block_size, first, count, read, write);
         }
+        if g.bits == 8 {
+            self.encode_rows::<u8>(block_size, first, count, read, write)
+        } else {
+            self.encode_rows::<u16>(block_size, first, count, read, write)
+        }
+    }
+
+    fn encode_rows<L: Lane>(
+        &self,
+        block_size: u64,
+        first: usize,
+        count: usize,
+        mut read: impl FnMut(usize, u64, &mut [u8]) -> EngineResult<()>,
+        mut write: impl FnMut(usize, u64, &[u8]) -> EngineResult<()>,
+    ) -> EngineResult<()> {
+        let g = self.geometry;
         let rows = g
             .capacity
             .checked_mul(2)
             .ok_or(EngineError::resource_limit("FFT encoder rows"))?;
-        let (stripe, _buffers) = self.buffers(block_size, rows)?;
+        let (stripe, _buffers) = self.buffers::<L>(block_size, rows)?;
         let symbols = stripe / g.field_bytes();
-        let mut work = vec![vec![0u16; symbols]; g.capacity];
-        let mut sum = vec![vec![0u16; symbols]; g.capacity];
-        let mut bytes = vec![0; stripe];
+        let mut work = bank::<L>(g.capacity, symbols)?;
+        let mut sum = bank::<L>(g.capacity, symbols)?;
+        let (mut work, mut sum) = (work.rows_mut(), sum.rows_mut());
+        let mut bytes = vec![
+            0;
+            if L::is_direct(g.field_bytes()) {
+                0
+            } else {
+                stripe
+            }
+        ];
+        // The last chunk's rows past the final input are zero.
+        let tail = g.inputs % g.capacity;
+        let tail: Vec<bool> = (0..g.capacity).map(|at| tail != 0 && at >= tail).collect();
+        let unit = g.field_bytes();
         let mut offset = 0;
         while offset < block_size {
             self.options.cancel.check()?;
             let take = (block_size - offset).min(stripe as u64) as usize;
-            for row in &mut sum {
-                row.fill(0);
-            }
+            // Symbols holding stripe bytes; the read fills those bytes, so
+            // only the symbols past them are cleared.
+            let used = take.div_ceil(unit);
             for base in (0..g.inputs).step_by(g.capacity) {
-                for (at, row) in work.iter_mut().enumerate() {
+                // The first chunk is transformed in the sum rows themselves,
+                // which therefore need no clearing and no addition.
+                let rows = if base == 0 { &mut sum } else { &mut work };
+                for (at, row) in rows.iter_mut().enumerate() {
+                    let row: &mut [L] = row;
                     self.options.cancel.check()?;
-                    row.fill(0);
                     if base + at >= g.inputs {
+                        row.fill(L::default());
                         continue;
                     }
-                    bytes.fill(0);
-                    read(base + at, offset, &mut bytes[..take])?;
-                    unpack(g.field_bytes(), &bytes, row);
-                }
-                self.transform(&mut work, g.capacity + base, true)?;
-                for (to, from) in sum.iter_mut().zip(&work) {
-                    for (to, from) in to.iter_mut().zip(from) {
-                        *to ^= from;
+                    if let Some(row) = L::direct(unit, row) {
+                        read(base + at, offset, &mut row[..take])?;
+                    } else {
+                        read(base + at, offset, &mut bytes[..take])?;
+                        bytes[take..used * unit].fill(0);
+                        L::unpack(unit, &bytes[..used * unit], &mut row[..used]);
                     }
+                    row[used..].fill(L::default());
+                }
+                let zero = (base + g.capacity > g.inputs).then_some(tail.as_slice());
+                if base == 0 {
+                    self.transform(&mut sum, zero, g.capacity, true)?;
+                } else {
+                    // Each tile of the chunk is added into the sum as the
+                    // transform finishes it, while it is still in the cache.
+                    self.transform_counted(
+                        &mut work,
+                        zero,
+                        g.capacity + base,
+                        true,
+                        Some(&mut sum),
+                        0,
+                    )?;
                 }
             }
-            self.transform(&mut sum, 0, false)?;
+            self.transform(&mut sum, None, 0, false)?;
             for (index, row) in sum.iter().enumerate().skip(first).take(count) {
-                pack(g.field_bytes(), row, &mut bytes);
-                write(index, offset, &bytes[..take])?;
+                let out = match L::direct_ref(unit, row) {
+                    Some(row) => row,
+                    None => {
+                        L::pack(g.field_bytes(), row, &mut bytes);
+                        &bytes
+                    }
+                };
+                write(index, offset, &out[..take])?;
             }
             offset += take as u64;
         }
@@ -556,16 +959,56 @@ impl FftCodec {
 
     /// Recover missing original rows using precisely the admitted recovery
     /// indices. Unused transform positions are authenticated geometry padding.
+    /// As for [`Self::encode`], the input callback must fill every byte of
+    /// the stripe it is handed.
     pub fn decode(
         &self,
         block_size: u64,
         lost: &[usize],
         recovery: &[usize],
+        read: impl FnMut(FftInput, u64, &mut [u8]) -> EngineResult<()>,
+        write: impl FnMut(usize, u64, &[u8]) -> EngineResult<()>,
+    ) -> EngineResult<()> {
+        self.decode_with(block_size, lost, recovery, read, None, write)
+    }
+
+    /// [`Self::decode`], handing every input stripe's bytes, as `read`
+    /// filled them, to `consume` as well: each stripe of each surviving
+    /// input and supplied recovery row exactly once, the stripes of a row
+    /// in offset order. With workers the stripes of a batch of rows are
+    /// consumed in parallel, in no particular order among themselves, while
+    /// `read`, still on the calling thread and in row order, fills the next
+    /// batch. Without workers, or when no room is left for the batch, each
+    /// stripe is consumed right after it is read. A failing `consume` or
+    /// `read` ends the decode with its error; when both fail in one batch
+    /// the consumer's is returned.
+    pub fn decode_with(
+        &self,
+        block_size: u64,
+        lost: &[usize],
+        recovery: &[usize],
+        read: impl FnMut(FftInput, u64, &mut [u8]) -> EngineResult<()>,
+        consume: Option<&FftConsumer<'_>>,
+        write: impl FnMut(usize, u64, &[u8]) -> EngineResult<()>,
+    ) -> EngineResult<()> {
+        self.decode_held(block_size, lost, recovery, read, consume, write, None)
+    }
+
+    /// [`Self::decode_with`], reserving `hold` at the admitted stripe; see
+    /// [`StripeHold`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decode_held(
+        &self,
+        block_size: u64,
+        lost: &[usize],
+        recovery: &[usize],
         mut read: impl FnMut(FftInput, u64, &mut [u8]) -> EngineResult<()>,
+        consume: Option<&FftConsumer<'_>>,
         mut write: impl FnMut(usize, u64, &[u8]) -> EngineResult<()>,
+        hold: Option<&dyn StripeHold>,
     ) -> EngineResult<()> {
         let mut progress = self.options.stage(crate::runtime::Stage::Decode)?;
-        let mut write = |index, offset, bytes: &[u8]| {
+        let write = |index, offset, bytes: &[u8]| {
             write(index, offset, bytes)?;
             self.options.diagnostics.note_reconstructed(bytes.len());
             progress.advance(bytes.len() as u64);
@@ -579,8 +1022,39 @@ impl FftCodec {
             return Err(EngineError::InvalidState("insufficient FFT recovery"));
         }
         if g.is_trivial() {
-            return self.decode_trivial(block_size, lost, recovery, read, write);
+            let none = |_: FftInput, _: u64, _: &[u8]| Ok(());
+            let consume: &FftConsumer<'_> = consume.unwrap_or(&none);
+            return self.decode_trivial(
+                block_size,
+                lost,
+                recovery,
+                |row, offset, out| {
+                    read(row, offset, out)?;
+                    consume(row, offset, out)
+                },
+                write,
+            );
         }
+        if g.bits == 8 {
+            self.decode_rows::<u8>(block_size, lost, recovery, read, consume, write, hold)
+        } else {
+            self.decode_rows::<u16>(block_size, lost, recovery, read, consume, write, hold)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_rows<L: Lane>(
+        &self,
+        block_size: u64,
+        lost: &[usize],
+        recovery: &[usize],
+        mut read: impl FnMut(FftInput, u64, &mut [u8]) -> EngineResult<()>,
+        consume: Option<&FftConsumer<'_>>,
+        mut write: impl FnMut(usize, u64, &[u8]) -> EngineResult<()>,
+        hold: Option<&dyn StripeHold>,
+    ) -> EngineResult<()> {
+        use rayon::prelude::*;
+        let g = self.geometry;
         let field = self.field.as_ref().expect("nontrivial FFT field");
         let _plan = self.options.memory.reserve_as(
             MemoryCategory::CodecScratch,
@@ -608,48 +1082,307 @@ impl FftCodec {
         let factors = field
             .erasure_factors(&erased, &cancelled)
             .map_err(transform_error)?;
-        let (stripe, _buffers) = self.buffers(block_size, g.domain)?;
+        // The rows the decode reads, ascending, and where each lost input's
+        // lands among them.
+        let mut at: Vec<usize> = lost.iter().map(|&index| g.capacity + index).collect();
+        at.sort_unstable();
+        // The fused rows when they fit with `spare` left free, else the
+        // separate steps' rows.
+        let admit = |spare: usize| -> EngineResult<(usize, Reservation, bool)> {
+            match self.fused_buffers::<L>(block_size, lost.len(), spare)? {
+                Some(buffers) => Ok((buffers.0, buffers.1, true)),
+                None => {
+                    let buffers = self.buffers_leaving::<L>(block_size, g.domain, spare, true)?;
+                    Ok((buffers.0, buffers.1, false))
+                }
+            }
+        };
+        let mut admitted = admit(0)?;
+        // What the caller holds beside the decode is reserved at the stripe
+        // just admitted. When the bank left too little for it, the bank is
+        // admitted again leaving room for it at the narrowest stripe, which
+        // bounds what any stripe needs, and the fused rows give way first.
+        if let Some(hold) = hold
+            && !hold.reserve(admitted.0)
+            && let Some(spare) = hold.bytes(g.field_bytes())
+        {
+            drop(admitted);
+            admitted = match admit(spare) {
+                Ok(narrower) => narrower,
+                Err(EngineError::ResourceLimit(_)) => admit(0)?,
+                Err(error) => return Err(error),
+            };
+            hold.reserve(admitted.0);
+        }
+        let (stripe, _buffers, fused) = admitted;
         let symbols = stripe / g.field_bytes();
-        let mut plan = ForwardPlan::new(g, lost, symbols, &self.options)?;
-        let mut rows = vec![vec![0u16; symbols]; g.domain];
-        let mut bytes = vec![0; stripe];
+        let mut plan = if fused {
+            None
+        } else {
+            Some(ForwardPlan::new(g, lost, symbols, &self.options)?)
+        };
+        let mut rows = bank::<L>(g.domain, symbols)?;
+        let mut rows = rows.rows_mut();
+        let mut found = bank::<L>(if fused { at.len() } else { 0 }, symbols)?;
+        let mut found = found.rows_mut();
+        let mut bytes = vec![
+            0;
+            if L::is_direct(g.field_bytes()) {
+                0
+            } else {
+                stripe
+            }
+        ];
+        // Erased and padding rows are never read, so they stay zero.
+        let zero: Vec<bool> = (0..g.domain)
+            .map(|index| erased[index] || index >= g.capacity + g.inputs)
+            .collect();
+        let unit = g.field_bytes();
+        let backend = self.options.fft_backend;
+        let input = |index: usize| {
+            if index < g.capacity {
+                FftInput::Recovery(index)
+            } else {
+                FftInput::Original(index - g.capacity)
+            }
+        };
+        // With workers and a consumer, the stripes of a batch of rows are read
+        // ahead, straight into their rows where the lane is the byte image and
+        // otherwise into a ring, then consumed and scaled on the pool while
+        // the next batch is read; the ring holds two batches for that. It
+        // comes only out of what the bank left, beyond a stripe of slack;
+        // without room for two batches of two stripes, as without workers,
+        // each stripe is consumed and scaled as it is read.
+        let mut ring: Vec<Vec<u8>> = Vec::new();
+        let mut _ring_memory = None;
+        let mut batch = 0;
+        if let (Some(workers), Some(_)) = (&self.workers, consume) {
+            let wanted = (workers.pool().current_num_threads() * 2).clamp(2, 32);
+            if L::is_direct(unit) {
+                batch = (g.domain / 4).clamp(16, DIRECT_BATCH);
+            } else {
+                let room = self.options.memory.available().saturating_sub(stripe) / stripe;
+                let fit = (wanted * 2).min(room) / 2;
+                if fit >= 2
+                    && let Ok(reservation) = self
+                        .options
+                        .memory
+                        .reserve_as(MemoryCategory::CodecScratch, 2 * fit * stripe)
+                {
+                    _ring_memory = Some(reservation);
+                    ring = vec![vec![0; stripe]; 2 * fit];
+                    batch = fit;
+                }
+            }
+        }
+        tracing::debug!(batch, "PAR3 FFT decode consumer batch admitted");
         let mut offset = 0;
         while offset < block_size {
             self.options.cancel.check()?;
             let take = (block_size - offset).min(stripe as u64) as usize;
-            for (index, row) in rows.iter_mut().enumerate() {
-                self.options.cancel.check()?;
-                row.fill(0);
-                if erased[index] || index >= g.capacity + g.inputs {
-                    continue;
-                }
-                bytes.fill(0);
-                let source = if index < g.capacity {
-                    FftInput::Recovery(index)
-                } else {
-                    FftInput::Original(index - g.capacity)
-                };
-                read(source, offset, &mut bytes[..take])?;
-                unpack(g.field_bytes(), &bytes, row);
-                field
-                    .scale_with_backend(row, factors[index], self.options.fft_backend, &cancelled)
+            // Symbols holding stripe bytes; the read fills those bytes, so
+            // only the symbols past them are cleared, and each symbol is
+            // scaled as it is loaded.
+            let used = take.div_ceil(unit);
+            if batch == 0 {
+                for (index, row) in rows.iter_mut().enumerate() {
+                    let row: &mut [L] = row;
+                    self.options.cancel.check()?;
+                    if zero[index] {
+                        row.fill(L::default());
+                        continue;
+                    }
+                    let source = input(index);
+                    let factor = factors[index];
+                    if let Some(direct) = L::direct(unit, row) {
+                        read(source, offset, &mut direct[..take])?;
+                        if let Some(consume) = consume {
+                            consume(source, offset, &direct[..take])?;
+                        }
+                        L::scale(field, &mut row[..used], factor, backend, &cancelled)
+                    } else {
+                        read(source, offset, &mut bytes[..take])?;
+                        if let Some(consume) = consume {
+                            consume(source, offset, &bytes[..take])?;
+                        }
+                        bytes[take..used * unit].fill(0);
+                        let packed = &bytes[..used * unit];
+                        L::unpack_scaled(
+                            field,
+                            unit,
+                            packed,
+                            &mut row[..used],
+                            factor,
+                            backend,
+                            &cancelled,
+                        )
+                    }
                     .map_err(transform_error)?;
+                    row[used..].fill(L::default());
+                }
+            } else {
+                // Batch by batch: each is read on this thread while the pool
+                // consumes and scales the one before, out of the other half
+                // of the ring, and the last is consumed alone.
+                let consume = consume.expect("batched reads have a consumer");
+                let pool = self
+                    .workers
+                    .as_ref()
+                    .expect("batched reads have workers")
+                    .pool();
+                let (zero, factors) = (&zero, &factors);
+                let mut read_batch = |rows: &mut [&mut [L]],
+                                      first: usize,
+                                      ring: &mut [Vec<u8>]|
+                 -> EngineResult<()> {
+                    for (at, row) in rows.iter_mut().enumerate() {
+                        let row: &mut [L] = row;
+                        self.options.cancel.check()?;
+                        if zero[first + at] {
+                            continue;
+                        }
+                        if let Some(direct) = L::direct(unit, row) {
+                            read(input(first + at), offset, &mut direct[..take])?;
+                        } else {
+                            let slot = &mut ring[at];
+                            read(input(first + at), offset, &mut slot[..take])?;
+                            slot[take..used * unit].fill(0);
+                        }
+                    }
+                    Ok(())
+                };
+                let consume_batch =
+                    |rows: &mut [&mut [L]], first: usize, ring: &[Vec<u8>]| -> EngineResult<()> {
+                        rows.par_iter_mut().enumerate().try_for_each(
+                            |(at, row)| -> EngineResult<()> {
+                                let row: &mut [L] = row;
+                                let index = first + at;
+                                if zero[index] {
+                                    row.fill(L::default());
+                                    return Ok(());
+                                }
+                                let source = input(index);
+                                let factor = factors[index];
+                                if L::is_direct(unit) {
+                                    let direct = L::direct(unit, row).expect("byte image");
+                                    consume(source, offset, &direct[..take])?;
+                                    L::scale(field, &mut row[..used], factor, backend, &cancelled)
+                                } else {
+                                    let packed = &ring[at];
+                                    consume(source, offset, &packed[..take])?;
+                                    L::unpack_scaled(
+                                        field,
+                                        unit,
+                                        &packed[..used * unit],
+                                        &mut row[..used],
+                                        factor,
+                                        backend,
+                                        &cancelled,
+                                    )
+                                }
+                                .map_err(transform_error)?;
+                                row[used..].fill(L::default());
+                                Ok(())
+                            },
+                        )
+                    };
+                let mut start = 0;
+                let mut pending: Option<std::ops::Range<usize>> = None;
+                let mut parity = false;
+                loop {
+                    let next = (start < rows.len()).then(|| start..(start + batch).min(rows.len()));
+                    if pending.is_none() && next.is_none() {
+                        break;
+                    }
+                    // The pending batch ends where the next begins.
+                    let (done, rest) = rows.split_at_mut(start);
+                    let half = ring.len() / 2;
+                    let (front, back) = ring.split_at_mut(half);
+                    let (ring_pending, ring_next) =
+                        if parity { (back, front) } else { (front, back) };
+                    let mut consumed = Ok(());
+                    let mut read_ahead = Ok(());
+                    pool.in_place_scope(|scope| {
+                        if let Some(pending) = &pending {
+                            let first = pending.start;
+                            let batch = &mut done[first..];
+                            let ring = &*ring_pending;
+                            let consumed = &mut consumed;
+                            scope.spawn(move |_| *consumed = consume_batch(batch, first, ring));
+                        }
+                        if let Some(next) = &next {
+                            read_ahead = read_batch(&mut rest[..next.len()], next.start, ring_next);
+                        }
+                    });
+                    consumed?;
+                    read_ahead?;
+                    if let Some(next) = &next {
+                        start = next.end;
+                    }
+                    pending = next;
+                    parity = !parity;
+                }
             }
-            self.transform(&mut rows, 0, true)?;
-            field
-                .derivative(&mut rows, &cancelled)
-                .map_err(transform_error)?;
-            self.transform_forward(&mut rows, &mut plan)?;
+            match &mut plan {
+                Some(plan) => {
+                    self.transform(&mut rows, Some(&zero), 0, true)?;
+                    L::derivative(
+                        field,
+                        &mut rows,
+                        self.workers.as_ref().map(crate::runtime::WorkerPool::pool),
+                        &cancelled,
+                    )
+                    .map_err(transform_error)?;
+                    self.transform_forward(&mut rows, plan)?;
+                }
+                None => {
+                    let work = L::derivative_at(
+                        field,
+                        &mut rows,
+                        Some(&zero),
+                        &at,
+                        &mut found,
+                        backend,
+                        self.workers.as_ref().map(crate::runtime::WorkerPool::pool),
+                        &cancelled,
+                    )
+                    .map_err(transform_error)?;
+                    // Against the inverse and forward transforms in full.
+                    // The split steps run the forward low half twice over
+                    // each block holding a lost row, so where most blocks
+                    // do they perform more than both in full: the count is
+                    // the work performed, and nothing is skipped then.
+                    let full = 2 * butterflies(g.domain);
+                    self.options.diagnostics.note_transform(
+                        work.transforms,
+                        work.butterflies,
+                        symbols,
+                        full.saturating_sub(work.butterflies),
+                    );
+                }
+            }
             for &index in lost {
                 let factor = field
                     .inverse(factors[g.capacity + index])
                     .ok_or(EngineError::InvalidState("singular FFT locator"))?;
-                let row = &mut rows[g.capacity + index];
-                field
-                    .scale_with_backend(row, factor, self.options.fft_backend, &cancelled)
+                let row = if fused {
+                    let slot = at
+                        .binary_search(&(g.capacity + index))
+                        .expect("every lost row is read");
+                    &mut *found[slot]
+                } else {
+                    &mut *rows[g.capacity + index]
+                };
+                L::scale(field, row, factor, self.options.fft_backend, &cancelled)
                     .map_err(transform_error)?;
-                pack(g.field_bytes(), row, &mut bytes);
-                write(index, offset, &bytes[..take])?;
+                let out = match L::direct_ref(unit, row) {
+                    Some(row) => row,
+                    None => {
+                        L::pack(g.field_bytes(), row, &mut bytes);
+                        &bytes
+                    }
+                };
+                write(index, offset, &out[..take])?;
             }
             offset += take as u64;
         }
@@ -743,6 +1476,85 @@ impl FftCodec {
         Ok(())
     }
 
+    /// What `encode` reserves for its stripes when memory does not narrow
+    /// them, by the same layout it charges: `byte_buffers` for a trivial
+    /// geometry, otherwise `buffers` on the lane `encode` runs (byte rows for
+    /// GF(2^8), word rows for GF(2^16)). A caller holding output beside the
+    /// encode leaves this much so the stripe stays at its configured width.
+    pub(crate) fn encode_stripe_bytes(&self, block_size: u64) -> usize {
+        let target = self
+            .options
+            .stripe_bytes
+            .min(usize::try_from(block_size).unwrap_or(usize::MAX));
+        if self.geometry.is_trivial() {
+            return target.saturating_mul(2).saturating_add(64);
+        }
+        let unit = self.geometry.field_bytes();
+        let rows = self.geometry.capacity.saturating_mul(2);
+        let per_byte = if self.geometry.bits == 8 {
+            workspace_per_byte::<u8>(rows, unit)
+        } else {
+            workspace_per_byte::<u16>(rows, unit)
+        }
+        .unwrap_or(usize::MAX);
+        let lane = if self.geometry.bits == 8 { 1 } else { 2 };
+        (target / unit * unit)
+            .saturating_mul(per_byte)
+            .saturating_add(rows.saturating_mul(ROW_BYTES))
+            .saturating_add(BANK_SLACK)
+            .saturating_add(self.walk_units_bytes(rows, target, lane))
+    }
+
+    /// Scratch the workers may take beside `rows` rows of `lane`-byte symbols
+    /// over a `stripe`-byte stripe when a pooled derivative runs them in
+    /// column tiles: each copies its tile, at most half
+    /// [`reedsolomon_rs::fft::TRANSFORM_TILE_BYTES`], and all of them
+    /// together never more than the bank, and each lists the rows of its
+    /// tile. The transforms tile in place and take none; their lists are
+    /// [`Self::walk_units_bytes`]. Nothing without a derivative, with one
+    /// worker, or on a target that does not tile.
+    fn walk_scratch_bytes(&self, rows: usize, stripe: usize, lane: usize) -> usize {
+        let threads = self.worker_count();
+        if threads == 1 || !reedsolomon_rs::fft::COLUMN_TILES {
+            return 0;
+        }
+        let unit = self.geometry.field_bytes();
+        let bank = rows.saturating_mul(stripe / unit).saturating_mul(lane);
+        threads
+            .saturating_mul(reedsolomon_rs::fft::TRANSFORM_TILE_BYTES / 2)
+            .min(bank)
+            .saturating_add(
+                threads
+                    .saturating_mul(rows)
+                    .saturating_mul(size_of::<&mut [u8]>()),
+            )
+    }
+
+    /// What a walked transform of `rows` rows of `lane`-byte symbols over a
+    /// `stripe`-byte stripe, or any narrower one the budget admits, keeps
+    /// beside the scratch: the units of its sweeps, most for the inverse
+    /// over every row. A narrower stripe never needs more of them under the
+    /// same sweeps, but rows under 64 symbols take radix-2 sweeps, which
+    /// keep different units and may walk where the wider rows would not, so
+    /// the wider of the two is charged. Nothing when neither tiles.
+    fn walk_units_bytes(&self, rows: usize, stripe: usize, lane: usize) -> usize {
+        let Some(field) = &self.field else {
+            return 0;
+        };
+        let unit = self.geometry.field_bytes();
+        let units = |stripe: usize| {
+            field.walk_units_bytes(
+                rows,
+                stripe / unit,
+                lane,
+                true,
+                self.options.fft_backend,
+                self.worker_count(),
+            )
+        };
+        units(stripe).max(units(stripe.min(63 * unit)))
+    }
+
     fn byte_buffers(&self, block_size: u64) -> EngineResult<(usize, Reservation)> {
         self.options.validate()?;
         if block_size == 0 {
@@ -763,35 +1575,231 @@ impl FftCodec {
         Ok(admitted)
     }
 
-    fn buffers(&self, block_size: u64, rows: usize) -> EngineResult<(usize, Reservation)> {
+    /// Admit a decode's rows for [`TransformField::derivative_at`]: the
+    /// domain's rows and one more per lost row for what it reads, the
+    /// conversion buffer, the units of its sweeps, its flags, and the tile
+    /// scratch of every worker. None, for the separate steps and
+    /// [`Self::buffers`], when the bank the configured stripe would admit
+    /// fits a transform tile and the passes the fused steps save cost
+    /// nothing, when the budget cannot hold them, and on a target that does
+    /// not tile, where the tiles cost more than the passes over whole rows.
+    /// `spare` bytes of the budget must stay free beside them, or they are
+    /// declined too: what the caller holds back for itself is never taken by
+    /// the extra rows.
+    ///
+    /// The fused rows charge more than the separate steps' rows, so where the
+    /// budget narrows the stripe they narrow it further, and every stripe
+    /// pass over a block reads every input once more. They are taken only
+    /// when their stripe walks each block in no more passes than the one
+    /// [`Self::buffers`] would admit from the same budget, so they read every
+    /// input as often and as much: the passes saved over the bank never buy
+    /// more reads. A narrower stripe in as many passes only holds less.
+    fn fused_buffers<L: Lane>(
+        &self,
+        block_size: u64,
+        lost: usize,
+        spare: usize,
+    ) -> EngineResult<Option<(usize, Reservation)>> {
         self.options.validate()?;
-        let unit = self.geometry.field_bytes();
+        let g = self.geometry;
+        let unit = g.field_bytes();
         if block_size == 0 || !block_size.is_multiple_of(unit as u64) {
             return Err(EngineError::InvalidState("FFT block alignment"));
         }
-        let overhead = rows
-            .checked_mul(32)
-            .ok_or(EngineError::resource_limit("FFT rows"))?;
-        let per_byte = rows
-            .checked_mul(2 / unit)
-            .and_then(|n| n.checked_add(2))
-            .ok_or(EngineError::resource_limit("FFT stripes"))?;
         let target = self
             .options
             .stripe_bytes
             .min(usize::try_from(block_size).unwrap_or(usize::MAX));
-        let buffers = self.options.memory.reserve_stripes_with_overhead(
+        let field = self.field.as_ref().expect("nontrivial FFT field");
+        if !self.fuses_decode()
+            || !reedsolomon_rs::fft::derivative_at_walks(g.domain, target / unit, size_of::<L>())
+        {
+            return Ok(None);
+        }
+        let rows = g.domain + lost;
+        let Some(per_byte) = workspace_per_byte::<L>(rows, unit) else {
+            return Ok(None);
+        };
+        let threads = self.worker_count();
+        // The rows' headers, the index of each lost row, and the steps'
+        // own keep.
+        let overhead = rows
+            .saturating_mul(ROW_BYTES)
+            .saturating_add(BANK_SLACK)
+            .saturating_add(lost.saturating_mul(size_of::<usize>()))
+            .saturating_add(field.derivative_at_bytes(
+                g.domain,
+                target / unit,
+                size_of::<L>(),
+                self.options.fft_backend,
+                threads,
+            ))
+            .saturating_add(spare);
+        let available = self.options.memory.available();
+        let fused = crate::runtime::stripe_within(available, target, per_byte, unit, overhead);
+        let (charges, _) = self.bank_charges::<L>(g.domain, target, spare, true)?;
+        let separate = charges
+            .iter()
+            .map(|&(per_byte, overhead)| {
+                crate::runtime::stripe_within(available, target, per_byte, unit, overhead)
+            })
+            .max()
+            .unwrap_or(0);
+        let passes = |stripe: usize| block_size.div_ceil(stripe.max(1) as u64);
+        if fused == 0 || passes(fused) > passes(separate) {
+            return Ok(None);
+        }
+        match self.options.memory.reserve_stripes_with_overhead(
             MemoryCategory::CodecScratch,
             target,
             per_byte,
             unit,
             overhead,
-        )?;
-        self.options
-            .diagnostics
-            .note_stripe(buffers.0, per_byte, target);
+        ) {
+            Ok(mut buffers) => {
+                buffers.1.shrink_to(buffers.1.bytes() - spare);
+                self.options
+                    .diagnostics
+                    .note_stripe(buffers.0, per_byte, target);
+                tracing::debug!(
+                    stripe_bytes = buffers.0,
+                    rows,
+                    "PAR3 FFT fused stripes admitted"
+                );
+                Ok(Some(buffers))
+            }
+            Err(EngineError::ResourceLimit(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Admit `rows` transform rows of lane `L`, plus its conversion buffer.
+    /// Byte rows charge one byte per stripe byte, so a GF(2^8) cohort gets
+    /// twice the stripe the same budget admitted for zero-extended rows.
+    fn buffers<L: Lane>(&self, block_size: u64, rows: usize) -> EngineResult<(usize, Reservation)> {
+        self.buffers_leaving::<L>(block_size, rows, 0, false)
+    }
+
+    /// [`Self::buffers`], narrowing the stripe until `spare` bytes of the
+    /// budget stay free beside them; with `derivative`, for rows a pooled
+    /// derivative runs over as well.
+    fn buffers_leaving<L: Lane>(
+        &self,
+        block_size: u64,
+        rows: usize,
+        spare: usize,
+        derivative: bool,
+    ) -> EngineResult<(usize, Reservation)> {
+        self.options.validate()?;
+        let unit = self.geometry.field_bytes();
+        if block_size == 0 || !block_size.is_multiple_of(unit as u64) {
+            return Err(EngineError::InvalidState("FFT block alignment"));
+        }
+        let target = self
+            .options
+            .stripe_bytes
+            .min(usize::try_from(block_size).unwrap_or(usize::MAX));
+        let (charges, walk) = self.bank_charges::<L>(rows, target, spare, derivative)?;
+        let mut attempts = charges;
+        let available = self.options.memory.available();
+        let stripe = |(per_byte, overhead): &(usize, usize)| {
+            (available.saturating_sub(*overhead) / per_byte).min(target)
+        };
+        if stripe(&attempts[1]) > stripe(&attempts[0]) {
+            attempts.swap(0, 1);
+        }
+        let mut buffers = Err(EngineError::resource_limit("FFT stripes"));
+        for (per_byte, overhead) in attempts.into_iter().take(if walk == 0 { 1 } else { 2 }) {
+            buffers = self.options.memory.reserve_stripes_with_overhead(
+                MemoryCategory::CodecScratch,
+                target,
+                per_byte,
+                unit,
+                overhead,
+            );
+            match &mut buffers {
+                Err(EngineError::ResourceLimit(_)) => continue,
+                Err(_) => break,
+                Ok(buffers) => {
+                    buffers.1.shrink_to(buffers.1.bytes() - spare);
+                    self.options
+                        .diagnostics
+                        .note_stripe(buffers.0, per_byte, target);
+                    break;
+                }
+            }
+        }
+        let buffers = buffers?;
         tracing::debug!(stripe_bytes = buffers.0, rows, "PAR3 FFT stripes admitted");
         Ok(buffers)
+    }
+
+    /// Whether this codec decodes through [`TransformField::derivative_at`]
+    /// where the bank is large enough: where transforms tile, unless the
+    /// options say otherwise.
+    fn fuses_decode(&self) -> bool {
+        self.options
+            .fft_fused_decode
+            .unwrap_or(reedsolomon_rs::fft::COLUMN_TILES)
+    }
+
+    /// What [`Self::buffers`] charges for `rows` rows of lane `L` at the
+    /// configured `target`, `spare` included in each overhead, as its two
+    /// forms of (bytes per stripe byte, fixed overhead), and the derivative
+    /// scratch the first form charges, with `derivative` only; with none,
+    /// only the first form applies, and the second repeats it.
+    fn bank_charges<L: Lane>(
+        &self,
+        rows: usize,
+        target: usize,
+        spare: usize,
+        derivative: bool,
+    ) -> EngineResult<([(usize, usize); 2], usize)> {
+        let unit = self.geometry.field_bytes();
+        let per_byte = workspace_per_byte::<L>(rows, unit)
+            .ok_or(EngineError::resource_limit("FFT stripes"))?;
+        // The row handles, the pages the banks round up to, and the units a
+        // tiled transform keeps are what the rows cost whatever the stripe.
+        // The tile copies a pooled derivative's workers may take beside
+        // them are charged either as what the configured stripe would let
+        // them take, a fixed amount, or as the bank the admitted stripe
+        // holds once more, per stripe byte, which bounds it however narrow
+        // the stripe becomes: whichever leaves the wider stripe first, the
+        // other when that one does not fit at all.
+        let lists = if derivative {
+            self.worker_count()
+                .checked_mul(rows)
+                .and_then(|lists| lists.checked_mul(size_of::<&mut [u8]>()))
+                .ok_or(EngineError::resource_limit("FFT rows"))?
+        } else {
+            0
+        };
+        let kept = rows
+            .checked_mul(ROW_BYTES)
+            .and_then(|handles| handles.checked_add(BANK_SLACK))
+            .and_then(|handles| {
+                handles.checked_add(self.walk_units_bytes(rows, target, size_of::<L>()))
+            })
+            .and_then(|kept| kept.checked_add(spare))
+            .ok_or(EngineError::resource_limit("FFT rows"))?;
+        let walk = if derivative {
+            self.walk_scratch_bytes(rows, target, size_of::<L>())
+        } else {
+            0
+        };
+        let kept = if walk == 0 { kept } else { kept + lists };
+        let walk = walk.saturating_sub(lists);
+        let overhead = kept
+            .checked_add(walk)
+            .ok_or(EngineError::resource_limit("FFT rows"))?;
+        let again = rows
+            .checked_mul(size_of::<L>() / unit)
+            .and_then(|bank| per_byte.checked_add(bank))
+            .ok_or(EngineError::resource_limit("FFT stripes"))?;
+        if walk == 0 {
+            return Ok(([(per_byte, kept), (per_byte, kept)], walk));
+        }
+        Ok(([(per_byte, overhead), (again, kept)], walk))
     }
 }
 
@@ -845,12 +1853,19 @@ mod tests {
                     Err(EngineError::Unsupported("FFT field representation"))
                 ));
             }
+            // The reference's label for a set holding one recovery block,
+            // whatever capacity the matrix reserves.
             assert!(
                 geometry
                     .validate_field(GaloisField {
                         size: 0,
                         generator: 0
                     })
+                    .is_ok()
+            );
+            assert!(
+                geometry
+                    .validate_field(GaloisField { size: 0, generator })
                     .is_err()
             );
         }
@@ -927,29 +1942,29 @@ mod charge_tests {
         }
     }
 
-    /// One cohort's row workspace is `domain` transform rows plus one byte
-    /// stripe. The charge is taken before any of it is allocated, so it must
-    /// cover every row's capacity and its vector header.
+    /// One cohort's row workspace is `domain` transform rows plus, for 16-bit
+    /// rows, one byte stripe. The charge is taken before any of it is
+    /// allocated, so it must cover every row's capacity and its vector header.
     #[test]
     fn row_workspace_charge_matches_the_rows_a_cohort_allocates() {
-        for inputs in [200u64, 5_000] {
+        fn check<L: Lane>(inputs: u64) {
             let geometry = FftGeometry::new(inputs, 1).unwrap();
             let options = options(256 << 20);
             let codec = FftCodec::new(geometry, options.clone()).unwrap();
             let unit = geometry.field_bytes();
             let block_size = 1 << 16;
             let before = options.memory.used();
-            let (stripe, buffers) = codec.buffers(block_size, geometry.domain).unwrap();
+            let (stripe, buffers) = codec.buffers::<L>(block_size, geometry.domain).unwrap();
             assert_eq!(options.memory.used() - before, buffers.bytes());
 
             // Exactly what `decode` allocates once the charge is granted.
             let symbols = stripe / unit;
-            let rows = vec![vec![0u16; symbols]; geometry.domain];
-            let bytes = vec![0u8; stripe];
-            let measured = rows.capacity() * size_of::<Vec<u16>>()
+            let rows = vec![vec![L::default(); symbols]; geometry.domain];
+            let bytes = vec![0u8; if L::is_direct(unit) { 0 } else { stripe }];
+            let measured = rows.capacity() * size_of::<Vec<L>>()
                 + rows
                     .iter()
-                    .map(|row| row.capacity() * size_of::<u16>())
+                    .map(|row| row.capacity() * size_of::<L>())
                     .sum::<usize>()
                 + bytes.capacity();
             assert!(
@@ -968,6 +1983,34 @@ mod charge_tests {
             drop(codec);
             assert_eq!(options.memory.used(), 0);
         }
+        // The byte lane GF(2^8) runs on, the zero-extended reference it
+        // replaced, and GF(2^16).
+        check::<u8>(200);
+        check::<u16>(200);
+        check::<u16>(5_000);
+    }
+
+    /// A budget too small for full-width stripes narrows them to whole
+    /// granules of the target's page, in the decode workspace and in the
+    /// repair adapter's source buffers alike, so every stripe offset in a
+    /// page-aligned block stays on a page boundary.
+    #[test]
+    fn budget_narrowed_fft_stripes_are_whole_granules() {
+        let granule = crate::runtime::STRIPE_GRANULES[0];
+        // 400 inputs and capacity 64 pad to a 512-row GF(2^16) domain.
+        let geometry = FftGeometry::new(400, 6).unwrap();
+        assert_eq!((geometry.domain, geometry.field_bytes()), (512, 2));
+        let codec = FftCodec::new(geometry, options(24 << 20)).unwrap();
+        let (stripe, buffers) = codec.buffers::<u16>(1 << 20, geometry.domain).unwrap();
+        assert!(stripe < 64 << 10, "the budget did not narrow: {stripe}");
+        assert!(stripe.is_multiple_of(granule), "unaligned stripe {stripe}");
+        drop(buffers);
+        drop(codec);
+
+        let mut codec = FftCodec::new(geometry, options(768 << 10)).unwrap();
+        let (stripe, _buffers) = codec.reserve_source_stripes(1 << 20, 4).unwrap();
+        assert!(stripe < 64 << 10, "the budget did not narrow: {stripe}");
+        assert!(stripe.is_multiple_of(granule), "unaligned stripe {stripe}");
     }
 
     /// The repair adapter keeps two byte buffers for the whole reconstruction
@@ -1015,6 +2058,11 @@ mod charge_tests {
 mod plan_tests {
     use super::*;
     use crate::runtime::MemoryBudget;
+
+    /// The row slices the codec's transforms take, over test rows.
+    fn slices(rows: &mut [Vec<u16>]) -> Vec<&mut [u16]> {
+        rows.iter_mut().map(Vec::as_mut_slice).collect()
+    }
 
     fn rows(count: usize, symbols: usize, bits: u32, seed: u64) -> Vec<Vec<u16>> {
         let mut state = seed | 1;
@@ -1108,7 +2156,7 @@ mod plan_tests {
         options.cancel.cancel();
         assert!(
             matches!(
-                codec.transform_forward(&mut workspace, &mut plan),
+                codec.transform_forward(&mut slices(&mut workspace), &mut plan),
                 Err(EngineError::Cancelled)
             ),
             "a cancelled transform did not report it"
@@ -1139,14 +2187,16 @@ mod plan_tests {
 
         // One transform that does run, so the test is measuring a difference
         // and not an engine that never counts anything.
-        codec.transform(&mut workspace, 0, false).expect("runs");
+        codec
+            .transform(&mut slices(&mut workspace), None, 0, false)
+            .expect("runs");
         let ran = options.diagnostics.codec();
         assert!(ran.transform_calls > 0 && ran.butterflies > 0, "{ran:?}");
 
         options.cancel.cancel();
         assert!(
             matches!(
-                codec.transform(&mut workspace, 0, false),
+                codec.transform(&mut slices(&mut workspace), None, 0, false),
                 Err(EngineError::Cancelled)
             ),
             "a cancelled transform did not report it"
@@ -1181,7 +2231,9 @@ mod plan_tests {
             let levels = geometry.domain.trailing_zeros();
             let start = rows(geometry.domain, symbols, geometry.bits, 0x9e37 + inputs);
             let mut expected = start.clone();
-            codec.transform(&mut expected, 0, false).unwrap();
+            codec
+                .transform(&mut slices(&mut expected), None, 0, false)
+                .unwrap();
             for block_log2 in 1..=levels {
                 let width = 1usize << block_log2;
                 for first in [0usize, 1, geometry.domain / 2] {
@@ -1197,7 +2249,9 @@ mod plan_tests {
                         _reservation: options.memory.reserve(0).unwrap(),
                     };
                     let mut actual = start.clone();
-                    codec.transform_forward(&mut actual, &mut plan).unwrap();
+                    codec
+                        .transform_forward(&mut slices(&mut actual), &mut plan)
+                        .unwrap();
                     let kept = block * width..block * width + width;
                     assert_eq!(
                         actual[kept.clone()],
@@ -1235,6 +2289,300 @@ mod plan_tests {
                 assert!(plan.block_log2 <= levels);
             }
             drop(options);
+        }
+    }
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use super::*;
+    use crate::runtime::MemoryBudget;
+
+    fn bytes(count: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        (0..count)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 32) as u8
+            })
+            .collect()
+    }
+
+    fn codec(geometry: FftGeometry, stripe: usize, workers: usize, scalar: bool) -> FftCodec {
+        let options = ExecutionOptions {
+            memory: MemoryBudget::new(256 << 20),
+            workers,
+            stripe_bytes: stripe,
+            fft_backend: if scalar {
+                LinearBackend::Scalar
+            } else {
+                LinearBackend::Auto
+            },
+            ..ExecutionOptions::default()
+        };
+        FftCodec::new(geometry, options).unwrap()
+    }
+
+    /// Recovery rows `0..capacity` through the public entry point (the byte
+    /// lane for GF(2^8)) and through the zero-extended `u16` reference.
+    fn encode_both(
+        codec: &FftCodec,
+        block: usize,
+        data: &[Vec<u8>],
+    ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let capacity = codec.geometry.capacity();
+        let read = |index: usize, offset: u64, out: &mut [u8]| {
+            let offset = offset as usize;
+            out.copy_from_slice(&data[index][offset..offset + out.len()]);
+            Ok(())
+        };
+        let mut lane = vec![vec![0u8; block]; capacity];
+        let mut reference = lane.clone();
+        codec
+            .encode(block as u64, 0, capacity, read, |index, offset, bytes| {
+                let offset = offset as usize;
+                lane[index][offset..offset + bytes.len()].copy_from_slice(bytes);
+                Ok(())
+            })
+            .unwrap();
+        codec
+            .encode_rows::<u16>(block as u64, 0, capacity, read, |index, offset, bytes| {
+                let offset = offset as usize;
+                reference[index][offset..offset + bytes.len()].copy_from_slice(bytes);
+                Ok(())
+            })
+            .unwrap();
+        (lane, reference)
+    }
+
+    fn decode_with(
+        codec: &FftCodec,
+        reference: bool,
+        block: usize,
+        data: &[Vec<u8>],
+        recovery_rows: &[Vec<u8>],
+        lost: &[usize],
+        recovery: &[usize],
+    ) -> Vec<Vec<u8>> {
+        let read = |source: FftInput, offset: u64, out: &mut [u8]| {
+            let offset = offset as usize;
+            let row = match source {
+                FftInput::Original(index) => {
+                    assert!(!lost.contains(&index), "read a lost row");
+                    &data[index]
+                }
+                FftInput::Recovery(index) => &recovery_rows[index],
+            };
+            out.copy_from_slice(&row[offset..offset + out.len()]);
+            Ok(())
+        };
+        let mut out = vec![vec![0u8; block]; data.len()];
+        let write = |index: usize, offset: u64, bytes: &[u8]| {
+            let offset = offset as usize;
+            out[index][offset..offset + bytes.len()].copy_from_slice(bytes);
+            Ok(())
+        };
+        if reference {
+            // The word lane over bytes is not the stripe's own image, so with
+            // workers its consumer takes the batched ring path; every stripe
+            // read must reach it once, as read, and nothing else.
+            let consumed = std::sync::Mutex::new(vec![0u64; data.len() + recovery_rows.len()]);
+            let consume = |source: FftInput, offset: u64, bytes: &[u8]| {
+                let (slot, row) = match source {
+                    FftInput::Original(index) => (index, &data[index]),
+                    FftInput::Recovery(index) => (data.len() + index, &recovery_rows[index]),
+                };
+                let offset = offset as usize;
+                assert_eq!(
+                    bytes,
+                    &row[offset..offset + bytes.len()],
+                    "consumed {source:?}"
+                );
+                consumed.lock().unwrap()[slot] += bytes.len() as u64;
+                Ok(())
+            };
+            codec
+                .decode_rows::<u16>(
+                    block as u64,
+                    lost,
+                    recovery,
+                    read,
+                    Some(&consume),
+                    write,
+                    None,
+                )
+                .unwrap();
+            let consumed = consumed.into_inner().unwrap();
+            for (index, count) in consumed[..data.len()].iter().enumerate() {
+                let expected = if lost.contains(&index) {
+                    0
+                } else {
+                    block as u64
+                };
+                assert_eq!(*count, expected, "original {index} consumed {count} bytes");
+            }
+            for (index, count) in consumed[data.len()..].iter().enumerate() {
+                let expected = if recovery.contains(&index) {
+                    block as u64
+                } else {
+                    0
+                };
+                assert_eq!(*count, expected, "recovery {index} consumed {count} bytes");
+            }
+        } else {
+            codec
+                .decode(block as u64, lost, recovery, read, write)
+                .unwrap();
+        }
+        out
+    }
+
+    /// The byte lane must emit exactly what the zero-extended 16-bit lane
+    /// emitted for GF(2^8): every recovery row on encode and every
+    /// reconstructed row on decode, across cohort shapes (one and several
+    /// input bases, full and padded domains), block lengths that are odd,
+    /// below one vector and split across several stripes, both backends, and
+    /// serial and pooled execution.
+    #[test]
+    fn the_byte_lane_matches_the_word_lane_bit_for_bit() {
+        let shapes = [
+            (2u64, 1i8),
+            (5, 2),
+            (13, 3),
+            (40, 3),
+            (100, 5),
+            (150, 6),
+            (192, 6),
+            (64, 7),
+        ];
+        let mut cases = 0;
+        for (shape, &(inputs, capacity_log2)) in shapes.iter().enumerate() {
+            let geometry = FftGeometry::new(inputs, capacity_log2).unwrap();
+            assert_eq!(geometry.field_bytes(), 1);
+            assert!(!geometry.is_trivial());
+            let capacity = geometry.capacity();
+            let inputs = geometry.inputs();
+            for (block, stripe) in [
+                (1usize, 1 << 16),
+                (3, 2),
+                (15, 1 << 16),
+                (17, 16),
+                (65, 64),
+                (1000, 333),
+                (4097, 1 << 16),
+            ] {
+                let data: Vec<Vec<u8>> = (0..inputs)
+                    .map(|index| bytes(block, (shape * 1_000_003 + block * 131 + index) as u64))
+                    .collect();
+                // Loss patterns: one row, a leading run, scattered rows, and
+                // as many rows as the recovery can carry.
+                let all = capacity.min(inputs);
+                let patterns: Vec<Vec<usize>> = vec![
+                    vec![inputs / 2],
+                    (0..all.div_ceil(2)).collect(),
+                    (0..inputs).step_by(3).take(all).collect(),
+                    (inputs - all..inputs).rev().collect(),
+                ];
+                for workers in [1usize, 4] {
+                    for scalar in [false, true] {
+                        let codec = codec(geometry, stripe, workers, scalar);
+                        let (lane, reference) = encode_both(&codec, block, &data);
+                        assert_eq!(
+                            lane, reference,
+                            "encode {inputs}+{capacity} block {block} stripe {stripe} \
+                             workers {workers} scalar {scalar}"
+                        );
+                        for lost in &patterns {
+                            // Recovery rows, highest first, so decodes do not
+                            // always draw the same prefix.
+                            let recovery: Vec<usize> =
+                                (0..capacity).rev().take(lost.len() + 1).collect();
+                            let recovery = &recovery[..lost.len().max(1).min(capacity)];
+                            let actual =
+                                decode_with(&codec, false, block, &data, &lane, lost, recovery);
+                            let expected =
+                                decode_with(&codec, true, block, &data, &lane, lost, recovery);
+                            assert_eq!(
+                                actual, expected,
+                                "decode {inputs}+{capacity} block {block} lost {lost:?} \
+                                 workers {workers} scalar {scalar}"
+                            );
+                            for &index in lost {
+                                assert_eq!(actual[index], data[index], "row {index} not repaired");
+                            }
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, shapes.len() * 7 * 4 * 2 * 2);
+    }
+
+    /// Byte rows are charged at one byte per stripe byte, so a budget that
+    /// narrows the zero-extended rows admits the byte lane a wider stripe:
+    /// twice the word lane's before each is rounded down to a whole page
+    /// granule, which takes less than one granule from either. The budget
+    /// leaves both stripes many granules wide, so that rounding stays small
+    /// next to the factor of two on 4 KiB and 16 KiB granule targets alike.
+    #[test]
+    fn a_gf8_cohort_gets_twice_the_stripe_under_the_same_budget() {
+        let granule = crate::runtime::STRIPE_GRANULES[0];
+        let geometry = FftGeometry::new(150, 6).unwrap();
+        let options = ExecutionOptions {
+            memory: MemoryBudget::new(96 << 20),
+            workers: 1,
+            stripe_bytes: 1 << 20,
+            ..ExecutionOptions::default()
+        };
+        let codec = FftCodec::new(geometry, options).unwrap();
+        let (bytes, held) = codec.buffers::<u8>(1 << 20, geometry.domain()).unwrap();
+        drop(held);
+        let (words, _held) = codec.buffers::<u16>(1 << 20, geometry.domain()).unwrap();
+        assert!(bytes < 1 << 20, "the budget should narrow the byte stripe");
+        assert!(
+            words >= 8 * granule,
+            "word lane {words} spans fewer than 8 granules of {granule}"
+        );
+        assert!(
+            bytes + 2 * granule >= 2 * words && bytes <= 2 * words + 2 * granule,
+            "byte lane admitted {bytes}, word lane {words}, granule {granule}"
+        );
+    }
+
+    /// `encode_stripe_bytes` promises what `encode` reserves for its stripes,
+    /// by the layout `buffers` charges, on both fields.
+    #[test]
+    fn encode_stripe_bytes_matches_the_encode_reservation() {
+        for ((inputs, capacity_log2), workers) in [(100u64, 7i8), (150, 6), (300, 8), (40, 4)]
+            .into_iter()
+            .flat_map(|shape| [(shape, 1), (shape, 3)])
+        {
+            let geometry = FftGeometry::new(inputs, capacity_log2).unwrap();
+            let options = ExecutionOptions {
+                memory: MemoryBudget::new(1 << 30),
+                workers,
+                stripe_bytes: 1 << 16,
+                ..ExecutionOptions::default()
+            };
+            let codec = FftCodec::new(geometry, options.clone()).unwrap();
+            let rows = geometry.capacity * 2;
+            let before = options.memory.used();
+            let held = if geometry.bits == 8 {
+                codec.buffers::<u8>(1 << 20, rows).unwrap()
+            } else {
+                codec.buffers::<u16>(1 << 20, rows).unwrap()
+            };
+            let reserved = options.memory.used() - before;
+            drop(held);
+            assert_eq!(
+                codec.encode_stripe_bytes(1 << 20),
+                reserved,
+                "GF(2^{}) inputs {inputs} capacity 2^{capacity_log2}, {workers} workers",
+                geometry.bits
+            );
         }
     }
 }

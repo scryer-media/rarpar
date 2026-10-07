@@ -159,6 +159,279 @@ inventory only names its local path. SSH uses batch mode, supports optional
 per-host ports and additional OpenSSH options, and leaves host-key verification
 under the operator's normal SSH policy.
 
+## PAR3 Suite
+
+`rarpar-bench par3` compares the shipped `rarpar` CLI with the pinned
+`par3cmdline` reference on create, verify and repair. It measures the CLI
+because that is what ships, the same way the PAR2 suite drives `rarpar par`.
+If you pass `--engine-perf PATH`, it also runs the `par3-rs` `engine_perf`
+example once per set and durability as an untimed stage breakdown, selecting
+the durability with `PAR3_BENCH_CREATE_DURABILITY` and
+`PAR3_BENCH_REPAIR_DURABILITY` (`durable` or `buffered`; older builds ignore
+the repair variable). Nothing from that pass goes into the timing tables.
+
+```sh
+cd bench/rarpar-bench
+go build -o target/rarpar-bench ./cmd/rarpar-bench
+
+# The matrix the profile runs; it builds and runs nothing.
+target/rarpar-bench par3 matrix --profile full
+
+# Build the reference from the pinned archive in config/toolchains.json
+# (mirror first, then upstream; BLAKE3-verified either way). Needs CMake.
+target/rarpar-bench par3 build-reference --out target/par3-reference
+
+# Smoke run, about a minute.
+target/rarpar-bench par3 run --profile smoke \
+  --reference target/par3-reference/build/par3cmd/par3 \
+  --candidate ../../target/release/rarpar \
+  --work target/p3 --out target/par3-smoke \
+  --ops create,verify,verify-damaged,repair --repeats 3
+
+# Re-render the Markdown from a saved results.json.
+target/rarpar-bench par3 report --input target/par3-smoke/results.json
+```
+
+### Sets
+
+Each set is a deterministic generated dataset plus one codec configuration.
+The same inputs and damage are produced on every host:
+
+| set | data | block | input / recovery | codec | damage |
+|---|---|---|---|---|---|
+| `a-gf16` | 1 GiB | 1 MiB | 1024 / 103 | Cauchy GF(2^16) | 50 lost blocks |
+| `a-gf8` | 1 GiB | 8 MiB | 128 / 13 | Cauchy GF(2^8) | 6 lost blocks |
+| `a-fft` | 1 GiB | 1 MiB | 1024 / 103 | FFT | 50 lost blocks |
+| `b-gf16` | 300 MiB, many files | 1 MiB | 300 / 30 | Cauchy GF(2^16) | 10 lost blocks in 5 of 10 files |
+| `c-gf16` | 1.5 GiB | 32 KiB | 49152 / 4916 | Cauchy GF(2^16) | 2000 lost blocks |
+| `c-fft` | 1.5 GiB | 32 KiB | 49152 / 4916 | FFT | 2000 lost blocks |
+| `smoke-*` | 8 MiB | 16-128 KiB | 65-514 / 7-52 | GF8, GF16, FFT | 6-30 lost blocks |
+
+`--profile full` runs sets A, B and C and then the smoke sets.
+`--profile smoke` runs only the three smoke sets. Use `--set ID` (repeatable) to narrow either profile.
+
+### Rows and protocol
+
+The rows are the reference (single-threaded), `rarpar-w1` and `rarpar-w8`. Use
+`--workers` to choose different worker counts. `--kernel-variant
+NAME:VAR=value[,VAR=value]` adds a `rarpar` row with extra environment
+variables. The env-gated kernel pins on main are currently no-ops for PAR3;
+the flag is plumbing for when they exist.
+
+Every `rarpar` create and repair row runs twice: once durable, which is the
+default (no flag, one fsync per output), and once buffered (`--buffered`, no
+fsync). The durable row is listed first and labelled `durable (default)`; the
+buffered row is named `rarpar-wN-buffered`. Both carry ratios against the
+single reference row, whose durability column reads `none (never syncs)`.
+Verify rows write nothing and run once. `--durability durable` drops the
+buffered rows; durable is always required. The suite probes
+`rarpar par3 <op> --help` for `--buffered` as a whole token. When the help
+prints but lacks it, which is the case for `par3 repair` today, the suite skips
+that op's buffered row and says so in the report notes. When the help itself
+fails (a timeout, a non-zero exit, a start failure, or a quarantine), the run
+stops with that error rather than guessing. `par3 matrix --profile full` prints
+the rows per op.
+
+Each variant gets the warmups, then the measured repeats, and the variant order
+alternates on every repeat. Each table cell is the median with the range,
+`median [min–max]`, for wall time, user+sys CPU, and peak RSS. Ratios compare
+medians against the reference, so below 1.000 means `rarpar` used less. Use
+`--pin-cpus 0-7` to confine every timed process to that CPU range (Linux
+`taskset`, Windows affinity). It takes one CPU or an inclusive range within
+CPUs 0-63; a list such as `0,2` is refused because the Windows mask cannot
+apply it. A matrix that would hold two rows with the same name, such as
+`--workers 1,1`, is refused too. `--iocount` adds an untimed `strace -f -c` pass on
+Linux and reports block and syscall counts.
+
+Repair runs against a fresh copy of the damaged tree each time. A repair row
+passes only when the repaired files hash back to the originals. The
+"left behind" column lists the backup files each tool writes.
+
+### Peak RSS
+
+Peak RSS is a required field of every row (`max_rss_bytes` in `results.json`
+and `runs.jsonl`). Every table shows it next to wall and CPU, with the
+ours/reference RSS ratio. The harness reads it from the child itself:
+
+| platform | source | equivalent tool output |
+|---|---|---|
+| macOS | `wait4` rusage `ru_maxrss`, already bytes | `/usr/bin/time -l` "maximum resident set size" |
+| Linux | `wait4` rusage `ru_maxrss`, KiB scaled to bytes | `/usr/bin/time -v` "Maximum resident set size" |
+| Windows | `K32GetProcessMemoryInfo` `PeakWorkingSetSize` on a handle opened at start and held across exit | (`Process.PeakWorkingSet64` reads null after exit, so it is not used) |
+
+A process that exits without a peak RSS is a harness bug, not a missing value:
+the row fails as `harness-missing-rss` (for the reference too; it is never
+turned into a DNF), and `par3 report` refuses a `results.json` whose ok rows
+lack the field. Only rows that never finished, such as a DNF or a timeout, may
+have no RSS.
+
+### Timeouts and reference DNF
+
+Every run has a per-run timeout, `--timeout`, now 20 minutes by default (it
+was longer before). The limit applies to `rarpar` rows too, so on a slow host
+raise it, or a large set's `rarpar` rows fail as `timeout`. A `rarpar` row that
+times out stays failed and is not retried on its remaining warmups and
+repeats. `--reference-timeout` sets a different limit for the reference only.
+
+A reference run is **DNF** for exactly these failure classes, recorded with
+the exit code (or the timeout) and the last line it printed:
+
+- `timeout`: it exceeded its timeout and was killed, with its whole process
+  group (an interrupt or SIGTERM to `par3 run` kills the running process
+  group the same way before the harness exits);
+- `signal`: it was killed by a signal;
+- `exit-N`: it exited non-zero;
+- `no-carriers`, `truncated-carriers`, `unreadable-carriers`: a create exited 0
+  but wrote no recovery files, fewer recovery blocks than asked for, or files
+  that do not parse.
+
+The suite carries on: the rest of that reference row is skipped, every
+`rarpar` row still runs, and the run never fails because of it. Ratios against
+a DNF reference show `-`.
+
+Every other reference failure fails the run: `start-failed` (the binary would
+not start), `reference-nondeterministic` (its create did not reproduce its own
+canonical set byte for byte, which would make every identity verdict
+meaningless), `repair-mismatch` (its repair did not restore the original
+bytes) and `harness-missing-rss`.
+
+Verify and repair need a canonical recovery set, normally written by an untimed
+reference create. If that create is DNF (one of the classes above; any other
+failure stops the set), `rarpar` (durable, most workers) writes
+the canonical set instead, the reference still verifies and repairs it, the
+identity verdicts are skipped, and the report says where the set came from.
+
+### Identity verdicts
+
+Every create row is compared with the reference's set for the same inputs:
+
+- `identical`: byte-identical files.
+- `payloads-only`: every recovery block's payload matches, but packet metadata
+  differs.
+- `DIFFERENT`: the recovery payloads differ.
+
+Since par3-rs 0.4.5, `rarpar par3 create` derives the `InputSetID`, orders the
+inputs, and repeats and orders packets the way the reference does. Its sets
+therefore carry the reference's recovery payloads and should be
+`payloads-only`: by default the only packet that differs is the `Creator`
+text. With the reference's `Creator` text (`engine_perf` takes
+`PAR3_BENCH_CREATOR`) the sets are `identical`. Treat `DIFFERENT` as a
+recovery-payload regression and investigate it, with one expected exception:
+for a Cauchy set with more than 128 input blocks whose input and recovery
+blocks total at most 256, the reference chooses GF(2^16) and `rarpar` chooses
+GF(2^8). The field, the `InputSetID` and the recovery coefficients then all
+differ. The verdict is recorded rather than failed: each tool's create is still
+verified by itself and repaired back to the original bytes. The report says
+which packet types and counts differ.
+
+### Reference caveats
+
+- **macOS.** Upstream `par3cmdline` does not build on macOS. On macOS,
+  `build-reference` applies
+  `internal/par3bench/patches/par3cmdline-2971702e-macos.patch`, a bench-only
+  port that is labelled in its header, and fetches a pinned `sse2neon.h` on
+  arm64. Linux arm64 gets the same patch, since upstream's x86-only SIMD
+  flags fail there; its Darwin hunks are guarded, so Linux code paths are
+  unchanged. Linux x86-64 and Windows build or use the unmodified source. The
+  patch digest is recorded in `reference.json` and in the results.
+- **Work-path length.** The reference stores pointers into its list of
+  recovery file names, then reallocates the list once it outgrows 1 KiB. It
+  reopens the volumes through those dangling pointers and fails with
+  "Failed to open Recovery File". It turns the output path into an absolute
+  path first, so only the total length of the absolute volume paths matters,
+  and a relative `--work` does not help. FFT sets always reach this path, and
+  so do Cauchy sets too large to hold in memory. The failure is
+  nondeterministic, so `par3 run` and `fleet plan` warn per set, with the
+  path length and the number of characters to cut, and then run anyway; if the
+  reference fails, its rows are DNF as above. Keep `--work` short, for example
+  `/bench/p3` or `C:\p3`.
+- **Windows.** The fleet uses the official `windows/par3.exe` from the pinned
+  archive, verified by digest, instead of building it.
+
+### Windows Defender
+
+The suite hashes both binaries at startup and again before every batch. A
+binary that refuses to start (a Defender block), disappears, or changes on
+disk stops the run as `binary-quarantined`, with the path and what happened.
+The harness never adds exclusions and never retries around it. Restore the
+binary, or ask the host owner to allow it, then rerun.
+
+Known false positive: Defender flags the `par3-rs` `engine_perf.exe` example
+as `Trojan:Win64/AsyncRAT.C!MTB` and quarantines it. `engine_perf.exe` is only
+used by a manual `par3 run --engine-perf PATH`; the fleet neither ships nor
+runs it. The operator-approved handling is a path-scoped Defender exclusion,
+added by hand by the host owner, on the bench work directory that holds
+`engine_perf.exe`: the directory you build it into (cargo's
+`target\release\examples`) or copy it into before passing it as `PATH`. Do not
+widen it beyond that directory. No automation in this repository touches
+Defender settings, and none may.
+
+### Output
+
+`--out` receives `results.json` (schema `rarpar-par3-bench-v1`; the
+durability, DNF, timeout and canonical-source fields were added without
+changing any existing field, so the schema name stays v1), `runs.jsonl`
+(one line per process, warmups included) and `report.md`. Generated datasets
+and the reference's canonical sets are cached under `--work`; delete it to
+reclaim the space. `--keep-stages` keeps the per-run directories for
+inspection.
+
+### Storage targets and engine rows
+
+`--target NAME=DIR` (repeatable, instead of `--work`) runs every row on every
+target, interleaved, so a remote mount and its local control come from one
+run. Each record carries the target's mount (filesystem, mount options,
+`--target-meta NAME:key=value` facts the harness cannot see) and, on Linux NFS
+mounts, the per-run delta of `/proc/self/mountstats` (READ, WRITE, COMMIT and
+metadata ops, bytes, RTT). `--engine-workers 8` adds timed `engine_perf` rows
+that report the engine's disk-work counters (opens, read/write calls and
+bytes, fsyncs); `--engine-variant NAME:VAR=V` adds rows with `PAR3_BENCH_*`
+switches, for example `wff-off:PAR3_BENCH_WHOLE_FILE_FIRST=0` for single-pass
+disk verification. `--rows engine` keeps only those rows. `--drop-caches`
+drops the page cache before every timed run (Linux, root). Engine rows have no
+reference ratio.
+
+### Network-mount rig
+
+`bench/nfs` is a compose project: a kernel nfsd server exporting one `async`
+and one `sync` export, and a privileged Linux client with the pinned Rust
+toolchain that builds the tree under test from a read-only source mount and
+runs the suite on three targets: `local` (the client's volume), `nfs-async`
+and `nfs-sync`. Run it from `bench/rarpar-bench`:
+
+```sh
+rarpar-bench nfs run --context desktop-linux --label run1 \
+  --env NFS_VERS=4.1 --env NFS_ACTIMEO=0 \
+  -- --profile full --set a-gf16 --engine-workers 8 --repeats 3
+rarpar-bench nfs down --context desktop-linux
+```
+
+Mount options are client environment variables (`NFS_VERS`, `NFS_PROTO`,
+`NFS_RSIZE`, `NFS_WSIZE`, `NFS_HARD`, `NFS_ACTIMEO`, `NFS_CLIENT_SYNC`,
+`NFS_NCONNECT`, `NFS_EXTRA_OPTS`) and are recorded in every row with the
+server type and export mode. `--service bench-client-lowmem` runs in a client
+whose memory limit (`RIG_LOWMEM_LIMIT`, default 768m) is below the largest
+set file, so a second read pass cannot come from the page cache. `--env
+RIG_EXT4=8G` adds a `local-ext4` target, a fresh loop-mounted ext4 image of
+that size: a local filesystem without file clones. Evidence goes
+to `target/bench/nfs/<label>/`, with the host's load average sampled into
+`host-load.jsonl`. The cache volume keeps builds and datasets between runs;
+`nfs down --volumes` removes it.
+
+Server and client share one kernel, so the client turns NFS LOCALIO off
+before mounting (else I/O would bypass the protocol) and restores it after.
+The network is a container bridge with no real latency, and the exports sit
+on the same virtual disk as the local control: the rig shows protocol cost
+(extra round trips, commits, cache behaviour), not a NAS's disks or a WAN.
+Compare NFS rows with local rows from the same run only.
+
+`--env RIG_RATE_MBPS=80` throttles the client's link to that many MB/s each
+way inside the client's network namespace (a token bucket on its interface,
+and one on an IFB device its inbound traffic is redirected through), so the
+server is unchanged. After mounting, the client writes a 1 GiB file to the
+async export, drops the page cache, reads it back with `dd` and records the
+measured rates in `rig.json` and in every NFS target's metadata.
+
 ## Evidence And Charts
 
 Build a report and render static charts from a completed comparative run:

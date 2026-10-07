@@ -1,6 +1,494 @@
 # Changelog
 
-## 0.4.4 (Unreleased)
+## 0.4.5
+
+- `ExecutionOptions` gains a hidden, bench-only `disk_verify_whole_first`
+  switch. `Some(false)` makes disk verification hash a file's extents and the
+  whole file side by side in one pass instead of trying the whole file first,
+  and `Some(true)` forces whole file first; the default (`None`) picks by
+  mount kind, below. The `engine_perf` example exposes it as
+  `PAR3_BENCH_WHOLE_FILE_FIRST=0|1` so both orders can be measured on any
+  mount.
+- Source verification (`evidence::verify_source`, and through it session
+  verification and repair assessment, on both the whole-file and the extent
+  pass) and the packet scanner (`ingest::PacketScanner`) now read a source
+  front to back in reads of up to a mebibyte, never more than the source,
+  instead of 64 KiB. The read size no longer depends on the block size or on
+  whether the hash runs in parallel; a file verified beside others in a batch
+  was read 64 KiB at a time. On a network mount, whose client reads ahead far
+  less than a local disk, each small read became a small request on the wire
+  (a Linux NFS client fetched such a walk 128 KiB at a time). The larger
+  buffers are charged to the memory budget as before (a mebibyte per file
+  verified at once, and per scanner); a budget without room for them falls
+  back to the old 64 KiB, and a caller that narrows `stripe_bytes` below
+  64 KiB still reads at that stripe. A scanner fill is charged to
+  `scan_work` for what it asks and refunded what a short read did not
+  return beyond one stripe, so a whole scan still costs its bytes and a poll
+  that finds nothing one stripe. Evidence is unchanged.
+  The scanner checks the source's generation once per refill rather than at
+  the top of every poll; a refill whose read fails rechecks it before
+  returning, so a carrier that disappears or is rewritten under the scanner
+  reports `SourceChanged`, not the provider's I/O error.
+- New `mount` module: `MountKind { Local, Remote, Unknown }` and
+  `SourceAccess::mount_kind` (default `Unknown`). `DiskSourceAccess` probes
+  each source directory once (`statfs` `f_type` on Linux: NFS and SMB/CIFS
+  are remote, FUSE is unknown; `f_fstypename` on macOS: `nfs`, `smbfs`,
+  `afpfs` and `webdav` are remote; `GetDriveTypeW` on Windows: a remote drive
+  is remote) and caches the answer. Disk verification now hashes a file on a
+  remote mount whole and by extent side by side in one pass, so a damaged
+  file is not fetched over the network a second time; local and unknown
+  mounts keep whole file first, which hashes an intact file once. A forced
+  `disk_verify_whole_first` wins over the mount kind, and a wrapper that
+  forwards `open_file` should forward `mount_kind` too.
+  `ExecutionDiagnostics::verify_order` reports the order that ran and the
+  mount kinds behind it, and `engine_perf` prints them. Evidence is
+  unchanged.
+- **Behaviour change:** the streaming creation engine (`creation::CreationPlan`)
+  now derives the InputSetID the way the reference does — and the way
+  `create::create` already did, through the same code — from each file's full
+  name, size, hash and chunk layout, the directory names, and the Start packet
+  body. It previously digested the block size, field and File packets, so sets
+  it writes now carry a different InputSetID than before for the same inputs.
+- **Behaviour change:** streaming-engine recovery and data volumes now repeat
+  the metadata the way the reference does: after one full copy up front, every
+  packet but the Creator packet is written `floor(log2(n))` more times, one
+  packet at a time and cycling through them, spread between the volume's `n`
+  rows (or data blocks). A volume previously held a single copy.
+  `CreationRequirements::output_sizes` counts the copies, and a
+  `VolumeLayout::SizeLimited` carrier still fits its limit with them included.
+  The index file and embedded (PAR-inside) carriers keep one copy. Directory
+  and Root packets now list their children sorted by packet hash, and Directory
+  packets are written in the reference's order.
+  The carrier authenticator proves each repeated copy by comparing it with
+  the copy of that packet it hashed first, instead of hashing and parsing it
+  again; the copies still go out through the same buffered writes.
+- **Behaviour change:** the streaming engine stores, packs and shares packets
+  as the reference does. Inputs are stored longest file tail (size modulo
+  block size) first, then largest file, then by name, whatever order the
+  sources are listed in; the order comes from the source sizes, so it costs no
+  extra I/O. Embedded (PAR-inside) carriers keep their listed order. Without
+  deduplication a tail is packed behind the first earlier tail, in placement
+  order, that is still the last in its block and has room, rather than only
+  behind the latest; with aligned or sliding deduplication it goes into the
+  first block, by block index, with room, as the reference's `-d1` and `-d2`
+  place it. File and Directory
+  packets with identical contents, such as empty files of one name in two
+  directories, are written once and listed by every parent. With these, the
+  engine writes `par3cmdline`'s bytes for the reference's default creation
+  (no `-C` comment, which is the only way the reference writes a Comment
+  packet) over single files, multi-file sets and directory trees, verified for
+  Cauchy and FFT (interleaved too) recovery volumes, at every deduplication
+  mode. Data volumes still store a tail block whole, where the reference cuts
+  its Data packet to the bytes in use, and an interleaved set's data volumes
+  count blocks singly where the reference counts rows of cohort blocks.
+- **Behaviour change:** a streaming-engine FFT set now records no Galois field
+  in its Start packet when it carries a single recovery block, as the
+  reference does, whatever capacity its matrix reserves. It previously
+  recorded GF(2^8) or GF(2^16) unless the capacity was one, and recorded no
+  field for a capacity-one set without recovery blocks, where the reference
+  records the geometry's field. (The reference also records none for a
+  requested capacity of one with no recovery blocks, which these options
+  cannot express.) Only a capacity of one makes that block the
+  XOR of the inputs; under a wider capacity it is still the first transform
+  parity of that capacity, computed in the field the geometry implies.
+- Verification and repair now accept an FFT set that records no Galois field
+  whatever capacity its matrix reserves, such as the reference's
+  `par3 c -c1 -cm4`. They previously refused every such set but the
+  capacity-one one as an unsupported field.
+- `engine_perf` takes `PAR3_BENCH_CREATOR` to replace the Creator packet text.
+- The sliding-window placement scan rolls its CRC-64 with a shift-only byte
+  step and a four-byte lookahead over contiguous stripe slices, seeds the first
+  window with `crc-fast`, and confirms a hit from the bytes already in the scan
+  buffer instead of re-reading them. Placement runs about seven times faster
+  with identical matches; `PlacementReport::read_bytes` no longer counts
+  confirmation bytes served from memory.
+- Disk sources keep a small cache of open read handles behind the shared handle
+  budget and read with positioned I/O; repair stages hold one write handle per
+  output per pass. A heavy repair opens files tens of times instead of tens of
+  thousands. Idle cached handles yield their leases to other openers, a
+  replaced file is detected at the next snapshot, and WASI keeps opening per
+  read. `ExecutionDiagnostics::file_opens()` counts opens.
+- Windows source identity comes from the opened handle: the volume serial and
+  128-bit file ID (`FILE_ID_INFO`, with the 64-bit index as the fallback) and
+  the NTFS change time stand in for the Unix device/inode pair and ctime. A
+  source snapshot on Windows is now a zero-byte metadata query instead of a
+  re-hash of the file, and the identity, handle-budget and snapshot tests that
+  were Unix-only run on Windows. The read-handle cache applies on volumes with
+  POSIX unlink/rename (NTFS on Windows 10 1809 and later); FAT, exFAT and SMB
+  keep their snapshots without the cache, since a handle held open there
+  would leave a deleted source pending deletion and refuse renames over it. A
+  1 GiB repair that previously rescanned the source on every snapshot and gave
+  up after minutes completes in seconds with identical output; create runs
+  3.2× and verify 6.2× faster (Windows NTFS, release, median of 3).
+  Filesystems without a change time (FAT, some SMB shares) fall back to the
+  previous content snapshot.
+- Refusals for source generation hashing now name
+  `"cumulative scanning work (source generation hashes)"` instead of
+  `"cumulative scanning work"`; scanner refusals keep the old name.
+- Sources are snapshot-checked once per read-ahead refill in the scanner and
+  once per stripe pass in creation, carrier regeneration and repair, always
+  after the last read a write depends on and before that write, instead of
+  before and after every read. A file changed mid-operation still ends in
+  `SourceChanged` with nothing installed; the change surfaces at the next
+  write or pass end rather than the next read.
+- Budget-narrowed stripes round down to a whole multiple of the compilation
+  target's page: 16 KiB on Apple targets (4 KiB when 16 KiB does not fit),
+  4 KiB everywhere else, so stripe reads and writes stay page-aligned without
+  issuing more, smaller transfers on 4 KiB-page hosts. Budget-constrained FFT
+  repair wall time roughly halves on Apple hosts and improves by about a
+  quarter on x86 Linux; the 64 KiB default and user-chosen stripe sizes are
+  unchanged.
+- Disk verification hashes a file as a whole first and hashes its extents
+  only when that hash does not prove the file intact. An intact file is read
+  and hashed once (about half the CPU, 1.9× faster on one worker); a damaged
+  file, or one whose length cannot match, is read a second time for its
+  extents, with one extra open. Verdicts are unchanged for any set whose
+  packets agree with each other; the streaming verifier still computes both
+  hashes in one pass.
+- Cauchy creation encodes recovery rows on the worker pool when the rows per
+  pass carry at least 1 MiB of work per worker. Output is byte-identical for
+  every worker count and no read is added.
+- Cauchy creation and repair fold up to 16 source stripes into each
+  recovery or syndrome row per fork/join through grouped multiply-accumulate
+  kernels, and the repair solve is grouped the same way. Resident recovery
+  rows accumulate in contiguous stripe buffers and are copied home once per
+  pass, so a pass no longer walks slices a block apart. The extra stripes are
+  taken only from budget left over after the pass, the pool and a stripe of
+  slack, and fall back to the one-stripe walk without them. The encode's
+  scratch rises by at most fifteen stripes plus the staged rows, and a group
+  of stripes can admit more pool workers than one stripe did, each charged as
+  worker stacks: 10 rows of 256 KiB blocks at eight workers peak at 7.00 MB
+  rather than 2.80 MB, 2.62 MB of it worker stacks that were not admitted
+  before, still inside the budget. Repair's scratch rises by fifteen stripes.
+  Output bytes and every I/O count are unchanged. 1 GiB, 100 rows, GF(2^16):
+  create 24.5% fewer cycles at one worker and 2.3× faster at eight; repair
+  2.2× faster at eight workers with 42% of the CPU. GF(2^8) gains are much
+  smaller (create 2% fewer cycles at one worker, 1.6× at eight; repair 1.5×
+  at eight). Where the host's grouped kernel is slower than its single-source
+  one (`reedsolomon_rs::gf_simd::input_batch_width() < 2`: AVX-512 without
+  GFNI measured at 0.70× of the one-source walk, AVX2 without GFNI at 0.9×),
+  the staged stripes still cut the I/O walks but fold source by source. The
+  GFNI byte-plane batch kernels in reedsolomon-rs 0.4.8 take 1 GiB, 100 rows,
+  GF(2^16) create at one worker from 2.56 to 2.10 s of codec time on Zen 4
+  and 2.63 to 2.42 s on Sapphire Rapids, 3.82 to 3.61 s on an AVX2 Alder
+  Lake; bytes identical.
+- GF(2^8) batches go through `reedsolomon_rs::gf8::mul_acc_input_batch`, the
+  grouped kernel of reedsolomon-rs 0.4.8, instead of folding each source
+  through the one-source kernel over 8 KiB tiles of the destination; hosts
+  without a grouped kernel keep the tile walk. 1 GiB, 100 rows, 8 MiB
+  blocks, GF(2^8) create at one worker, codec seconds: Sapphire Rapids 3.62
+  to 1.87, Zen 4 3.27 to 2.03, Alder Lake 3.65 to 2.33 (GFNI AVX2), Apple
+  M-series 2.33 to 2.17; bytes identical.
+- GF(2^8) batches take each factor's plan from `gf8::MulPlan::cached` instead
+  of building sixteen plans per stripe, and pick up the 512-bit shuffle
+  kernels of reedsolomon-rs 0.4.8 on AVX512BW hosts without GFNI. 1 GiB,
+  100 rows, GF(2^8) Cauchy on Skylake-SP: create 8.24 to 6.21 s at one
+  worker and 4.70 to 3.75 s at four, repair 4.72 to 3.77 s and 3.15 to
+  2.78 s; Zen 4 and Sapphire Rapids within noise; bytes identical.
+- With a worker pool, Cauchy repair reads and scatters the next group of
+  surviving stripes while the workers fold the previous one, and adds the
+  recovery rows to their syndromes in parallel. The second set of stripes is
+  taken only from spare budget beyond the slack; reads, writes and
+  source-change checks keep their order and counts on the calling thread,
+  and one worker runs the unchanged alternating walk. Decode on 1 GiB with
+  50 lost blocks: 1.06 → 0.62 s at four workers, flat CPU.
+- On that overlapped walk the workers also write the group they fold to the
+  staged outputs and hash it for the staged proof, so the calling thread only
+  reads: the writes take turns on the output handles while the hashing runs
+  in parallel outside the proof's lock. The lost blocks are still written in
+  order after each solve. The outputs are held open ahead of such a walk when
+  they all fit the writer cache and the handle budget keeps two free beyond
+  them, so no worker ever opens a handle; otherwise, and with one worker, the
+  calling thread writes as before, and either way the walk opens the same
+  handles it did. Where the staged outputs are clones nothing changes, since
+  surviving blocks are never written there. Decode on an ext4 stage, 1 GiB,
+  50 lost 1 MiB blocks, eight workers on four Alder Lake P-cores: 1.36 →
+  0.94 s, one worker and CPU time unchanged, read, write and open counts
+  identical, bytes identical.
+- A stripe that one extent supplies whole is read straight into its buffer:
+  the per-byte coverage map, which every read zeroed, scanned byte by byte
+  for an alias, filled and scanned again, is kept only for stripes assembled
+  from several extents or padded past a file's end, and its alias scan is one
+  `memchr`. That bookkeeping was five bytes touched per byte read, on the
+  thread the walks' workers wait for. Cauchy repair Decode on ext4, 1 GiB,
+  50 lost 1 MiB blocks, Alder Lake: one worker 2.64–2.68 → 2.31–2.40 s,
+  eight 0.94–1.00 → 0.80–0.86 s, CPU time down 0.35 and 0.7 s; reads,
+  checks and bytes unchanged.
+- The FFT repair walk hands the writing and hashing of the surviving blocks
+  it reads to its workers too, under the same hold on the output handles:
+  `FftCodec::decode_with` takes a consumer of each input stripe, and with
+  workers the calling thread reads a batch of rows ahead, straight into the
+  bank, and the workers write, hash and scale that batch in parallel while
+  the calling thread reads the next one. Without workers or a consumer each
+  stripe is consumed as it is read, as before. FFT repair Decode on ext4,
+  2 GiB of 1 MiB blocks over GF(2^16), 50 lost, eight workers on four Alder
+  Lake P-cores: 1.77–1.83 → 1.63–1.68 s for the parallel consume and
+  1.36–1.37 → 1.27–1.29 s for the overlap; one worker unchanged.
+- GF(2^16) transform rows are the stripe's own bytes on little-endian
+  targets, as GF(2^8) rows already were: the walk reads each stripe into
+  its row and writes each repaired row from itself, with no conversion
+  buffer, no unpacking pass and no ring, and scales in place. Elsewhere the
+  rows still convert through one byte buffer. One worker 2.00 → 1.98 s,
+  eight unchanged, 2 MiB less resident.
+- FFT transforms and derivatives run their banks in column tiles, in place
+  (`reedsolomon-rs` 0.4.8): beyond 512 KiB a pass takes a tile of rows at a
+  window of columns through every sweep while it stays in the cache, the
+  workers sharing a pass's tiles and a lone worker running them itself, so
+  one worker tiles too. This replaces the slab walk this release carried
+  before, which gathered rows into each worker's scratch and back. The
+  forward transform's pruned width classes and kept blocks beyond a tile go
+  to the pool one after another, so one class streams through the workers'
+  caches at a time (classes of a mebibyte transformed side by side on
+  sibling threads cost 2% of the decode and 5% of its CPU), and smaller
+  ones run side by side as before. An encode adds each tile of a chunk's
+  transform into its running sum as the last pass leaves it, with no pass
+  of its own. The rows live in `reedsolomon-rs`'s `RowBank`, one zeroed,
+  page-aligned allocation per bank instead of a vector per row, padded a
+  cache line per row where rows are a multiple of 512 bytes and backed by
+  huge pages on Linux x86_64. The codec charges the banks' padding and
+  page rounding, the butterflies a tiled transform keeps, on one worker as
+  on a pool, and a tiled derivative's tile copies (at most 256 KiB a
+  worker, never more than the bank) beside the rows. On Apple silicon,
+  which does not tile, the transforms sweep whole rows as before and no
+  scratch is charged. Carriers and repaired files are byte-identical, and
+  reads, writes and syncs are unchanged. Against the slab walk on Sapphire
+  Rapids, 1.5 GiB of 32 KiB blocks over GF(2^16), 4916 recovery blocks:
+  create 4.09 → 3.27 s at one worker (CPU 3.25 → 2.43 s) and 2.87 →
+  2.42 s at eight (CPU 4.46 → 3.88 s); repair of 2000 lost 16.74 →
+  16.60 s and 15.55 → 14.86 s, decode 6.37 → 6.05 s and 4.06 → 3.56 s,
+  with eight workers spending 15.5 s of CPU instead of 14.6 s. 512 MiB of
+  4 MiB blocks over GF(2^8), eight lost: repair 4.34 → 4.16 s and 4.13 →
+  4.07 s, CPU 1.26 → 1.09 s and 2.31 → 1.88 s. The AVX2 and GFNI tier the
+  host takes without AVX-512 moves the same way. On an M-series, which
+  does not tile, both sets stay within 3% of the slab-walk build's wall and
+  CPU at 1, 8 and 18 workers, apart from sub-second GF(2^8) repairs that
+  move by up to a tenth either way between runs.
+- FFT decode runs its inverse transform, formal derivative and forward
+  transform as one step, `reedsolomon-rs` 0.4.8's
+  `TransformField::derivative_at`: three tiled passes over the bank instead
+  of the walked inverse, a separate derivative pass that streamed the whole
+  bank once per set bit of a row index, and the pruned forward plan. The
+  codec admits the domain's rows plus one per lost block for what the step
+  returns, the index of each lost row, and the step's sweeps, bookkeeping
+  and tile scratch beside them. The fused rows charge more than the
+  separate steps, so a binding budget narrows their stripe further; they
+  are taken only where their stripe walks each block in no more passes
+  than the separate steps' stripe from the same budget, so they never read
+  an input more often or more bytes of it. Where the bank fits a
+  transform tile, where the budget refuses those rows or would take more
+  passes, and on Apple silicon, which does not tile (forced on, an
+  Apple M5 Max decode took 1.81 → 2.61 s at one worker), the previous path
+  runs. `ExecutionOptions::fft_fused_decode` (hidden) forces either path,
+  for tests. The direct lane reads up to 256 rows ahead of its workers, a
+  quarter of the domain and at least 16, instead of two per worker: the
+  short batches left the pool spinning between them.
+- An FFT repair reserves its staged outputs' proof frontiers as soon as the
+  decode's stripe is known, and narrows the stripe to leave room for them
+  when they would not fit, as the Cauchy repair does. A repair walking
+  stripes narrower than a block holds a frontier for every block it decodes,
+  and these were taken as they opened out of whatever the decode's bank
+  left: where that came up short, on either decode path, the proof gave up
+  and every staged output was read back in full (1.61 GB more on the run
+  below with the fused decode).
+- FFT repair of 1.5 GiB of 32 KiB blocks over GF(2^16), 2000 lost, 2 GiB
+  budget, medians of three, repaired bytes and file reads (5.08 GB)
+  identical, peak RSS 1959 → 1750 MiB. Intel Core i5-1240P (Alder Lake),
+  Decode stage (process CPU): eight workers on four P-cores 3.86 → 2.54 s
+  (22.2 → 12.4 s), four on one thread per P-core 3.58 → 2.55 s (12.3 →
+  8.3 s), two 4.40 → 3.23 s (9.6 → 7.3 s), one 5.93 → 5.08 s (7.2 →
+  6.4 s). Apple M5 Max, separate steps with the batch change: eight
+  workers 0.76 → 0.65 s (6.4 → 5.0 s), eighteen 0.88 → 0.60 s (11.2 →
+  7.3 s), one unchanged. Create and Cauchy repair unchanged.
+- Carrier regeneration reads each source stripe once per group of recovery
+  rows the memory budget admits, instead of once per row.
+- Recovery rows that fit the memory budget alongside the codec stay resident
+  and are hashed and written straight to carriers; no spool file is created or
+  synced. Spooled rows, and source blocks copied into data carriers, are read
+  once instead of twice.
+- **Behaviour change:** staged outputs are no longer read back before
+  installation. Carriers are authenticated packet by packet as their bytes
+  reach the file, with the checks the scanner made; staged repair outputs are
+  proven from the bytes each write hands the kernel against the authenticated
+  block checksums, and fall back to the old read-back for anything that
+  proof does not cover (out-of-order or repeated writes, an extent without a
+  checksum, a budget refusal). What is proven is what the engine wrote; a
+  storage layer that keeps different bytes is the synchronization barrier's
+  contract and a later verification's question. A 1 GiB repair reads 1 GiB
+  less; creation no longer re-reads its carriers. One verdict changes: a File
+  packet whose whole-file fingerprint disagrees with block checksums that
+  every rebuilt byte matches is installed where the read-back refused it,
+  when damage hid the disagreement from verification. An output whose
+  evidence already shows it is still read back and refused, so a second
+  repair of such a file fails instead of installing it again while `assess`
+  keeps reporting it incomplete.
+- The recovery spool is never synchronized; it is scratch consumed by the same
+  process. `CreationDurability::SyncFiles` covers staged carriers only.
+- New `RepairDurability { SyncFiles, Buffered }` and
+  `Par3RepairSession::repair_with_durability`; `repair` keeps `SyncFiles`.
+  Under `Buffered` nothing is synchronized before installation and a crash
+  can leave a partial or empty output where the damaged one was; the host
+  must issue its own barrier.
+- Source-change checks during repair settle once at the end of each stripe
+  pass and before installation, not before every staged write (a 1 GiB
+  repair: 16,948 snapshots → 618). A source changed mid-repair still ends in
+  `SourceChanged` with nothing installed; it is noticed at the end of the pass.
+- Creation planning hashes a source of at least 8 MiB on a worker pool,
+  admitted as verification admits one (at most four workers, refused into the
+  serial walk under memory pressure): the file hash and the block hashes of
+  each 1 MiB buffer run side by side on the pool, blocks that start and end
+  inside the buffer hashed in parallel, while the calling thread takes the
+  CRCs and reads the next buffer. Reads keep the serial walk's order, sizes
+  and count; one worker, smaller sources and sliding deduplication keep the
+  serial walk unchanged. Planning reserves up to two 1 MiB buffers and the
+  pool's stacks beside its stripe. Output bytes and every I/O count are
+  unchanged. 1 GiB: planning 4× faster with 1 MiB blocks and 3.7× faster with
+  64 KiB blocks at four or more workers, for about 0.1–0.3 s more CPU.
+- Repair stages a damaged file as a clone of its source where the
+  filesystem shares extents: `fclonefileat` on APFS (macOS), the `FICLONE`
+  ioctl on Linux reflink filesystems (Btrfs, XFS with reflink, bcachefs).
+  It applies when the source's registry hands over the very file the
+  evidence verified through `SourceAccess::open_file`, identified from that
+  handle, and the file has no unprotected range; a registry that does not
+  hand over its file is never cloned behind its back. Repair in place, a
+  source found under another name and a separate output directory on the
+  same volume all clone. The clone is cut or extended to the protected length,
+  and the repair writes only what it lacks: the lost blocks and any inline
+  tail. Intact blocks are no longer copied into the stage. When blocks are
+  lost they are still read once to compute the syndromes; a file whose blocks
+  are all intact but which carries trailing bytes is cut back with no source
+  read and no write. What the clone holds is proven by the evidence for the
+  file it cloned, through that file's snapshot alone, which is re-checked
+  right after the clone and again before installation, so nothing is read
+  back. That trusts the change time to move with every write, as
+  `SourceSnapshot` already does; a filesystem that hides or coarsens it
+  (attribute-cached network mounts, an unflushed memory-mapped writer) can
+  hide a change from it. A 1 GiB file with one lost 1 MiB block writes
+  1 MiB instead of 1 GiB. On macOS the clone keeps the original's mode and
+  extended attributes; on Linux the staged file is created fresh, as a copy
+  would be.
+  `ExecutionDiagnostics::file_clones()` counts clones.
+- Where a clone is refused because the filesystem cannot share extents, or
+  the stage is on another device (`EOPNOTSUPP`, `EXDEV`, `EINVAL`, `ENOTTY`,
+  `EPERM`), staging falls back silently to the full copy it made before. The
+  same happens when the registry hands over no file, the file is no longer
+  the one its snapshot describes, or, on macOS, the file is not
+  owner-writable or carries an immutable or append-only flag, which a clone
+  would inherit. After a refusal that means the filesystem has no clones
+  (`EOPNOTSUPP`, `ENOTTY`), later outputs of the same repair do not try
+  again; an `EINVAL`, which a reflink filesystem can return for one file,
+  does not stop the next. Windows, WASI and other targets are unchanged. A
+  clone attempt uses `DiskSourceAccess`'s cached read handle, so it costs no
+  open while handles are cached. Repair also no longer reads surviving
+  blocks that no reconstruction and no staged output needs.
+- On macOS and Linux, where no clone is taken and the repair keeps no
+  backup (`Par3RepairSession::repair` with `backup` off), a damaged file is
+  now patched where it stands instead of being copied whole into a stage:
+  only the extents its
+  evidence does not hold intact are written. It applies only when the
+  registry hands over the very file the evidence verified, that file has a
+  single link and no unprotected range, it is unchanged since its snapshot,
+  and nothing else the repair reads (a placed extent, another file's
+  evidence, a recovery or data payload) comes from it. The patched file is
+  then read back whole and checked against its File packet before it is
+  reported repaired, since its own writes move its snapshot; a mismatch fails
+  the repair. The first write re-checks that snapshot, so a file rewritten
+  while its syndromes were read ends in `SourceChanged` with nothing patched,
+  as a cloned source does; writers to one output serialize on that check, so
+  the repair's own first write cannot move the snapshot under a check still
+  in progress. A patch cut short leaves the intact extents untouched, so the
+  file still verifies as damaged and repairs again. Where the filesystem has
+  no clones, a file with a few lost blocks now costs those blocks' writes and
+  one read-back instead of a full rewrite, which on a network mount is most of
+  the repair. A file with a backup, a second hard link, or a separate output
+  directory is still staged and copied as before; Windows is unchanged.
+  `ExecutionDiagnostics::file_in_place_repairs()` counts patched files, and
+  `engine_perf` reports it as `file_in_place`.
+- A repaired output that is read back before installation (a file patched in
+  place, or a staged one whose writes did not prove it) is now read in runs
+  of adjacent protected extents rather than one extent at a time. An output
+  of 8 MiB or more is read in 1 MiB pieces hashed across up to four workers
+  of an admitted pool, as disk verification already hashes a large source;
+  it falls back to the serial 64 KiB read when memory or the worker budget
+  refuses. The fingerprint and its verdict are unchanged.
+- macOS and Linux builds take `libc` as a regular dependency, and permit
+  `unsafe` only in the two file-clone calls. Every other non-Windows target
+  keeps `forbid(unsafe_code)`.
+- PAR-inside insertion (`InsertionPlan`) stages the output as a clone of the
+  source archive on macOS and Linux reflink filesystems. It does this only
+  when the source's open handle is still the file and generation the plan
+  inspected. It then appends just the embedded carrier and the duplicated
+  footer. Where the clone is refused, or the source has no file behind it, the
+  archive is copied as before. Either way the staged output is no longer read
+  back. Instead:
+  - a clone is proven by the source generation, re-checked before
+    installation;
+  - a copy is hashed as it is written and compared with the plan's file
+    fingerprint;
+  - the carrier's packets are authenticated as they are written.
+  A mismatch still fails before anything is installed. The carrier now goes
+  straight into the staged output, so insertion writes no intermediate
+  carrier files and makes no carrier fsyncs. There is one sync of the staged
+  output, skipped under `CreationDurability::Buffered` through the new
+  `InsertionPlan::execute_with_durability`. The output bytes are unchanged.
+  For a 1 GiB stored zip with 100 × 1 MiB recovery blocks, insertion
+  reads 1 GiB instead of 3.2 GiB, writes 100 MiB instead of 1.2 GiB, and
+  makes 1 fsync instead of 3. On macOS a cloned output keeps the source's
+  mode and extended attributes.
+  `InsertionRequirements::scratch_bytes` no longer counts the carrier, which
+  is no longer written to scratch.
+- `SourceAccess::open_file` (default `None`) lets a source registry hand the
+  engine an opaque `SourceFile` for staging by clone. `DiskSourceAccess`
+  returns its cached handle, or opens the file read-only when handles are
+  not cached. Wrapping registries should forward it.
+- The GF(2^8) FFT codec runs on byte rows (`reedsolomon-rs` 0.4.8's 8-bit
+  lane): no widening to `u16` and back, half the row workspace, so a
+  budget-narrowed GF(2^8) cohort gets twice the stripe and fewer stripe I/O
+  calls. The transform uses fused radix-4 butterflies and skips butterflies
+  over rows the layout knows are zero (padding past the inputs, erased rows).
+  Carriers and repaired bytes are identical. The recovery spool's admission
+  prices a GF(2^8) encode's stripes on the same byte-row layout, so in the
+  band of budgets where the old zero-extended estimate spilled recovery rows
+  to a scratch spool file and read them back, they now stay resident; this
+  changes I/O only, and carriers are byte-identical.
+- **Behaviour change:** `fft::FftCodec::encode` and `decode` no longer zero a
+  stripe before handing it to the input callback; the callback must fill every
+  byte of the slice it is given, as every in-crate caller already did. Decode
+  reads, unpacks and scales each row in one pass and clears only the part of
+  a row past the read; encode transforms the first chunk directly in the sum
+  rows. The formal derivative stores each row once and splits its columns
+  across the worker pool. Decode codec time falls 4–7% at one worker and
+  10–22% at eight, on both fields; carriers and repaired bytes are identical.
+- On x86_64 hosts with GFNI, the FFT codec's byte maps run as affine
+  transforms and the formal derivative as one AVX2 pass (`reedsolomon-rs`
+  0.4.8); carriers and repaired bytes are identical.
+- Repair no longer reads every selected recovery and data packet twice, once
+  to reauthenticate it and again to use it, when one stripe covers the block.
+  The codec's own read of the whole payload is hashed, together with the
+  header and identity fields authenticated at admission, and its bytes are
+  used only once the packet's hash matches. A mismatch refuses the repair
+  with the same `PacketHashMismatch`, charges `failed_hash_bytes` and
+  `rejected_packets` as before, and removes the outputs it had staged.
+  Payloads the codec never reads are still authenticated before anything is
+  installed. A stripe narrower than the block, configured or narrowed by the
+  budget, authenticates every payload in its own pass before the walk, as
+  before, through the stripe buffer when the budget refuses that pass its
+  own. Apple M5 Max, ten 30 MiB files in 64 KiB blocks with 328 lost: file
+  reads 702.2 → 680.6 MB in 11,047 → 10,391 calls, opens 54 → 45, snapshot
+  checks 2,751 → 2,423 (Cauchy); 709.7 → 688.2 MB in 11,163 → 10,507 calls,
+  opens 57 → 48 (FFT). Wall and CPU are unchanged at one and eight workers
+  with a warm cache; on AMD Zen 4 (EPYC 9R14, eight cores) the same counts
+  fall by the same amounts, Cauchy wall 2.21 → 2.20 s at one worker and
+  0.46 → 0.44 s at eight, FFT 0.91 → 0.90 s and 0.61 → 0.59 s, CPU
+  unchanged. Repairs in 1 MiB blocks at the default 64 KiB stripe read
+  exactly what they did.
+- Creation planning (`creation::CreationPlan::build`) reports a source that
+  disappears or is rewritten while its inline tail (a final chunk under 40
+  bytes) is read as `SourceChanged`, not the provider's `NotFound` or I/O
+  error, as it already did for every other chunk. This covers both the serial
+  walk and a planning pool, whose read-ahead failure was returned unchecked
+  when the walk reached the tail.
+
+## 0.4.4
 
 - **Behaviour change:** repair output on native targets is now confined to an
   opened directory capability. Replacing the output-root path or swapping a

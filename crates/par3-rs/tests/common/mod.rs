@@ -1363,12 +1363,16 @@ pub struct TempTree {
 impl TempTree {
     /// Make a fresh directory named after the test using it.
     pub fn new(label: &str) -> Self {
+        Self::under(&std::env::temp_dir(), label)
+    }
+
+    /// Make a fresh directory named after the test using it under `root`.
+    pub fn under(root: &std::path::Path, label: &str) -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
 
         let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("par3-rs-{label}-{}-{unique}", std::process::id()));
+        let path = root.join(format!("par3-rs-{label}-{}-{unique}", std::process::id()));
         std::fs::create_dir_all(&path).expect("a scratch directory");
         let keep = std::env::var_os("PAR3_KEEP_OUTPUT").is_some();
         if keep {
@@ -1408,6 +1412,92 @@ impl Drop for TempTree {
         if !self.keep {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+}
+
+/// Give `path` an ACL entry denying the current user writes, or, with `deny`
+/// false, remove every ACL entry it has.
+#[cfg(target_os = "macos")]
+pub fn deny_owner_writes(path: &std::path::Path, deny: bool) {
+    use std::process::Command;
+    let status = if deny {
+        let user = Command::new("id").arg("-un").output().expect("id -un");
+        let user = String::from_utf8(user.stdout).expect("a user name");
+        Command::new("chmod")
+            .arg("+a")
+            .arg(format!("{} deny write", user.trim()))
+            .arg(path)
+            .status()
+    } else {
+        Command::new("chmod").arg("-N").arg(path).status()
+    };
+    assert!(status.expect("chmod").success(), "chmod {path:?}");
+}
+
+/// Whether the volume under the system temp directory deletes and renames
+/// over open files at once, as Unix filesystems and NTFS on Windows 10 1809
+/// and later do. Where it does not (FAT, exFAT, SMB) the disk registry keeps
+/// no read handles open between reads, and a file held open refuses a rename
+/// over it, so tests counting cached opens or replacing a file mid-read skip.
+pub fn temp_volume_has_posix_unlink_rename() -> bool {
+    #[cfg(windows)]
+    {
+        static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *FLAG.get_or_init(|| {
+            let tree = TempTree::new("volume-flags");
+            let file = std::fs::File::open(tree.write("probe", b"")).expect("a probe file");
+            let flag = windows_volume::posix_unlink_rename(&file);
+            if !flag {
+                println!("temp volume lacks POSIX unlink/rename; cache-dependent cases skip");
+            }
+            flag
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+/// The volume-flag query the disk registry gates its read-handle cache on.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows_volume {
+    use std::os::windows::io::AsRawHandle;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetVolumeInformationByHandleW(
+            handle: *mut core::ffi::c_void,
+            name: *mut u16,
+            name_len: u32,
+            serial: *mut u32,
+            max_component: *mut u32,
+            flags: *mut u32,
+            fs_name: *mut u16,
+            fs_name_len: u32,
+        ) -> i32;
+    }
+
+    pub fn posix_unlink_rename(file: &std::fs::File) -> bool {
+        const FILE_SUPPORTS_POSIX_UNLINK_RENAME: u32 = 0x400;
+        use std::ptr::null_mut;
+        let mut flags = 0;
+        // SAFETY: null buffers with zero lengths are permitted for every
+        // output but `flags`; the borrowed handle stays open for the call.
+        let ok = unsafe {
+            GetVolumeInformationByHandleW(
+                file.as_raw_handle(),
+                null_mut(),
+                0,
+                null_mut(),
+                null_mut(),
+                &mut flags,
+                null_mut(),
+                0,
+            )
+        };
+        ok != 0 && flags & FILE_SUPPORTS_POSIX_UNLINK_RENAME != 0
     }
 }
 
@@ -1562,39 +1652,113 @@ pub fn cauchy_block_set(
     seed: &[u8],
     tree: &TempTree,
 ) -> ManyBlockSet {
-    use par3_rs::creation::{
-        CreationCodec, CreationOptions, CreationPlan, CreationSource, VolumeLayout,
-    };
-    let mut bytes = vec![0; blocks * block_size as usize];
-    let mut hash = blake3::Hasher::new();
-    hash.update(seed);
-    hash.finalize_xof().fill(&mut bytes);
+    cauchy_files_set(
+        1,
+        blocks * block_size as usize,
+        block_size,
+        recovery,
+        seed,
+        tree,
+    )
+}
+
+/// A Cauchy-coded set of `files` files of `bytes_per_file` bytes each, one
+/// recovery block per carrier. A file length that is not a multiple of the
+/// block gives every file a tail.
+pub fn cauchy_files_set(
+    files: usize,
+    bytes_per_file: usize,
+    block_size: u64,
+    recovery: u64,
+    seed: &[u8],
+    tree: &TempTree,
+) -> ManyBlockSet {
+    files_set(
+        files,
+        bytes_per_file,
+        block_size,
+        recovery,
+        par3_rs::creation::CreationCodec::Cauchy,
+        seed,
+        tree,
+    )
+}
+
+/// An FFT-coded set of one file of `blocks` blocks of `block_size` bytes, one
+/// cohort, room for exactly `recovery` (a power of two) recovery blocks, one
+/// per carrier. Unlike [`many_block_set`], the blocks can be wide enough for
+/// a repair's stripes to split them.
+pub fn fft_block_set(
+    blocks: usize,
+    block_size: u64,
+    recovery: u64,
+    seed: &[u8],
+    tree: &TempTree,
+) -> ManyBlockSet {
+    assert!(recovery.is_power_of_two(), "FFT capacity is a power of two");
+    files_set(
+        1,
+        blocks * block_size as usize,
+        block_size,
+        recovery,
+        par3_rs::creation::CreationCodec::Fft {
+            capacity_log2: recovery.trailing_zeros() as i8,
+            interleave: 0,
+        },
+        seed,
+        tree,
+    )
+}
+
+fn files_set(
+    files: usize,
+    bytes_per_file: usize,
+    block_size: u64,
+    recovery: u64,
+    codec: par3_rs::creation::CreationCodec,
+    seed: &[u8],
+    tree: &TempTree,
+) -> ManyBlockSet {
+    use par3_rs::creation::{CreationOptions, CreationPlan, CreationSource, VolumeLayout};
     let mut access = MemorySourceAccess::default();
-    access.insert(SourceId(1), 1, bytes.clone().into());
+    let mut contents = Vec::new();
+    let mut sources = Vec::new();
+    for index in 0..files {
+        let mut bytes = vec![0; bytes_per_file];
+        let mut hash = blake3::Hasher::new();
+        hash.update(seed);
+        if index != 0 {
+            hash.update(&(index as u64).to_le_bytes());
+        }
+        hash.finalize_xof().fill(&mut bytes);
+        let name = if files == 1 {
+            "input.bin".to_owned()
+        } else {
+            format!("input{index}.bin")
+        };
+        access.insert(SourceId(index as u64 + 1), 1, bytes.clone().into());
+        sources.push(CreationSource {
+            name: name.clone(),
+            source: SourceId(index as u64 + 1),
+        });
+        contents.push((name, bytes));
+    }
     let mut options = CreationOptions {
         block_size,
         recovery_count: recovery,
         volumes: VolumeLayout::Uniform(1),
-        codec: CreationCodec::Cauchy,
+        codec,
         ..CreationOptions::default()
     };
     options.execution.workers = 1;
     options.execution.memory = MemoryBudget::new(768 << 20);
     options.execution.retained_bytes = 384 << 20;
-    let plan = CreationPlan::build(
-        Arc::new(access),
-        &[CreationSource {
-            name: "input.bin".into(),
-            source: SourceId(1),
-        }],
-        options.clone(),
-    )
-    .unwrap();
+    let plan = CreationPlan::build(Arc::new(access), &sources, options.clone()).unwrap();
     let id = plan.input_set_id();
     let paths = plan.execute(&tree.path().join("set"), tree.path()).unwrap();
     ManyBlockSet {
         id,
-        contents: vec![("input.bin".to_owned(), bytes)],
+        contents,
         paths,
     }
 }

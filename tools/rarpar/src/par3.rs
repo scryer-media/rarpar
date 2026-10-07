@@ -99,15 +99,11 @@ pub fn is_carrier(path: &Path) -> bool {
 }
 
 pub fn is_carrier_candidate(path: &Path) -> bool {
-    use std::io::Read;
     if is_carrier(path) {
         return true;
     }
-    let mut prefix = [0; 8];
-    std::fs::File::open(path)
-        .and_then(|mut file| file.read_exact(&mut prefix))
-        .is_ok()
-        && &prefix == par3_rs::MAGIC
+    crate::discovery::read_prefix(path, par3_rs::MAGIC.len())
+        .is_ok_and(|prefix| prefix == par3_rs::MAGIC)
 }
 
 fn carrier_options(
@@ -1001,9 +997,12 @@ mod tests {
         assert_eq!(sets.len(), 16);
         let scanned = options.scan_work.used();
         let read_bytes = options.diagnostics.file_io().read_bytes;
-        let expected_reads = carrier.len() as u64 * if cfg!(windows) { 2 } else { 1 };
+        // The carrier is read once on every platform: a Windows snapshot
+        // takes the file's identity and change time from its stamp instead
+        // of hashing its contents, so it reads nothing.
+        let expected_reads = carrier.len() as u64;
         assert_eq!(read_bytes, expected_reads);
-        assert_eq!(scanned, expected_reads + u64::from(cfg!(windows)));
+        assert_eq!(scanned, expected_reads);
         let cli = Cli::try_parse_from(["rarpar", "auto", path.to_str().unwrap()]).unwrap();
         for set in &sets {
             assert_eq!(
