@@ -56,7 +56,10 @@ documented in each crate's own changelog so those notes ship with the crate.
 - 7-Zip facade: a folder that cannot be read while scanning for archives
   (the folder named as the archive, anything below it, or an `-air` walk)
   fails the command with 7-Zip's scan error and exit code 2, instead of
-  counting as empty and exiting 0 with nothing processed.
+  counting as empty and exiting 0 with nothing processed. A wildcard name or
+  `-ai` rule in one folder fails the same way when that folder or one of its
+  entries cannot be read, even when another selector already found an
+  archive, so `-sdel` never runs after an incomplete scan.
 - 7-Zip facade: a command-line argument that is not valid Unicode is a
   command-line error (exit code 7). It was read with U+FFFD in place of its
   bytes, so it could name a different archive, which `-sdel` then deleted.
@@ -104,7 +107,9 @@ documented in each crate's own changelog so those notes ship with the crate.
   `--dry-run` repair reports `"status": "planned"` with `"dry_run": true`
   instead of `"repaired"`. A `--dry-run` removal refuses a missing or
   damaged host as a removal would, and reports `"status": "planned"` with
-  `"dry_run": true` for an intact set. In place, `insert`, `repair` and
+  `"dry_run": true` for an intact set. A `--dry-run` insertion no longer
+  creates the `-d` output directory or in-place staging directories, and
+  still refuses an existing output. In place, `insert`, `repair` and
   `remove` stage each output in its own volume's directory, so the final
   rename never crosses a filesystem.
 - `par3 inside repair` and `remove` refuse a host name recorded in the set
@@ -156,6 +161,10 @@ documented in each crate's own changelog so those notes ship with the crate.
 - par3cmdline facade: `vs` and `rs` given a ZIP or 7z with a directory
   (`par3 vs sub/archive.zip`, or an absolute path) find it in that
   directory instead of reporting it missing.
+- par3cmdline facade: the verbose header and the partial-set report print
+  the Galois field generator of a Start packet declaring an eight-byte (or
+  larger) field with its leading 1 spelled out, instead of shifting a 64-bit
+  value out of range and panicking in an overflow-checked build.
 - par3cmdline facade: `-S<n>` also stops a candidate scan already under way
   when the time is up, instead of letting one large extra file be searched
   to its end first.

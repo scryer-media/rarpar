@@ -234,6 +234,30 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
         Par3InsidePlacement::Last => Rar5Placement::Last,
         Par3InsidePlacement::Independent => Rar5Placement::Independent,
     };
+    let refuse_existing = |outputs: &[PathBuf]| -> Result<(), RarparError> {
+        match outputs.iter().find(|output| output.exists()) {
+            Some(output) => Err(RarparError::Unsafe(format!(
+                "output exists: {}",
+                output.display()
+            ))),
+            None => Ok(()),
+        }
+    };
+    // A dry run reports the plan, refusing an existing output as the run
+    // would, before any output or staging directory is made.
+    if cli.dry_run {
+        if let Some(directory) = args.output_dir.as_ref().filter(|_| !args.in_place) {
+            let outputs: Vec<PathBuf> = hosts
+                .iter()
+                .map(|host| directory.join(&host.name))
+                .collect();
+            refuse_existing(&outputs)?;
+        }
+        return Ok((
+            true,
+            json!({"operation":"par3_inside_insert","status":"planned","dry_run":true,"hosts":hosts.iter().map(|h| &h.name).collect::<Vec<_>>(),"block_size":block_size}),
+        ));
+    }
     // In place, each output is staged in its own volume's directory, so the
     // final rename never crosses a filesystem.
     let mut staging = Vec::new();
@@ -253,14 +277,7 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
             .collect()
     };
     let output_dir = outputs[0].parent().expect("joined").to_owned();
-    for output in &outputs {
-        if output.exists() {
-            return Err(RarparError::Unsafe(format!(
-                "output exists: {}",
-                output.display()
-            )));
-        }
-    }
+    refuse_existing(&outputs)?;
     let scratch_holder;
     let scratch = match &args.scratch_dir {
         Some(dir) => dir.clone(),
@@ -281,12 +298,6 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
         ..CreationOptions::default()
     };
     let mut inserted = Vec::new();
-    if cli.dry_run {
-        return Ok((
-            true,
-            json!({"operation":"par3_inside_insert","status":"planned","dry_run":true,"hosts":hosts.iter().map(|h| &h.name).collect::<Vec<_>>(),"block_size":block_size}),
-        ));
-    }
     if placement == Rar5Placement::Independent {
         for (host, output) in hosts.iter().zip(&outputs) {
             let count = count_for(blocks_of(host.archive.length));

@@ -65,6 +65,10 @@
     host's recovery range past `u64::MAX` (`EngineError::Unsupported`)
     instead of panicking in a debug build or wrapping and misbinding hosts in
     a release one.
+  - `open` releases the packets and memory reservations of its discovery
+    scan before rescanning through the final provider, so a set whose
+    packets need a bit over half the memory budget is no longer refused for
+    holding two packet inventories at once.
 - A derived carrier (`CarrierPlan::derived`) looks up its available Recovery
   Data packets in one pass over the payloads instead of one pass per
   recovery index, so regenerating a region of a set with tens of thousands

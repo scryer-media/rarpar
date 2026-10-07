@@ -1430,25 +1430,40 @@ fn print_partial_header(packets: &[IngestedPacket], noise: i32) -> bool {
         par3_rs::PacketBody::Start(start) => Some((start.block_size, start.galois_field)),
         _ => None,
     });
-    let (block_size, size, generator) = start.map_or((0, 0, 0), |(block_size, field)| {
-        let generator = if field.size == 0 {
-            0
-        } else {
-            field.generator | (1 << (u64::from(field.size) * 8))
-        };
-        (block_size, field.size, generator)
-    });
+    let (block_size, field) = start.unwrap_or((
+        0,
+        par3_rs::GaloisField {
+            size: 0,
+            generator: 0,
+        },
+    ));
     println!();
     println!("Block size = {block_size}");
     if noise >= 1 {
-        println!("Galois field size = {size}");
-        println!("Galois field generator = 0x{generator:X}");
+        println!("Galois field size = {}", field.size);
+        println!("Galois field generator = {}", generator_text(field));
     }
     if let Some(root) = &root {
         println!("Block count = {}", root.lowest_unused_block_index);
         println!("Root attribute = {}", root.attributes);
     }
     root.is_some()
+}
+
+/// The generator polynomial as the report prints it, leading 1 restored:
+/// `0x0` for a set without a field. A field of eight bytes or more, which a
+/// Start packet may declare though only GF(2^8) and GF(2^16) are supported,
+/// is spelled out digit by digit, since its leading 1 does not fit a `u64`.
+fn generator_text(field: par3_rs::GaloisField) -> String {
+    match (field.size, field.polynomial()) {
+        (0, _) => "0x0".to_owned(),
+        (_, Some(polynomial)) => format!("0x{polynomial:X}"),
+        (size, None) => format!(
+            "0x1{:0width$X}",
+            field.generator,
+            width = usize::from(size) * 2
+        ),
+    }
 }
 
 /// par3cmdline's 16-bit Cauchy decoder announces its matrix solve; the 8-bit
@@ -1488,13 +1503,8 @@ fn print_header(set: &Par3Set, file_order: &[usize], noise: i32, block_map: bool
     println!("Block size = {}", set.block_size());
     if noise >= 1 {
         let field = set.galois_field();
-        let generator = if field.size == 0 {
-            0
-        } else {
-            field.generator | (1 << (u64::from(field.size) * 8))
-        };
         println!("Galois field size = {}", field.size);
-        println!("Galois field generator = 0x{generator:X}");
+        println!("Galois field generator = {}", generator_text(field));
     }
     println!("Block count = {}", set.block_count());
     println!("Root attribute = {}", set.root().attributes);
@@ -2375,6 +2385,21 @@ fn search_limits() -> PlacementOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The generator is reported with its leading 1 for every field size a
+    /// Start packet can declare, including eight bytes, whose leading 1 lies
+    /// past a `u64`, never by shifting a `u64` out of range.
+    #[test]
+    fn generators_print_for_every_field_size() {
+        let text = |size, generator| generator_text(par3_rs::GaloisField { size, generator });
+        assert_eq!(text(0, 0), "0x0");
+        assert_eq!(text(1, 0x1D), "0x11D");
+        assert_eq!(text(2, 0x100B), "0x1100B");
+        assert_eq!(text(4, 0x8D), "0x10000008D");
+        assert_eq!(text(8, 0x1B), "0x1000000000000001B");
+        assert_eq!(text(8, u64::MAX), "0x1FFFFFFFFFFFFFFFF");
+        assert_eq!(text(255, 0).len(), 2 + 1 + 510);
+    }
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|arg| (*arg).to_owned()).collect()

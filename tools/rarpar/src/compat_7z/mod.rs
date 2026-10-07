@@ -774,21 +774,19 @@ fn find_archives(
         }
         if option.wildcards && has_wildcard(file) {
             wildcard_names = true;
-            let listing = fs::read_dir(if dir.is_empty() { "." } else { dir });
-            let mut matches = Vec::new();
-            if let Ok(listing) = listing {
-                for entry in listing.flatten() {
-                    let Ok(meta) = fs::metadata(entry.path()) else {
-                        continue;
-                    };
-                    let entry_name = entry.file_name().to_string_lossy().into_owned();
-                    if meta.is_file() && wildcard_match(file, &entry_name, case_sensitive) {
-                        matches.push((format!("{dir}{entry_name}"), meta.len()));
-                    }
+            match scan_folder(dir, file, case_sensitive) {
+                Ok(mut matches) => {
+                    matches.sort();
+                    found.extend(matches);
+                }
+                // A folder that cannot be read fails the scan, as the
+                // recursive walk does, even when another name found an
+                // archive: never an incomplete, successful one.
+                Err((path, error)) => {
+                    scan_error(session, &path, &error);
+                    missing = Some(error);
                 }
             }
-            matches.sort();
-            found.extend(matches);
             continue;
         }
         match fs::metadata(name) {
@@ -901,6 +899,41 @@ fn walk(
         }
     }
     Ok(folders)
+}
+
+/// The files directly in the folder `dir` names (`""` is the current one)
+/// whose names match the wildcard `file`. A folder that is not there holds
+/// nothing to match; any other failure to list it, or to read an entry,
+/// ends the scan with the path and the error.
+fn scan_folder(
+    dir: &str,
+    file: &str,
+    case_sensitive: bool,
+) -> Result<Vec<(String, u64)>, (String, io::Error)> {
+    let listing = match fs::read_dir(if dir.is_empty() { "." } else { dir }) {
+        Ok(listing) => listing,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err((dir.to_owned(), error)),
+    };
+    let mut matches = Vec::new();
+    for entry in listing {
+        let entry = entry.map_err(|error| (dir.to_owned(), error))?;
+        let entry_name = entry.file_name().to_string_lossy().into_owned();
+        if !wildcard_match(file, &entry_name, case_sensitive) {
+            continue;
+        }
+        let path = format!("{dir}{entry_name}");
+        let meta = match fs::metadata(entry.path()) {
+            Ok(meta) => meta,
+            // Gone since the folder was listed, or a link to nothing.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err((path, error)),
+        };
+        if meta.is_file() {
+            matches.push((path, meta.len()));
+        }
+    }
+    Ok(matches)
 }
 
 /// 7-Zip's scan error: the system message and the path it hit.

@@ -672,4 +672,65 @@ mod generated {
         );
         assert_eq!(verified["sets"].as_array().unwrap().len(), 3, "{verified}");
     }
+
+    /// A dry-run insertion reports its plan and leaves the tree as it found
+    /// it: no output directory is made, and in place no staging directory is
+    /// left beside the volumes, which keep their bytes.
+    #[test]
+    fn a_dry_run_insertion_makes_no_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source = root.join("source");
+        family(&source, 41);
+        let listing = || {
+            let mut names: Vec<_> = std::fs::read_dir(&source)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = listing();
+        let pristine: Vec<Vec<u8>> = before
+            .iter()
+            .map(|name| std::fs::read(source.join(name)).unwrap())
+            .collect();
+        let planned = run(
+            root,
+            &[
+                "--dry-run",
+                "par3",
+                "inside",
+                "insert",
+                "source/set.part1.rar",
+                "-d",
+                "fresh/nested",
+                "-s",
+                "4096",
+            ],
+            0,
+        );
+        assert_eq!(planned["status"], "planned", "{planned}");
+        assert_eq!(planned["dry_run"], true, "{planned}");
+        assert!(!root.join("fresh").exists(), "no output directory is made");
+        let planned = run(
+            root,
+            &[
+                "--dry-run",
+                "par3",
+                "inside",
+                "insert",
+                "source/set.part1.rar",
+                "--in-place",
+                "-s",
+                "4096",
+            ],
+            0,
+        );
+        assert_eq!(planned["status"], "planned", "{planned}");
+        assert_eq!(listing(), before, "no staging directory is made");
+        for (name, bytes) in before.iter().zip(&pristine) {
+            assert_eq!(&std::fs::read(source.join(name)).unwrap(), bytes);
+        }
+    }
 }

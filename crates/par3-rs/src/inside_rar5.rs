@@ -1099,6 +1099,10 @@ pub fn open(paths: &[PathBuf], options: &ExecutionOptions) -> EngineResult<Vec<R
             }
         }
     }
+    // The discovery inventory holds authenticated packets and their memory
+    // reservations; release it before the rescan builds the final one, so the
+    // two are never charged to the budget together.
+    drop(candidates);
     known.extend(extra);
     let access: Arc<dyn SourceAccess> = Arc::new(disk_access(&known, options));
     // Rescan everything through the final provider so packet origins agree.
@@ -1270,6 +1274,25 @@ fn stem_change(recorded: &str, actual: &str) -> Option<(String, String)> {
     let old = &recorded[..recorded.len() - keep];
     let new = &actual[..actual.len() - keep];
     (!old.is_empty() && !new.is_empty()).then(|| (old.to_owned(), new.to_owned()))
+}
+
+/// Consecutive recovery index ranges for hosts carrying `counts` packets each,
+/// the first starting at `first`. `first` comes from an authenticated packet,
+/// which may still carry any index: a range past `u64::MAX` is refused, never
+/// wrapped.
+fn recovery_ranges(first: u64, counts: &[u64]) -> EngineResult<Vec<Range<u64>>> {
+    let mut base = first;
+    counts
+        .iter()
+        .map(|&count| {
+            let end = base
+                .checked_add(count)
+                .ok_or(EngineError::Unsupported("recovery index out of range"))?;
+            let range = base..end;
+            base = end;
+            Ok(range)
+        })
+        .collect()
 }
 
 fn open_set(
@@ -1456,14 +1479,12 @@ fn open_set(
             }
         }
     }
-    let mut base = first.unwrap_or(0);
-    for host in &mut hosts {
-        let count = host.recovery.end;
-        let end = base
-            .checked_add(count)
-            .ok_or(EngineError::Unsupported("recovery index out of range"))?;
-        host.recovery = base..end;
-        base = end;
+    let counts: Vec<u64> = hosts.iter().map(|host| host.recovery.end).collect();
+    for (host, range) in hosts
+        .iter_mut()
+        .zip(recovery_ranges(first.unwrap_or(0), &counts)?)
+    {
+        host.recovery = range;
     }
     for host in hosts.iter_mut().filter(|host| host.source.is_none()) {
         let by_recovery = candidates.iter().find(|c| {
@@ -2306,50 +2327,94 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Rewrite the first Recovery Data packet of `bytes` to carry `index`,
-    /// with its packet hash recomputed so the packet still authenticates.
-    fn set_first_recovery_index(bytes: &mut [u8], index: u64) {
-        let at = bytes
-            .windows(8)
-            .position(|window| window == b"PAR REC\0")
-            .expect("a Recovery Data packet")
-            - 40;
-        let length = u64::from_le_bytes(bytes[at + 24..at + 32].try_into().unwrap()) as usize;
-        bytes[at + 80..at + 88].copy_from_slice(&index.to_le_bytes());
-        let hash = crate::hash::fingerprint(&bytes[at + 24..at + length]);
-        bytes[at + 8..at + 24].copy_from_slice(&hash);
-    }
-
     /// An authenticated Recovery Data packet at a host's first slot may carry
-    /// any index. One that puts the host's recovery range past `u64::MAX` is
-    /// refused, never wrapped or a panic; a shifted index in range still binds.
+    /// any index. A first index that puts any host's recovery range past
+    /// `u64::MAX` is refused, never wrapped or a panic; a shifted first index
+    /// in range still lays the hosts out consecutively.
     #[test]
     fn recovery_indices_past_the_index_space_are_refused() {
-        let dir = scratch_dir("recovery-index");
-        let inserted = insert_synthetic(&dir, &["thrush-ledger.rar"], 40, false);
-        let pristine = std::fs::read(&inserted[0]).unwrap();
-        let sets = open(&inserted, &ExecutionOptions::default()).unwrap();
-        assert_eq!(sets[0].hosts[0].recovery, 0..2);
-        // The opened set holds its host open: it is closed before the host
-        // is rewritten or removed.
-        drop(sets);
-        for index in [u64::MAX, u64::MAX - 1] {
-            let mut bytes = pristine.clone();
-            set_first_recovery_index(&mut bytes, index);
-            std::fs::write(&inserted[0], &bytes).unwrap();
+        for first in [u64::MAX, u64::MAX - 1] {
             assert!(
                 matches!(
-                    open(&inserted, &ExecutionOptions::default()),
+                    recovery_ranges(first, &[2]),
                     Err(EngineError::Unsupported("recovery index out of range"))
                 ),
-                "index {index}"
+                "first index {first}"
             );
         }
-        let mut bytes = pristine;
-        set_first_recovery_index(&mut bytes, 5);
-        std::fs::write(&inserted[0], &bytes).unwrap();
+        assert!(matches!(
+            recovery_ranges(u64::MAX - 3, &[2, 2]),
+            Err(EngineError::Unsupported("recovery index out of range"))
+        ));
+        assert_eq!(
+            recovery_ranges(u64::MAX - 4, &[2, 2]).unwrap(),
+            [u64::MAX - 4..u64::MAX - 2, u64::MAX - 2..u64::MAX]
+        );
+        assert_eq!(recovery_ranges(5, &[2, 3]).unwrap(), [5..7, 7..10]);
+        assert_eq!(recovery_ranges(0, &[]).unwrap(), []);
+    }
+
+    /// An inserted set opens with its hosts' recovery ranges starting at the
+    /// index its packets carry.
+    #[test]
+    fn an_inserted_set_binds_recovery_ranges_from_its_packets() {
+        let dir = scratch_dir("recovery-index");
+        let inserted = insert_synthetic(&dir, &["thrush-ledger.rar"], 40, false);
         let sets = open(&inserted, &ExecutionOptions::default()).unwrap();
-        assert_eq!(sets[0].hosts[0].recovery, 5..7);
+        assert_eq!(sets[0].hosts[0].recovery, 0..2);
+        drop(sets);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Opening a set charges the budget for one packet inventory at a time:
+    /// the discovery scan's packets are released before the rescan through
+    /// the final provider takes its own, so a set whose packets need a bit
+    /// over half the budget still opens.
+    #[test]
+    fn opening_never_holds_two_packet_inventories_at_once() {
+        use crate::runtime::{MemoryBudget, MemoryCategory};
+        let dir = scratch_dir("one-inventory");
+        let inserted = insert_synthetic(
+            &dir,
+            &[
+                "kestrel.part1.rar",
+                "kestrel.part2.rar",
+                "kestrel.part3.rar",
+            ],
+            50,
+            false,
+        );
+        let options = || ExecutionOptions {
+            memory: MemoryBudget::new(1 << 30),
+            stripe_bytes: 4096,
+            ..ExecutionOptions::default()
+        };
+        // What one scan of every given file keeps once its scanners are gone.
+        let scanned = options();
+        let access: Arc<dyn SourceAccess> = Arc::new(disk_access(&inserted, &scanned));
+        let inventory: Vec<Candidate> = inserted
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                candidate(&access, path.clone(), SourceId(index as u64), &scanned).unwrap()
+            })
+            .collect();
+        let one = scanned
+            .memory
+            .ledger()
+            .category(MemoryCategory::CarrierPackets)
+            .current;
+        assert!(one > 0, "the scan kept its packets");
+        drop(inventory);
+        let opened = options();
+        let sets = open(&inserted, &opened).unwrap();
+        assert_eq!(sets.len(), 1);
+        let peak = opened
+            .memory
+            .ledger()
+            .category(MemoryCategory::CarrierPackets)
+            .peak;
+        assert!(peak < 2 * one, "peak {peak} holds two inventories of {one}");
         drop(sets);
         std::fs::remove_dir_all(&dir).unwrap();
     }
