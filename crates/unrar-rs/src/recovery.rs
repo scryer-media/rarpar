@@ -10,6 +10,8 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{RarError, RarResult};
 use crate::probe::probe_volume;
@@ -483,23 +485,34 @@ fn restore_rar5_folded(
         slot.valid = ok;
     }
     let missing = (0..data_count).filter(|&i| !size_ok[i]).collect::<Vec<_>>();
-    let partial_paths = missing
-        .iter()
-        .map(|&i| partial_restore_path(&data_slots[i].output_path))
-        .collect::<Vec<_>>();
-    let remove_partials = || {
-        for path in &partial_paths {
+    let mut partial_paths = Vec::with_capacity(missing.len());
+    let mut partials = Vec::with_capacity(missing.len());
+    let remove_paths = |paths: &[PathBuf]| {
+        for path in paths {
             let _ = std::fs::remove_file(path);
         }
     };
+    for &i in &missing {
+        match create_partial(&data_slots[i].output_path) {
+            Ok((path, file)) => {
+                partial_paths.push(path.clone());
+                partials.push((path, file));
+            }
+            Err(error) => {
+                drop(partials);
+                remove_paths(&partial_paths);
+                return Err(error);
+            }
+        }
+    }
+    let remove_partials = || remove_paths(&partial_paths);
 
     let pass = match reconstruct_rar5(
         &coder,
         data_slots,
         recovery_slots,
         &missing,
-        &partial_paths,
-        true,
+        Rar5Outputs::Created(partials),
         true,
     ) {
         Ok(pass) => pass,
@@ -613,8 +626,10 @@ fn restore_rar5_checked(
         data_slots,
         recovery_slots,
         &missing_volume_numbers,
-        &output_paths,
-        options.overwrite_existing,
+        Rar5Outputs::Paths {
+            paths: &output_paths,
+            overwrite_existing: options.overwrite_existing,
+        },
         false,
     )?;
     Ok(Some((missing_volume_numbers, pass.restored)))
@@ -629,15 +644,56 @@ fn refuse_existing_restored(path: &Path) -> RarError {
     }
 }
 
-/// A hidden sibling of `output` that a speculative restore writes before it
-/// knows the restore stands. The process id keeps two restores of one set
-/// apart.
+/// How many names [`create_partial`] tries before it gives up.
+const PARTIAL_CREATE_ATTEMPTS: usize = 16;
+
+/// Create a fresh hidden sibling of `output` for a speculative restore to
+/// write before it knows the restore stands, returning its path and the file.
+fn create_partial(output: &Path) -> RarResult<(PathBuf, File)> {
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent).map_err(RarError::Io)?;
+    }
+    create_exclusive(|| partial_restore_path(output))
+}
+
+/// Create the first of `next_path`'s names that does not exist yet. The
+/// create is exclusive, so it never opens, truncates or follows a file or
+/// symlink already at a name; such a name is skipped for the next one.
+fn create_exclusive(mut next_path: impl FnMut() -> PathBuf) -> RarResult<(PathBuf, File)> {
+    let mut last_error = None;
+    for _ in 0..PARTIAL_CREATE_ATTEMPTS {
+        let path = next_path();
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(RarError::Io(error)),
+        }
+    }
+    Err(RarError::Io(last_error.unwrap_or_else(|| {
+        std::io::Error::from(std::io::ErrorKind::AlreadyExists)
+    })))
+}
+
+/// A hidden sibling name of `output` for a speculative restore. The process
+/// id, a per-process counter and the clock's nanoseconds keep restores apart,
+/// within a process and across processes, and make the name unpredictable
+/// enough that [`create_exclusive`] rarely has to skip one.
 fn partial_restore_path(output: &Path) -> PathBuf {
+    static NEXT_PARTIAL: AtomicU64 = AtomicU64::new(0);
     let name = output
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    output.with_file_name(format!(".{name}.{}.partial", std::process::id()))
+    let serial = NEXT_PARTIAL.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos());
+    output.with_file_name(format!(
+        ".{name}.{}.{serial}.{nanos:09}.partial",
+        std::process::id()
+    ))
 }
 
 fn rar5_recovery_reference_name(
@@ -732,7 +788,19 @@ struct Rar5Reconstruction {
     data_crcs: Vec<Option<u32>>,
 }
 
-/// Rebuild the missing data volumes into `output_paths` (one per entry of
+/// Where [`reconstruct_rar5`] writes the restored volumes.
+enum Rar5Outputs<'a> {
+    /// Opened once the inputs are: each path is created, or with
+    /// `overwrite_existing` truncated where it exists.
+    Paths {
+        paths: &'a [PathBuf],
+        overwrite_existing: bool,
+    },
+    /// Files the caller already created, with their paths.
+    Created(Vec<(PathBuf, File)>),
+}
+
+/// Rebuild the missing data volumes into `outputs` (one per entry of
 /// `missing_volume_numbers`). With `hash_data`, every data volume the decode
 /// reads is hashed on the way through, so a caller that trusted its size can
 /// check it against the table without a second read.
@@ -741,8 +809,7 @@ fn reconstruct_rar5(
     data_slots: &[Rar5DataSlot],
     recovery_slots: &[Rar5RecoverySlot],
     missing_volume_numbers: &[usize],
-    output_paths: &[PathBuf],
-    overwrite_existing: bool,
+    outputs: Rar5Outputs<'_>,
     hash_data: bool,
 ) -> RarResult<Rar5Reconstruction> {
     let missing_count = missing_volume_numbers.len();
@@ -792,22 +859,29 @@ fn reconstruct_rar5(
         })
         .collect::<RarResult<Vec<_>>>()?;
 
-    let mut outputs = Vec::with_capacity(missing_count);
-    let mut restored_paths = Vec::with_capacity(missing_count);
-    for path in output_paths {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(RarError::Io)?;
+    let (restored_paths, mut outputs): (Vec<PathBuf>, Vec<File>) = match outputs {
+        Rar5Outputs::Paths {
+            paths,
+            overwrite_existing,
+        } => {
+            let mut outputs = Vec::with_capacity(missing_count);
+            for path in paths {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(RarError::Io)?;
+                }
+                let file = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(overwrite_existing)
+                    .create_new(!overwrite_existing)
+                    .open(path)
+                    .map_err(RarError::Io)?;
+                outputs.push(file);
+            }
+            (paths.to_vec(), outputs)
         }
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(overwrite_existing)
-            .create_new(!overwrite_existing)
-            .open(path)
-            .map_err(RarError::Io)?;
-        outputs.push(file);
-        restored_paths.push(path.clone());
-    }
+        Rar5Outputs::Created(created) => created.into_iter().unzip(),
+    };
 
     // The file each logical unit is read from: the data volume where it is
     // valid, otherwise the next valid recovery volume, in order. Fixed for
@@ -2525,6 +2599,211 @@ mod tests {
             std::fs::read(bad_path).unwrap(),
             b"previous backup".to_vec()
         );
+    }
+
+    /// A two-data, one-recovery RAR5 set written into `dir` with its first
+    /// data volume missing: the second data volume and the `.rev` are
+    /// present. Returns the present paths and the bytes the restore must put
+    /// at `{stem}.part1.rar`. The recovery payload is arbitrary; the missing
+    /// volume is whatever the decoder rebuilds from it, and the table carries
+    /// that volume's size and CRC32, so the set is consistent by construction.
+    fn synthetic_rar5_set(dir: &Path, stem: &str, seed: u8) -> (Vec<PathBuf>, Vec<u8>) {
+        let mut second = build_probe_rar5_archive(
+            crate::header::main_archive::flags::VOLUME
+                | crate::header::main_archive::flags::VOLUME_NUMBER,
+            Some(1),
+        );
+        second.extend((0..97u8).map(|i| i.wrapping_mul(7) ^ seed));
+        let first_len = second.len() + 23;
+        let rs_len = first_len + (first_len & 1);
+        let payload = (0..rs_len)
+            .map(|i| (i as u8).wrapping_mul(13) ^ seed)
+            .collect::<Vec<_>>();
+
+        let coder = Rar5RsCoder::new_decoder(2, 1, &[false, true, true]).unwrap();
+        let mut second_unit = second.clone();
+        second_unit.resize(rs_len, 0);
+        let mut first = vec![0u8; rs_len];
+        coder.apply_units(&[&payload, &second_unit], &mut [&mut first[..]]);
+        first.truncate(first_len);
+
+        let mut raw = vec![1u8]; // version
+        raw.extend_from_slice(&2u16.to_le_bytes()); // data count
+        raw.extend_from_slice(&1u16.to_le_bytes()); // recovery count
+        raw.extend_from_slice(&2u16.to_le_bytes()); // recovery volume number
+        raw.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+        for volume in [&first, &second] {
+            raw.extend_from_slice(&(volume.len() as u64).to_le_bytes());
+            raw.extend_from_slice(&crc32fast::hash(volume).to_le_bytes());
+        }
+        let mut rev = build_rar5_rev_from_raw(&raw);
+        rev.extend_from_slice(&payload);
+
+        let second_path = dir.join(format!("{stem}.part2.rar"));
+        let rev_path = dir.join(format!("{stem}.part1.rev"));
+        std::fs::write(&second_path, &second).unwrap();
+        std::fs::write(&rev_path, &rev).unwrap();
+        (vec![second_path, rev_path], first)
+    }
+
+    /// Hidden or `.partial` names in `dir`, other than `keep`.
+    fn stray_partials(dir: &Path, keep: &[&Path]) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                let name = path.file_name().unwrap().to_string_lossy();
+                (name.starts_with('.') || name.ends_with(".partial"))
+                    && !keep.contains(&path.as_path())
+            })
+            .collect()
+    }
+
+    fn restore_into(dir: &Path, overwrite_existing: bool) -> RecoveryOptions {
+        RecoveryOptions {
+            output_dir: Some(dir.to_path_buf()),
+            overwrite_existing,
+            verify_restored: true,
+        }
+    }
+
+    /// The speculative partial used to sit at `.<name>.<pid>.partial` and was
+    /// opened truncating, so a file planted there was clobbered. A regular
+    /// file at that name must now be left as it is, and the restore must
+    /// still land byte for byte with nothing left behind.
+    #[test]
+    fn rar5_folded_restore_leaves_a_file_at_the_old_partial_name_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, expected) = synthetic_rar5_set(dir.path(), "fixture_alpha", 0x11);
+        let output = dir.path().join("fixture_alpha.part1.rar");
+        let planted = dir.path().join(format!(
+            ".fixture_alpha.part1.rar.{}.partial",
+            std::process::id()
+        ));
+        std::fs::write(&planted, b"not yours").unwrap();
+
+        let report = restore_volumes_from_paths(&paths, &restore_into(dir.path(), false)).unwrap();
+
+        assert_eq!(report.restored_paths, vec![output.clone()]);
+        assert!(std::fs::read(&output).unwrap() == expected);
+        assert_eq!(std::fs::read(&planted).unwrap(), b"not yours");
+        assert_eq!(
+            stray_partials(dir.path(), &[&planted]),
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    /// A symlink at the old predictable partial name must be neither
+    /// followed nor truncated: its target keeps its bytes.
+    #[cfg(unix)]
+    #[test]
+    fn rar5_folded_restore_does_not_follow_a_symlink_at_the_old_partial_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let (paths, expected) = synthetic_rar5_set(dir.path(), "fixture_beta", 0x22);
+        let victim = elsewhere.path().join("victim.bin");
+        std::fs::write(&victim, b"keep these bytes").unwrap();
+        let planted = dir.path().join(format!(
+            ".fixture_beta.part1.rar.{}.partial",
+            std::process::id()
+        ));
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        restore_volumes_from_paths(&paths, &restore_into(dir.path(), false)).unwrap();
+
+        assert!(std::fs::read(dir.path().join("fixture_beta.part1.rar")).unwrap() == expected);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep these bytes");
+        assert!(
+            std::fs::symlink_metadata(&planted)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            stray_partials(dir.path(), &[&planted]),
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    /// The exclusive create skips a taken name, a symlink included, without
+    /// opening it, and takes the next one.
+    #[test]
+    fn create_exclusive_skips_a_taken_name_without_opening_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let taken = dir.path().join(".taken.partial");
+        let fresh = dir.path().join(".fresh.partial");
+        std::fs::write(&taken, b"already here").unwrap();
+        let mut names = [taken.clone(), fresh.clone()].into_iter();
+
+        let (path, mut file) = create_exclusive(|| names.next().unwrap()).unwrap();
+        file.write_all(b"new").unwrap();
+        drop(file);
+
+        assert_eq!(path, fresh);
+        assert_eq!(std::fs::read(&taken).unwrap(), b"already here");
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"new");
+
+        let error = create_exclusive(|| taken.clone()).unwrap_err();
+        assert!(
+            matches!(&error, RarError::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&taken).unwrap(), b"already here");
+    }
+
+    /// Two restores of distinct sets into one directory at once in one
+    /// process: each lands byte for byte and neither leaves a partial.
+    #[test]
+    fn rar5_folded_restores_side_by_side_do_not_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let sets = [("fixture_gamma", 0x33), ("fixture_delta", 0x44)]
+            .map(|(stem, seed)| (stem, synthetic_rar5_set(dir.path(), stem, seed)));
+        let options = restore_into(dir.path(), false);
+
+        std::thread::scope(|scope| {
+            let handles = sets
+                .iter()
+                .map(|(_, (paths, _))| scope.spawn(|| restore_volumes_from_paths(paths, &options)))
+                .collect::<Vec<_>>();
+            for handle in handles {
+                handle.join().unwrap().unwrap();
+            }
+        });
+
+        for (stem, (_, expected)) in &sets {
+            let output = dir.path().join(format!("{stem}.part1.rar"));
+            assert!(std::fs::read(&output).unwrap() == *expected, "{stem}");
+        }
+        assert_eq!(stray_partials(dir.path(), &[]), Vec::<PathBuf>::new());
+    }
+
+    /// With `overwrite_existing`, a restore into a separate output directory
+    /// replaces a target already there on every platform (the install is a
+    /// rename onto it), and without it the restore refuses as before.
+    #[test]
+    fn rar5_folded_restore_replaces_an_existing_target_when_asked() {
+        let source = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let (paths, expected) = synthetic_rar5_set(source.path(), "fixture_epsilon", 0x55);
+        let target = out.path().join("fixture_epsilon.part1.rar");
+        std::fs::write(&target, b"stale volume").unwrap();
+
+        let error = restore_volumes_from_paths(&paths, &restore_into(out.path(), false))
+            .expect_err("an existing target without overwrite is refused");
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to overwrite existing restored volume"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"stale volume");
+        assert_eq!(stray_partials(out.path(), &[]), Vec::<PathBuf>::new());
+
+        let report = restore_volumes_from_paths(&paths, &restore_into(out.path(), true)).unwrap();
+
+        assert_eq!(report.restored_paths, vec![target.clone()]);
+        assert!(std::fs::read(&target).unwrap() == expected);
+        assert_eq!(stray_partials(out.path(), &[]), Vec::<PathBuf>::new());
     }
 
     #[test]

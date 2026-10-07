@@ -557,6 +557,8 @@ fn parse_recovery_packet_from_reader(
             payload_offset,
             payload_len,
             header.packet_hash,
+            *header.recovery_set_id.as_bytes(),
+            exponent,
             fingerprint.clone(),
         ),
         None => RecoverySliceData::file_backed_shared(
@@ -1362,7 +1364,7 @@ mod tests {
             panic!("expected a hashed file-backed payload");
         };
         assert!(
-            recovery::scan_authentication(path, *offset, *len, packet_hash).is_some(),
+            recovery::scan_authentication(path, *offset, *len, packet_hash, &rsid, 3).is_some(),
             "a settled scan vouches for the payload it hashed"
         );
 
@@ -1373,7 +1375,10 @@ mod tests {
         else {
             unreachable!();
         };
-        assert!(recovery::scan_authentication(cloned_path, *offset, *len, packet_hash).is_some());
+        assert!(
+            recovery::scan_authentication(cloned_path, *offset, *len, packet_hash, &rsid, 3)
+                .is_some()
+        );
 
         let hand_built = RecoverySliceData::FileBacked {
             path: Arc::clone(path),
@@ -1391,8 +1396,15 @@ mod tests {
             unreachable!();
         };
         assert!(
-            recovery::scan_authentication(hand_path, *hand_offset, *hand_len, packet_hash)
-                .is_none(),
+            recovery::scan_authentication(
+                hand_path,
+                *hand_offset,
+                *hand_len,
+                packet_hash,
+                &rsid,
+                3
+            )
+            .is_none(),
             "a span the scan never hashed is not vouched for"
         );
         assert!(!hand_built.validate_packet_hash(&rsid, 3).unwrap());

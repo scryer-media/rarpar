@@ -46,11 +46,23 @@ pub enum RecoverySliceData {
 /// exists; entries whose payloads are all gone are pruned when the next scan
 /// registers. A span is vouched for only when its offset, length and packet
 /// hash are the ones the scan authenticated, so a payload built by hand over
-/// the scanner's path is read and hashed like any other.
+/// the scanner's path is read and hashed like any other. The packet hash
+/// also covers the recovery set ID and the exponent, so the span is vouched
+/// for only under the set ID and exponent the scan hashed it with; asked
+/// about any other, the payload is read and hashed against that one.
 struct ScanAuthentication {
     path: Weak<Path>,
     fingerprint: FileStatFingerprint,
-    spans: HashMap<u64, (usize, [u8; 16])>,
+    spans: HashMap<u64, AuthenticatedSpan>,
+}
+
+/// What the scanner hashed at one payload offset.
+#[derive(PartialEq, Eq)]
+struct AuthenticatedSpan {
+    len: usize,
+    packet_hash: [u8; 16],
+    recovery_set_id: [u8; 16],
+    exponent: RecoveryExponent,
 }
 
 static SCAN_AUTHENTICATIONS: Mutex<Option<HashMap<usize, ScanAuthentication>>> = Mutex::new(None);
@@ -62,8 +74,7 @@ fn interned_path_key(path: &Arc<Path>) -> usize {
 fn record_scan_authentication(
     path: &Arc<Path>,
     offset: u64,
-    len: usize,
-    packet_hash: [u8; 16],
+    span: AuthenticatedSpan,
     fingerprint: FileStatFingerprint,
 ) {
     let mut table = SCAN_AUTHENTICATIONS
@@ -81,7 +92,7 @@ fn record_scan_authentication(
     });
     // One allocation is one scan, and one scan records one fingerprint.
     debug_assert_eq!(entry.fingerprint, fingerprint);
-    entry.spans.insert(offset, (len, packet_hash));
+    entry.spans.insert(offset, span);
 }
 
 pub(super) fn scan_authentication(
@@ -89,13 +100,21 @@ pub(super) fn scan_authentication(
     offset: u64,
     len: usize,
     packet_hash: &[u8; 16],
+    recovery_set_id: &[u8; 16],
+    exponent: RecoveryExponent,
 ) -> Option<FileStatFingerprint> {
     let table = SCAN_AUTHENTICATIONS
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     let entry = table.as_ref()?.get(&interned_path_key(path))?;
     debug_assert!(std::ptr::addr_eq(entry.path.as_ptr(), Arc::as_ptr(path)));
-    (entry.spans.get(&offset) == Some(&(len, *packet_hash))).then(|| entry.fingerprint.clone())
+    let span = AuthenticatedSpan {
+        len,
+        packet_hash: *packet_hash,
+        recovery_set_id: *recovery_set_id,
+        exponent,
+    };
+    (entry.spans.get(&offset) == Some(&span)).then(|| entry.fingerprint.clone())
 }
 
 impl RecoverySliceData {
@@ -132,7 +151,8 @@ impl RecoverySliceData {
     }
 
     /// A file-backed slice whose payload the scanner has just authenticated
-    /// against `packet_hash`, with the volume fingerprinted as it was opened.
+    /// against `packet_hash` under `recovery_set_id` and `exponent`, with the
+    /// volume fingerprinted as it was opened.
     ///
     /// The fingerprint is taken before any byte is read, so a write that
     /// lands during or after the scan moves it and sends validation back to
@@ -142,9 +162,21 @@ impl RecoverySliceData {
         offset: u64,
         len: usize,
         packet_hash: [u8; 16],
+        recovery_set_id: [u8; 16],
+        exponent: RecoveryExponent,
         fingerprint: FileStatFingerprint,
     ) -> Self {
-        record_scan_authentication(&path, offset, len, packet_hash, fingerprint);
+        record_scan_authentication(
+            &path,
+            offset,
+            AuthenticatedSpan {
+                len,
+                packet_hash,
+                recovery_set_id,
+                exponent,
+            },
+            fingerprint,
+        );
         Self::FileBacked {
             path,
             offset,
@@ -208,7 +240,8 @@ impl RecoverySliceData {
         else {
             return Ok(true);
         };
-        if let Some(authenticated_at) = scan_authentication(path, *offset, *len, expected)
+        if let Some(authenticated_at) =
+            scan_authentication(path, *offset, *len, expected, recovery_set_id, exponent)
             && FileStatFingerprint::capture_path(path).as_ref() == Some(&authenticated_at)
         {
             return Ok(true);

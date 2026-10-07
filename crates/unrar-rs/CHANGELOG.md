@@ -32,7 +32,14 @@
   volumes that are absent or the wrong size are ones the recovery volumes
   can cover, the decode checks the other volumes' CRC32s as it reads them
   and writes to hidden partial files; only when every CRC32 matches are bad
-  volumes renamed to `.bad` and the partial files moved into place. If one
+  volumes renamed to `.bad` and the partial files moved into place. Each
+  partial file is created exclusively under a name carrying the process ID,
+  a per-process counter and the clock's nanoseconds, so it never opens,
+  truncates or follows a file or symlink already in the output directory,
+  whatever `overwrite_existing` says, and concurrent restores never share
+  one; a taken name is skipped for the next. Moving a partial file into
+  place replaces an existing output on every platform when
+  `overwrite_existing` is set, and is refused as before when it is not. If one
   fails, the partial files are removed and the restore continues as before
   from the verdicts the decode found, so renames and refusals are unchanged.
   The next chunk is read while the current one is decoded, inside the same

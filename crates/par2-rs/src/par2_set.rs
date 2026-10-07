@@ -867,6 +867,73 @@ mod tests {
         assert_eq!(head, vec![0xAB; 16]);
     }
 
+    /// `from_paths` keeps a recovery packet whatever set it names, so a
+    /// volume from another set lands in the inventory under its exponent.
+    /// Its packet hash covers that other set's ID, so validating it under
+    /// this set's ID must fail: when the scan read it moments ago and must
+    /// hash it again, and when the scan vouched for it on a settled volume
+    /// whose stat is unchanged. The vouching holds only for the set ID and
+    /// exponent the scan hashed it under.
+    #[test]
+    fn a_foreign_recovery_packet_fails_validation_fresh_and_cached() {
+        let file_id = [0x01; 16];
+        let main_a = make_main_body(1024, &[file_id]);
+        let rsid_a = compute_rsid(&main_a);
+        let main_b = make_main_body(2048, &[file_id]);
+        let rsid_b = compute_rsid(&main_b);
+        assert_ne!(rsid_a, rsid_b);
+
+        let mut recovery_body = 5u32.to_le_bytes().to_vec();
+        recovery_body.extend_from_slice(&[0xCD; 1024]);
+        let index_a = make_full_packet(header::TYPE_MAIN, &main_a, rsid_a);
+        let volume_b = make_full_packet(header::TYPE_RECOVERY, &recovery_body, rsid_b);
+
+        for settled in [false, true] {
+            let dir = tempdir().unwrap();
+            let index_path = dir.path().join("fixture_set_a.par2");
+            let volume_path = dir.path().join("fixture_set_b.vol05+01.par2");
+            std::fs::write(&index_path, &index_a).unwrap();
+            std::fs::write(&volume_path, &volume_b).unwrap();
+            if settled {
+                // An mtime far in the past: the scan's fingerprint has
+                // settled, so it records its authentication.
+                std::fs::File::options()
+                    .write(true)
+                    .open(&volume_path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(
+                        std::time::SystemTime::UNIX_EPOCH
+                            + std::time::Duration::from_secs(1_700_000_000),
+                    ))
+                    .unwrap();
+            }
+
+            let set = Par2FileSet::from_paths(&[&index_path, &volume_path]).unwrap();
+            assert_eq!(set.recovery_set_id.as_bytes(), &rsid_a);
+            let slice = set
+                .recovery_slices
+                .get(&5)
+                .expect("the builder keeps the foreign packet");
+            assert!(slice.data.as_bytes().is_none(), "payload stays file-backed");
+
+            assert!(
+                !slice
+                    .data
+                    .validate_packet_hash(set.recovery_set_id.as_bytes(), 5)
+                    .unwrap(),
+                "settled={settled}: a packet of another set fails under this set's ID"
+            );
+            assert!(
+                !slice.data.validate_packet_hash(&rsid_b, 6).unwrap(),
+                "settled={settled}: the right set under another exponent fails"
+            );
+            assert!(
+                slice.data.validate_packet_hash(&rsid_b, 5).unwrap(),
+                "settled={settled}: the set and exponent it was hashed under pass"
+            );
+        }
+    }
+
     #[test]
     fn no_main_packet_error() {
         let rsid = [0; 16];
