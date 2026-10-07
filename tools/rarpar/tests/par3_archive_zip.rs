@@ -197,6 +197,15 @@ fn an_inside_set_keeps_the_zip_readable_and_repairs_it() {
             .args(["vs", "inner.zip"]),
     );
     assert!(stdout.contains("protected data is complete"), "{stdout}");
+    // Named with its directory, relative or absolute, from elsewhere.
+    let absolute = archive.to_str().unwrap();
+    for named in ["out/inner.zip", absolute] {
+        let stdout = run_ok(Command::new(&par3).current_dir(root).args(["vs", named]));
+        assert!(
+            stdout.contains("protected data is complete"),
+            "{named}: {stdout}"
+        );
+    }
     // A local header, the central directory, and the copy of the end records
     // after the packets: all protected.
     damage(&archive, 10, 3000);

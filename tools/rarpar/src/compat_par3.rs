@@ -816,7 +816,8 @@ fn parse(args: &[String]) -> Result<Parsed, Failure> {
 #[derive(Debug)]
 struct Context {
     base: PathBuf,
-    /// The PAR file resolved against the directory rarpar was started in.
+    /// The PAR file resolved against the directory rarpar was started in, or
+    /// for a self target against the base path its directory became.
     par_path: PathBuf,
     execution: ExecutionOptions,
 }
@@ -854,7 +855,13 @@ fn prepare(invocation: &Invocation) -> Result<Context, Failure> {
     if options.noise >= 1 {
         print_option_summary(invocation);
     }
-    let par_path = current.join(native(&invocation.par_filename));
+    // A self target's directory was moved into the base path when it was
+    // parsed, so its bare name resolves there.
+    let par_path = if invocation.self_target {
+        base.join(native(&invocation.par_filename))
+    } else {
+        current.join(native(&invocation.par_filename))
+    };
     Ok(Context {
         base,
         par_path,

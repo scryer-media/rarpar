@@ -116,12 +116,15 @@ documented in each crate's own changelog so those notes ship with the crate.
   longer packs the previous archive, its PAR3 index or its recovery volumes
   into the new archive.
 - `par3 archive` counts each recovery row's own allocation against
-  `--par3-memory-mib`, so many recovery blocks of a small block size are refused
-  before they are allocated instead of overrunning the budget.
+  `--par3-memory-mib`, so many recovery blocks of a small block size are
+  refused before they are allocated instead of overrunning the budget.
 - `par3 archive` writes and syncs the sibling index and recovery volumes
   beside their names before it installs anything, so a failed write (a full
   disk, say) no longer leaves the archive replaced and the previous set
   truncated.
+- par3cmdline facade: `vs` and `rs` given a ZIP or 7z with a directory
+  (`par3 vs sub/archive.zip`, or an absolute path) find it in that
+  directory instead of reporting it missing.
 
 ### Library versions
 
