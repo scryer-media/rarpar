@@ -427,9 +427,7 @@ fn list_verify_repair_round_trip() {
 
     // -qq repairs in silence, final summary included.
     damage(&root.join("lantern.bin"), 10, 600);
-    par3.run(root, &["r", "-qq", "set.par3"])
-        .code(0)
-        .silent();
+    par3.run(root, &["r", "-qq", "set.par3"]).code(0).silent();
     assert_eq!(std::fs::read(root.join("lantern.bin")).unwrap(), original);
 }
 

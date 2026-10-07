@@ -2547,7 +2547,10 @@ mod tests {
             (&["v", "-Z", "s"], "Invalid option specified: -Z"),
             (&["v", "-", "s"], "Invalid option specified: -"),
             (&["v", "-d3", "s"], "Invalid option specified: -d3"),
-            (&["v", "-m256MiB", "s"], "Invalid option specified: -m256MiB"),
+            (
+                &["v", "-m256MiB", "s"],
+                "Invalid option specified: -m256MiB",
+            ),
             (&["v", "-m4x", "s"], "Invalid option specified: -m4x"),
             (&["v", "-q"], "PAR filename is not specified"),
             (&["v", "--"], "PAR filename is not specified"),
