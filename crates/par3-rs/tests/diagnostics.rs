@@ -1594,6 +1594,7 @@ struct DiskRepair {
     read_bytes: u64,
     write_bytes: u64,
     clones: u64,
+    in_place: u64,
     syncs: u64,
 }
 
@@ -1645,6 +1646,7 @@ fn repair_disk_files(
         read_bytes: after.read_bytes - before.read_bytes,
         write_bytes: after.write_bytes - before.write_bytes,
         clones: options.diagnostics.file_clones(),
+        in_place: options.diagnostics.file_in_place_repairs(),
         syncs: options.diagnostics.file_sync().calls,
     };
     drop(session);
@@ -1654,8 +1656,9 @@ fn repair_disk_files(
 }
 
 /// Whether this target clones a file repaired in place. macOS always can on
-/// APFS; a Linux filesystem without reflink falls back to the copy, which is
-/// what the tests then check instead.
+/// APFS; a Linux filesystem without reflink patches the file where it stands
+/// when no backup is kept, and otherwise falls back to the copy. The tests
+/// check whichever path the run took.
 fn expect_clone(run: &DiskRepair) -> bool {
     if cfg!(target_os = "macos") {
         assert_eq!(run.clones, 1, "an in-place repair on APFS must clone");
@@ -1687,12 +1690,19 @@ fn a_file_repaired_in_place_from_its_clone_writes_only_its_lost_block() {
             backup,
         );
         let len = bytes.len() as u64;
-        // The surviving blocks, read once for the syndromes; no read-back.
-        assert_eq!(run.read_bytes, len - block);
         assert_eq!(run.syncs, 1);
         if expect_clone(&run) {
+            // The surviving blocks, read once for the syndromes; no read-back.
+            assert_eq!(run.read_bytes, len - block, "backup {backup}");
+            assert_eq!(run.write_bytes, block, "backup {backup}");
+        } else if run.in_place == 1 {
+            // Patched where it stands: the lost block is written, then the
+            // whole file is read back, as its snapshot no longer vouches for it.
+            assert!(!backup, "a kept backup is never patched in place");
+            assert_eq!(run.read_bytes, (len - block) + len, "backup {backup}");
             assert_eq!(run.write_bytes, block, "backup {backup}");
         } else {
+            assert_eq!(run.read_bytes, len - block, "backup {backup}");
             assert_eq!(run.write_bytes, len, "backup {backup}");
         }
         if backup {
@@ -1737,6 +1747,10 @@ fn a_clone_cut_or_extended_to_its_length_writes_only_what_it_lacks() {
         if expect_clone(&run) {
             assert_eq!(run.read_bytes, read, "{case}");
             assert_eq!(run.write_bytes, written, "{case}");
+        } else if run.in_place == 1 {
+            // Patched where it stands and read back whole.
+            assert_eq!(run.read_bytes, read + len, "{case}");
+            assert_eq!(run.write_bytes, written, "{case}");
         } else {
             assert_eq!(run.read_bytes, copied, "{case}");
             assert_eq!(run.write_bytes, len, "{case}");
@@ -1762,7 +1776,7 @@ fn an_fft_repair_in_place_writes_only_the_lost_block() {
         inputs.path(),
         false,
     );
-    if expect_clone(&run) {
+    if expect_clone(&run) || run.in_place == 1 {
         assert_eq!(run.write_bytes, 64);
     } else {
         assert_eq!(run.write_bytes, damaged.len() as u64);
@@ -1978,19 +1992,32 @@ fn review_a_destination_rewritten_after_its_clone_ends_in_source_changed() {
     let report = session.repair(inputs.path(), false);
     let clones = options.diagnostics.file_clones();
     assert!(!access.armed.load(Ordering::SeqCst), "repair read nothing");
-    let Err(EngineError::RepairInterrupted {
-        installed,
-        temporary,
-        cause,
-    }) = report
-    else {
-        panic!("{report:?} (clones {clones})");
+    // A staged clone is reported as the interruption's temporary; a file
+    // patched where it stands leaves nothing behind, so the change is the
+    // whole report.
+    let temporary = match report {
+        Err(EngineError::RepairInterrupted {
+            installed,
+            temporary,
+            cause,
+        }) => {
+            assert!(
+                matches!(*cause, EngineError::SourceChanged(SourceId(1))),
+                "{cause:?}"
+            );
+            assert!(installed.is_empty());
+            temporary
+        }
+        Err(EngineError::SourceChanged(SourceId(1))) => {
+            assert_eq!(
+                options.diagnostics.file_in_place_repairs(),
+                1,
+                "clones {clones}"
+            );
+            Vec::new()
+        }
+        other => panic!("{other:?} (clones {clones})"),
     };
-    assert!(
-        matches!(*cause, EngineError::SourceChanged(SourceId(1))),
-        "{cause:?}"
-    );
-    assert!(installed.is_empty());
     let mut rewritten = on_disk.clone();
     rewritten[12 * block as usize + 5] = 0x5a;
     assert!(

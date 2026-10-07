@@ -74,10 +74,29 @@ struct StagedFile {
 
 /// An output repaired in place: the file it is, and the source it was read
 /// as, whose snapshots this repair's own writes move on.
-#[derive(Clone, Copy)]
+///
+/// Until the first write the snapshot still vouches for the file, so that
+/// write re-checks it first: a source rewritten while its syndromes were read
+/// ends in [`EngineError::SourceChanged`] with nothing patched, as a cloned
+/// source does. After it, only the read-back vouches for the file.
+#[derive(Clone)]
 struct InPlace {
     identity: crate::repair_tree::FileIdentity,
     source: crate::source::SourceId,
+    snapshot: crate::source::SourceSnapshot,
+    written: Arc<AtomicBool>,
+}
+
+/// Re-check the source of an output patched in place before the first
+/// byte is written to it; every later write finds the snapshot moved by the
+/// repair's own writes and checks nothing.
+fn before_in_place_write(access: &dyn SourceAccess, target: &StagedFile) -> EngineResult<()> {
+    if let Some(in_place) = &target.in_place
+        && !in_place.written.swap(true, Ordering::AcqRel)
+    {
+        crate::source::ensure_snapshot(access, in_place.source, in_place.snapshot)?;
+    }
+    Ok(())
 }
 
 impl StagedFile {
@@ -197,6 +216,7 @@ fn patched_in_place(outputs: &[StagedFile], source: crate::source::SourceId) -> 
     outputs.iter().any(|target| {
         target
             .in_place
+            .as_ref()
             .is_some_and(|in_place| in_place.source == source)
     })
 }
@@ -379,6 +399,11 @@ fn repair_inner(
                     (session.access.as_ref(), evidence.source, evidence.snapshot),
                 )?
             {
+                // The cut or extension just made moved the snapshot; what the
+                // first write re-checks is the file as prepared.
+                let Some(snapshot) = session.access.snapshot(evidence.source)? else {
+                    return Err(EngineError::SourceChanged(evidence.source));
+                };
                 tree.discard_stage(&stage_name, &temporary, temporary_outputs);
                 session.options.diagnostics.note_in_place();
                 staged.push(StagedFile {
@@ -390,6 +415,8 @@ fn repair_inner(
                     in_place: Some(InPlace {
                         identity,
                         source: evidence.source,
+                        snapshot,
+                        written: Arc::new(AtomicBool::new(false)),
                     }),
                 });
                 continue;
@@ -1569,7 +1596,7 @@ fn open_staged(
 ) -> EngineResult<File> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let (Some(tree), Some(in_place), Some(destination)) =
-        (tree, target.in_place, target.destination.as_ref())
+        (tree, target.in_place.as_ref(), target.destination.as_ref())
     {
         return tree.open_in_place(destination, in_place.identity, read, write, options);
     }
@@ -1665,7 +1692,7 @@ impl<'a> StageWriters<'a> {
             owed: OwedChecks::default(),
             patched: outputs
                 .iter()
-                .filter_map(|target| target.in_place.map(|in_place| in_place.source))
+                .filter_map(|target| target.in_place.as_ref().map(|in_place| in_place.source))
                 .collect(),
             capacity: (options.open_handles.min(options.handles.limit()) / 4).max(1),
             open,
@@ -1784,6 +1811,7 @@ impl<'a> StageWriters<'a> {
         offset: u64,
         bytes: &[u8],
     ) -> EngineResult<()> {
+        before_in_place_write(self.access, target)?;
         let mut slots = self
             .open
             .slots
@@ -2017,6 +2045,9 @@ fn finish_staged(
             continue;
         }
         // Inline tails need no source and no recovery equation.
+        if inline {
+            before_in_place_write(session.access.as_ref(), target)?;
+        }
         let mut file = open_staged(tree, target, false, true, &session.options)?;
         for index in 0..extents.len() {
             if let Some(bytes) = extents.inline_bytes(index) {

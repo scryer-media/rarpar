@@ -391,7 +391,9 @@
   evidence, a recovery or data payload) comes from it. The patched file is
   then read back whole and checked against its File packet before it is
   reported repaired, since its own writes move its snapshot; a mismatch fails
-  the repair. A patch cut short leaves the intact extents untouched, so the
+  the repair. The first write re-checks that snapshot, so a file rewritten
+  while its syndromes were read ends in `SourceChanged` with nothing patched,
+  as a cloned source does. A patch cut short leaves the intact extents untouched, so the
   file still verifies as damaged and repairs again. Where the filesystem has
   no clones, a file with a few lost blocks now costs those blocks' writes and
   one read-back instead of a full rewrite, which on a network mount is most of
