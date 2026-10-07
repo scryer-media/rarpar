@@ -32,6 +32,12 @@ documented in each crate's own changelog so those notes ship with the crate.
 - 7-Zip facade: after `--`, words starting with `@` are member names, not
   list files, and `-sdel` no longer deletes an archive when the member
   filters selected nothing from it.
+- 7-Zip facade archive discovery: `-ax` excludes archives, so an excluded
+  archive is never opened and never deleted by `-sdel`; `-ai`/`-ax` keep
+  their own `r` recursion, so `-air!*.7z` finds archives in every folder
+  below; and a folder named as the archive is walked without following
+  links, so a self-referential link ends the walk and a link out of the
+  folder finds nothing outside it.
 - par3cmdline facade: the block-map report is counted from ranges, so a set
   with a huge block count no longer walks every block; non-UTF-8 arguments
   reach the files they name byte for byte on Unix; `\` separates path
