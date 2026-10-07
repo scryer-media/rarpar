@@ -309,9 +309,9 @@ fn repair_inner(
         )?;
     }
     // Every payload is authenticated before its bytes are used, by the read
-    // that consumes it where that read takes the whole payload.
+    // that consumes it where that read takes the whole payload, and otherwise
+    // before the codec's walk, which can then keep the bytes it authenticated.
     let checks = PayloadChecks::new(session);
-    checks.before_walk(session.options.stripe_bytes, layout.block_size, None)?;
     let path_cost = assessment
         .files
         .iter()
@@ -597,9 +597,9 @@ pub(crate) fn stage_embedded_files(
         )?;
     }
     // Every payload is authenticated before its bytes are used, by the read
-    // that consumes it where that read takes the whole payload.
+    // that consumes it where that read takes the whole payload, and otherwise
+    // before the codec's walk, which can then keep the bytes it authenticated.
     let checks = PayloadChecks::new(session);
-    checks.before_walk(session.options.stripe_bytes, layout.block_size, None)?;
     let targets: Vec<StagedFile> = temporaries
         .iter()
         .enumerate()
@@ -661,12 +661,24 @@ pub(crate) fn stage_embedded_files(
 /// has matched, and a mismatch refuses the repair as it always has.
 /// [`Self::finish`] authenticates whatever the codec never read, so a repair
 /// still refuses a set carrying a payload that no longer matches its packet.
+/// Whole payloads kept by [`PayloadChecks::before_walk_holding`], with the
+/// budget they hold.
+#[derive(Default)]
+struct HeldPayloads {
+    bytes: HashMap<(bool, u64), Vec<u8>>,
+    reservations: Vec<crate::runtime::Reservation>,
+}
+
 struct PayloadChecks<'a> {
     session: &'a Par3RepairSession,
     /// Payloads already authenticated: `(is data, block or recovery index)`.
     done: Mutex<std::collections::BTreeSet<(bool, u64)>>,
     /// Whether an authentication refused the repair.
     refused: AtomicBool,
+    /// Whole payloads a walk narrower than the block read once, authenticated
+    /// as they were read, and serves its stripes from, with the budget they
+    /// hold.
+    held: Mutex<HeldPayloads>,
 }
 
 impl<'a> PayloadChecks<'a> {
@@ -675,6 +687,7 @@ impl<'a> PayloadChecks<'a> {
             session,
             done: Mutex::new(std::collections::BTreeSet::new()),
             refused: AtomicBool::new(false),
+            held: Mutex::new(HeldPayloads::default()),
         }
     }
 
@@ -721,6 +734,21 @@ impl<'a> PayloadChecks<'a> {
     ) -> EngineResult<()> {
         let session = self.session;
         let key = Self::key(payload);
+        if let Some(bytes) = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .bytes
+            .get(&key)
+        {
+            out.fill(0);
+            let from = bytes
+                .len()
+                .min(usize::try_from(offset).unwrap_or(usize::MAX));
+            let take = (bytes.len() - from).min(out.len());
+            out[..take].copy_from_slice(&bytes[from..from + take]);
+            return Ok(());
+        }
         if !self.checked(key) {
             if offset == 0 && out.len() as u64 >= payload.len() {
                 self.refusing(session.input.read_payload(payload, &session.options, out))?;
@@ -800,6 +828,76 @@ impl<'a> PayloadChecks<'a> {
             Some(payload) => self.read(payload, offset, out),
             None => self.session.read_block(block, offset, out, covered, owed),
         }
+    }
+
+    /// [`Self::before_walk`] for a walk that holds its stripes and would read
+    /// every payload once per stripe pass: each payload the budget has room
+    /// for, beyond a stripe of slack, is read whole once, authenticated over
+    /// that read, and held until [`Self::release`], so later passes read no
+    /// carrier. Any payload left over is authenticated in its own pass and
+    /// read per stripe, as before.
+    fn before_walk_holding(
+        &self,
+        stripe: usize,
+        block_size: u64,
+        scratch: &mut [u8],
+    ) -> EngineResult<()> {
+        if stripe as u64 >= block_size {
+            return Ok(());
+        }
+        let session = self.session;
+        let assessment = session.assessment.as_ref().expect("assessment");
+        for payload in assessment
+            .recovery
+            .iter()
+            .chain(session.data_payloads().values())
+        {
+            let key = Self::key(payload);
+            if self.checked(key) {
+                continue;
+            }
+            let memory = &session.options.memory;
+            let reservation = usize::try_from(payload.len())
+                .ok()
+                .filter(|&len| {
+                    memory
+                        .available()
+                        .saturating_sub(crate::runtime::SOURCE_GROUP_SLACK)
+                        >= len
+                })
+                .and_then(|len| {
+                    Some((
+                        len,
+                        memory.reserve_as(MemoryCategory::CodecScratch, len).ok()?,
+                    ))
+                });
+            let Some((len, reservation)) = reservation else {
+                self.authenticate(payload, Some(scratch))?;
+                continue;
+            };
+            let mut bytes = vec![0; len];
+            self.refusing(
+                session
+                    .input
+                    .read_payload(payload, &session.options, &mut bytes),
+            )?;
+            self.note(key);
+            let mut held = self
+                .held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            held.bytes.insert(key, bytes);
+            held.reservations.push(reservation);
+        }
+        Ok(())
+    }
+
+    /// Drop the payloads [`Self::before_walk_holding`] kept, and their budget.
+    fn release(&self) {
+        *self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = HeldPayloads::default();
     }
 
     /// Authenticate every payload the repair selected and never read.
@@ -1165,7 +1263,7 @@ where
     let mut recovered = vec![vec![0u8; stripe]; tile];
     let mut inputs = vec![vec![0u8; stripe]; group * sets];
     let mut covered = vec![0u8; stripe];
-    checks.before_walk(stripe, layout.block_size, Some(&mut covered))?;
+    checks.before_walk_holding(stripe, layout.block_size, &mut covered)?;
     let parallel = pool.as_ref().map(crate::runtime::WorkerPool::pool);
     let mut offset = 0;
     while offset < layout.block_size {
@@ -1421,6 +1519,7 @@ where
         writers.settle()?;
         offset += take as u64;
     }
+    checks.release();
     Ok(())
 }
 

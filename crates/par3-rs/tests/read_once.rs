@@ -10,7 +10,6 @@ use par3_rs::{InputSetId, ScanLimits};
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// A local-mount provider that counts the bytes it hands out per source.
@@ -18,6 +17,9 @@ use std::sync::{Arc, Mutex};
 struct Counting {
     inner: MemorySourceAccess,
     reads: Arc<Mutex<BTreeMap<u64, u64>>>,
+    /// Bytes `(source, offset)` that read back flipped, without the snapshot
+    /// admitting to it.
+    rot: Mutex<Vec<(u64, u64)>>,
 }
 
 impl Counting {
@@ -56,6 +58,11 @@ impl SourceAccess for Counting {
     fn read_at(&self, source: SourceId, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
         let read = self.inner.read_at(source, offset, out)?;
         Counting::count(&self.reads, source, read);
+        for &(id, at) in self.rot.lock().unwrap().iter() {
+            if id == source.0 && (offset..offset + read as u64).contains(&at) {
+                out[(at - offset) as usize] ^= 1;
+            }
+        }
         Ok(read)
     }
     fn next_available(&self, source: SourceId, offset: u64) -> std::io::Result<Option<Range<u64>>> {
@@ -193,61 +200,186 @@ fn a_create_whose_sources_fit_reads_each_source_once() {
     }
 }
 
-#[test]
-fn measure_repair() {
-    let created = create(CreationCodec::Cauchy, 6, None);
+/// Reads during one repair of [`inputs`] with blocks 3 and 8 of the first
+/// damaged, under a `memory` budget.
+struct Repaired {
+    /// Reads of the damaged file during the assessment.
+    assess: u64,
+    /// Reads of every carrier during the repair.
+    carriers: u64,
+    /// The repaired first file.
+    output: Vec<u8>,
+}
+
+const LOST: [usize; 2] = [3, 8];
+
+fn repair(created: &Created, memory: usize) -> Option<Repaired> {
     let inputs = inputs();
     let mut access = Counting::default();
     let mut damaged = inputs[0].1.clone();
-    for block in [3usize, 8] {
+    for block in LOST {
         damaged[block * BLOCK as usize + 5] ^= 0x40;
     }
     access.insert(1, damaged);
     access.insert(2, inputs[1].1.clone());
-    for (index, carrier) in created.carriers.iter().enumerate() {
-        access.insert(100 + index as u64, carrier.clone());
+    let carriers = 100..100 + created.carriers.len() as u64;
+    for (id, carrier) in carriers.clone().zip(&created.carriers) {
+        access.insert(id, carrier.clone());
     }
     let access = Arc::new(access);
-    let options = options(256 << 20);
-    let mut session = Par3RepairSession::new(created.id, access.clone(), options.clone()).unwrap();
-    for index in 0..created.carriers.len() {
+    let options = options(memory);
+    let mut session = Par3RepairSession::new(created.id, access.clone(), options.clone()).ok()?;
+    for id in carriers.clone() {
         let mut scanner = PacketScanner::new(
             access.clone(),
-            SourceId(100 + index as u64),
+            SourceId(id),
+            options.clone(),
+            ScanLimits::default(),
+        )
+        .ok()?;
+        while let ScanEvent::Packet(packet) = scanner.poll().ok()? {
+            session.merge(packet).ok()?;
+        }
+    }
+    session.bind_file(inputs[0].0, SourceId(1)).ok()?;
+    session.bind_file(inputs[1].0, SourceId(2)).ok()?;
+    access.reset();
+    if session.assess().ok()?.status != RepairStatus::Ready {
+        return None;
+    }
+    let assess = access.read(1);
+    access.reset();
+    let output = common::TempTree::new("read-once-repair");
+    let report = session.repair(output.path(), false).ok()?;
+    assert_eq!(report.reconstructed_blocks, LOST.len() as u64);
+    let repaired = Repaired {
+        assess,
+        carriers: carriers.map(|id| access.read(id)).sum(),
+        output: std::fs::read(output.path().join(inputs[0].0)).unwrap(),
+    };
+    drop(session);
+    assert_eq!(options.memory.used(), 0, "{memory}: the repair leaked");
+    Some(repaired)
+}
+
+/// Budgets from a roomy 4 MiB down, a quarter block at a time, with what
+/// each read, until one meets `until` or refuses the repair.
+fn sweep(created: &Created, until: impl Fn(&Repaired) -> bool) -> Vec<(usize, Repaired)> {
+    let mut rows = Vec::new();
+    let mut memory = 4usize << 20;
+    while let Some(run) = repair(created, memory) {
+        let done = until(&run);
+        rows.push((memory, run));
+        if done {
+            break;
+        }
+        let Some(next) = memory.checked_sub(BLOCK as usize / 4) else {
+            break;
+        };
+        memory = next;
+    }
+    rows
+}
+
+#[test]
+fn a_narrow_stripe_reads_each_held_recovery_row_once() {
+    let created = create(CreationCodec::Cauchy, 6, None);
+    let original = inputs().swap_remove(0).1;
+    let once = LOST.len() as u64 * BLOCK;
+    let packet = BLOCK + 64;
+    let rows = sweep(&created, |run| {
+        run.carriers == once + LOST.len() as u64 * packet
+    });
+    // The default stripe is a quarter of the block. A roomy repair reads each
+    // row it uses whole once, authenticated by that read, and walks its
+    // stripes from memory; it used to authenticate the row in a pass of its
+    // own and then read it again a stripe at a time.
+    assert_eq!(rows[0].1.carriers, once);
+    // A budget with no room to hold a row authenticates it and reads it per
+    // stripe, as before: its packet from the length field on, then its stripes.
+    let mut held_none = false;
+    for (memory, run) in &rows {
+        assert!(
+            run.output == original,
+            "{memory}: the repair changed its bytes"
+        );
+        // Whole, then by block for its intact extents.
+        assert_eq!(run.assess, 2 * original.len() as u64, "{memory}");
+        let extra = run.carriers - once;
+        assert_eq!(
+            extra % packet,
+            0,
+            "{memory}: read {} of the rows",
+            run.carriers
+        );
+        assert!(extra / packet <= LOST.len() as u64);
+        held_none |= extra / packet == LOST.len() as u64;
+    }
+    assert!(held_none, "no budget was too tight to hold a row");
+}
+
+#[test]
+fn a_held_recovery_row_that_rots_under_the_reader_refuses_the_repair() {
+    let created = create(CreationCodec::Cauchy, 6, None);
+    let inputs = inputs();
+    let mut access = Counting::default();
+    let mut damaged = inputs[0].1.clone();
+    for block in LOST {
+        damaged[block * BLOCK as usize + 5] ^= 0x40;
+    }
+    access.insert(1, damaged);
+    access.insert(2, inputs[1].1.clone());
+    for (id, carrier) in (100..).zip(&created.carriers) {
+        access.insert(id, carrier.clone());
+    }
+    let access = Arc::new(access);
+    let options = options(4 << 20);
+    let mut session = Par3RepairSession::new(created.id, access.clone(), options.clone()).unwrap();
+    let (mut rows, mut packet_length) = (Vec::new(), 0);
+    for id in (100..).take(created.carriers.len()) {
+        let mut scanner = PacketScanner::new(
+            access.clone(),
+            SourceId(id),
             options.clone(),
             ScanLimits::default(),
         )
         .unwrap();
         while let ScanEvent::Packet(packet) = scanner.poll().unwrap() {
+            if let Some(payload) = packet.payload().filter(|payload| {
+                matches!(
+                    payload.kind(),
+                    par3_rs::ingest::PayloadKind::Recovery { .. }
+                )
+            }) {
+                let origin = packet.origin();
+                packet_length = payload.packet_length();
+                rows.push((origin.source.0, origin.offset + packet_length - 1));
+            }
             session.merge(packet).unwrap();
         }
     }
-    let scan: u64 = (0..created.carriers.len() as u64)
-        .map(|index| access.read(100 + index))
-        .sum();
-    access.reset();
-    session.bind_file("alpha.bin", SourceId(1)).unwrap();
-    session.bind_file("beta.dat", SourceId(2)).unwrap();
+    session.bind_file(inputs[0].0, SourceId(1)).unwrap();
+    session.bind_file(inputs[1].0, SourceId(2)).unwrap();
     assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
-    let assess = (access.read(1), access.read(2));
-    let assess_carriers: u64 = (0..created.carriers.len() as u64)
-        .map(|index| access.read(100 + index))
-        .sum();
-    access.reset();
-    let output = common::TempTree::new("read-once-repair");
-    session.repair(output.path(), false).unwrap();
-    let repair = (access.read(1), access.read(2));
-    let repair_carriers: u64 = (0..created.carriers.len() as u64)
-        .map(|index| access.read(100 + index))
-        .sum();
+    // Every row changes after it authenticated, so the one the narrow walk
+    // holds first is the one that refuses.
+    *access.rot.lock().unwrap() = rows;
+    let output = common::TempTree::new("read-once-rot");
+    let refused = session.repair(output.path(), false).unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            par3_rs::runtime::EngineError::Format(par3_rs::Par3Error::PacketHashMismatch { .. })
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(session.rejected_packets(), 1);
+    assert_eq!(session.failed_hash_bytes(), packet_length);
     assert_eq!(
-        std::fs::read(output.path().join("alpha.bin")).unwrap(),
-        inputs[0].1
+        std::fs::read_dir(output.path()).unwrap().count(),
+        0,
+        "a refused repair left staged output behind"
     );
-    eprintln!(
-        "file len {} scan carriers {scan} (total {}) assess {assess:?} carriers {assess_carriers} repair {repair:?} carriers {repair_carriers}",
-        inputs[0].1.len(),
-        created.carriers.iter().map(Vec::len).sum::<usize>()
-    );
-    let _ = AtomicU64::new(0).load(Ordering::Relaxed);
+    drop(session);
+    assert_eq!(options.memory.used(), 0);
 }

@@ -123,6 +123,17 @@
   recovery rows need the room. The snapshot checks around execution are
   unchanged, and the carriers are byte-identical to a two-pass create. Over
   that ceiling the encode reads every source again, as before.
+- A Cauchy repair whose stripe is narrower than the block (the default
+  64 KiB stripe under larger blocks) no longer reads every selected recovery
+  and data packet twice, once to authenticate it and again a stripe at a time.
+  Each payload the budget has room for, beyond a stripe of slack after the
+  codec's own reservations, is read whole once, authenticated over that read
+  and held, charged to `MemoryCategory::CodecScratch`, until the walk ends;
+  its stripes come from memory. Payloads are now authenticated just before
+  the walk rather than before the outputs are staged; a mismatch still
+  refuses with `PacketHashMismatch`, charges `failed_hash_bytes` and
+  `rejected_packets` as before, and removes the staged outputs. Payloads the
+  budget cannot hold, and every FFT repair, read as before.
 
 ## 0.5.0
 
