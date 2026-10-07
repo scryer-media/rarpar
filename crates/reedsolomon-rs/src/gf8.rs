@@ -2031,7 +2031,11 @@ mod tests {
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     #[test]
     fn kernel_name_follows_the_sve2_dispatch_gate() {
-        let expected = if crate::sve2::enabled() { "sve2" } else { "neon" };
+        let expected = if crate::sve2::enabled() {
+            "sve2"
+        } else {
+            "neon"
+        };
         assert_eq!(kernel_name(), expected);
     }
 
