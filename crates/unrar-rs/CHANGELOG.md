@@ -51,6 +51,14 @@
 - `reedsolomon-rs` requirement raised to 0.4.9 for `decode_matrix`,
   `apply_decode_matrix_gf8` and `Rar5RsCoder::apply_units`.
 
+### Fixed
+
+- A RAR3 PPMd member whose corrupt model drives a frequency total past the
+  range coder's range no longer panics (an assertion in debug builds, a
+  division by zero in release builds). The coder records the fault, and the
+  member fails with `CorruptArchive` or a CRC mismatch instead. Found by the
+  `rar_extract` fuzz target; the input is kept as a regression test.
+
 ## 0.10.8
 
 ### Fixed

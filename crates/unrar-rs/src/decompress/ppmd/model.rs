@@ -774,6 +774,12 @@ impl Model {
     #[inline(always)]
     pub fn decode_char_result<R: RangeCode>(&mut self, rc: &mut R) -> RarResult<Option<u8>> {
         let ch = self.decode_char(rc);
+        if rc.faulted() {
+            // A frequency total outran the coder's range: the stream is
+            // corrupt whatever symbol the arithmetic then produced.
+            self.model_fault = false;
+            return Self::corrupt_model();
+        }
         if ch < 0 {
             if std::mem::take(&mut self.model_fault) {
                 return Self::corrupt_model();
