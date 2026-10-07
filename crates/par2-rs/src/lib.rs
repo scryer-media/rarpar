@@ -211,7 +211,7 @@ pub use placement::{PlacementEntry, PlacementPlan, apply_placement_plan, scan_pl
 pub use reedsolomon_rs::{gf, gf_pmul, gf_simd, matrix_tiled};
 pub use rename::{
     MatchType, RenameSuggestion, SplitFileGroup, detect_split_files, identify_par2_files,
-    scan_for_renames,
+    identify_par2_files_for_set, scan_for_renames,
 };
 pub use repair::{
     NativeRepairSolver, RepairOptions, RepairPlan, RepairProblem, RepairSolver, SolverError,
