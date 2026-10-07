@@ -128,6 +128,11 @@ documented in each crate's own changelog so those notes ship with the crate.
 - par3cmdline facade: `-S<n>` also stops a candidate scan already under way
   when the time is up, instead of letting one large extra file be searched
   to its end first.
+- `par3 inside verify` and `repair` scope a missing volume's coverage to its
+  own directory: a set elsewhere that records a volume of the same name no
+  longer hides it, so the run reports it and fails.
+- `par3 inside` lists each volume family's directory once and opens each
+  volume once, however many volumes of the family are named.
 
 ### Library versions
 

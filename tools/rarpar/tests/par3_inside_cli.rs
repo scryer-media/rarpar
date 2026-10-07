@@ -487,3 +487,140 @@ fn inside_verify_without_an_embedded_set_fails() {
     assert!(stderr.contains("no PAR3 packets found"), "{stderr}");
     assert!(output.stdout.is_empty());
 }
+
+/// Generated RAR5 volumes, so these tests need no fixture.
+#[cfg(feature = "sevenz")]
+mod generated {
+    use std::path::Path;
+
+    use crc_fast::{CrcAlgorithm, Digest};
+
+    use super::run;
+
+    fn push_vint(out: &mut Vec<u8>, mut value: u64) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                out.push(byte);
+                return;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    /// One RAR5 header block: CRC32, size, `fields` as vints, then `data`.
+    fn block(fields: &[u64], data: &[u8]) -> Vec<u8> {
+        let mut inner = Vec::new();
+        for &field in fields {
+            push_vint(&mut inner, field);
+        }
+        let mut sized = Vec::new();
+        push_vint(&mut sized, inner.len() as u64);
+        sized.extend_from_slice(&inner);
+        let mut digest = Digest::new(CrcAlgorithm::Crc32IsoHdlc);
+        digest.update(&sized);
+        let mut out = (digest.finalize() as u32).to_le_bytes().to_vec();
+        out.extend_from_slice(&sized);
+        out.extend_from_slice(data);
+        out
+    }
+
+    /// Volume `index` of `count`: main header, one opaque data block, end header.
+    fn volume(index: u64, count: u64, seed: u8) -> Vec<u8> {
+        let mut out = b"Rar!\x1a\x07\x01\x00".to_vec();
+        let main = if index == 0 {
+            vec![1, 0, 0x1]
+        } else {
+            vec![1, 0, 0x3, index]
+        };
+        out.extend(block(&main, &[]));
+        let data: Vec<u8> = (0..20_000u32)
+            .map(|value| (value as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect();
+        out.extend(block(&[2, 0x2, data.len() as u64], &data));
+        out.extend(block(&[5, 0, u64::from(index + 1 < count)], &[]));
+        out
+    }
+
+    /// Write `set.part1.rar` .. `set.part3.rar` into `directory`.
+    fn family(directory: &Path, seed: u8) {
+        std::fs::create_dir_all(directory).unwrap();
+        for index in 0..3 {
+            let name = format!("set.part{}.rar", index + 1);
+            std::fs::write(directory.join(name), volume(index, 3, seed + index as u8)).unwrap();
+        }
+    }
+
+    fn insert(root: &Path, source: &str, output: &str, placement: &str) {
+        let first = format!("{source}/set.part1.rar");
+        run(
+            root,
+            &[
+                "par3",
+                "inside",
+                "insert",
+                &first,
+                "-d",
+                output,
+                "-s",
+                "4096",
+                "-r",
+                "10",
+                "--placement",
+                placement,
+            ],
+            0,
+        );
+    }
+
+    /// A volume missing from one directory is not covered by a set in another
+    /// directory that records a volume of the same name.
+    #[test]
+    fn a_same_named_volume_elsewhere_does_not_cover_a_missing_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        family(&root.join("first-source"), 1);
+        family(&root.join("second-source"), 101);
+        insert(root, "first-source", "first", "spread");
+        insert(root, "second-source", "second", "independent");
+        std::fs::remove_file(root.join("second/set.part2.rar")).unwrap();
+        let verified = run(
+            root,
+            &[
+                "par3",
+                "inside",
+                "verify",
+                "first/set.part1.rar",
+                "second/set.part1.rar",
+            ],
+            1,
+        );
+        assert_eq!(
+            verified["unprotected_missing_volumes"],
+            serde_json::json!(["set.part2.rar"])
+        );
+    }
+
+    /// Naming several volumes of one family lists and opens it once.
+    #[test]
+    fn several_volumes_of_one_family_open_each_set_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        family(&root.join("source"), 7);
+        insert(root, "source", "protected", "independent");
+        let verified = run(
+            root,
+            &[
+                "par3",
+                "inside",
+                "verify",
+                "protected/set.part1.rar",
+                "protected/set.part2.rar",
+                "protected/set.part3.rar",
+            ],
+            0,
+        );
+        assert_eq!(verified["sets"].as_array().unwrap().len(), 3, "{verified}");
+    }
+}

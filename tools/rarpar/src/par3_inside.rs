@@ -1,5 +1,6 @@
 //! `rarpar par3 inside`: PAR3 recovery embedded in RAR5 archives.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use par3_rs::creation::{CreationDurability, CreationOptions};
@@ -387,22 +388,26 @@ fn open(cli: &Cli, args: &Par3InsideArgs) -> Result<Vec<Rar5Set>, RarparError> {
         }
     }
     // Every present volume of a given `.partN.rar` set, so sets embedded per
-    // volume are all opened.
+    // volume are all opened. Each family's directory is listed once however
+    // many of its volumes are named.
     let mut paths = args.archives.clone();
+    let mut listed: HashSet<PathBuf> = paths.iter().cloned().collect();
+    let mut families: HashSet<(PathBuf, String)> = HashSet::new();
     for path in &args.archives {
         let Some((stem, _)) = part_number(path) else {
             continue;
         };
-        let directory = path
-            .parent()
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let mut siblings: Vec<PathBuf> = std::fs::read_dir(directory)?
+        let directory = directory_of(path);
+        if !families.insert((directory.clone(), stem.clone())) {
+            continue;
+        }
+        let mut siblings: Vec<PathBuf> = std::fs::read_dir(&directory)?
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
             .filter(|candidate| part_number(candidate).is_some_and(|(found, _)| found == stem))
-            .filter(|candidate| !paths.contains(candidate))
+            .filter(|candidate| !listed.contains(candidate))
             .collect();
         siblings.sort();
+        listed.extend(siblings.iter().cloned());
         paths.extend(siblings);
     }
     Ok(rar5::open(&paths, &execution)?)
@@ -418,17 +423,34 @@ fn open(cli: &Cli, args: &Par3InsideArgs) -> Result<Vec<Rar5Set>, RarparError> {
 /// number at or under that bound is then always absent, so a family whose
 /// suffixes run past it still reports a missing volume and is never healthy.
 fn uncovered_volumes(cli: &Cli, args: &Par3InsideArgs, sets: &[Rar5Set]) -> Vec<String> {
-    let covered: Vec<String> = sets.iter().flat_map(Rar5Set::current_names).collect();
+    // A set covers its recorded names in the directories its found hosts are
+    // in: a same-named volume elsewhere is another family's.
+    let mut covered: HashSet<(PathBuf, String)> = HashSet::new();
+    for set in sets {
+        let names = set.current_names();
+        let directories: HashSet<PathBuf> = set
+            .hosts
+            .iter()
+            .filter_map(|host| host.path.as_deref())
+            .map(directory_of)
+            .collect();
+        for directory in directories {
+            covered.extend(names.iter().map(|name| (directory.clone(), name.clone())));
+        }
+    }
+    let recorded: usize = sets.iter().map(|set| set.hosts.len()).sum();
     let mut missing = Vec::new();
+    let mut reported: HashSet<String> = HashSet::new();
+    let mut families: HashSet<(PathBuf, String)> = HashSet::new();
     for path in &args.archives {
         let Some((stem, _)) = part_number(path) else {
             continue;
         };
-        let directory = path
-            .parent()
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let Ok(entries) = std::fs::read_dir(directory) else {
+        let directory = directory_of(path);
+        if !families.insert((directory.clone(), stem.clone())) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&directory) else {
             continue;
         };
         let mut present: Vec<(u64, PathBuf, usize)> = entries
@@ -458,14 +480,17 @@ fn uncovered_volumes(cli: &Cli, args: &Par3InsideArgs, sets: &[Rar5Set]) -> Vec<
             rar5::inspect(&disk, par3_rs::source::SourceId(0), &options).ok()
         })
         .is_some_and(|archive| archive.more_volumes);
-        let bound = (present.len() + covered.len() + 1) as u64;
+        let bound = (present.len() + recorded + 1) as u64;
         let end = highest.saturating_add(u64::from(more)).min(bound);
+        let numbers: HashSet<u64> = present.iter().map(|(found, _, _)| *found).collect();
         for number in 1..=end {
-            if present.iter().any(|(found, _, _)| *found == number) {
+            if numbers.contains(&number) {
                 continue;
             }
             let name = format!("{stem}.part{number:0width$}.rar");
-            if !covered.contains(&name) && !missing.contains(&name) {
+            if !covered.contains(&(directory.clone(), name.clone()))
+                && reported.insert(name.clone())
+            {
                 missing.push(name);
             }
         }
