@@ -1327,6 +1327,78 @@ mod tests {
         }
     }
 
+    /// The scanner's authentication of a payload lives beside
+    /// `RecoverySliceData::FileBacked`, not in it, so the variant keeps the
+    /// field set it was published with: the literal and the exhaustive pattern
+    /// below are written against exactly those four fields. A clone of a
+    /// scanned payload keeps its authentication; a payload built by hand over
+    /// the scanner's interned path, but naming a span the scan did not hash,
+    /// gets none.
+    #[test]
+    fn scan_authentication_stays_out_of_the_public_variant() {
+        let rsid = [0x8C; 16];
+        let mut stream = make_main_packet_bytes(8, rsid);
+        stream.extend_from_slice(&make_recovery_packet(3, &[0x5A; 8], rsid));
+        let file = NamedTempFile::new().unwrap();
+        file.as_file().write_all(&stream).unwrap();
+        file.as_file()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            )
+            .unwrap();
+
+        let packets = scan_packets_from_path(file.path()).unwrap();
+        let Packet::RecoverySlice(slice) = &packets[1].0 else {
+            panic!("expected a recovery packet, got {:?}", packets[1].0);
+        };
+        let RecoverySliceData::FileBacked {
+            path,
+            offset,
+            len,
+            packet_hash: Some(packet_hash),
+        } = &slice.data
+        else {
+            panic!("expected a hashed file-backed payload");
+        };
+        assert!(
+            recovery::scan_authentication(path, *offset, *len, packet_hash).is_some(),
+            "a settled scan vouches for the payload it hashed"
+        );
+
+        let cloned = slice.data.clone();
+        let RecoverySliceData::FileBacked {
+            path: cloned_path, ..
+        } = &cloned
+        else {
+            unreachable!();
+        };
+        assert!(recovery::scan_authentication(cloned_path, *offset, *len, packet_hash).is_some());
+
+        let hand_built = RecoverySliceData::FileBacked {
+            path: Arc::clone(path),
+            offset: *offset + 1,
+            len: *len - 1,
+            packet_hash: Some(*packet_hash),
+        };
+        let RecoverySliceData::FileBacked {
+            path: hand_path,
+            offset: hand_offset,
+            len: hand_len,
+            packet_hash: _,
+        } = &hand_built
+        else {
+            unreachable!();
+        };
+        assert!(
+            recovery::scan_authentication(hand_path, *hand_offset, *hand_len, packet_hash)
+                .is_none(),
+            "a span the scan never hashed is not vouched for"
+        );
+        assert!(!hand_built.validate_packet_hash(&rsid, 3).unwrap());
+        assert!(slice.data.validate_packet_hash(&rsid, 3).unwrap());
+    }
+
     /// An authenticated file-backed span must still detect later mutations.
     #[test]
     fn file_backed_recovery_payloads_still_validate_their_packet_hash() {
