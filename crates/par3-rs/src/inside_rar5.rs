@@ -719,7 +719,6 @@ pub fn insert_set(
                 file.sync_all()?;
             }
             drop(file);
-            std::fs::hard_link(&staged[index], &outputs[index])?;
             reports.push(Rar5Inserted {
                 path: outputs[index].clone(),
                 region_bytes: gaps[index].0 + gaps[index].1,
@@ -727,12 +726,50 @@ pub fn insert_set(
                 set: plan.input_set_id(),
             });
         }
+        // Every host is finished and verified before any is linked into
+        // place, and a failed link removes the outputs linked before it, so
+        // a failed insertion leaves no final output behind.
+        link_all(&staged, outputs)?;
         Ok(reports)
     })();
     for path in staged {
         let _ = std::fs::remove_file(path);
     }
     result
+}
+
+/// Link each finished `staged[k]` to the absent `outputs[k]`. On a failure,
+/// remove the outputs this call already linked, so none is left behind.
+fn link_all(staged: &[PathBuf], outputs: &[PathBuf]) -> EngineResult<()> {
+    for (position, (temporary, output)) in staged.iter().zip(outputs).enumerate() {
+        let linked =
+            injected_install_failure(position).and_then(|()| std::fs::hard_link(temporary, output));
+        if let Err(error) = linked {
+            for earlier in &outputs[..position] {
+                let _ = std::fs::remove_file(earlier);
+            }
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Fails the install of the output at this position in its call, so
+    /// tests can reach the rollback of earlier installs.
+    static FAIL_INSTALL_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// A test-injected failure for the install at `position`; never fails
+/// outside tests.
+fn injected_install_failure(position: usize) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_INSTALL_AT.with(std::cell::Cell::get) == Some(position) {
+        return Err(io::Error::other("injected install failure"));
+    }
+    let _ = position;
+    Ok(())
 }
 
 fn copy(
@@ -2315,6 +2352,56 @@ mod tests {
         assert_eq!(alpha.hosts[1].path, None);
         assert_eq!(alpha.needs_repair(), vec![1]);
         drop(sets);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A shared set whose second host fails to install leaves no final
+    /// output behind, so the same insertion can be retried.
+    #[test]
+    fn a_failed_later_host_leaves_no_inserted_output_behind() {
+        let dir = scratch_dir("insert-rollback");
+        let originals = dir.join("original");
+        let scratch = dir.join("scratch");
+        std::fs::create_dir_all(&originals).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        let names = ["dunlin.part1.rar", "dunlin.part2.rar"];
+        let paths: Vec<PathBuf> = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let path = originals.join(name);
+                let volume = Some((index as u64, index == 0));
+                std::fs::write(&path, synthetic_rar5(volume, 90 + index as u8)).unwrap();
+                path
+            })
+            .collect();
+        let options = ExecutionOptions::default();
+        let hosts = prepare_hosts(&paths, Rar5Layout::Trailing, &options).unwrap();
+        let outputs: Vec<PathBuf> = names.iter().map(|name| dir.join(name)).collect();
+        let insert = || {
+            insert_set(
+                &hosts,
+                &outputs,
+                &[2, 2],
+                Rar5Layout::Trailing,
+                CreationOptions {
+                    block_size: 256,
+                    recovery_count: 4,
+                    ..CreationOptions::default()
+                },
+                &scratch,
+                CreationDurability::Buffered,
+            )
+        };
+        FAIL_INSTALL_AT.with(|at| at.set(Some(1)));
+        let failed = insert();
+        FAIL_INSTALL_AT.with(|at| at.set(None));
+        assert!(failed.is_err());
+        for output in &outputs {
+            assert!(!output.exists(), "{} is left behind", output.display());
+        }
+        let inserted = insert().unwrap();
+        assert_eq!(inserted.len(), 2);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
