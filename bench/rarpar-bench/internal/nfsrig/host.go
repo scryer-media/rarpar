@@ -97,8 +97,10 @@ func (o *HostOptions) Validate() error {
 	if !known {
 		return fmt.Errorf("unknown client service %q (want %s)", o.Service, strings.Join(Clients, " or "))
 	}
-	if o.Label == "" || strings.ContainsAny(o.Label, "/\\ ") {
-		return fmt.Errorf("--label must be a plain directory name")
+	// The label is one path component on the host results directory and on
+	// the container's /results mount, so it must name a directory inside both.
+	if o.Label == "" || o.Label == "." || o.Label == ".." || strings.ContainsAny(o.Label, "/\\ ") || !filepath.IsLocal(o.Label) {
+		return fmt.Errorf("--label %q must be a plain directory name (not . or .., no separators or spaces)", o.Label)
 	}
 	for _, path := range []*string{&o.Compose, &o.Source, &o.Results} {
 		if *path == "" {

@@ -99,19 +99,33 @@ func IOCountSupported() (bool, string) {
 }
 
 // CountIO runs the command once under `strace -f -c` and parses the summary.
-func CountIO(ctx context.Context, command Command, scratch string) (IOCounts, error) {
+// accept says whether the traced command's exit status means it completed
+// the operation; strace exits with that status, and the counts of a run that
+// did not complete are not the operation's.
+func CountIO(ctx context.Context, command Command, scratch string, accept func(exitCode int) bool) (IOCounts, error) {
 	summary := filepath.Join(scratch, "strace-summary.txt")
 	_ = os.Remove(summary)
 	wrapped := command
 	wrapped.Path = "strace"
 	wrapped.Args = append([]string{"-f", "-c", "-o", summary, "--", command.Path}, command.Args...)
-	result := Run(ctx, wrapped)
-	if result.Failure != "" {
-		return IOCounts{}, fmt.Errorf("strace pass %s: %v", result.Failure, result.Err)
+	if err := tracedRunProblem(Run(ctx, wrapped), accept); err != nil {
+		return IOCounts{}, err
 	}
 	data, err := os.ReadFile(summary)
 	if err != nil {
 		return IOCounts{}, err
 	}
 	return ParseStraceSummary(string(data))
+}
+
+// tracedRunProblem rejects a strace pass that did not run, or whose traced
+// command exited with a status accept refuses.
+func tracedRunProblem(result Result, accept func(exitCode int) bool) error {
+	if result.Failure != "" {
+		return fmt.Errorf("strace pass %s: %v", result.Failure, result.Err)
+	}
+	if !accept(result.ExitCode) {
+		return fmt.Errorf("strace pass: the traced command exited %d: %s", result.ExitCode, lastLine(result))
+	}
+	return nil
 }

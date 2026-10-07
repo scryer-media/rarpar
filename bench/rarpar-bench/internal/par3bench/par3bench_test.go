@@ -577,3 +577,118 @@ func TestPortPatchAppliesOffX86Linux(t *testing.T) {
 		}
 	}
 }
+
+// A create row of any tool that exits 0 without the set it was asked for
+// fails: verify and repair read the canonical carriers, so nothing else
+// would notice a candidate create that wrote nothing.
+func TestCreateOutputProblemRejectsMissingCarriers(t *testing.T) {
+	config := Config{Recovery: 3}
+	dir := t.TempDir()
+	if _, failure, _ := createOutputProblem(dir, config); failure != "no-carriers" {
+		t.Errorf("an empty create directory: %q, want no-carriers", failure)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "set.par3"), []byte("not a packet stream at all, long enough for one header....."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, failure, _ := createOutputProblem(dir, config); failure != "unreadable-carriers" {
+		t.Errorf("garbage carriers: %q, want unreadable-carriers", failure)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "set.par3"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, failure, detail := createOutputProblem(dir, config); failure != "truncated-carriers" {
+		t.Errorf("an index with no recovery blocks: %q (%s), want truncated-carriers", failure, detail)
+	}
+}
+
+// par3cmdline's verify exits 0 whatever it finds; rarpar's exits 1 when the
+// set is not intact. A damaged-verify row accepts only its own tool's code.
+func TestDamagedVerifyExitCodesAreChosenByTool(t *testing.T) {
+	cases := []struct {
+		tool string
+		exit int
+		want bool
+	}{
+		{ToolReference, 0, true},
+		{ToolReference, 1, false},
+		{ToolReference, 2, false},
+		{ToolCandidate, 1, true},
+		{ToolCandidate, 0, false},
+		{ToolCandidate, 2, false},
+		{ToolEngine, 0, false},
+	}
+	for _, c := range cases {
+		if got := damagedVerifyAccepted(c.tool, c.exit); got != c.want {
+			t.Errorf("%s exit %d: accepted %t, want %t", c.tool, c.exit, got, c.want)
+		}
+	}
+}
+
+func TestVersionProbeProblem(t *testing.T) {
+	if problem := versionProbeProblem(Result{}, "par3cmdline version 0.0.1"); problem != "" {
+		t.Errorf("a clean probe: %q", problem)
+	}
+	if problem := versionProbeProblem(Result{}, ""); problem == "" {
+		t.Error("a probe that printed nothing must not identify the binary")
+	}
+	if problem := versionProbeProblem(Result{Measurement: Measurement{ExitCode: 3}, Stdout: "usage\n"}, "usage"); problem == "" {
+		t.Error("a probe that exited 3 must not identify the binary")
+	}
+	if problem := versionProbeProblem(Result{Failure: "start-failed"}, ""); problem == "" {
+		t.Error("a probe that did not start must not identify the binary")
+	}
+}
+
+// A set named twice would run twice under one row key and double its samples.
+func TestSelectRejectsADuplicateSet(t *testing.T) {
+	profile, err := LookupProfile("smoke")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := profile.Select([]string{"smoke-gf8", "smoke-gf8"}); err == nil || !strings.Contains(err.Error(), "more than once") {
+		t.Fatalf("Select with a repeated set = %v, want a duplicate error", err)
+	}
+	selected, err := profile.Select([]string{"smoke-gf8"})
+	if err != nil || len(selected.Configs) != 1 {
+		t.Fatalf("Select of one set = %d configs, %v", len(selected.Configs), err)
+	}
+}
+
+// strace exits with the traced command's status; a pass whose command did
+// not complete its op publishes no counts.
+func TestTracedRunProblemChecksTheTracedExit(t *testing.T) {
+	createDone := func(code int) bool { return exitAccepted(OpCreate, ToolReference, code) }
+	if err := tracedRunProblem(Result{}, createDone); err != nil {
+		t.Errorf("a clean traced create: %v", err)
+	}
+	if err := tracedRunProblem(Result{Measurement: Measurement{ExitCode: 6}}, createDone); err == nil {
+		t.Error("a traced create that exited 6 must not be counted")
+	}
+	if err := tracedRunProblem(Result{Failure: "timeout"}, createDone); err == nil {
+		t.Error("a traced run that timed out must not be counted")
+	}
+	damaged := func(code int) bool { return exitAccepted(OpVerifyDamaged, ToolCandidate, code) }
+	if err := tracedRunProblem(Result{Measurement: Measurement{ExitCode: 1}}, damaged); err != nil {
+		t.Errorf("rarpar's damaged verdict is a completed verify: %v", err)
+	}
+	if err := tracedRunProblem(Result{}, damaged); err == nil {
+		t.Error("rarpar calling a damaged set intact must not be counted")
+	}
+}
+
+func TestCheckOpsRefusesDuplicateAndUnknownOps(t *testing.T) {
+	if err := CheckOps(KnownOps); err != nil {
+		t.Fatalf("every known op once must pass: %v", err)
+	}
+	if err := CheckOps([]string{OpCreate, OpVerify, OpCreate}); err == nil || !strings.Contains(err.Error(), `op "create" is listed more than once`) {
+		t.Fatalf("a repeated op must be refused by name, got %v", err)
+	}
+	if err := CheckOps([]string{"explode"}); err == nil || !strings.Contains(err.Error(), "unknown op") {
+		t.Fatalf("an unknown op must be refused, got %v", err)
+	}
+	// RunSuite's option validation applies the same check.
+	options := Options{Reference: os.Args[0], Candidate: os.Args[0], Work: "/w", Out: t.TempDir(), Ops: []string{OpRepair, OpRepair}, Repeats: 1}
+	if err := validateOptions(&options); err == nil || !strings.Contains(err.Error(), `op "repair" is listed more than once`) {
+		t.Fatalf("validateOptions must refuse a repeated op, got %v", err)
+	}
+}

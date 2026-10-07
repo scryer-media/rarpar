@@ -122,11 +122,18 @@ func (p Profile) Select(ids []string) (Profile, error) {
 	}
 	selected := Profile{Name: p.Name}
 	used := map[string]bool{}
+	picked := map[string]bool{}
 	for _, id := range ids {
 		config, ok := known[id]
 		if !ok {
 			return Profile{}, fmt.Errorf("profile %s has no set %q (known: %s)", p.Name, id, strings.Join(p.ConfigIDs(), ", "))
 		}
+		if picked[id] {
+			// Running a set twice would merge twice the requested samples
+			// under one row and print its tables twice.
+			return Profile{}, fmt.Errorf("set %q is selected more than once", id)
+		}
+		picked[id] = true
 		selected.Configs = append(selected.Configs, config)
 		used[config.Dataset] = true
 	}

@@ -352,3 +352,94 @@ func TestWriteZipUsesForwardSlashes(t *testing.T) {
 		t.Fatalf("zip entries = %s", got)
 	}
 }
+
+// PowerShell does not stop on a native command's non-zero exit, so every
+// external command in the run script must be followed by a Check that fails
+// the run with that step's exit code; otherwise a crashed step is collected
+// as status=ok.
+func TestWindowsRunScriptChecksEveryExternalExit(t *testing.T) {
+	config, machine := windowsExample(t)
+	for _, suite := range []string{SuiteCRCProbe, SuiteMacroPAR3} {
+		if !machine.hasSuite(suite) {
+			machine.Suites = append(machine.Suites, suite)
+		}
+	}
+	layout := windowsLayout(machine, "fleet-testrun")
+	script := WindowsRunScript(machine, config.Fleet.Defaults, "fleet-testrun", layout,
+		map[string]string{"rar": `C:\o\UnRAR.exe`, "par2": `C:\o\par2.exe`, "par3": `C:\o\par3.exe`})
+	if !strings.Contains(script, "function Check($what) { if ($LASTEXITCODE -ne 0) { Fail ($what + ':exit-' + $LASTEXITCODE) } }") {
+		t.Fatal("the run script must define Check over $LASTEXITCODE")
+	}
+	lines := strings.Split(script, "\r\n")
+	external := 0
+	for i, line := range lines {
+		at := strings.Index(line, "& $")
+		if at < 0 {
+			continue
+		}
+		external++
+		rest := line[at:]
+		next := ""
+		if i+1 < len(lines) {
+			next = strings.TrimSpace(lines[i+1])
+		}
+		if !strings.Contains(rest, "; Check '") && !strings.HasPrefix(next, "Check '") {
+			t.Errorf("external command without an exit check:\n%s\n%s", line, next)
+		}
+	}
+	// crc_probe, and per family corpus verify, plan, run and report, and the
+	// PAR3 suite.
+	if external < 6 {
+		t.Fatalf("found %d external commands; the script shape changed:\n%s", external, script)
+	}
+}
+
+func TestWindowsStagingClearsAReusedRunRootFirst(t *testing.T) {
+	_, machine := windowsExample(t)
+	machine.Connection.KeyPath = filepath.Join(t.TempDir(), "key")
+	logPath := fakeRemote(t, "started")
+	transport, err := NewTransport(machine, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle, upload := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(bundle, "rarpar.exe"), []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(upload, "run.ps1"), []byte("# run"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	layout := windowsLayout(machine, "fleet-reused")
+	if _, err := stageAndStartWindows(context.Background(), transport, layout, bundle, upload); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := strings.Split(strings.TrimSpace(string(data)), "\n")
+	first := calls[0]
+	if !strings.HasPrefix(first, "ssh ") {
+		t.Fatalf("the first remote call must clear the run root, got %s", first)
+	}
+	fields := strings.Split(first, " [")
+	script := decodePowerShell(t, strings.TrimSuffix(fields[len(fields)-1], "]"))
+	for _, path := range []string{layout.Base, layout.Scratch} {
+		if !strings.Contains(script, "Remove-Item -LiteralPath "+psQuote(path)+" -Recurse -Force") {
+			t.Fatalf("the clearing script must remove %s before staging, got:\n%s", path, script)
+		}
+	}
+	last := calls[len(calls)-1]
+	fields = strings.Split(last, " [")
+	if start := decodePowerShell(t, strings.TrimSuffix(fields[len(fields)-1], "]")); !strings.Contains(start, "Win32_Process") {
+		t.Fatalf("the runner must start only after the run root is cleared and restaged, got:\n%s", start)
+	}
+	for _, call := range calls[1 : len(calls)-1] {
+		if strings.HasPrefix(call, "ssh ") {
+			fields := strings.Split(call, " [")
+			if strings.Contains(decodePowerShell(t, strings.TrimSuffix(fields[len(fields)-1], "]")), "Remove-Item -LiteralPath "+psQuote(layout.Base)) {
+				t.Fatalf("the run root must be cleared once, before any upload: %s", call)
+			}
+		}
+	}
+}

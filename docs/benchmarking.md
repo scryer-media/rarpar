@@ -310,14 +310,19 @@ Every create row is compared with the reference's set for the same inputs:
   differs.
 - `DIFFERENT`: the recovery payloads differ.
 
-Today's CLI sets are `DIFFERENT` by design. They carry a different `Creator`
-and `InputSetID`, write each packet once per volume where the reference writes
-it twice, and order the inputs differently. As a result the recovery
-coefficients differ too. For sets with 129-255 input blocks, `rarpar` and the
-reference also choose GF(2^8) versus GF(2^16) at different thresholds. This is
-recorded rather than failed: each tool's create is still verified by itself
-and repaired back to the original bytes. The report says which packet types
-and counts differ.
+Since par3-rs 0.4.5, `rarpar par3 create` derives the `InputSetID`, orders the
+inputs, and repeats and orders packets the way the reference does. Its sets
+therefore carry the reference's recovery payloads and should be
+`payloads-only`: by default the only packet that differs is the `Creator`
+text. With the reference's `Creator` text (`engine_perf` takes
+`PAR3_BENCH_CREATOR`) the sets are `identical`. Treat `DIFFERENT` as a
+recovery-payload regression and investigate it, with one expected exception:
+for a Cauchy set with more than 128 input blocks whose input and recovery
+blocks total at most 256, the reference chooses GF(2^16) and `rarpar` chooses
+GF(2^8). The field, the `InputSetID` and the recovery coefficients then all
+differ. The verdict is recorded rather than failed: each tool's create is still
+verified by itself and repaired back to the original bytes. The report says
+which packet types and counts differ.
 
 ### Reference caveats
 

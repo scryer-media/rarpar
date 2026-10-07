@@ -134,10 +134,8 @@ func runPAR3Matrix(args []string, stdout io.Writer) error {
 		return err
 	}
 	opList := splitList(*ops)
-	for _, op := range opList {
-		if !containsString(par3bench.KnownOps, op) {
-			return fmt.Errorf("unknown op %q (known: %s)", op, strings.Join(par3bench.KnownOps, ", "))
-		}
+	if err := par3bench.CheckOps(opList); err != nil {
+		return err
 	}
 	rows := par3bench.Variants(workerList, variants, durabilities)
 	if err := par3bench.CheckVariantNames(rows); err != nil {

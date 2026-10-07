@@ -556,7 +556,7 @@ impl ScanReadAhead {
         &mut self,
         access: &dyn SourceAccess,
         source: SourceId,
-        source_len: u64,
+        snapshot: SourceSnapshot,
         offset: u64,
         out: &mut [u8],
         options: &ExecutionOptions,
@@ -564,7 +564,8 @@ impl ScanReadAhead {
         if offset < self.offset || offset - self.offset >= self.len as u64 {
             self.len = 0;
             self.unchecked = true;
-            let mut take = source_len
+            let mut take = snapshot
+                .len
                 .saturating_sub(offset)
                 .min(self.bytes.len() as u64) as usize;
             // A fill is charged what it asks for, and handed back what a
@@ -577,9 +578,21 @@ impl ScanReadAhead {
                 options.scan_work.charge(take)?;
             }
             let read =
-                options
+                match options
                     .diagnostics
-                    .read_at(access, source, offset, &mut self.bytes[..take])?;
+                    .read_at(access, source, offset, &mut self.bytes[..take])
+                {
+                    Ok(read) => read,
+                    // A source that vanished or was rewritten under the refill
+                    // reports that, not the I/O error it caused: the poll-level
+                    // generation check this read would have been settled by
+                    // never runs once the error is returned.
+                    Err(error) => {
+                        ensure_snapshot(access, source, snapshot)?;
+                        self.unchecked = false;
+                        return Err(error.into());
+                    }
+                };
             if read > take {
                 return Err(EngineError::InvalidState("invalid source read length"));
             }
@@ -1071,7 +1084,7 @@ impl PacketScanner {
                     let count = self.read_ahead.read_at(
                         self.access.as_ref(),
                         self.source,
-                        self.snapshot.len,
+                        self.snapshot,
                         self.offset + read as u64,
                         &mut self.buffer[read..take],
                         &self.options,
@@ -1110,7 +1123,7 @@ impl PacketScanner {
                     let count = self.read_ahead.read_at(
                         self.access.as_ref(),
                         self.source,
-                        self.snapshot.len,
+                        self.snapshot,
                         self.offset + header_read as u64,
                         &mut header_bytes[header_read..],
                         &self.options,
@@ -1203,7 +1216,7 @@ impl PacketScanner {
                 let read = self.read_ahead.read_at(
                     self.access.as_ref(),
                     self.source,
-                    self.snapshot.len,
+                    self.snapshot,
                     candidate.offset + candidate.consumed,
                     &mut self.buffer[..take],
                     &self.options,
@@ -2162,6 +2175,89 @@ mod admission_tests {
             set.rejected_packets(),
             0,
             "a carrier that moved is not a packet this set refused"
+        );
+    }
+
+    /// A provider whose reads fail once it is armed, and whose snapshot then
+    /// reports the source gone when `vanish` is set or unchanged otherwise.
+    struct FailingRefill {
+        inner: MemorySourceAccess,
+        armed: std::sync::atomic::AtomicBool,
+        vanish: bool,
+    }
+
+    impl crate::source::SourceAccess for FailingRefill {
+        fn snapshot(
+            &self,
+            source: SourceId,
+        ) -> std::io::Result<Option<crate::source::SourceSnapshot>> {
+            if self.vanish && self.armed.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(None);
+            }
+            self.inner.snapshot(source)
+        }
+
+        fn read_at(&self, source: SourceId, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.armed.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+            }
+            self.inner.read_at(source, offset, out)
+        }
+
+        fn next_available(
+            &self,
+            source: SourceId,
+            offset: u64,
+        ) -> std::io::Result<Option<std::ops::Range<u64>>> {
+            self.inner.next_available(source, offset)
+        }
+    }
+
+    fn poll_failing_refill(vanish: bool) -> EngineError {
+        let archive = crate::test_reference::set_vol0_par3();
+        let mut inner = MemorySourceAccess::default();
+        inner.insert(SourceId(1), 1, archive.into());
+        let access = Arc::new(FailingRefill {
+            inner,
+            armed: std::sync::atomic::AtomicBool::new(false),
+            vanish,
+        });
+        let mut scanner = PacketScanner::new(
+            Arc::clone(&access) as Arc<dyn crate::source::SourceAccess>,
+            SourceId(1),
+            ExecutionOptions::default(),
+            ScanLimits::default(),
+        )
+        .expect("a scanner over the archive");
+        access
+            .armed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        scanner
+            .poll()
+            .expect_err("the first refill cannot read the source")
+    }
+
+    /// PR #92 review: the scanner settles its generation check after a
+    /// refill, so a refill whose read fails used to return the provider's
+    /// I/O error even when the source had disappeared under it. It must
+    /// report the change, as every other optimized read path does.
+    #[test]
+    fn a_refill_that_fails_because_the_source_vanished_reports_the_change() {
+        let error = poll_failing_refill(true);
+        assert!(
+            matches!(error, EngineError::SourceChanged(SourceId(1))),
+            "a vanished source surfaced as {error:?}"
+        );
+    }
+
+    /// The same failed refill over a source that is still the scanned
+    /// generation keeps the read's own error.
+    #[test]
+    fn a_refill_that_fails_over_an_unchanged_source_keeps_its_error() {
+        let error = poll_failing_refill(false);
+        assert!(
+            !matches!(error, EngineError::SourceChanged(_)),
+            "an unchanged source reported a change: {error:?}"
         );
     }
 

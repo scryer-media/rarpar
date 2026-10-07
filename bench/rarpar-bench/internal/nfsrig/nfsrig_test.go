@@ -183,6 +183,12 @@ func TestHostCommands(t *testing.T) {
 	}
 	for _, bad := range []HostOptions{
 		{Compose: "c", Source: "s", Results: "r", Label: "a/b"},
+		{Compose: "c", Source: "s", Results: "r", Label: ""},
+		{Compose: "c", Source: "s", Results: "r", Label: "."},
+		{Compose: "c", Source: "s", Results: "r", Label: ".."},
+		{Compose: "c", Source: "s", Results: "r", Label: `a\b`},
+		{Compose: "c", Source: "s", Results: "r", Label: "/abs"},
+		{Compose: "c", Source: "s", Results: "r", Label: "a b"},
 		{Compose: "c", Source: "s", Results: "r", Label: "a", Service: "other"},
 		{Compose: "c", Source: "s", Label: "a"},
 		{Compose: "c", Source: "s", Results: "r", Label: "a", Env: []string{"NOEQUALS"}},

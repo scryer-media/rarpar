@@ -57,6 +57,10 @@
   `scan_work` for what it asks and refunded what a short read did not
   return beyond one stripe, so a whole scan still costs its bytes and a poll
   that finds nothing one stripe. Evidence is unchanged.
+  The scanner checks the source's generation once per refill rather than at
+  the top of every poll; a refill whose read fails rechecks it before
+  returning, so a carrier that disappears or is rewritten under the scanner
+  reports `SourceChanged`, not the provider's I/O error.
 - New `mount` module: `MountKind { Local, Remote, Unknown }` and
   `SourceAccess::mount_kind` (default `Unknown`). `DiskSourceAccess` probes
   each source directory once (`statfs` `f_type` on Linux: NFS and SMB/CIFS
@@ -463,7 +467,9 @@
   evidence, a recovery or data payload) comes from it. The patched file is
   then read back whole and checked against its File packet before it is
   reported repaired, since its own writes move its snapshot; a mismatch fails
-  the repair. A patch cut short leaves the intact extents untouched, so the
+  the repair. The first write re-checks that snapshot, so a file rewritten
+  while its syndromes were read ends in `SourceChanged` with nothing patched,
+  as a cloned source does. A patch cut short leaves the intact extents untouched, so the
   file still verifies as damaged and repairs again. Where the filesystem has
   no clones, a file with a few lost blocks now costs those blocks' writes and
   one read-back instead of a full rewrite, which on a network mount is most of
@@ -529,6 +535,32 @@
 - On x86_64 hosts with GFNI, the FFT codec's byte maps run as affine
   transforms and the formal derivative as one AVX2 pass (`reedsolomon-rs`
   0.4.8); carriers and repaired bytes are identical.
+- Repair no longer reads every selected recovery and data packet twice, once
+  to reauthenticate it and again to use it, when one stripe covers the block.
+  The codec's own read of the whole payload is hashed, together with the
+  header and identity fields authenticated at admission, and its bytes are
+  used only once the packet's hash matches. A mismatch refuses the repair
+  with the same `PacketHashMismatch`, charges `failed_hash_bytes` and
+  `rejected_packets` as before, and removes the outputs it had staged.
+  Payloads the codec never reads are still authenticated before anything is
+  installed. A stripe narrower than the block, configured or narrowed by the
+  budget, authenticates every payload in its own pass before the walk, as
+  before, through the stripe buffer when the budget refuses that pass its
+  own. Apple M5 Max, ten 30 MiB files in 64 KiB blocks with 328 lost: file
+  reads 702.2 → 680.6 MB in 11,047 → 10,391 calls, opens 54 → 45, snapshot
+  checks 2,751 → 2,423 (Cauchy); 709.7 → 688.2 MB in 11,163 → 10,507 calls,
+  opens 57 → 48 (FFT). Wall and CPU are unchanged at one and eight workers
+  with a warm cache; on AMD Zen 4 (EPYC 9R14, eight cores) the same counts
+  fall by the same amounts, Cauchy wall 2.21 → 2.20 s at one worker and
+  0.46 → 0.44 s at eight, FFT 0.91 → 0.90 s and 0.61 → 0.59 s, CPU
+  unchanged. Repairs in 1 MiB blocks at the default 64 KiB stripe read
+  exactly what they did.
+- Creation planning (`creation::CreationPlan::build`) reports a source that
+  disappears or is rewritten while its inline tail (a final chunk under 40
+  bytes) is read as `SourceChanged`, not the provider's `NotFound` or I/O
+  error, as it already did for every other chunk. This covers both the serial
+  walk and a planning pool, whose read-ahead failure was returned unchecked
+  when the walk reached the tail.
 
 ## 0.4.4
 

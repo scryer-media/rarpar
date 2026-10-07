@@ -350,7 +350,7 @@ documented in each crate's own changelog so those notes ship with the crate.
 - par3-rs 0.4.5 (pinned exactly), which needs reedsolomon-rs 0.4.8. par2-rs
   and unrar-rs are unchanged.
 
-## rarpar 0.5.4 (Unreleased)
+## rarpar 0.5.4
 
 ### CLI Changes
 
