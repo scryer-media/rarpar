@@ -206,6 +206,27 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
         Par3InsidePlacement::Last => Rar5Placement::Last,
         Par3InsidePlacement::Independent => Rar5Placement::Independent,
     };
+    // A plan is reported before anything is created: no output directory,
+    // staging directory or scratch file. An existing output is refused as
+    // the insertion would refuse it.
+    if !args.in_place {
+        let directory = args.output_dir.as_ref().expect("required by clap");
+        for host in &hosts {
+            let output = directory.join(&host.name);
+            if output.exists() {
+                return Err(RarparError::Unsafe(format!(
+                    "output exists: {}",
+                    output.display()
+                )));
+            }
+        }
+    }
+    if cli.dry_run {
+        return Ok((
+            true,
+            json!({"operation":"par3_inside_insert","status":"planned","dry_run":true,"hosts":hosts.iter().map(|h| &h.name).collect::<Vec<_>>(),"block_size":block_size}),
+        ));
+    }
     // In place, each output is staged in its own volume's directory, so the
     // final rename never crosses a filesystem.
     let mut staging = Vec::new();
@@ -253,12 +274,6 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
         ..CreationOptions::default()
     };
     let mut inserted = Vec::new();
-    if cli.dry_run {
-        return Ok((
-            true,
-            json!({"operation":"par3_inside_insert","status":"planned","dry_run":true,"hosts":hosts.iter().map(|h| &h.name).collect::<Vec<_>>(),"block_size":block_size}),
-        ));
-    }
     if placement == Rar5Placement::Independent {
         for (host, output) in hosts.iter().zip(&outputs) {
             let count = count_for(blocks_of(host.archive.length));

@@ -19,6 +19,11 @@ documented in each crate's own changelog so those notes ship with the crate.
   is not valid UTF-8 now names the same file instead of one with U+FFFD in
   place of its odd bytes. Folder walks and `-o` with `*` keep such names
   too.
+- `par3 inside insert --dry-run` reports its plan before it creates
+  anything: it no longer leaves the `-d` output directory behind, and in
+  place it makes no staging or scratch files beside the volumes (so a
+  read-only source directory no longer fails a dry run). An existing output
+  is still refused.
 
 ## rarpar 0.8.1
 

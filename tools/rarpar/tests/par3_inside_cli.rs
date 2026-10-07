@@ -383,3 +383,59 @@ fn inside_dry_run_removal_checks_like_a_removal() {
     assert_eq!(dry, code(false));
     assert!(!root.join("stripped").join(name(3)).exists());
 }
+
+/// A dry-run insertion reports its plan before it creates anything: no
+/// output directory, and in place no staging or scratch file beside the host.
+#[test]
+fn inside_dry_run_insertion_creates_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/unrar-rs/fuzz/corpus/rar_extract/rar5_longname.rar");
+    let shelf = root.join("shelf");
+    std::fs::create_dir(&shelf).unwrap();
+    let host = shelf.join("quill-host.rar");
+    std::fs::copy(&source, &host).unwrap();
+    let host = host.to_str().unwrap();
+    let planned = run(
+        root,
+        &[
+            "--dry-run",
+            "par3",
+            "inside",
+            "insert",
+            host,
+            "-d",
+            "fresh/out",
+            "-c",
+            "2",
+        ],
+        0,
+    );
+    assert_eq!(planned["status"], "planned");
+    assert!(!root.join("fresh").exists());
+    let planned = run(
+        root,
+        &[
+            "--dry-run",
+            "par3",
+            "inside",
+            "insert",
+            host,
+            "--in-place",
+            "-c",
+            "2",
+        ],
+        0,
+    );
+    assert_eq!(planned["status"], "planned");
+    let left: Vec<_> = std::fs::read_dir(&shelf)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(left, ["quill-host.rar"]);
+    assert_eq!(
+        std::fs::read(shelf.join("quill-host.rar")).unwrap(),
+        std::fs::read(&source).unwrap()
+    );
+}
