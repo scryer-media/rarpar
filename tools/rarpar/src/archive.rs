@@ -704,15 +704,12 @@ fn refuse_aliases(paths: &[PathBuf]) -> Result<(), RarparError> {
 pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparError> {
     // An odd block size rounds up to even; the largest odd size has no even
     // size above it.
-    let block_size = args
-        .block_size
-        .checked_next_multiple_of(2)
-        .ok_or_else(|| {
-            RarparError::Usage(format!(
-                "--block-size {} cannot be rounded up to an even size",
-                args.block_size
-            ))
-        })?;
+    let block_size = args.block_size.checked_next_multiple_of(2).ok_or_else(|| {
+        RarparError::Usage(format!(
+            "--block-size {} cannot be rounded up to an even size",
+            args.block_size
+        ))
+    })?;
     let base = args.base_path.clone().unwrap_or(std::env::current_dir()?);
     reject_symlinks(&base)?;
     let base = base.canonicalize()?;
