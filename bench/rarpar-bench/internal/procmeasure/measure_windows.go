@@ -1,6 +1,6 @@
 //go:build windows
 
-package par3bench
+package procmeasure
 
 import (
 	"errors"
@@ -149,6 +149,10 @@ func isQuarantineError(err error) bool {
 	return false
 }
 
-func rssSource() string {
-	return "K32GetProcessMemoryInfo PeakWorkingSetSize on the held process handle"
-}
+// NativeRSSSource is where Run and Track read the peak resident set here.
+const NativeRSSSource = RSSSourcePeakWorkingSet
+
+const nativeRSSSource = NativeRSSSource
+
+// closeOnExec is a no-op: Windows handles are not inherited unless asked.
+func closeOnExec(int) {}

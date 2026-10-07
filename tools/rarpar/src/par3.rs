@@ -102,6 +102,8 @@ pub fn is_carrier_candidate(path: &Path) -> bool {
     if is_carrier(path) {
         return true;
     }
+    #[cfg(test)]
+    tests::SNIFFED.with(|sniffed| sniffed.borrow_mut().push(path.to_path_buf()));
     crate::discovery::read_prefix(path, par3_rs::MAGIC.len())
         .is_ok_and(|prefix| prefix == par3_rs::MAGIC)
 }
@@ -129,8 +131,16 @@ fn scan(paths: &[PathBuf], options: &ExecutionOptions) -> Result<Vec<LoadedSet>,
     }
     let access: Arc<dyn SourceAccess> = Arc::new(disk);
     let mut sets: BTreeMap<(InputSetId, PathBuf), LoadedSet> = BTreeMap::new();
+    // Carriers share a directory or a few; resolve each one once.
+    let mut directories: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
     for (index, path) in paths.iter().enumerate() {
-        let directory = parent(path).canonicalize()?;
+        let directory = match directories.entry(parent(path)) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.get().clone(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let resolved = entry.key().canonicalize()?;
+                entry.insert(resolved).clone()
+            }
+        };
         let mut scanner = PacketScanner::new(
             access.clone(),
             SourceId(index as u64),
@@ -215,14 +225,14 @@ pub fn discover_sets(
     Ok(result)
 }
 
-fn parent(path: &Path) -> PathBuf {
+pub(crate) fn parent(path: &Path) -> PathBuf {
     path.parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
         .to_path_buf()
 }
 
-fn reject_symlinks(path: &Path) -> Result<(), RarparError> {
+pub(crate) fn reject_symlinks(path: &Path) -> Result<(), RarparError> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => {
             return Err(RarparError::Unsafe(format!(
@@ -332,8 +342,17 @@ fn collect_files(
     } else if meta.is_dir() {
         for entry in std::fs::read_dir(root)? {
             let entry = entry?;
+            // The entry's own type does not follow links, so a regular file
+            // here needs no further stat of its path.
             let kind = entry.file_type()?;
-            if kind.is_file() || (kind.is_dir() && !cli.no_recursive && depth < cli.max_depth) {
+            if kind.is_file() {
+                files.insert(entry.path());
+                if files.len() > cli.max_files {
+                    return Err(RarparError::Resource(
+                        "PAR3 discovery exceeded --max-files".into(),
+                    ));
+                }
+            } else if kind.is_dir() && !cli.no_recursive && depth < cli.max_depth {
                 collect_files(&entry.path(), cli, depth + 1, files)?;
             }
         }
@@ -356,30 +375,95 @@ fn load_selected(
     let mut files = BTreeSet::new();
     if input.is_dir() {
         collect_files(&input, cli, 0, &mut files)?;
-    } else {
-        files.insert(input.clone());
-        // Siblings are candidates only; authenticated identities select the set.
-        for entry in std::fs::read_dir(parent(&input))? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() && is_carrier_candidate(&entry.path()) {
-                files.insert(entry.path());
-                if files.len() > cli.max_files {
-                    return Err(RarparError::Resource(
-                        "PAR3 discovery exceeded --max-files".into(),
-                    ));
-                }
+        files.retain(|path| is_carrier_candidate(path));
+        let paths: Vec<_> = files.into_iter().collect();
+        let options = carrier_options(options, paths.len())?;
+        return select_loaded(scan(&paths, &options)?, args, &input);
+    }
+    files.insert(input.clone());
+    // Siblings are candidates only; authenticated identities select the set.
+    // A `.par3` name is a candidate by name. Any other sibling may be a
+    // renamed carrier and needs its magic read, except a file the named
+    // carrier's set protects: that is data by definition, and sniffing it
+    // cost an open and a read per data file before verification read it in
+    // full. So the named carriers are scanned first, the remaining siblings
+    // are sniffed, and only a sniffed carrier costs a scan of every candidate
+    // together, as before.
+    let mut unnamed = Vec::new();
+    for entry in std::fs::read_dir(parent(&input))? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if is_carrier(&path) {
+            files.insert(path);
+            if files.len() > cli.max_files {
+                return Err(RarparError::Resource(
+                    "PAR3 discovery exceeded --max-files".into(),
+                ));
             }
+        } else if path != input {
+            unnamed.push((entry.file_name(), path));
         }
     }
-    let paths: Vec<_> = files
-        .into_iter()
-        .filter(|path| *path == input || is_carrier_candidate(path))
-        .collect();
+    let paths: Vec<_> = files.iter().cloned().collect();
+    let named_options = carrier_options(options, paths.len())?;
+    let named = scan(&paths, &named_options)?;
+    let protected = top_level_protected_names(&named);
+    let mut renamed = false;
+    for (name, path) in unnamed {
+        if protected
+            .as_ref()
+            .is_some_and(|protected| protected.contains(name.as_os_str()))
+            || !is_carrier_candidate(&path)
+        {
+            continue;
+        }
+        renamed = true;
+        files.insert(path);
+        if files.len() > cli.max_files {
+            return Err(RarparError::Resource(
+                "PAR3 discovery exceeded --max-files".into(),
+            ));
+        }
+    }
+    if !renamed {
+        return select_loaded(named, args, &input);
+    }
+    drop(named);
+    let paths: Vec<_> = files.into_iter().collect();
     let options = carrier_options(options, paths.len())?;
-    let mut sets = scan(&paths, &options)?;
+    select_loaded(scan(&paths, &options)?, args, &input)
+}
+
+/// The names directly in the carriers' directory that the loaded sets protect,
+/// or `None` when a set's file list is not known yet (its metadata is
+/// incomplete), so every sibling must still be sniffed.
+fn top_level_protected_names(sets: &[LoadedSet]) -> Option<BTreeSet<std::ffi::OsString>> {
+    let mut names = BTreeSet::new();
+    for set in sets {
+        let metadata = set.packets.metadata().ok()??;
+        names.extend(
+            metadata
+                .files()
+                .iter()
+                .map(par3_rs::Par3File::path)
+                .filter(|path| !path.contains('/'))
+                .map(std::ffi::OsString::from),
+        );
+    }
+    Some(names)
+}
+
+fn select_loaded(
+    mut sets: Vec<LoadedSet>,
+    args: &Par3Args,
+    input: &Path,
+) -> Result<LoadedSet, RarparError> {
     sets.retain(|set| {
         args.set_id.as_ref().map_or_else(
-            || input.is_dir() || set.paths.contains(&input),
+            || input.is_dir() || set.paths.iter().any(|path| path == input),
             |id| set.id.to_string().eq_ignore_ascii_case(id),
         )
     });
@@ -400,6 +484,7 @@ fn load_selected(
 
 pub fn run_command(cli: &Cli, command: Par3Command) -> Result<u8, RarparError> {
     let result = match command {
+        Par3Command::Inside(command) => return crate::par3_inside::run(cli, command),
         Par3Command::Create(args) => create(cli, &args),
         Par3Command::Verify(args) => {
             verify_repair(cli, &args, false).map(|outcome| (outcome.success, outcome.report))
@@ -407,6 +492,8 @@ pub fn run_command(cli: &Cli, command: Par3Command) -> Result<u8, RarparError> {
         Par3Command::Repair(args) => {
             verify_repair(cli, &args, true).map(|outcome| (outcome.success, outcome.report))
         }
+        #[cfg(feature = "sevenz")]
+        Par3Command::Archive(args) => crate::archive::run(cli, &args),
     };
     match result {
         Ok((success, report)) => {
@@ -468,7 +555,27 @@ fn emit(cli: &Cli, report: &Value) -> Result<(), RarparError> {
                 ""
             }
         );
-        if let Some(outputs) = report["outputs"].as_array() {
+        if report["operation"] == "par3_archive" {
+            if report["dry_run"] != true {
+                println!(
+                    "  {}: {} member(s), {} bytes, {} protected",
+                    report["archive"].as_str().unwrap_or_default(),
+                    report["members"],
+                    report["archive_bytes"],
+                    report["protected_bytes"]
+                );
+                println!(
+                    "  {} block(s) of {} bytes, {} recovery block(s), PAR3 set {}",
+                    report["blocks"],
+                    report["block_size"],
+                    report["recovery_blocks"],
+                    report["mode"].as_str().unwrap_or_default()
+                );
+            }
+            for path in report["outputs"].as_array().into_iter().flatten() {
+                println!("  {}", path.as_str().unwrap_or_default());
+            }
+        } else if let Some(outputs) = report["outputs"].as_array() {
             println!(
                 "  {} block(s), {} cohort(s), {} scratch bytes",
                 report["blocks"], report["cohorts"], report["scratch_bytes"]
@@ -616,7 +723,7 @@ fn verify_repair_loaded(
     for (name, id) in bindings {
         session.bind_file(&name, id)?;
     }
-    let assessment = session.assess()?;
+    let mut assessment = session.assess()?;
     let unresolved: Vec<_> = assessment
         .files
         .iter()
@@ -661,8 +768,10 @@ fn verify_repair_loaded(
                 }
             }
         }
+        // Only a search can change the verdict; an untouched set keeps it
+        // rather than checking every source again.
+        assessment = session.assess()?;
     }
-    let assessment = session.assess()?;
     let mut success = assessment.status == RepairStatus::Complete;
     let ready = assessment.status == RepairStatus::Ready;
     let mut report = json!({
@@ -957,6 +1066,85 @@ mod tests {
     use clap::Parser;
     use par3_rs::runtime::ScanWorkBudget;
     use par3_rs::source::MemorySourceAccess;
+
+    thread_local! {
+        /// The paths [`is_carrier_candidate`] read a magic from, on this thread.
+        pub(super) static SNIFFED: std::cell::RefCell<Vec<PathBuf>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Selecting the set of a named carrier sniffed the magic of every sibling
+    /// that is not named `.par3`, the set's own data files included, before
+    /// verification read those files in full. A file the set protects is data
+    /// and is no longer opened; an unrelated file still is, and a carrier
+    /// renamed to such a name is still found.
+    #[test]
+    fn carrier_selection_does_not_sniff_the_files_the_set_protects() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut access = MemorySourceAccess::default();
+        let mut sources = Vec::new();
+        for index in 0..3u64 {
+            let name = format!("harbor-log-{index}.bin");
+            let bytes = vec![0x41 + index as u8; 3000];
+            std::fs::write(root.join(&name), &bytes).unwrap();
+            access.insert(SourceId(index), 0, Arc::from(bytes));
+            sources.push(CreationSource {
+                name,
+                source: SourceId(index),
+            });
+        }
+        let plan = CreationPlan::build(
+            Arc::new(access),
+            &sources,
+            CreationOptions {
+                block_size: 512,
+                recovery_count: 2,
+                ..CreationOptions::default()
+            },
+        )
+        .unwrap();
+        let carriers = plan.execute(&root.join("harbor"), &root).unwrap();
+        let index = root.join("harbor.par3");
+        assert!(carriers.contains(&index), "{carriers:?}");
+        std::fs::write(root.join("readme.txt"), b"unrelated").unwrap();
+        let cli = Cli::try_parse_from(["rarpar", "auto", index.to_str().unwrap()]).unwrap();
+        let args = Par3Args {
+            input: index.clone(),
+            search_dirs: Vec::new(),
+            set_id: None,
+            no_backup: false,
+        };
+        let select = || {
+            SNIFFED.with(|sniffed| sniffed.borrow_mut().clear());
+            let loaded = load_selected(&cli, &args, &ExecutionOptions::default()).unwrap();
+            let mut sniffed: Vec<String> = SNIFFED.with(|sniffed| {
+                sniffed
+                    .borrow()
+                    .iter()
+                    .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+                    .collect()
+            });
+            sniffed.sort();
+            let mut paths = loaded.paths.clone();
+            paths.sort();
+            (sniffed, paths)
+        };
+
+        let (sniffed, paths) = select();
+        assert_eq!(sniffed, ["readme.txt"]);
+        let mut expected = carriers.clone();
+        expected.sort();
+        assert_eq!(paths, expected);
+
+        let moved = carriers.iter().find(|path| **path != index).unwrap();
+        let relocated = root.join("relocated-carrier");
+        std::fs::rename(moved, &relocated).unwrap();
+        let (sniffed, paths) = select();
+        assert_eq!(sniffed, ["readme.txt", "relocated-carrier"]);
+        assert!(paths.contains(&relocated), "{paths:?}");
+        assert_eq!(paths.len(), carriers.len());
+    }
 
     #[test]
     fn shared_carrier_sets_repair_and_rediscover_without_rescanning() {

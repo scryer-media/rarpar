@@ -52,14 +52,15 @@ rtk cargo package --locked --list -p par2-rs
 rtk cargo package --locked --list -p par3-rs
 ```
 
-Use `.github/workflows/publish-crates.yml` for real crates.io publishing. The
-workflow accepts `package=all` for coordinated releases or one publishable crate
-name for a patch release. Coordinated publishes derive every crate's version
-from its manifest, so packages such as `unrar-rs` may advance independently
-of `reedsolomon-rs` and `par2-rs`; the `version` input is required only
-for a single-crate publish. The `all` path publishes in the order above so each
-downstream package can be verified by `cargo publish` after its internal
-dependency is visible in the crates.io index.
+Use `.github/workflows/publish-crates.yml` for real crates.io publishing. Its
+only input is `dry_run`. The workflow computes the publish plan itself: every
+publishable workspace crate whose manifest version is not on crates.io yet,
+in dependency order (`reedsolomon-rs` first, then the crates that depend on
+it), with the version taken from each crate's manifest. A crate whose version
+already exists in the registry is left alone, and a manifest version below
+the newest published release fails the run. Nothing is typed in by hand:
+bump the manifests, merge, run the workflow. The plan is printed in the run
+summary, and a dry run verifies every crate in it without publishing.
 
 ## Release Signing and Provenance
 
@@ -139,13 +140,13 @@ Verify repository metadata before the first publish.
   the GitHub Release and Homebrew update.
   Homebrew selects the GNU direct archive on glibc 2.35+ and the musl direct
   archive otherwise.
-- `.github/workflows/publish-crates.yml` publishes crates to crates.io in the
-  selected package mode. It is manual-only and defaults to dry-run/preflight
-  mode. Use `package=all` for coordinated releases or a specific package name
-  for patch releases. Set `dry_run` to `false` to publish. Real publishing
-  runs exact package/list/size checks immediately before each crate, retries
-  failures, and waits for each published crate version to appear in the
-  crates.io index before continuing.
+- `.github/workflows/publish-crates.yml` publishes to crates.io every
+  workspace crate whose manifest version is not there yet, in dependency
+  order. It is manual-only and defaults to dry-run/preflight mode; set
+  `dry_run` to `false` to publish. Real publishing runs exact
+  package/list/size checks immediately before each crate, retries failures,
+  and waits for each published crate version to appear in the crates.io
+  index before continuing.
 
 Release builds intentionally avoid `target-cpu` and other CPU-specific compile
 flags so acceleration comes from runtime dispatch instead of host-specific
@@ -156,12 +157,12 @@ WGPU from every shipped `rarpar` artifact on every platform.
 
 Required repository configuration:
 
-- crates.io Trusted Publishing: `reedsolomon-rs`, `unrar-rs` and `par2-rs`
-  each list this repository, `publish-crates.yml` and the `crates-io`
-  environment as a Trusted Publisher. `par3-rs` cannot be configured this way
-  until it exists on crates.io, so its first release has to be published by
-  hand; add the Trusted Publisher immediately afterwards, before the next
-  `package=all` run reaches it. The publish job exchanges its OIDC
+- crates.io Trusted Publishing: every publishable crate (`reedsolomon-rs`,
+  `unrar-rs`, `par2-rs`, `par3-rs`) lists this repository,
+  `publish-crates.yml` and the `crates-io` environment as a Trusted
+  Publisher. A new crate cannot be configured this way until it exists on
+  crates.io, so its first release has to be published by hand; add the
+  Trusted Publisher immediately afterwards, before the next run reaches it. The publish job exchanges its OIDC
   identity for a short-lived token (`rust-lang/crates-io-auth-action`); no
   long-lived registry token is stored in the repository.
 - `crates-io` environment: the identity Trusted Publishing is scoped to, and

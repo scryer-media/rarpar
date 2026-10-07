@@ -1615,3 +1615,73 @@ fn compat_par2_repair_honors_base_directory() {
         "All files are correct"
     );
 }
+
+#[test]
+fn compat_par2_facade_is_consumer_side_only() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("ledger.bin"), b"invented input bytes").unwrap();
+    for (args, message) in [
+        (
+            &["c", "set.par2", "ledger.bin"][..],
+            "rarpar does not create PAR2 files through the par2cmdline facade (c is not supported)",
+        ),
+        (
+            &["create", "-r10", "set.par2", "ledger.bin"],
+            "(create is not supported); use `rarpar par create`.",
+        ),
+        (
+            &["v", "set.par2"],
+            "rarpar does not verify through the par2cmdline facade (v is not supported)",
+        ),
+        (&["verify", "set.par2"], "(verify is not supported)"),
+        (
+            &["r", "-s100", "set.par2"],
+            "Cannot specify block size unless creating.",
+        ),
+        (
+            &["r", "-B", ".", "-r10", "set.par2"],
+            "Cannot specify redundancy unless creating.",
+        ),
+        (
+            &["r", "-b4", "set.par2"],
+            "Cannot specify block count unless creating.",
+        ),
+        (
+            &["r", "-c2", "set.par2"],
+            "Cannot specify recovery block count unless creating.",
+        ),
+        (
+            &["r", "-f1", "set.par2"],
+            "Cannot specify first block number unless creating.",
+        ),
+        (
+            &["r", "-u", "set.par2"],
+            "Cannot specify uniform files unless creating.",
+        ),
+        (
+            &["r", "-l", "set.par2"],
+            "Cannot specify limit files unless creating.",
+        ),
+        (
+            &["r", "-n2", "set.par2"],
+            "Cannot specify recovery file count unless creating.",
+        ),
+        (
+            &["r", "-R", "set.par2"],
+            "Cannot specific Recursive unless creating.",
+        ),
+    ] {
+        let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+        let output = run_in_dir(temp.path(), &args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(3), "{args:?}: {stderr}");
+        assert!(stderr.contains(message), "{args:?}: {stderr}");
+    }
+    // Nothing was written.
+    let mut names: Vec<_> = std::fs::read_dir(temp.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["ledger.bin"]);
+}

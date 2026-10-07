@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/bench"
+	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/procmeasure"
 )
 
 const (
@@ -40,7 +41,7 @@ const (
 	// FailureMissingRSS marks a run whose process exited but whose peak RSS
 	// the harness did not capture. It is a harness bug, so it fails the run
 	// for either tool and is never turned into a reference DNF.
-	FailureMissingRSS = "harness-missing-rss"
+	FailureMissingRSS = procmeasure.FailureMissingRSS
 
 	// DurabilityDurable is rarpar's default: every output file is synced
 	// before the command returns. DurabilityBuffered flushes without
@@ -487,6 +488,9 @@ type Results struct {
 	DNF      []string `json:"dnf,omitempty"`
 	Status   string   `json:"status"`
 	Failures []string `json:"failures,omitempty"`
+	// RSSSummary is every rarpar row's peak RSS against its scenario's
+	// reference, worst (lowest) reference/rarpar ratio first (see RSSSummary).
+	RSSSummary []procmeasure.RSSScenario `json:"rss_summary,omitempty"`
 }
 
 type runner struct {
@@ -634,6 +638,7 @@ func RunSuite(ctx context.Context, options Options) (*Results, error) {
 	if len(r.failures) > 0 {
 		results.Status = StatusFailed
 	}
+	results.RSSSummary = RSSSummary(results)
 	if err := writeJSONFile(filepath.Join(options.Out, "results.json"), results); err != nil {
 		return results, err
 	}
@@ -1565,7 +1570,7 @@ func (r *runner) runOne(ctx context.Context, op string, config Config, dataset D
 		// exit without one means the harness failed to measure it.
 		record.Status = StatusFailed
 		record.Failure = FailureMissingRSS
-		record.Error = "the process exited but the harness recorded no peak RSS (" + rssSource() + ")"
+		record.Error = "the process exited but the harness recorded no peak RSS (expected " + procmeasure.DescribeRSSSource(procmeasure.NativeRSSSource) + ")"
 		return record, nil
 	}
 	switch op {

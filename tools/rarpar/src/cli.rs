@@ -24,7 +24,8 @@ Examples:
   rarpar --password-file passwords.txt ./release
 
 rarpar is not an official RAR, UnRAR, or PAR2 utility and does not create or
-modify RAR archives.";
+recompress RAR archives. `rarpar par3 inside` adds or removes a PAR3 region in
+a copy of an existing RAR5 archive without changing the archive's own bytes.";
 
 #[derive(Clone, Debug, Parser)]
 #[command(
@@ -162,6 +163,137 @@ pub enum Par3Command {
     Verify(Par3Args),
     /// Rebuild damaged files in the working directory, keeping numbered backups.
     Repair(Par3Args),
+    /// Write a 7z archive and protect it with PAR3 in the same pass.
+    #[cfg(feature = "sevenz")]
+    #[command(long_about = "\
+Write a 7z archive of the given files and directories and compute its PAR3
+recovery data from the bytes as they are written, without reading the archive
+back. By default the set is written beside the archive as OUTPUT.par3 and
+recovery volumes; --inside appends it after the archive's end header instead,
+where 7z readers ignore it and PAR3 tools find it.")]
+    Archive(Par3ArchiveArgs),
+    /// EXPERIMENTAL: PAR-inside for RAR5 archives and volume sets made by RARLAB rar.
+    #[command(
+        subcommand,
+        long_about = "\
+EXPERIMENTAL: the on-disk layout of the embedded PAR3 region may change before
+it is stable, and output from this version may not verify with a later one.
+
+Embed PAR3 recovery inside existing RAR5 archives, verify and repair them from
+that embedded recovery, and remove it again. The archive's own bytes are never
+changed: insertion writes a new copy with a PAR3 region added, and removal
+restores the original byte for byte. RAR archives are never created or
+recompressed."
+    )]
+    Inside(Par3InsideCommand),
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum Par3InsideCommand {
+    /// EXPERIMENTAL: add a PAR3 region to a RAR5 archive or every volume of a RAR5 set.
+    Insert(Par3InsideInsertArgs),
+    /// EXPERIMENTAL: verify archive data and embedded regions.
+    Verify(Par3InsideArgs),
+    /// EXPERIMENTAL: rebuild damaged or missing volumes and regions from embedded recovery.
+    Repair(Par3InsideRepairArgs),
+    /// EXPERIMENTAL: write the archives without their PAR3 regions, byte-identical to the originals.
+    Remove(Par3InsideRemoveArgs),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Par3InsideLayout {
+    /// After the end-of-archive header; the archive itself is untouched.
+    Trailing,
+    /// A skippable block of an unassigned type before the end-of-archive header.
+    Block,
+    /// A skippable `PAR3` service header before the end-of-archive header.
+    Service,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Par3InsidePlacement {
+    /// One set; every volume carries the metadata and an even share of recovery.
+    Spread,
+    /// One set; every volume carries the metadata, the last carries all recovery.
+    Last,
+    /// A separate set inside each volume.
+    Independent,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct Par3InsideInsertArgs {
+    /// Archive, or any volume of a `.partN.rar` set (the other volumes are found by name).
+    #[arg(required = true, num_args = 1..)]
+    pub archives: Vec<PathBuf>,
+    /// Directory for the protected copies; required unless --in-place.
+    #[arg(
+        short = 'd',
+        long,
+        value_name = "DIR",
+        required_unless_present = "in_place"
+    )]
+    pub output_dir: Option<PathBuf>,
+    /// Replace each archive with its protected copy.
+    #[arg(long, conflicts_with = "output_dir")]
+    pub in_place: bool,
+    /// Logical block size in bytes; defaults to the smallest power of two from 4096 keeping at most 2048 blocks.
+    #[arg(short = 's', long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub block_size: Option<u64>,
+    /// Number of recovery packets in the set (per volume with --placement independent).
+    #[arg(short = 'c', long, conflicts_with = "recovery_percent")]
+    pub recovery_count: Option<u64>,
+    /// Recovery percentage of protected blocks (default 5).
+    #[arg(short = 'r', long, conflicts_with = "recovery_count")]
+    pub recovery_percent: Option<u32>,
+    #[arg(long, value_enum, default_value_t = Par3InsideLayout::Trailing)]
+    pub layout: Par3InsideLayout,
+    #[arg(long, value_enum, default_value_t = Par3InsidePlacement::Spread)]
+    pub placement: Par3InsidePlacement,
+    /// Scratch directory for recovery encoding; defaults to the output directory.
+    #[arg(long)]
+    pub scratch_dir: Option<PathBuf>,
+    /// Flush buffers without requesting durable storage barriers.
+    #[arg(long)]
+    pub buffered: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct Par3InsideArgs {
+    /// Archive or volumes; the rest of a volume set is found by recorded name.
+    #[arg(required = true, num_args = 1..)]
+    pub archives: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct Par3InsideRepairArgs {
+    #[command(flatten)]
+    pub inputs: Par3InsideArgs,
+    /// Write rebuilt volumes here instead of replacing them in place.
+    #[arg(short = 'd', long, value_name = "DIR")]
+    pub output_dir: Option<PathBuf>,
+    /// Replace damaged volumes without keeping numbered backups.
+    #[arg(long, conflicts_with = "output_dir")]
+    pub no_backup: bool,
+    /// Scratch directory for staging; defaults to the output directory.
+    #[arg(long)]
+    pub scratch_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct Par3InsideRemoveArgs {
+    #[command(flatten)]
+    pub inputs: Par3InsideArgs,
+    /// Directory for the stripped archives; required unless --in-place.
+    #[arg(
+        short = 'd',
+        long,
+        value_name = "DIR",
+        required_unless_present = "in_place"
+    )]
+    pub output_dir: Option<PathBuf>,
+    /// Replace each archive with its stripped original.
+    #[arg(long, conflicts_with = "output_dir")]
+    pub in_place: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -224,6 +356,65 @@ pub struct Par3CreateArgs {
     /// Flush buffers without requesting durable storage barriers.
     #[arg(long)]
     pub buffered: bool,
+}
+
+#[cfg(feature = "sevenz")]
+#[derive(Debug, Clone, Args)]
+pub struct Par3ArchiveArgs {
+    /// Output archive path.
+    pub output: PathBuf,
+    /// Files and directories to archive, relative to --base-path (defaults to current directory).
+    #[arg(required = true, num_args = 1..)]
+    pub inputs: Vec<PathBuf>,
+    /// Directory archive member names are relative to.
+    #[arg(long)]
+    pub base_path: Option<PathBuf>,
+    /// Archive format: 7z (LZMA2) or zip (deflate).
+    #[arg(long, value_enum, default_value_t = ArchiveFormat::SevenZ)]
+    pub format: ArchiveFormat,
+    /// Compression level, 0 (stored) to 9.
+    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(0..=9))]
+    pub level: u32,
+    /// Executable filter applied before compression; 7z only.
+    #[arg(long, value_enum, default_value_t = ArchiveFilter::None)]
+    pub filter: ArchiveFilter,
+    /// Compress every file on its own instead of as one solid block; 7z only.
+    #[arg(long)]
+    pub no_solid: bool,
+    /// Append the PAR3 set inside the archive, after its end header, instead of beside it.
+    #[arg(long, conflicts_with_all = ["block_size", "recovery_count"])]
+    pub inside: bool,
+    /// Logical block size in bytes for the sibling set; odd sizes are rounded up.
+    #[arg(short = 's', long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(40..))]
+    pub block_size: u64,
+    /// Number of recovery packets in the sibling set (defaults to one).
+    #[arg(short = 'c', long, conflicts_with = "recovery_percent")]
+    pub recovery_count: Option<u64>,
+    /// Recovery percentage of input blocks, rounded up; with --inside, 0 to 250, and 0 means one block.
+    #[arg(short = 'r', long, conflicts_with = "recovery_count")]
+    pub recovery_percent: Option<u32>,
+}
+
+#[cfg(feature = "sevenz")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ArchiveFormat {
+    #[value(name = "7z")]
+    SevenZ,
+    Zip,
+}
+
+#[cfg(feature = "sevenz")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ArchiveFilter {
+    None,
+    X86,
+    Arm,
+    ArmThumb,
+    Arm64,
+    Ia64,
+    Sparc,
+    Ppc,
+    Riscv,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

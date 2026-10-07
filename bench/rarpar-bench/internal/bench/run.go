@@ -3,6 +3,7 @@ package bench
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -15,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/procmeasure"
 )
 
 type RunOptions struct {
@@ -210,7 +213,10 @@ func executeSubject(ctx context.Context, role, label, binary string, manifest Co
 		return failedExecution(role, label, manifest, run, warmup, err)
 	}
 	phaseDiagnostics := warmup && manifest.Config.Family == "rar" && manifest.Config.Format == 5
-	measurement, stdout, stderr, err := timedCommand(ctx, binary, args, stage, true, phaseDiagnostics, options.Perf)
+	measurement, stdout, stderr, err := runTimed(ctx, binary, args, stage, true, phaseDiagnostics, options.Perf)
+	if err == nil {
+		err = requirePeakRSS(measurement)
+	}
 	if phaseDiagnostics {
 		measurement.RAR5Phases = collectRAR5PhaseDiagnostics(stdout, stderr)
 		measurement.RAR5Decode = collectRAR5DecodeDiagnostics(stdout, stderr)
@@ -255,7 +261,10 @@ func executeReference(ctx context.Context, reference BinaryIdentity, manifest Co
 	if err != nil {
 		return failedExecution("reference", reference.Label, manifest, run, warmup, err)
 	}
-	measurement, stdout, stderr, err := timedCommand(ctx, binary, args, stage, false, false, options.Perf)
+	measurement, stdout, stderr, err := runTimed(ctx, binary, args, stage, false, false, options.Perf)
+	if err == nil {
+		err = requirePeakRSS(measurement)
+	}
 	if err == nil && requiresValidation(manifest) {
 		validationStart := time.Now()
 		if isPAR2Generation(manifest) {
@@ -270,6 +279,16 @@ func executeReference(ctx context.Context, reference BinaryIdentity, manifest Co
 	}
 	successful = true
 	return Execution{Subject: reference.Label, Role: "reference", CaseID: manifest.ID, Family: manifest.Config.Family, Workload: manifest.Config.Workload, Run: run, Warmup: warmup, Success: true, CompiledCapability: "reference", Backend: "reference", Measurement: measurement}
+}
+
+// requirePeakRSS fails an execution whose tool exited cleanly but carries no
+// peak resident set: that is a harness measurement failure, recorded as a
+// failed sample rather than a silent zero.
+func requirePeakRSS(measurement Measurement) error {
+	if measurement.MaxRSSBytes > 0 {
+		return nil
+	}
+	return fmt.Errorf("%s: the tool exited but the harness recorded no peak RSS", procmeasure.FailureMissingRSS)
 }
 
 func stageCase(corpusRoot string, manifest CorpusCaseManifest, output, role string, run int) (string, func(), error) {
@@ -587,6 +606,14 @@ func validatePerfCollector(goos string, lookup func(string) (string, error)) err
 	return nil
 }
 
+// rssReportFD is the descriptor the rss-exec shim reports on under perf:
+// ExtraFiles[1], after perf's own log descriptor 3.
+const rssReportFD = 4
+
+func secondsToNanos(seconds float64) int64 {
+	return int64(math.Round(seconds * 1e9))
+}
+
 func perfStatArgs(program string, args []string) []string {
 	commandArgs := []string{
 		"stat",
@@ -600,26 +627,49 @@ func perfStatArgs(program string, args []string) []string {
 	return append(commandArgs, args...)
 }
 
+// runTimed is the timed launch; tests replace it to simulate a measurement
+// the harness failed to complete.
+var runTimed = timedCommand
+
 func timedCommand(ctx context.Context, program string, args []string, directory string, candidate, phaseDiagnostics, collectPerf bool) (Measurement, []byte, []byte, error) {
 	var command *exec.Cmd
 	var perfReader, perfWriter *os.File
+	var rssReader, rssWriter *os.File
 	if collectPerf {
 		perfPath, err := exec.LookPath("perf")
 		if err != nil {
 			return Measurement{CollectorNote: "instruction collector unavailable: opt-in Linux perf is not enabled", PerfCollectorNote: "perf stat collector unavailable: " + err.Error()}, nil, nil, err
 		}
+		// perf stat is the direct child here, so its rusage would be perf's
+		// (or the larger of perf's and the tool's): perf launches the rss-exec
+		// shim, which runs the tool and reports the tool's own rusage on fd 4.
+		self, err := os.Executable()
+		if err != nil {
+			return Measurement{CollectorNote: "instruction collector unavailable: opt-in Linux perf is not enabled", PerfCollectorNote: "perf stat collector unavailable: cannot locate the rss-exec shim: " + err.Error()}, nil, nil, err
+		}
 		perfReader, perfWriter, err = os.Pipe()
 		if err != nil {
 			return Measurement{CollectorNote: "instruction collector unavailable: opt-in Linux perf is not enabled", PerfCollectorNote: "perf stat collector unavailable: cannot create log pipe: " + err.Error()}, nil, nil, err
 		}
-		command = exec.CommandContext(ctx, perfPath, perfStatArgs(program, args)...)
-		command.ExtraFiles = []*os.File{perfWriter}
+		rssReader, rssWriter, err = os.Pipe()
+		if err != nil {
+			perfReader.Close()
+			perfWriter.Close()
+			return Measurement{CollectorNote: "instruction collector unavailable: opt-in Linux perf is not enabled", PerfCollectorNote: "perf stat collector unavailable: cannot create rss report pipe: " + err.Error()}, nil, nil, err
+		}
+		command = exec.CommandContext(ctx, perfPath, perfStatArgs(self, procmeasure.ShimArgs(rssReportFD, program, args))...)
+		command.ExtraFiles = []*os.File{perfWriter, rssWriter}
 	} else {
 		command = exec.CommandContext(ctx, program, args...)
 	}
+	// A cancelled run ends the whole tree: under perf that is perf, the
+	// rss-exec shim and the tool, not perf alone.
+	procmeasure.ConfigureKill(command)
 	if perfWriter != nil {
 		defer perfReader.Close()
 		defer perfWriter.Close()
+		defer rssReader.Close()
+		defer rssWriter.Close()
 	}
 	command.Dir = directory
 	command.Env = benchmarkCommandEnvironment(candidate, phaseDiagnostics)
@@ -631,7 +681,23 @@ func timedCommand(ctx context.Context, program string, args []string, directory 
 	command.Stdout = &stdout
 	command.Stderr = &stderr
 	started := time.Now()
-	err := command.Run()
+	var tracked procmeasure.Measurement
+	err := command.Start()
+	if err == nil {
+		tracker := procmeasure.Track(command, "")
+		if rssWriter != nil {
+			// Only the shim may hold the write end, so the read below ends
+			// when the shim exits.
+			rssWriter.Close()
+		}
+		err = command.Wait()
+		tracker.Finish(command, &tracked)
+		if errors.Is(err, exec.ErrWaitDelay) {
+			// The command itself exited; only an orphaned descendant still
+			// held the output pipes, which WaitDelay then closed.
+			err = nil
+		}
+	}
 	var perfOutput []byte
 	var perfReadErr error
 	if perfWriter != nil {
@@ -647,6 +713,20 @@ func timedCommand(ctx context.Context, program string, args []string, directory 
 	if command.ProcessState != nil && !collectPerf {
 		measurement.UserNanos = DurationNanos(command.ProcessState.UserTime())
 		measurement.SystemNanos = DurationNanos(command.ProcessState.SystemTime())
+		measurement.MaxRSSBytes = tracked.MaxRSSBytes
+		measurement.RSSSource = tracked.RSSSource
+	}
+	if command.ProcessState != nil && collectPerf && ctx.Err() == nil {
+		// The shim's report is the tool's own CPU time and peak. A cancelled
+		// run killed the shim with perf, so there is no report to read.
+		if report, reportErr := procmeasure.ReadShimReport(rssReader); reportErr == nil {
+			measurement.UserNanos = secondsToNanos(report.UserSeconds)
+			measurement.SystemNanos = secondsToNanos(report.SysSeconds)
+			measurement.MaxRSSBytes = report.MaxRSSBytes
+			measurement.RSSSource = report.RSSSource
+		} else if err == nil {
+			err = reportErr
+		}
 	}
 	var collectorErr error
 	if collectPerf {

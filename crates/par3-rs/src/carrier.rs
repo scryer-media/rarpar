@@ -30,6 +30,10 @@ pub enum CarrierRestoration {
     Exact,
     /// The caller explicitly requested a valid replacement carrier.
     Replacement,
+    /// The packet order and recovery indices follow from an authenticated
+    /// gap length and a fixed layout rule. Packets still available keep their
+    /// original hashes; missing ones are regenerated deterministically.
+    Derived,
 }
 
 /// Retained manifest and resource plan for one carrier.
@@ -258,6 +262,96 @@ impl CarrierPlan {
             scratch_rows: Self::count_recovery(&entries),
             entries,
             restoration: CarrierRestoration::Replacement,
+            bytes,
+            _reservation: reservation,
+        })
+    }
+
+    /// A carrier laid out by rule: `metadata`, a complete copy in its
+    /// original order, then one Recovery Data packet per index of `indices`
+    /// under the set's single Cauchy matrix. Available packets keep their
+    /// authenticated hashes; the rest are regenerated.
+    pub(crate) fn derived(
+        session: &mut Par3RepairSession,
+        metadata: Vec<Vec<u8>>,
+        indices: std::ops::Range<u64>,
+    ) -> EngineResult<Self> {
+        session.assess()?;
+        let set = session
+            .set
+            .as_ref()
+            .ok_or(EngineError::InvalidState("metadata is incomplete"))?;
+        let [matrix] = set.matrix_packets() else {
+            return Err(EngineError::Unsupported("derived carrier needs one matrix"));
+        };
+        if !matches!(matrix.body(), PacketBody::CauchyMatrix(_)) {
+            return Err(EngineError::Unsupported("derived carrier needs one matrix"));
+        }
+        let matrix = matrix.hash();
+        let cost = metadata
+            .iter()
+            .map(|packet| packet.len().saturating_mul(2).saturating_add(512))
+            .sum::<usize>()
+            .saturating_add((indices.end - indices.start) as usize * 512);
+        if cost > session.options.retained_bytes {
+            return Err(EngineError::budget_limit(
+                "retained derived carrier manifest",
+                cost,
+                session.options.retained_bytes,
+                session.options.retained_bytes,
+            ));
+        }
+        let reservation = session
+            .options
+            .memory
+            .reserve_as(MemoryCategory::Caches, cost)?;
+        let mut bytes = metadata
+            .iter()
+            .map(|packet| packet.len() as u64)
+            .sum::<u64>();
+        let mut entries: Vec<Entry> = metadata.into_iter().map(Entry::Metadata).collect();
+        // One pass over the payloads, not one per regenerated index.
+        let mut available = std::collections::BTreeMap::new();
+        for payload in session.input.payloads() {
+            if let PayloadKind::Recovery {
+                root,
+                matrix: packet_matrix,
+                index,
+            } = payload.kind()
+                && root == set.root_hash()
+                && packet_matrix == matrix
+                && indices.contains(&index)
+            {
+                available
+                    .entry(index)
+                    .or_insert_with(|| payload.packet_hash());
+            }
+        }
+        let mut known = true;
+        for index in indices {
+            let kind = PayloadKind::Recovery {
+                root: set.root_hash(),
+                matrix,
+                index,
+            };
+            let expected = available.get(&index).copied();
+            known &= expected.is_some();
+            entries.push(Entry::Payload {
+                kind,
+                length: set.block_size(),
+                expected,
+            });
+            bytes += set.block_size() + 88;
+        }
+        Ok(Self {
+            id: set.input_set_id(),
+            scratch_rows: Self::count_recovery(&entries),
+            entries,
+            restoration: if known {
+                CarrierRestoration::Exact
+            } else {
+                CarrierRestoration::Derived
+            },
             bytes,
             _reservation: reservation,
         })

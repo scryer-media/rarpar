@@ -205,7 +205,16 @@ pub struct CreationRequirements {
     pub cohorts: u64,
 }
 
-/// A plan retains metadata and source slices, never complete source blocks.
+/// Source bytes a plan kept from its hash pass, charged to the budget until
+/// the encode that reads them has run.
+struct ResidentSources {
+    sources: BTreeMap<SourceId, Vec<u8>>,
+    _reservation: Reservation,
+}
+
+/// A plan retains metadata and source slices. It holds complete sources only
+/// when all of them fit under the retained ceiling, and only until execution
+/// has encoded from them.
 pub struct CreationPlan {
     access: Arc<dyn SourceAccess>,
     options: CreationOptions,
@@ -227,6 +236,9 @@ pub struct CreationPlan {
     /// An embedded carrier keeps the single copy its container layout sized.
     repeat_metadata: bool,
     requirements: CreationRequirements,
+    /// Every source as the hash pass read it, when all of them fit; the
+    /// encode then reads them from here rather than from the provider.
+    resident: std::sync::Mutex<Option<ResidentSources>>,
     _reservation: Reservation,
 }
 
@@ -236,6 +248,12 @@ impl CreationPlan {
     /// File, quick-prefix, block, and tail hashes share one source pass; sliding
     /// deduplication additionally reads candidate windows. Forward readers are
     /// used when available, with at most one retained input handle per file.
+    ///
+    /// When every source fits beside the plan under
+    /// [`ExecutionOptions::retained_bytes`] and the budget has room for it,
+    /// the hash pass keeps the bytes it reads and execution encodes from
+    /// them, so each source is read once. Otherwise execution reads the
+    /// sources again. The packets and recovery data are the same either way.
     ///
     /// The inputs are stored in the reference's order — longest file tail
     /// (size modulo block size) first, then largest file, then name — whatever order `sources` lists
@@ -369,6 +387,26 @@ impl CreationPlan {
             }
         }
         let pool = pool.filter(|_| !ahead_buffers.is_empty());
+        // Taken after the planning buffers, so keeping the sources never
+        // narrows the hash pass.
+        let resident = match usize::try_from(source_bytes).ok().filter(|&bytes| {
+            bytes != 0
+                && estimate
+                    .checked_add(bytes)
+                    .is_some_and(|need| need <= options.execution.retained_bytes)
+        }) {
+            Some(bytes) => match options
+                .execution
+                .memory
+                .reserve_as(MemoryCategory::Caches, bytes)
+            {
+                Ok(reservation) => Some(reservation),
+                Err(EngineError::ResourceLimit(_)) => None,
+                Err(error) => return Err(error),
+            },
+            None => None,
+        };
+        let mut kept = BTreeMap::new();
         let mut files = Vec::new();
         let mut blocks: Vec<Block> = Vec::new();
         let mut full = BTreeMap::<Fingerprint, u64>::new();
@@ -423,6 +461,8 @@ impl CreationPlan {
                 position: 0,
                 file_hash: FingerprintHasher::new(),
                 quick_crc: RollingHasher::new(),
+                keep: (resident.is_some() && !kept.contains_key(&source.source))
+                    .then(|| vec![0; snapshot.len as usize]),
                 ahead: pool
                     .as_ref()
                     .filter(|_| snapshot.len >= crate::hash::PARALLEL_SOURCE_BYTES)
@@ -534,6 +574,9 @@ impl CreationPlan {
                 at += length;
             }
             ensure_snapshot(access.as_ref(), source.source, snapshot)?;
+            if let Some(bytes) = reader.keep.take() {
+                kept.insert(source.source, bytes);
+            }
             files.push(PlannedFile {
                 name: source.name.clone(),
                 source: source.source,
@@ -681,6 +724,10 @@ impl CreationPlan {
             data_volumes: Vec::new(),
             repeat_metadata: true,
             requirements,
+            resident: std::sync::Mutex::new(resident.map(|reservation| ResidentSources {
+                sources: kept,
+                _reservation: reservation,
+            })),
             _reservation: reservation,
         };
         plan.build_metadata()?;
@@ -848,6 +895,192 @@ impl CreationPlan {
         Ok(packet_bytes)
     }
 
+    /// Assemble one embedded file per host from its body view and an optional
+    /// tail view, planned in that order as `SourceId(2k)` and `SourceId(2k+1)`.
+    /// Each file becomes `body, gap, tail`: the gap is one unprotected chunk
+    /// holding a format prefix of `prefix(carrier)` bytes and then host `k`'s
+    /// carrier, which is the whole metadata and `counts[k]` recovery packets,
+    /// taken in host order from one contiguous recovery range. The file
+    /// fingerprint covers the body and the tail, so it is the fingerprint of
+    /// the host as it was before insertion. Returns each host's gap as
+    /// `(prefix, carrier)` lengths.
+    pub(crate) fn embedded_set_layout(
+        &mut self,
+        tails: &[bool],
+        counts: &[u64],
+        prefix: &dyn Fn(u64) -> u64,
+    ) -> EngineResult<Vec<(u64, u64)>> {
+        if self.options.codec != CreationCodec::Cauchy
+            || self.options.store_data
+            || tails.len() != counts.len()
+            || tails.is_empty()
+            || counts.iter().sum::<u64>() != self.options.recovery_count
+            || self.options.recovery_count == 0
+        {
+            return Err(EngineError::Unsupported("embedded creation geometry"));
+        }
+        let mut views: BTreeMap<SourceId, PlannedFile> = std::mem::take(&mut self.files)
+            .into_iter()
+            .map(|file| (file.source, file))
+            .collect();
+        let mut tail_views = Vec::new();
+        for (host, &tail) in tails.iter().enumerate() {
+            let mut file = views
+                .remove(&SourceId(2 * host as u64))
+                .ok_or(EngineError::InvalidState("embedded source views"))?;
+            let tail = if tail {
+                Some(
+                    views
+                        .remove(&SourceId(2 * host as u64 + 1))
+                        .ok_or(EngineError::InvalidState("embedded source views"))?,
+                )
+            } else {
+                None
+            };
+            // The quick hash covers the first 16 KiB of the host, which is
+            // the body only when the body reaches that far.
+            if file.snapshot.len < 16 * 1024 {
+                file.packet.quick_rolling_hash = 0;
+            }
+            file.packet
+                .chunks
+                .push(ChunkDescription::Unprotected { length: 1 });
+            if let Some(tail) = &tail {
+                file.packet
+                    .chunks
+                    .extend(tail.packet.chunks.iter().cloned());
+            }
+            tail_views.push(tail);
+            self.files.push(file);
+        }
+        if !views.is_empty() {
+            return Err(EngineError::InvalidState("embedded source views"));
+        }
+        let size = self.options.execution.stripe_bytes.min(64 << 10);
+        let _memory = self
+            .options
+            .execution
+            .memory
+            .reserve_as(MemoryCategory::OutputStaging, size)?;
+        let mut buffer = vec![0; size];
+        for (file, tail) in self.files.iter_mut().zip(&tail_views) {
+            let Some(tail) = tail else { continue };
+            // The fingerprint of body and tail together needs the body again.
+            let mut hash = FingerprintHasher::new();
+            for (source, snapshot) in [(file.source, file.snapshot), (tail.source, tail.snapshot)] {
+                let mut at = 0;
+                while at < snapshot.len {
+                    self.options.execution.cancel.check()?;
+                    let take = (snapshot.len - at).min(size as u64) as usize;
+                    read_exact_at(
+                        &self.options.execution.diagnostics,
+                        self.access.as_ref(),
+                        source,
+                        at,
+                        &mut buffer[..take],
+                    )?;
+                    hash.update(&buffer[..take]);
+                    at += take as u64;
+                }
+                ensure_snapshot(self.access.as_ref(), source, snapshot)?;
+            }
+            file.packet.fingerprint = hash.finalize();
+        }
+        self.build_metadata()?;
+        let metadata_size = self.requirements.metadata_bytes;
+        let packet = self
+            .options
+            .block_size
+            .checked_add(88)
+            .ok_or(EngineError::resource_limit("embedded packet bytes"))?;
+        let mut gaps = Vec::with_capacity(counts.len());
+        for (file, &count) in self.files.iter_mut().zip(counts) {
+            let carrier = packet
+                .checked_mul(count)
+                .and_then(|bytes| bytes.checked_add(metadata_size))
+                .ok_or(EngineError::resource_limit("embedded packet bytes"))?;
+            let lead = prefix(carrier);
+            let gap = file
+                .packet
+                .chunks
+                .iter_mut()
+                .find(|chunk| matches!(chunk, ChunkDescription::Unprotected { .. }))
+                .expect("planned gap");
+            *gap = ChunkDescription::Unprotected {
+                length: lead
+                    .checked_add(carrier)
+                    .ok_or(EngineError::resource_limit("embedded gap"))?,
+            };
+            gaps.push((lead, carrier));
+        }
+        self.build_metadata()?;
+        if self.requirements.metadata_bytes != metadata_size {
+            return Err(EngineError::InvalidState(
+                "embedded metadata length changed",
+            ));
+        }
+        self.repeat_metadata = false;
+        self.volumes.clear();
+        self.data_volumes.clear();
+        self.requirements.output_sizes.clear();
+        let mut first = self.options.first_recovery;
+        for &count in counts {
+            self.volumes.push((first, count));
+            self.requirements
+                .output_sizes
+                .push(packet * count + metadata_size);
+            first += count;
+        }
+        self.requirements.source_bytes = self
+            .files
+            .iter()
+            .flat_map(|file| file.packet.chunks.iter())
+            .try_fold(0u64, |total, chunk| total.checked_add(chunk.length()))
+            .ok_or(EngineError::resource_limit("embedded file length"))?;
+        Ok(gaps)
+    }
+
+    /// Encode once and write host `k`'s carrier, its metadata and then its
+    /// recovery packets, to `outs[k]`, after `before(k)` has run. Sources are
+    /// checked as [`Self::execute`] checks them.
+    pub(crate) fn write_embedded_set<W: Write>(
+        &self,
+        outs: &mut [W],
+        scratch_directory: &Path,
+        mut before: impl FnMut(usize, &mut W) -> EngineResult<()>,
+        mut after: impl FnMut(usize, &mut W) -> EngineResult<()>,
+    ) -> EngineResult<()> {
+        let _progress = self
+            .options
+            .execution
+            .stage(crate::runtime::Stage::Create)?;
+        if self.volumes.len() != outs.len() || !self.data_volumes.is_empty() {
+            return Err(EngineError::InvalidState("embedded carrier layout"));
+        }
+        for file in &self.files {
+            ensure_snapshot(self.access.as_ref(), file.source, file.snapshot)?;
+        }
+        let mut spool = self.encode(scratch_directory)?;
+        for (index, out) in outs.iter_mut().enumerate() {
+            before(index, out)?;
+            self.write_output(index + 1, &mut spool, out)?;
+            after(index, out)?;
+        }
+        drop(spool);
+        for file in &self.files {
+            ensure_snapshot(self.access.as_ref(), file.source, file.snapshot)?;
+        }
+        Ok(())
+    }
+
+    /// Each embedded file's fingerprint, in host order.
+    pub(crate) fn embedded_fingerprints(&self) -> Vec<[u8; 16]> {
+        self.files
+            .iter()
+            .map(|file| file.packet.fingerprint)
+            .collect()
+    }
+
     /// Execute into explicit local output and scratch directories. Existing
     /// destinations are never replaced. Every carrier is staged and authenticated
     /// before installation; scratch storage is removed after success.
@@ -909,7 +1142,7 @@ impl CreationPlan {
                 Err(error) => return Err(error.into()),
             }
         }
-        let mut spool = self.encode(scratch_directory)?;
+        let mut spool = self.encode_sources(scratch_directory)?;
         // The spool is scratch this process reads back and deletes; no policy
         // makes it durable.
         let mut staged = Vec::new();
@@ -954,6 +1187,7 @@ impl CreationPlan {
             staged.push(temporary);
         }
         drop(spool);
+        self.release_resident();
         for file in &self.files {
             ensure_snapshot(self.access.as_ref(), file.source, file.snapshot)?;
         }
@@ -976,6 +1210,32 @@ impl CreationPlan {
             progress.advance(1);
         }
         Ok(destinations)
+    }
+
+    /// [`Self::encode`], from the resident sources when the plan kept them.
+    /// An encode the budget refuses beside them runs again reading the
+    /// sources, so keeping them never refuses a creation. They stay only
+    /// while data carriers still need their blocks.
+    fn encode_sources(&self, scratch_directory: &Path) -> EngineResult<RecoverySpool> {
+        let spool = match self.encode(scratch_directory) {
+            Err(EngineError::ResourceLimit(_)) if self.release_resident() => {
+                self.encode(scratch_directory)
+            }
+            spool => spool,
+        }?;
+        if self.data_volumes.is_empty() {
+            self.release_resident();
+        }
+        Ok(spool)
+    }
+
+    /// Drop the resident sources, returning whether there were any.
+    fn release_resident(&self) -> bool {
+        self.resident
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .is_some()
     }
 
     /// Encode the recovery rows into a spool: resident when they fit the
@@ -1162,9 +1422,10 @@ impl CreationPlan {
         for file in &self.files {
             ensure_snapshot(self.access.as_ref(), file.source, file.snapshot)?;
         }
-        let mut spool = self.encode(scratch_directory)?;
+        let mut spool = self.encode_sources(scratch_directory)?;
         self.write_output(1, &mut spool, out)?;
         drop(spool);
+        self.release_resident();
         for file in &self.files {
             ensure_snapshot(self.access.as_ref(), file.source, file.snapshot)?;
         }
@@ -1179,7 +1440,9 @@ impl CreationPlan {
 
     /// Read one stripe of an input block. Each piece read is checked against
     /// its snapshot afterwards, or, given `owed`, recorded there for the
-    /// caller to settle before writing anything derived from it.
+    /// caller to settle before writing anything derived from it. A resident
+    /// source is copied from the bytes the plan hashed, and execution checks
+    /// its snapshot before and after.
     fn read_block(
         &self,
         index: usize,
@@ -1188,10 +1451,23 @@ impl CreationPlan {
         owed: Option<&OwedChecks>,
     ) -> EngineResult<()> {
         out.fill(0);
+        let resident = self
+            .resident
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for piece in &self.blocks[index].pieces {
             let start = offset.max(piece.offset);
             let end = (offset + out.len() as u64).min(piece.offset + piece.length);
             if start >= end {
+                continue;
+            }
+            if let Some(bytes) = resident
+                .as_ref()
+                .and_then(|resident| resident.sources.get(&piece.source))
+            {
+                let at = (piece.at + start - piece.offset) as usize;
+                out[(start - offset) as usize..(end - offset) as usize]
+                    .copy_from_slice(&bytes[at..at + (end - start) as usize]);
                 continue;
             }
             // Only a check after the read vouches for the bytes; a failed
@@ -1486,18 +1762,25 @@ impl CreationPlan {
         scratch_directory: &Path,
     ) -> EngineResult<RecoverySpool> {
         let memory = &self.options.execution.memory;
-        if let Ok(bytes) = usize::try_from(self.requirements.scratch_bytes)
-            && bytes
-                .checked_add(encode)
-                .and_then(|need| need.checked_add(self.carrier_stage_bytes()))
-                .is_some_and(|need| need <= memory.available())
-            && let Ok(reservation) = memory.reserve_as(MemoryCategory::OutputStaging, bytes)
-        {
-            tracing::debug!(bytes, "PAR3 recovery rows held resident");
-            return Ok(RecoverySpool::Memory {
-                rows: vec![0; bytes],
-                _reservation: reservation,
-            });
+        // Resident sources never push the rows out to a scratch file: rows
+        // that would fit without them are kept, and the sources read again.
+        loop {
+            if let Ok(bytes) = usize::try_from(self.requirements.scratch_bytes)
+                && bytes
+                    .checked_add(encode)
+                    .and_then(|need| need.checked_add(self.carrier_stage_bytes()))
+                    .is_some_and(|need| need <= memory.available())
+                && let Ok(reservation) = memory.reserve_as(MemoryCategory::OutputStaging, bytes)
+            {
+                tracing::debug!(bytes, "PAR3 recovery rows held resident");
+                return Ok(RecoverySpool::Memory {
+                    rows: vec![0; bytes],
+                    _reservation: reservation,
+                });
+            }
+            if !self.release_resident() {
+                break;
+            }
         }
         let path = crate::session_repair::ScratchFile::new(
             &scratch_directory.join("recovery-spool"),
@@ -2128,8 +2411,17 @@ struct PlanningReader<'a> {
     position: u64,
     file_hash: FingerprintHasher,
     quick_crc: RollingHasher,
+    /// The whole source, filled as it is read, when the plan keeps it.
+    keep: Option<Vec<u8>>,
     /// Set only while a pool is held; otherwise every read is the walk's own.
     ahead: Option<HashAhead<'a>>,
+}
+
+/// Copy bytes just read at `start` into the kept source, if there is one.
+fn keep_read(keep: &mut Option<Vec<u8>>, start: u64, bytes: &[u8]) {
+    if let Some(keep) = keep {
+        keep[start as usize..start as usize + bytes.len()].copy_from_slice(bytes);
+    }
 }
 
 /// Fill `out` from `start`, through the forward reader while it lasts and
@@ -2308,6 +2600,7 @@ impl PlanningReader<'_> {
             start,
             out,
         )?;
+        keep_read(&mut self.keep, start, out);
         self.file_hash.update(out);
         let quick = (16384u64.saturating_sub(start)).min(out.len() as u64) as usize;
         self.quick_crc.update(&out[..quick]);
@@ -2430,8 +2723,12 @@ impl PlanningReader<'_> {
     fn step(&mut self) -> EngineResult<()> {
         let (access, source, options, len) =
             (self.access, self.source, self.options, self.snapshot.len);
-        let forward = &mut self.forward;
-        let mut read = |at: u64, out: &mut [u8]| fetch(access, source, options, forward, at, out);
+        let (forward, keep) = (&mut self.forward, &mut self.keep);
+        let mut read = |at: u64, out: &mut [u8]| {
+            fetch(access, source, options, forward, at, out)?;
+            keep_read(keep, at, out);
+            Ok(())
+        };
         let file_hash = &mut self.file_hash;
         let quick_crc = &mut self.quick_crc;
         let ahead = self.ahead.as_mut().expect("pooled planning");

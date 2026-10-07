@@ -1,6 +1,6 @@
 //go:build !windows
 
-package par3bench
+package procmeasure
 
 import (
 	"os"
@@ -68,9 +68,9 @@ func configureKill(cmd *exec.Cmd) {
 	}
 }
 
-func rssSource() string {
-	if runtime.GOOS == "darwin" {
-		return "rusage ru_maxrss, bytes"
-	}
-	return "rusage ru_maxrss, KiB"
-}
+// NativeRSSSource is where Run and Track read the peak resident set here.
+const NativeRSSSource = RSSSourceRusage
+
+const nativeRSSSource = NativeRSSSource
+
+func closeOnExec(fd int) { syscall.CloseOnExec(fd) }

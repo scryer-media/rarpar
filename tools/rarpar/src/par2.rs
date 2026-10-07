@@ -51,6 +51,10 @@ struct ResolvedPar2Input {
     primary_dir: PathBuf,
     search_dirs: Vec<PathBuf>,
     placement: ParPlacement,
+    /// The set as resolution already scanned it, so the flow does not read and
+    /// hash every volume a second time. `None` when resolution could not
+    /// parse it; the flow then scans again and reports why.
+    scanned: Option<par2_rs::Par2FileSet>,
 }
 
 pub fn run_command(cli: &Cli, command: ParCommand) -> Result<u8, RarparError> {
@@ -64,8 +68,8 @@ pub fn run_command(cli: &Cli, command: ParCommand) -> Result<u8, RarparError> {
         ParCommand::Repair(args) => ("repair", true, args),
         ParCommand::Create(_) => unreachable!("create handled above"),
     };
-    let resolved = resolve_input(cli, &args)?;
-    let outcome = run_flow(&resolved, repair, cli.dry_run, cli.quiet || cli.json)?;
+    let mut resolved = resolve_input(cli, &args)?;
+    let outcome = run_flow(&mut resolved, repair, cli.dry_run, cli.quiet || cli.json)?;
     emit_command_outcome(cli, command_name, &outcome)?;
     Ok(if outcome.success {
         EXIT_SUCCESS
@@ -281,13 +285,24 @@ fn emit_command_outcome(
     Ok(())
 }
 
+/// par2cmdline's exit code for a command line it rejects.
+const PAR2CMDLINE_INVALID_COMMAND_LINE: u8 = 3;
+
 /// Accept a `par2 r [options] PARFILE WILDCARD` invocation directly.
 ///
-/// This is deliberately limited to repair mode; Rarpar's documented `par`
-/// subcommands remain the general-purpose interface.
+/// The facade is consumer-side only and deliberately limited to repair mode:
+/// creation stays with `rarpar par create`, and Rarpar's documented `par`
+/// subcommands remain the general-purpose interface. A par2cmdline `c` or `v`
+/// command line naming a `.par2` file, and a create-only switch given to `r`,
+/// are refused with par2cmdline's invalid-command-line code.
 pub fn dispatch_par2cmdline_compat(args: &[OsString]) -> Option<u8> {
+    if let Some(message) = refused_par2cmdline_invocation(args) {
+        eprintln!("{message}");
+        return Some(PAR2CMDLINE_INVALID_COMMAND_LINE);
+    }
     let input = parse_par2cmdline_repair_input(args)?;
-    let resolved = match resolve_compat_input(&input.par2_path, input.base_dir, input.wildcard) {
+    let mut resolved = match resolve_compat_input(&input.par2_path, input.base_dir, input.wildcard)
+    {
         Ok(resolved) => resolved,
         Err(error) => {
             eprintln!("rarpar: {error}");
@@ -296,7 +311,7 @@ pub fn dispatch_par2cmdline_compat(args: &[OsString]) -> Option<u8> {
         }
     };
 
-    match run_flow(&resolved, true, false, true) {
+    match run_flow(&mut resolved, true, false, true) {
         Ok(outcome) => {
             emit_par2cmdline_outcome(&outcome);
             Some(if outcome.success {
@@ -311,6 +326,60 @@ pub fn dispatch_par2cmdline_compat(args: &[OsString]) -> Option<u8> {
             Some(error.exit_code())
         }
     }
+}
+
+/// The refusal message for a par2cmdline command line the facade claims but
+/// does not run, or `None` to let the command line through.
+fn refused_par2cmdline_invocation(args: &[OsString]) -> Option<String> {
+    let command = args.first()?.to_str()?.to_ascii_lowercase();
+    let names_par2 = || {
+        args[1..].iter().any(|arg| {
+            Path::new(arg)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("par2"))
+        })
+    };
+    match command.as_str() {
+        "c" | "create" if names_par2() => {
+            return Some(format!(
+                "rarpar does not create PAR2 files through the par2cmdline facade ({command} is not supported); use `rarpar par create`."
+            ));
+        }
+        "v" | "verify" if names_par2() => {
+            return Some(format!(
+                "rarpar does not verify through the par2cmdline facade ({command} is not supported); use `rarpar par verify`."
+            ));
+        }
+        "r" if names_par2() => {}
+        _ => return None,
+    }
+    // par2cmdline reads options up to the first argument that is not one,
+    // and rejects the create-only switches when it is not creating.
+    let mut options = args[1..].iter().map(|arg| arg.to_string_lossy());
+    while let Some(option) = options.next() {
+        let Some(switch) = option.strip_prefix('-') else {
+            break;
+        };
+        let message = match switch.chars().next() {
+            Some('b') => "Cannot specify block count unless creating.",
+            Some('s') => "Cannot specify block size unless creating.",
+            Some('r') => "Cannot specify redundancy unless creating.",
+            Some('c') => "Cannot specify recovery block count unless creating.",
+            Some('f') => "Cannot specify first block number unless creating.",
+            Some('u') => "Cannot specify uniform files unless creating.",
+            Some('l') => "Cannot specify limit files unless creating.",
+            Some('n') => "Cannot specify recovery file count unless creating.",
+            Some('R') => "Cannot specific Recursive unless creating.",
+            Some('-') if switch == "-" => break,
+            Some('B' | 'a') if switch.len() == 1 => {
+                options.next();
+                continue;
+            }
+            _ => continue,
+        };
+        return Some(message.to_owned());
+    }
+    None
 }
 
 struct Par2cmdlineRepairInput {
@@ -366,10 +435,12 @@ fn resolve_compat_input(
         return Err(RarparError::MissingInput(input.to_path_buf()));
     }
 
-    let par2_paths = discover_compat_par2_paths(input, wildcard.as_deref())?;
-    let set_id = par2_rs::Par2FileSet::from_paths(&par2_paths)
-        .map(|set| set.recovery_set_id.to_string())
-        .unwrap_or_else(|_| format!("par2:{}", input.display()));
+    let (par2_paths, seed) = discover_compat_par2_paths(input, wildcard.as_deref())?;
+    let scanned = scan_discovered_set(&par2_paths, seed);
+    let set_id = scanned.as_ref().map_or_else(
+        || format!("par2:{}", input.display()),
+        |set| set.recovery_set_id.to_string(),
+    );
     let primary_dir = base_dir.unwrap_or_else(|| {
         input
             .parent()
@@ -384,6 +455,7 @@ fn resolve_compat_input(
         primary_dir,
         search_dirs: Vec::new(),
         placement: ParPlacement::Smart,
+        scanned,
     })
 }
 
@@ -405,7 +477,7 @@ fn emit_par2cmdline_outcome(outcome: &ParOutcome) {
 }
 
 pub fn repair_set(cli: &Cli, set: &Par2Set) -> Result<ParOutcome, RarparError> {
-    let resolved = ResolvedPar2Input {
+    let mut resolved = ResolvedPar2Input {
         set_id: set.id.clone(),
         par2_paths: set.paths.clone(),
         primary_dir: cli
@@ -414,12 +486,13 @@ pub fn repair_set(cli: &Cli, set: &Par2Set) -> Result<ParOutcome, RarparError> {
             .unwrap_or_else(|| set.base_dir.clone()),
         search_dirs: cli.search_dir.clone(),
         placement: cli.par_placement,
+        scanned: None,
     };
-    run_flow(&resolved, true, false, cli.quiet || cli.json)
+    run_flow(&mut resolved, true, false, cli.quiet || cli.json)
 }
 
 fn run_flow(
-    resolved: &ResolvedPar2Input,
+    resolved: &mut ResolvedPar2Input,
     repair: bool,
     dry_run: bool,
     quiet: bool,
@@ -436,7 +509,11 @@ fn run_flow(
     let _cache_retention = repair.then(par2_rs::CacheEvictionDeferral::acquire);
 
     let load_started = std::time::Instant::now();
-    let par2_set = par2_rs::Par2FileSet::from_paths(&resolved.par2_paths)?;
+    let par2_set = match resolved.scanned.take() {
+        Some(set) => set,
+        None => par2_rs::Par2FileSet::from_paths(&resolved.par2_paths)?,
+    };
+    let resolved = &*resolved;
     info!(
         elapsed_ms = load_started.elapsed().as_secs_f64() * 1_000.0,
         "PAR2 set loaded"
@@ -597,14 +674,17 @@ fn resolve_input(cli: &Cli, args: &ParArgs) -> Result<ResolvedPar2Input, RarparE
         return Err(RarparError::MissingInput(args.input.clone()));
     }
 
-    let par2_paths = if args.input.is_dir() {
-        collect_par2_paths_from_dir(&args.input)?
+    let (par2_paths, seed) = if args.input.is_dir() {
+        (collect_par2_paths_from_dir(&args.input)?, None)
     } else {
-        discover_matching_par2_paths(&args.input)?
+        let (paths, seed) = discover_matching_par2_paths(&args.input)?;
+        (paths, Some(seed))
     };
-    let set_id = par2_rs::Par2FileSet::from_paths(&par2_paths)
-        .map(|set| set.recovery_set_id.to_string())
-        .unwrap_or_else(|_| format!("par2:{}", args.input.display()));
+    let scanned = scan_discovered_set(&par2_paths, seed);
+    let set_id = scanned.as_ref().map_or_else(
+        || format!("par2:{}", args.input.display()),
+        |set| set.recovery_set_id.to_string(),
+    );
 
     let primary_dir = cli.working_dir.clone().unwrap_or_else(|| {
         if args.input.is_dir() {
@@ -628,6 +708,7 @@ fn resolve_input(cli: &Cli, args: &ParArgs) -> Result<ResolvedPar2Input, RarparE
         primary_dir,
         search_dirs,
         placement: cli.par_placement,
+        scanned,
     })
 }
 
@@ -659,12 +740,22 @@ fn collect_par2_paths_from_dir(dir: &Path) -> Result<Vec<PathBuf>, RarparError> 
     Ok(par2_paths)
 }
 
+/// The parse of the named `.par2` that volume discovery makes, with that
+/// file's spelling in the discovered path list (`None` when the list does not
+/// hold it).
+type SeedParse = (Option<PathBuf>, par2_rs::Par2FileSet);
+
+/// The discovered paths, and the seed parse when discovery made one, so the
+/// caller can build the full set without parsing the seed file again.
+type DiscoveredPar2Paths = (Vec<PathBuf>, Option<SeedParse>);
+
 fn discover_compat_par2_paths(
     input: &Path,
     wildcard: Option<&Path>,
-) -> Result<Vec<PathBuf>, RarparError> {
+) -> Result<DiscoveredPar2Paths, RarparError> {
     let Some(wildcard) = wildcard else {
-        return discover_matching_par2_paths(input);
+        let (paths, seed) = discover_matching_par2_paths(input)?;
+        return Ok((paths, Some(seed)));
     };
     let parent = wildcard
         .parent()
@@ -686,24 +777,113 @@ fn discover_compat_par2_paths(
         .collect::<Vec<_>>();
     par2_paths.sort();
     if par2_paths.is_empty() {
-        return discover_matching_par2_paths(input);
+        let (paths, seed) = discover_matching_par2_paths(input)?;
+        return Ok((paths, Some(seed)));
     }
-    Ok(par2_paths)
+    Ok((par2_paths, None))
 }
 
-fn discover_matching_par2_paths(input: &Path) -> Result<Vec<PathBuf>, RarparError> {
+/// The full set over `paths`, reusing `seed` (the parse of one of them that
+/// volume discovery already made) when it is the only path.
+///
+/// With other volumes the whole list is parsed once more, seed included: one
+/// packet builder sees every packet (an IFSC whose description sits in
+/// another volume is kept) and one budget meters the combined inventory.
+/// Two finalized parses cannot be unioned faithfully. `None` keeps the
+/// caller's lazy re-parse, which reports the error.
+fn scan_discovered_set(paths: &[PathBuf], seed: Option<SeedParse>) -> Option<par2_rs::Par2FileSet> {
+    if let Some((Some(seed_path), seed)) = seed
+        && paths.iter().all(|path| *path == seed_path)
+    {
+        return Some(seed);
+    }
+    par2_rs::Par2FileSet::from_paths(paths).ok()
+}
+
+fn discover_matching_par2_paths(input: &Path) -> Result<(Vec<PathBuf>, SeedParse), RarparError> {
     let seed_set = par2_rs::Par2FileSet::from_paths(&[input])?;
     let parent = input
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let mut par2_paths = par2_rs::identify_par2_files(parent, &seed_set.recovery_set_id)?;
+    let mut par2_paths = identify_set_volumes(parent, &seed_set)?;
     if par2_paths.is_empty() {
         par2_paths.push(input.to_path_buf());
     }
     par2_paths.sort();
     par2_paths.dedup();
-    Ok(par2_paths)
+    // Discovery lists the input under the directory it scanned, which need
+    // not be the caller's spelling (`./set.par2` for `set.par2`).
+    let listed = input.file_name().map(|name| parent.join(name));
+    let seed_path = [listed.as_deref(), Some(input)]
+        .into_iter()
+        .flatten()
+        .find(|candidate| par2_paths.iter().any(|path| path == candidate))
+        .map(Path::to_path_buf);
+    Ok((par2_paths, (seed_path, seed_set)))
+}
+
+/// [`par2_rs::identify_par2_files`] without opening the files the seed set
+/// protects at lengths no PAR2 volume can have, as
+/// [`par2_rs::identify_par2_files_for_set`] does. Any other sibling may be a
+/// renamed volume and has its first header read: a file at a protected name
+/// and its recorded length is skipped unread only when that length is under
+/// a packet header or not a multiple of 4, which spares an open and a read
+/// per such data file before verification reads it in full.
+fn identify_set_volumes(
+    dir: &Path,
+    seed: &par2_rs::Par2FileSet,
+) -> Result<Vec<PathBuf>, RarparError> {
+    use std::io::Read;
+    const HEADER_SIZE: usize = 64;
+    let protected: std::collections::HashMap<&str, u64> = seed
+        .files
+        .values()
+        .map(|description| (description.filename.as_str(), description.length))
+        .collect();
+    let mut matches = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if name.starts_with(".swap.")
+            || name.starts_with(".chunk.")
+            || name.starts_with(".weaver-par2-repair")
+            || name.contains(".weaver-par2-backup.")
+        {
+            continue;
+        }
+        let path = entry.path();
+        // The entry's type does not follow links; a link still counts when it
+        // names a regular file, as `Path::is_file` decides.
+        let kind = entry.file_type()?;
+        if !(kind.is_file() || (kind.is_symlink() && path.is_file())) {
+            continue;
+        }
+        // Every PAR2 packet is at least a header long and a multiple of 4
+        // bytes, so a whole volume is too: a protected file at a length no
+        // volume can have is skipped unread, and any other is sniffed, since
+        // an obfuscated volume can sit at a missing file's name and length.
+        if let Some(&length) = protected.get(name)
+            && std::fs::metadata(&path)?.len() == length
+            && (length < HEADER_SIZE as u64 || !length.is_multiple_of(4))
+        {
+            continue;
+        }
+        let mut header = Vec::with_capacity(HEADER_SIZE);
+        std::fs::File::open(&path)?
+            .take(HEADER_SIZE as u64)
+            .read_to_end(&mut header)?;
+        if header.len() == HEADER_SIZE
+            && let Ok(parsed) = par2_rs::PacketHeader::parse(&header, 0)
+            && parsed.recovery_set_id == seed.recovery_set_id
+        {
+            matches.push(path);
+        }
+    }
+    Ok(matches)
 }
 
 fn wildcard_match(pattern: &str, text: &str) -> bool {
@@ -948,4 +1128,264 @@ fn is_ext(path: &Path, expected: &str) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case(expected))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refused(args: &[&str]) -> Option<String> {
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        refused_par2cmdline_invocation(&args)
+    }
+
+    #[test]
+    fn par2cmdline_facade_refuses_the_create_side() {
+        assert!(
+            refused(&["c", "set.par2", "a"])
+                .unwrap()
+                .contains("(c is not supported)")
+        );
+        assert!(
+            refused(&["create", "-r10", "set.par2", "a"])
+                .unwrap()
+                .contains("(create is not supported)")
+        );
+        assert!(
+            refused(&["v", "set.par2"])
+                .unwrap()
+                .contains("(v is not supported)")
+        );
+        assert!(
+            refused(&["verify", "set.par2"])
+                .unwrap()
+                .contains("(verify is not supported)")
+        );
+        assert_eq!(
+            refused(&["r", "-q", "-s100", "set.par2"]).as_deref(),
+            Some("Cannot specify block size unless creating.")
+        );
+        assert_eq!(
+            refused(&["r", "-B", "-r", "-n2", "set.par2"]).as_deref(),
+            Some("Cannot specify recovery file count unless creating."),
+            "a bare -B takes the next argument as its path"
+        );
+    }
+
+    #[test]
+    fn par2cmdline_facade_keeps_the_repair_options() {
+        for args in [
+            &["r", "set.par2"][..],
+            &[
+                "r", "-N", "-p", "-q", "-m512", "-t4", "-B", "base", "set.par2", "*",
+            ],
+            &["r", "-v", "-v", "set.par2"],
+            // Options end at the first non-option, and at `--`.
+            &["r", "set.par2", "-s100"],
+            &["r", "--", "-s100", "set.par2"],
+        ] {
+            assert_eq!(refused(args), None, "{args:?}");
+        }
+        // Without a PAR2 argument the command line is not par2cmdline's.
+        assert_eq!(refused(&["c", "archive.rar", "file"]), None);
+        assert_eq!(refused(&["v", "archive.rar"]), None);
+    }
+
+    /// A small PAR2 set in `dir`: three protected files and recovery volumes.
+    fn create_small_set(dir: &Path) -> (Vec<PathBuf>, par2_rs::Par2CreateOutcome) {
+        create_small_set_of(dir, 3000)
+    }
+
+    /// As [`create_small_set`], with protected files of `length` bytes.
+    fn create_small_set_of(
+        dir: &Path,
+        length: usize,
+    ) -> (Vec<PathBuf>, par2_rs::Par2CreateOutcome) {
+        let mut sources = Vec::new();
+        for (index, name) in [
+            "orchard-notes.part1.bin",
+            "orchard-notes.part2.bin",
+            "orchard-notes.part3.bin",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = dir.join(name);
+            std::fs::write(&path, vec![0x31 + index as u8; length]).unwrap();
+            sources.push(path);
+        }
+        let mut options = Par2CreatorOptions::with_output(
+            dir.join("orchard-notes.par2"),
+            Some(dir.to_path_buf()),
+            sources.clone(),
+        );
+        options.block_sizing = BlockSizing::Bytes(512);
+        options.recovery_amount = RecoveryAmount::Count(6);
+        let creator = Par2Creator::new(options);
+        let plan = creator.plan().unwrap();
+        let outcome = creator.create(&plan).unwrap();
+        assert!(
+            outcome.volume_paths.len() >= 2,
+            "{:?}",
+            outcome.volume_paths
+        );
+        (sources, outcome)
+    }
+
+    /// When the named `.par2` is the set's only file, discovery's parse of it
+    /// is the full set: the file is not opened again (it is unreadable here
+    /// by then).
+    #[cfg(unix)]
+    #[test]
+    fn a_lone_named_par2_is_not_parsed_twice() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let (_, outcome) = create_small_set(temp.path());
+        for volume in &outcome.volume_paths {
+            std::fs::remove_file(volume).unwrap();
+        }
+        let (paths, seed) = discover_matching_par2_paths(&outcome.main_path).unwrap();
+        assert_eq!(paths, std::slice::from_ref(&outcome.main_path));
+        let reference = par2_rs::Par2FileSet::from_paths(&paths).unwrap();
+
+        std::fs::set_permissions(&outcome.main_path, std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        if std::fs::File::open(&outcome.main_path).is_ok() {
+            return;
+        }
+        let set = scan_discovered_set(&paths, Some(seed)).expect("built without the named file");
+        assert_eq!(set.recovery_set_id, reference.recovery_set_id);
+        assert_eq!(set.slice_checksums.len(), reference.slice_checksums.len());
+    }
+
+    /// The whole packets of a PAR2 file whose type passes `keep`, in order.
+    fn packets_of(path: &Path, keep: impl Fn(&par2_rs::PacketType) -> bool) -> Vec<u8> {
+        let bytes = std::fs::read(path).unwrap();
+        let mut out = Vec::new();
+        let mut offset = 0;
+        while offset + 64 <= bytes.len() {
+            let header = par2_rs::PacketHeader::parse(&bytes[offset..offset + 64], 0).unwrap();
+            let end = offset + header.length as usize;
+            if keep(&header.packet_type) {
+                out.extend_from_slice(&bytes[offset..end]);
+            }
+            offset = end;
+        }
+        out
+    }
+
+    /// Metadata split across files (the named `.par2` holds the file
+    /// descriptions, a volume holds their slice checksums) is all kept: the
+    /// checksums are not dropped for lack of a description in their own file.
+    #[test]
+    fn slice_checksums_described_in_the_named_par2_are_kept() {
+        use par2_rs::PacketType;
+        let temp = tempfile::tempdir().unwrap();
+        let (_, outcome) = create_small_set(temp.path());
+        let index = packets_of(&outcome.main_path, |kind| {
+            matches!(kind, PacketType::Main | PacketType::FileDescription)
+        });
+        let checksums = packets_of(&outcome.main_path, |kind| {
+            matches!(kind, PacketType::Main | PacketType::InputFileSliceChecksum)
+        });
+        let (kept, removed) = outcome.volume_paths.split_first().unwrap();
+        let mut volume = checksums;
+        volume.extend(packets_of(kept, |kind| {
+            matches!(kind, PacketType::RecoverySlice)
+        }));
+        for path in removed {
+            std::fs::remove_file(path).unwrap();
+        }
+        std::fs::write(&outcome.main_path, index).unwrap();
+        std::fs::write(kept, volume).unwrap();
+
+        let (paths, seed) = discover_matching_par2_paths(&outcome.main_path).unwrap();
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        let set = scan_discovered_set(&paths, Some(seed)).unwrap();
+        assert_eq!(set.files.len(), 3);
+        assert_eq!(set.slice_checksums.len(), 3);
+        assert!(!set.recovery_slices.is_empty());
+    }
+
+    /// Volume discovery used to open and read the first 64 bytes of every
+    /// sibling, the set's own data files included, before verification read
+    /// those files in full. A protected file at its recorded length that no
+    /// PAR2 volume can have (not a multiple of 4) is data and is not opened
+    /// at all: one made unreadable here would fail the sniff. A renamed
+    /// volume under an unprotected name is still found.
+    #[cfg(unix)]
+    #[test]
+    fn volume_discovery_does_not_open_protected_files_no_volume_could_be() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let (sources, outcome) = create_small_set_of(temp.path(), 3001);
+
+        let relocated = &outcome.volume_paths[0];
+        std::fs::rename(relocated, temp.path().join("relocated-volume")).unwrap();
+        let mut expected: Vec<String> = outcome
+            .output_paths
+            .iter()
+            .filter(|path| *path != relocated)
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .chain(["relocated-volume".to_owned()])
+            .collect();
+        expected.sort();
+
+        let seed =
+            par2_rs::Par2FileSet::from_paths(std::slice::from_ref(&outcome.main_path)).unwrap();
+        let data = &sources[2];
+        std::fs::set_permissions(data, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // A process that can read it anyway proves nothing either way.
+        if std::fs::File::open(data).is_ok() {
+            return;
+        }
+
+        let mut found: Vec<String> = identify_set_volumes(temp.path(), &seed)
+            .expect("discovery never touches the unreadable data file")
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        assert_eq!(found, expected);
+    }
+
+    /// A volume renamed onto a missing protected file's name is still a
+    /// volume: a protected name at another length than recorded is sniffed.
+    #[test]
+    fn a_volume_under_a_missing_protected_name_is_found() {
+        let temp = tempfile::tempdir().unwrap();
+        let (sources, outcome) = create_small_set(temp.path());
+        let renamed = &sources[1];
+        let volume = &outcome.volume_paths[0];
+        std::fs::rename(volume, renamed).unwrap();
+        assert_ne!(std::fs::metadata(renamed).unwrap().len(), 3000);
+
+        let seed =
+            par2_rs::Par2FileSet::from_paths(std::slice::from_ref(&outcome.main_path)).unwrap();
+        let found = identify_set_volumes(temp.path(), &seed).unwrap();
+        assert!(found.contains(renamed), "{found:?}");
+    }
+
+    /// An obfuscated volume at a missing protected file's name and exactly
+    /// its recorded length is still a volume: a length a PAR2 file can have
+    /// is never skipped unread.
+    #[test]
+    fn a_volume_at_a_missing_protected_name_and_length_is_found() {
+        let temp = tempfile::tempdir().unwrap();
+        let (sources, outcome) = create_small_set(temp.path());
+        let renamed = &sources[1];
+        let recorded = std::fs::metadata(renamed).unwrap().len();
+        let volume = &outcome.volume_paths[0];
+        let mut bytes = std::fs::read(volume).unwrap();
+        assert!(bytes.len() as u64 <= recorded, "{} bytes", bytes.len());
+        // Trailing zeros after the packets, to the recorded length.
+        bytes.resize(recorded as usize, 0);
+        std::fs::remove_file(volume).unwrap();
+        std::fs::write(renamed, &bytes).unwrap();
+
+        let seed =
+            par2_rs::Par2FileSet::from_paths(std::slice::from_ref(&outcome.main_path)).unwrap();
+        let found = identify_set_volumes(temp.path(), &seed).unwrap();
+        assert!(found.contains(renamed), "{found:?}");
+    }
 }

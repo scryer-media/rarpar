@@ -3,8 +3,12 @@ package bench
 import (
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"sort"
+	"strings"
+
+	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/procmeasure"
 )
 
 func BuildReport(rawPath string) (Report, error) {
@@ -12,7 +16,14 @@ func BuildReport(rawPath string) (Report, error) {
 	if err := readJSON(rawPath, &raw); err != nil {
 		return Report{}, err
 	}
-	if raw.SchemaVersion != RunSchemaVersion || raw.Plan.SchemaVersion != PlanSchemaVersion || raw.CorpusDigest != raw.Plan.CorpusDigest {
+	switch raw.SchemaVersion {
+	case RunSchemaVersion:
+	case runSchemaWithoutRSS:
+		return Report{}, fmt.Errorf("raw benchmark record is run schema %d, which predates the required per-execution peak RSS (max_rss_bytes); rerun the benchmark to produce run schema %d", raw.SchemaVersion, RunSchemaVersion)
+	default:
+		return Report{}, fmt.Errorf("raw benchmark record has unsupported run schema %d; this harness reads run schema %d", raw.SchemaVersion, RunSchemaVersion)
+	}
+	if raw.Plan.SchemaVersion != PlanSchemaVersion || raw.CorpusDigest != raw.Plan.CorpusDigest {
 		return Report{}, fmt.Errorf("raw benchmark record has invalid provenance")
 	}
 	collectorMode := raw.CollectorMode
@@ -21,6 +32,9 @@ func BuildReport(rawPath string) (Report, error) {
 	}
 	if collectorMode != wallClockCollector && collectorMode != perfStatCollector {
 		return Report{}, fmt.Errorf("unsupported benchmark collector mode %q", collectorMode)
+	}
+	if err := ValidateExecutions(raw.Executions); err != nil {
+		return Report{}, err
 	}
 	digest, err := fileSHA256(rawPath)
 	if err != nil {
@@ -37,8 +51,19 @@ func BuildReport(rawPath string) (Report, error) {
 		Reference:     raw.Reference,
 		ReferencePAR2: raw.ReferencePAR2,
 	}
+	report.RSSSummary = []procmeasure.RSSScenario{}
 	if raw.Reference == nil {
 		report.Omitted = []string{"no reference binary was supplied; relative-speed charts are unavailable"}
+		for _, planCase := range raw.Plan.Cases {
+			candidate := successfulMeasurements(raw.Executions, "candidate", planCase.ID)
+			if len(candidate) == 0 {
+				continue
+			}
+			scenario := rssScenario(planCase.ID, candidate, nil)
+			scenario.Note = "no reference binary was supplied"
+			report.RSSSummary = append(report.RSSSummary, scenario)
+		}
+		procmeasure.SortRSSScenarios(report.RSSSummary)
 		return report, nil
 	}
 	for _, planCase := range raw.Plan.Cases {
@@ -72,12 +97,93 @@ func BuildReport(rawPath string) (Report, error) {
 			Backend:            consistentBackend(candidate),
 		}
 		comparison.CandidateRAR5Phases = summarizeRAR5Phases(candidateWarmups)
+		comparison.CandidateCPUNanos = summarizeValues(candidate, cpuNanos)
+		comparison.ReferenceCPUNanos = summarizeValues(reference, cpuNanos)
+		comparison.CPURatio = medianRatio(comparison.CandidateCPUNanos, comparison.ReferenceCPUNanos)
+		comparison.CandidateRSSBytes = summarizeValues(candidate, peakRSS)
+		comparison.ReferenceRSSBytes = summarizeValues(reference, peakRSS)
+		comparison.RSSRatio = medianRatio(comparison.CandidateRSSBytes, comparison.ReferenceRSSBytes)
+		comparison.CandidateRSSSource = rssSources(candidate)
+		comparison.ReferenceRSSSource = rssSources(reference)
 		report.Comparisons = append(report.Comparisons, comparison)
+		report.RSSSummary = append(report.RSSSummary, rssScenario(planCase.ID, candidate, reference))
 	}
+	procmeasure.SortRSSScenarios(report.RSSSummary)
 	sort.SliceStable(report.Comparisons, func(left, right int) bool {
 		return caseOrder(raw.Plan, report.Comparisons[left].CaseID) < caseOrder(raw.Plan, report.Comparisons[right].CaseID)
 	})
 	return report, nil
+}
+
+// ValidateExecutions enforces the required per-sample fields: every
+// successful execution must carry a positive peak RSS, and a record with one
+// that does not is invalid.
+func ValidateExecutions(executions []Execution) error {
+	var bad []string
+	for _, execution := range executions {
+		if execution.Success && execution.Measurement.MaxRSSBytes <= 0 {
+			bad = append(bad, fmt.Sprintf("%s/%s run %d", execution.CaseID, execution.Role, execution.Run))
+		}
+	}
+	if len(bad) == 0 {
+		return nil
+	}
+	shown := bad
+	if len(shown) > 5 {
+		shown = append(shown[:5:5], fmt.Sprintf("… %d more", len(bad)-5))
+	}
+	return fmt.Errorf("%d successful execution(s) lack the required max_rss_bytes: %s", len(bad), strings.Join(shown, ", "))
+}
+
+func cpuNanos(execution Execution) int64 {
+	return execution.Measurement.UserNanos + execution.Measurement.SystemNanos
+}
+
+func peakRSS(execution Execution) int64 { return execution.Measurement.MaxRSSBytes }
+
+func summarizeValues(executions []Execution, value func(Execution) int64) ValueSummary {
+	values := make([]int64, len(executions))
+	for index, execution := range executions {
+		values[index] = value(execution)
+	}
+	median, low, high := procmeasure.PeakStats(values)
+	return ValueSummary{Median: median, Min: low, Max: high}
+}
+
+// medianRatio is reference/rarpar medians (above 1 rarpar used less), or
+// nil without both figures.
+func medianRatio(candidate, reference ValueSummary) *float64 {
+	if candidate.Median <= 0 || reference.Median <= 0 {
+		return nil
+	}
+	value := float64(reference.Median) / float64(candidate.Median)
+	return &value
+}
+
+func rssSources(executions []Execution) string {
+	sources := make([]string, len(executions))
+	for index, execution := range executions {
+		sources[index] = execution.Measurement.RSSSource
+	}
+	return procmeasure.JoinSources(sources)
+}
+
+func rssScenario(caseID string, candidate, reference []Execution) procmeasure.RSSScenario {
+	rss := summarizeValues(candidate, peakRSS)
+	scenario := procmeasure.RSSScenario{
+		Scenario:          caseID,
+		RarparMedianBytes: rss.Median,
+		RarparMinBytes:    rss.Min,
+		RarparMaxBytes:    rss.Max,
+		RarparSource:      rssSources(candidate),
+	}
+	if len(reference) > 0 {
+		rss := summarizeValues(reference, peakRSS)
+		scenario.ReferenceMedianBytes, scenario.ReferenceMinBytes, scenario.ReferenceMaxBytes = rss.Median, rss.Min, rss.Max
+		scenario.ReferenceSource = rssSources(reference)
+	}
+	procmeasure.CompleteRSSScenario(&scenario)
+	return scenario
 }
 
 func referenceLabelForFamily(family string) string {
@@ -160,6 +266,12 @@ func caseOrder(plan Plan, id string) int {
 	return len(plan.Cases) + 1
 }
 
+// WriteReport writes report.json and, beside it, the Markdown rendering
+// (same name, .md).
 func WriteReport(path string, report Report) error {
-	return writeJSON(filepath.Clean(path), report)
+	path = filepath.Clean(path)
+	if err := writeJSON(path, report); err != nil {
+		return err
+	}
+	return os.WriteFile(MarkdownPath(path), []byte(RenderReportMarkdown(report)), 0o644)
 }

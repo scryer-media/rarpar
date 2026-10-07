@@ -452,6 +452,9 @@ fn create_watched(
     };
     options.execution.workers = 1;
     options.execution.stripe_bytes = 1024;
+    // Room for the plan but not for the source beside it, so execution walks
+    // the source in its stripe passes and these counts measure that walk.
+    options.execution.retained_bytes = blocks * 4096;
     let mut disk = DiskSourceAccess::with_options(options.execution.clone());
     disk.insert(SourceId(1), path.clone());
     let watched = Arc::new(Watched::new(disk));
@@ -981,6 +984,8 @@ fn fft_creation_rejects_a_source_changed_mid_operation() {
             };
             options.execution.workers = 1;
             options.execution.stripe_bytes = 1024;
+            // Too little room to keep the source, so the encode reads it.
+            options.execution.retained_bytes = 32 * 4096;
             let mut disk = DiskSourceAccess::with_options(options.execution.clone());
             disk.insert(SourceId(1), path.clone());
             let watched = Arc::new(Watched::new(disk));

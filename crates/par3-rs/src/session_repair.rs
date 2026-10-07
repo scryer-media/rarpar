@@ -309,9 +309,9 @@ fn repair_inner(
         )?;
     }
     // Every payload is authenticated before its bytes are used, by the read
-    // that consumes it where that read takes the whole payload.
+    // that consumes it where that read takes the whole payload, and otherwise
+    // before the codec's walk, which can then keep the bytes it authenticated.
     let checks = PayloadChecks::new(session);
-    checks.before_walk(session.options.stripe_bytes, layout.block_size, None)?;
     let path_cost = assessment
         .files
         .iter()
@@ -554,6 +554,24 @@ pub(crate) fn stage_embedded(
     temporary: &Path,
     durability: RepairDurability,
 ) -> EngineResult<u64> {
+    if session
+        .layout()?
+        .is_some_and(|layout| layout.files.len() != 1)
+    {
+        return Err(EngineError::Unsupported(
+            "embedded repair requires one file",
+        ));
+    }
+    stage_embedded_files(session, &[temporary.to_owned()], durability)
+}
+
+/// Stage every file of an embedded set, file `k` to `temporaries[k]`, which
+/// must already exist. Unprotected gaps are left zero for the caller to fill.
+pub(crate) fn stage_embedded_files(
+    session: &mut Par3RepairSession,
+    temporaries: &[std::path::PathBuf],
+    durability: RepairDurability,
+) -> EngineResult<u64> {
     session.options.validate()?;
     if !matches!(
         session.assess()?.status,
@@ -567,10 +585,8 @@ pub(crate) fn stage_embedded(
         ));
     }
     let layout = session.layout.as_ref().expect("assessed layout");
-    if layout.files.len() != 1 {
-        return Err(EngineError::Unsupported(
-            "embedded repair requires one file",
-        ));
+    if layout.files.len() != temporaries.len() {
+        return Err(EngineError::InvalidState("embedded repair targets"));
     }
     let assessment = session.assessment.as_ref().expect("assessment");
     for evidence in session.evidence.values() {
@@ -581,21 +597,27 @@ pub(crate) fn stage_embedded(
         )?;
     }
     // Every payload is authenticated before its bytes are used, by the read
-    // that consumes it where that read takes the whole payload.
+    // that consumes it where that read takes the whole payload, and otherwise
+    // before the codec's walk, which can then keep the bytes it authenticated.
     let checks = PayloadChecks::new(session);
-    checks.before_walk(session.options.stripe_bytes, layout.block_size, None)?;
-    let targets = [StagedFile {
-        index: 0,
-        destination: None,
-        stage_name: None,
-        temporary: temporary.to_owned(),
-        cloned: None,
-        in_place: None,
-    }];
-    OpenOptions::new()
-        .write(true)
-        .open_budgeted(temporary, &session.options)?
-        .set_len(layout.files[0].len)?;
+    let targets: Vec<StagedFile> = temporaries
+        .iter()
+        .enumerate()
+        .map(|(index, temporary)| StagedFile {
+            index,
+            destination: None,
+            stage_name: None,
+            temporary: temporary.clone(),
+            cloned: None,
+            in_place: None,
+        })
+        .collect();
+    for (file, temporary) in layout.files.iter().zip(temporaries) {
+        OpenOptions::new()
+            .write(true)
+            .open_budgeted(temporary, &session.options)?
+            .set_len(file.len)?;
+    }
     let proof = StagedProof::new(layout, &targets, &session.options);
     if assessment.lost_blocks.is_empty() {
         copy_available(session, &checks, layout, None, &targets, &proof)?;
@@ -639,12 +661,24 @@ pub(crate) fn stage_embedded(
 /// has matched, and a mismatch refuses the repair as it always has.
 /// [`Self::finish`] authenticates whatever the codec never read, so a repair
 /// still refuses a set carrying a payload that no longer matches its packet.
+/// Whole payloads kept by [`PayloadChecks::before_walk_holding`], with the
+/// budget they hold.
+#[derive(Default)]
+struct HeldPayloads {
+    bytes: HashMap<(bool, u64), Vec<u8>>,
+    reservations: Vec<crate::runtime::Reservation>,
+}
+
 struct PayloadChecks<'a> {
     session: &'a Par3RepairSession,
     /// Payloads already authenticated: `(is data, block or recovery index)`.
     done: Mutex<std::collections::BTreeSet<(bool, u64)>>,
     /// Whether an authentication refused the repair.
     refused: AtomicBool,
+    /// Whole payloads a walk narrower than the block read once, authenticated
+    /// as they were read, and serves its stripes from, with the budget they
+    /// hold.
+    held: Mutex<HeldPayloads>,
 }
 
 impl<'a> PayloadChecks<'a> {
@@ -653,6 +687,7 @@ impl<'a> PayloadChecks<'a> {
             session,
             done: Mutex::new(std::collections::BTreeSet::new()),
             refused: AtomicBool::new(false),
+            held: Mutex::new(HeldPayloads::default()),
         }
     }
 
@@ -699,6 +734,21 @@ impl<'a> PayloadChecks<'a> {
     ) -> EngineResult<()> {
         let session = self.session;
         let key = Self::key(payload);
+        if let Some(bytes) = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .bytes
+            .get(&key)
+        {
+            out.fill(0);
+            let from = bytes
+                .len()
+                .min(usize::try_from(offset).unwrap_or(usize::MAX));
+            let take = (bytes.len() - from).min(out.len());
+            out[..take].copy_from_slice(&bytes[from..from + take]);
+            return Ok(());
+        }
         if !self.checked(key) {
             if offset == 0 && out.len() as u64 >= payload.len() {
                 self.refusing(session.input.read_payload(payload, &session.options, out))?;
@@ -778,6 +828,76 @@ impl<'a> PayloadChecks<'a> {
             Some(payload) => self.read(payload, offset, out),
             None => self.session.read_block(block, offset, out, covered, owed),
         }
+    }
+
+    /// [`Self::before_walk`] for a walk that holds its stripes and would read
+    /// every payload once per stripe pass: each payload the budget has room
+    /// for, beyond a stripe of slack, is read whole once, authenticated over
+    /// that read, and held until [`Self::release`], so later passes read no
+    /// carrier. Any payload left over is authenticated in its own pass and
+    /// read per stripe, as before.
+    fn before_walk_holding(
+        &self,
+        stripe: usize,
+        block_size: u64,
+        scratch: &mut [u8],
+    ) -> EngineResult<()> {
+        if stripe as u64 >= block_size {
+            return Ok(());
+        }
+        let session = self.session;
+        let assessment = session.assessment.as_ref().expect("assessment");
+        for payload in assessment
+            .recovery
+            .iter()
+            .chain(session.data_payloads().values())
+        {
+            let key = Self::key(payload);
+            if self.checked(key) {
+                continue;
+            }
+            let memory = &session.options.memory;
+            let reservation = usize::try_from(payload.len())
+                .ok()
+                .filter(|&len| {
+                    memory
+                        .available()
+                        .saturating_sub(crate::runtime::SOURCE_GROUP_SLACK)
+                        >= len
+                })
+                .and_then(|len| {
+                    Some((
+                        len,
+                        memory.reserve_as(MemoryCategory::CodecScratch, len).ok()?,
+                    ))
+                });
+            let Some((len, reservation)) = reservation else {
+                self.authenticate(payload, Some(scratch))?;
+                continue;
+            };
+            let mut bytes = vec![0; len];
+            self.refusing(
+                session
+                    .input
+                    .read_payload(payload, &session.options, &mut bytes),
+            )?;
+            self.note(key);
+            let mut held = self
+                .held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            held.bytes.insert(key, bytes);
+            held.reservations.push(reservation);
+        }
+        Ok(())
+    }
+
+    /// Drop the payloads [`Self::before_walk_holding`] kept, and their budget.
+    fn release(&self) {
+        *self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = HeldPayloads::default();
     }
 
     /// Authenticate every payload the repair selected and never read.
@@ -1143,7 +1263,7 @@ where
     let mut recovered = vec![vec![0u8; stripe]; tile];
     let mut inputs = vec![vec![0u8; stripe]; group * sets];
     let mut covered = vec![0u8; stripe];
-    checks.before_walk(stripe, layout.block_size, Some(&mut covered))?;
+    checks.before_walk_holding(stripe, layout.block_size, &mut covered)?;
     let parallel = pool.as_ref().map(crate::runtime::WorkerPool::pool);
     let mut offset = 0;
     while offset < layout.block_size {
@@ -1399,6 +1519,7 @@ where
         writers.settle()?;
         offset += take as u64;
     }
+    checks.release();
     Ok(())
 }
 
@@ -2572,6 +2693,46 @@ pub(crate) fn contained_destination(base: &Path, relative: &str) -> EngineResult
     crate::paths::validate_relative_path(relative)?;
     let tree = RepairTree::new(base, std::iter::once(relative))?;
     Ok(repair_destination(&tree, relative)?.display)
+}
+
+/// Create the protected directory `relative` under `base` the way repair
+/// installs files: one component at a time, relative to an open handle on
+/// `base`, refusing any symbolic link on the way. For directory-only repairs
+/// (an empty directory the set records), where no file installation would
+/// create it.
+///
+/// # Errors
+///
+/// [`EngineError::Io`] when `relative` is not a plain relative path, a
+/// component is a symbolic link or not a directory, or creation fails.
+pub fn create_directory(base: &Path, relative: &str) -> EngineResult<()> {
+    #[cfg(not(target_os = "wasi"))]
+    crate::repair_tree::create_directory(base, relative)?;
+    #[cfg(target_os = "wasi")]
+    {
+        crate::paths::validate_relative_path(relative).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+        })?;
+        let mut directory = base.to_owned();
+        for component in Path::new(relative).components() {
+            directory.push(component);
+            match std::fs::symlink_metadata(&directory) {
+                Ok(meta) if meta.is_dir() => {}
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "repair directory component is a link or not a directory",
+                    )
+                    .into());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir(&directory)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn stage_path(destination: &Path, options: &ExecutionOptions) -> EngineResult<PathBuf> {

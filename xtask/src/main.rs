@@ -816,6 +816,11 @@ fn audit_feature_metadata(metadata: &CargoMetadata, options: &FeatureAuditOption
     require_feature(metadata, "rarpar", "crypto-aws-lc")?;
     require_feature(metadata, "par2-rs", "crypto-aws-lc")?;
     require_feature(metadata, "unrar-rs", "crypto-aws-lc")?;
+    // `par3 archive`, PAR-inside and the 7-Zip facade live behind `sevenz`,
+    // which release builds name explicitly (they pass --no-default-features).
+    // Its codec must resolve the same AWS-LC backend as the others.
+    require_feature(metadata, "rarpar", "sevenz")?;
+    require_feature(metadata, "sevenz-turbo", "aws-lc-crypto")?;
 
     let aws_lc_versions = resolved_package_versions(metadata, "aws-lc-sys");
     if aws_lc_versions.len() != 1 {
@@ -1582,6 +1587,27 @@ mod tests {
     }
 
     #[test]
+    fn feature_audit_rejects_a_build_without_sevenz() {
+        let options = FeatureAuditOptions {
+            manifest: PathBuf::from("Cargo.toml"),
+            target: "x86_64-apple-darwin".to_owned(),
+            features: "runtime,crypto-aws-lc".to_owned(),
+        };
+        let mut metadata = feature_metadata(&["0.42.0"]);
+        metadata
+            .resolve
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "rarpar")
+            .expect("test package node")
+            .features
+            .retain(|feature| feature != "sevenz");
+        let error = audit_feature_metadata(&metadata, &options)
+            .expect_err("a release build without the 7z commands must fail the audit");
+        assert!(error.to_string().contains("sevenz"));
+    }
+
+    #[test]
     fn feature_audit_rejects_a_build_that_resolved_the_rustcrypto_backend() {
         // A matrix entry that forgets `crypto-aws-lc` still builds and still
         // passes its tests -- it just ships the portable backend. The audit is
@@ -1817,12 +1843,26 @@ mod tests {
                 name: "reedsolomon-rs".to_owned(),
                 version: "0.3.0".to_owned(),
             },
+            CargoPackage {
+                id: "sevenz-turbo".to_owned(),
+                name: "sevenz-turbo".to_owned(),
+                version: "0.26.1".to_owned(),
+            },
         ];
         let mut nodes = vec![
             CargoNode {
                 id: "rarpar".to_owned(),
-                features: vec!["runtime".to_owned(), "crypto-aws-lc".to_owned()],
-                deps: deps(&["par2-rs", "unrar-rs", "reedsolomon-rs"]),
+                features: vec![
+                    "runtime".to_owned(),
+                    "crypto-aws-lc".to_owned(),
+                    "sevenz".to_owned(),
+                ],
+                deps: deps(&["par2-rs", "unrar-rs", "reedsolomon-rs", "sevenz-turbo"]),
+            },
+            CargoNode {
+                id: "sevenz-turbo".to_owned(),
+                features: vec!["aws-lc-crypto".to_owned()],
+                deps: Vec::new(),
             },
             CargoNode {
                 id: "par2-rs".to_owned(),

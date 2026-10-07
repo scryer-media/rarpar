@@ -1,7 +1,110 @@
 # Changelog
 
-## 0.4.5
+## 0.5.0
 
+- **Experimental:** `inside::rar5` adds PAR-inside for RAR5 archives and RAR5
+  volume sets made by RARLAB rar. The region layout is not part of the PAR3
+  specification yet; it may change before it is stable, and regions written
+  by this version may not verify with a later one.
+  - `inspect` walks a RAR5 archive's block headers (no member is
+    decompressed), refuses RAR4, non-RAR input and unknown trailing data, and
+    finds an existing region.
+  - `prepare_hosts`, `placement_counts` and `insert_set` write one input set
+    across every volume, with a region per volume in the `Trailing`, `Service`
+    or `Block` layout and recovery packets placed by `Spread`, `Last` or
+    `Independent`. Each File's chunks are the bytes before the region, one
+    unprotected chunk for the region, and the bytes after it.
+  - `open` finds a set's volumes by recorded name, recovery indices, volume
+    number or stem change, and returns `Rar5Set`, whose `repair` rebuilds
+    data and regions byte-exactly and whose `remove` writes the originals
+    back, checked against the File hash.
+- **Breaking:** `carrier::CarrierRestoration` gains `Derived`, for a carrier
+  rebuilt from a derived packet order with regenerated recovery packets.
+- RAR5 PAR-inside (`inside::rar5`) fixes:
+  - A name suffix shared by a recorded and an actual host name is compared on
+    character boundaries; names ending in different characters that share a
+    final UTF-8 byte no longer panic.
+  - `Rar5Set::repair` derives every carrier before it writes any rebuilt
+    host, so a lost volume and damage in another are repaired together.
+  - A host is bound by name only to a file carrying its own set's packets (or
+    none from another set), so sets in different directories whose hosts
+    share a name each bind their own file.
+  - `prepare_hosts` refuses header-encrypted volume families (several hosts,
+    or a `.partN.rar` name): their volume numbers and end flags are
+    encrypted, so a family missing its last parts could not be told from a
+    complete one.
+  - `prepare_hosts` returns `EngineError::InvalidState` for an empty host
+    list instead of panicking, as `insert_set` does.
+  - `prepare_hosts` records the revision it inspected, and `insert_set`
+    refuses a host that changed since, instead of using stale framing
+    offsets.
+  - `insert_set` refuses a nonzero `first_recovery`: the region records no
+    recovery-index base.
+  - `placement_counts` returns `EngineResult<Vec<u64>>` and refuses
+    `Rar5Placement::Independent`, which is one `insert_set` per host.
+  - New `Rar5Set::removable`: the checks `Rar5Set::remove` makes, without
+    writing anything.
+  - A rebuilt host staged on another filesystem than its destination is
+    installed by a copy beside the destination, compared byte for byte, then
+    linked in; it no longer fails with a cross-device link error.
+  - `open` indexes a host's packets by offset once and checks each expected
+    region slot with a lookup, so verify, repair and remove over a region of
+    tens of thousands of small recovery packets are no longer quadratic.
+  - `open` refuses a set whose Start packet records a block size too large
+    for a Recovery Data packet length (`EngineError::Unsupported`) instead
+    of wrapping that length to zero and aborting on a division by zero.
+  - `open` looks up a recorded host name beside the given files only when it
+    is one safe file name, so an absolute name or one with `..` no longer
+    reaches a file outside their directories. New `validate_host_name`
+    makes that check.
+  - `open` derives the renamed-stem lookups from each candidate and the
+    recorded names sharing its `.partN.` (or final extension) tail, keeping
+    each distinct stem change once, so a large volume set no longer holds a
+    mapping for every candidate and recorded name pair.
+  - `open` lists the sets it finds with a hash set and indexes each file's
+    packets by set, so a carrier holding packets of many sets is no longer
+    rescanned per packet or once per set.
+  - `open` binds a missing volume by volume number only to a file that does
+    not carry only another set's packets, as binding by name does, so a
+    same-length volume of another set given in the same call is never taken
+    as this set's host.
+  - `open` refuses a set whose Root packet names no file
+    (`EngineError::Unsupported`) instead of panicking.
+  - `prepare_hosts` refuses a host name that `validate_host_name` refuses
+    (`EngineError::UnsafePath`), before reading the host, so insertion no
+    longer records a name that repair and removal then refuse.
+  - `Rar5Set::remove` checks every destination before writing any, and a
+    failed removal deletes the outputs it already linked in, so an existing
+    later destination no longer leaves earlier stripped hosts behind.
+  - A service header whose name length runs past the header, up to
+    `u64::MAX`, is refused with `EngineError::Unsupported` instead of
+    overflowing the slice bound and panicking.
+  - `open` refuses an authenticated Recovery Data packet whose index puts a
+    host's recovery range past `u64::MAX` (`EngineError::Unsupported`)
+    instead of panicking in a debug build or wrapping and misbinding hosts in
+    a release one.
+  - `open` releases the packets and memory reservations of its discovery
+    scan before rescanning through the final provider, so a set whose
+    packets need a bit over half the memory budget is no longer refused for
+    holding two packet inventories at once.
+  - `open` binds a host by name to a file carrying no packets only in a
+    directory that holds a file carrying the set's own packets, so when one
+    call spans several directories a missing volume is never bound to an
+    unrelated same-named archive beside another set.
+  - `insert_set` finishes and verifies every host before linking any into
+    its output, and a failed link removes the outputs linked before it, so a
+    failed multi-host insertion leaves no final output behind and can be
+    retried.
+  - `Rar5Set::repair` verifies every rebuilt host before installing any, and
+    a failed install removes the destinations this call installed before
+    it, as `Rar5Set::remove` does, so a failed repair can be retried.
+- A derived carrier (`CarrierPlan::derived`) looks up its available Recovery
+  Data packets in one pass over the payloads instead of one pass per
+  recovery index, so regenerating a region of a set with tens of thousands
+  of recovery packets no longer costs a quadratic number of comparisons.
+- New `session_repair::create_directory(base, relative)`: creates a protected
+  directory one component at a time relative to an open handle on `base`,
+  refusing symbolic links, for repairs that only need an empty directory.
 - `ExecutionOptions` gains a hidden, bench-only `disk_verify_whole_first`
   switch. `Some(false)` makes disk verification hash a file's extents and the
   whole file side by side in one pass instead of trying the whole file first,
@@ -43,6 +146,52 @@
   `ExecutionDiagnostics::verify_order` reports the order that ran and the
   mount kinds behind it, and `engine_perf` prints them. Evidence is
   unchanged.
+- Repair no longer reads every selected recovery and data packet twice, once
+  to reauthenticate it and again to use it, when one stripe covers the block.
+  The codec's own read of the whole payload is hashed, together with the
+  header and identity fields authenticated at admission, and its bytes are
+  used only once the packet's hash matches. A mismatch refuses the repair
+  with the same `PacketHashMismatch`, charges `failed_hash_bytes` and
+  `rejected_packets` as before, and removes the outputs it had staged.
+  Payloads the codec never reads are still authenticated before anything is
+  installed. A stripe narrower than the block, configured or narrowed by the
+  budget, authenticates every payload in its own pass before the walk, as
+  before, through the stripe buffer when the budget refuses that pass its
+  own. Apple M5 Max, ten 30 MiB files in 64 KiB blocks with 328 lost: file
+  reads 702.2 → 680.6 MB in 11,047 → 10,391 calls, opens 54 → 45, snapshot
+  checks 2,751 → 2,423 (Cauchy); 709.7 → 688.2 MB in 11,163 → 10,507 calls,
+  opens 57 → 48 (FFT). Wall and CPU are unchanged at one and eight workers
+  with a warm cache; on AMD Zen 4 (EPYC 9R14, eight cores) the same counts
+  fall by the same amounts, Cauchy wall 2.21 → 2.20 s at one worker and
+  0.46 → 0.44 s at eight, FFT 0.91 → 0.90 s and 0.61 → 0.59 s, CPU
+  unchanged. Repairs in 1 MiB blocks at the default 64 KiB stripe read
+  exactly what they did.
+- The changed-carrier sweep before each assessment asks each carrier for its
+  snapshot once instead of once per recovery payload it holds, so a carrier
+  of many recovery blocks costs one stat per assessment rather than one per
+  block.
+- `CreationPlan` reads each source once instead of twice when every source,
+  beside the plan itself, fits under `ExecutionOptions::retained_bytes` and the
+  memory budget grants it: the hash pass keeps the bytes it read, charged to
+  `MemoryCategory::Caches`, and the encode and data volumes use them. The kept
+  bytes are released once the encode has run, or earlier if the encode or the
+  recovery rows need the room. The snapshot checks around execution are
+  unchanged, and the carriers are byte-identical to a two-pass create. Over
+  that ceiling the encode reads every source again, as before.
+- A Cauchy repair whose stripe is narrower than the block (the default
+  64 KiB stripe under larger blocks) no longer reads every selected recovery
+  and data packet twice, once to authenticate it and again a stripe at a time.
+  Each payload the budget has room for, beyond a stripe of slack after the
+  codec's own reservations, is read whole once, authenticated over that read
+  and held, charged to `MemoryCategory::CodecScratch`, until the walk ends;
+  its stripes come from memory. Payloads are now authenticated just before
+  the walk rather than before the outputs are staged; a mismatch still
+  refuses with `PacketHashMismatch`, charges `failed_hash_bytes` and
+  `rejected_packets` as before, and removes the staged outputs. Payloads the
+  budget cannot hold, and every FFT repair, read as before.
+
+## 0.4.5
+
 - **Behaviour change:** the streaming creation engine (`creation::CreationPlan`)
   now derives the InputSetID the way the reference does — and the way
   `create::create` already did, through the same code — from each file's full

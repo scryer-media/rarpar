@@ -643,6 +643,9 @@ fn grouped_carriers(
     };
     options.execution.workers = workers;
     options.execution.memory = par3_rs::runtime::MemoryBudget::new(memory);
+    // Room for the plan but not for the source beside it, so the encode
+    // walks the source and its reads measure the walk.
+    options.execution.retained_bytes = recovery_count as usize * 128 + (24 << 10);
     let execution = options.execution.clone();
     let plan = CreationPlan::build(
         Arc::new(access),

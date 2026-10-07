@@ -13,10 +13,14 @@ import (
 
 	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/bench"
 	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/oci"
+	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/procmeasure"
 	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/testcorpus"
 )
 
 func main() {
+	// The rss-exec shim runs before anything else: perf stat launches this
+	// binary as the shim so the tool's own rusage is read, not perf's.
+	procmeasure.MaybeRunShim()
 	if err := run(context.Background(), os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "rarpar-bench:", err)
 		os.Exit(1)
@@ -74,7 +78,7 @@ func usage() {
   rarpar-bench plan create --corpus DIR --out FILE [--seed TEXT] [--lane LANE] [--family rar|par2] [--par2-placement MODE] [--warmups N] [--repeats N] [--case ID]...
   rarpar-bench preflight [--docker PATH] [--perf]
   rarpar-bench run --corpus DIR --plan FILE --candidate PATH --out DIR [--reference-rar PATH --reference-par2 PATH] [--source-manifest PATH --source-target TRIPLE] [--perf]
-  rarpar-bench report --input FILE --out FILE
+  rarpar-bench report --input FILE --out FILE   (also writes FILE with .md: wall, CPU, peak RSS)
   rarpar-bench render --input FILE --out DIR
   rarpar-bench fleet plan|run|collect|teardown --config PATH
   rarpar-bench par3 matrix|build-reference|run|report ...   (rarpar-bench par3 help)

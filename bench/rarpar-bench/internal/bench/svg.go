@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/procmeasure"
 )
 
 const chartWidth = 1200
@@ -214,7 +216,7 @@ func renderSVGGroups(family string, groups []chartGroup) ([]byte, error) {
 		for _, comparison := range group.comparisons {
 			label := truncate(comparison.Workload, 66)
 			fmt.Fprintf(&document, "    <text class=\"workload\" x=\"48\" y=\"%d\">%s</text>\n", y+24, escapeXML(label))
-			fmt.Fprintf(&document, "    <text class=\"timing\" x=\"48\" y=\"%d\">%s -> %s</text>\n", y+40, formatDuration(comparison.Reference.Median), formatDuration(comparison.Candidate.Median))
+			fmt.Fprintf(&document, "    <text class=\"timing\" x=\"48\" y=\"%d\">%s</text>\n", y+40, timingLine(comparison))
 			x := ratioX(comparison.Ratio, axisStart, parity, axisEnd)
 			class := barClass(comparison)
 			if comparison.Ratio >= 1 {
@@ -233,6 +235,16 @@ func renderSVGGroups(family string, groups []chartGroup) ([]byte, error) {
 	}
 	document.WriteString("  </g>\n</svg>\n")
 	return document.Bytes(), nil
+}
+
+// timingLine is the reference -> rarpar wall medians, and the peak RSS
+// medians beside them when both sides carry one.
+func timingLine(comparison Comparison) string {
+	line := formatDuration(comparison.Reference.Median) + " -> " + formatDuration(comparison.Candidate.Median)
+	if comparison.ReferenceRSSBytes.Median > 0 && comparison.CandidateRSSBytes.Median > 0 {
+		line += fmt.Sprintf("  |  peak RSS %s -> %s MiB", procmeasure.MiB(comparison.ReferenceRSSBytes.Median), procmeasure.MiB(comparison.CandidateRSSBytes.Median))
+	}
+	return line
 }
 
 func orderComparisonsByRelativeSpeed(plan Plan, comparisons []Comparison) {

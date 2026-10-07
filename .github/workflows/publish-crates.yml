@@ -3,23 +3,8 @@ name: publish-crates
 on:
   workflow_dispatch:
     inputs:
-      package:
-        description: Crate package to publish.
-        required: true
-        default: all
-        type: choice
-        options:
-          - all
-          - reedsolomon-rs
-          - unrar-rs
-          - par2-rs
-          - par3-rs
-      version:
-        description: Version for a single-crate publish. Coordinated publishes derive each crate version from its manifest.
-        required: false
-        type: string
       dry_run:
-        description: Run preflight only without publishing to crates.io.
+        description: Preflight only. Computes the publish plan and verifies every crate it would publish, without publishing to crates.io.
         required: true
         default: true
         type: boolean
@@ -39,6 +24,8 @@ jobs:
     name: preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    outputs:
+      plan: ${{ steps.plan.outputs.plan }}
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -75,62 +62,110 @@ jobs:
         run: |
           sccache --start-server || true
           sccache --zero-stats || true
-      - name: Check workspace version
-        env:
-          EXPECTED_VERSION: ${{ inputs.version }}
-          PUBLISH_PACKAGE: ${{ inputs.package }}
+      # The plan is every publishable workspace crate whose manifest version
+      # is not on crates.io yet, in dependency order: a crate is published only
+      # after every workspace crate it depends on. Nothing is typed in by hand;
+      # the manifests are the single source of truth, and a crate whose version
+      # already exists in the registry is left alone. A manifest version below
+      # the registry's newest release is a mistake and fails the run.
+      - name: Compute the publish plan
+        id: plan
         run: |
           python3 - <<'PY'
           import json
           import os
           import subprocess
           import sys
+          import urllib.error
+          import urllib.request
 
-          expected = os.environ["EXPECTED_VERSION"].strip()
-          selected_package = os.environ["PUBLISH_PACKAGE"]
+          metadata = json.loads(subprocess.check_output([
+              "cargo", "metadata", "--locked", "--format-version", "1", "--no-deps",
+          ]))
+          members = {p["id"]: p for p in metadata["packages"]}
           publishable = {
-              "reedsolomon-rs",
-              "unrar-rs",
-              "par2-rs",
-              "par3-rs",
+              p["name"]: p for p in members.values() if p.get("publish") != []
           }
-          metadata = subprocess.check_output([
-              "cargo",
-              "metadata",
-              "--locked",
-              "--format-version",
-              "1",
-              "--no-deps",
-          ])
-          packages = json.loads(metadata)["packages"]
-          selected = {
-              package["name"]: package["version"]
-              for package in packages
-              if package["name"] in publishable
+          for name in ("rarpar", "xtask"):
+              if name in publishable:
+                  print(f"{name} must have publish = false", file=sys.stderr)
+                  sys.exit(1)
+
+          # Dependency order among the publishable crates (path dependencies).
+          deps = {
+              name: sorted(
+                  d["name"] for d in p["dependencies"]
+                  if d["name"] in publishable and d.get("path")
+                  and d.get("kind") in (None, "normal", "build")
+              )
+              for name, p in publishable.items()
           }
-          rarpar = next(
-              (package for package in packages if package["name"] == "rarpar"),
-              None,
-          )
-          if set(selected) != publishable:
-              print(
-                  f"missing publishable package metadata: got {selected}",
-                  file=sys.stderr,
+          # Among crates whose dependencies are all placed, keep the
+          # workspace member order from the root manifest.
+          member_order = [members[i]["name"] for i in metadata["workspace_members"]]
+          order = []
+          while len(order) < len(publishable):
+              ready = sorted(
+                  (n for n in publishable if n not in order
+                   and all(d in order for d in deps[n])),
+                  key=member_order.index,
               )
-              sys.exit(1)
-          if selected_package == "all":
-              print(f"coordinated publish versions: {selected}")
-          elif not expected:
-              print("version is required when publishing a single crate", file=sys.stderr)
-              sys.exit(1)
-          elif selected.get(selected_package) != expected:
-              print(
-                  f"version mismatch: expected {selected_package} {expected}, got {selected}",
-                  file=sys.stderr,
-              )
-              sys.exit(1)
-          if rarpar is None or rarpar.get("publish") != []:
-              print(f"rarpar must have publish=false, got {rarpar}", file=sys.stderr)
+              if not ready:
+                  print(f"dependency cycle among {sorted(set(publishable) - set(order))}", file=sys.stderr)
+                  sys.exit(1)
+              order.extend(ready)
+
+          def index_path(name):
+              if len(name) == 1:
+                  return f"1/{name}"
+              if len(name) == 2:
+                  return f"2/{name}"
+              if len(name) == 3:
+                  return f"3/{name[0]}/{name}"
+              return f"{name[:2]}/{name[2:4]}/{name}"
+
+          def published_versions(name):
+              url = f"https://index.crates.io/{index_path(name)}"
+              try:
+                  with urllib.request.urlopen(url, timeout=30) as response:
+                      body = response.read().decode()
+              except urllib.error.HTTPError as error:
+                  if error.code == 404:
+                      return []
+                  raise
+              return [json.loads(line)["vers"] for line in body.splitlines() if line.strip()]
+
+          def key(version):
+              return tuple(int(part) for part in version.split("-")[0].split("."))
+
+          plan = []
+          rows = []
+          failed = False
+          for name in order:
+              version = publishable[name]["version"]
+              published = published_versions(name)
+              newest = max(published, key=key) if published else None
+              if version in published:
+                  action = "already published"
+              elif newest is not None and key(version) < key(newest):
+                  action = f"ERROR: manifest {version} is below the newest published {newest}"
+                  failed = True
+              else:
+                  action = "publish" + ("" if published else " (first release)")
+                  plan.append(name)
+              rows.append((name, version, newest or "none", action))
+
+          summary = ["| crate | manifest | newest on crates.io | action |", "|---|---|---|---|"]
+          summary += [f"| {n} | {v} | {c} | {a} |" for n, v, c, a in rows]
+          summary.append("")
+          summary.append("Publish order: " + (" -> ".join(plan) if plan else "nothing to publish"))
+          text = "\n".join(summary)
+          print(text)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as handle:
+              handle.write("## Publish plan\n\n" + text + "\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as handle:
+              handle.write("plan=" + " ".join(plan) + "\n")
+          if failed:
               sys.exit(1)
           PY
       # The workspace suite and clippy already ran on this exact commit in `ci`
@@ -196,15 +231,14 @@ jobs:
       # surface by hand for a release that touches library API.
       - name: Check semver against the published baselines
         env:
-          PUBLISH_PACKAGE: ${{ inputs.package }}
+          PLAN: ${{ steps.plan.outputs.plan }}
         run: |
           set -euo pipefail
-          if [ "$PUBLISH_PACKAGE" = "all" ]; then
-            packages="reedsolomon-rs unrar-rs par2-rs par3-rs"
-          else
-            packages="$PUBLISH_PACKAGE"
+          if [ -z "$PLAN" ]; then
+            echo "nothing to publish; skipping semver-checks"
+            exit 0
           fi
-          for package in $packages; do
+          for package in $PLAN; do
             # A crate with no release on crates.io has no baseline to compare
             # against, and cargo-semver-checks fails rather than passing
             # vacuously. Nothing can have broken for a first publish.
@@ -219,114 +253,40 @@ jobs:
             cargo semver-checks --package "$package"
             echo "::endgroup::"
           done
+      # One `cargo package` over the whole plan: Cargo packages interdependent
+      # workspace crates together and verifies each against the sibling
+      # `.crate` files it just built, so a downstream crate is checked against
+      # the exact upstream it will be published with, before either exists in
+      # the registry.
       - name: Verify package contents
         env:
-          PUBLISH_PACKAGE: ${{ inputs.package }}
+          PLAN: ${{ steps.plan.outputs.plan }}
         run: |
           set -euo pipefail
-          mkdir -p .ci/package-lists
-
-          registry_has_version() {
-            local tmp rc
-            tmp="$(mktemp -d)"
-            if (
-              cd "$tmp"
-              cargo info "$1@$2" >/dev/null 2>&1
-            ); then
-              rc=0
-            else
-              rc=$?
-            fi
-            rm -rf "$tmp"
-            return "$rc"
-          }
-
-          manifest_for_crate() {
-            case "$1" in
-              reedsolomon-rs) echo "crates/reedsolomon-rs/Cargo.toml" ;;
-              unrar-rs) echo "crates/unrar-rs/Cargo.toml" ;;
-              par2-rs) echo "crates/par2-rs/Cargo.toml" ;;
-              par3-rs) echo "crates/par3-rs/Cargo.toml" ;;
-              *) echo "unknown crate: $1" >&2; return 1 ;;
-            esac
-          }
-
-          crate_version() {
-            cargo metadata --locked --format-version 1 --no-deps \
-              | python3 -c 'import json,sys; crate=sys.argv[1]; packages=json.load(sys.stdin)["packages"]; print(next(package["version"] for package in packages if package["name"] == crate))' "$1"
-          }
-
-          verify_fixture_exclude() {
-            crate="$1"
-            case "$crate" in
-              unrar-rs|par2-rs)
-                python3 - "$(manifest_for_crate "$crate")" "$crate" <<'PY'
-          import pathlib
-          import sys
-          import tomllib
-
-          manifest = pathlib.Path(sys.argv[1])
-          crate = sys.argv[2]
-          data = tomllib.loads(manifest.read_text())
-          excludes = data.get("package", {}).get("exclude", [])
-          if "tests/fixtures/**" not in excludes:
-              print(
-                  f"{crate} manifest must exclude tests/fixtures/**",
-                  file=sys.stderr,
-              )
-              sys.exit(1)
-          PY
-                ;;
-            esac
-          }
-
-          package_and_list() {
-            local crate
-            local -a package_args=()
-            for crate in "$@"; do
-              package_args+=(-p "$crate")
-            done
-            cargo package --locked "${package_args[@]}"
-            for crate in "$@"; do
-              cargo package --locked --list -p "$crate" > ".ci/package-lists/${crate}.txt"
-              if grep -n 'tests/fixtures' ".ci/package-lists/${crate}.txt"; then
-                echo "::error::${crate} package includes fixture files"
-                exit 1
-              fi
-              if [ "$crate" = par3-rs ] && grep -n '^benchmarks/' ".ci/package-lists/${crate}.txt"; then
-                echo "::error::par3-rs package includes benchmark evidence"
-                exit 1
-              fi
-              if [ "$crate" = unrar-rs ]; then
-                grep -Fxq LICENSE ".ci/package-lists/${crate}.txt"
-              fi
-            done
-          }
-
-          if [ "$PUBLISH_PACKAGE" = all ]; then
-            reed_solomon_version="$(crate_version reedsolomon-rs)"
-            unrar_version="$(crate_version unrar-rs)"
-            # Verify PAR3 against the sibling archive before the new arithmetic
-            # version is available in the registry, matching PR CI.
-            package_and_list reedsolomon-rs par3-rs
-
-            if registry_has_version reedsolomon-rs "$reed_solomon_version"; then
-              package_and_list unrar-rs
-            else
-              echo "unrar-rs exact package check deferred until reedsolomon-rs@$reed_solomon_version is published"
-              verify_fixture_exclude unrar-rs
-            fi
-
-            if registry_has_version reedsolomon-rs "$reed_solomon_version" \
-              && registry_has_version unrar-rs "$unrar_version"; then
-              package_and_list par2-rs
-            else
-              echo "par2-rs exact package check deferred until same-release dependencies are published"
-              verify_fixture_exclude par2-rs
-            fi
-          else
-            package_and_list "$PUBLISH_PACKAGE"
+          if [ -z "$PLAN" ]; then
+            echo "nothing to publish; skipping package verification"
+            exit 0
           fi
+          mkdir -p .ci/package-lists
+          package_args=()
+          for crate in $PLAN; do
+            package_args+=(-p "$crate")
+          done
+          cargo package --locked "${package_args[@]}"
+          for crate in $PLAN; do
+            cargo package --locked --list -p "$crate" > ".ci/package-lists/${crate}.txt"
+            if grep -n 'tests/fixtures' ".ci/package-lists/${crate}.txt"; then
+              echo "::error::${crate} package includes fixture files"
+              exit 1
+            fi
+            if [ "$crate" = par3-rs ] && grep -n '^benchmarks/' ".ci/package-lists/${crate}.txt"; then
+              echo "::error::par3-rs package includes benchmark evidence"
+              exit 1
+            fi
+            if [ "$crate" = unrar-rs ]; then
+              grep -Fxq LICENSE ".ci/package-lists/${crate}.txt"
+            fi
+          done
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
@@ -342,7 +302,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     needs: [preflight]
-    if: ${{ inputs.dry_run == false }}
+    if: ${{ inputs.dry_run == false && needs.preflight.outputs.plan != '' }}
     environment: crates-io
     permissions:
       contents: read
@@ -385,19 +345,19 @@ jobs:
         run: |
           sccache --start-server || true
           sccache --zero-stats || true
-      # Each of reedsolomon-rs, unrar-rs and par2-rs lists this repository and
-      # workflow as a Trusted Publisher on crates.io; the action mints a token
-      # scoped to those crates for the duration of the job. par3-rs cannot be
-      # added to that list until it has been published once by hand, because
-      # crates.io only offers Trusted Publishing on a crate that already exists;
-      # until then an `all` run will fail on it.
+      # Every publishable crate lists this repository, this workflow and the
+      # crates-io environment as a Trusted Publisher on crates.io; the action
+      # mints a token scoped to those crates for the duration of the job. A
+      # crate's first release has to be published by hand, because crates.io
+      # only offers Trusted Publishing on a crate that already exists; add the
+      # Trusted Publisher right after, before the next run reaches it.
       - name: Authenticate to crates.io through Trusted Publishing
         id: crates-io-auth
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
       - name: Publish crates in dependency order
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
-          PUBLISH_PACKAGE: ${{ inputs.package }}
+          PLAN: ${{ needs.preflight.outputs.plan }}
         run: |
           set -euo pipefail
           mkdir -p .ci/package-lists
@@ -459,13 +419,8 @@ jobs:
               | python3 -c 'import json,sys; crate=sys.argv[1]; packages=json.load(sys.stdin)["packages"]; print(next(package["version"] for package in packages if package["name"] == crate))' "$1"
           }
 
-          if [ "$PUBLISH_PACKAGE" = all ]; then
-            crates="reedsolomon-rs unrar-rs par2-rs par3-rs"
-          else
-            crates="$PUBLISH_PACKAGE"
-          fi
-
-          for crate in $crates; do
+          echo "publish order: $PLAN"
+          for crate in $PLAN; do
             verify_package_contents "$crate"
             publish_with_retry "$crate"
             wait_for_crate_version "$crate" "$(crate_version "$crate")"

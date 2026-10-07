@@ -5,6 +5,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/procmeasure"
 )
 
 // Stat is a median with its range.
@@ -190,12 +192,15 @@ func ratio(ours, reference Stat) string {
 	if ours.N == 0 || reference.N == 0 || reference.Median == 0 {
 		return "-"
 	}
-	return fmt.Sprintf("%.3f", ours.Median/reference.Median)
+	if ours.Median == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%.3f", reference.Median/ours.Median)
 }
 
 // RenderReport renders the Markdown report: one table per configuration and
-// operation, medians with [min–max], and ours/reference ratios (below 1.000
-// means rarpar used less).
+// operation, medians with [min–max], and reference/ours ratios (above 1.000
+// means rarpar was faster or used less).
 func RenderReport(results *Results) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# PAR3 benchmark: %s\n\n", results.Profile)
@@ -245,9 +250,10 @@ func RenderReport(results *Results) string {
 		fmt.Fprintln(&b)
 	}
 	fmt.Fprintf(&b, "- Started %s, finished %s, status **%s**\n\n", results.StartedUTC, results.FinishedUTC, results.Status)
-	fmt.Fprintln(&b, "Wall and CPU (user+sys) are seconds, RSS is peak MiB; cells are median [min–max]. Ratios are rarpar/reference medians: below 1.000 rarpar used less. The reference is single-threaded. Every rarpar row, durable and buffered, is compared with the same reference row.")
+	fmt.Fprintln(&b, "Wall and CPU (user+sys) are seconds, RSS is peak MiB; cells are median [min–max]. Every ratio is reference/rarpar medians: above 1.000 rarpar was faster or used less. The reference is single-threaded. Every rarpar row, durable and buffered, is compared with the same reference row.")
 	fmt.Fprintln(&b, "Carriers: `identical` = byte-identical to the reference's set; `payloads-only` = every recovery block's payload matches but packet metadata differs; `DIFFERENT` = recovery payloads differ.")
 	fmt.Fprintln(&b)
+	procmeasure.RenderRSSSummary(&b, RSSSummary(results))
 
 	windowsCounters := false
 	for _, run := range results.Runs {
