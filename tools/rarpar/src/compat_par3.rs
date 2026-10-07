@@ -461,7 +461,10 @@ fn parse(args: &[String]) -> Result<Parsed, Failure> {
                 "g" | "gb" => value.wrapping_shl(30),
                 "m" | "mb" => value.wrapping_shl(20),
                 "k" | "kb" => value.wrapping_shl(10),
-                _ => value,
+                "" => value,
+                _ => {
+                    return Err(fail(&notices, &format!("Invalid option specified: {arg}")));
+                }
             };
         } else if first == b'S' && starts_with_digit(option, 1) {
             if !matches!(operation, Operation::Verify | Operation::Repair) {
@@ -2410,6 +2413,9 @@ mod tests {
         assert_eq!(options.search_limit, 250);
         assert_eq!(options.noise, -2);
         assert_eq!(options.memory_limit, 2 << 30);
+        assert_eq!(parsed(&["v", "-m7", "x"]).options.memory_limit, 7);
+        assert_eq!(parsed(&["v", "-m3Mb", "x"]).options.memory_limit, 3 << 20);
+        assert_eq!(parsed(&["v", "-m5K", "x"]).options.memory_limit, 5 << 10);
         assert_eq!(options.absolute, b'a');
         assert_eq!(options.file_system, 0x10007);
         assert_eq!(parsed(&["c", "-l", "x"]).options.file_scheme, -2);
@@ -2541,6 +2547,8 @@ mod tests {
             (&["v", "-Z", "s"], "Invalid option specified: -Z"),
             (&["v", "-", "s"], "Invalid option specified: -"),
             (&["v", "-d3", "s"], "Invalid option specified: -d3"),
+            (&["v", "-m256MiB", "s"], "Invalid option specified: -m256MiB"),
+            (&["v", "-m4x", "s"], "Invalid option specified: -m4x"),
             (&["v", "-q"], "PAR filename is not specified"),
             (&["v", "--"], "PAR filename is not specified"),
         ] {

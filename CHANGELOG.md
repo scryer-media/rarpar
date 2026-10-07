@@ -10,6 +10,10 @@ documented in each crate's own changelog so those notes ship with the crate.
 - The `par3` facade (par3cmdline compatibility) is silent at `-qq` when it
   repairs: the final "Repair complete." or "Repair failed." line follows the
   same noise level as the rest of the output.
+- The `par3` facade rejects a `-m` memory limit with an unknown suffix (such
+  as `-m256MiB`) as a malformed command instead of reading it as bytes; the
+  accepted suffixes stay none, `k`, `kb`, `m`, `mb`, `g` and `gb`, in any
+  case.
 
 ## rarpar 0.8.1
 
