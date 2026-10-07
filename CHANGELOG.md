@@ -96,12 +96,15 @@ documented in each crate's own changelog so those notes ship with the crate.
   recovery blocks, verify drops from 181 path stats to 60 and repair from 324
   to 111, with the same bytes read.
 - `par verify` and `repair` read and hash the PAR2 volumes once instead of
-  twice, and volume discovery no longer opens the files the set protects to
-  look for renamed volumes; on ten 3 MiB files with 10% recovery, verify
+  twice, and volume discovery no longer opens the files the set protects
+  (a protected name at its recorded length) to look for renamed volumes,
+  while a protected name at another length is still sniffed; on ten 3 MiB files with 10% recovery, verify
   reads 34.7 MB in 23 opens instead of 37.9 MB in 38.
-- `par verify` and `repair` build the PAR2 set from the parse volume
-  discovery already made of the named `.par2`, so that file is parsed once
-  instead of twice.
+- `par verify` and `repair` of a set whose named `.par2` is its only file
+  build the set from the parse volume discovery already made, so that file
+  is parsed once instead of twice. With other volumes the whole list is
+  parsed together, so one budget meters it and slice checksums described in
+  another file are kept.
 - RAR volume discovery for a named archive (the unrar facade and
   `rarpar rar`) no longer resolves the real path of every file in the
   directory: the archive is matched by the spelling it was given, and only a
