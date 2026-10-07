@@ -148,7 +148,14 @@ fn cancelling_encoding_from_progress_cleans_spool_and_staging_for_both_codecs() 
         assert!(matches!(error, EngineError::Cancelled), "{error}");
         assert_eq!(std::fs::read_dir(tree.path()).unwrap().count(), 0);
         assert_eq!(options.handles.used(), 0);
-        assert_eq!(options.memory.used(), retained);
+        // Spooled rows push out the source the plan kept from its hash pass,
+        // to be read again; nothing else the execute took is still held.
+        let released = if memory.is_some() {
+            common::a_bin().len()
+        } else {
+            0
+        };
+        assert_eq!(options.memory.used(), retained - released);
         assert_eq!(
             options.diagnostics.file_io().write_bytes > 0,
             memory.is_some(),
@@ -871,7 +878,10 @@ fn read_ahead_never_starves_the_proof_frontiers_into_read_back() {
     );
     let peak = roomy.memory.peak();
     let mut rows = Vec::new();
-    let mut budget = peak.saturating_sub(1900 << 10);
+    // The roomy repair also held the recovery rows whole, which its peak
+    // counts and a tight budget never grants, so the sweep starts lower by
+    // that much.
+    let mut budget = peak.saturating_sub((1900 << 10) + recovery as usize * block);
     while budget <= peak + (64 << 10) {
         if let Some(run) = repair(budget) {
             rows.push((
@@ -1102,8 +1112,8 @@ fn stripe_passes_over_a_block_are_passes_and_not_rereads() {
 /// hashing the whole packet, before the codec read the same payload again to
 /// use it. Where one stripe covers the block, the codec's own read of a payload
 /// is now what gets hashed, and its bytes are used only once the hash matched:
-/// each payload is fetched once. A stripe narrower than the block still
-/// authenticates each payload in a pass of its own before its first stripe.
+/// each payload is fetched once. A stripe narrower than the block reads each
+/// payload whole once, before its first stripe, where the budget can hold it.
 #[test]
 fn a_payload_read_whole_is_authenticated_by_the_read_that_uses_it() {
     let (blocks, block_size, damage) = (32usize, 4096u64, [2usize, 9]);
@@ -1150,17 +1160,13 @@ fn a_payload_read_whole_is_authenticated_by_the_read_that_uses_it() {
             (once, blocks as u64),
             "{workers} workers: a whole-block stripe read a payload twice"
         );
-        // A quarter-block stripe walks four passes and authenticates each row
-        // first: its packet from the length field on, header and identity
-        // fields included, in stripe-sized reads.
-        let packet = block_size + 64;
+        // A quarter-block stripe walks four passes over the surviving blocks,
+        // but with room to hold them it reads each row whole once,
+        // authenticated by that read, and serves its stripes from it.
         assert_eq!(
             repair(workers, block_size as usize / 4),
-            (
-                once + lost * packet,
-                4 * blocks as u64 + lost * packet.div_ceil(block_size / 4)
-            ),
-            "{workers} workers: a narrow stripe changed what it authenticates"
+            (once, 4 * (blocks as u64 - lost) + lost),
+            "{workers} workers: a narrow stripe read a held row again"
         );
     }
 }
