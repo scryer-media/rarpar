@@ -599,6 +599,22 @@ fn links_are_judged_from_where_they_are_created() {
     assert!(!std::fs::symlink_metadata(&pivot).unwrap().is_symlink());
 }
 
+/// A link target that is not UTF-8 keeps its own bytes: it is never rewritten
+/// with U+FFFD into a link to some other name.
+#[cfg(unix)]
+#[test]
+fn link_targets_keep_their_bytes() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().unwrap();
+    write_entries(
+        &dir.path().join("raw.7z"),
+        &[("raw.lnk", b"caf\xe9.txt", true)],
+    );
+    expect(&facade(dir.path(), &["x", "-y", "-oout", "raw.7z"], b""), 0);
+    let target = std::fs::read_link(dir.path().join("out/raw.lnk")).unwrap();
+    assert_eq!(target.as_os_str().as_bytes(), b"caf\xe9.txt");
+}
+
 /// A refused link leaves nothing at its name, as 7-Zip's does: not an empty
 /// placeholder in place of the file `-y` overwrote.
 #[cfg(unix)]

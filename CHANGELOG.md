@@ -60,6 +60,8 @@ documented in each crate's own changelog so those notes ship with the crate.
 - 7-Zip facade: a link member refused as dangerous leaves nothing at its
   name, as 7-Zip's does, instead of the empty placeholder opened when its
   data began.
+- 7-Zip facade: a Unix link target that is not UTF-8 is created byte for
+  byte, not rewritten with U+FFFD into a link to a different name.
 - par3cmdline facade: the block-map report is counted from ranges, so a set
   with a huge block count no longer walks every block; non-UTF-8 arguments
   reach the files they name byte for byte on Unix; `\` separates path
