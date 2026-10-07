@@ -435,8 +435,8 @@ fn resolve_compat_input(
         return Err(RarparError::MissingInput(input.to_path_buf()));
     }
 
-    let par2_paths = discover_compat_par2_paths(input, wildcard.as_deref())?;
-    let scanned = par2_rs::Par2FileSet::from_paths(&par2_paths).ok();
+    let (par2_paths, seed) = discover_compat_par2_paths(input, wildcard.as_deref())?;
+    let scanned = scan_discovered_set(&par2_paths, seed);
     let set_id = scanned.as_ref().map_or_else(
         || format!("par2:{}", input.display()),
         |set| set.recovery_set_id.to_string(),
@@ -674,12 +674,13 @@ fn resolve_input(cli: &Cli, args: &ParArgs) -> Result<ResolvedPar2Input, RarparE
         return Err(RarparError::MissingInput(args.input.clone()));
     }
 
-    let par2_paths = if args.input.is_dir() {
-        collect_par2_paths_from_dir(&args.input)?
+    let (par2_paths, seed) = if args.input.is_dir() {
+        (collect_par2_paths_from_dir(&args.input)?, None)
     } else {
-        discover_matching_par2_paths(&args.input)?
+        let (paths, seed) = discover_matching_par2_paths(&args.input)?;
+        (paths, Some(seed))
     };
-    let scanned = par2_rs::Par2FileSet::from_paths(&par2_paths).ok();
+    let scanned = scan_discovered_set(&par2_paths, seed);
     let set_id = scanned.as_ref().map_or_else(
         || format!("par2:{}", args.input.display()),
         |set| set.recovery_set_id.to_string(),
@@ -739,12 +740,22 @@ fn collect_par2_paths_from_dir(dir: &Path) -> Result<Vec<PathBuf>, RarparError> 
     Ok(par2_paths)
 }
 
+/// The parse of the named `.par2` that volume discovery makes, with that
+/// file's spelling in the discovered path list (`None` when the list does not
+/// hold it).
+type SeedParse = (Option<PathBuf>, par2_rs::Par2FileSet);
+
+/// The discovered paths, and the seed parse when discovery made one, so the
+/// caller can build the full set without parsing the seed file again.
+type DiscoveredPar2Paths = (Vec<PathBuf>, Option<SeedParse>);
+
 fn discover_compat_par2_paths(
     input: &Path,
     wildcard: Option<&Path>,
-) -> Result<Vec<PathBuf>, RarparError> {
+) -> Result<DiscoveredPar2Paths, RarparError> {
     let Some(wildcard) = wildcard else {
-        return discover_matching_par2_paths(input);
+        let (paths, seed) = discover_matching_par2_paths(input)?;
+        return Ok((paths, Some(seed)));
     };
     let parent = wildcard
         .parent()
@@ -766,12 +777,53 @@ fn discover_compat_par2_paths(
         .collect::<Vec<_>>();
     par2_paths.sort();
     if par2_paths.is_empty() {
-        return discover_matching_par2_paths(input);
+        let (paths, seed) = discover_matching_par2_paths(input)?;
+        return Ok((paths, Some(seed)));
     }
-    Ok(par2_paths)
+    Ok((par2_paths, None))
 }
 
-fn discover_matching_par2_paths(input: &Path) -> Result<Vec<PathBuf>, RarparError> {
+/// The full set over `paths`, reusing `seed` (the parse of one of them that
+/// volume discovery already made) instead of reading that file a second time.
+///
+/// The other volumes are parsed on their own and the seed fills what they
+/// lack. Both parses validated their packets against the same main packet
+/// (one recovery set ID is one main packet body), and every packet key names
+/// its content, so the union holds everything one parse over every path
+/// holds.
+/// When the other volumes do not form a set on their own (no main packet
+/// among them, say) the whole list is parsed as before. `None` keeps the
+/// caller's lazy re-parse, which reports the error.
+fn scan_discovered_set(paths: &[PathBuf], seed: Option<SeedParse>) -> Option<par2_rs::Par2FileSet> {
+    let Some((Some(seed_path), mut seed)) = seed else {
+        return par2_rs::Par2FileSet::from_paths(paths).ok();
+    };
+    let others: Vec<&PathBuf> = paths.iter().filter(|path| **path != seed_path).collect();
+    if others.is_empty() {
+        return Some(seed);
+    }
+    let Ok(mut set) = par2_rs::Par2FileSet::from_paths(&others) else {
+        return par2_rs::Par2FileSet::from_paths(paths).ok();
+    };
+    if set.recovery_set_id != seed.recovery_set_id {
+        return par2_rs::Par2FileSet::from_paths(paths).ok();
+    }
+    for (id, description) in seed.files.drain() {
+        set.files.entry(id).or_insert(description);
+    }
+    for (id, checksums) in seed.slice_checksums.drain() {
+        set.slice_checksums.entry(id).or_insert(checksums);
+    }
+    for (exponent, slice) in std::mem::take(&mut seed.recovery_slices) {
+        set.recovery_slices.entry(exponent).or_insert(slice);
+    }
+    if set.creator.is_none() {
+        set.creator = seed.creator.take();
+    }
+    Some(set)
+}
+
+fn discover_matching_par2_paths(input: &Path) -> Result<(Vec<PathBuf>, SeedParse), RarparError> {
     let seed_set = par2_rs::Par2FileSet::from_paths(&[input])?;
     let parent = input
         .parent()
@@ -783,7 +835,15 @@ fn discover_matching_par2_paths(input: &Path) -> Result<Vec<PathBuf>, RarparErro
     }
     par2_paths.sort();
     par2_paths.dedup();
-    Ok(par2_paths)
+    // Discovery lists the input under the directory it scanned, which need
+    // not be the caller's spelling (`./set.par2` for `set.par2`).
+    let listed = input.file_name().map(|name| parent.join(name));
+    let seed_path = [listed.as_deref(), Some(input)]
+        .into_iter()
+        .flatten()
+        .find(|candidate| par2_paths.iter().any(|path| path == candidate))
+        .map(Path::to_path_buf);
+    Ok((par2_paths, (seed_path, seed_set)))
 }
 
 /// [`par2_rs::identify_par2_files`] without opening the files the seed set
@@ -1142,16 +1202,8 @@ mod tests {
         assert_eq!(refused(&["v", "archive.rar"]), None);
     }
 
-    /// Volume discovery used to open and read the first 64 bytes of every
-    /// sibling, the set's own data files included, before verification read
-    /// those files in full. A protected file is data by definition and is not
-    /// opened at all: one made unreadable here would fail the sniff. A
-    /// renamed volume under an unprotected name is still found.
-    #[cfg(unix)]
-    #[test]
-    fn volume_discovery_does_not_open_the_files_the_set_protects() {
-        use std::os::unix::fs::PermissionsExt;
-        let temp = tempfile::tempdir().unwrap();
+    /// A small PAR2 set in `dir`: three protected files and recovery volumes.
+    fn create_small_set(dir: &Path) -> (Vec<PathBuf>, par2_rs::Par2CreateOutcome) {
         let mut sources = Vec::new();
         for (index, name) in [
             "orchard-notes.part1.bin",
@@ -1161,13 +1213,13 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let path = temp.path().join(name);
+            let path = dir.join(name);
             std::fs::write(&path, vec![0x31 + index as u8; 3000]).unwrap();
             sources.push(path);
         }
         let mut options = Par2CreatorOptions::with_output(
-            temp.path().join("orchard-notes.par2"),
-            Some(temp.path().to_path_buf()),
+            dir.join("orchard-notes.par2"),
+            Some(dir.to_path_buf()),
             sources.clone(),
         );
         options.block_sizing = BlockSizing::Bytes(512);
@@ -1180,6 +1232,63 @@ mod tests {
             "{:?}",
             outcome.volume_paths
         );
+        (sources, outcome)
+    }
+
+    /// Discovery parses the named `.par2` to learn the set; the full set used
+    /// to parse it a second time. It is now built from the other volumes plus
+    /// that seed parse, so the named file is not opened again (it is
+    /// unreadable here by then), and the result holds what one parse over
+    /// every path holds.
+    #[cfg(unix)]
+    #[test]
+    fn the_full_set_reuses_the_discovery_parse_of_the_named_par2() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let (_, outcome) = create_small_set(temp.path());
+        let (paths, seed) = discover_matching_par2_paths(&outcome.main_path).unwrap();
+        assert_eq!(seed.0.as_deref(), Some(outcome.main_path.as_path()));
+        let reference = par2_rs::Par2FileSet::from_paths(&paths).unwrap();
+
+        std::fs::set_permissions(&outcome.main_path, std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        if std::fs::File::open(&outcome.main_path).is_ok() {
+            return;
+        }
+        let set = scan_discovered_set(&paths, Some(seed)).expect("built without the named file");
+
+        assert_eq!(set.recovery_set_id, reference.recovery_set_id);
+        assert_eq!(set.slice_size, reference.slice_size);
+        assert_eq!(set.recovery_file_ids, reference.recovery_file_ids);
+        assert_eq!(set.non_recovery_file_ids, reference.non_recovery_file_ids);
+        assert_eq!(set.creator, reference.creator);
+        let mut files: Vec<_> = set.files.keys().collect();
+        let mut expected_files: Vec<_> = reference.files.keys().collect();
+        files.sort();
+        expected_files.sort();
+        assert_eq!(files, expected_files);
+        for (id, checksums) in &reference.slice_checksums {
+            assert_eq!(set.slice_checksums[id].len(), checksums.len());
+        }
+        assert_eq!(set.slice_checksums.len(), reference.slice_checksums.len());
+        assert!(
+            set.recovery_slices
+                .keys()
+                .eq(reference.recovery_slices.keys())
+        );
+    }
+
+    /// Volume discovery used to open and read the first 64 bytes of every
+    /// sibling, the set's own data files included, before verification read
+    /// those files in full. A protected file is data by definition and is not
+    /// opened at all: one made unreadable here would fail the sniff. A
+    /// renamed volume under an unprotected name is still found.
+    #[cfg(unix)]
+    #[test]
+    fn volume_discovery_does_not_open_the_files_the_set_protects() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let (sources, outcome) = create_small_set(temp.path());
 
         let relocated = &outcome.volume_paths[0];
         std::fs::rename(relocated, temp.path().join("relocated-volume")).unwrap();

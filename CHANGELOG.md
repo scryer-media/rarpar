@@ -99,6 +99,9 @@ documented in each crate's own changelog so those notes ship with the crate.
   twice, and volume discovery no longer opens the files the set protects to
   look for renamed volumes; on ten 3 MiB files with 10% recovery, verify
   reads 34.7 MB in 23 opens instead of 37.9 MB in 38.
+- `par verify` and `repair` build the PAR2 set from the parse volume
+  discovery already made of the named `.par2`, so that file is parsed once
+  instead of twice.
 
 ### Library versions
 
