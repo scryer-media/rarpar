@@ -2347,8 +2347,8 @@ mod tests {
             Err(EngineError::Unsupported("recovery index out of range"))
         ));
         assert_eq!(
-            recovery_ranges(u64::MAX - 2, &[2]).unwrap(),
-            [u64::MAX - 2..u64::MAX]
+            recovery_ranges(u64::MAX - 4, &[2, 2]).unwrap(),
+            [u64::MAX - 4..u64::MAX - 2, u64::MAX - 2..u64::MAX]
         );
         assert_eq!(recovery_ranges(5, &[2, 3]).unwrap(), [5..7, 7..10]);
         assert_eq!(recovery_ranges(0, &[]).unwrap(), []);
