@@ -489,7 +489,7 @@ impl CreationPlan {
                     append_full(&mut chunks, index, options.block_size);
                 } else if length < 40 {
                     let mut bytes = vec![0; length as usize];
-                    reader.read(at, &mut bytes)?;
+                    reader.read_inline(at, &mut bytes)?;
                     append_tail(
                         &mut chunks,
                         length,
@@ -2315,6 +2315,17 @@ impl PlanningReader<'_> {
         Ok(())
     }
 
+    /// Read the file's inline tail. As with a chunk, a failed read, whether
+    /// made here or read ahead on a pool, is reported as the change behind
+    /// it, if any.
+    fn read_inline(&mut self, start: u64, out: &mut [u8]) -> EngineResult<()> {
+        if let Err(error) = self.read(start, out) {
+            ensure_snapshot(self.access, self.source, self.snapshot)?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn hash_chunk(
         &mut self,
         start: u64,
@@ -2551,6 +2562,83 @@ impl PlanningReader<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A source that vanishes when its inline tail is read: the read fails
+    /// with `NotFound` and the source has no snapshot from then on.
+    struct VanishingTail {
+        inner: crate::source::MemorySourceAccess,
+        tail_at: u64,
+        gone: std::sync::atomic::AtomicBool,
+    }
+
+    impl SourceAccess for VanishingTail {
+        fn snapshot(&self, source: SourceId) -> std::io::Result<Option<SourceSnapshot>> {
+            if self.gone.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(None);
+            }
+            self.inner.snapshot(source)
+        }
+        fn read_at(&self, source: SourceId, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
+            if offset >= self.tail_at {
+                self.gone.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Err(std::io::ErrorKind::NotFound.into());
+            }
+            self.inner.read_at(source, offset, out)
+        }
+        fn next_available(
+            &self,
+            source: SourceId,
+            offset: u64,
+        ) -> std::io::Result<Option<std::ops::Range<u64>>> {
+            self.inner.next_available(source, offset)
+        }
+    }
+
+    #[test]
+    fn an_inline_tail_whose_source_vanished_is_reported_as_changed() {
+        // A source large enough for a planning pool, one byte block per
+        // buffer, so the 17-byte inline tail is read ahead on its own while
+        // the last block is hashed; the failure waits for the walk to reach
+        // the tail. The serial walk reads the tail itself.
+        let block_size = 1u64 << 20;
+        let large = crate::hash::PARALLEL_SOURCE_BYTES;
+        let bytes: Vec<u8> = (0..large + 17).map(|i| (i * 131 + i / 977) as u8).collect();
+        for workers in [1, 4] {
+            let mut inner = crate::source::MemorySourceAccess::default();
+            inner.insert(SourceId(1), 1, bytes.clone().into());
+            let mut options = CreationOptions {
+                block_size,
+                recovery_count: 2,
+                ..CreationOptions::default()
+            };
+            options.execution.workers = workers;
+            let execution = options.execution.clone();
+            let result = CreationPlan::build(
+                Arc::new(VanishingTail {
+                    inner,
+                    tail_at: large,
+                    gone: false.into(),
+                }),
+                &[CreationSource {
+                    name: "fixture.bin".into(),
+                    source: SourceId(1),
+                }],
+                options,
+            );
+            assert!(
+                matches!(result, Err(EngineError::SourceChanged(SourceId(1)))),
+                "{workers} workers: {:?}",
+                result.err()
+            );
+            let stacks = execution
+                .diagnostics
+                .memory()
+                .unwrap()
+                .category(crate::runtime::MemoryCategory::WorkerStacks)
+                .peak;
+            assert_eq!(stacks > 0, workers > 1, "{workers} workers: planning pool");
+        }
+    }
 
     #[test]
     fn a_tail_goes_behind_the_first_placed_tail_with_room() {

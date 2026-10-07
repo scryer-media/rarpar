@@ -479,6 +479,12 @@
   0.46 → 0.44 s at eight, FFT 0.91 → 0.90 s and 0.61 → 0.59 s, CPU
   unchanged. Repairs in 1 MiB blocks at the default 64 KiB stripe read
   exactly what they did.
+- Creation planning (`creation::CreationPlan::build`) reports a source that
+  disappears or is rewritten while its inline tail (a final chunk under 40
+  bytes) is read as `SourceChanged`, not the provider's `NotFound` or I/O
+  error, as it already did for every other chunk. This covers both the serial
+  walk and a planning pool, whose read-ahead failure was returned unchecked
+  when the walk reached the tail.
 
 ## 0.4.4
 
