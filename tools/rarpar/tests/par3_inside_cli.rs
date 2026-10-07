@@ -204,6 +204,45 @@ fn inside_reports_a_missing_volume_no_independent_set_covers() {
     );
 }
 
+/// A volume renamed to a huge suffix, whose end header says another follows,
+/// is reported against a bound the inputs justify instead of having every
+/// number up to its suffix enumerated.
+#[test]
+fn inside_bounds_a_renamed_volume_suffix() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let Some(sources) = originals(root) else {
+        return;
+    };
+    let first = sources[0].to_str().unwrap();
+    run(
+        root,
+        &[
+            "par3",
+            "inside",
+            "insert",
+            first,
+            "--in-place",
+            "-s",
+            "4096",
+            "-c",
+            "14",
+        ],
+        0,
+    );
+    let directory = root.join("original");
+    std::fs::remove_file(directory.join(name(7))).unwrap();
+    std::fs::rename(
+        directory.join(name(6)),
+        directory.join(format!("{STEM}.part{}.rar", u64::MAX)),
+    )
+    .unwrap();
+    let verified = run(root, &["par3", "inside", "verify", first], 1);
+    let missing = verified["unprotected_missing_volumes"].as_array().unwrap();
+    assert!(!missing.is_empty());
+    assert!(missing.len() <= 6 + 7 + 1, "{missing:?}");
+}
+
 /// One repair over two sets in two directories: a lost volume comes back
 /// beside its own set's survivors, and a dry run reports a plan and writes
 /// nothing.

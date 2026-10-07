@@ -69,6 +69,12 @@ documented in each crate's own changelog so those notes ship with the crate.
   `"dry_run": true` for an intact set. In place, `insert`, `repair` and
   `remove` stage each output in its own volume's directory, so the final
   rename never crosses a filesystem.
+- `par3 inside repair` and `remove` refuse a host name recorded in the set
+  that is not one safe file name (absolute, `..`, or a separator) before
+  writing anything, so an output never lands outside the chosen directory.
+  Missing-volume gaps are enumerated only up to the volumes present plus the
+  hosts the sets record, so a volume renamed to a huge `.partN.rar` suffix
+  yields a report instead of unbounded work.
 - Release binaries are built with the `sevenz` feature, so `par3 archive`
   and the 7-Zip facade ship in them, and the `cargo xtask` feature audit
   refuses a release build without it.

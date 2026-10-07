@@ -307,6 +307,28 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
     ))
 }
 
+/// The names a set's hosts are written under, each refused unless it is one
+/// safe path component: a recorded name comes from the set's own packets, so
+/// an absolute one or one with `..` would leave the chosen directory.
+fn host_names(set: &Rar5Set) -> Result<Vec<String>, RarparError> {
+    let names = set.current_names();
+    for name in &names {
+        check_host_name(name)?;
+    }
+    Ok(names)
+}
+
+fn check_host_name(name: &str) -> Result<(), RarparError> {
+    if name.contains('/') {
+        return Err(RarparError::Unsafe(format!(
+            "recorded host name is not a single file name: {name}"
+        )));
+    }
+    par3_rs::paths::validate_relative_path(name).map_err(|violation| {
+        RarparError::Unsafe(format!("recorded host name {name:?}: {violation}"))
+    })
+}
+
 /// The directory `path` is in.
 fn directory_of(path: &Path) -> PathBuf {
     path.parent()
@@ -395,6 +417,12 @@ fn open(cli: &Cli, args: &Par3InsideArgs) -> Result<Vec<Rar5Set>, RarparError> {
 /// Volumes of the given archives' `.partN.rar` sets that are absent and that
 /// no opened set records: a numbering gap, or a missing successor of the
 /// highest volume present when its end header says another follows.
+///
+/// A volume number comes from a file name, which may be renamed to any
+/// suffix, so numbers are enumerated only up to a bound the inputs justify:
+/// the volumes present and the hosts the opened sets record, plus one. Some
+/// number at or under that bound is then always absent, so a family whose
+/// suffixes run past it still reports a missing volume and is never healthy.
 fn uncovered_volumes(cli: &Cli, args: &Par3InsideArgs, sets: &[Rar5Set]) -> Vec<String> {
     let covered: Vec<String> = sets.iter().flat_map(Rar5Set::current_names).collect();
     let mut missing = Vec::new();
@@ -433,7 +461,8 @@ fn uncovered_volumes(cli: &Cli, args: &Par3InsideArgs, sets: &[Rar5Set]) -> Vec<
             rar5::inspect(&disk, par3_rs::source::SourceId(0), &options).ok()
         })
         .is_some_and(|archive| archive.more_volumes);
-        let end = highest + u64::from(more);
+        let bound = (present.len() + covered.len() + 1) as u64;
+        let end = highest.saturating_add(u64::from(more)).min(bound);
         for number in 1..=end {
             if present.iter().any(|(found, _, _)| *found == number) {
                 continue;
@@ -483,6 +512,7 @@ fn repair(cli: &Cli, args: &Par3InsideRepairArgs) -> Result<(bool, Value), Rarpa
             success = false;
             continue;
         }
+        let names = host_names(set)?;
         if cli.dry_run {
             planned = true;
             continue;
@@ -494,7 +524,6 @@ fn repair(cli: &Cli, args: &Par3InsideRepairArgs) -> Result<(bool, Value), Rarpa
             .find_map(|host| host.path.as_deref())
             .map(directory_of)
             .unwrap_or_else(|| directory_of(&args.inputs.archives[0]));
-        let names = set.current_names();
         let finals: Vec<PathBuf> = set
             .hosts
             .iter()
@@ -573,10 +602,10 @@ fn remove(cli: &Cli, args: &Par3InsideRemoveArgs) -> Result<(bool, Value), Rarpa
     for set in &mut sets {
         // A dry run makes the checks a removal would, and writes nothing.
         set.removable()?;
+        let names = host_names(set)?;
         if cli.dry_run {
             continue;
         }
-        let names = set.current_names();
         let mut stage = Vec::new();
         let directories = if args.in_place {
             // Each host is staged in its own directory, so the rename back
@@ -620,4 +649,29 @@ fn remove(cli: &Cli, args: &Par3InsideRemoveArgs) -> Result<(bool, Value), Rarpa
         true,
         json!({"operation":"par3_inside_remove","status":"removed","outputs":outputs}),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_host_name;
+    use crate::error::RarparError;
+
+    #[test]
+    fn a_recorded_host_name_must_be_one_safe_component() {
+        assert!(check_host_name("invented_title.part1.rar").is_ok());
+        for name in [
+            "/var/invented_title.part1.rar",
+            "../invented_title.part1.rar",
+            "..",
+            "nested/invented_title.part1.rar",
+            "nested\\invented_title.part1.rar",
+            "C:invented_title.part1.rar",
+            "",
+        ] {
+            assert!(
+                matches!(check_host_name(name), Err(RarparError::Unsafe(_))),
+                "{name:?}"
+            );
+        }
+    }
 }
