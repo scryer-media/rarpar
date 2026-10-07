@@ -84,17 +84,28 @@ struct InPlace {
     identity: crate::repair_tree::FileIdentity,
     source: crate::source::SourceId,
     snapshot: crate::source::SourceSnapshot,
-    written: Arc<AtomicBool>,
+    /// Whether the pre-write check has completed. Held, not merely set, while
+    /// the check runs: a writer that finds the flag clear checks under the
+    /// lock, so no other writer can touch the file before the check has read
+    /// the snapshot, and the flag is published only once the check passed.
+    checked: Arc<Mutex<bool>>,
 }
 
 /// Re-check the source of an output patched in place before the first
 /// byte is written to it; every later write finds the snapshot moved by the
-/// repair's own writes and checks nothing.
+/// repair's own writes and checks nothing. Concurrent writers to one output
+/// serialize on the check: the repair's own first write cannot move the
+/// snapshot under a check still in progress.
 fn before_in_place_write(access: &dyn SourceAccess, target: &StagedFile) -> EngineResult<()> {
-    if let Some(in_place) = &target.in_place
-        && !in_place.written.swap(true, Ordering::AcqRel)
-    {
-        crate::source::ensure_snapshot(access, in_place.source, in_place.snapshot)?;
+    if let Some(in_place) = &target.in_place {
+        let mut checked = in_place
+            .checked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !*checked {
+            crate::source::ensure_snapshot(access, in_place.source, in_place.snapshot)?;
+            *checked = true;
+        }
     }
     Ok(())
 }
@@ -416,7 +427,7 @@ fn repair_inner(
                         identity,
                         source: evidence.source,
                         snapshot,
-                        written: Arc::new(AtomicBool::new(false)),
+                        checked: Arc::new(Mutex::new(false)),
                     }),
                 });
                 continue;

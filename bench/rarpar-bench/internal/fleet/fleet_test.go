@@ -1029,3 +1029,17 @@ func TestNativeBuildArchMapping(t *testing.T) {
 		t.Fatal("uname arch normalization is wrong")
 	}
 }
+
+func TestValidateRunID(t *testing.T) {
+	if err := ValidateRunID(NewRunID("")); err != nil {
+		t.Fatalf("a fresh run id must validate: %v", err)
+	}
+	if err := ValidateRunID("fleet-20261007T030000Z"); err != nil {
+		t.Fatalf("a plain run id must validate: %v", err)
+	}
+	for _, bad := range []string{"", ".", "..", "../shared", "a/b", `a\b`, "with space", "/abs"} {
+		if err := ValidateRunID(bad); err == nil {
+			t.Errorf("run id %q must be rejected", bad)
+		}
+	}
+}

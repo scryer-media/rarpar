@@ -26,6 +26,11 @@ func Teardown(ctx context.Context, options TeardownOptions) error {
 	if options.Log == nil {
 		options.Log = os.Stderr
 	}
+	if options.RunID != "" {
+		if err := ValidateRunID(options.RunID); err != nil {
+			return err
+		}
+	}
 	logf := func(format string, args ...any) {
 		fmt.Fprintf(options.Log, "[%s] %s\n", time.Now().UTC().Format("15:04:05Z"), fmt.Sprintf(format, args...))
 	}
@@ -91,6 +96,18 @@ func runLocal(program string, args ...string) error {
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s %s: %w: %s", program, strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+// ValidateRunID rejects a run id that is not one local path component. The
+// id names the results directory, the host run root and the staging the run
+// clears before it starts, so a value such as `..`, a separator, or a space
+// would point every one of those outside the directory configured for it.
+func ValidateRunID(runID string) error {
+	if runID == "" || runID == "." || runID == ".." ||
+		strings.ContainsAny(runID, "/\\ ") || !filepath.IsLocal(runID) {
+		return fmt.Errorf("run id %q must be a single local path component", runID)
 	}
 	return nil
 }
