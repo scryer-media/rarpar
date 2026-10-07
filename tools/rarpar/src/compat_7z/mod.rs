@@ -414,9 +414,12 @@ fn parse_options(parsed: &Parsed, session: &mut Session) -> Result<Options, Line
         wildcard_switch(text, false, recursion, &mut names)?;
     }
     let mut positional = Vec::new();
-    for word in words {
+    // `--` ends `@listfile` reading for every word after it: judge each
+    // word by its own place among the non-switches.
+    let first = parsed.non_switches.len() - words.len();
+    for (index, word) in (first..).zip(words) {
         if let Some(file) = word.strip_prefix('@')
-            && parsed.stop_index.is_none_or(|stop| stop > 0)
+            && parsed.stop_index.is_none_or(|stop| index < stop)
         {
             list_file(file, &default_option, &mut positional)?;
         } else {
@@ -866,11 +869,13 @@ fn run_extract(session: &mut Session, options: Options, archives: Vec<(String, u
             setup.out_dir = String::new();
         }
         let selected = extract::selection(&opened.archive.files, &options.censor);
+        // An archive is deleted only when something was extracted from it.
+        let any_selected = selected.iter().any(|&wanted| wanted);
         match extract::extract(session, &setup, &mut stats, opened, selected) {
             Ending::Done(0) => {
                 ok += 1;
                 session.out("Everything is Ok\n");
-                if delete_after && !setup.test {
+                if delete_after && !setup.test && any_selected {
                     for volume in &set.paths {
                         let _ = fs::remove_file(volume);
                     }

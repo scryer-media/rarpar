@@ -554,7 +554,6 @@ fn trailing_data_and_par3_inside_extract_cleanly() {
 }
 
 /// One non-solid LZMA2 archive of `(name, data, is_link)` entries, in order.
-#[cfg(unix)]
 fn write_entries(path: &Path, entries: &[(&str, &[u8], bool)]) {
     let mut out = Vec::new();
     {
@@ -621,7 +620,10 @@ fn members_are_never_written_through_a_linked_folder() {
         err.contains("Dangerous link via another link was ignored : shelf/ledger.txt"),
         "{err}"
     );
-    assert_eq!(std::fs::read(victim.join("ledger.txt")).unwrap(), b"keep me");
+    assert_eq!(
+        std::fs::read(victim.join("ledger.txt")).unwrap(),
+        b"keep me"
+    );
 }
 
 /// A symlink member whose target is longer than any path is refused as it
@@ -631,11 +633,11 @@ fn members_are_never_written_through_a_linked_folder() {
 fn oversized_link_targets_are_refused() {
     let dir = tempfile::tempdir().unwrap();
     let target = vec![b'a'; 1 << 20];
-    write_entries(
-        &dir.path().join("long.7z"),
-        &[("long.lnk", &target, true)],
+    write_entries(&dir.path().join("long.7z"), &[("long.lnk", &target, true)]);
+    let (_, err) = expect(
+        &facade(dir.path(), &["x", "-y", "-oout", "long.7z"], b""),
+        2,
     );
-    let (_, err) = expect(&facade(dir.path(), &["x", "-y", "-oout", "long.7z"], b""), 2);
     assert!(
         err.contains("Cannot create symbolic link : File name too long"),
         "{err}"
@@ -644,6 +646,32 @@ fn oversized_link_targets_are_refused() {
         std::fs::symlink_metadata(dir.path().join("out/long.lnk"))
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
     );
+}
+
+/// After `--`, a word starting with `@` is a member name, not a list file.
+#[test]
+fn double_dash_makes_at_words_member_names() {
+    let dir = tempfile::tempdir().unwrap();
+    write_entries(
+        &dir.path().join("notes.7z"),
+        &[
+            ("@note.txt", b"literal", false),
+            ("other.txt", b"skipped", false),
+        ],
+    );
+    expect(
+        &facade(
+            dir.path(),
+            &["x", "-y", "-oout", "notes.7z", "--", "@note.txt"],
+            b"",
+        ),
+        0,
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("out/@note.txt")).unwrap(),
+        b"literal"
+    );
+    assert!(!dir.path().join("out/other.txt").exists());
 }
 
 #[test]
@@ -1243,4 +1271,25 @@ mod reference {
             failures.join("\n\n")
         );
     }
+}
+
+/// `-sdel` deletes an archive only when something was extracted from it: a
+/// filter that matches nothing leaves the archive in place.
+#[test]
+fn sdel_keeps_an_archive_nothing_was_extracted_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("crate.7z");
+    write_archive(&archive, SOLID);
+    let output = facade(
+        dir.path(),
+        &["x", "-sdel", "-y", "-oout", "crate.7z", "no-such-member"],
+        b"",
+    );
+    let (stdout, _) = expect(&output, 0);
+    assert!(stdout.contains("No files to process"), "{stdout}");
+    assert!(archive.is_file());
+    let output = facade(dir.path(), &["x", "-sdel", "-y", "-oout", "crate.7z"], b"");
+    expect(&output, 0);
+    assert!(!archive.exists());
+    assert_tree(&dir.path().join("out"));
 }
