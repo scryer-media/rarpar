@@ -528,6 +528,11 @@ mod generated {
 
     /// Volume `index` of `count`: main header, one opaque data block, end header.
     fn volume(index: u64, count: u64, seed: u8) -> Vec<u8> {
+        sized_volume(index, count, seed, 20_000)
+    }
+
+    /// As [`volume`], with a data block of `length` bytes.
+    fn sized_volume(index: u64, count: u64, seed: u8, length: u32) -> Vec<u8> {
         let mut out = b"Rar!\x1a\x07\x01\x00".to_vec();
         let main = if index == 0 {
             vec![1, 0, 0x1]
@@ -535,7 +540,7 @@ mod generated {
             vec![1, 0, 0x3, index]
         };
         out.extend(block(&main, &[]));
-        let data: Vec<u8> = (0..20_000u32)
+        let data: Vec<u8> = (0..length)
             .map(|value| (value as u8).wrapping_mul(31).wrapping_add(seed))
             .collect();
         out.extend(block(&[2, 0x2, data.len() as u64], &data));
@@ -649,6 +654,52 @@ mod generated {
             );
             assert_eq!(upper["sets"].as_array().unwrap().len(), 3, "{upper}");
         }
+    }
+
+    /// An independent insertion whose second set fails leaves no output of
+    /// the first behind. With an odd block size, the small first volume fits
+    /// GF(2^8) while the large second needs GF(2^16), whose blocks must be
+    /// of even length, so only the second set is refused.
+    #[test]
+    fn a_failed_later_independent_set_leaves_no_earlier_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source = root.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        for (index, length) in [10_000u32, 40_000, 10_000].into_iter().enumerate() {
+            let name = format!("set.part{}.rar", index + 1);
+            let bytes = sized_volume(index as u64, 3, 61 + index as u8, length);
+            std::fs::write(source.join(name), bytes).unwrap();
+        }
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_rarpar"))
+            .current_dir(root)
+            .args([
+                "--json",
+                "par3",
+                "inside",
+                "insert",
+                "source/set.part1.rar",
+                "-d",
+                "protected",
+                "-s",
+                "101",
+                "-c",
+                "4",
+                "--placement",
+                "independent",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "stdout={}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let left: Vec<_> = std::fs::read_dir(root.join("protected"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "left behind: {left:?}");
     }
 
     /// Naming several volumes of one family lists and opens it once.

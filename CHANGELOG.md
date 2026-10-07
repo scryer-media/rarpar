@@ -452,6 +452,11 @@ documented in each crate's own changelog so those notes ship with the crate.
   extraction is an error of that member, named with its path and the
   system's reason, so the summary counts it under `Sub items Errors` and the
   command exits 2 instead of 0.
+- `par3 inside insert --placement independent -d DIR` removes the outputs of
+  the sets it already inserted when a later volume's set fails, so a failed
+  run no longer leaves earlier volumes behind for a retry to refuse. A
+  shared set, `par3 inside repair` and a host bound across directories get
+  the matching par3-rs fixes below.
 
 ### Library versions
 

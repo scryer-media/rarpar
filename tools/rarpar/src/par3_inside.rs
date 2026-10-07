@@ -301,7 +301,7 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
     if placement == Rar5Placement::Independent {
         for (host, output) in hosts.iter().zip(&outputs) {
             let count = count_for(blocks_of(host.archive.length));
-            inserted.extend(rar5::insert_set(
+            match rar5::insert_set(
                 std::slice::from_ref(host),
                 std::slice::from_ref(output),
                 &[count],
@@ -309,7 +309,17 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
                 creation(count),
                 &scratch,
                 durability,
-            )?);
+            ) {
+                Ok(entries) => inserted.extend(entries),
+                Err(error) => {
+                    // The sets inserted before this one are this run's own
+                    // outputs; a failed insertion leaves none of them behind.
+                    for entry in &inserted {
+                        let _ = std::fs::remove_file(&entry.path);
+                    }
+                    return Err(error.into());
+                }
+            }
         }
     } else {
         let count = count_for(
