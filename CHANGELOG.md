@@ -102,6 +102,12 @@ documented in each crate's own changelog so those notes ship with the crate.
 - `par verify` and `repair` build the PAR2 set from the parse volume
   discovery already made of the named `.par2`, so that file is parsed once
   instead of twice.
+- RAR volume discovery for a named archive (the unrar facade and
+  `rarpar rar`) no longer resolves the real path of every file in the
+  directory: the archive is matched by the spelling it was given, and only a
+  file that could carry its real name is resolved. A six-volume set beside
+  eight unrelated files goes from 27 path resolutions (14 of the first
+  volume) to 1.
 
 ### Library versions
 

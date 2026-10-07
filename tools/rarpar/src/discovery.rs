@@ -342,6 +342,7 @@ fn discover_named_rar_family(
     let mut entries = std::fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.path());
 
+    let mut archive_identity = ArchiveIdentity::new(archive);
     let mut files = Vec::new();
     for entry in entries {
         let file_type = entry.file_type()?;
@@ -350,7 +351,7 @@ fn discover_named_rar_family(
         }
 
         let path = entry.path();
-        let is_archive = same_path(&path, archive);
+        let is_archive = archive_identity.is(&path);
         let is_family_candidate = set_hint(&path).as_deref() == Some(label)
             && (looks_rarish_by_name(&path) || is_ext(&path, "rev"));
         if !is_archive && !is_family_candidate {
@@ -372,17 +373,103 @@ fn discover_named_rar_family(
     Ok(files)
 }
 
+/// [`Path::canonicalize`], counted per thread under test so RAR set
+/// discovery's path resolutions can be asserted.
+fn real_path(path: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(test)]
+    REAL_PATH_CALLS.with(|calls| calls.set(calls.get() + 1));
+    path.canonicalize()
+}
+
+#[cfg(test)]
+thread_local! {
+    static REAL_PATH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether a regular file listed in the archive's own directory is the archive,
+/// as [`same_path`] decides, without resolving every entry's real path.
+///
+/// Such an entry is not a link (the listing's type does not follow one), so
+/// its real path ends in its own name. It can be the archive only when that
+/// name is the archive's real name, so only an entry whose name could be that
+/// one is resolved, and the archive itself is resolved at most once. The
+/// names are compared without case because a case-insensitive filesystem
+/// accepts the archive in a spelling the listing does not use.
+struct ArchiveIdentity<'a> {
+    archive: &'a Path,
+    is_link: bool,
+    resolved: Option<Option<PathBuf>>,
+}
+
+impl<'a> ArchiveIdentity<'a> {
+    fn new(archive: &'a Path) -> Self {
+        // A link archive's real name is its target's, which only resolving it
+        // tells; any other archive's real name is its own up to case.
+        let is_link = std::fs::symlink_metadata(archive)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(true);
+        Self {
+            archive,
+            is_link,
+            resolved: None,
+        }
+    }
+
+    fn resolved(&mut self) -> Option<&Path> {
+        self.resolved
+            .get_or_insert_with(|| real_path(self.archive).ok())
+            .as_deref()
+    }
+
+    fn is(&mut self, entry: &Path) -> bool {
+        if entry == self.archive {
+            return true;
+        }
+        let names_match = |candidate: Option<&Path>| {
+            candidate
+                .and_then(Path::file_name)
+                .zip(entry.file_name())
+                .is_some_and(|(left, right)| {
+                    left.to_string_lossy()
+                        .eq_ignore_ascii_case(&right.to_string_lossy())
+                })
+        };
+        let candidate = if self.is_link {
+            names_match(self.resolved())
+        } else {
+            names_match(Some(self.archive))
+        };
+        if !candidate {
+            return false;
+        }
+        let Ok(entry) = real_path(entry) else {
+            return false;
+        };
+        self.resolved() == Some(entry.as_path())
+    }
+}
+
 fn selected_rar_set(files: Vec<DiscoveredFile>, archive: &Path) -> Result<RarSet, RarparError> {
     selected_rar_set_from_sets(build_rar_sets(&files), archive)
 }
 
 fn selected_rar_set_from_sets(sets: Vec<RarSet>, archive: &Path) -> Result<RarSet, RarparError> {
-    sets.into_iter()
-        .find(|set| {
-            set.volumes
-                .iter()
-                .any(|volume| same_path(&volume.path, archive))
-        })
+    // Discovery lists the archive under the spelling it was given, so a
+    // textual match finds it without resolving any path; only a set reached
+    // some other way resolves the archive, once, against each volume.
+    let position = sets
+        .iter()
+        .position(|set| set.volumes.iter().any(|volume| volume.path == archive))
+        .or_else(|| {
+            let archive = real_path(archive).ok()?;
+            sets.iter().position(|set| {
+                set.volumes
+                    .iter()
+                    .any(|volume| real_path(&volume.path).ok().as_ref() == Some(&archive))
+            })
+        });
+    position
+        .and_then(|index| sets.into_iter().nth(index))
         .ok_or_else(|| RarparError::Data(format!("no RAR set found for {}", archive.display())))
 }
 
@@ -1023,6 +1110,84 @@ mod tests {
         names
             .iter()
             .all(|name| fixture_is_hydrated(&rar4_fixture(name)))
+    }
+
+    fn real_path_calls() -> usize {
+        REAL_PATH_CALLS.with(std::cell::Cell::get)
+    }
+
+    /// Finding the named archive's volume family compared every regular file
+    /// in the directory with the archive by resolving both real paths, so a
+    /// directory of 13 files resolved the archive 13 times and each other file
+    /// once, unrelated files included. The archive as listed is now matched by
+    /// its spelling, and only an entry that could carry the archive's real
+    /// name is resolved: none here, and for an archive named through a link,
+    /// the link once and its target once.
+    #[test]
+    fn rar_family_discovery_resolves_only_what_could_be_the_archive() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in [
+            "glade.part1.rar",
+            "glade.part2.rar",
+            "glade.part3.rar",
+            "notes-1.txt",
+            "notes-2.txt",
+            "notes-3.txt",
+            "unrelated.part1.rar",
+        ] {
+            std::fs::write(temp.path().join(name), b"Rar!\x1a\x07\x01\x00").unwrap();
+        }
+        let options = DiscoveryOptions {
+            working_dir: None,
+            recursive: false,
+            max_depth: 1,
+            max_files: 100,
+            par3_memory_mib: 256,
+            par3_workers: None,
+            par3_max_lost_blocks: 4096,
+        };
+        let names = |files: &[DiscoveredFile]| {
+            let mut names: Vec<String> = files
+                .iter()
+                .map(|file| {
+                    file.path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            names.sort();
+            names
+        };
+
+        let archive = temp.path().join("glade.part1.rar");
+        let before = real_path_calls();
+        let files = discover_named_rar_family(&archive, classify_path(&archive), "glade", &options)
+            .unwrap();
+        assert_eq!(real_path_calls() - before, 0);
+        assert_eq!(
+            names(&files),
+            ["glade.part1.rar", "glade.part2.rar", "glade.part3.rar"]
+        );
+
+        #[cfg(unix)]
+        {
+            let alias = temp.path().join("alias.part1.rar");
+            std::os::unix::fs::symlink(&archive, &alias).unwrap();
+            let before = real_path_calls();
+            let files = discover_named_rar_family(&alias, classify_path(&alias), "glade", &options)
+                .unwrap();
+            assert_eq!(real_path_calls() - before, 2);
+            // The link's target is the archive, so it is listed once, as the
+            // archive the caller named.
+            let archive_entries: Vec<_> = files.iter().filter(|file| file.path == alias).collect();
+            assert_eq!(archive_entries.len(), 1);
+            assert_eq!(
+                names(&files),
+                ["alias.part1.rar", "glade.part2.rar", "glade.part3.rar"]
+            );
+        }
     }
 
     #[test]
