@@ -320,7 +320,9 @@ fn list_file(
 struct Options {
     command: Command,
     forced_type: Option<String>,
-    archives: Vec<String>,
+    archives: Vec<(NameOption, String)>,
+    /// `-ax`: archives that are never opened, so never deleted.
+    archive_excludes: Censor,
     censor: Censor,
     names_case_sensitive: bool,
     setup: Setup,
@@ -388,18 +390,36 @@ fn parse_options(parsed: &Parsed, session: &mut Session) -> Result<Options, Line
         };
     }
 
+    // The archive names: `-ai` and `-ax` keep their own recursion, and
+    // nothing ever recurses for the archive name itself, `-r` included.
     let mut archive_names = Vec::new();
     if !parsed.has("an") {
         match words.next() {
-            Some(name) => archive_names.push(name.clone()),
+            Some(name) => archive_names.push((NameOption::default(), name.clone())),
             None => return Err(LineError::new("Cannot find archive name", "")),
         }
     }
-    let mut archive_extra = Vec::new();
     for text in &parsed.get("ai").strings {
-        wildcard_switch(text, true, Recursion::None, &mut archive_extra)?;
+        wildcard_switch(text, true, Recursion::None, &mut archive_names)?;
     }
-    archive_names.extend(archive_extra.into_iter().map(|(_, name)| name));
+    let mut archive_excluded = Vec::new();
+    for text in &parsed.get("ax").strings {
+        wildcard_switch(text, false, Recursion::None, &mut archive_excluded)?;
+    }
+    let mut archive_excludes = Censor::new(case_sensitive);
+    archive_excludes.add_name(
+        &NameOption {
+            recursion: Recursion::All,
+            ..NameOption::default()
+        },
+        "*",
+    );
+    for (option, name) in &archive_excluded {
+        if name.is_empty() {
+            return Err(LineError::new("Empty file path", ""));
+        }
+        archive_excludes.add_name(option, name);
+    }
 
     let mut names: Vec<(NameOption, String)> = Vec::new();
     for text in &parsed.get("i").strings {
@@ -496,6 +516,7 @@ fn parse_options(parsed: &Parsed, session: &mut Session) -> Result<Options, Line
         command,
         forced_type,
         archives: archive_names,
+        archive_excludes,
         censor,
         names_case_sensitive: case_sensitive,
         setup: Setup {
@@ -601,11 +622,27 @@ fn find_archives(
     let mut folders = 0u64;
     let mut missing: Option<io::Error> = None;
     let mut wildcard_names = false;
-    for name in &options.archives {
+    let case_sensitive = options.names_case_sensitive;
+    for (option, name) in &options.archives {
         let (dir, file) = match name.rfind(['/', std::path::MAIN_SEPARATOR]) {
             Some(at) => (&name[..=at], &name[at + 1..]),
             None => ("", name.as_str()),
         };
+        let recursive = match option.recursion {
+            Recursion::All => true,
+            Recursion::WildcardOnly => has_wildcard(file),
+            Recursion::None => false,
+        };
+        if recursive {
+            // `-air`: the name is matched in its folder and every folder
+            // under it.
+            wildcard_names = true;
+            let mut matches = Vec::new();
+            folders += walk(dir, Some((file, case_sensitive)), &mut matches);
+            matches.sort();
+            found.extend(matches);
+            continue;
+        }
         if has_wildcard(file) {
             wildcard_names = true;
             let listing = fs::read_dir(if dir.is_empty() { "." } else { dir });
@@ -616,9 +653,7 @@ fn find_archives(
                         continue;
                     };
                     let entry_name = entry.file_name().to_string_lossy().into_owned();
-                    if meta.is_file()
-                        && wildcard_match(file, &entry_name, options.names_case_sensitive)
-                    {
+                    if meta.is_file() && wildcard_match(file, &entry_name, case_sensitive) {
                         matches.push((format!("{dir}{entry_name}"), meta.len()));
                     }
                 }
@@ -633,7 +668,12 @@ fn find_archives(
                 // A folder stands for every file under it.
                 folders += 1;
                 let mut inside = Vec::new();
-                folders += walk(Path::new(name), &mut inside);
+                let prefix = if name.ends_with(['/', std::path::MAIN_SEPARATOR]) {
+                    name.clone()
+                } else {
+                    format!("{name}{}", std::path::MAIN_SEPARATOR)
+                };
+                folders += walk(&prefix, None, &mut inside);
                 inside.sort();
                 found.extend(inside);
             }
@@ -647,6 +687,8 @@ fn find_archives(
         session.err(&format!("\n\nSystem ERROR:\n{}\n", errno_text(&error)));
         return Err(EXIT_FATAL);
     }
+    // `-ax`: an excluded archive is never opened, so never deleted.
+    found.retain(|(path, _)| options.archive_excludes.selects(path, false));
     if found.is_empty() && (wildcard_names || options.archives.is_empty()) {
         return Err(line_error(
             session,
@@ -656,21 +698,30 @@ fn find_archives(
     Ok((found, folders))
 }
 
-/// Every file under `dir`, returning how many folders it passed.
-fn walk(dir: &Path, found: &mut Vec<(String, u64)>) -> u64 {
+/// Every file under the folder `prefix` names (`""` is the current one)
+/// whose name matches `mask`, returning how many folders it passed.
+///
+/// Links are never followed: a linked folder such as `loop -> .` would
+/// recurse without end, and a link out of the folder would reach archives
+/// outside the one that was named.
+fn walk(prefix: &str, mask: Option<(&str, bool)>, found: &mut Vec<(String, u64)>) -> u64 {
     let mut folders = 0;
-    let Ok(listing) = fs::read_dir(dir) else {
+    let Ok(listing) = fs::read_dir(if prefix.is_empty() { "." } else { prefix }) else {
         return 0;
     };
     for entry in listing.flatten() {
-        let path = entry.path();
-        let Ok(meta) = fs::metadata(&path) else {
+        let Ok(meta) = fs::symlink_metadata(entry.path()) else {
             continue;
         };
+        let entry_name = entry.file_name().to_string_lossy().into_owned();
+        let path = format!("{prefix}{entry_name}");
         if meta.is_dir() {
-            folders += 1 + walk(&path, found);
-        } else if meta.is_file() {
-            found.push((path.to_string_lossy().into_owned(), meta.len()));
+            let inner = format!("{path}{}", std::path::MAIN_SEPARATOR);
+            folders += 1 + walk(&inner, mask, found);
+        } else if meta.is_file()
+            && mask.is_none_or(|(mask, cs)| wildcard_match(mask, &entry_name, cs))
+        {
+            found.push((path, meta.len()));
         }
     }
     folders

@@ -1273,6 +1273,81 @@ mod reference {
     }
 }
 
+/// A folder named as the archive is walked without following links: a
+/// linked folder that points back at itself ends the walk instead of
+/// recursing, and a link out of the folder finds nothing outside it.
+#[cfg(unix)]
+#[test]
+fn folder_walk_does_not_follow_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let shelf = dir.path().join("shelf");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&shelf).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    write_archive(&shelf.join("inner.7z"), SOLID);
+    write_archive(&outside.join("stray.7z"), SOLID);
+    std::os::unix::fs::symlink(".", shelf.join("loop")).unwrap();
+    std::os::unix::fs::symlink(&outside, shelf.join("away")).unwrap();
+    std::os::unix::fs::symlink(outside.join("stray.7z"), shelf.join("stray.7z")).unwrap();
+    let (out, _) = expect(&facade(dir.path(), &["l", "shelf"], b""), 0);
+    assert!(out.contains("1 folder, 1 file, "), "{out}");
+    assert!(out.contains("Listing archive: shelf/inner.7z\n"), "{out}");
+    assert!(!out.contains("stray.7z"), "{out}");
+    assert!(!out.contains("loop"), "{out}");
+}
+
+/// `-ax` keeps an archive out of the command entirely: under `-sdel` the
+/// excluded archive is neither extracted nor deleted.
+#[test]
+fn excluded_archives_are_never_processed_or_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    write_archive(&dir.path().join("drop.7z"), SOLID);
+    write_archive(&dir.path().join("keep.7z"), SOLID);
+    let (out, _) = expect(
+        &facade(
+            dir.path(),
+            &["x", "*.7z", "-ax!keep.7z", "-sdel", "-y", "-oout"],
+            b"",
+        ),
+        0,
+    );
+    assert!(out.contains("1 file, "), "{out}");
+    assert!(out.contains("Extracting archive: drop.7z\n"), "{out}");
+    assert!(!out.contains("keep.7z"), "{out}");
+    assert!(!dir.path().join("drop.7z").exists());
+    assert!(dir.path().join("keep.7z").is_file());
+    assert_tree(&dir.path().join("out"));
+}
+
+/// `-air` matches its name in every folder below, as `-ai` does in one.
+#[test]
+fn recursive_archive_includes_descend() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("shelf/deep")).unwrap();
+    write_archive(&dir.path().join("top.7z"), SOLID);
+    write_archive(&dir.path().join("shelf/deep/low.7z"), SOLID);
+    let (out, _) = expect(&facade(dir.path(), &["l", "-an", "-ai!*.7z"], b""), 0);
+    assert!(out.contains("Listing archive: top.7z\n"), "{out}");
+    assert!(!out.contains("low.7z"), "{out}");
+    let (out, _) = expect(&facade(dir.path(), &["l", "-an", "-air!*.7z"], b""), 0);
+    assert!(out.contains("2 folders, 2 files, "), "{out}");
+    assert!(out.contains("Listing archive: top.7z\n"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "Listing archive: shelf{0}deep{0}low.7z\n",
+            std::path::MAIN_SEPARATOR
+        )),
+        "{out}"
+    );
+    // A recursive exclusion reaches as deep.
+    let (out, _) = expect(
+        &facade(dir.path(), &["l", "-an", "-air!*.7z", "-axr!low.7z"], b""),
+        0,
+    );
+    assert!(out.contains("Listing archive: top.7z\n"), "{out}");
+    assert!(!out.contains("low.7z"), "{out}");
+}
+
 /// `-sdel` deletes an archive only when something was extracted from it: a
 /// filter that matches nothing leaves the archive in place.
 #[test]
