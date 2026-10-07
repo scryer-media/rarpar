@@ -1022,12 +1022,14 @@ fn stem_change(recorded: &str, actual: &str) -> Option<(String, String)> {
     if recorded == actual {
         return None;
     }
-    let common = recorded
-        .bytes()
+    // Whole characters only: a byte-wise suffix can end inside one.
+    let common: usize = recorded
+        .chars()
         .rev()
-        .zip(actual.bytes().rev())
+        .zip(actual.chars().rev())
         .take_while(|(a, b)| a == b)
-        .count();
+        .map(|(a, _)| a.len_utf8())
+        .sum();
     let suffix = &recorded[recorded.len() - common..];
     let dot = suffix.find(".part").or_else(|| suffix.find('.'))?;
     let keep = common - dot;
@@ -1618,5 +1620,25 @@ impl Rar5Set {
             let _ = std::fs::remove_file(path);
         }
         result.map(|()| written)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stem_changes_split_on_character_boundaries() {
+        // `é` (C3 A9) and `ĩ` (C4 A9) share their last byte.
+        assert_eq!(
+            stem_change("host-\u{e9}.rar", "host-\u{129}.rar"),
+            Some(("host-\u{e9}".to_owned(), "host-\u{129}".to_owned()))
+        );
+        assert_eq!(
+            stem_change("old.part1.rar", "new.part1.rar"),
+            Some(("old".to_owned(), "new".to_owned()))
+        );
+        assert_eq!(stem_change("same.rar", "same.rar"), None);
+        assert_eq!(stem_change("\u{e9}", "\u{129}"), None);
     }
 }
