@@ -3,28 +3,19 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
-## rarpar 0.5.5
+## rarpar 0.5.4 (Unreleased)
 
 ### CLI Changes
 
-- `par3 create` writes the reference implementation's layout. The
-  `InputSetID` is derived as `par3cmdline` derives it, so a set made from the
-  same inputs carries a different `InputSetID` than one made by 0.5.4.
-  Recovery volumes repeat the metadata packets as the reference does (one full
-  copy, then every packet but the Creator packet `floor(log2(n))` more times),
-  so they are larger than before. Inputs are stored longest tail first, tails
-  are packed and identical File and Directory packets shared as the reference
-  does, and Directory and Root packets list their children in its order. With
-  the reference's default options a set now differs from `par3cmdline`'s only
-  in its `Creator` text, except for a Cauchy set of 129-255 input blocks
-  totalling at most 256 blocks with recovery, which still uses GF(2^8) where
-  the reference uses GF(2^16). An FFT set with a single recovery block records
-  no Galois field, as the reference does.
-- `par3 verify` and `par3 repair` accept an FFT set that records no Galois
-  field whatever capacity its matrix reserves, such as the reference's
-  `par3 c -c1 -cm4`; they previously refused it as an unsupported field.
-- A PAR3 carrier that disappears or is rewritten while it is being scanned is
-  reported as changed rather than as the I/O error of the failed read.
+- PAR2 inspection and repair retain valid recovery packets following a corrupt
+  packet length and prefer valid copies over corrupt duplicate exponents.
+- PAR2 repair analysis reports a source-changed error instead of panicking when
+  a source file grows between parallel scan phases; shrinking files also reject
+  the stale scan.
+- PAR3 repair confines output to the opened destination tree, rejects unsafe
+  destination links and filesystem aliases, and uses exclusively created private
+  staging directories. Ordinary source-file verification keeps its existing link
+  behavior.
 - The format probes that read the first bytes of every file in a directory
   (PAR3 sibling discovery and `auto` classification) no longer pull in
   read-ahead (random-access advice on Linux, `F_RDAHEAD` off on macOS). A
@@ -38,32 +29,11 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ### Library versions
 
-- par3-rs 0.4.5: the reference creation layout, mebibyte source reads and the
-  verification order by mount kind above, and faster Cauchy and FFT creation
-  and repair.
-- reedsolomon-rs 0.4.8 (through par3-rs and par2-rs): new SIMD tiers and
-  kernels; output is bit-identical.
-  Other library versions are unchanged.
-
-## rarpar 0.5.4
-
-### CLI Changes
-
-- PAR2 inspection and repair retain valid recovery packets following a corrupt
-  packet length and prefer valid copies over corrupt duplicate exponents.
-- PAR2 repair analysis reports a source-changed error instead of panicking when
-  a source file grows between parallel scan phases; shrinking files also reject
-  the stale scan.
-- PAR3 repair confines output to the opened destination tree, rejects unsafe
-  destination links and filesystem aliases, and uses exclusively created private
-  staging directories. Ordinary source-file verification keeps its existing link
-  behavior.
-
-### Library versions
-
 - par2-rs 0.10.7: authenticate recovery packets during the bounded file scan
   and reject changed source extents during parallel repair analysis.
 - par3-rs 0.4.4: confine repair reads and installs to the opened output tree.
+- par3-rs 0.4.5: mebibyte source reads and the verification order by mount
+  kind above.
   Other library versions are unchanged.
 
 ## rarpar 0.5.3
