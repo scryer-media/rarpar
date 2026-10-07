@@ -26,6 +26,19 @@ The CLI version for these changes is assigned when the CLI is released.
   one pass, hashing it whole and by block together, so a damaged file is not
   read over the network twice; files on a local disk are still hashed whole
   first.
+- `rar restore-volumes`, and the extraction commands that restore a missing
+  volume from RAR3 (RAR 2.9-4.x) `.rev` files, rebuild those volumes about
+  eight times faster: the decoder is applied as a matrix to whole regions on
+  every core instead of byte column by byte column. Restored volumes are
+  byte-identical to before.
+- Restoring several missing volumes from RAR5 `.rev` files multiplies on every
+  core: about twice as fast with eight of 41 volumes missing.
+- Restoring from `.rev` files reads and checks the volumes side by side,
+  hashes restored volumes as they are written, and for RAR5 checks the intact
+  data volumes during the decode instead of reading them twice. Restoring a
+  2.1 GB set with one or eight of 41 volumes missing now takes about 0.25 to
+  0.33 s for either RAR3 or RAR5, against 1 to 5.6 s for RARLAB unrar 7.20.
+  Damaged volumes are renamed to `.bad` exactly as before.
 
 ### Library versions
 
@@ -35,6 +48,8 @@ The CLI version for these changes is assigned when the CLI is released.
   protects that are present at their recorded lengths.
 - par3-rs 0.4.5: mebibyte source reads and the verification order by mount
   kind above.
+- reedsolomon-rs 0.4.9 and unrar-rs 0.10.9: the RAR recovery-volume restore
+  above.
   Other library versions are unchanged.
 
 ## rarpar 0.5.4
