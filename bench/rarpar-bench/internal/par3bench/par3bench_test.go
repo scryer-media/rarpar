@@ -675,3 +675,20 @@ func TestTracedRunProblemChecksTheTracedExit(t *testing.T) {
 		t.Error("rarpar calling a damaged set intact must not be counted")
 	}
 }
+
+func TestCheckOpsRefusesDuplicateAndUnknownOps(t *testing.T) {
+	if err := CheckOps(KnownOps); err != nil {
+		t.Fatalf("every known op once must pass: %v", err)
+	}
+	if err := CheckOps([]string{OpCreate, OpVerify, OpCreate}); err == nil || !strings.Contains(err.Error(), `op "create" is listed more than once`) {
+		t.Fatalf("a repeated op must be refused by name, got %v", err)
+	}
+	if err := CheckOps([]string{"explode"}); err == nil || !strings.Contains(err.Error(), "unknown op") {
+		t.Fatalf("an unknown op must be refused, got %v", err)
+	}
+	// RunSuite's option validation applies the same check.
+	options := Options{Reference: os.Args[0], Candidate: os.Args[0], Work: "/w", Out: t.TempDir(), Ops: []string{OpRepair, OpRepair}, Repeats: 1}
+	if err := validateOptions(&options); err == nil || !strings.Contains(err.Error(), `op "repair" is listed more than once`) {
+		t.Fatalf("validateOptions must refuse a repeated op, got %v", err)
+	}
+}

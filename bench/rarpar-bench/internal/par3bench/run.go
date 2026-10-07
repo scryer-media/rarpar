@@ -644,6 +644,23 @@ func RunSuite(ctx context.Context, options Options) (*Results, error) {
 	return results, nil
 }
 
+// CheckOps refuses an unknown operation and an operation named twice. A
+// repeated operation would run its whole matrix twice under the same keys and
+// merge both passes into one summary.
+func CheckOps(ops []string) error {
+	seen := make(map[string]bool, len(ops))
+	for _, op := range ops {
+		if !contains(KnownOps, op) {
+			return fmt.Errorf("unknown op %q (known: %s)", op, strings.Join(KnownOps, ", "))
+		}
+		if seen[op] {
+			return fmt.Errorf("op %q is listed more than once", op)
+		}
+		seen[op] = true
+	}
+	return nil
+}
+
 func validateOptions(options *Options) error {
 	if options.Reference == "" || options.Candidate == "" {
 		return errors.New("--reference and --candidate are required")
@@ -654,10 +671,8 @@ func validateOptions(options *Options) error {
 	if len(options.Ops) == 0 {
 		options.Ops = DefaultOps
 	}
-	for _, op := range options.Ops {
-		if !contains(KnownOps, op) {
-			return fmt.Errorf("unknown op %q (known: %s)", op, strings.Join(KnownOps, ", "))
-		}
+	if err := CheckOps(options.Ops); err != nil {
+		return err
 	}
 	if len(options.Workers) == 0 {
 		options.Workers = []int{1, 8}

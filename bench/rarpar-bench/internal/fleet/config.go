@@ -937,10 +937,8 @@ func validatePAR3(state *decodeState, prefix string, machine *Machine) {
 	if _, err := profile.Select(plan.Sets); err != nil {
 		state.fail("%s: par3.sets: %v", prefix, err)
 	}
-	for _, op := range plan.Ops {
-		if !contains(par3bench.KnownOps, op) {
-			state.fail("%s: par3.ops: unknown op %q (known: %s)", prefix, op, strings.Join(par3bench.KnownOps, ", "))
-		}
+	if err := par3bench.CheckOps(plan.Ops); err != nil {
+		state.fail("%s: par3.ops: %v", prefix, err)
 	}
 	if len(plan.Workers) == 0 {
 		state.fail("%s: par3.workers must not be empty", prefix)

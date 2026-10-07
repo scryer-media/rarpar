@@ -47,6 +47,7 @@ func TestPAR3ConfigValidation(t *testing.T) {
 		{"unknown profile", `profile = "full"                         # full | smoke`, `profile = "huge"`, "par3.profile"},
 		{"unknown set", `# sets = ["a-gf16", "c-gf16"]            # default: every set in the profile`, `sets = ["z-gf99"]`, "par3.sets"},
 		{"unknown op", `# ops = ["create", "verify", "repair"]   # default; verify-damaged is opt-in`, `ops = ["explode"]`, "unknown op"},
+		{"duplicate op", `# ops = ["create", "verify", "repair"]   # default; verify-damaged is opt-in`, `ops = ["create", "create"]`, `op "create" is listed more than once`},
 		{"zero workers", `workers = [1, 8]                         # rarpar rows; the reference is single-threaded`, `workers = [0]`, "par3.workers must be positive"},
 		{"bad kernel variant", `# kernel_variants = ["name:VAR=value"]`, `kernel_variants = ["novar"]`, "kernel_variants"},
 		{"duplicate worker count", `workers = [1, 8]                         # rarpar rows; the reference is single-threaded`, `workers = [8, 8]`, "appears twice"},
