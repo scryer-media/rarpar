@@ -105,10 +105,10 @@ documented in each crate's own changelog so those notes ship with the crate.
 - par3-rs 0.5.1: mebibyte source reads, the verification order by mount
   kind, single-read packet authentication during repair,
   `session_repair::create_directory`, and the RAR5 PAR-inside fixes.
-- par2-rs 0.10.8: repair planning trusts the scan's recovery packet
-  authentication while a volume's stat is unchanged, and
-  `identify_par2_files_for_set` skips the files a set protects. Other library
-  versions are unchanged.
+- par2-rs 0.10.8: strict verify reads a damaged file once, repair planning
+  trusts the scan's recovery packet authentication while a volume's stat is
+  unchanged, and `identify_par2_files_for_set` skips the files a set
+  protects. Other library versions are unchanged.
 
 ## rarpar 0.8.0
 
