@@ -117,7 +117,7 @@ impl Par2FileSet {
             let mut accepted = 0usize;
             let mut sink = |packet: Packet, offset: u64, _set_id: RecoverySetId| -> Result<()> {
                 accepted += 1;
-                match builder.add_packet_budgeted(packet, offset, &budget) {
+                match builder.add_packet_budgeted(packet, offset, None, &budget) {
                     Ok(_) => {}
                     // A budget refusal is the caller's problem, not a per-file
                     // diagnostic: it means the inventory would be incomplete.
@@ -160,7 +160,7 @@ impl Par2FileSet {
         let budget = PacketScanBudget::new(PacketScanLimits::default());
         let mut builder = Par2FileSetBuilder::new();
         for packet in packets {
-            builder.add_packet_budgeted(packet, 0, &budget)?;
+            builder.add_packet_budgeted(packet, 0, None, &budget)?;
         }
         builder.build()
     }
@@ -403,10 +403,10 @@ impl PacketSink for BuilderSink<'_> {
         &mut self,
         packet: Packet,
         offset: u64,
-        _recovery_set_id: RecoverySetId,
+        recovery_set_id: RecoverySetId,
     ) -> Result<()> {
         self.builder
-            .add_packet_budgeted(packet, offset, self.budget)?;
+            .add_packet_budgeted(packet, offset, Some(recovery_set_id), self.budget)?;
         Ok(())
     }
 }
@@ -498,10 +498,16 @@ impl Par2FileSetBuilder {
     ///
     /// A duplicate, an unknown packet, or a packet past a logical bound costs
     /// the budget nothing: it is never charged in the first place.
+    ///
+    /// `scanned_under` is the recovery set ID the packet's header named when a
+    /// scan under `budget` handed it over, and `None` for a packet from
+    /// anywhere else. A scanned recovery payload the builder keeps has its
+    /// scan authentication recorded; one it drops leaves none behind.
     pub(crate) fn add_packet_budgeted(
         &mut self,
         packet: Packet,
         offset: u64,
+        scanned_under: Option<RecoverySetId>,
         budget: &PacketScanBudget,
     ) -> Result<PacketAdmission> {
         if !self.would_retain(&packet) {
@@ -511,8 +517,14 @@ impl Par2FileSetBuilder {
         }
         let bytes = packet_retained_bytes(&packet);
         budget.charge_retained(bytes)?;
+        let scan_admission =
+            scanned_under.and_then(|set_id| budget.scan_admission(&packet, &set_id));
         let admission = self.add_packet(packet, offset)?;
-        if admission != PacketAdmission::Retained {
+        if admission == PacketAdmission::Retained {
+            if let Some(scan_admission) = scan_admission {
+                scan_admission.record();
+            }
+        } else {
             budget.release_retained(bytes);
         }
         Ok(admission)
@@ -865,6 +877,73 @@ mod tests {
         let mut head = vec![0u8; 16];
         recovery.data.read_range_padded(0, &mut head).unwrap();
         assert_eq!(head, vec![0xAB; 16]);
+    }
+
+    /// `from_paths` keeps a recovery packet whatever set it names, so a
+    /// volume from another set lands in the inventory under its exponent.
+    /// Its packet hash covers that other set's ID, so validating it under
+    /// this set's ID must fail: when the scan read it moments ago and must
+    /// hash it again, and when the scan vouched for it on a settled volume
+    /// whose stat is unchanged. The vouching holds only for the set ID and
+    /// exponent the scan hashed it under.
+    #[test]
+    fn a_foreign_recovery_packet_fails_validation_fresh_and_cached() {
+        let file_id = [0x01; 16];
+        let main_a = make_main_body(1024, &[file_id]);
+        let rsid_a = compute_rsid(&main_a);
+        let main_b = make_main_body(2048, &[file_id]);
+        let rsid_b = compute_rsid(&main_b);
+        assert_ne!(rsid_a, rsid_b);
+
+        let mut recovery_body = 5u32.to_le_bytes().to_vec();
+        recovery_body.extend_from_slice(&[0xCD; 1024]);
+        let index_a = make_full_packet(header::TYPE_MAIN, &main_a, rsid_a);
+        let volume_b = make_full_packet(header::TYPE_RECOVERY, &recovery_body, rsid_b);
+
+        for settled in [false, true] {
+            let dir = tempdir().unwrap();
+            let index_path = dir.path().join("fixture_set_a.par2");
+            let volume_path = dir.path().join("fixture_set_b.vol05+01.par2");
+            std::fs::write(&index_path, &index_a).unwrap();
+            std::fs::write(&volume_path, &volume_b).unwrap();
+            if settled {
+                // An mtime far in the past: the scan's fingerprint has
+                // settled, so it records its authentication.
+                std::fs::File::options()
+                    .write(true)
+                    .open(&volume_path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(
+                        std::time::SystemTime::UNIX_EPOCH
+                            + std::time::Duration::from_secs(1_700_000_000),
+                    ))
+                    .unwrap();
+            }
+
+            let set = Par2FileSet::from_paths(&[&index_path, &volume_path]).unwrap();
+            assert_eq!(set.recovery_set_id.as_bytes(), &rsid_a);
+            let slice = set
+                .recovery_slices
+                .get(&5)
+                .expect("the builder keeps the foreign packet");
+            assert!(slice.data.as_bytes().is_none(), "payload stays file-backed");
+
+            assert!(
+                !slice
+                    .data
+                    .validate_packet_hash(set.recovery_set_id.as_bytes(), 5)
+                    .unwrap(),
+                "settled={settled}: a packet of another set fails under this set's ID"
+            );
+            assert!(
+                !slice.data.validate_packet_hash(&rsid_b, 6).unwrap(),
+                "settled={settled}: the right set under another exponent fails"
+            );
+            assert!(
+                slice.data.validate_packet_hash(&rsid_b, 5).unwrap(),
+                "settled={settled}: the set and exponent it was hashed under pass"
+            );
+        }
     }
 
     #[test]

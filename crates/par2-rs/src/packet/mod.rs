@@ -11,11 +11,13 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use tracing::{debug, trace, warn};
 
 use crate::checksum::Md5State;
 use crate::error::{Par2Error, Result};
+use crate::evidence::FileStatFingerprint;
 use crate::types::{CancellationToken, MAX_FILES_PER_SET, RecoverySetId};
 
 pub use budget::{
@@ -117,11 +119,15 @@ impl PacketSink for CollectingSink<'_> {
         // about to occupy on top of the packet's own metadata.
         self.budget.charge_bytes(size_of::<ScannedPacket>())?;
         budget::reserve_fallible(&mut self.packets, 1)?;
+        let admission = self.budget.scan_admission(&packet, &recovery_set_id);
         self.packets.push(ScannedPacket {
             packet,
             offset,
             recovery_set_id,
         });
+        if let Some(admission) = admission {
+            admission.record();
+        }
         Ok(())
     }
 }
@@ -545,17 +551,52 @@ fn parse_recovery_packet_from_reader(
         return Err(Par2Error::PacketHashMismatch { offset });
     }
 
+    // Keep the hash for repair-time revalidation: the file may change after
+    // this authenticated scan without changing its retained span. The
+    // fingerprint lets that revalidation skip the read while it has not.
+    // When the volume's fingerprint settled, the budget holds it and the
+    // authentication is recorded only if the sink keeps this packet.
+    let data = RecoverySliceData::file_backed_shared(
+        Arc::clone(path),
+        payload_offset,
+        payload_len,
+        Some(header.packet_hash),
+    );
     Ok(Packet::RecoverySlice(RecoverySlicePacket {
         exponent,
-        // Keep the hash for repair-time revalidation: the file may change
-        // after this authenticated scan without changing its retained span.
-        data: RecoverySliceData::file_backed_shared(
-            Arc::clone(path),
-            payload_offset,
-            payload_len,
-            Some(header.packet_hash),
-        ),
+        data,
     }))
+}
+
+/// How long a volume's mtime must have stood still before a scan may vouch
+/// for its recovery payloads by fingerprint. Two seconds is the coarsest
+/// mtime granularity in common use (FAT); below it, a write landing in the
+/// same tick as the scan would leave the fingerprint unchanged.
+const SCAN_FINGERPRINT_SETTLE: Duration = Duration::from_secs(2);
+
+/// The fingerprint a scan may record next to the recovery payloads it
+/// authenticates, or `None` when it may not record one.
+///
+/// `before_open` is the path's fingerprint taken before the scan opened it and
+/// `opened` the open handle's metadata. They must agree — a path replaced
+/// between the two is not vouched for — and the mtime must exist and be at
+/// least [`SCAN_FINGERPRINT_SETTLE`] older than `scan_started`. That last rule
+/// is what makes an unchanged fingerprint mean unchanged bytes: any write at
+/// or after `scan_started` stamps an mtime at least one granule newer than
+/// the recorded one, so a later stat sees it and validation reads the bytes
+/// again. A volume still being written, or written moments ago, is therefore
+/// re-hashed at repair time exactly as before.
+fn settled_scan_fingerprint(
+    before_open: Option<FileStatFingerprint>,
+    opened: &std::fs::Metadata,
+    scan_started: SystemTime,
+) -> Option<FileStatFingerprint> {
+    let fingerprint = before_open?;
+    if fingerprint != FileStatFingerprint::from_metadata(opened) {
+        return None;
+    }
+    let age = scan_started.duration_since(fingerprint.modified()?).ok()?;
+    (age >= SCAN_FINGERPRINT_SETTLE).then_some(fingerprint)
 }
 
 /// Collect every packet of an on-disk PAR2 file under the default limits.
@@ -605,11 +646,22 @@ pub fn scan_packets_from_path_bounded(
     budget: &PacketScanBudget,
     sink: &mut dyn PacketSink,
 ) -> Result<()> {
+    // Fingerprinted before the open (see `settled_scan_fingerprint`), so the
+    // fingerprint can only describe the bytes this scan reads or a state from
+    // before them.
+    let scan_started = SystemTime::now();
+    let fingerprint_before_open = FileStatFingerprint::capture_path(path);
     let file = File::open(path).map_err(Par2Error::Io)?;
-    let file_len = file.metadata().map_err(Par2Error::Io)?.len();
+    let metadata = file.metadata().map_err(Par2Error::Io)?;
+    let file_len = metadata.len();
+    let authenticated_at =
+        settled_scan_fingerprint(fingerprint_before_open, &metadata, scan_started);
     crate::file_cache::advise_sequential(&file, path, file_len);
     let mut reader = BufReader::with_capacity(256 * 1024, file);
     let shared_path: Arc<Path> = Arc::from(path);
+    if let Some(fingerprint) = authenticated_at {
+        budget.note_scan_fingerprint(&shared_path, fingerprint);
+    }
     let mut interned_path_charged = false;
     let mut offset = 0u64;
 
@@ -1273,6 +1325,178 @@ mod tests {
         }
     }
 
+    /// The scanner's authentication of a payload lives beside
+    /// `RecoverySliceData::FileBacked`, not in it, so the variant keeps the
+    /// field set it was published with: the literal and the exhaustive pattern
+    /// below are written against exactly those four fields. A clone of a
+    /// scanned payload keeps its authentication; a payload built by hand over
+    /// the scanner's interned path, but naming a span the scan did not hash,
+    /// gets none.
+    #[test]
+    fn scan_authentication_stays_out_of_the_public_variant() {
+        let rsid = [0x8C; 16];
+        let mut stream = make_main_packet_bytes(8, rsid);
+        stream.extend_from_slice(&make_recovery_packet(3, &[0x5A; 8], rsid));
+        let file = NamedTempFile::new().unwrap();
+        file.as_file().write_all(&stream).unwrap();
+        file.as_file()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            )
+            .unwrap();
+
+        let packets = scan_packets_from_path(file.path()).unwrap();
+        let Packet::RecoverySlice(slice) = &packets[1].0 else {
+            panic!("expected a recovery packet, got {:?}", packets[1].0);
+        };
+        let RecoverySliceData::FileBacked {
+            path,
+            offset,
+            len,
+            packet_hash: Some(packet_hash),
+        } = &slice.data
+        else {
+            panic!("expected a hashed file-backed payload");
+        };
+        assert!(
+            recovery::scan_authentication(path, *offset, *len, packet_hash, &rsid, 3).is_some(),
+            "a settled scan vouches for the payload it hashed"
+        );
+
+        let cloned = slice.data.clone();
+        let RecoverySliceData::FileBacked {
+            path: cloned_path, ..
+        } = &cloned
+        else {
+            unreachable!();
+        };
+        assert!(
+            recovery::scan_authentication(cloned_path, *offset, *len, packet_hash, &rsid, 3)
+                .is_some()
+        );
+
+        let hand_built = RecoverySliceData::FileBacked {
+            path: Arc::clone(path),
+            offset: *offset + 1,
+            len: *len - 1,
+            packet_hash: Some(*packet_hash),
+        };
+        let RecoverySliceData::FileBacked {
+            path: hand_path,
+            offset: hand_offset,
+            len: hand_len,
+            packet_hash: _,
+        } = &hand_built
+        else {
+            unreachable!();
+        };
+        assert!(
+            recovery::scan_authentication(
+                hand_path,
+                *hand_offset,
+                *hand_len,
+                packet_hash,
+                &rsid,
+                3
+            )
+            .is_none(),
+            "a span the scan never hashed is not vouched for"
+        );
+        assert!(!hand_built.validate_packet_hash(&rsid, 3).unwrap());
+        assert!(slice.data.validate_packet_hash(&rsid, 3).unwrap());
+    }
+
+    /// A settled volume of one Main packet and `recovery` recovery packets of
+    /// distinct exponents.
+    fn settled_volume(rsid: [u8; 16], recovery: u32) -> NamedTempFile {
+        let mut stream = make_main_packet_bytes(8, rsid);
+        for exponent in 0..recovery {
+            stream.extend_from_slice(&make_recovery_packet(exponent, &[0x6D; 8], rsid));
+        }
+        let file = NamedTempFile::new().unwrap();
+        file.as_file().write_all(&stream).unwrap();
+        file.as_file()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            )
+            .unwrap();
+        file
+    }
+
+    fn recovery_path(packet: &Packet) -> Option<Arc<Path>> {
+        match packet {
+            Packet::RecoverySlice(RecoverySlicePacket {
+                data: RecoverySliceData::FileBacked { path, .. },
+                ..
+            }) => Some(Arc::clone(path)),
+            _ => None,
+        }
+    }
+
+    /// A scan of a settled volume whose sink keeps nothing records no
+    /// authentication: only payloads a sink keeps can be validated again.
+    /// The same volume scanned into a sink that keeps everything records
+    /// every payload.
+    #[test]
+    fn a_sink_that_keeps_nothing_leaves_no_scan_authentications() {
+        let rsid = [0x8D; 16];
+        let volume = settled_volume(rsid, 16);
+
+        let budget = PacketScanBudget::new(PacketScanLimits::default());
+        let mut seen = None;
+        let mut drop_all = |packet: Packet, _offset: u64, _set_id: RecoverySetId| -> Result<()> {
+            seen = seen.take().or_else(|| recovery_path(&packet));
+            Ok(())
+        };
+        scan_packets_from_path_bounded(volume.path(), &budget, &mut drop_all).unwrap();
+        // Held here, so the allocation the table would be keyed by is live.
+        let path = seen.expect("the volume has recovery packets");
+        assert_eq!(recovery::scan_authentication_count(&path), 0);
+
+        let packets = scan_packets_from_path_with_set_ids(volume.path()).unwrap();
+        let kept = recovery_path(&packets[1].packet).unwrap();
+        assert_eq!(recovery::scan_authentication_count(&kept), 16);
+    }
+
+    /// The authentications a scan records are the payloads its sink kept, so
+    /// a low metadata limit, which stops the sink keeping more, bounds them.
+    #[test]
+    fn a_low_metadata_limit_bounds_the_scan_authentications() {
+        let rsid = [0x8E; 16];
+        let volume = settled_volume(rsid, 64);
+        let limit = 1024;
+        let budget = PacketScanBudget::new(
+            PacketScanLimits::default().with_max_retained_metadata_bytes(limit),
+        );
+        let mut builder = crate::par2_set::Par2FileSetBuilder::new();
+        let mut seen = None;
+        let mut sink = |packet: Packet, offset: u64, set_id: RecoverySetId| -> Result<()> {
+            seen = seen.take().or_else(|| recovery_path(&packet));
+            builder
+                .add_packet_budgeted(packet, offset, Some(set_id), &budget)
+                .map(drop)
+        };
+
+        let result = scan_packets_from_path_bounded(volume.path(), &budget, &mut sink);
+        assert!(
+            matches!(result, Err(Par2Error::ResourceLimitExceeded { .. })),
+            "{result:?}"
+        );
+        let path = seen.expect("the volume has recovery packets");
+        let recorded = recovery::scan_authentication_count(&path);
+        assert!(recorded > 0);
+        assert!(
+            recorded < 64,
+            "{recorded} of 64 recorded under a {limit}-byte limit"
+        );
+        // One retained packet is the Main packet; every other is a recovery
+        // packet the builder kept, and each of those has its record.
+        assert_eq!(recorded, budget.retained_packets() - 1);
+        assert!(budget.retained_bytes() <= limit);
+    }
+
     /// An authenticated file-backed span must still detect later mutations.
     #[test]
     fn file_backed_recovery_payloads_still_validate_their_packet_hash() {
@@ -1296,5 +1520,61 @@ mod tests {
         corrupted[last] ^= 0xFF;
         std::fs::write(file.path(), &corrupted).unwrap();
         assert!(!slice.data.validate_packet_hash(&rsid, 7).unwrap());
+    }
+
+    /// A scan vouches for a volume's payloads only when the stat it took
+    /// before opening the volume matches the opened handle and the mtime is
+    /// old enough that any later write must stamp a newer one. The clock is
+    /// passed in, so the boundary is exercised exactly.
+    #[test]
+    fn a_scan_vouches_only_for_a_settled_volume_it_actually_opened() {
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let volume = NamedTempFile::new().unwrap();
+        volume
+            .as_file()
+            .write_all(b"invented volume bytes")
+            .unwrap();
+        volume
+            .as_file()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let opened = volume.as_file().metadata().unwrap();
+        let before = FileStatFingerprint::capture_path(volume.path());
+        assert!(before.is_some());
+
+        let settled = modified + SCAN_FINGERPRINT_SETTLE;
+        assert_eq!(
+            settled_scan_fingerprint(before.clone(), &opened, settled),
+            before
+        );
+        // One millisecond, not one nanosecond: Windows `SystemTime` ticks in
+        // 100 ns units, so a 1 ns step truncates to no step at all.
+        let racy = settled - Duration::from_millis(1);
+        assert_eq!(
+            settled_scan_fingerprint(before.clone(), &opened, racy),
+            None
+        );
+        let clock_behind_mtime = modified - Duration::from_secs(1);
+        assert_eq!(
+            settled_scan_fingerprint(before.clone(), &opened, clock_behind_mtime),
+            None
+        );
+        assert_eq!(settled_scan_fingerprint(None, &opened, settled), None);
+
+        // The path named another file when it was stat'ed than the one opened.
+        let other = NamedTempFile::new().unwrap();
+        other
+            .as_file()
+            .write_all(b"a different invented volume")
+            .unwrap();
+        other
+            .as_file()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let other_opened = other.as_file().metadata().unwrap();
+        assert_eq!(
+            settled_scan_fingerprint(before, &other_opened, settled),
+            None
+        );
     }
 }

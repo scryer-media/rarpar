@@ -95,6 +95,34 @@ impl Rar5RsCoder {
             }
         }
     }
+
+    /// The decode matrix: `missing_data_count()` rows of `data_count`
+    /// columns, row-major. Row `r` rebuilds the `r`-th missing data volume
+    /// from the units [`update_outputs`](Self::update_outputs) is fed, in
+    /// the same order.
+    pub fn matrix(&self) -> &[u16] {
+        &self.matrix
+    }
+
+    /// Rebuild every missing data row from all `data_count` logical units at
+    /// once, overwriting `outputs`: the same sums a full pass of
+    /// [`update_outputs`](Self::update_outputs) leaves, computed by
+    /// [`apply_decode_matrix_gf16`](crate::decode_apply::apply_decode_matrix_gf16)
+    /// across stripes on every core.
+    ///
+    /// `units[data_num]` is what `update_outputs` would be given for that
+    /// position: the data volume's bytes when it is present, otherwise the
+    /// next valid recovery volume's. Every unit and output must have the same
+    /// even length.
+    pub fn apply_units(&self, units: &[&[u8]], outputs: &mut [&mut [u8]]) {
+        assert_eq!(units.len(), self.data_count, "one unit per data volume");
+        assert_eq!(
+            outputs.len(),
+            self.missing_data_count,
+            "one output buffer is required per missing data row"
+        );
+        crate::decode_apply::apply_decode_matrix_gf16(&self.matrix, units, outputs);
+    }
 }
 
 fn make_decoder_matrix(
@@ -273,6 +301,68 @@ mod tests {
 
         assert_eq!(restored0, data[0]);
         assert_eq!(restored2, data[2]);
+    }
+
+    /// The batched apply leaves exactly what a full `update_outputs` pass
+    /// does, for a shape with more units than one kernel group and several
+    /// stripes per output.
+    #[test]
+    fn apply_units_matches_update_outputs() {
+        let data_count = 23;
+        let rec_count = 6;
+        let len = 200_002;
+        let data = (0..data_count)
+            .map(|d| {
+                (0..len)
+                    .map(|i| ((i * 31 + d * 17) ^ (i >> 7)) as u8)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let recovery = encode_recovery(&data, rec_count);
+        let mut valid = vec![true; data_count + rec_count];
+        for missing in [0, 5, 11, 22] {
+            valid[missing] = false;
+        }
+        valid[data_count + 1] = false;
+        let coder = Rar5RsCoder::new_decoder(data_count, rec_count, &valid).unwrap();
+
+        let mut next_recovery = 0;
+        let units = (0..data_count)
+            .map(|d| {
+                if valid[d] {
+                    data[d].as_slice()
+                } else {
+                    while !valid[data_count + next_recovery] {
+                        next_recovery += 1;
+                    }
+                    next_recovery += 1;
+                    recovery[next_recovery - 1].as_slice()
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut incremental = vec![vec![0u8; len]; 4];
+        {
+            let mut outs = incremental
+                .iter_mut()
+                .map(Vec::as_mut_slice)
+                .collect::<Vec<_>>();
+            for (d, unit) in units.iter().enumerate() {
+                coder.update_outputs(d, unit, &mut outs);
+            }
+        }
+        let mut batched = vec![vec![0xEEu8; len]; 4];
+        {
+            let mut outs = batched
+                .iter_mut()
+                .map(Vec::as_mut_slice)
+                .collect::<Vec<_>>();
+            coder.apply_units(&units, &mut outs);
+        }
+        assert_eq!(batched, incremental);
+        for (row, missing) in [0, 5, 11, 22].into_iter().enumerate() {
+            assert_eq!(batched[row], data[missing]);
+        }
     }
 
     #[test]

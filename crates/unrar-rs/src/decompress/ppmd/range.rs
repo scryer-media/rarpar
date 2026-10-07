@@ -17,6 +17,15 @@ const BOT: u32 = 1 << 15;
 
 pub trait RangeCode {
     fn normalize(&mut self);
+    /// Whether a frequency total ever exceeded the coder's range.
+    ///
+    /// A well-formed stream keeps `range / scale` at least 1: the model's
+    /// totals are bounded and normalization keeps `range` above `BOT`. A
+    /// corrupt stream can drive a total past the range, and the division
+    /// that follows would be by zero. The coder records that instead of
+    /// panicking, hands back a count no symbol owns, and the model turns
+    /// the fault into a corrupt-archive error.
+    fn faulted(&self) -> bool;
     fn get_current_count(&mut self, scale: u32) -> u32;
     fn get_threshold(&mut self, scale: u32) -> u32;
     fn get_binary_threshold(&mut self) -> u32 {
@@ -34,6 +43,7 @@ pub struct RangeDecoder<'a> {
     low: u32,
     code: u32,
     range: u32,
+    faulted: bool,
 }
 
 pub struct BitReadRangeDecoder<'a, R: BitRead> {
@@ -42,6 +52,7 @@ pub struct BitReadRangeDecoder<'a, R: BitRead> {
     code: u32,
     range: u32,
     start_bit_position: usize,
+    faulted: bool,
 }
 
 /// Snapshot of the range coder registers.
@@ -76,6 +87,7 @@ impl<'a> RangeDecoder<'a> {
             low: 0,
             code,
             range: u32::MAX,
+            faulted: false,
         })
     }
 
@@ -119,8 +131,20 @@ impl<'a> RangeDecoder<'a> {
     pub fn get_current_count(&mut self, scale: u32) -> u32 {
         debug_assert_ne!(scale, 0);
         self.range /= scale;
-        debug_assert_ne!(self.range, 0);
+        if self.range == 0 {
+            return self.fault();
+        }
         (self.code.wrapping_sub(self.low)) / self.range
+    }
+
+    /// Record a frequency total past the range and return a count no
+    /// symbol owns. `range` is left at 1 so the arithmetic that follows
+    /// stays defined until the model reads the fault.
+    #[cold]
+    fn fault(&mut self) -> u32 {
+        self.faulted = true;
+        self.range = 1;
+        u32::MAX
     }
 
     /// Get the current "threshold" for binary symbol decisions.
@@ -134,6 +158,9 @@ impl<'a> RangeDecoder<'a> {
     #[inline(always)]
     pub fn get_binary_threshold(&mut self) -> u32 {
         self.range >>= 14;
+        if self.range == 0 {
+            return self.fault();
+        }
         (self.code.wrapping_sub(self.low)) / self.range
     }
 
@@ -185,6 +212,7 @@ impl<R: BitRead> BitReadRangeDecoder<'_, R> {
             code,
             range: u32::MAX,
             start_bit_position,
+            faulted: false,
         })
     }
 
@@ -197,6 +225,7 @@ impl<R: BitRead> BitReadRangeDecoder<'_, R> {
             code: state.code,
             range: state.range,
             start_bit_position,
+            faulted: false,
         }
     }
 
@@ -225,6 +254,14 @@ impl<R: BitRead> BitReadRangeDecoder<'_, R> {
         self.reader.read_byte_or_zero()
     }
 
+    /// See [`RangeDecoder::fault`].
+    #[cold]
+    fn fault(&mut self) -> u32 {
+        self.faulted = true;
+        self.range = 1;
+        u32::MAX
+    }
+
     #[inline(always)]
     fn normalize(&mut self) {
         while {
@@ -248,6 +285,10 @@ impl<R: BitRead> BitReadRangeDecoder<'_, R> {
 impl RangeCode for RangeDecoder<'_> {
     fn normalize(&mut self) {
         RangeDecoder::normalize(self)
+    }
+
+    fn faulted(&self) -> bool {
+        self.faulted
     }
 
     fn get_current_count(&mut self, scale: u32) -> u32 {
@@ -282,10 +323,17 @@ impl<R: BitRead> RangeCode for BitReadRangeDecoder<'_, R> {
     }
 
     #[inline(always)]
+    fn faulted(&self) -> bool {
+        self.faulted
+    }
+
+    #[inline(always)]
     fn get_current_count(&mut self, scale: u32) -> u32 {
         debug_assert_ne!(scale, 0);
         self.range /= scale;
-        debug_assert_ne!(self.range, 0);
+        if self.range == 0 {
+            return self.fault();
+        }
         (self.code.wrapping_sub(self.low)) / self.range
     }
 
@@ -297,6 +345,9 @@ impl<R: BitRead> RangeCode for BitReadRangeDecoder<'_, R> {
     #[inline(always)]
     fn get_binary_threshold(&mut self) -> u32 {
         self.range >>= 14;
+        if self.range == 0 {
+            return self.fault();
+        }
         (self.code.wrapping_sub(self.low)) / self.range
     }
 
@@ -354,6 +405,39 @@ mod tests {
         // get_current_count(256) = 0x40000000 / (0xFFFFFFFF / 256) = ~64
         let count = rd.get_current_count(256);
         assert_eq!(count, 64);
+    }
+
+    /// A frequency total past the range is a fault, not a division by zero:
+    /// the count comes back as one no symbol owns, the coder says so, and
+    /// the arithmetic that follows stays defined.
+    #[test]
+    fn a_frequency_total_past_the_range_faults_instead_of_dividing_by_zero() {
+        let input = [0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut rd = RangeDecoder::new(&input).unwrap();
+        // Shrink the range below the scale without normalizing, as a
+        // corrupt model does when its totals outgrow the coder.
+        rd.decode(0, 1, 1 << 15);
+        rd.range = 100;
+        assert!(!RangeCode::faulted(&rd));
+        assert_eq!(rd.get_current_count(1_000), u32::MAX);
+        assert!(RangeCode::faulted(&rd));
+        assert_eq!(rd.range, 1);
+        // Later calls keep working on the degenerate range.
+        let _ = rd.get_current_count(7);
+        assert!(rd.decode_binary(128, 256) || true);
+
+        let mut rd = RangeDecoder::new(&input).unwrap();
+        rd.range = 1 << 13;
+        assert_eq!(rd.get_binary_threshold(), u32::MAX);
+        assert!(RangeCode::faulted(&rd));
+
+        use crate::decompress::lz::bitstream::BitReader;
+        let mut reader = BitReader::new(&input);
+        let mut bd = BitReadRangeDecoder::new(&mut reader).unwrap();
+        bd.range = 100;
+        assert_eq!(RangeCode::get_current_count(&mut bd, 1_000), u32::MAX);
+        assert!(RangeCode::faulted(&bd));
+        assert_eq!(bd.range, 1);
     }
 
     #[test]

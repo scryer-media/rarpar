@@ -500,6 +500,268 @@ fn chunk_proves_slice_damage(
     false
 }
 
+/// Per-slice CRC32 + MD5 verdicts accumulated over one sequential stream of a
+/// file, chunk by chunk.
+///
+/// Slices wholly inside a chunk are hashed in SIMD lanes; a slice that
+/// straddles a chunk boundary (only possible when a slice is larger than the
+/// chunk) is carried across in a streaming [`checksum::SliceChecksumState`].
+/// Either way a slice is judged on exactly the bytes, and with exactly the
+/// zero padding, that [`verify_slices`] judges it on, so the vector this
+/// produces is the vector `verify_slices` would.
+struct SliceVerdictStream<'a> {
+    checksums: &'a [SliceChecksum],
+    slice_size: u64,
+    file_len: u64,
+    /// Bytes fed so far; the next `feed` must start here.
+    fed: u64,
+    valid: Vec<bool>,
+    partial: Option<checksum::SliceChecksumState>,
+    any_invalid: bool,
+}
+
+impl<'a> SliceVerdictStream<'a> {
+    fn new(checksums: &'a [SliceChecksum], slice_size: u64, file_len: u64) -> Self {
+        Self {
+            checksums,
+            slice_size,
+            file_len,
+            fed: 0,
+            valid: Vec::with_capacity(checksums.len()),
+            partial: None,
+            any_invalid: false,
+        }
+    }
+
+    fn push(&mut self, crc32: u32, md5: [u8; 16]) {
+        let ok = self
+            .checksums
+            .get(self.valid.len())
+            .is_some_and(|expected| expected.crc32 == crc32 && expected.md5 == md5);
+        self.any_invalid |= !ok;
+        self.valid.push(ok);
+    }
+
+    fn feed(&mut self, mut data: &[u8]) {
+        let kernel_lanes = md5_simd::max_lanes().min(VERIFY_SIMD_MAX_LANES);
+        while !data.is_empty() && self.fed < self.file_len {
+            let slice_start = (self.fed / self.slice_size) * self.slice_size;
+            let slice_end = (slice_start + self.slice_size).min(self.file_len);
+            let need = (slice_end - self.fed) as usize;
+            if self.partial.is_none() && self.fed == slice_start && data.len() >= need {
+                // A run of whole slices: hash it lane batch by lane batch.
+                let mut inputs: [&[u8]; VERIFY_SIMD_MAX_LANES] = [&[]; VERIFY_SIMD_MAX_LANES];
+                let mut lanes = 0usize;
+                let mut cursor = self.fed;
+                let mut taken = 0usize;
+                while lanes < kernel_lanes && cursor < self.file_len {
+                    let end = (cursor + self.slice_size).min(self.file_len);
+                    let len = (end - cursor) as usize;
+                    if taken + len > data.len() {
+                        break;
+                    }
+                    inputs[lanes] = &data[taken..taken + len];
+                    lanes += 1;
+                    taken += len;
+                    cursor = end;
+                }
+                if let [input] = &inputs[..lanes] {
+                    // A lone slice gains nothing from the lane kernel, which
+                    // runs it at a fraction of the scalar rate.
+                    let mut state = checksum::SliceChecksumState::new();
+                    state.update(input);
+                    let (crc32, md5) = state.finalize(Some(self.slice_size));
+                    self.push(crc32, md5);
+                } else {
+                    let inputs = &inputs[..lanes];
+                    let md5s = md5_simd::md5_multi(inputs, Some(self.slice_size));
+                    for (input, md5) in inputs.iter().zip(md5s) {
+                        self.push(checksum::crc32_padded(input, self.slice_size), md5);
+                    }
+                }
+                self.fed = cursor;
+                data = &data[taken..];
+                continue;
+            }
+            let take = need.min(data.len());
+            let state = self
+                .partial
+                .get_or_insert_with(checksum::SliceChecksumState::new);
+            state.update(&data[..take]);
+            self.fed += take as u64;
+            data = &data[take..];
+            if take == need {
+                let state = self.partial.take().expect("slice in progress");
+                let (crc32, md5) = state.finalize(Some(self.slice_size));
+                self.push(crc32, md5);
+            }
+        }
+    }
+
+    /// The verdict vector, or `None` when the stream did not cover every
+    /// slice (a short read), in which case it says nothing reliable.
+    fn finish(self) -> Option<Vec<bool>> {
+        (self.partial.is_none() && self.valid.len() == self.checksums.len()).then_some(self.valid)
+    }
+}
+
+/// Chunk size for the single-read pass: the largest whole number of slices
+/// that fits the slice-check batch budget ([`VERIFY_SIMD_BATCH_MEMORY_BYTES`]),
+/// so each chunk carries enough slices to fill the MD5 lanes and the
+/// per-chunk hand-off to the second worker is amortised over megabytes. A
+/// slice larger than the budget is streamed across budget-sized chunks. The
+/// buffer is the same size the two-pass path's second pass stages, and the
+/// single-read pass never runs that second pass, so peak memory for a damaged
+/// file does not grow.
+fn single_read_chunk_bytes(slice_size: u64) -> usize {
+    match usize::try_from(slice_size) {
+        Ok(slice) if slice > 0 && slice <= VERIFY_SIMD_BATCH_MEMORY_BYTES => {
+            (VERIFY_SIMD_BATCH_MEMORY_BYTES / slice) * slice
+        }
+        _ => VERIFY_SIMD_BATCH_MEMORY_BYTES,
+    }
+}
+
+/// What the single-read strict pass learned about a file.
+struct SingleReadOutcome {
+    /// The 16 KiB prefix and whole-file MD5 both matched. Only then is the
+    /// file complete, exactly as on the two-pass path.
+    complete: bool,
+    /// Per-slice verdicts identical to [`verify_slices`], or `None` when the
+    /// pass could not cover the file (an I/O error or a short read) and the
+    /// caller must fall back to the second pass.
+    valid_slices: Option<Vec<bool>>,
+}
+
+/// The strict pipeline's first pass with the per-slice verdicts computed in
+/// the same read ([`VerifyOptions::single_read`]).
+///
+/// Every chunk feeds two independent computations: the serial 16 KiB and
+/// whole-file MD5 chain, and the per-slice CRC32 + MD5 checks, which hash in
+/// SIMD lanes. Where rayon has a second worker the two run side by side on
+/// each chunk, so the slice checks stay off the chain's critical path. The
+/// pass always reads to the end — a damaged file is read once instead of up
+/// to its first bad slice and then again in full. Once a slice has failed the
+/// file cannot be complete, so the chain is abandoned from the next chunk on,
+/// and the rest of a damaged file pays only for the slice checks.
+///
+/// `may_join` says whether the side-by-side join may open: see
+/// [`single_read_may_join`]. Without it both computations run on the calling
+/// thread, one after the other, over the same chunk.
+fn stream_strict_single_read(
+    par2: &Par2FileSet,
+    file_id: &FileId,
+    access: &dyn FileAccess,
+    checksums: &[SliceChecksum],
+    may_join: bool,
+) -> SingleReadOutcome {
+    let failed = SingleReadOutcome {
+        complete: false,
+        valid_slices: None,
+    };
+    let Some(desc) = par2.file_description(file_id) else {
+        return failed;
+    };
+    let Some(actual_len) = access.file_length(file_id) else {
+        return failed;
+    };
+    let slice_size = par2.slice_size;
+    if slice_size == 0 {
+        return failed;
+    }
+    let chunk_bytes = single_read_chunk_bytes(slice_size);
+    let side_by_side = may_join
+        && reedsolomon_rs::threading::parallel_enabled()
+        && rayon::current_num_threads() > 1;
+
+    let mut quick_state = checksum::FileHashState::new();
+    let mut full_state = None;
+    let mut slices = SliceVerdictStream::new(checksums, slice_size, actual_len);
+    let mut buf = vec![0u8; chunk_bytes];
+    let mut total_read = 0u64;
+    let Ok(mut reader) = access.open_sequential_reader(file_id) else {
+        return failed;
+    };
+
+    while total_read < actual_len {
+        let want = ((actual_len - total_read) as usize).min(chunk_bytes);
+        let read = match reader.as_mut() {
+            Some(reader) => read_from_sequential_reader(&mut **reader, &mut buf[..want], want),
+            None => access.read_file_range_into(file_id, total_read, &mut buf[..want]),
+        };
+        let Ok(read_len) = read else {
+            return failed;
+        };
+        if read_len == 0 {
+            break;
+        }
+        let data = &buf[..read_len];
+        if slices.any_invalid {
+            slices.feed(data);
+        } else if side_by_side {
+            rayon::join(
+                || update_quick_and_full_hash_states(&mut quick_state, &mut full_state, data),
+                || slices.feed(data),
+            );
+        } else {
+            update_quick_and_full_hash_states(&mut quick_state, &mut full_state, data);
+            slices.feed(data);
+        }
+        total_read += read_len as u64;
+        if read_len < want {
+            break;
+        }
+    }
+
+    if total_read != actual_len {
+        return failed;
+    }
+    let abandoned = slices.any_invalid;
+    let valid_slices = slices.finish();
+    if abandoned {
+        return SingleReadOutcome {
+            complete: false,
+            valid_slices,
+        };
+    }
+    // See `stream_strict_hashes`: the stream stops at `actual_len`, so a file
+    // that grew past it is caught by probing for a trailing byte.
+    let grew = match reader.as_mut() {
+        Some(reader) => {
+            let mut probe = [0u8; 1];
+            match read_from_sequential_reader(&mut **reader, &mut probe, 1) {
+                Ok(read) => read != 0,
+                Err(_) => return failed,
+            }
+        }
+        None => false,
+    };
+    let quick_hash = quick_state.finalize();
+    let full_hash = full_state.map_or(quick_hash, checksum::FileHashState::finalize);
+    SingleReadOutcome {
+        complete: !grew
+            && quick_hash == desc.hash_16k
+            && actual_len == desc.length
+            && full_hash == desc.hash_full,
+        valid_slices,
+    }
+}
+
+/// Whether [`stream_strict_single_read`] may join its two per-chunk
+/// computations on rayon.
+///
+/// Parallelism runs on one axis at a time (see
+/// [`verify_repaired_file_ids_parallel`]): a per-chunk join inside the
+/// file-parallel `par_iter` of [`verify_selected_file_ids_parallel_with_options`]
+/// would let a worker blocked on it steal other files' verification frames
+/// onto its stack. So the join opens only when the caller has said there is
+/// no other axis in flight (`span_access` present: a lone file), or when the
+/// verify loop is not running on a rayon worker at all, so nothing it blocks
+/// on can be stolen onto its stack.
+fn single_read_may_join(span_access_present: bool) -> bool {
+    span_access_present || rayon::current_thread_index().is_none()
+}
+
 fn verify_full_hash_streaming(
     expected_hash: [u8; 16],
     actual_len: u64,
@@ -841,7 +1103,6 @@ pub fn verify_slices_from_crcs(
 }
 
 /// Options controlling verification behavior.
-#[derive(Default)]
 // Verification learns new dials over time; a new one should not cost every
 // consumer a major version. Build with `..Default::default()`.
 #[non_exhaustive]
@@ -899,6 +1160,30 @@ pub struct VerifyOptions {
     /// `WEAVER_PAR2_FAST_VERIFY` environment variable overrides this per verify
     /// call, taking precedence over whatever is set here.
     pub fast_verify: bool,
+    /// Read a damaged file once on the strict path (default `true`).
+    ///
+    /// The strict pipeline streams each file through the 16 KiB and
+    /// whole-file MD5 chain. With this set, the same pass also checks every
+    /// slice's CRC32 and MD5, side by side with the chain, and reads to the
+    /// end, so a damaged file's per-slice verdicts come out of that one read.
+    /// With it clear, the pass checks only CRC32s, stops at the first bad
+    /// slice, and a second pass re-reads the whole file for the verdicts.
+    /// Verdicts are identical either way; the trade is that a clean file also
+    /// pays for the per-slice MD5s, which mostly run on a second worker
+    /// rather than lengthening the pass.
+    pub single_read: bool,
+}
+
+impl Default for VerifyOptions {
+    fn default() -> Self {
+        Self {
+            cancel: None,
+            progress: None,
+            proven_slices: HashMap::new(),
+            fast_verify: false,
+            single_read: true,
+        }
+    }
 }
 
 impl VerifyOptions {
@@ -1061,7 +1346,10 @@ pub fn verify_selected_file_ids_parallel_with_options(
                 access,
                 span_parallel.then_some(access),
                 std::slice::from_ref(file_id),
-                &VerifyOptions::default(),
+                &VerifyOptions {
+                    single_read: options.single_read,
+                    ..VerifyOptions::default()
+                },
                 fast_verify,
             )
         })
@@ -1986,6 +2274,53 @@ fn verify_selected_file_ids_resolved(
         let checksums = par2
             .file_checksums(file_id)
             .filter(|checksums| checksums.len() == slice_count);
+        if options.single_read
+            && let Some(checksums) = checksums
+        {
+            let single = stream_strict_single_read(
+                par2,
+                file_id,
+                access,
+                checksums,
+                single_read_may_join(span_access.is_some()),
+            );
+            let file = if single.complete {
+                FileVerification {
+                    file_id: *file_id,
+                    filename: desc.filename.clone(),
+                    status: FileStatus::Complete,
+                    valid_slices: vec![true; slice_count],
+                    missing_slice_count: 0,
+                }
+            } else {
+                // Only a pass that could not cover the file reads it again.
+                let valid = single.valid_slices.unwrap_or_else(|| {
+                    strict_slice_validity(par2, access, span_access, file_id, slice_count)
+                });
+                let damaged = valid.iter().filter(|&&v| !v).count() as u32;
+                total_missing_blocks = total_missing_blocks.saturating_add(damaged);
+                FileVerification {
+                    file_id: *file_id,
+                    filename: desc.filename.clone(),
+                    status: FileStatus::Damaged(damaged),
+                    valid_slices: valid,
+                    missing_slice_count: damaged,
+                }
+            };
+            files.push(file);
+            bytes_processed += desc.length;
+            if let Some(ref progress) = options.progress {
+                progress(ProgressUpdate {
+                    stage: ProgressStage::Verifying,
+                    current: file_index as u32 + 1,
+                    total: total_files,
+                    bytes_processed,
+                    total_bytes: None,
+                    phase: ProgressPhase::Whole,
+                });
+            }
+            continue;
+        }
         let outcome = stream_strict_hashes(par2, file_id, access, checksums).unwrap_or(
             StrictStreamOutcome::Hashes {
                 quick_ok: false,
@@ -3926,5 +4261,396 @@ mod tests {
             "a short read must condemn only the slices it actually cut short"
         );
         assert_eq!(result.files[0].missing_slice_count, 2);
+    }
+
+    // --- Single-read strict pass -------------------------------------------
+
+    fn two_pass_opts() -> VerifyOptions {
+        VerifyOptions {
+            single_read: false,
+            ..Default::default()
+        }
+    }
+
+    /// A sequential-reader access that counts the bytes its readers deliver,
+    /// so the reader path of the strict pass is held to the same bound as the
+    /// range path [`CountingAccess`] covers.
+    struct CountingReaderAccess {
+        files: HashMap<FileId, Vec<u8>>,
+        bytes_read: Arc<AtomicUsize>,
+    }
+
+    struct CountingReader {
+        inner: Cursor<Vec<u8>>,
+        bytes_read: Arc<AtomicUsize>,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let read = self.inner.read(buf)?;
+            self.bytes_read.fetch_add(read, Ordering::Relaxed);
+            Ok(read)
+        }
+    }
+
+    impl CountingReaderAccess {
+        fn take_bytes_read(&self) -> usize {
+            self.bytes_read.swap(0, Ordering::Relaxed)
+        }
+    }
+
+    impl FileAccess for CountingReaderAccess {
+        fn read_file_range(&self, file_id: &FileId, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+            let data = self
+                .files
+                .get(file_id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file not found"))?;
+            let start = (offset as usize).min(data.len());
+            let end = (start + len as usize).min(data.len());
+            self.bytes_read.fetch_add(end - start, Ordering::Relaxed);
+            Ok(data[start..end].to_vec())
+        }
+
+        fn read_file_range_into(
+            &self,
+            file_id: &FileId,
+            offset: u64,
+            dst: &mut [u8],
+        ) -> io::Result<usize> {
+            let data = self.read_file_range(file_id, offset, dst.len() as u64)?;
+            dst[..data.len()].copy_from_slice(&data);
+            Ok(data.len())
+        }
+
+        fn open_sequential_reader(&self, file_id: &FileId) -> io::Result<Option<Box<dyn Read>>> {
+            let data = self
+                .files
+                .get(file_id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file not found"))?;
+            Ok(Some(Box::new(CountingReader {
+                inner: Cursor::new(data.clone()),
+                bytes_read: Arc::clone(&self.bytes_read),
+            })))
+        }
+
+        fn file_exists(&self, file_id: &FileId) -> bool {
+            self.files.contains_key(file_id)
+        }
+
+        fn file_length(&self, file_id: &FileId) -> Option<u64> {
+            self.files.get(file_id).map(|data| data.len() as u64)
+        }
+
+        fn read_file(&self, file_id: &FileId) -> io::Result<Vec<u8>> {
+            let len = self.file_length(file_id).unwrap_or(0);
+            self.read_file_range(file_id, 0, len)
+        }
+
+        fn write_file_range(
+            &mut self,
+            _file_id: &FileId,
+            _offset: u64,
+            _data: &[u8],
+        ) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "test access is read-only",
+            ))
+        }
+    }
+
+    /// The single-read pass reports exactly what the two-pass path reports —
+    /// every field of every `FileVerification`, and the set totals — wherever
+    /// the damage sits: each slice alone, the zero-padded tail, several slices
+    /// at once, none at all, and only the whole-file hash. Slice sizes cover a
+    /// chunk-aligned power of two, a size that does not divide the chunk, and
+    /// one larger than a chunk, whose slices straddle chunk boundaries. Both
+    /// read paths (ranges and a sequential reader) and both damaged-branch
+    /// scanners are exercised.
+    #[test]
+    fn single_read_verdicts_match_the_two_pass_path_for_every_damage_position() {
+        for slice_size in [1024u64, 3000, (VERIFY_FULL_HASH_CHUNK_BYTES as u64) + 512] {
+            let len = (slice_size as usize) * 5 + 300;
+            let pristine = deterministic_file(len);
+            let slice_count = (len as u64).div_ceil(slice_size) as usize;
+            let mut damage_sets: Vec<Vec<usize>> = (0..slice_count).map(|i| vec![i]).collect();
+            damage_sets.push(Vec::new());
+            damage_sets.push(vec![0, 2, slice_count - 1]);
+            damage_sets.push(vec![1, 3]);
+            for damaged in &damage_sets {
+                let mut data = pristine.clone();
+                for &slice in damaged {
+                    let at = (slice as u64 * slice_size) as usize + 7;
+                    data[at] ^= 0xff;
+                }
+                let (set, _, file_id) = setup_test_set(&pristine, slice_size);
+                let mut memory = MemoryFileAccess::new();
+                memory.add_file(file_id, data.clone());
+                let reader_access = CountingReaderAccess {
+                    files: HashMap::from([(file_id, data)]),
+                    bytes_read: Arc::new(AtomicUsize::new(0)),
+                };
+                for access in [&memory as &(dyn FileAccess + Sync), &reader_access] {
+                    for span_access in [None, Some(access)] {
+                        let run = |options: &VerifyOptions| {
+                            verify_selected_file_ids_resolved(
+                                &set,
+                                access,
+                                span_access,
+                                &[file_id],
+                                options,
+                                false,
+                            )
+                        };
+                        let single = run(&strict_opts());
+                        let two_pass = run(&two_pass_opts());
+                        assert_eq!(
+                            format!("{single:?}"),
+                            format!("{two_pass:?}"),
+                            "slice_size {slice_size} damaged {damaged:?}"
+                        );
+                        if damaged.is_empty() {
+                            assert!(matches!(single.files[0].status, FileStatus::Complete));
+                        } else {
+                            let expected = verify_slices(&set, &file_id, access).unwrap();
+                            assert_eq!(single.files[0].valid_slices, expected);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Only the whole-file hash disagrees: `Damaged(0)` with every slice
+        // valid, from both paths.
+        let slice_size = 4096u64;
+        let data = deterministic_file((slice_size as usize) * 6);
+        let (set, access, file_id) =
+            setup_test_set_with_full_hash(&data, slice_size, Some([0x5a; 16]));
+        let single =
+            verify_selected_file_ids_with_options(&set, &access, &[file_id], &strict_opts());
+        let two_pass =
+            verify_selected_file_ids_with_options(&set, &access, &[file_id], &two_pass_opts());
+        assert!(matches!(single.files[0].status, FileStatus::Damaged(0)));
+        assert_eq!(format!("{single:?}"), format!("{two_pass:?}"));
+    }
+
+    /// A damaged file costs exactly one read of its length in single-read
+    /// mode, on either read path, where the two-pass path reads it up to the
+    /// damage and then again in full. A clean file costs one read either way.
+    #[test]
+    fn single_read_reads_a_damaged_file_once() {
+        let slice_size = 64 * 1024u64;
+        let len = (slice_size as usize) * 64;
+        let pristine = deterministic_file(len);
+        for damaged_slice in [0usize, 32, 63] {
+            let mut data = pristine.clone();
+            data[damaged_slice * slice_size as usize + 3] ^= 0xff;
+            let (set, _, file_id) = setup_test_set(&pristine, slice_size);
+            let mut memory = MemoryFileAccess::new();
+            memory.add_file(file_id, data.clone());
+            let ranges = CountingAccess::new(memory);
+            let reader = CountingReaderAccess {
+                files: HashMap::from([(file_id, data)]),
+                bytes_read: Arc::new(AtomicUsize::new(0)),
+            };
+
+            let single =
+                verify_selected_file_ids_with_options(&set, &ranges, &[file_id], &strict_opts());
+            assert_eq!(
+                ranges.take_bytes_read(),
+                len,
+                "damaged slice {damaged_slice}"
+            );
+            let two_pass =
+                verify_selected_file_ids_with_options(&set, &ranges, &[file_id], &two_pass_opts());
+            assert!(ranges.take_bytes_read() > len);
+            assert_eq!(format!("{single:?}"), format!("{two_pass:?}"));
+
+            verify_selected_file_ids_with_options(&set, &reader, &[file_id], &strict_opts());
+            assert_eq!(
+                reader.take_bytes_read(),
+                len,
+                "damaged slice {damaged_slice}"
+            );
+        }
+
+        let (set, _, file_id) = setup_test_set(&pristine, slice_size);
+        let mut memory = MemoryFileAccess::new();
+        memory.add_file(file_id, pristine.clone());
+        let ranges = CountingAccess::new(memory);
+        for options in [strict_opts(), two_pass_opts()] {
+            let result = verify_selected_file_ids_with_options(&set, &ranges, &[file_id], &options);
+            assert!(matches!(result.files[0].status, FileStatus::Complete));
+            assert_eq!(ranges.take_bytes_read(), len);
+        }
+    }
+
+    /// File-parallel strict verification with single-read on must give the
+    /// verdicts of the sequential path, file for file, when several files are
+    /// damaged at different slices — and its per-chunk join stays closed on
+    /// the workers that run the file-level `par_iter`, so the two parallel
+    /// axes never nest. The join decision is checked on a pool worker and off
+    /// one directly rather than inferred from timing.
+    #[test]
+    fn file_parallel_single_read_matches_sequential_and_never_nests_the_join() {
+        let slice_size = 4096u64;
+        let len = (slice_size as usize) * 12 + 100;
+        let names = [
+            "invented-volume-a.bin",
+            "invented-volume-b.bin",
+            "invented-volume-c.bin",
+            "invented-volume-d.bin",
+            "invented-volume-e.bin",
+        ];
+        let pristine: Vec<Vec<u8>> = (0..names.len())
+            .map(|i| {
+                deterministic_file(len)
+                    .into_iter()
+                    .map(|byte| byte.wrapping_add(i as u8))
+                    .collect()
+            })
+            .collect();
+        let entries: Vec<(&[u8], &str)> = pristine
+            .iter()
+            .zip(names)
+            .map(|(data, name)| (data.as_slice(), name))
+            .collect();
+        let (set, mut access, file_ids) = setup_test_set_multi(&entries, slice_size);
+        // Four of five files damaged, each somewhere else; one stays intact.
+        for (index, damaged_slices) in [vec![0usize], vec![5, 6], vec![12], vec![3, 9, 11]]
+            .into_iter()
+            .enumerate()
+        {
+            let mut data = pristine[index].clone();
+            for slice in damaged_slices {
+                data[slice * slice_size as usize + 11] ^= 0x5a;
+            }
+            access.add_file(file_ids[index], data);
+        }
+
+        let sequential =
+            verify_selected_file_ids_with_options(&set, &access, &file_ids, &two_pass_opts());
+        assert_eq!(
+            sequential
+                .files
+                .iter()
+                .filter(|file| matches!(file.status, FileStatus::Damaged(_)))
+                .count(),
+            4,
+            "fixture must damage four files"
+        );
+        for options in [strict_opts(), two_pass_opts()] {
+            let parallel =
+                verify_selected_file_ids_parallel_with_options(&set, &access, &file_ids, &options);
+            assert_eq!(format!("{parallel:?}"), format!("{sequential:?}"));
+        }
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        assert!(!pool.install(|| single_read_may_join(false)));
+        assert!(pool.install(|| single_read_may_join(true)));
+        assert!(single_read_may_join(false));
+    }
+
+    /// Process CPU time (user + system, every thread), for the perf
+    /// measurement below.
+    #[cfg(unix)]
+    fn process_cpu_seconds() -> f64 {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        // SAFETY: `getrusage` fills the struct it is handed and nothing else.
+        let usage = unsafe {
+            libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr());
+            usage.assume_init()
+        };
+        let seconds = |tv: libc::timeval| tv.tv_sec as f64 + tv.tv_usec as f64 / 1e6;
+        seconds(usage.ru_utime) + seconds(usage.ru_stime)
+    }
+
+    /// Wall time, CPU time and bytes read of a strict verify of one
+    /// page-cached on-disk file, single-read against two-pass, clean and
+    /// damaged in its last slice. Run by hand:
+    ///
+    /// ```sh
+    /// cargo test --locked --release -p par2-rs --lib -- --ignored perf_single_read
+    /// ```
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "perf measurement, run by hand in release mode"]
+    fn perf_single_read_against_two_pass() {
+        let _keep_cached = crate::file_cache::CacheEvictionDeferral::acquire();
+        let len = 255 * 1024 * 1024usize;
+        let pristine = deterministic_file(len);
+        for slice_size in [64 * 1024u64, 768 * 1024, 4 * 1024 * 1024] {
+            let (set, _, file_id) = setup_test_set(&pristine, slice_size);
+            let dir = tempfile::tempdir().unwrap();
+            let name = set.file_description(&file_id).unwrap().filename.clone();
+            let path = dir.path().join(&name);
+            let mut damaged = pristine.clone();
+            damaged[len - 5] ^= 0xff;
+            for (label, bytes) in [("clean", &pristine), ("damaged-at-end", &damaged)] {
+                std::fs::write(&path, bytes).unwrap();
+                let access = crate::DiskFileAccess::new(dir.path().to_path_buf(), &set);
+                let _ = std::fs::read(&path).unwrap();
+                let mut samples: [Vec<(f64, f64)>; 2] = [Vec::new(), Vec::new()];
+                for _ in 0..7 {
+                    for (arm, options) in [two_pass_opts(), strict_opts()].iter().enumerate() {
+                        let cpu = process_cpu_seconds();
+                        let started = std::time::Instant::now();
+                        let result = verify_selected_file_ids_with_options(
+                            &set,
+                            &access,
+                            &[file_id],
+                            options,
+                        );
+                        let wall = started.elapsed().as_secs_f64();
+                        samples[arm].push((wall, process_cpu_seconds() - cpu));
+                        std::hint::black_box(result);
+                    }
+                }
+                // Fastest sample: the measurement is of what the pass costs,
+                // not of whatever else the host was running at the time.
+                let fastest = |values: &mut Vec<(f64, f64)>| {
+                    values.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    values[0]
+                };
+                let (two_wall, two_cpu) = fastest(&mut samples[0]);
+                let (one_wall, one_cpu) = fastest(&mut samples[1]);
+                let bytes_two = {
+                    let mut memory = MemoryFileAccess::new();
+                    memory.add_file(file_id, bytes.clone());
+                    let counting = CountingAccess::new(memory);
+                    verify_selected_file_ids_with_options(
+                        &set,
+                        &counting,
+                        &[file_id],
+                        &two_pass_opts(),
+                    );
+                    counting.take_bytes_read()
+                };
+                let bytes_one = {
+                    let mut memory = MemoryFileAccess::new();
+                    memory.add_file(file_id, bytes.clone());
+                    let counting = CountingAccess::new(memory);
+                    verify_selected_file_ids_with_options(
+                        &set,
+                        &counting,
+                        &[file_id],
+                        &strict_opts(),
+                    );
+                    counting.take_bytes_read()
+                };
+                println!(
+                    "slice {slice_size} {label}: two-pass wall {:.1} ms cpu {:.1} ms bytes {bytes_two}; \
+                     single-read wall {:.1} ms cpu {:.1} ms bytes {bytes_one}; wall {:+.1}%",
+                    two_wall * 1e3,
+                    two_cpu * 1e3,
+                    one_wall * 1e3,
+                    one_cpu * 1e3,
+                    (one_wall / two_wall - 1.0) * 100.0
+                );
+            }
+        }
     }
 }

@@ -1,12 +1,14 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use bytes::Bytes;
 
 use crate::checksum::Md5State;
 use crate::error::{Par2Error, Result};
+use crate::evidence::FileStatFingerprint;
 use crate::types::{CancellationToken, RecoveryExponent};
 
 #[derive(Debug, Clone)]
@@ -25,6 +27,163 @@ pub enum RecoverySliceData {
         /// `None` means the payload was already validated (or is synthetic).
         packet_hash: Option<[u8; 16]>,
     },
+}
+
+/// Scanner authentications of file-backed payloads, keyed by the interned
+/// volume path allocation.
+///
+/// The bounded file scanner hashes every recovery payload as it reads it and,
+/// when the volume's stat has settled, records the fingerprint the volume had
+/// when it was opened. While the path still fingerprints identically,
+/// [`RecoverySliceData::validate_packet_hash`] accepts that authentication
+/// instead of reading and hashing the payload again.
+///
+/// The record lives here rather than in [`RecoverySliceData::FileBacked`] so
+/// that variant keeps exactly its public fields. Only payloads a sink kept are
+/// recorded (see [`ScanAdmission`]). Every payload of one scan
+/// shares one `Arc<Path>`, and clones of a payload share it too, so the
+/// allocation's address names the scan. The entry holds a `Weak` to that
+/// allocation, which keeps the address from being reused while the entry
+/// exists; entries whose payloads are all gone are pruned when the next scan
+/// registers. A span is vouched for only when its offset, length and packet
+/// hash are the ones the scan authenticated, so a payload built by hand over
+/// the scanner's path is read and hashed like any other. The packet hash
+/// also covers the recovery set ID and the exponent, so the span is vouched
+/// for only under the set ID and exponent the scan hashed it with; asked
+/// about any other, the payload is read and hashed against that one.
+struct ScanAuthentication {
+    path: Weak<Path>,
+    fingerprint: FileStatFingerprint,
+    spans: HashMap<u64, AuthenticatedSpan>,
+}
+
+/// What the scanner hashed at one payload offset.
+#[derive(PartialEq, Eq)]
+struct AuthenticatedSpan {
+    len: usize,
+    packet_hash: [u8; 16],
+    recovery_set_id: [u8; 16],
+    exponent: RecoveryExponent,
+}
+
+static SCAN_AUTHENTICATIONS: Mutex<Option<HashMap<usize, ScanAuthentication>>> = Mutex::new(None);
+
+fn interned_path_key(path: &Arc<Path>) -> usize {
+    Arc::as_ptr(path).cast::<u8>() as usize
+}
+
+fn record_scan_authentication(
+    path: &Arc<Path>,
+    offset: u64,
+    span: AuthenticatedSpan,
+    fingerprint: FileStatFingerprint,
+) {
+    let mut table = SCAN_AUTHENTICATIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let table = table.get_or_insert_with(HashMap::new);
+    let key = interned_path_key(path);
+    if !table.contains_key(&key) {
+        table.retain(|_, entry| entry.path.strong_count() > 0);
+    }
+    let entry = table.entry(key).or_insert_with(|| ScanAuthentication {
+        path: Arc::downgrade(path),
+        fingerprint: fingerprint.clone(),
+        spans: HashMap::new(),
+    });
+    // One allocation is one scan, and one scan records one fingerprint.
+    debug_assert_eq!(entry.fingerprint, fingerprint);
+    entry.spans.insert(offset, span);
+}
+
+pub(super) fn scan_authentication(
+    path: &Arc<Path>,
+    offset: u64,
+    len: usize,
+    packet_hash: &[u8; 16],
+    recovery_set_id: &[u8; 16],
+    exponent: RecoveryExponent,
+) -> Option<FileStatFingerprint> {
+    let table = SCAN_AUTHENTICATIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let entry = table.as_ref()?.get(&interned_path_key(path))?;
+    debug_assert!(std::ptr::addr_eq(entry.path.as_ptr(), Arc::as_ptr(path)));
+    let span = AuthenticatedSpan {
+        len,
+        packet_hash: *packet_hash,
+        recovery_set_id: *recovery_set_id,
+        exponent,
+    };
+    (entry.spans.get(&offset) == Some(&span)).then(|| entry.fingerprint.clone())
+}
+
+/// A scanned recovery payload's authentication, waiting for its packet to be
+/// admitted.
+///
+/// The scanner hashes every recovery payload it reads, but only the payloads a
+/// sink keeps can ever be validated again, so only those are recorded in the
+/// side table: [`PacketScanBudget::scan_admission`] builds this before the
+/// packet is handed over, and [`Self::record`] runs once the sink has kept it.
+/// A packet the sink drops, as a duplicate or for any other reason, leaves
+/// nothing behind, so the table never holds more spans than the inventories
+/// built from scans retain, and those are metered by their budgets.
+///
+/// [`PacketScanBudget::scan_admission`]: super::PacketScanBudget::scan_admission
+pub(crate) struct ScanAdmission {
+    path: Arc<Path>,
+    offset: u64,
+    span: AuthenticatedSpan,
+    fingerprint: FileStatFingerprint,
+}
+
+impl ScanAdmission {
+    /// The admission for `packet`, scanned from a recovery packet whose header
+    /// named `recovery_set_id`, when it is a hashed file-backed payload over a
+    /// path the scan fingerprinted. `fingerprint` looks that path up.
+    pub(crate) fn for_packet(
+        packet: &RecoverySlicePacket,
+        recovery_set_id: &[u8; 16],
+        fingerprint: impl FnOnce(&Arc<Path>) -> Option<FileStatFingerprint>,
+    ) -> Option<Self> {
+        let RecoverySliceData::FileBacked {
+            path,
+            offset,
+            len,
+            packet_hash: Some(packet_hash),
+        } = &packet.data
+        else {
+            return None;
+        };
+        let fingerprint = fingerprint(path)?;
+        Some(Self {
+            path: Arc::clone(path),
+            offset: *offset,
+            span: AuthenticatedSpan {
+                len: *len,
+                packet_hash: *packet_hash,
+                recovery_set_id: *recovery_set_id,
+                exponent: packet.exponent,
+            },
+            fingerprint,
+        })
+    }
+
+    /// Record the authentication now that its packet has been kept.
+    pub(crate) fn record(self) {
+        record_scan_authentication(&self.path, self.offset, self.span, self.fingerprint);
+    }
+}
+
+/// How many spans the side table holds for `path`'s scan.
+#[cfg(test)]
+pub(crate) fn scan_authentication_count(path: &Arc<Path>) -> usize {
+    SCAN_AUTHENTICATIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .and_then(|table| table.get(&interned_path_key(path)))
+        .map_or(0, |entry| entry.spans.len())
 }
 
 impl RecoverySliceData {
@@ -64,9 +223,17 @@ impl RecoverySliceData {
     ///
     /// In-memory payloads were hash-validated when the packet was parsed, and
     /// file-backed payloads recorded without a hash are trusted as-is.
-    /// File-backed payloads captured by the streaming scanner (which skips
-    /// payload hashing for speed) are re-hashed from disk here: the packet
+    /// Other file-backed payloads are re-hashed from disk here: the packet
     /// hash covers `recovery_set_id || type || exponent || payload`.
+    ///
+    /// The bounded file scanner authenticates every recovery payload as it
+    /// reads it and records the volume's stat fingerprint (length, mtime and,
+    /// on Unix, device and inode). A payload whose volume still fingerprints
+    /// identically keeps that verdict without being read again; one whose
+    /// volume changed, vanished or stopped being a regular file is read and
+    /// hashed as before. What the fingerprint cannot see — a same-length
+    /// in-place rewrite that also restores the mtime — is left to the
+    /// verification of the repaired files that follows every repair.
     pub fn validate_packet_hash(
         &self,
         recovery_set_id: &[u8; 16],
@@ -107,6 +274,12 @@ impl RecoverySliceData {
         else {
             return Ok(true);
         };
+        if let Some(authenticated_at) =
+            scan_authentication(path, *offset, *len, expected, recovery_set_id, exponent)
+            && FileStatFingerprint::capture_path(path).as_ref() == Some(&authenticated_at)
+        {
+            return Ok(true);
+        }
 
         let mut hasher = Md5State::new();
         hasher.update(recovery_set_id);

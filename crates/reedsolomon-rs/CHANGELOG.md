@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.4.9
+
+- `rar3::Rar3RsCoder::decode_matrix(total, erasures)` returns the RAR3
+  decoder for one erasure set as a dense GF(2^8) matrix, one row per erasure
+  and one column per block position. It is built by running `decode` on each
+  unit vector, so it is the scalar decoder's own map, bit for bit, and it
+  refuses exactly the shapes `decode` refuses.
+- `decode_apply::apply_decode_matrix_gf8` applies such a matrix to whole
+  regions: one rayon task per output row and stripe (16 to 256 KiB), each
+  folding groups of sources through `gf8::mul_acc_input_batch`. Zero
+  coefficients are skipped. The output does not depend on the stripe size,
+  thread count or kernel tier.
+- `decode_apply::apply_decode_matrix_gf16` is the same driver over GF(2^16),
+  folding groups through `gf_simd::mul_acc_input_batch_prepared` with every
+  coefficient prepared once per matrix rather than once per stripe.
+- `rar5::Rar5RsCoder::apply_units` rebuilds every missing row from all the
+  logical units of a chunk at once through `apply_decode_matrix_gf16`, and
+  `Rar5RsCoder::matrix` exposes the inverted decode rows. The result is the
+  one a full `update_outputs` pass leaves.
+- `Rar3RsCoder::decode` rebuilds its cached erasure locator when the block
+  length changes, not only when the erasure set does; a coder reused across
+  blocks of different lengths with the same erasures no longer corrects the
+  wrong positions. `decode_matrix` derives its matrix from fresh locator
+  state rather than from whatever block the coder decoded last.
+
 ## 0.4.8
 
 - SVE2 tiers on aarch64. On a host that reports SVE2, these NEON kernels hand

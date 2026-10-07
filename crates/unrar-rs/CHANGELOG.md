@@ -1,5 +1,75 @@
 # Changelog
 
+## 0.10.9
+
+### Changed
+
+- RAR3 recovery-volume restore no longer decodes one byte column at a time.
+  For a fixed set of missing volumes the column decoder is linear, so
+  `restore_volumes_from_paths` derives it once as a matrix
+  (`Rar3RsCoder::decode_matrix`) and applies the rows for the missing data
+  volumes to whole regions with the gf8 kernels on every core. Restored bytes
+  are unchanged. On an Apple M5 Max, restoring a 41 + 10 volume set of
+  2.1 GB took 3.7-5.5 s and 51-53 CPU-s with one volume missing and
+  4.3-5.1 s with eight missing; it now takes 0.5 s and 0.64-1.07 s. RARLAB
+  unrar 7.20 takes 4.1-4.4 s and 4.6-4.7 s on the same sets.
+- RAR5 recovery-volume restore reads every unit of a chunk before decoding
+  it and applies the whole decode matrix with `Rar5RsCoder::apply_units`, on
+  every core, instead of multiplying unit by unit on one thread. The working
+  set stays at 64 MiB, now shared by the units and the outputs. On the same
+  host, a 2.1 GB 41 + 10 set with eight volumes missing went from 1.22-1.27 s
+  to 0.55 s (unrar 7.20: 1.31 s); with one missing, where the restore is
+  bound by reading and checking the volumes, from 0.51 s to 0.48 s. Restored
+  bytes are unchanged.
+- Recovery-volume restore reads side by side. The `.rev` headers, the
+  recovery-volume CRC32s and the data-volume checks run on every core and
+  are applied in volume order, so errors surface where they did. Each chunk
+  of the decode is read from all of its volumes at once, and a restored
+  volume is hashed as it is written instead of read back to verify it. RAR3
+  `.rev` CRC32s are computed in 256 KiB reads instead of loading each file
+  whole.
+- RAR5 restore no longer reads the intact data volumes twice. When the
+  volumes that are absent or the wrong size are ones the recovery volumes
+  can cover, the decode checks the other volumes' CRC32s as it reads them
+  and writes to hidden partial files; only when every CRC32 matches are bad
+  volumes renamed to `.bad` and the partial files moved into place. Each
+  partial file is created exclusively under a name carrying the process ID,
+  a per-process counter and the clock's nanoseconds, so it never opens,
+  truncates or follows a file or symlink already in the output directory,
+  whatever `overwrite_existing` says, and concurrent restores never share
+  one; a taken name is skipped for the next. Moving a partial file into
+  place replaces an existing output on every platform when
+  `overwrite_existing` is set, and is refused as before when it is not. If one
+  fails, the partial files are removed and the restore continues as before
+  from the verdicts the decode found, so renames and refusals are unchanged.
+  The next chunk is read while the current one is decoded, inside the same
+  64 MiB working set.
+- On the 2.1 GB 41 + 10 sets above, restores now take 0.26 s (RAR3) and
+  0.25 s (RAR5) with one volume missing and 0.32 s and 0.33 s with eight
+  missing, against 4.4-4.6 s, 0.98-1.09 s, 4.7-5.6 s and 1.37-1.51 s for
+  unrar 7.20. Peak RSS is 70-73 MiB in every case (unrar: 79-353 MiB).
+- `reedsolomon-rs` requirement raised to 0.4.9 for `decode_matrix`,
+  `apply_decode_matrix_gf8` and `Rar5RsCoder::apply_units`.
+
+### Fixed
+
+- A RAR3 PPMd member whose corrupt model drives a frequency total past the
+  range coder's range no longer panics (an assertion in debug builds, a
+  division by zero in release builds). The coder records the fault, and the
+  member fails with `CorruptArchive` or a CRC mismatch instead. Found by the
+  `rar_extract` fuzz target; the input is kept as a regression test.
+- A RAR5 restore without `overwrite_existing` no longer replaces a file that
+  appears at a restored volume's name after the existence check. Each
+  restored volume is hard-linked into place, which the filesystem refuses
+  atomically when the name is taken, and the restore fails with the usual
+  refusal while the file at that name is left untouched. On a filesystem
+  that cannot hard-link the volume is created exclusively and copied into
+  place instead, so the name is never replaced there either.
+- A RAR3 restore checks the data volume it takes its names from again when
+  it assigns the volumes to slots, as the serial restore did, instead of
+  reusing the verdict of the side-by-side check. A volume damaged after that
+  check is treated as missing rather than fed to the reconstruction.
+
 ## 0.10.8
 
 ### Fixed

@@ -117,9 +117,64 @@ pub fn scan_for_renames(dir: &Path, par2_set: &Par2FileSet) -> io::Result<Vec<Re
 /// Reads the first 64 bytes of each file to check for PAR2 magic and extract
 /// the recovery set ID. Returns paths of files that match `expected_set_id`
 /// but may have obfuscated names.
+///
+/// This opens every regular file in `dir`, the set's own data files included.
+/// When the set's file descriptions are at hand, prefer
+/// [`identify_par2_files_for_set`], which leaves those alone.
 pub fn identify_par2_files(
     dir: &Path,
     expected_set_id: &RecoverySetId,
+) -> io::Result<Vec<PathBuf>> {
+    identify_par2_files_skipping(dir, expected_set_id, &HashMap::new(), &mut |path| {
+        read_first_n_bytes(path, header::HEADER_SIZE)
+    })
+}
+
+/// [`identify_par2_files`] for `par2_set`'s recovery set, without opening the
+/// files the set protects.
+///
+/// A regular file whose name is one of the set's file descriptions, whose
+/// length is the length that description records, and whose length could not
+/// be a PAR2 file of whole packets (shorter than a packet header, or not a
+/// multiple of 4) is the set's data, so it is skipped from its directory
+/// entry's stat instead of read: one open and one read saved per such
+/// protected file. Every other file — including one at a protected name with
+/// the recorded length when that length could be a volume's, and one at a
+/// protected name with some other length — is identified by its first packet
+/// header as before, so a renamed or obfuscated volume of whole packets is
+/// found exactly as [`identify_par2_files`] finds it. Only a volume truncated
+/// to a length that is not a multiple of 4, and then sitting at a protected
+/// name with exactly that file's recorded length, is passed over.
+pub fn identify_par2_files_for_set(dir: &Path, par2_set: &Par2FileSet) -> io::Result<Vec<PathBuf>> {
+    let protected: HashMap<&str, u64> = par2_set
+        .files
+        .values()
+        .map(|desc| (desc.filename.as_str(), desc.length))
+        .collect();
+    identify_par2_files_skipping(dir, &par2_set.recovery_set_id, &protected, &mut |path| {
+        read_first_n_bytes(path, header::HEADER_SIZE)
+    })
+}
+
+/// Whether a file of `len` bytes could be a PAR2 file made of whole packets.
+/// Every packet is at least a header long and a multiple of 4 bytes, so a
+/// whole volume is too; any other length cannot be one.
+fn could_be_whole_par2_file(len: u64) -> bool {
+    len >= header::HEADER_SIZE as u64 && len.is_multiple_of(4)
+}
+
+/// The directory walk behind both identify entry points. `skip_protected`
+/// maps a protected file's name to its recorded length; a regular file
+/// matching both is skipped unread only when that length could not be a
+/// PAR2 file of whole packets. Name and length alone never exclude an entry:
+/// a renamed volume can sit at a protected name with exactly the recorded
+/// length. `read_head` reads a candidate's first packet header; it is a
+/// parameter so tests can count what the walk opens.
+fn identify_par2_files_skipping(
+    dir: &Path,
+    expected_set_id: &RecoverySetId,
+    skip_protected: &HashMap<&str, u64>,
+    read_head: &mut dyn FnMut(&Path) -> io::Result<Vec<u8>>,
 ) -> io::Result<Vec<PathBuf>> {
     let mut matches = Vec::new();
 
@@ -128,19 +183,23 @@ pub fn identify_par2_files(
         let entry = entry?;
         let path = entry.path();
 
-        if !path.is_file() {
+        // `fs::metadata` follows symlinks, as `Path::is_file` does.
+        let Some(metadata) = fs::metadata(&path).ok().filter(|meta| meta.is_file()) else {
             continue;
-        }
+        };
 
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
 
-        if is_generated_par2_artifact_name(file_name) {
+        if is_generated_par2_artifact_name(file_name)
+            || (skip_protected.get(file_name) == Some(&metadata.len())
+                && !could_be_whole_par2_file(metadata.len()))
+        {
             continue;
         }
 
-        let data = read_first_n_bytes(&path, header::HEADER_SIZE)?;
+        let data = read_head(&path)?;
         if data.len() < header::HEADER_SIZE {
             continue;
         }
@@ -433,6 +492,228 @@ mod tests {
         let expected_id = RecoverySetId::from_bytes([0x42; 16]);
         let matches = identify_par2_files(dir.path(), &expected_id).unwrap();
         assert!(matches.is_empty());
+    }
+
+    /// The set-aware walk finds exactly the volumes the plain walk finds and
+    /// opens none of the files the set protects, whose lengths are not
+    /// multiples of 4 and so cannot be PAR2 volumes. A real set is created in
+    /// a tempdir, so the volumes carry real headers.
+    #[test]
+    fn identify_par2_files_for_set_skips_protected_files_and_finds_the_same_volumes() {
+        let dir = TempDir::new().unwrap();
+        let sources: Vec<PathBuf> = ["alpha.bin", "beta.bin", "gamma.bin"]
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let path = dir.path().join(name);
+                fs::write(&path, vec![index as u8 + 1; 4095 + 2 * index]).unwrap();
+                path
+            })
+            .collect();
+        let mut options = crate::create::Par2CreatorOptions::with_output(
+            dir.path().join("invented-set"),
+            Some(dir.path().to_path_buf()),
+            sources,
+        );
+        options.block_sizing = crate::create::BlockSizing::Bytes(1024);
+        options.recovery_amount = crate::create::RecoveryAmount::Count(4);
+        let creator = crate::create::Par2Creator::new(options);
+        let plan = creator.plan().unwrap();
+        creator.create(&plan).unwrap();
+        // An obfuscated volume and an unrelated file are still candidates.
+        let index = dir.path().join("invented-set.par2");
+        fs::copy(&index, dir.path().join("obfuscated-7f3a")).unwrap();
+        fs::write(dir.path().join("notes.txt"), b"not a volume").unwrap();
+        let set = Par2FileSet::from_paths(&[&index]).unwrap();
+        let regular_files = fs::read_dir(dir.path()).unwrap().count();
+
+        let mut opened = Vec::new();
+        let mut plain = identify_par2_files_skipping(
+            dir.path(),
+            &set.recovery_set_id,
+            &HashMap::new(),
+            &mut |path| {
+                opened.push(path.to_path_buf());
+                read_first_n_bytes(path, header::HEADER_SIZE)
+            },
+        )
+        .unwrap();
+        assert_eq!(opened.len(), regular_files);
+
+        let protected: HashMap<&str, u64> = set
+            .files
+            .values()
+            .map(|d| (d.filename.as_str(), d.length))
+            .collect();
+        assert_eq!(protected.len(), 3);
+        let mut opened_for_set = Vec::new();
+        let mut for_set = identify_par2_files_skipping(
+            dir.path(),
+            &set.recovery_set_id,
+            &protected,
+            &mut |path| {
+                opened_for_set.push(path.to_path_buf());
+                read_first_n_bytes(path, header::HEADER_SIZE)
+            },
+        )
+        .unwrap();
+        assert_eq!(opened_for_set.len(), regular_files - 3);
+        assert!(opened_for_set.iter().all(|path| {
+            let name = path.file_name().and_then(|name| name.to_str()).unwrap();
+            !protected.contains_key(name)
+        }));
+
+        plain.sort();
+        for_set.sort();
+        assert_eq!(plain, for_set);
+        assert!(for_set.contains(&dir.path().join("obfuscated-7f3a")));
+        let mut public = identify_par2_files_for_set(dir.path(), &set).unwrap();
+        public.sort();
+        assert_eq!(public, for_set);
+    }
+
+    /// A protected name does not by itself make an entry the protected data.
+    /// With one data file missing and a renamed volume sitting at its name, the
+    /// set-aware walk reads that entry (its length is not the recorded one) and
+    /// returns the volume, exactly as the plain walk does; the data files that
+    /// are present at their recorded lengths are still left unopened.
+    #[test]
+    fn identify_par2_files_for_set_inspects_a_volume_at_a_missing_protected_name() {
+        let dir = TempDir::new().unwrap();
+        let names = ["delta.bin", "epsilon.bin", "zeta.bin"];
+        let sources: Vec<PathBuf> = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let path = dir.path().join(name);
+                fs::write(&path, vec![index as u8 + 7; 4097 + 2 * index]).unwrap();
+                path
+            })
+            .collect();
+        let mut options = crate::create::Par2CreatorOptions::with_output(
+            dir.path().join("invented-set"),
+            Some(dir.path().to_path_buf()),
+            sources,
+        );
+        options.block_sizing = crate::create::BlockSizing::Bytes(1024);
+        options.recovery_amount = crate::create::RecoveryAmount::Count(4);
+        let creator = crate::create::Par2Creator::new(options);
+        let plan = creator.plan().unwrap();
+        creator.create(&plan).unwrap();
+        let index = dir.path().join("invented-set.par2");
+        let set = Par2FileSet::from_paths(&[&index]).unwrap();
+
+        // The data file at "epsilon.bin" is gone; a volume renamed to its name
+        // took its place. The index stays, so the volume is not the only one.
+        let missing = dir.path().join(names[1]);
+        fs::remove_file(&missing).unwrap();
+        fs::copy(&index, &missing).unwrap();
+        assert_ne!(fs::metadata(&missing).unwrap().len(), 4099);
+
+        let mut opened = Vec::new();
+        let protected: HashMap<&str, u64> = set
+            .files
+            .values()
+            .map(|d| (d.filename.as_str(), d.length))
+            .collect();
+        let mut for_set = identify_par2_files_skipping(
+            dir.path(),
+            &set.recovery_set_id,
+            &protected,
+            &mut |path| {
+                opened.push(path.to_path_buf());
+                read_first_n_bytes(path, header::HEADER_SIZE)
+            },
+        )
+        .unwrap();
+        assert!(for_set.contains(&missing), "the renamed volume is found");
+        assert!(opened.contains(&missing));
+        for present in [names[0], names[2]] {
+            assert!(
+                !opened.contains(&dir.path().join(present)),
+                "{present} is present at its recorded length and stays unopened"
+            );
+        }
+
+        let mut plain = identify_par2_files(dir.path(), &set.recovery_set_id).unwrap();
+        plain.sort();
+        for_set.sort();
+        assert_eq!(plain, for_set);
+        let mut public = identify_par2_files_for_set(dir.path(), &set).unwrap();
+        public.sort();
+        assert_eq!(public, for_set);
+    }
+
+    /// Create a set over `names` in `dir`, with `lengths[i]` bytes in
+    /// `names[i]`, and return the index path.
+    fn create_invented_set(dir: &Path, names: &[&str], lengths: &[usize]) -> PathBuf {
+        let sources = names
+            .iter()
+            .zip(lengths)
+            .enumerate()
+            .map(|(index, (name, &len))| {
+                let path = dir.join(name);
+                fs::write(&path, vec![index as u8 + 3; len]).unwrap();
+                path
+            })
+            .collect();
+        let mut options = crate::create::Par2CreatorOptions::with_output(
+            dir.join("invented-set"),
+            Some(dir.to_path_buf()),
+            sources,
+        );
+        options.block_sizing = crate::create::BlockSizing::Bytes(1024);
+        options.recovery_amount = crate::create::RecoveryAmount::Count(2);
+        let creator = crate::create::Par2Creator::new(options);
+        let plan = creator.plan().unwrap();
+        creator.create(&plan).unwrap();
+        dir.join("invented-set.par2")
+    }
+
+    /// Name and recorded length alone do not make an entry the protected
+    /// data. A volume renamed to a protected name whose recorded length is
+    /// exactly the volume's own length is read and returned, as the plain
+    /// walk returns it.
+    #[test]
+    fn identify_par2_files_for_set_finds_a_volume_at_a_protected_name_with_the_recorded_length() {
+        let names = ["theta.bin", "iota.bin"];
+        // The index length depends on the slice counts, so settle a length
+        // for "iota.bin" equal to the index it produces.
+        let mut iota_len = 4096usize;
+        let mut settled = None;
+        for _ in 0..8 {
+            let probe = TempDir::new().unwrap();
+            let index = create_invented_set(probe.path(), &names, &[4097, iota_len]);
+            let index_len = fs::metadata(&index).unwrap().len() as usize;
+            if index_len == iota_len {
+                settled = Some(probe);
+                break;
+            }
+            iota_len = index_len;
+        }
+        let dir = settled.expect("the index length settles");
+        let index = dir.path().join("invented-set.par2");
+        let set = Par2FileSet::from_paths(&[&index]).unwrap();
+        assert!(
+            set.files
+                .values()
+                .any(|desc| desc.filename == names[1] && desc.length == iota_len as u64)
+        );
+        assert_eq!(iota_len % 4, 0);
+
+        // "iota.bin" is gone and the index, renamed to its name, stands there
+        // at exactly the recorded length.
+        let renamed = dir.path().join(names[1]);
+        fs::remove_file(&renamed).unwrap();
+        fs::rename(&index, &renamed).unwrap();
+        assert_eq!(fs::metadata(&renamed).unwrap().len(), iota_len as u64);
+
+        let mut plain = identify_par2_files(dir.path(), &set.recovery_set_id).unwrap();
+        let mut for_set = identify_par2_files_for_set(dir.path(), &set).unwrap();
+        plain.sort();
+        for_set.sort();
+        assert!(for_set.contains(&renamed), "the renamed volume is found");
+        assert_eq!(plain, for_set);
     }
 
     #[test]

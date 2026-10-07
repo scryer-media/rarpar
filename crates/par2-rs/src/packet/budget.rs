@@ -36,13 +36,17 @@
 //! recovery-block count rather than by this budget. The byte meter is about the
 //! metadata that a scan can multiply.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Weak};
 
 use crate::error::{Par2Error, Result};
-use crate::types::{CancellationToken, MAX_FILES_PER_SET};
+use crate::evidence::FileStatFingerprint;
+use crate::types::{CancellationToken, MAX_FILES_PER_SET, RecoverySetId};
 
 use super::Packet;
+use super::recovery::ScanAdmission;
 
 /// Highest recovery-slice exponent that can contribute to a repair.
 ///
@@ -163,6 +167,12 @@ pub struct PacketScanBudget {
     examined: Cell<u64>,
     retained_packets: Cell<usize>,
     retained_bytes: Cell<usize>,
+    /// The settled fingerprint of each volume this budget's scans opened,
+    /// keyed by the address of the scan's interned path. One entry per
+    /// volume, not per packet; the `Weak` keeps the address from being reused
+    /// while the budget lives. A kept recovery packet's authentication is
+    /// recorded from here (see [`ScanAdmission`]).
+    scan_fingerprints: RefCell<HashMap<usize, (Weak<Path>, FileStatFingerprint)>>,
 }
 
 impl std::fmt::Debug for PacketScanBudget {
@@ -185,6 +195,7 @@ impl PacketScanBudget {
             examined: Cell::new(0),
             retained_packets: Cell::new(0),
             retained_bytes: Cell::new(0),
+            scan_fingerprints: RefCell::new(HashMap::new()),
         }
     }
 
@@ -297,6 +308,36 @@ impl PacketScanBudget {
         self.retained_packets
             .set(self.retained_packets.get().saturating_sub(1));
         self.release_bytes(bytes);
+    }
+
+    /// Note that a scan under this budget authenticates the recovery payloads
+    /// it reads from `path` against a volume that fingerprinted as
+    /// `fingerprint` when it was opened.
+    pub(crate) fn note_scan_fingerprint(&self, path: &Arc<Path>, fingerprint: FileStatFingerprint) {
+        self.scan_fingerprints.borrow_mut().insert(
+            Arc::as_ptr(path).cast::<u8>() as usize,
+            (Arc::downgrade(path), fingerprint),
+        );
+    }
+
+    /// The authentication to record if `packet`, handed over by a scan under
+    /// this budget from a header naming `recovery_set_id`, is kept. `None`
+    /// for anything but a hashed file-backed recovery payload from a volume
+    /// one of this budget's scans fingerprinted.
+    pub(crate) fn scan_admission(
+        &self,
+        packet: &Packet,
+        recovery_set_id: &RecoverySetId,
+    ) -> Option<ScanAdmission> {
+        let Packet::RecoverySlice(slice) = packet else {
+            return None;
+        };
+        ScanAdmission::for_packet(slice, recovery_set_id.as_bytes(), |path| {
+            let fingerprints = self.scan_fingerprints.borrow();
+            let (noted, fingerprint) =
+                fingerprints.get(&(Arc::as_ptr(path).cast::<u8>() as usize))?;
+            std::ptr::addr_eq(noted.as_ptr(), Arc::as_ptr(path)).then(|| fingerprint.clone())
+        })
     }
 
     fn limit_error(&self, reason: &str) -> Par2Error {
