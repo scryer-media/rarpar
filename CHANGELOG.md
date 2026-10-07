@@ -161,6 +161,10 @@ documented in each crate's own changelog so those notes ship with the crate.
 - par3cmdline facade: `vs` and `rs` given a ZIP or 7z with a directory
   (`par3 vs sub/archive.zip`, or an absolute path) find it in that
   directory instead of reporting it missing.
+- par3cmdline facade: the verbose header and the partial-set report print
+  the Galois field generator of a Start packet declaring an eight-byte (or
+  larger) field with its leading 1 spelled out, instead of shifting a 64-bit
+  value out of range and panicking in an overflow-checked build.
 - par3cmdline facade: `-S<n>` also stops a candidate scan already under way
   when the time is up, instead of letting one large extra file be searched
   to its end first.
