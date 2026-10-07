@@ -375,8 +375,11 @@ impl Protect {
             .iter()
             .map(|candidate| candidate.bytes(high))
             .fold(0, u64::saturating_add);
-        if needed > self.budget {
-            return Err(self.fail(memory_error(needed, self.budget)));
+        // The buffered archive stays live until every lane has been fed it,
+        // so it shares the budget with the lanes.
+        let peak = needed.saturating_add(self.retained());
+        if peak > self.budget {
+            return Err(self.fail(memory_error(peak, self.budget)));
         }
         let fed = self.head.len() - self.hold.min(self.head.len());
         let mut lanes = Vec::with_capacity(candidates.len());
@@ -400,6 +403,12 @@ impl Protect {
         self.buffering = false;
         self.schedule_prune();
         Ok(())
+    }
+
+    /// Bytes of the archive held while the lanes start: the buffered head,
+    /// and the copy of its tail the lanes trail by.
+    fn retained(&self) -> u64 {
+        (self.head.len() + self.hold.min(self.head.len())) as u64
     }
 
     fn schedule_prune(&mut self) {
@@ -901,8 +910,9 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
     let needed = geometry.block_size.saturating_mul(geometry.rows);
     let mut reread = false;
     let mut lane = if protect.buffering {
-        if needed > budget {
-            return Err(memory_error(needed, budget));
+        let peak = needed.saturating_add(protect.head.len() as u64);
+        if peak > budget {
+            return Err(memory_error(peak, budget));
         }
         exact_lane(&geometry, |lane| {
             lane.feed(&protect.head[..data_end as usize])
@@ -1513,5 +1523,75 @@ mod tests {
         }
         let geometry = plan.geometry(protect.len);
         assert!(protect.take_lane(&geometry).is_none());
+    }
+
+    /// An archive that outgrows the buffer starts its lanes while the
+    /// buffered head is still live, so the lanes and that head together must
+    /// fit the budget.
+    #[test]
+    fn started_lanes_and_the_buffered_head_fit_the_budget() {
+        let budget = 2 * MIB;
+        let (mut refused, mut started) = (0, 0);
+        for rows in [1u64, 64, 160, 240, 320, 400] {
+            let plan = Plan::Sibling {
+                block_size: 4096,
+                choice: RecoveryChoice::Count(rows),
+            };
+            let outlook = Outlook {
+                consumed: Arc::new(AtomicU64::new(0)),
+                total: 0,
+                in_flight: 0,
+                header: 0,
+                expansion: 1000,
+            };
+            let failure = Arc::new(Mutex::new(None));
+            let mut protect = Protect {
+                plan,
+                outlook,
+                budget,
+                head: Vec::new(),
+                head_cap: budget / 2,
+                buffering: true,
+                lanes: Vec::new(),
+                hold: 0,
+                held: Vec::new(),
+                digest: FileDigest::new(),
+                len: 0,
+                next_prune: 0,
+                failure: failure.clone(),
+            };
+            let data = vec![3u8; (budget / 2) as usize + 1];
+            let len = data.len() as u64;
+            let high = protect.outlook.high(len);
+            let lanes: u64 = plan
+                .candidates(len, high)
+                .iter()
+                .map(|candidate| candidate.bytes(high))
+                .sum();
+            let retained = len;
+            match protect.feed(&data) {
+                Ok(()) => {
+                    started += 1;
+                    assert!(!protect.buffering, "rows {rows}");
+                    assert!(
+                        lanes + retained <= budget,
+                        "rows {rows}: {lanes} + {retained}"
+                    );
+                }
+                Err(_) => {
+                    refused += 1;
+                    assert!(
+                        lanes + retained > budget,
+                        "rows {rows}: {lanes} + {retained}"
+                    );
+                    let error = failure.lock().unwrap().take().expect("a recorded refusal");
+                    assert!(matches!(error, RarparError::Resource(_)), "{error}");
+                }
+            }
+        }
+        assert!(
+            started > 0 && refused > 0,
+            "{started} started, {refused} refused"
+        );
     }
 }

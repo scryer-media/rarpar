@@ -63,7 +63,9 @@ documented in each crate's own changelog so those notes ship with the crate.
   be its own PAR3 index or a recovery volume (`set.par3`, in any case) is
   refused before anything is written. `--max-files` stops the input
   walk as soon as the limit is passed, the streaming lanes' memory budget
-  counts the state kept per block, ZIP member times are local times (DOS
+  counts the state kept per block and the archive bytes still buffered
+  when the lanes start, so `--par3-memory-mib` is no longer exceeded by
+  about half once an archive outgrows the buffer, ZIP member times are local times (DOS
   time has no zone), and setuid, setgid and sticky bits are kept in ZIP
   external attributes. An odd `--block-size` too large to round up to an
   even size is refused as a usage error instead of aborting.
