@@ -421,6 +421,14 @@ pub fn prepare_hosts(
     let disk: Arc<dyn SourceAccess> = Arc::new(disk_access(paths, options));
     let mut hosts = Vec::new();
     for (index, path) in paths.iter().enumerate() {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(EngineError::Unsupported("host name is not UTF-8"))?
+            .to_owned();
+        // The name is recorded in the set and checked again by every later
+        // repair and removal; refuse one that check would refuse.
+        validate_host_name(&name)?;
         let snapshot = disk
             .snapshot(SourceId(index as u64))?
             .ok_or(EngineError::Unavailable {
@@ -456,11 +464,6 @@ pub fn prepare_hosts(
                 "a locked RAR5 archive allows only the trailing layout",
             ));
         }
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or(EngineError::Unsupported("host name is not UTF-8"))?
-            .to_owned();
         hosts.push(Rar5Host {
             path: path.clone(),
             name,
@@ -983,6 +986,47 @@ struct Candidate {
     source: SourceId,
     volume: Option<u64>,
     packets: Vec<IngestedPacket>,
+    /// Indices into `packets` per input set, so opening one set walks its own
+    /// packets rather than every packet of every set the file carries.
+    by_set: HashMap<InputSetId, Vec<usize>>,
+}
+
+impl Candidate {
+    fn new(
+        path: PathBuf,
+        source: SourceId,
+        volume: Option<u64>,
+        packets: Vec<IngestedPacket>,
+    ) -> Self {
+        let mut by_set: HashMap<InputSetId, Vec<usize>> = HashMap::new();
+        for (index, packet) in packets.iter().enumerate() {
+            by_set.entry(packet.input_set_id()).or_default().push(index);
+        }
+        Candidate {
+            path,
+            source,
+            volume,
+            packets,
+            by_set,
+        }
+    }
+
+    /// This file's packets of set `id`, in scan order.
+    fn packets_of(&self, id: InputSetId) -> impl Iterator<Item = &IngestedPacket> {
+        self.by_set
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .map(|&index| &self.packets[index])
+    }
+
+    fn carries(&self, id: InputSetId) -> bool {
+        self.by_set.contains_key(&id)
+    }
+
+    fn carries_other_than(&self, id: InputSetId) -> bool {
+        self.by_set.keys().any(|other| *other != id)
+    }
 }
 
 fn file_name(path: &Path) -> Option<&str> {
@@ -1064,10 +1108,13 @@ pub fn open(paths: &[PathBuf], options: &ExecutionOptions) -> EngineResult<Vec<R
             )?);
         }
     }
+    // Sets in order of first appearance; `listed` answers membership so a
+    // carrier with many sets is not rescanned per packet.
     let mut ids: Vec<InputSetId> = Vec::new();
+    let mut listed: HashSet<InputSetId> = HashSet::new();
     for candidate in &candidates {
         for packet in &candidate.packets {
-            if !ids.contains(&packet.input_set_id()) {
+            if listed.insert(packet.input_set_id()) {
                 ids.push(packet.input_set_id());
             }
         }
@@ -1095,12 +1142,12 @@ fn candidate(
     if packets.is_empty() && from != 0 {
         packets = scan(access.clone(), source, 0, options)?;
     }
-    Ok(Candidate {
+    Ok(Candidate::new(
         path,
         source,
-        volume: archive.and_then(|archive| archive.volume),
+        archive.and_then(|archive| archive.volume),
         packets,
-    })
+    ))
 }
 
 /// A recorded host name and, when a sibling was renamed, the name it would
@@ -1228,7 +1275,7 @@ fn open_set(
 ) -> EngineResult<Rar5Set> {
     let mut session = Par3RepairSession::new(id, access.clone(), options.clone())?;
     for candidate in candidates {
-        for packet in candidate.packets.iter().filter(|p| p.input_set_id() == id) {
+        for packet in candidate.packets_of(id) {
             session.merge(packet.clone())?;
         }
     }
@@ -1247,11 +1294,7 @@ fn open_set(
     // Canonical metadata order: the first complete run at the start of a region.
     let mut metadata: Option<Vec<Vec<u8>>> = None;
     for candidate in candidates {
-        let mut packets: Vec<&IngestedPacket> = candidate
-            .packets
-            .iter()
-            .filter(|packet| packet.input_set_id() == id)
-            .collect();
+        let mut packets: Vec<&IngestedPacket> = candidate.packets_of(id).collect();
         packets.sort_by_key(|packet| packet.origin().offset);
         let mut run = Vec::new();
         let mut seen = BTreeSet::new();
@@ -1352,7 +1395,8 @@ fn open_set(
             region_intact: false,
         });
     }
-    let region_layout = region_layout.expect("at least one host");
+    // A Root packet with no children names no host, and so no region.
+    let region_layout = region_layout.ok_or(EngineError::Unsupported("set names no host file"))?;
     // Bind files: recorded name, then recovery indices, then volume number,
     // then a lone host and a lone file.
     // Among files of the recorded name, one carrying this set's packets wins;
@@ -1362,8 +1406,8 @@ fn open_set(
         let named = |c: &&Candidate| {
             file_name(&c.path) == Some(host.name.as_str()) && !used.contains(&c.source)
         };
-        let ours = |c: &&Candidate| c.packets.iter().any(|p| p.input_set_id() == id);
-        let foreign = |c: &&Candidate| c.packets.iter().any(|p| p.input_set_id() != id);
+        let ours = |c: &&Candidate| c.carries(id);
+        let foreign = |c: &&Candidate| c.carries_other_than(id);
         if let Some(candidate) = candidates
             .iter()
             .filter(named)
@@ -1387,7 +1431,7 @@ fn open_set(
             .expect("bound");
         let start = host.gap.start + host.prefix + metadata_bytes;
         let before: u64 = hosts[..position].iter().map(|host| host.recovery.end).sum();
-        for packet in candidate.packets.iter().filter(|p| p.input_set_id() == id) {
+        for packet in candidate.packets_of(id) {
             let Some(PayloadKind::Recovery { index, .. }) = packet.payload().map(|p| p.kind())
             else {
                 continue;
@@ -1411,10 +1455,9 @@ fn open_set(
     for host in hosts.iter_mut().filter(|host| host.source.is_none()) {
         let by_recovery = candidates.iter().find(|c| {
             !used.contains(&c.source)
-                && c.packets.iter().any(|p| {
-                    p.input_set_id() == id
-                        && matches!(p.payload().map(|p| p.kind()),
-                            Some(PayloadKind::Recovery { index, .. }) if host.recovery.contains(&index))
+                && c.packets_of(id).any(|p| {
+                    matches!(p.payload().map(|p| p.kind()),
+                        Some(PayloadKind::Recovery { index, .. }) if host.recovery.contains(&index))
                 })
         });
         if let Some(candidate) = by_recovery {
@@ -1434,6 +1477,9 @@ fn open_set(
             !used.contains(&c.source)
                 && c.volume == Some(position as u64)
                 && snapshot_len(c) == Some(host.length)
+                // As for names: a file carrying only another set's packets
+                // is never this set's host.
+                && (c.carries(id) || !c.carries_other_than(id))
         }) {
             used.insert(candidate.source);
             host.source = Some(candidate.source);
@@ -1444,9 +1490,7 @@ fn open_set(
     if hosts.len() == 1 && hosts[0].source.is_none() {
         let free: Vec<_> = candidates
             .iter()
-            .filter(|c| {
-                !used.contains(&c.source) && c.packets.iter().any(|p| p.input_set_id() == id)
-            })
+            .filter(|c| !used.contains(&c.source) && c.carries(id))
             .collect();
         if let [candidate] = free.as_slice() {
             hosts[0].source = Some(candidate.source);
@@ -1486,7 +1530,7 @@ fn open_set(
         // many small recovery packets stays linear.
         let mut hashes_at = BTreeSet::new();
         let mut recovery_at = BTreeSet::new();
-        for p in candidate.packets.iter().filter(|p| p.input_set_id() == id) {
+        for p in candidate.packets_of(id) {
             let offset = p.origin().offset;
             hashes_at.insert((offset, p.hash()));
             if let Some(PayloadKind::Recovery { index, .. }) = p.payload().map(|p| p.kind()) {
@@ -1806,6 +1850,16 @@ impl Rar5Set {
             return Err(EngineError::InvalidState("remove destination count"));
         }
         self.removable()?;
+        // Every destination is checked before any is written, so an existing
+        // later one does not leave earlier outputs behind.
+        if destinations
+            .iter()
+            .any(|destination| std::fs::symlink_metadata(destination).is_ok())
+        {
+            return Err(
+                io::Error::new(io::ErrorKind::AlreadyExists, "remove output exists").into(),
+            );
+        }
         let options = self.session.options.clone();
         let layout = self.session.layout()?.expect("layout");
         let size = options.stripe_bytes.min(64 << 10);
@@ -1860,6 +1914,13 @@ impl Rar5Set {
         })();
         for path in staged {
             let _ = std::fs::remove_file(path);
+        }
+        if result.is_err() {
+            // Outputs this call linked in are its own; a failed removal
+            // leaves none of them behind.
+            for path in &written {
+                let _ = std::fs::remove_file(path);
+            }
         }
         result.map(|()| written)
     }
@@ -1954,6 +2015,247 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, ["host.rar", "rebuilt"], "no staged copy is left");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn scratch_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("par3-rar5-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// One RAR5 header block: CRC32, size, `fields` as vints, then `data`.
+    fn rar5_block(fields: &[u64], data: &[u8]) -> Vec<u8> {
+        let mut inner = Vec::new();
+        for &field in fields {
+            push_vint(&mut inner, field);
+        }
+        let mut sized = Vec::new();
+        push_vint(&mut sized, inner.len() as u64);
+        sized.extend_from_slice(&inner);
+        let mut out = crc32(&sized).to_le_bytes().to_vec();
+        out.extend_from_slice(&sized);
+        out.extend_from_slice(data);
+        out
+    }
+
+    /// A walkable RAR5 archive: main header, one opaque data block filled
+    /// from `seed`, end header. `volume` is `(number, more follow)`.
+    fn synthetic_rar5(volume: Option<(u64, bool)>, seed: u8) -> Vec<u8> {
+        let mut out = SIGNATURE.to_vec();
+        let main = match volume {
+            None => vec![1, 0, 0],
+            Some((0, _)) => vec![1, 0, 0x1],
+            Some((number, _)) => vec![1, 0, 0x3, number],
+        };
+        out.extend(rar5_block(&main, &[]));
+        let data: Vec<u8> = (0..3000u32)
+            .map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect();
+        out.extend(rar5_block(&[2, FLAG_DATA, data.len() as u64], &data));
+        let more = matches!(volume, Some((_, true)));
+        out.extend(rar5_block(&[5, 0, u64::from(more)], &[]));
+        out
+    }
+
+    /// Write a synthetic volume family `names` into `dir/original`, insert one
+    /// trailing set over it (or one set per volume when `independent`), and
+    /// return the inserted files, written into `dir`.
+    fn insert_synthetic(dir: &Path, names: &[&str], seed: u8, independent: bool) -> Vec<PathBuf> {
+        let originals = dir.join("original");
+        let scratch = dir.join("scratch");
+        std::fs::create_dir_all(&originals).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        let paths: Vec<PathBuf> = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let path = originals.join(name);
+                let volume = (names.len() > 1).then(|| (index as u64, index + 1 != names.len()));
+                std::fs::write(&path, synthetic_rar5(volume, seed + index as u8)).unwrap();
+                path
+            })
+            .collect();
+        let options = ExecutionOptions::default();
+        let hosts = prepare_hosts(&paths, Rar5Layout::Trailing, &options).unwrap();
+        let outputs: Vec<PathBuf> = names.iter().map(|name| dir.join(name)).collect();
+        let creation = |count| CreationOptions {
+            block_size: 256,
+            recovery_count: count,
+            ..CreationOptions::default()
+        };
+        if independent {
+            for (host, output) in hosts.iter().zip(&outputs) {
+                insert_set(
+                    std::slice::from_ref(host),
+                    std::slice::from_ref(output),
+                    &[2],
+                    Rar5Layout::Trailing,
+                    creation(2),
+                    &scratch,
+                    CreationDurability::Buffered,
+                )
+                .unwrap();
+            }
+        } else {
+            let total = 2 * names.len() as u64;
+            let counts = placement_counts(Rar5Placement::Spread, names.len(), total).unwrap();
+            insert_set(
+                &hosts,
+                &outputs,
+                &counts,
+                Rar5Layout::Trailing,
+                creation(total),
+                &scratch,
+                CreationDurability::Buffered,
+            )
+            .unwrap();
+        }
+        outputs
+    }
+
+    /// Two independent sets in two files each open, in file order: the
+    /// per-set packet index hands every set its own packets.
+    #[test]
+    fn independent_sets_each_open_from_their_own_packets() {
+        let dir = scratch_dir("independent");
+        let inserted = insert_synthetic(&dir, &["plover.part1.rar", "plover.part2.rar"], 1, true);
+        let sets = open(&inserted, &ExecutionOptions::default()).unwrap();
+        assert_eq!(sets.len(), 2);
+        for (set, path) in sets.iter().zip(&inserted) {
+            assert_eq!(set.status, RepairStatus::Complete);
+            assert_eq!(set.hosts.len(), 1);
+            assert_eq!(set.hosts[0].path.as_ref(), Some(path));
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A set whose Root packet has no children names no host: opening it is
+    /// refused, not a panic.
+    #[test]
+    fn a_set_with_no_host_files_is_refused() {
+        use crate::packet::{GaloisField, Packet, PacketBody, RootPacket, StartPacket};
+        let dir = scratch_dir("empty-root");
+        let id = InputSetId([7; 8]);
+        let start = Packet::new(
+            id,
+            PacketBody::Start(StartPacket {
+                parent_input_set_id: InputSetId::ZERO,
+                parent_root_hash: [0; 16],
+                block_size: 256,
+                galois_field: GaloisField {
+                    size: 1,
+                    generator: 0x1d,
+                },
+                legacy_random: None,
+            }),
+        );
+        let root = Packet::new(
+            id,
+            PacketBody::Root(RootPacket {
+                lowest_unused_block_index: 0,
+                attributes: 0,
+                option_hashes: Vec::new(),
+                children: Vec::new(),
+            }),
+        );
+        let mut bytes = synthetic_rar5(None, 3);
+        bytes.extend(start.to_bytes());
+        bytes.extend(root.to_bytes());
+        let path = dir.join("wren-notes.rar");
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            open(std::slice::from_ref(&path), &ExecutionOptions::default()),
+            Err(EngineError::Unsupported("set names no host file"))
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A missing volume of one set is never bound by volume number to a
+    /// same-length volume of another set that carries only that set's packets.
+    #[test]
+    fn volume_number_binding_skips_another_sets_volume() {
+        let dir = scratch_dir("foreign-volume");
+        let first = insert_synthetic(
+            &dir.join("alpha"),
+            &["alpha.part1.rar", "alpha.part2.rar"],
+            10,
+            false,
+        );
+        let second = insert_synthetic(
+            &dir.join("gamma"),
+            &["gamma.part1.rar", "gamma.part2.rar"],
+            20,
+            false,
+        );
+        assert_eq!(
+            std::fs::metadata(&first[1]).unwrap().len(),
+            std::fs::metadata(&second[1]).unwrap().len(),
+            "the foreign volume has the expected length"
+        );
+        std::fs::remove_file(&first[1]).unwrap();
+        let paths = [first[0].clone(), second[0].clone(), second[1].clone()];
+        let sets = open(&paths, &ExecutionOptions::default()).unwrap();
+        let alpha = sets
+            .iter()
+            .find(|set| set.hosts[0].name == "alpha.part1.rar")
+            .unwrap();
+        assert_eq!(alpha.hosts[1].path, None);
+        assert_eq!(alpha.needs_repair(), vec![1]);
+        let gamma = sets
+            .iter()
+            .find(|set| set.hosts[0].name == "gamma.part1.rar")
+            .unwrap();
+        assert_eq!(gamma.status, RepairStatus::Complete);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A host name the later repair and removal checks would refuse is
+    /// refused at insertion, before the archive is read.
+    #[cfg(unix)]
+    #[test]
+    fn insertion_refuses_a_host_name_repair_would_refuse() {
+        let dir = scratch_dir("host-name");
+        for name in ["heron\\notes.rar", "heron:notes.rar"] {
+            let path = dir.join(name);
+            std::fs::write(&path, synthetic_rar5(None, 4)).unwrap();
+            assert!(
+                matches!(
+                    prepare_hosts(
+                        std::slice::from_ref(&path),
+                        Rar5Layout::Trailing,
+                        &ExecutionOptions::default()
+                    ),
+                    Err(EngineError::UnsafePath(_))
+                ),
+                "{name:?}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Removal checks every destination before writing any: an existing later
+    /// destination leaves no earlier output behind.
+    #[test]
+    fn removal_writes_nothing_when_a_later_destination_exists() {
+        let dir = scratch_dir("remove-preflight");
+        let inserted = insert_synthetic(&dir, &["linnet.part1.rar", "linnet.part2.rar"], 30, false);
+        let mut set = open(&inserted[..1], &ExecutionOptions::default())
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(set.status, RepairStatus::Complete);
+        let out = dir.join("stripped");
+        std::fs::create_dir_all(&out).unwrap();
+        let destinations = [out.join("linnet.part1.rar"), out.join("linnet.part2.rar")];
+        std::fs::write(&destinations[1], b"already here").unwrap();
+        assert!(set.remove(&destinations).is_err());
+        assert!(!destinations[0].exists(), "no partial output is left");
+        assert_eq!(std::fs::read(&destinations[1]).unwrap(), b"already here");
+        std::fs::remove_file(&destinations[1]).unwrap();
+        let written = set.remove(&destinations).unwrap();
+        assert_eq!(written.len(), 2);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
