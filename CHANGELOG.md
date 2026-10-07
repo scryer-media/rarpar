@@ -43,7 +43,7 @@ documented in each crate's own changelog so those notes ship with the crate.
 - par2-rs 0.10.8: strict verify reads a damaged file once, repair planning
   trusts the scan's recovery packet authentication while a volume's stat is
   unchanged, and `identify_par2_files_for_set` skips the files a set
-  protects that are present at their recorded lengths.
+  protects that are present at recorded lengths no PAR2 volume can have.
 - par3-rs 0.4.5: mebibyte source reads and the verification order by mount
   kind above.
 - reedsolomon-rs 0.4.9 and unrar-rs 0.10.9: the RAR recovery-volume restore

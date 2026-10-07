@@ -53,9 +53,14 @@ Fewer redundant reads on the verify and repair paths.
   the set's recovery set ID that skips the files the set protects instead of
   opening each one and reading its first 64 bytes. An entry is skipped only
   when it is a regular file at a protected name with the length the set
-  records for it; any other entry at a protected name, such as a renamed
-  volume standing where a data file is missing, is read and identified like
-  every other candidate. `identify_par2_files` is unchanged.
+  records for it, and that length could not be a PAR2 file of whole packets
+  (shorter than a packet header, or not a multiple of 4). Name and length
+  alone never exclude an entry: a renamed volume standing at a protected
+  name, whether at some other length or at exactly the recorded one, is read
+  and identified like every other candidate, so the walk returns every
+  volume `identify_par2_files` returns. Only a volume truncated to a length
+  that is not a multiple of 4 and then sitting at a protected name with
+  exactly that length is passed over. `identify_par2_files` is unchanged.
 
 ### API
 
