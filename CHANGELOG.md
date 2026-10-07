@@ -32,7 +32,7 @@ The CLI version for these changes is assigned when the CLI is released.
 - par2-rs 0.10.8: strict verify reads a damaged file once, repair planning
   trusts the scan's recovery packet authentication while a volume's stat is
   unchanged, and `identify_par2_files_for_set` skips the files a set
-  protects.
+  protects that are present at their recorded lengths.
 - par3-rs 0.4.5: mebibyte source reads and the verification order by mount
   kind above.
   Other library versions are unchanged.
