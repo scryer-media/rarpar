@@ -513,6 +513,40 @@ fn a_directory_at_a_protected_name_is_not_file() {
         .says("Repair is possible.");
 }
 
+/// A protected name that is a link to an intact file verifies through the
+/// link, while a repair still refuses to write through it.
+#[cfg(unix)]
+#[test]
+fn verify_reads_through_a_linked_name_and_repair_refuses_it() {
+    let par3 = Par3::new();
+    let dir = fixture();
+    let root = dir.path();
+    create(root, "500", "2", &["lantern.bin", "pebble.txt"]);
+    std::fs::rename(root.join("pebble.txt"), root.join("pebble-kept.txt")).unwrap();
+    std::os::unix::fs::symlink("pebble-kept.txt", root.join("pebble.txt")).unwrap();
+    par3.run(root, &["v", "set.par3"])
+        .code(0)
+        .says("Target: \"pebble.txt\" - complete.")
+        .says("All files are correct, repair is not required.")
+        .lacks("unsafe PAR3 member path");
+
+    damage(&root.join("pebble-kept.txt"), 1, 4);
+    let damaged = std::fs::read(root.join("pebble-kept.txt")).unwrap();
+    par3.run(root, &["r", "set.par3"])
+        .code(7)
+        .says("unsafe PAR3 member path: pebble.txt");
+    assert_eq!(
+        std::fs::read(root.join("pebble-kept.txt")).unwrap(),
+        damaged
+    );
+    assert!(
+        std::fs::symlink_metadata(root.join("pebble.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
 #[test]
 fn rarpar_name_claims_par3_command_lines() {
     let dir = fixture();

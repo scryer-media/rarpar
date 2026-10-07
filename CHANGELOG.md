@@ -52,7 +52,9 @@ documented in each crate's own changelog so those notes ship with the crate.
   are created without following links; a moved-file search has no byte or
   candidate ceiling; directory-tree ordering is linear rather than
   quadratic; a PAR filename given in another case on a case-insensitive
-  filesystem finds its recovery volumes by their on-disk spelling.
+  filesystem finds its recovery volumes by their on-disk spelling. Verify
+  and list read through a protected name that is a link to a regular file,
+  as par3cmdline does, while repair still refuses to write through one.
 - par3cmdline facade, PAR-inside (`vs`/`rs`): complete packets are copied by
   par3cmdline's own window rule, archive reads go through a mebibyte cache
   and repeated self-repair replaces the previous `.1` backup instead of

@@ -1705,8 +1705,10 @@ fn print_listing(set: &Par3Set, file_order: &[usize], directory_order: &[usize],
 }
 
 /// Join a name the PAR3 set supplies onto `root`, refusing anything but plain
-/// components and any symlink on the way.
-fn member_path(root: &Path, name: &str) -> Result<PathBuf, Failure> {
+/// components and any symlink on the way. With `link_at_name`, a read-only run
+/// may find a link at the name itself and read through it, as par3cmdline
+/// does; a run that may write there never accepts one.
+fn member_path(root: &Path, name: &str, link_at_name: bool) -> Result<PathBuf, Failure> {
     let unsafe_name = || {
         Failure::new(
             RET_LOGIC_ERROR,
@@ -1723,8 +1725,12 @@ fn member_path(root: &Path, name: &str) -> Result<PathBuf, Failure> {
         return Err(unsafe_name());
     }
     let mut joined = root.to_path_buf();
-    for component in path.components() {
+    let last = path.components().count();
+    for (index, component) in path.components().enumerate() {
         joined.push(component);
+        if link_at_name && index + 1 == last {
+            break;
+        }
         if std::fs::symlink_metadata(&joined).is_ok_and(|meta| meta.file_type().is_symlink()) {
             return Err(unsafe_name());
         }
@@ -1824,6 +1830,9 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
     }
 
     let base = &context.base;
+    // Only a repair writes at the protected names, so only a repair refuses a
+    // link at one.
+    let link_at_name = operation != Operation::Repair;
     // Directories.
     let mut missing_directories = Vec::new();
     if !directory_order.is_empty() {
@@ -1834,7 +1843,8 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
         }
         for &index in &directory_order {
             let name = set.directories()[index].path();
-            let path = member_path(base, name).map_err(|failure| failure.with_trailer(trailer))?;
+            let path = member_path(base, name, link_at_name)
+                .map_err(|failure| failure.with_trailer(trailer))?;
             let state = match std::fs::metadata(&path) {
                 Ok(meta) if meta.is_dir() => " - found.",
                 Ok(_) => " - not directory.",
@@ -1858,8 +1868,8 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
     let mut bindings = Vec::new();
     let mut destinations = BTreeMap::new();
     for file in set.files() {
-        let path =
-            member_path(base, file.path()).map_err(|failure| failure.with_trailer(trailer))?;
+        let path = member_path(base, file.path(), link_at_name)
+            .map_err(|failure| failure.with_trailer(trailer))?;
         // Only a regular file (or a link to one) is a source; anything else
         // at the name is left unbound, so its contents count as missing and
         // it is reported as "not file" below.
