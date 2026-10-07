@@ -1100,14 +1100,25 @@ pub(crate) fn write_sibling(
     overwrite: bool,
 ) -> std::io::Result<Vec<PathBuf>> {
     let (index, volumes) = sibling_paths(stem, rows.len() as u64);
-    if !overwrite {
-        for path in std::iter::once(&index).chain(volumes.iter().map(|(_, _, path)| path)) {
-            if path.try_exists().unwrap_or(false) {
+    for path in std::iter::once(&index).chain(volumes.iter().map(|(_, _, path)| path)) {
+        // Look at the name itself: a link, dangling or not, is never
+        // written through, and overwriting replaces only a real file.
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("refusing a symlinked output: {}", path.display()),
+                ));
+            }
+            Ok(_) if !overwrite => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
                     format!("{} already exists", path.display()),
                 ));
             }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
     }
     let mut written = Vec::new();
@@ -1149,11 +1160,11 @@ fn write_file(
     path: &Path,
     body: impl FnOnce(&mut BufWriter<std::fs::File>) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NOFOLLOW);
+    let file = options.open(path)?;
     let mut out = BufWriter::new(file);
     body(&mut out)?;
     out.flush()?;

@@ -310,6 +310,47 @@ fn existing_outputs_and_bad_switches_are_refused() {
     }
 }
 
+/// A recovery volume name that is taken is found before the archive is
+/// installed, and a symlink at one is never written through, even with
+/// `--overwrite`.
+#[test]
+fn taken_or_linked_volume_names_stop_the_archive_first() {
+    let dir = fixture(1000);
+    let root = dir.path();
+    std::fs::write(root.join("set.vol0+1.par3"), b"someone else's").unwrap();
+    let output = rarpar(
+        root,
+        &with_args(
+            &["par3", "archive", "--base-path", "in", "set.7z"],
+            &MEMBERS,
+        ),
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert!(!root.join("set.7z").exists());
+    assert!(!root.join("set.par3").exists());
+    assert_eq!(
+        std::fs::read(root.join("set.vol0+1.par3")).unwrap(),
+        b"someone else's"
+    );
+
+    #[cfg(unix)]
+    {
+        std::fs::remove_file(root.join("set.vol0+1.par3")).unwrap();
+        std::fs::write(root.join("victim.bin"), b"keep me").unwrap();
+        std::os::unix::fs::symlink("victim.bin", root.join("set.vol0+1.par3")).unwrap();
+        let output = rarpar(
+            root,
+            &with_args(
+                &["par3", "archive", "--overwrite", "--base-path", "in", "set.7z"],
+                &MEMBERS,
+            ),
+        );
+        assert_ne!(output.status.code(), Some(0));
+        assert!(!root.join("set.7z").exists());
+        assert_eq!(std::fs::read(root.join("victim.bin")).unwrap(), b"keep me");
+    }
+}
+
 /// The sets match par3cmdline's `c` and `i` over the finished archive, byte
 /// for byte, once both write the same Creator text.
 #[test]

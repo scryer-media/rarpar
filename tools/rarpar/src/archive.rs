@@ -961,6 +961,20 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
     file.sync_all()?;
     drop(file);
     let archive_bytes = std::fs::metadata(staged.path())?.len();
+    if geometry.inside.is_none() {
+        // The volume names are known now: check them all before the
+        // archive is installed, so a collision leaves nothing half made.
+        let (_, volumes) = par3_stream::sibling_paths(&stem, rows.len() as u64);
+        for (_, _, path) in &volumes {
+            reject_symlinks(path)?;
+            if !cli.overwrite && std::fs::symlink_metadata(path).is_ok() {
+                return Err(RarparError::Unsafe(format!(
+                    "output exists: {}",
+                    path.display()
+                )));
+            }
+        }
+    }
     staged
         .persist(output)
         .map_err(|error| RarparError::Io(error.error))?;
