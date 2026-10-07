@@ -381,10 +381,13 @@ documented in each crate's own changelog so those notes ship with the crate.
   recovery blocks, verify drops from 181 path stats to 60 and repair from 324
   to 111, with the same bytes read.
 - `par verify` and `repair` read and hash the PAR2 volumes once instead of
-  twice, and volume discovery no longer opens the files the set protects
-  (a protected name at its recorded length) to look for renamed volumes,
-  while a protected name at another length is still sniffed; on ten 3 MiB files with 10% recovery, verify
-  reads 34.7 MB in 23 opens instead of 37.9 MB in 38.
+  twice; on ten 3 MiB files with 10% recovery, verify reads 34.7 MB instead
+  of 37.9 MB. Volume discovery no longer opens a file the set protects at its
+  recorded length when no PAR2 volume can have that length (under 64 bytes
+  or not a multiple of 4), as `par2_rs::identify_par2_files_for_set` does;
+  any other protected file has only its 64-byte header read, so an
+  obfuscated volume renamed onto a missing file's name and exact length is
+  still found and the set repaired.
 - `par verify` and `repair` of a set whose named `.par2` is its only file
   build the set from the parse volume discovery already made, so that file
   is parsed once instead of twice. With other volumes the whole list is
