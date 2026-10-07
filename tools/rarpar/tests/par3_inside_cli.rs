@@ -602,6 +602,57 @@ mod generated {
         );
     }
 
+    /// A family named in one case while the directory keeps another: on
+    /// Windows, whose names ignore case, every volume is verified and a
+    /// missing one is reported in the directory's spelling. Elsewhere stems
+    /// match exactly, so the other spelling is not the named family.
+    #[test]
+    fn a_family_named_in_another_case() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        family(&root.join("source"), 23);
+        insert(root, "source", "protected", "independent");
+        let protected = root.join("protected");
+        for part in 1..=3 {
+            std::fs::rename(
+                protected.join(format!("set.part{part}.rar")),
+                protected.join(format!("SET.part{part}.rar")),
+            )
+            .unwrap();
+        }
+        let named = "protected/set.part1.rar";
+        if cfg!(windows) {
+            let verified = run(root, &["par3", "inside", "verify", named], 0);
+            assert_eq!(verified["sets"].as_array().unwrap().len(), 3, "{verified}");
+            std::fs::remove_file(protected.join("SET.part2.rar")).unwrap();
+            let verified = run(root, &["par3", "inside", "verify", named], 1);
+            assert_eq!(verified["sets"].as_array().unwrap().len(), 2, "{verified}");
+            assert_eq!(
+                verified["unprotected_missing_volumes"],
+                serde_json::json!(["SET.part2.rar"])
+            );
+        } else if root.join(named).is_file() {
+            // A case-insensitive volume opens the named spelling, but only
+            // an exact stem is its family.
+            let verified = run(root, &["par3", "inside", "verify", named], 0);
+            assert_eq!(verified["sets"].as_array().unwrap().len(), 1, "{verified}");
+        } else {
+            // A case-sensitive volume has no such file.
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_rarpar"))
+                .current_dir(root)
+                .args(["--json", "par3", "inside", "verify", named])
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            let upper = run(
+                root,
+                &["par3", "inside", "verify", "protected/SET.part1.rar"],
+                0,
+            );
+            assert_eq!(upper["sets"].as_array().unwrap().len(), 3, "{upper}");
+        }
+    }
+
     /// Naming several volumes of one family lists and opens it once.
     #[test]
     fn several_volumes_of_one_family_open_each_set_once() {

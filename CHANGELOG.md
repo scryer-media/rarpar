@@ -177,6 +177,12 @@ documented in each crate's own changelog so those notes ship with the crate.
 - 7-Zip facade: a volume `-sdel` cannot delete is reported with its path and
   the system's reason, and counts as an error of its archive, so the summary
   lists the archive with errors and the command exits 2 instead of 0.
+- `par3 inside` on Windows matches a `.partN.rar` family's stem without
+  regard to case, as Windows names do: naming `set.part1.rar` beside
+  `SET.part2.rar` opens and verifies every volume, and a missing volume is
+  reported in the directory's spelling, instead of verifying only the named
+  volume and reporting the family healthy. Elsewhere stems still match
+  exactly.
 
 ### Library versions
 
