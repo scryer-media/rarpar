@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.9
+
+- `rar3::Rar3RsCoder::decode_matrix(total, erasures)` returns the RAR3
+  decoder for one erasure set as a dense GF(2^8) matrix, one row per erasure
+  and one column per block position. It is built by running `decode` on each
+  unit vector, so it is the scalar decoder's own map, bit for bit, and it
+  refuses exactly the shapes `decode` refuses.
+- `decode_apply::apply_decode_matrix_gf8` applies such a matrix to whole
+  regions: one rayon task per output row and stripe (16 to 256 KiB), each
+  folding groups of sources through `gf8::mul_acc_input_batch`. Zero
+  coefficients are skipped. The output does not depend on the stripe size,
+  thread count or kernel tier.
+
 ## 0.4.8
 
 - SVE2 tiers on aarch64. On a host that reports SVE2, these NEON kernels hand

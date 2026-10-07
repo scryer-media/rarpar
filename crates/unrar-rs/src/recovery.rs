@@ -5,7 +5,6 @@
 //! module keeps that restore logic separate from archive extraction so existing
 //! extraction APIs remain unchanged.
 
-use rayon::prelude::*;
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -14,6 +13,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{RarError, RarResult};
 use crate::probe::probe_volume;
 use crate::types::ArchiveFormat;
+use reedsolomon_rs::decode_apply::apply_decode_matrix_gf8;
 use reedsolomon_rs::rar3::Rar3RsCoder;
 use reedsolomon_rs::rar5::Rar5RsCoder;
 
@@ -1000,64 +1000,64 @@ fn reconstruct_rar3(
     let erasures = (0..total_count)
         .filter(|&idx| slots[idx].is_none())
         .collect::<Vec<_>>();
-    let mut buffers = vec![vec![0u8; chunk_size]; total_count];
+    let present = (0..total_count)
+        .filter(|&idx| slots[idx].is_some())
+        .collect::<Vec<_>>();
 
-    // One byte per missing volume per column, interleaved, filled in parallel
-    // and scattered back afterwards. Allocated once for the whole restore: the
-    // previous shape collected a `Vec<Vec<u8>>` with one entry per byte
-    // position, which cost two heap allocations for every single byte
-    // reconstructed and held millions of one-byte `Vec`s live at a time.
-    let missing_count = missing_volume_numbers.len();
-    let mut restored = vec![0u8; chunk_size * missing_count];
-
-    // Built once and cloned into each rayon split below. A clone is a flat
-    // copy of the tables; `new` would rebuild the GF tables and the generator
-    // polynomial per split, and its only failure is one we can report here
-    // instead of from inside the column loop.
-    let coder_template = Rar3RsCoder::new(rec_count).ok_or_else(|| RarError::CorruptArchive {
+    // For a fixed erasure set the scalar column decoder is a linear map, so
+    // it is derived once as a matrix (by running that decoder on unit
+    // vectors) and applied to whole regions with the gf8 kernels. Only the
+    // rows of missing data volumes are kept, and only the columns of present
+    // volumes: an erased position reads as zero, so its column contributes
+    // nothing. The matrix is the decoder's own map, so the bytes are the same
+    // ones the per-column decode produced.
+    let coder = Rar3RsCoder::new(rec_count).ok_or_else(|| RarError::CorruptArchive {
         detail: "RAR3 recovery set has invalid recovery count".into(),
     })?;
+    let matrix = coder.decode_matrix(total_count, &erasures).map(|full| {
+        rar3_missing_rows(
+            &full,
+            total_count,
+            &erasures,
+            &present,
+            missing_volume_numbers,
+        )
+    });
+
+    let mut buffers = vec![vec![0u8; chunk_size]; present.len()];
+    let missing_count = missing_volume_numbers.len();
+    let mut restored = vec![vec![0u8; chunk_size]; missing_count];
 
     loop {
         let mut max_read = 0usize;
-        for idx in 0..total_count {
-            buffers[idx].fill(0);
+        for (buffer, &idx) in buffers.iter_mut().zip(&present) {
             if let Some(file) = &mut inputs[idx] {
-                let read = read_padded(file, &mut buffers[idx])?;
+                let read = read_padded(file, buffer)?;
                 max_read = max_read.max(read);
             }
         }
         if max_read == 0 {
             break;
         }
+        // Reported here rather than up front so a set with nothing to read
+        // fails or succeeds exactly as the column decoder did.
+        let matrix = matrix.as_ref().ok_or_else(|| RarError::CorruptArchive {
+            detail: "RAR3 recovery decoder failed".into(),
+        })?;
 
-        // One coder per rayon split, boxed and reused across that split's
-        // columns: the erasure pattern is the same for every column, which is
-        // exactly the case the coder's cached locator polynomial exists for.
-        restored[..max_read * missing_count]
-            .par_chunks_mut(missing_count)
-            .enumerate()
-            .try_for_each_init(
-                || Box::new(coder_template.clone()),
-                |coder, (pos, out)| {
-                    decode_rar3_column(coder, &buffers, pos, &erasures, missing_volume_numbers, out)
-                },
-            )?;
+        let input_refs = buffers
+            .iter()
+            .map(|buffer| &buffer[..max_read])
+            .collect::<Vec<_>>();
+        let mut output_refs = restored
+            .iter_mut()
+            .map(|buffer| &mut buffer[..max_read])
+            .collect::<Vec<_>>();
+        apply_decode_matrix_gf8(matrix, &input_refs, &mut output_refs);
 
-        if missing_count == 1 {
-            buffers[missing_volume_numbers[0]][..max_read].copy_from_slice(&restored[..max_read]);
-        } else {
-            for (missing_idx, &volume_idx) in missing_volume_numbers.iter().enumerate() {
-                let buffer = &mut buffers[volume_idx];
-                for pos in 0..max_read {
-                    buffer[pos] = restored[pos * missing_count + missing_idx];
-                }
-            }
-        }
-
-        for (out_idx, &missing_idx) in missing_volume_numbers.iter().enumerate() {
-            outputs[out_idx]
-                .write_all(&buffers[missing_idx][..max_read])
+        for (output, buffer) in outputs.iter_mut().zip(&restored) {
+            output
+                .write_all(&buffer[..max_read])
                 .map_err(RarError::Io)?;
         }
     }
@@ -1069,43 +1069,26 @@ fn reconstruct_rar3(
     Ok(())
 }
 
-/// Reconstruct the missing bytes at one column position into `out`, which
-/// holds one byte per entry of `missing_volume_numbers`.
-///
-/// Deliberately a function of its own and never inlined. Rayon's
-/// `bridge_producer_consumer::helper` recurses once per split and inlines the
-/// consumer's map closure into every level; under fat LTO that placed the
-/// coder's GF tables and the decoder's scratch polynomials — some 35 KiB —
-/// in each recursive frame, and a 2 MiB worker overflowed on a set of four
-/// 22 MiB volumes. Keeping the decode in a leaf frame bounds what the
-/// recursion carries to a few pointers, whatever the optimizer decides.
-///
-/// The column itself is a stack array rather than a `Vec`: this runs once per
-/// byte of the restored volumes, so a heap allocation here is a heap
-/// allocation per reconstructed byte.
-#[inline(never)]
-fn decode_rar3_column(
-    coder: &mut Rar3RsCoder,
-    buffers: &[Vec<u8>],
-    pos: usize,
+/// The rows of a full RAR3 decode matrix (one per erasure, one column per
+/// volume position) that rebuild the missing data volumes, restricted to the
+/// columns of the present volumes, in the order `apply_decode_matrix_gf8`
+/// takes them.
+fn rar3_missing_rows(
+    full: &[u8],
+    total: usize,
     erasures: &[usize],
+    present: &[usize],
     missing_volume_numbers: &[usize],
-    out: &mut [u8],
-) -> RarResult<()> {
-    let mut storage = [0u8; MAX_RAR3_SET];
-    let column = &mut storage[..buffers.len()];
-    for (slot, buffer) in column.iter_mut().zip(buffers) {
-        *slot = buffer[pos];
+) -> Vec<u8> {
+    let mut rows = Vec::with_capacity(missing_volume_numbers.len() * present.len());
+    for &missing in missing_volume_numbers {
+        let row = erasures
+            .iter()
+            .position(|&era| era == missing)
+            .expect("every missing data volume is an erasure");
+        rows.extend(present.iter().map(|&col| full[row * total + col]));
     }
-    if !coder.decode(column, erasures) {
-        return Err(RarError::CorruptArchive {
-            detail: "RAR3 recovery decoder failed".into(),
-        });
-    }
-    for (slot, &idx) in out.iter_mut().zip(missing_volume_numbers) {
-        *slot = column[idx];
-    }
-    Ok(())
+    rows
 }
 
 fn finalize_rar3_restored_output(

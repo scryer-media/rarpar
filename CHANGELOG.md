@@ -19,11 +19,18 @@ The CLI version for these changes is assigned when the CLI is released.
   one pass, hashing it whole and by block together, so a damaged file is not
   read over the network twice; files on a local disk are still hashed whole
   first.
+- `rar restore-volumes`, and the extraction commands that restore a missing
+  volume from RAR3 (RAR 2.9-4.x) `.rev` files, rebuild those volumes about
+  eight times faster: the decoder is applied as a matrix to whole regions on
+  every core instead of byte column by byte column. Restored volumes are
+  byte-identical to before.
 
 ### Library versions
 
 - par3-rs 0.4.5: mebibyte source reads and the verification order by mount
   kind above.
+- reedsolomon-rs 0.4.9 and unrar-rs 0.10.9: the RAR recovery-volume restore
+  above.
   Other library versions are unchanged.
 
 ## rarpar 0.5.4

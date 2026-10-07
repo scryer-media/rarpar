@@ -6554,6 +6554,100 @@ fn test_rar3_recovery_volumes_large_restore_two_missing_parts() {
     );
 }
 
+/// Every way each RARLAB recovery set can be short of data volumes and still
+/// be restorable: each set of one or more missing data volumes, up to the
+/// recovery count, with every set of recovery volumes large enough to cover
+/// it. Each restored volume must equal RARLAB's original byte for byte.
+#[test]
+fn test_recovery_volumes_restore_every_recoverable_loss() {
+    struct Set {
+        directory: &'static str,
+        data: Vec<String>,
+        recovery: Vec<String>,
+    }
+    let names = |stem: &str, count: usize, width: usize, ext: &str| {
+        (1..=count)
+            .map(|volume| format!("{stem}.part{volume:0width$}.{ext}"))
+            .collect::<Vec<_>>()
+    };
+    let sets = [
+        Set {
+            directory: "rar4",
+            data: names("rar3_recovery_volumes", 5, 1, "rar"),
+            recovery: names("rar3_recovery_volumes", 2, 1, "rev"),
+        },
+        Set {
+            directory: "rar4",
+            data: names("rar3_recovery_volumes_large", 4, 1, "rar"),
+            recovery: names("rar3_recovery_volumes_large", 2, 1, "rev"),
+        },
+        Set {
+            directory: "rar5",
+            data: names("rar5_recovery_volumes", 10, 2, "rar"),
+            recovery: names("rar5_recovery_volumes", 2, 2, "rev"),
+        },
+        Set {
+            directory: "rar5",
+            data: names("rar5_hp_recovery_volumes", 5, 1, "rar"),
+            recovery: names("rar5_hp_recovery_volumes", 2, 1, "rev"),
+        },
+    ];
+
+    let subsets = |count: usize| (1u32..(1 << count)).collect::<Vec<_>>();
+    for set in &sets {
+        for missing_mask in subsets(set.data.len()) {
+            let missing = missing_mask.count_ones() as usize;
+            if missing > set.recovery.len() {
+                continue;
+            }
+            for kept_mask in subsets(set.recovery.len()) {
+                if (kept_mask.count_ones() as usize) < missing {
+                    continue;
+                }
+                let temp_dir = tempfile::tempdir().unwrap();
+                let mut paths = Vec::new();
+                let mut expected = Vec::new();
+                for (index, name) in set.data.iter().enumerate() {
+                    let dst = temp_dir.path().join(name);
+                    if missing_mask & (1 << index) != 0 {
+                        expected.push(dst);
+                        continue;
+                    }
+                    std::fs::copy(fixture(set.directory, name), &dst).unwrap();
+                    paths.push(dst);
+                }
+                for (index, name) in set.recovery.iter().enumerate() {
+                    if kept_mask & (1 << index) != 0 {
+                        let dst = temp_dir.path().join(name);
+                        std::fs::copy(fixture(set.directory, name), &dst).unwrap();
+                        paths.push(dst);
+                    }
+                }
+                let options = unrar_rs::RecoveryOptions {
+                    output_dir: Some(temp_dir.path().to_path_buf()),
+                    overwrite_existing: false,
+                    verify_restored: true,
+                };
+                let case = format!(
+                    "{} missing {missing_mask:#b} recovery kept {kept_mask:#b}",
+                    set.data[0]
+                );
+                let report = unrar_rs::restore_volumes_from_paths(&paths, &options)
+                    .unwrap_or_else(|error| panic!("{case}: {error}"));
+                assert_eq!(report.restored_paths, expected, "{case}");
+                for path in &expected {
+                    let name = path.file_name().unwrap().to_str().unwrap();
+                    assert!(
+                        std::fs::read(path).unwrap()
+                            == std::fs::read(fixture(set.directory, name)).unwrap(),
+                        "{case}: {name} differs from RARLAB's volume"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn test_recovery_restore_is_idempotent_for_complete_sets() {
     let rar5_names = (1..=10)

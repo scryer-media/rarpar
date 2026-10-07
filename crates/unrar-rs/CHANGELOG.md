@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.10.9
+
+### Changed
+
+- RAR3 recovery-volume restore no longer decodes one byte column at a time.
+  For a fixed set of missing volumes the column decoder is linear, so
+  `restore_volumes_from_paths` derives it once as a matrix
+  (`Rar3RsCoder::decode_matrix`) and applies the rows for the missing data
+  volumes to whole regions with the gf8 kernels on every core. Restored bytes
+  are unchanged. On an Apple M5 Max, restoring a 41 + 10 volume set of
+  2.1 GB took 3.7-5.5 s and 51-53 CPU-s with one volume missing and
+  4.3-5.1 s with eight missing; it now takes 0.5 s and 0.64-1.07 s. RARLAB
+  unrar 7.20 takes 4.1-4.4 s and 4.6-4.7 s on the same sets.
+- `reedsolomon-rs` requirement raised to 0.4.9 for `decode_matrix` and
+  `apply_decode_matrix_gf8`.
+
 ## 0.10.8
 
 ### Fixed
