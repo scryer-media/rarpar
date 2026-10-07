@@ -17,13 +17,15 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 use par3_rs::ingest::{IncrementalSet, IngestedPacket, PacketScanner, PayloadKind, ScanEvent};
 use par3_rs::layout::ExtentKind;
 use par3_rs::placement::{PlacementOptions, search_extent};
-use par3_rs::runtime::{EngineError, ExecutionOptions, HandleBudget, MemoryBudget};
+use par3_rs::runtime::{
+    CancellationToken, EngineError, ExecutionOptions, HandleBudget, MemoryBudget,
+};
 use par3_rs::session::{Par3RepairSession, RepairStatus};
 use par3_rs::source::{DiskSourceAccess, SourceAccess, SourceId};
 use par3_rs::{Fingerprint, InputSetId, Par3Error, Par3Set, ScanLimits};
@@ -816,7 +818,8 @@ fn parse(args: &[String]) -> Result<Parsed, Failure> {
 #[derive(Debug)]
 struct Context {
     base: PathBuf,
-    /// The PAR file resolved against the directory rarpar was started in.
+    /// The PAR file resolved against the directory rarpar was started in, or
+    /// for a self target against the base path its directory became.
     par_path: PathBuf,
     execution: ExecutionOptions,
 }
@@ -854,7 +857,13 @@ fn prepare(invocation: &Invocation) -> Result<Context, Failure> {
     if options.noise >= 1 {
         print_option_summary(invocation);
     }
-    let par_path = current.join(native(&invocation.par_filename));
+    // A self target's directory was moved into the base path when it was
+    // parsed, so its bare name resolves there.
+    let par_path = if invocation.self_target {
+        base.join(native(&invocation.par_filename))
+    } else {
+        current.join(native(&invocation.par_filename))
+    };
     Ok(Context {
         base,
         par_path,
@@ -2240,6 +2249,77 @@ fn search_candidates(
     search_limit: u32,
 ) -> Result<(), EngineError> {
     let started = Instant::now();
+    // `-S` also bounds a scan already under way: a timer cancels a token of
+    // the search's own, and a cancelled scan ends the search with what it has
+    // found so far.
+    let mut search = execution.clone();
+    let timer = (search_limit > 0).then(|| {
+        let token = CancellationToken::default();
+        search.cancel = token.clone();
+        DeadlineTimer::start(
+            token,
+            started + Duration::from_millis(u64::from(search_limit)),
+        )
+    });
+    let result = search_extents(
+        session,
+        access,
+        candidates,
+        unresolved,
+        &search,
+        started,
+        search_limit,
+    );
+    drop(timer);
+    match result {
+        Err(EngineError::Cancelled) if search_limit > 0 => Ok(()),
+        other => other,
+    }
+}
+
+/// Cancels a token at a deadline unless dropped first; dropping it stops
+/// and joins the timer thread.
+struct DeadlineTimer {
+    stop: Option<mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DeadlineTimer {
+    fn start(token: CancellationToken, deadline: Instant) -> Self {
+        let (stop, stopped) = mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let wait = deadline.saturating_duration_since(Instant::now());
+            if let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(wait) {
+                token.cancel();
+            }
+        });
+        Self {
+            stop: Some(stop),
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for DeadlineTimer {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The search proper: every wanted extent, until the time is up or the
+/// search's token is cancelled.
+fn search_extents(
+    session: &mut Par3RepairSession,
+    access: &dyn SourceAccess,
+    candidates: &[SourceId],
+    unresolved: &[Vec<std::ops::Range<u64>>],
+    execution: &ExecutionOptions,
+    started: Instant,
+    search_limit: u32,
+) -> Result<(), EngineError> {
     let Some(layout) = session.layout()? else {
         return Ok(());
     };
@@ -2672,6 +2752,25 @@ mod tests {
             native(&invocation.par_filename).as_bytes(),
             b"sub\xff/set.par3"
         );
+    }
+
+    /// The `-S` timer cancels the search's token once its deadline passes,
+    /// so a scan under way stops; dropped before its deadline it cancels
+    /// nothing and its thread is joined.
+    #[test]
+    fn the_search_deadline_cancels_its_token_only_once_due() {
+        let due = CancellationToken::default();
+        let timer = DeadlineTimer::start(due.clone(), Instant::now());
+        while due.check().is_ok() {
+            std::thread::yield_now();
+        }
+        drop(timer);
+        assert!(matches!(due.check(), Err(EngineError::Cancelled)));
+
+        let early = CancellationToken::default();
+        let far = Instant::now() + Duration::from_secs(24 * 60 * 60);
+        drop(DeadlineTimer::start(early.clone(), far));
+        assert!(early.check().is_ok());
     }
 
     #[test]

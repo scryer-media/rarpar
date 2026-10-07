@@ -15,7 +15,6 @@
 //! block whose first bytes are written last (a 7z start header) be corrected
 //! afterwards by adding the difference.
 
-use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -204,6 +203,15 @@ struct OpenTail {
 pub(crate) const LANE_BYTES_PER_BLOCK: u64 = (1
     + std::mem::size_of::<Option<BlockChecksum>>()
     + std::mem::size_of::<BlockChecksum>()) as u64;
+
+/// Memory [`Coding::new`] takes for `rows` recovery rows of `block_size`
+/// bytes: each row is its own allocation, so besides its bytes it costs a
+/// `Vec` in the outer list and what an allocator rounds a small allocation
+/// up by. With tiny blocks and many rows that overhead outweighs the rows.
+pub(crate) fn coding_bytes(block_size: u64, rows: u64) -> u64 {
+    const ROW_OVERHEAD: u64 = std::mem::size_of::<Vec<u8>>() as u64 + 32;
+    block_size.saturating_add(ROW_OVERHEAD).saturating_mul(rows)
+}
 
 /// One block size's view of the file: block checksums, chunk descriptions and
 /// the recovery rows of every field it is coding in.
@@ -1097,14 +1105,40 @@ pub(crate) fn sibling_paths(stem: &Path, rows: u64) -> (PathBuf, Vec<(u64, u64, 
     (directory.join(format!("{base}.par3")), volumes)
 }
 
+/// Files written beside their destinations and not yet installed; dropping
+/// this removes them.
+pub(crate) struct StagedSibling {
+    files: Vec<(tempfile::NamedTempFile, PathBuf)>,
+    overwrite: bool,
+}
+
+impl StagedSibling {
+    /// Rename every staged file onto its destination, in order.
+    pub(crate) fn install(self) -> std::io::Result<Vec<PathBuf>> {
+        let mut written = Vec::new();
+        for (staged, path) in self.files {
+            if self.overwrite {
+                staged.persist(&path)
+            } else {
+                staged.persist_noclobber(&path)
+            }
+            .map_err(|error| error.error)?;
+            written.push(path);
+        }
+        Ok(written)
+    }
+}
+
 /// Write a sibling set: the index file and its recovery volumes, laid out as
-/// par3cmdline lays them out.
+/// par3cmdline lays them out. Every file is written and synced beside its
+/// destination first; nothing is installed until [`StagedSibling::install`],
+/// so a failed write (a full disk, say) leaves every existing file as it was.
 pub(crate) fn write_sibling(
     stem: &Path,
     set: &BuiltSet,
     rows: &[Vec<u8>],
     overwrite: bool,
-) -> std::io::Result<Vec<PathBuf>> {
+) -> std::io::Result<StagedSibling> {
     let (index, volumes) = sibling_paths(stem, rows.len() as u64);
     for path in std::iter::once(&index).chain(volumes.iter().map(|(_, _, path)| path)) {
         // Look at the name itself: a link, dangling or not, is never
@@ -1127,17 +1161,17 @@ pub(crate) fn write_sibling(
             Err(error) => return Err(error),
         }
     }
-    let mut written = Vec::new();
-    write_file(&index, |out| {
+    let mut files = Vec::new();
+    let staged = write_file(&index, |out| {
         out.write_all(&set.creator)?;
         for packet in &set.common {
             out.write_all(packet)?;
         }
         Ok(())
     })?;
-    written.push(index);
+    files.push((staged, index));
     for (start, count, path) in volumes {
-        write_file(&path, |out| {
+        let staged = write_file(&path, |out| {
             out.write_all(&set.creator)?;
             for packet in &set.common {
                 out.write_all(packet)?;
@@ -1157,31 +1191,76 @@ pub(crate) fn write_sibling(
             }
             Ok(())
         })?;
-        written.push(path);
+        files.push((staged, path));
     }
-    Ok(written)
+    Ok(StagedSibling { files, overwrite })
 }
 
+/// Write `body` to a new temporary file in `path`'s directory and sync it.
 fn write_file(
     path: &Path,
     body: impl FnOnce(&mut BufWriter<std::fs::File>) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+) -> std::io::Result<tempfile::NamedTempFile> {
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".rarpar-par3-");
+    // An ordinary output file, not a private temporary: 0o666 less the umask.
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NOFOLLOW);
-    let file = options.open(path)?;
-    let mut out = BufWriter::new(file);
+    builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666));
+    let staged = builder.tempfile_in(directory)?;
+    let mut out = BufWriter::new(staged.reopen()?);
     body(&mut out)?;
     out.flush()?;
     out.into_inner()
         .map_err(|error| error.into_error())?
-        .sync_all()
+        .sync_all()?;
+    Ok(staged)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sibling set is written beside its names and installed only on
+    /// `install`: until then, and if it is dropped instead, an existing index
+    /// keeps its bytes and no staged file is left.
+    #[test]
+    fn sibling_files_replace_nothing_until_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let stem = dir.path().join("vault");
+        let index = dir.path().join("vault.par3");
+        std::fs::write(&index, b"previous index").unwrap();
+        let set = BuiltSet {
+            set_id: InputSetId([1; 8]),
+            creator: b"creator".to_vec(),
+            common: vec![b"common".to_vec()],
+            root_hash: [2; 16],
+            matrix_hash: Some([3; 16]),
+        };
+        let rows = vec![vec![0u8; 4]; 3];
+        let listing = || {
+            let mut names: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+        let staged = write_sibling(&stem, &set, &rows, true).unwrap();
+        assert_eq!(std::fs::read(&index).unwrap(), b"previous index");
+        drop(staged);
+        assert_eq!(listing(), ["vault.par3"]);
+        assert_eq!(std::fs::read(&index).unwrap(), b"previous index");
+        let written = write_sibling(&stem, &set, &rows, true)
+            .unwrap()
+            .install()
+            .unwrap();
+        assert_eq!(written.len(), listing().len());
+        assert!(std::fs::read(&index).unwrap().starts_with(b"creator"));
+    }
 
     #[test]
     fn the_deferred_hash_matches_blake3_at_every_tree_shape() {

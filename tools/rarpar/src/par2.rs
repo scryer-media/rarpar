@@ -784,43 +784,20 @@ fn discover_compat_par2_paths(
 }
 
 /// The full set over `paths`, reusing `seed` (the parse of one of them that
-/// volume discovery already made) instead of reading that file a second time.
+/// volume discovery already made) when it is the only path.
 ///
-/// The other volumes are parsed on their own and the seed fills what they
-/// lack. Both parses validated their packets against the same main packet
-/// (one recovery set ID is one main packet body), and every packet key names
-/// its content, so the union holds everything one parse over every path
-/// holds.
-/// When the other volumes do not form a set on their own (no main packet
-/// among them, say) the whole list is parsed as before. `None` keeps the
+/// With other volumes the whole list is parsed once more, seed included: one
+/// packet builder sees every packet (an IFSC whose description sits in
+/// another volume is kept) and one budget meters the combined inventory.
+/// Two finalized parses cannot be unioned faithfully. `None` keeps the
 /// caller's lazy re-parse, which reports the error.
 fn scan_discovered_set(paths: &[PathBuf], seed: Option<SeedParse>) -> Option<par2_rs::Par2FileSet> {
-    let Some((Some(seed_path), mut seed)) = seed else {
-        return par2_rs::Par2FileSet::from_paths(paths).ok();
-    };
-    let others: Vec<&PathBuf> = paths.iter().filter(|path| **path != seed_path).collect();
-    if others.is_empty() {
+    if let Some((Some(seed_path), seed)) = seed
+        && paths.iter().all(|path| *path == seed_path)
+    {
         return Some(seed);
     }
-    let Ok(mut set) = par2_rs::Par2FileSet::from_paths(&others) else {
-        return par2_rs::Par2FileSet::from_paths(paths).ok();
-    };
-    if set.recovery_set_id != seed.recovery_set_id {
-        return par2_rs::Par2FileSet::from_paths(paths).ok();
-    }
-    for (id, description) in seed.files.drain() {
-        set.files.entry(id).or_insert(description);
-    }
-    for (id, checksums) in seed.slice_checksums.drain() {
-        set.slice_checksums.entry(id).or_insert(checksums);
-    }
-    for (exponent, slice) in std::mem::take(&mut seed.recovery_slices) {
-        set.recovery_slices.entry(exponent).or_insert(slice);
-    }
-    if set.creator.is_none() {
-        set.creator = seed.creator.take();
-    }
-    Some(set)
+    par2_rs::Par2FileSet::from_paths(paths).ok()
 }
 
 fn discover_matching_par2_paths(input: &Path) -> Result<(Vec<PathBuf>, SeedParse), RarparError> {
@@ -848,18 +825,20 @@ fn discover_matching_par2_paths(input: &Path) -> Result<(Vec<PathBuf>, SeedParse
 
 /// [`par2_rs::identify_par2_files`] without opening the files the seed set
 /// protects. Any other sibling may be a renamed volume and has its first
-/// header read; a protected file is data by definition, and sniffing it cost
-/// an open and a read per data file before verification read it in full.
+/// header read; a file at a protected name and its recorded length is taken
+/// as that data, and sniffing it cost an open and a read per data file before
+/// verification read it in full. A protected name at another length may be a
+/// volume renamed onto a missing file's name, so it is sniffed.
 fn identify_set_volumes(
     dir: &Path,
     seed: &par2_rs::Par2FileSet,
 ) -> Result<Vec<PathBuf>, RarparError> {
     use std::io::Read;
     const HEADER_SIZE: usize = 64;
-    let protected: std::collections::HashSet<&str> = seed
+    let protected: std::collections::HashMap<&str, u64> = seed
         .files
         .values()
-        .map(|description| description.filename.as_str())
+        .map(|description| (description.filename.as_str(), description.length))
         .collect();
     let mut matches = Vec::new();
     for entry in std::fs::read_dir(dir)? {
@@ -868,8 +847,7 @@ fn identify_set_volumes(
         let Some(name) = file_name.to_str() else {
             continue;
         };
-        if protected.contains(name)
-            || name.starts_with(".swap.")
+        if name.starts_with(".swap.")
             || name.starts_with(".chunk.")
             || name.starts_with(".weaver-par2-repair")
             || name.contains(".weaver-par2-backup.")
@@ -881,6 +859,11 @@ fn identify_set_volumes(
         // names a regular file, as `Path::is_file` decides.
         let kind = entry.file_type()?;
         if !(kind.is_file() || (kind.is_symlink() && path.is_file())) {
+            continue;
+        }
+        if let Some(&length) = protected.get(name)
+            && std::fs::metadata(&path)?.len() == length
+        {
             continue;
         }
         let mut header = Vec::with_capacity(HEADER_SIZE);
@@ -1235,19 +1218,20 @@ mod tests {
         (sources, outcome)
     }
 
-    /// Discovery parses the named `.par2` to learn the set; the full set used
-    /// to parse it a second time. It is now built from the other volumes plus
-    /// that seed parse, so the named file is not opened again (it is
-    /// unreadable here by then), and the result holds what one parse over
-    /// every path holds.
+    /// When the named `.par2` is the set's only file, discovery's parse of it
+    /// is the full set: the file is not opened again (it is unreadable here
+    /// by then).
     #[cfg(unix)]
     #[test]
-    fn the_full_set_reuses_the_discovery_parse_of_the_named_par2() {
+    fn a_lone_named_par2_is_not_parsed_twice() {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let (_, outcome) = create_small_set(temp.path());
+        for volume in &outcome.volume_paths {
+            std::fs::remove_file(volume).unwrap();
+        }
         let (paths, seed) = discover_matching_par2_paths(&outcome.main_path).unwrap();
-        assert_eq!(seed.0.as_deref(), Some(outcome.main_path.as_path()));
+        assert_eq!(paths, std::slice::from_ref(&outcome.main_path));
         let reference = par2_rs::Par2FileSet::from_paths(&paths).unwrap();
 
         std::fs::set_permissions(&outcome.main_path, std::fs::Permissions::from_mode(0o000))
@@ -1256,26 +1240,57 @@ mod tests {
             return;
         }
         let set = scan_discovered_set(&paths, Some(seed)).expect("built without the named file");
-
         assert_eq!(set.recovery_set_id, reference.recovery_set_id);
-        assert_eq!(set.slice_size, reference.slice_size);
-        assert_eq!(set.recovery_file_ids, reference.recovery_file_ids);
-        assert_eq!(set.non_recovery_file_ids, reference.non_recovery_file_ids);
-        assert_eq!(set.creator, reference.creator);
-        let mut files: Vec<_> = set.files.keys().collect();
-        let mut expected_files: Vec<_> = reference.files.keys().collect();
-        files.sort();
-        expected_files.sort();
-        assert_eq!(files, expected_files);
-        for (id, checksums) in &reference.slice_checksums {
-            assert_eq!(set.slice_checksums[id].len(), checksums.len());
-        }
         assert_eq!(set.slice_checksums.len(), reference.slice_checksums.len());
-        assert!(
-            set.recovery_slices
-                .keys()
-                .eq(reference.recovery_slices.keys())
-        );
+    }
+
+    /// The whole packets of a PAR2 file whose type passes `keep`, in order.
+    fn packets_of(path: &Path, keep: impl Fn(&par2_rs::PacketType) -> bool) -> Vec<u8> {
+        let bytes = std::fs::read(path).unwrap();
+        let mut out = Vec::new();
+        let mut offset = 0;
+        while offset + 64 <= bytes.len() {
+            let header = par2_rs::PacketHeader::parse(&bytes[offset..offset + 64], 0).unwrap();
+            let end = offset + header.length as usize;
+            if keep(&header.packet_type) {
+                out.extend_from_slice(&bytes[offset..end]);
+            }
+            offset = end;
+        }
+        out
+    }
+
+    /// Metadata split across files (the named `.par2` holds the file
+    /// descriptions, a volume holds their slice checksums) is all kept: the
+    /// checksums are not dropped for lack of a description in their own file.
+    #[test]
+    fn slice_checksums_described_in_the_named_par2_are_kept() {
+        use par2_rs::PacketType;
+        let temp = tempfile::tempdir().unwrap();
+        let (_, outcome) = create_small_set(temp.path());
+        let index = packets_of(&outcome.main_path, |kind| {
+            matches!(kind, PacketType::Main | PacketType::FileDescription)
+        });
+        let checksums = packets_of(&outcome.main_path, |kind| {
+            matches!(kind, PacketType::Main | PacketType::InputFileSliceChecksum)
+        });
+        let (kept, removed) = outcome.volume_paths.split_first().unwrap();
+        let mut volume = checksums;
+        volume.extend(packets_of(kept, |kind| {
+            matches!(kind, PacketType::RecoverySlice)
+        }));
+        for path in removed {
+            std::fs::remove_file(path).unwrap();
+        }
+        std::fs::write(&outcome.main_path, index).unwrap();
+        std::fs::write(kept, volume).unwrap();
+
+        let (paths, seed) = discover_matching_par2_paths(&outcome.main_path).unwrap();
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        let set = scan_discovered_set(&paths, Some(seed)).unwrap();
+        assert_eq!(set.files.len(), 3);
+        assert_eq!(set.slice_checksums.len(), 3);
+        assert!(!set.recovery_slices.is_empty());
     }
 
     /// Volume discovery used to open and read the first 64 bytes of every
@@ -1317,5 +1332,22 @@ mod tests {
             .collect();
         found.sort();
         assert_eq!(found, expected);
+    }
+
+    /// A volume renamed onto a missing protected file's name is still a
+    /// volume: a protected name at another length than recorded is sniffed.
+    #[test]
+    fn a_volume_under_a_missing_protected_name_is_found() {
+        let temp = tempfile::tempdir().unwrap();
+        let (sources, outcome) = create_small_set(temp.path());
+        let renamed = &sources[1];
+        let volume = &outcome.volume_paths[0];
+        std::fs::rename(volume, renamed).unwrap();
+        assert_ne!(std::fs::metadata(renamed).unwrap().len(), 3000);
+
+        let seed =
+            par2_rs::Par2FileSet::from_paths(std::slice::from_ref(&outcome.main_path)).unwrap();
+        let found = identify_set_volumes(temp.path(), &seed).unwrap();
+        assert!(found.contains(renamed), "{found:?}");
     }
 }

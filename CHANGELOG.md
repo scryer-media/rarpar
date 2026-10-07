@@ -124,12 +124,15 @@ documented in each crate's own changelog so those notes ship with the crate.
   recovery blocks, verify drops from 181 path stats to 60 and repair from 324
   to 111, with the same bytes read.
 - `par verify` and `repair` read and hash the PAR2 volumes once instead of
-  twice, and volume discovery no longer opens the files the set protects to
-  look for renamed volumes; on ten 3 MiB files with 10% recovery, verify
+  twice, and volume discovery no longer opens the files the set protects
+  (a protected name at its recorded length) to look for renamed volumes,
+  while a protected name at another length is still sniffed; on ten 3 MiB files with 10% recovery, verify
   reads 34.7 MB in 23 opens instead of 37.9 MB in 38.
-- `par verify` and `repair` build the PAR2 set from the parse volume
-  discovery already made of the named `.par2`, so that file is parsed once
-  instead of twice.
+- `par verify` and `repair` of a set whose named `.par2` is its only file
+  build the set from the parse volume discovery already made, so that file
+  is parsed once instead of twice. With other volumes the whole list is
+  parsed together, so one budget meters it and slice checksums described in
+  another file are kept.
 - RAR volume discovery for a named archive (the unrar facade and
   `rarpar rar`) no longer resolves the real path of every file in the
   directory: the archive is matched by the spelling it was given, and only a
@@ -140,6 +143,27 @@ documented in each crate's own changelog so those notes ship with the crate.
   set protects when looking for renamed carriers beside it: the `.par3`
   carriers are scanned first and only the other siblings are sniffed. Ten
   protected files beside the set: verify opens 14 files instead of 24.
+- `par3 archive --overwrite` with the archive under an input directory no
+  longer packs the previous archive, its PAR3 index or its recovery volumes
+  into the new archive.
+- `par3 archive` counts each recovery row's own allocation against
+  `--par3-memory-mib`, so many recovery blocks of a small block size are
+  refused before they are allocated instead of overrunning the budget.
+- `par3 archive` writes and syncs the sibling index and recovery volumes
+  beside their names before it installs anything, so a failed write (a full
+  disk, say) no longer leaves the archive replaced and the previous set
+  truncated.
+- par3cmdline facade: `vs` and `rs` given a ZIP or 7z with a directory
+  (`par3 vs sub/archive.zip`, or an absolute path) find it in that
+  directory instead of reporting it missing.
+- par3cmdline facade: `-S<n>` also stops a candidate scan already under way
+  when the time is up, instead of letting one large extra file be searched
+  to its end first.
+- `par3 inside verify` and `repair` scope a missing volume's coverage to its
+  own directory: a set elsewhere that records a volume of the same name no
+  longer hides it, so the run reports it and fails.
+- `par3 inside` lists each volume family's directory once and opens each
+  volume once, however many volumes of the family are named.
 
 ### Library versions
 

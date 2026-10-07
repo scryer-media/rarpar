@@ -43,6 +43,21 @@
     recorded names sharing its `.partN.` (or final extension) tail, keeping
     each distinct stem change once, so a large volume set no longer holds a
     mapping for every candidate and recorded name pair.
+  - `open` lists the sets it finds with a hash set and indexes each file's
+    packets by set, so a carrier holding packets of many sets is no longer
+    rescanned per packet or once per set.
+  - `open` binds a missing volume by volume number only to a file that does
+    not carry only another set's packets, as binding by name does, so a
+    same-length volume of another set given in the same call is never taken
+    as this set's host.
+  - `open` refuses a set whose Root packet names no file
+    (`EngineError::Unsupported`) instead of panicking.
+  - `prepare_hosts` refuses a host name that `validate_host_name` refuses
+    (`EngineError::UnsafePath`), before reading the host, so insertion no
+    longer records a name that repair and removal then refuse.
+  - `Rar5Set::remove` checks every destination before writing any, and a
+    failed removal deletes the outputs it already linked in, so an existing
+    later destination no longer leaves earlier stripped hosts behind.
 - A derived carrier (`CarrierPlan::derived`) looks up its available Recovery
   Data packets in one pass over the payloads instead of one pass per
   recovery index, so regenerating a region of a set with tens of thousands
