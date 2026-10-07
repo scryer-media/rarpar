@@ -139,12 +139,14 @@ fn volume_set(paths: &[PathBuf]) -> Result<Vec<PathBuf>, RarparError> {
 }
 
 /// A file name or volume family stem as the platform's file names compare:
-/// exactly, and on Windows under simple case folding, so there
-/// `set.part1.rar` and `SET.part2.rar` are one family. Each character folds to its one-character
-/// uppercase, as NTFS's upcase table does; one with a longer uppercase (`ß`)
-/// stays itself.
+/// exactly, and on Windows and macOS, whose default volumes ignore case,
+/// under simple case folding, so there `set.part1.rar` and `SET.part2.rar`
+/// are one family. Each character folds to its one-character uppercase, as
+/// NTFS's upcase table does; one with a longer uppercase (`ß`) stays itself.
+/// A case-sensitive volume on either platform is rare enough that two
+/// families differing only by case are treated as one there too.
 fn name_key(stem: &str) -> String {
-    if !cfg!(windows) {
+    if !cfg!(any(windows, target_os = "macos")) {
         return stem.to_owned();
     }
     stem.chars()
@@ -727,8 +729,9 @@ mod tests {
     fn family_stems_compare_as_the_platform_names_files() {
         assert!(same_stem("plover", "plover"));
         assert!(!same_stem("plover", "plover2"));
-        assert_eq!(same_stem("plover", "PLOVER"), cfg!(windows));
-        assert_eq!(same_stem("\u{e9}t\u{e9}", "\u{c9}T\u{c9}"), cfg!(windows));
+        let folds = cfg!(any(windows, target_os = "macos"));
+        assert_eq!(same_stem("plover", "PLOVER"), folds);
+        assert_eq!(same_stem("\u{e9}t\u{e9}", "\u{c9}T\u{c9}"), folds);
         assert!(!same_stem("stra\u{df}e", "STRASSE"));
     }
 

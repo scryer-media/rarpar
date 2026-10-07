@@ -602,10 +602,11 @@ mod generated {
         );
     }
 
-    /// A family named in one case while the directory keeps another: on
-    /// Windows, whose names ignore case, every volume is verified and a
-    /// missing one is reported in the directory's spelling. Elsewhere stems
-    /// match exactly, so the other spelling is not the named family.
+    /// A family named in one case while the directory keeps another: on a
+    /// volume whose names ignore case (Windows, and macOS by default), every
+    /// volume is verified and a missing one is reported in the directory's
+    /// spelling. On a case-sensitive volume the other spelling is another
+    /// file, and stems match exactly.
     #[test]
     fn a_family_named_in_another_case() {
         let temp = tempfile::tempdir().unwrap();
@@ -621,7 +622,11 @@ mod generated {
             .unwrap();
         }
         let named = "protected/set.part1.rar";
-        if cfg!(windows) {
+        if root.join(named).is_file() {
+            assert!(
+                cfg!(any(windows, target_os = "macos")),
+                "a volume that ignores case must be a platform whose stems fold"
+            );
             let verified = run(root, &["par3", "inside", "verify", named], 0);
             assert_eq!(verified["sets"].as_array().unwrap().len(), 3, "{verified}");
             std::fs::remove_file(protected.join("SET.part2.rar")).unwrap();
@@ -631,11 +636,6 @@ mod generated {
                 verified["unprotected_missing_volumes"],
                 serde_json::json!(["SET.part2.rar"])
             );
-        } else if root.join(named).is_file() {
-            // A case-insensitive volume opens the named spelling, but only
-            // an exact stem is its family.
-            let verified = run(root, &["par3", "inside", "verify", named], 0);
-            assert_eq!(verified["sets"].as_array().unwrap().len(), 1, "{verified}");
         } else {
             // A case-sensitive volume has no such file.
             let output = std::process::Command::new(env!("CARGO_BIN_EXE_rarpar"))
