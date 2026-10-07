@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use bytes::Bytes;
 
@@ -25,15 +26,76 @@ pub enum RecoverySliceData {
         /// re-validated against on-disk damage before repair uses them.
         /// `None` means the payload was already validated (or is synthetic).
         packet_hash: Option<[u8; 16]>,
-        /// The volume's stat fingerprint at the moment the scanner opened it
-        /// to authenticate this payload against `packet_hash`. While the path
-        /// still fingerprints identically, [`RecoverySliceData::validate_packet_hash`]
-        /// accepts that authentication instead of reading and hashing the
-        /// payload again. `None` — every constructor but the scanner's — means
-        /// the hash was never checked against these bytes, so validation
-        /// always reads them.
-        authenticated_at: Option<FileStatFingerprint>,
     },
+}
+
+/// Scanner authentications of file-backed payloads, keyed by the interned
+/// volume path allocation.
+///
+/// The bounded file scanner hashes every recovery payload as it reads it and,
+/// when the volume's stat has settled, records the fingerprint the volume had
+/// when it was opened. While the path still fingerprints identically,
+/// [`RecoverySliceData::validate_packet_hash`] accepts that authentication
+/// instead of reading and hashing the payload again.
+///
+/// The record lives here rather than in [`RecoverySliceData::FileBacked`] so
+/// that variant keeps exactly its public fields. Every payload of one scan
+/// shares one `Arc<Path>`, and clones of a payload share it too, so the
+/// allocation's address names the scan. The entry holds a `Weak` to that
+/// allocation, which keeps the address from being reused while the entry
+/// exists; entries whose payloads are all gone are pruned when the next scan
+/// registers. A span is vouched for only when its offset, length and packet
+/// hash are the ones the scan authenticated, so a payload built by hand over
+/// the scanner's path is read and hashed like any other.
+struct ScanAuthentication {
+    path: Weak<Path>,
+    fingerprint: FileStatFingerprint,
+    spans: HashMap<u64, (usize, [u8; 16])>,
+}
+
+static SCAN_AUTHENTICATIONS: Mutex<Option<HashMap<usize, ScanAuthentication>>> = Mutex::new(None);
+
+fn interned_path_key(path: &Arc<Path>) -> usize {
+    Arc::as_ptr(path).cast::<u8>() as usize
+}
+
+fn record_scan_authentication(
+    path: &Arc<Path>,
+    offset: u64,
+    len: usize,
+    packet_hash: [u8; 16],
+    fingerprint: FileStatFingerprint,
+) {
+    let mut table = SCAN_AUTHENTICATIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let table = table.get_or_insert_with(HashMap::new);
+    let key = interned_path_key(path);
+    if !table.contains_key(&key) {
+        table.retain(|_, entry| entry.path.strong_count() > 0);
+    }
+    let entry = table.entry(key).or_insert_with(|| ScanAuthentication {
+        path: Arc::downgrade(path),
+        fingerprint: fingerprint.clone(),
+        spans: HashMap::new(),
+    });
+    // One allocation is one scan, and one scan records one fingerprint.
+    debug_assert_eq!(entry.fingerprint, fingerprint);
+    entry.spans.insert(offset, (len, packet_hash));
+}
+
+pub(super) fn scan_authentication(
+    path: &Arc<Path>,
+    offset: u64,
+    len: usize,
+    packet_hash: &[u8; 16],
+) -> Option<FileStatFingerprint> {
+    let table = SCAN_AUTHENTICATIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let entry = table.as_ref()?.get(&interned_path_key(path))?;
+    debug_assert!(std::ptr::addr_eq(entry.path.as_ptr(), Arc::as_ptr(path)));
+    (entry.spans.get(&offset) == Some(&(len, *packet_hash))).then(|| entry.fingerprint.clone())
 }
 
 impl RecoverySliceData {
@@ -66,7 +128,6 @@ impl RecoverySliceData {
             offset,
             len,
             packet_hash,
-            authenticated_at: None,
         }
     }
 
@@ -83,12 +144,12 @@ impl RecoverySliceData {
         packet_hash: [u8; 16],
         fingerprint: FileStatFingerprint,
     ) -> Self {
+        record_scan_authentication(&path, offset, len, packet_hash, fingerprint);
         Self::FileBacked {
             path,
             offset,
             len,
             packet_hash: Some(packet_hash),
-            authenticated_at: Some(fingerprint),
         }
     }
 
@@ -143,13 +204,12 @@ impl RecoverySliceData {
             offset,
             len,
             packet_hash: Some(expected),
-            authenticated_at,
         } = self
         else {
             return Ok(true);
         };
-        if let Some(authenticated_at) = authenticated_at
-            && FileStatFingerprint::capture_path(path).as_ref() == Some(authenticated_at)
+        if let Some(authenticated_at) = scan_authentication(path, *offset, *len, expected)
+            && FileStatFingerprint::capture_path(path).as_ref() == Some(&authenticated_at)
         {
             return Ok(true);
         }
