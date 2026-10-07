@@ -72,10 +72,13 @@
       ]
     },
     "unit": {
-      "description": "The two fixtures the no-fixture unit lanes read (unit-tests, platform-tests).",
+      "description": "What the no-fixture unit lanes read (unit-tests, platform-tests): two UnRAR fixtures, and the PAR-inside containers the par3-rs insertion unit tests install into.",
       "include": [
         "crates/unrar-rs/tests/fixtures/rar5/rar5_hp_store.rar",
-        "crates/unrar-rs/tests/fixtures/rar4/rar4_hp_large.rar"
+        "crates/unrar-rs/tests/fixtures/rar4/rar4_hp_large.rar",
+        "crates/par3-rs/tests/fixtures/advanced/inside-original.zip",
+        "crates/par3-rs/tests/fixtures/advanced/inside-original.7z",
+        "crates/par3-rs/tests/fixtures/advanced/inside64-original.zip"
       ]
     },
     "cli": {
