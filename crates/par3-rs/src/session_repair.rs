@@ -2554,6 +2554,46 @@ pub(crate) fn contained_destination(base: &Path, relative: &str) -> EngineResult
     Ok(repair_destination(&tree, relative)?.display)
 }
 
+/// Create the protected directory `relative` under `base` the way repair
+/// installs files: one component at a time, relative to an open handle on
+/// `base`, refusing any symbolic link on the way. For directory-only repairs
+/// (an empty directory the set records), where no file installation would
+/// create it.
+///
+/// # Errors
+///
+/// [`EngineError::Io`] when `relative` is not a plain relative path, a
+/// component is a symbolic link or not a directory, or creation fails.
+pub fn create_directory(base: &Path, relative: &str) -> EngineResult<()> {
+    #[cfg(not(target_os = "wasi"))]
+    crate::repair_tree::create_directory(base, relative)?;
+    #[cfg(target_os = "wasi")]
+    {
+        crate::paths::validate_relative_path(relative).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+        })?;
+        let mut directory = base.to_owned();
+        for component in Path::new(relative).components() {
+            directory.push(component);
+            match std::fs::symlink_metadata(&directory) {
+                Ok(meta) if meta.is_dir() => {}
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "repair directory component is a link or not a directory",
+                    )
+                    .into());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir(&directory)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn stage_path(destination: &Path, options: &ExecutionOptions) -> EngineResult<PathBuf> {
     let parent = destination
         .parent()

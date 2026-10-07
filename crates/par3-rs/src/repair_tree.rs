@@ -917,6 +917,18 @@ fn canonical_key(path: &str) -> String {
     case_normalization_key(path)
 }
 
+/// Create the directory `relative` under `base` one component at a time,
+/// relative to an open handle on `base`, refusing any symbolic link on the
+/// way.
+pub(crate) fn create_directory(base: &Path, relative: &str) -> io::Result<()> {
+    crate::paths::validate_relative_path(relative)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let root = BudgetedDir::open(None, || Dir::open_ambient_dir(base, ambient_authority()))?;
+    // Every component of `relative` is a parent of the placeholder name,
+    // which itself is never touched.
+    relative_parent(&root, &Path::new(relative).join("_"), true).map(|_| ())
+}
+
 fn relative_parent(
     root: &BudgetedDir,
     relative: &Path,
@@ -1070,6 +1082,26 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(!outside.join("file.bin").exists());
         assert!(!root.path().join("old-parent/file.bin").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directories_are_created_without_following_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestRoot::new("directory-creation");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let base = root.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        create_directory(&base, "shelf/drawer").unwrap();
+        assert!(base.join("shelf/drawer").is_dir());
+
+        symlink(&outside, base.join("linked")).unwrap();
+        let error = create_directory(&base, "linked/drawer").expect_err("a link is refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!outside.join("drawer").exists());
+        assert!(create_directory(&base, "../escape").is_err());
     }
 
     #[test]
