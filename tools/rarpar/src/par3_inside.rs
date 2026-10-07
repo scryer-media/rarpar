@@ -123,7 +123,7 @@ fn volume_set(paths: &[PathBuf]) -> Result<Vec<PathBuf>, RarparError> {
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter_map(|candidate| {
             let (candidate_stem, number) = part_number(&candidate)?;
-            (candidate_stem == stem).then_some((number, candidate))
+            same_stem(&candidate_stem, &stem).then_some((number, candidate))
         })
         .collect();
     volumes.sort();
@@ -136,6 +136,31 @@ fn volume_set(paths: &[PathBuf]) -> Result<Vec<PathBuf>, RarparError> {
         }
     }
     Ok(volumes.into_iter().map(|(_, path)| path).collect())
+}
+
+/// A file name or volume family stem as the platform's file names compare:
+/// exactly, and on Windows under simple case folding, so there
+/// `set.part1.rar` and `SET.part2.rar` are one family. Each character folds to its one-character
+/// uppercase, as NTFS's upcase table does; one with a longer uppercase (`ß`)
+/// stays itself.
+fn name_key(stem: &str) -> String {
+    if !cfg!(windows) {
+        return stem.to_owned();
+    }
+    stem.chars()
+        .map(|c| {
+            let mut upper = c.to_uppercase();
+            match (upper.next(), upper.next()) {
+                (Some(single), None) => single,
+                _ => c,
+            }
+        })
+        .collect()
+}
+
+/// Whether two `.partN.rar` stems name one family, by [`name_key`].
+fn same_stem(a: &str, b: &str) -> bool {
+    a == b || name_key(a) == name_key(b)
 }
 
 /// `(stem, N)` for `stem.partN.rar`.
@@ -398,12 +423,16 @@ fn open(cli: &Cli, args: &Par3InsideArgs) -> Result<Vec<Rar5Set>, RarparError> {
             continue;
         };
         let directory = directory_of(path);
-        if !families.insert((directory.clone(), stem.clone())) {
+        if !families.insert((directory.clone(), name_key(&stem))) {
             continue;
         }
+        // The directory's own spelling is opened: on Windows a family named
+        // in another case is still listed whole.
         let mut siblings: Vec<PathBuf> = std::fs::read_dir(&directory)?
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|candidate| part_number(candidate).is_some_and(|(found, _)| found == stem))
+            .filter(|candidate| {
+                part_number(candidate).is_some_and(|(found, _)| same_stem(&found, &stem))
+            })
             .filter(|candidate| !listed.contains(candidate))
             .collect();
         siblings.sort();
@@ -435,7 +464,7 @@ fn uncovered_volumes(cli: &Cli, args: &Par3InsideArgs, sets: &[Rar5Set]) -> Vec<
             .map(directory_of)
             .collect();
         for directory in directories {
-            covered.extend(names.iter().map(|name| (directory.clone(), name.clone())));
+            covered.extend(names.iter().map(|name| (directory.clone(), name_key(name))));
         }
     }
     let recorded: usize = sets.iter().map(|set| set.hosts.len()).sum();
@@ -447,25 +476,33 @@ fn uncovered_volumes(cli: &Cli, args: &Par3InsideArgs, sets: &[Rar5Set]) -> Vec<
             continue;
         };
         let directory = directory_of(path);
-        if !families.insert((directory.clone(), stem.clone())) {
+        if !families.insert((directory.clone(), name_key(&stem))) {
             continue;
         }
         let Ok(entries) = std::fs::read_dir(&directory) else {
             continue;
         };
-        let mut present: Vec<(u64, PathBuf, usize)> = entries
+        let mut present: Vec<(u64, PathBuf, usize, String)> = entries
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
             // Only a file can be a volume: a directory at a volume's name
             // must not mask that volume as present.
             .filter(|candidate| candidate.is_file())
             .filter_map(|candidate| {
                 let (candidate_stem, number) = part_number(&candidate)?;
-                let width = candidate.file_name()?.to_str()?.len() - stem.len() - ".part.rar".len();
-                (candidate_stem == stem).then_some((number, candidate, width))
+                let width = candidate.file_name()?.to_str()?.len()
+                    - candidate_stem.len()
+                    - ".part.rar".len();
+                same_stem(&candidate_stem, &stem).then_some((
+                    number,
+                    candidate,
+                    width,
+                    candidate_stem,
+                ))
             })
             .collect();
         present.sort();
-        let Some((highest, last, width)) = present.last().cloned() else {
+        // A missing volume is named in the family's spelling on disk.
+        let Some((highest, last, width, spelling)) = present.last().cloned() else {
             continue;
         };
         let more = crate::par3::execution_options(
@@ -482,14 +519,14 @@ fn uncovered_volumes(cli: &Cli, args: &Par3InsideArgs, sets: &[Rar5Set]) -> Vec<
         .is_some_and(|archive| archive.more_volumes);
         let bound = (present.len() + recorded + 1) as u64;
         let end = highest.saturating_add(u64::from(more)).min(bound);
-        let numbers: HashSet<u64> = present.iter().map(|(found, _, _)| *found).collect();
+        let numbers: HashSet<u64> = present.iter().map(|(found, ..)| *found).collect();
         for number in 1..=end {
             if numbers.contains(&number) {
                 continue;
             }
-            let name = format!("{stem}.part{number:0width$}.rar");
-            if !covered.contains(&(directory.clone(), name.clone()))
-                && reported.insert(name.clone())
+            let name = format!("{spelling}.part{number:0width$}.rar");
+            if !covered.contains(&(directory.clone(), name_key(&name)))
+                && reported.insert(name_key(&name))
             {
                 missing.push(name);
             }
@@ -681,8 +718,19 @@ fn remove(cli: &Cli, args: &Par3InsideRemoveArgs) -> Result<(bool, Value), Rarpa
 
 #[cfg(test)]
 mod tests {
-    use super::check_host_name;
+    use super::{check_host_name, same_stem};
     use crate::error::RarparError;
+
+    /// Family stems compare exactly everywhere, and on Windows also across
+    /// case; a character whose uppercase is longer than one never folds.
+    #[test]
+    fn family_stems_compare_as_the_platform_names_files() {
+        assert!(same_stem("plover", "plover"));
+        assert!(!same_stem("plover", "plover2"));
+        assert_eq!(same_stem("plover", "PLOVER"), cfg!(windows));
+        assert_eq!(same_stem("\u{e9}t\u{e9}", "\u{c9}T\u{c9}"), cfg!(windows));
+        assert!(!same_stem("stra\u{df}e", "STRASSE"));
+    }
 
     #[test]
     fn a_recorded_host_name_must_be_one_safe_component() {

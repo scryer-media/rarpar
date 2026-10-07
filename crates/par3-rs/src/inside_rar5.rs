@@ -1444,8 +1444,13 @@ fn open_set(
             let offset = packet.origin().offset;
             if offset >= start && (offset - start).is_multiple_of(recovery_len) {
                 let slot = (offset - start) / recovery_len;
-                if slot < host.recovery.end && index >= before + slot {
-                    first = Some(index - before - slot);
+                // An authenticated packet may still carry any index: the
+                // arithmetic is checked, never wrapped.
+                let earlier = before
+                    .checked_add(slot)
+                    .ok_or(EngineError::Unsupported("recovery index out of range"))?;
+                if slot < host.recovery.end && index >= earlier {
+                    first = Some(index - earlier);
                     break 'base;
                 }
             }
@@ -1454,8 +1459,11 @@ fn open_set(
     let mut base = first.unwrap_or(0);
     for host in &mut hosts {
         let count = host.recovery.end;
-        host.recovery = base..base + count;
-        base += count;
+        let end = base
+            .checked_add(count)
+            .ok_or(EngineError::Unsupported("recovery index out of range"))?;
+        host.recovery = base..end;
+        base = end;
     }
     for host in hosts.iter_mut().filter(|host| host.source.is_none()) {
         let by_recovery = candidates.iter().find(|c| {
@@ -2295,6 +2303,54 @@ mod tests {
         let written = set.remove(&destinations).unwrap();
         assert_eq!(written.len(), 2);
         drop(set);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Rewrite the first Recovery Data packet of `bytes` to carry `index`,
+    /// with its packet hash recomputed so the packet still authenticates.
+    fn set_first_recovery_index(bytes: &mut [u8], index: u64) {
+        let at = bytes
+            .windows(8)
+            .position(|window| window == b"PAR REC\0")
+            .expect("a Recovery Data packet")
+            - 40;
+        let length = u64::from_le_bytes(bytes[at + 24..at + 32].try_into().unwrap()) as usize;
+        bytes[at + 80..at + 88].copy_from_slice(&index.to_le_bytes());
+        let hash = crate::hash::fingerprint(&bytes[at + 24..at + length]);
+        bytes[at + 8..at + 24].copy_from_slice(&hash);
+    }
+
+    /// An authenticated Recovery Data packet at a host's first slot may carry
+    /// any index. One that puts the host's recovery range past `u64::MAX` is
+    /// refused, never wrapped or a panic; a shifted index in range still binds.
+    #[test]
+    fn recovery_indices_past_the_index_space_are_refused() {
+        let dir = scratch_dir("recovery-index");
+        let inserted = insert_synthetic(&dir, &["thrush-ledger.rar"], 40, false);
+        let pristine = std::fs::read(&inserted[0]).unwrap();
+        let sets = open(&inserted, &ExecutionOptions::default()).unwrap();
+        assert_eq!(sets[0].hosts[0].recovery, 0..2);
+        // The opened set holds its host open: it is closed before the host
+        // is rewritten or removed.
+        drop(sets);
+        for index in [u64::MAX, u64::MAX - 1] {
+            let mut bytes = pristine.clone();
+            set_first_recovery_index(&mut bytes, index);
+            std::fs::write(&inserted[0], &bytes).unwrap();
+            assert!(
+                matches!(
+                    open(&inserted, &ExecutionOptions::default()),
+                    Err(EngineError::Unsupported("recovery index out of range"))
+                ),
+                "index {index}"
+            );
+        }
+        let mut bytes = pristine;
+        set_first_recovery_index(&mut bytes, 5);
+        std::fs::write(&inserted[0], &bytes).unwrap();
+        let sets = open(&inserted, &ExecutionOptions::default()).unwrap();
+        assert_eq!(sets[0].hosts[0].recovery, 5..7);
+        drop(sets);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

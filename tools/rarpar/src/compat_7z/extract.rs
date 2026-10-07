@@ -217,24 +217,23 @@ mod anchored {
         }
 
         /// Sets the times of `name` itself, a link included.
-        pub fn set_link_times(&self, name: &str, time: filetime::FileTime) {
-            let Ok(name) = c_name(name.as_bytes()) else {
-                return;
-            };
+        pub fn set_link_times(&self, name: &str, time: filetime::FileTime) -> io::Result<()> {
+            let name = c_name(name.as_bytes())?;
             // SAFETY: a zeroed `timespec` is valid; both fields are set.
             let mut stamp: libc::timespec = unsafe { std::mem::zeroed() };
             stamp.tv_sec = time.unix_seconds() as _;
             stamp.tv_nsec = time.nanoseconds() as _;
             let times = [stamp, stamp];
             // SAFETY: an open folder, a NUL-terminated name and two times.
-            unsafe {
+            check(unsafe {
                 libc::utimensat(
                     self.fd(),
                     name.as_ptr(),
                     times.as_ptr(),
                     libc::AT_SYMLINK_NOFOLLOW,
-                );
-            }
+                )
+            })
+            .map(drop)
         }
     }
 }
@@ -641,27 +640,50 @@ fn link_is_safe(item_parts: &[String], target: &str) -> bool {
     true
 }
 
-/// Sets a member's time and mode through an open handle on its output, so
-/// nothing is looked up by path again.
+/// A member's time or mode that could not be set: the message 7-Zip-style
+/// output names it with, and the system's reason.
+type MetadataError = (&'static str, io::Error);
+
+const CANNOT_SET_TIME: &str = "Cannot set file time";
+const CANNOT_SET_ATTRIBUTE: &str = "Cannot set file attribute";
+
+/// The folder walk's failure as the system error it stands for.
 #[cfg(unix)]
-fn apply_metadata(file: &File, item: &Item) {
+fn folder_io(error: FolderError) -> io::Error {
+    match error {
+        FolderError::Link => io::Error::from_raw_os_error(libc::ELOOP),
+        FolderError::Io(error) => error,
+    }
+}
+
+/// Sets a member's time and mode through an open handle on its output, so
+/// nothing is looked up by path again. Every step is tried; the first that
+/// fails is returned.
+#[cfg(unix)]
+fn apply_metadata(file: &File, item: &Item) -> Result<(), MetadataError> {
     use std::os::unix::fs::PermissionsExt;
+    let mut first = None;
     if let Some(ticks) = item.mtime {
         let time = filetime_of(ticks);
-        let _ = filetime::set_file_handle_times(file, Some(time), Some(time));
+        if let Err(error) = filetime::set_file_handle_times(file, Some(time), Some(time)) {
+            first = Some((CANNOT_SET_TIME, error));
+        }
     }
-    let Some(attrib) = item.attrib else {
-        return;
+    let mode = match item.attrib {
+        Some(attrib) if attrib & ATTRIB_UNIX_EXTENSION != 0 => Some(Ok((attrib >> 16) & 0o7777)),
+        Some(attrib) if attrib & ATTRIB_READONLY != 0 => Some(
+            file.metadata()
+                .map(|meta| meta.permissions().mode() & !0o222),
+        ),
+        _ => None,
     };
-    if attrib & ATTRIB_UNIX_EXTENSION != 0 {
-        let mode = (attrib >> 16) & 0o7777;
-        let _ = file.set_permissions(fs::Permissions::from_mode(mode));
-    } else if attrib & ATTRIB_READONLY != 0
-        && let Ok(meta) = file.metadata()
+    if let Some(mode) = mode
+        && let Err(error) =
+            mode.and_then(|mode| file.set_permissions(fs::Permissions::from_mode(mode)))
     {
-        let mode = meta.permissions().mode() & !0o222;
-        let _ = file.set_permissions(fs::Permissions::from_mode(mode));
+        first.get_or_insert((CANNOT_SET_ATTRIBUTE, error));
     }
+    first.map_or(Ok(()), Err)
 }
 
 /// Sets the metadata of `name` in `dir`. A link member gets its times only:
@@ -669,38 +691,49 @@ fn apply_metadata(file: &File, item: &Item) {
 /// output folder (through a link already there), so a link keeps the mode it
 /// was made with. Anything else is opened without following a link.
 #[cfg(unix)]
-fn set_metadata_at(dir: &Dir, name: &str, item: &Item) {
+fn set_metadata_at(dir: &Dir, name: &str, item: &Item) -> Result<(), MetadataError> {
     if item.symlink {
         if let Some(ticks) = item.mtime {
-            dir.set_link_times(name, filetime_of(ticks));
+            dir.set_link_times(name, filetime_of(ticks))
+                .map_err(|error| (CANNOT_SET_TIME, error))?;
         }
-    } else if let Ok(file) = dir.open_existing(name) {
-        apply_metadata(&file, item);
+        Ok(())
+    } else {
+        let file = dir
+            .open_existing(name)
+            .map_err(|error| (CANNOT_SET_ATTRIBUTE, error))?;
+        apply_metadata(&file, item)
     }
 }
 
 #[cfg(not(unix))]
-fn set_metadata(path: &Path, item: &Item) {
+fn set_metadata(path: &Path, item: &Item) -> Result<(), MetadataError> {
+    let mut first = None;
     if let Some(ticks) = item.mtime {
         let time = filetime_of(ticks);
-        let _ = filetime::set_symlink_file_times(path, time, time);
+        if let Err(error) = filetime::set_symlink_file_times(path, time, time) {
+            first = Some((CANNOT_SET_TIME, error));
+        }
     }
     let Some(attrib) = item.attrib else {
-        return;
+        return first.map_or(Ok(()), Err);
     };
     // Setting permissions follows a link, and a link's target may sit outside
     // the output folder (through a link already there), so a link keeps the
     // mode it was made with.
     if fs::symlink_metadata(path).map_or(true, |meta| meta.file_type().is_symlink()) {
-        return;
+        return first.map_or(Ok(()), Err);
     }
     if attrib & ATTRIB_READONLY != 0
-        && let Ok(meta) = fs::metadata(path)
+        && let Err(error) = fs::metadata(path).and_then(|meta| {
+            let mut permissions = meta.permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(path, permissions)
+        })
     {
-        let mut permissions = meta.permissions();
-        permissions.set_readonly(true);
-        let _ = fs::set_permissions(path, permissions);
+        first.get_or_insert((CANNOT_SET_ATTRIBUTE, error));
     }
+    first.map_or(Ok(()), Err)
 }
 
 /// Whether a decoded member is intact: one with its own CRC is judged by it,
@@ -775,11 +808,22 @@ impl Extractor<'_> {
     /// Sets a written member's metadata, reaching it the way it was made.
     fn place_metadata(&mut self, place: &Place, item: &Item) {
         #[cfg(unix)]
-        if let Ok((dir, _)) = self.folder(&place.folders, false) {
-            set_metadata_at(&dir, &place.name, item);
-        }
+        let result = self
+            .folder(&place.folders, false)
+            .map_err(|error| (CANNOT_SET_ATTRIBUTE, folder_io(error)))
+            .and_then(|(dir, _)| set_metadata_at(&dir, &place.name, item));
         #[cfg(not(unix))]
-        set_metadata(Path::new(&place.path), item);
+        let result = set_metadata(Path::new(&place.path), item);
+        self.metadata_result(result, &place.path);
+    }
+
+    /// A time or mode the facade preserves that could not be set is an
+    /// error of its member, named with its path and the system's reason.
+    fn metadata_result(&mut self, result: Result<(), MetadataError>, path: &str) {
+        if let Err((message, error)) = result {
+            let text = format!("{message} : {}", errno_text(&error));
+            self.item_error(&text, path);
+        }
     }
 
     fn operation_line(&mut self, item: &Item, test: bool) {
@@ -1150,23 +1194,25 @@ impl Extractor<'_> {
                 return Ok(());
             }
             self.written += 1;
-            set_metadata_at(&dir, &place.name, &item);
+            let result = set_metadata_at(&dir, &place.name, &item);
+            self.metadata_result(result, &place.path);
             return Ok(());
         }
         let _ = &link_target;
         self.written += 1;
         #[cfg(unix)]
-        match &file {
+        let result = match &file {
             // A link member that failed its CRC keeps its placeholder, and
             // gets only the times a link would.
             Some(file) if !item.symlink => apply_metadata(file, &item),
             _ => set_metadata_at(&dir, &place.name, &item),
-        }
+        };
         #[cfg(not(unix))]
-        {
+        let result = {
             drop((file, dir));
-            set_metadata(Path::new(&place.path), &item);
-        }
+            set_metadata(Path::new(&place.path), &item)
+        };
+        self.metadata_result(result, &place.path);
         Ok(())
     }
 
@@ -1380,31 +1426,31 @@ pub(super) fn extract(
         }
         extractor.flush_until(count).err()
     };
-    let ending = match ending {
+    for (parts, path, item) in std::mem::take(&mut extractor.dirs).iter().rev() {
+        // Each folder is reached again from the output folder's handle,
+        // rather than held open: an archive may make any number of them.
+        #[cfg(unix)]
+        let result = extractor
+            .folder(parts, false)
+            .map_err(|error| (CANNOT_SET_ATTRIBUTE, folder_io(error)))
+            .and_then(|(dir, _)| apply_metadata(&dir.0, item));
+        #[cfg(not(unix))]
+        let result = {
+            let _ = parts;
+            set_metadata(path, item)
+        };
+        extractor.metadata_result(result, &path.display().to_string());
+    }
+    // Folder metadata is set before the count is taken, so a folder whose
+    // time or mode could not be set is among the errors.
+    match ending {
         None => Ending::Done {
             errors: extractor.errors,
             written: extractor.written,
         },
         Some(Stop::Abort) => Ending::Abort,
         Some(Stop::Write(error) | Stop::Read(error)) => Ending::Failed(error),
-    };
-    for (parts, path, item) in std::mem::take(&mut extractor.dirs).iter().rev() {
-        // Each folder is reached again from the output folder's handle,
-        // rather than held open: an archive may make any number of them.
-        #[cfg(unix)]
-        {
-            let _ = path;
-            if let Ok((dir, _)) = extractor.folder(parts, false) {
-                apply_metadata(&dir.0, item);
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = parts;
-            set_metadata(path, item);
-        }
     }
-    ending
 }
 
 #[cfg(test)]

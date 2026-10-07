@@ -827,6 +827,12 @@ fn find_archives(
     }
     // `-ax`: an excluded archive is never opened, so never deleted.
     found.retain(|(path, _)| options.archive_excludes.selects(path, false));
+    // An archive two selectors both name (a positional name and an `-ai`
+    // rule, say) is opened once, in the place it was first found.
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|(path, _)| {
+        seen.insert(fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path)))
+    });
     if found.is_empty() && (wildcard_names || options.archives.is_empty()) {
         return Err(line_error(
             session,
