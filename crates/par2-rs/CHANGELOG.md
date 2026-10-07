@@ -20,7 +20,12 @@ Fewer redundant reads on the verify and repair paths.
   parallel — the slice checks cannot hide and wall time follows CPU; on a
   loaded host a clean verify measured up to 48% slower with 4 MiB slices. `VerifyOptions::single_read = false` restores the two-pass behaviour;
   it is on by default for `verify_all`, `verify_selected_file_ids` and their
-  `_with_options` and `_parallel` variants.
+  `_with_options` and `_parallel` variants. The side-by-side join opens only
+  when no other rayon axis is in flight: a lone file under
+  `verify_selected_file_ids_parallel_with_options`, or a verify loop that is
+  not running on a rayon worker. Files verified in parallel run the two
+  computations one after the other on their own worker, so a worker blocked
+  on a join cannot steal another file's verification frame onto its stack.
 - Planning a repair (`plan_repair_with_memory_limit`) and discarding unusable
   recovery packets after `InsufficientRecoveryData` no longer re-read and
   re-hash recovery payloads that the bounded file scan already authenticated.
@@ -30,27 +35,29 @@ Fewer redundant reads on the verify and repair paths.
   `RecoverySliceData::validate_packet_hash` accepts the scan's verdict while
   the path still fingerprints the same, and reads and hashes the payload as
   before when the volume changed, was replaced, is no longer a regular file,
-  or was too fresh to vouch for. Payloads built by any other constructor
-  are always re-hashed. A same-length rewrite that also restores the mtime is
-  invisible to the fingerprint and is left to the verification of the
-  repaired files.
+  or was too fresh to vouch for. Payloads built by any other constructor,
+  or as a `FileBacked` literal naming a span the scan did not hash, are always
+  re-hashed. A same-length rewrite that also restores the mtime is invisible
+  to the fingerprint and is left to the verification of the repaired files.
+  The scan's record is kept privately beside the payload, keyed by the
+  volume's interned path, so `RecoverySliceData::FileBacked` keeps exactly
+  the fields it had in 0.10.7.
 
 ### Added
 
 - `identify_par2_files_for_set(dir, &Par2FileSet)`: `identify_par2_files` for
   the set's recovery set ID that skips the files the set protects instead of
-  opening each one and reading its first 64 bytes. `identify_par2_files` is
-  unchanged.
+  opening each one and reading its first 64 bytes. An entry is skipped only
+  when it is a regular file at a protected name with the length the set
+  records for it; any other entry at a protected name, such as a renamed
+  volume standing where a data file is missing, is read and identified like
+  every other candidate. `identify_par2_files` is unchanged.
 
 ### API
 
 - `VerifyOptions` has a new `single_read: bool` field, `true` by default (see
   above). `VerifyOptions::default()` is now written out by hand rather than
   derived; every other field keeps its default.
-- `RecoverySliceData::FileBacked` has a new `authenticated_at:
-  Option<FileStatFingerprint>` field. Patterns that use `..` are unaffected;
-  code that builds the variant literally adds `authenticated_at: None` or uses
-  the existing constructors, which set it to `None`.
 
 ## 0.10.7 (Unreleased)
 

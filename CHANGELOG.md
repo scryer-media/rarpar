@@ -7,6 +7,13 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ### CLI Changes
 
+- `par verify` and `par repair` read a damaged file once. The strict pass
+  checks every slice's CRC32 and MD5 beside the whole-file hash and runs to
+  the end of the file, so a damaged file no longer costs a second full read;
+  verdicts are unchanged. Clean files pay more CPU for the slice hashes.
+- `par repair` no longer re-reads and re-hashes the recovery packets the set
+  scan already authenticated while their volumes are unchanged on disk.
+
 - The format probes that read the first bytes of every file in a directory
   (PAR3 sibling discovery and `auto` classification) no longer pull in
   read-ahead (random-access advice on Linux, `F_RDAHEAD` off on macOS). A
@@ -121,7 +128,8 @@ documented in each crate's own changelog so those notes ship with the crate.
 - par2-rs 0.10.8: strict verify reads a damaged file once, repair planning
   trusts the scan's recovery packet authentication while a volume's stat is
   unchanged, and `identify_par2_files_for_set` skips the files a set
-  protects. Other library versions are unchanged.
+  protects that are present at their recorded lengths. Other library
+  versions are unchanged.
 
 ## rarpar 0.8.0
 

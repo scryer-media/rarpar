@@ -644,11 +644,22 @@ struct SingleReadOutcome {
 /// to its first bad slice and then again in full. Once a slice has failed the
 /// file cannot be complete, so the chain is abandoned from the next chunk on,
 /// and the rest of a damaged file pays only for the slice checks.
+<<<<<<< HEAD
+=======
+///
+/// `may_join` says whether the side-by-side join may open: see
+/// [`single_read_may_join`]. Without it both computations run on the calling
+/// thread, one after the other, over the same chunk.
+>>>>>>> feature/par2-readback-main
 fn stream_strict_single_read(
     par2: &Par2FileSet,
     file_id: &FileId,
     access: &dyn FileAccess,
     checksums: &[SliceChecksum],
+<<<<<<< HEAD
+=======
+    may_join: bool,
+>>>>>>> feature/par2-readback-main
 ) -> SingleReadOutcome {
     let failed = SingleReadOutcome {
         complete: false,
@@ -665,8 +676,14 @@ fn stream_strict_single_read(
         return failed;
     }
     let chunk_bytes = single_read_chunk_bytes(slice_size);
+<<<<<<< HEAD
     let side_by_side =
         reedsolomon_rs::threading::parallel_enabled() && rayon::current_num_threads() > 1;
+=======
+    let side_by_side = may_join
+        && reedsolomon_rs::threading::parallel_enabled()
+        && rayon::current_num_threads() > 1;
+>>>>>>> feature/par2-readback-main
 
     let mut quick_state = checksum::FileHashState::new();
     let mut full_state = None;
@@ -741,6 +758,24 @@ fn stream_strict_single_read(
     }
 }
 
+<<<<<<< HEAD
+=======
+/// Whether [`stream_strict_single_read`] may join its two per-chunk
+/// computations on rayon.
+///
+/// Parallelism runs on one axis at a time (see
+/// [`verify_repaired_file_ids_parallel`]): a per-chunk join inside the
+/// file-parallel `par_iter` of [`verify_selected_file_ids_parallel_with_options`]
+/// would let a worker blocked on it steal other files' verification frames
+/// onto its stack. So the join opens only when the caller has said there is
+/// no other axis in flight (`span_access` present: a lone file), or when the
+/// verify loop is not running on a rayon worker at all, so nothing it blocks
+/// on can be stolen onto its stack.
+fn single_read_may_join(span_access_present: bool) -> bool {
+    span_access_present || rayon::current_thread_index().is_none()
+}
+
+>>>>>>> feature/par2-readback-main
 fn verify_full_hash_streaming(
     expected_hash: [u8; 16],
     actual_len: u64,
@@ -2256,7 +2291,17 @@ fn verify_selected_file_ids_resolved(
         if options.single_read
             && let Some(checksums) = checksums
         {
+<<<<<<< HEAD
             let single = stream_strict_single_read(par2, file_id, access, checksums);
+=======
+            let single = stream_strict_single_read(
+                par2,
+                file_id,
+                access,
+                checksums,
+                single_read_may_join(span_access.is_some()),
+            );
+>>>>>>> feature/par2-readback-main
             let file = if single.complete {
                 FileVerification {
                     file_id: *file_id,
@@ -4458,6 +4503,78 @@ mod tests {
         }
     }
 
+<<<<<<< HEAD
+=======
+    /// File-parallel strict verification with single-read on must give the
+    /// verdicts of the sequential path, file for file, when several files are
+    /// damaged at different slices — and its per-chunk join stays closed on
+    /// the workers that run the file-level `par_iter`, so the two parallel
+    /// axes never nest. The join decision is checked on a pool worker and off
+    /// one directly rather than inferred from timing.
+    #[test]
+    fn file_parallel_single_read_matches_sequential_and_never_nests_the_join() {
+        let slice_size = 4096u64;
+        let len = (slice_size as usize) * 12 + 100;
+        let names = [
+            "invented-volume-a.bin",
+            "invented-volume-b.bin",
+            "invented-volume-c.bin",
+            "invented-volume-d.bin",
+            "invented-volume-e.bin",
+        ];
+        let pristine: Vec<Vec<u8>> = (0..names.len())
+            .map(|i| {
+                deterministic_file(len)
+                    .into_iter()
+                    .map(|byte| byte.wrapping_add(i as u8))
+                    .collect()
+            })
+            .collect();
+        let entries: Vec<(&[u8], &str)> = pristine
+            .iter()
+            .zip(names)
+            .map(|(data, name)| (data.as_slice(), name))
+            .collect();
+        let (set, mut access, file_ids) = setup_test_set_multi(&entries, slice_size);
+        // Four of five files damaged, each somewhere else; one stays intact.
+        for (index, damaged_slices) in [vec![0usize], vec![5, 6], vec![12], vec![3, 9, 11]]
+            .into_iter()
+            .enumerate()
+        {
+            let mut data = pristine[index].clone();
+            for slice in damaged_slices {
+                data[slice * slice_size as usize + 11] ^= 0x5a;
+            }
+            access.add_file(file_ids[index], data);
+        }
+
+        let sequential =
+            verify_selected_file_ids_with_options(&set, &access, &file_ids, &two_pass_opts());
+        assert_eq!(
+            sequential
+                .files
+                .iter()
+                .filter(|file| matches!(file.status, FileStatus::Damaged(_)))
+                .count(),
+            4,
+            "fixture must damage four files"
+        );
+        for options in [strict_opts(), two_pass_opts()] {
+            let parallel =
+                verify_selected_file_ids_parallel_with_options(&set, &access, &file_ids, &options);
+            assert_eq!(format!("{parallel:?}"), format!("{sequential:?}"));
+        }
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        assert!(!pool.install(|| single_read_may_join(false)));
+        assert!(pool.install(|| single_read_may_join(true)));
+        assert!(single_read_may_join(false));
+    }
+
+>>>>>>> feature/par2-readback-main
     /// Process CPU time (user + system, every thread), for the perf
     /// measurement below.
     #[cfg(unix)]
