@@ -407,6 +407,10 @@ type RunRecord struct {
 	StderrLine string       `json:"stderr_line,omitempty"`
 	Identity   *Identity    `json:"identity,omitempty"`
 	Repair     *RepairCheck `json:"repair,omitempty"`
+	// SelfRepair is a create row's own set repairing damaged inputs back to
+	// the originals, for a set whose recovery payloads the reference's did
+	// not vouch for.
+	SelfRepair *RepairCheck `json:"self_repair,omitempty"`
 }
 
 // IOCountRecord is one untimed strace pass.
@@ -1591,17 +1595,34 @@ func (r *runner) runOne(ctx context.Context, op string, config Config, dataset D
 			record.StderrLine = lastLine(result)
 			return record, nil
 		}
-		if canonicalSource != ToolReference {
-			// No reference set to compare against.
+		var identity *Identity
+		if canonicalSource == ToolReference {
+			compared := CompareCarriers(canonicalSet, set)
+			identity = &compared
+			record.Identity = identity
+			if variant.Tool == ToolReference && !compared.Bytes {
+				// The reference must reproduce itself; if it does not, nothing
+				// compared against it means anything.
+				record.Status = StatusFailed
+				record.Failure = "reference-nondeterministic"
+				break
+			}
+		}
+		if !needsSelfRepair(variant.Tool, identity) {
 			break
 		}
-		identity := CompareCarriers(canonicalSet, set)
-		record.Identity = &identity
-		if variant.Tool == ToolReference && !identity.Bytes {
-			// The reference must reproduce itself; if it does not, nothing
-			// compared against it means anything.
+		// Verify and repair rows read the canonical set, never this one: a
+		// set whose payloads differ from the reference's (or that had no
+		// reference to compare with) proves itself by repairing damage.
+		check, failure, detail, err := r.selfRepair(ctx, config, dataset, manifest, state.dataDir, dir, variant)
+		if err != nil {
+			return record, err
+		}
+		record.SelfRepair = &check
+		if failure != "" {
 			record.Status = StatusFailed
-			record.Failure = "reference-nondeterministic"
+			record.Failure = failure
+			record.Error = detail
 		}
 	case OpRepair:
 		check, err := checkRepair(dir, manifest, state.canonical)
@@ -1617,6 +1638,50 @@ func (r *runner) runOne(ctx context.Context, op string, config Config, dataset D
 		}
 	}
 	return record, nil
+}
+
+// needsSelfRepair reports whether a create row's own set must repair damage
+// to count: every set but the reference's own, unless its recovery payloads
+// match the reference set's (which the reference's repairs exercise).
+func needsSelfRepair(tool string, identity *Identity) bool {
+	if tool == ToolReference {
+		return false
+	}
+	return identity == nil || !identity.RecoveryPayloads
+}
+
+// selfRepair stages the dataset's inputs, damaged as the config's repair
+// rows damage them, beside the carriers a create wrote to created, and has
+// the candidate repair them. The failure is "" when every protected file
+// comes back byte for byte.
+func (r *runner) selfRepair(ctx context.Context, config Config, dataset Dataset, manifest DatasetManifest,
+	dataDir, created string, variant Variant) (RepairCheck, string, string, error) {
+	stage := created + "-self-repair"
+	if !r.options.KeepStages {
+		defer os.RemoveAll(stage)
+	}
+	if err := stageFrom(stage, dataset, dataDir, created, config, OpRepair, ""); err != nil {
+		return RepairCheck{}, "", "", err
+	}
+	result := Run(ctx, r.checkCommand(OpRepair, stage, variant))
+	if result.Failure == "timeout" && ctx.Err() != nil {
+		return RepairCheck{}, "", "", ctx.Err()
+	}
+	if result.Failure != "" || result.ExitCode != 0 {
+		detail := fmt.Sprintf("repairing with its own set: exit %d %s", result.ExitCode, result.Failure)
+		if line := lastLine(result); line != "" {
+			detail += ": " + line
+		}
+		return RepairCheck{}, "self-repair-failed", strings.TrimSpace(detail), nil
+	}
+	check, err := checkRepair(stage, manifest, created)
+	if err != nil {
+		return check, "", "", err
+	}
+	if !check.Match {
+		return check, "self-repair-mismatch", "its own set repaired " + strings.Join(check.Mismatched, ", ") + " to the wrong bytes", nil
+	}
+	return check, "", "", nil
 }
 
 // exitAccepted reports whether a tool's run of op exited with the status of a
