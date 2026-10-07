@@ -1372,15 +1372,14 @@ fn rar3_recovery_reference_name<'a>(
 }
 
 /// A precomputed `rar3_data_volume_is_valid` verdict. The first read takes
-/// it, so an error is moved out rather than cloned; a second read of the same
-/// path recomputes it, as the serial code did.
+/// it, whatever it was, and a second read of the same path recomputes it from
+/// the file as the serial code did: the volume the reference-name search
+/// accepted is checked again when the slots are assigned, so one that changed
+/// after the side-by-side check does not enter the reconstruction on a stale
+/// verdict.
 fn take_rar3_validity(slot: &mut Option<RarResult<bool>>, path: &Path) -> RarResult<bool> {
     match slot.take() {
-        Some(Ok(valid)) => {
-            *slot = Some(Ok(valid));
-            Ok(valid)
-        }
-        Some(Err(error)) => Err(error),
+        Some(verdict) => verdict,
         None => rar3_data_volume_is_valid(path),
     }
 }
@@ -2925,6 +2924,29 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
 
         assert!(!rar3_data_volume_is_valid(&path).unwrap());
+    }
+
+    /// The reference-name search consumes the side-by-side verdict, so the
+    /// slot assignment checks the volume again: one that was intact when
+    /// first checked and was damaged since is then reported invalid instead
+    /// of entering the reconstruction on its stale verdict.
+    #[test]
+    fn rar3_reference_search_leaves_the_slot_assignment_to_recheck_the_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture_eta.part01.rar");
+        let mut bytes = rar4_archive_with_recovery_flag();
+        append_rar4_end_data_crc(&mut bytes, false);
+        std::fs::write(&path, &bytes).unwrap();
+        let data_paths = [&path];
+        let mut data_valid = vec![Some(rar3_data_volume_is_valid(&path))];
+
+        let reference = rar3_recovery_reference_name(&data_paths, &mut data_valid).unwrap();
+        assert_eq!(reference, path.as_path());
+
+        let mut damaged = rar4_archive_with_recovery_flag();
+        append_rar4_end_data_crc(&mut damaged, true);
+        std::fs::write(&path, damaged).unwrap();
+        assert!(!take_rar3_validity(&mut data_valid[0], &path).unwrap());
     }
 
     #[test]

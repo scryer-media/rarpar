@@ -64,6 +64,10 @@
   atomically when the name is taken, and the restore fails with the usual
   refusal while the file at that name is left untouched. Filesystems that
   cannot hard-link fall back to checking and renaming.
+- A RAR3 restore checks the data volume it takes its names from again when
+  it assigns the volumes to slots, as the serial restore did, instead of
+  reusing the verdict of the side-by-side check. A volume damaged after that
+  check is treated as missing rather than fed to the reconstruction.
 
 ## 0.10.8
 
