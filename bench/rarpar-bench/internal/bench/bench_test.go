@@ -843,10 +843,10 @@ func TestRAR5PhaseReportingUsesSuccessfulWarmupsAndIsDeterministic(t *testing.T)
 	raw.Plan.Warmups = 2
 	raw.Executions[0].Measurement.RAR5Phases = &RAR5PhaseEvidence{StagingNanos: &measuredOnly}
 	raw.Executions = append(raw.Executions,
-		Execution{Subject: "rarpar", Role: "candidate", CaseID: "case-1", Family: "rar", Workload: "RAR <unsafe>", Run: 1, Warmup: true, Success: true, Backend: "cpu", Measurement: Measurement{RAR5Phases: &RAR5PhaseEvidence{
+		Execution{Subject: "rarpar", Role: "candidate", CaseID: "case-1", Family: "rar", Workload: "RAR <unsafe>", Run: 1, Warmup: true, Success: true, Backend: "cpu", Measurement: Measurement{MaxRSSBytes: 1 << 20, RAR5Phases: &RAR5PhaseEvidence{
 			StagingNanos: &stagingFirst, HeaderScanNanos: &headerFirst, WorkerDecodeNanos: &workerFirst, SerialApplyNanos: &applyFirst,
 		}}},
-		Execution{Subject: "rarpar", Role: "candidate", CaseID: "case-1", Family: "rar", Workload: "RAR <unsafe>", Run: 2, Warmup: true, Success: true, Backend: "cpu", Measurement: Measurement{RAR5Phases: &RAR5PhaseEvidence{
+		Execution{Subject: "rarpar", Role: "candidate", CaseID: "case-1", Family: "rar", Workload: "RAR <unsafe>", Run: 2, Warmup: true, Success: true, Backend: "cpu", Measurement: Measurement{MaxRSSBytes: 1 << 20, RAR5Phases: &RAR5PhaseEvidence{
 			StagingNanos: &stagingSecond, HeaderScanNanos: &headerSecond, UnavailableReason: "worker decode was not emitted",
 		}}},
 		Execution{Subject: "rarpar", Role: "candidate", CaseID: "case-1", Family: "rar", Workload: "RAR <unsafe>", Run: 3, Warmup: true, Success: false, Backend: "cpu", Measurement: Measurement{RAR5Phases: &RAR5PhaseEvidence{StagingNanos: &measuredOnly}}},
@@ -956,8 +956,8 @@ func validCorpusConfig() CorpusConfig {
 func fixtureRunRecord() RunRecord {
 	plan := Plan{SchemaVersion: PlanSchemaVersion, ID: "plan-1", CorpusDigest: "corpus-digest", Seed: "seed", Warmups: 0, Repeats: 1, Lane: "cpu", Par2Placement: "canonical", Cases: []PlanCase{{ID: "case-1", Order: 1}}}
 	return RunRecord{SchemaVersion: 1, CollectorMode: wallClockCollector, Plan: plan, CorpusDigest: "corpus-digest", Machine: Machine{Label: "test-machine", Architecture: "arm64"}, Candidate: BinaryIdentity{Label: "rarpar", SHA256: "candidate"}, Reference: &BinaryIdentity{Label: "reference", SHA256: "reference"}, Executions: []Execution{
-		{Subject: "rarpar", Role: "candidate", CaseID: "case-1", Family: "rar", Workload: "RAR <unsafe>", Run: 1, Success: true, Backend: "cpu", Measurement: Measurement{WallNanos: 500_000_000}},
-		{Subject: "reference", Role: "reference", CaseID: "case-1", Family: "rar", Workload: "RAR <unsafe>", Run: 1, Success: true, Backend: "reference", Measurement: Measurement{WallNanos: 1_000_000_000}},
+		{Subject: "rarpar", Role: "candidate", CaseID: "case-1", Family: "rar", Workload: "RAR <unsafe>", Run: 1, Success: true, Backend: "cpu", Measurement: Measurement{WallNanos: 500_000_000, MaxRSSBytes: 48 << 20, RSSSource: "rusage"}},
+		{Subject: "reference", Role: "reference", CaseID: "case-1", Family: "rar", Workload: "RAR <unsafe>", Run: 1, Success: true, Backend: "reference", Measurement: Measurement{WallNanos: 1_000_000_000, MaxRSSBytes: 32 << 20, RSSSource: "rusage"}},
 	}}
 }
 

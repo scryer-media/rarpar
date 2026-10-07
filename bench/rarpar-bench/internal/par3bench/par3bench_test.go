@@ -435,7 +435,9 @@ func TestReportShowsDurabilityRowsAndReferenceDNF(t *testing.T) {
 	if !strings.Contains(report, "| rarpar-w1 | durable (default) | 3.000 [3.000–3.000] | 3.000 [3.000–3.000] | 10 [10–10] | - | - | - |") {
 		t.Fatalf("a rarpar row against a DNF reference must show no ratio:\n%s", report)
 	}
-	if strings.Index(report, "| rarpar-w1 | durable") > strings.Index(report, "| rarpar-w1-buffered |") {
+	// Within the configuration's table, not the peak RSS summary above it.
+	table := report[strings.Index(report, "## u — create"):]
+	if strings.Index(table, "| rarpar-w1 | durable") > strings.Index(table, "| rarpar-w1-buffered |") {
 		t.Fatal("the durable row must come before the buffered row")
 	}
 }

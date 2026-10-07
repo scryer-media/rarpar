@@ -1,6 +1,6 @@
 //go:build !windows
 
-package par3bench
+package procmeasure
 
 import (
 	"context"
