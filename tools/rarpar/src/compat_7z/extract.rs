@@ -16,6 +16,58 @@ use super::format::{
 use super::volume::Opened;
 use super::{Session, errno_text, filetime_of};
 
+/// The longest symlink target buffered; anything longer is refused while it
+/// streams, never accumulated.
+const MAX_LINK_TARGET: usize = 4096;
+
+/// Why a member's folders could not be made safely.
+enum FolderError {
+    /// A folder on the way is a symbolic link: writing through it could land
+    /// outside the output folder.
+    Link,
+    Io(io::Error),
+}
+
+/// Create the folders `parts` names under `base`, one component at a time,
+/// refusing any that is a symbolic link. `base` itself is the caller's own
+/// output folder and is trusted.
+fn confined_folders(base: &str, parts: &[String]) -> Result<(), FolderError> {
+    let mut path = PathBuf::from(if base.is_empty() { "." } else { base });
+    if !base.is_empty() {
+        fs::create_dir_all(&path).map_err(FolderError::Io)?;
+    }
+    for part in parts {
+        path.push(part);
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => return Err(FolderError::Link),
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(FolderError::Io(io::Error::from_raw_os_error(
+                    #[cfg(unix)]
+                    libc::ENOTDIR,
+                    #[cfg(not(unix))]
+                    267, // ERROR_DIRECTORY
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match fs::create_dir(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        // Raced: look again rather than trust it.
+                        let meta = fs::symlink_metadata(&path).map_err(FolderError::Io)?;
+                        if !meta.is_dir() || meta.file_type().is_symlink() {
+                            return Err(FolderError::Link);
+                        }
+                    }
+                    Err(error) => return Err(FolderError::Io(error)),
+                }
+            }
+            Err(error) => return Err(FolderError::Io(error)),
+        }
+    }
+    Ok(())
+}
+
 /// What to do with an output file that already exists (`-ao`, `-y`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Overwrite {
@@ -312,6 +364,15 @@ fn set_metadata(path: &Path, item: &Item) {
     }
 }
 
+/// Whether a decoded member is intact: one with its own CRC is judged by it,
+/// one without is only as good as its block's checksum.
+fn member_intact(expected: Option<u32>, crc: u32, block_failed: bool) -> bool {
+    match expected {
+        Some(expected) => expected == crc,
+        None => !block_failed,
+    }
+}
+
 /// Whether a read failed on sevenz-turbo's block checksum.
 fn is_checksum_failure(error: &io::Error) -> bool {
     error
@@ -399,13 +460,20 @@ impl Extractor<'_> {
         if self.setup.test || self.setup.to_stdout {
             return;
         }
-        let (path, _) = self.out_path(item);
+        let (path, parts) = self.out_path(item);
         let path = PathBuf::from(path);
-        if let Err(error) = fs::create_dir_all(&path) {
-            let text = format!("Cannot create folder : {}", errno_text(&error));
-            let shown = path.display().to_string();
-            self.item_error(&text, &shown);
-            return;
+        match confined_folders(&self.setup.out_dir, &parts) {
+            Ok(()) => {}
+            Err(FolderError::Link) => {
+                self.item_error("Dangerous link via another link was ignored", &item.name);
+                return;
+            }
+            Err(FolderError::Io(error)) => {
+                let text = format!("Cannot create folder : {}", errno_text(&error));
+                let shown = path.display().to_string();
+                self.item_error(&text, &shown);
+                return;
+            }
         }
         self.dirs.push((path, item.clone()));
     }
@@ -510,12 +578,12 @@ impl Extractor<'_> {
     }
 
     fn create(&mut self, path: &str) -> Option<File> {
-        match OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)
-        {
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        // Never write through a link planted at the member's own name.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NOFOLLOW);
+        match options.open(path) {
             Ok(file) => Some(file),
             Err(error) => {
                 let text = format!("Cannot open output file : {}", errno_text(&error));
@@ -532,15 +600,23 @@ impl Extractor<'_> {
             self.operation_line(item, self.setup.test);
             return Ok(Some(Output::default()));
         }
-        let (path, _) = self.out_path(item);
+        let (path, parts) = self.out_path(item);
+        // The folders on the way, made one at a time and never through a
+        // symbolic link, before anything at the member's own name is touched.
+        let folders = &parts[..parts.len().saturating_sub(1)];
+        match confined_folders(&self.setup.out_dir, folders) {
+            Ok(()) => {}
+            Err(FolderError::Link) => {
+                self.operation_line(item, false);
+                self.item_error("Dangerous link via another link was ignored", &item.name);
+                return Ok(None);
+            }
+            // As before: the open below reports the failure.
+            Err(FolderError::Io(_)) => {}
+        }
         let Some(path) = self.resolve_existing(path, item)? else {
             return Ok(None);
         };
-        if let Some(parent) = Path::new(&path).parent()
-            && !parent.as_os_str().is_empty()
-        {
-            let _ = fs::create_dir_all(parent);
-        }
         self.operation_line(item, false);
         let file = self.create(&path);
         Ok(Some(Output {
@@ -570,8 +646,10 @@ impl Extractor<'_> {
         let mut output: Option<Output> = None;
         let mut digest = Digest::new(CrcAlgorithm::Crc32IsoHdlc);
         let mut link_target: Vec<u8> = Vec::new();
+        let mut link_too_long = false;
         let mut got = 0u64;
         let mut last = false;
+        let mut block_failed = false;
         loop {
             let read = if last {
                 0
@@ -594,6 +672,7 @@ impl Extractor<'_> {
                     // 7-Zip's does.
                     Err(error) if is_checksum_failure(&error) && item.size - got <= take as u64 => {
                         last = true;
+                        block_failed = true;
                         (item.size - got) as usize
                     }
                     Err(error) => return Err(Stop::Read(error)),
@@ -625,7 +704,12 @@ impl Extractor<'_> {
                     return Err(Stop::Write(error));
                 }
             } else if item.symlink && cfg!(unix) {
-                link_target.extend_from_slice(chunk);
+                if link_target.len() + chunk.len() > MAX_LINK_TARGET {
+                    link_too_long = true;
+                    link_target = Vec::new();
+                } else if !link_too_long {
+                    link_target.extend_from_slice(chunk);
+                }
             } else if let Some(file) = output.as_mut().and_then(|output| output.file.as_mut())
                 && let Err(error) = file.write_all(chunk)
             {
@@ -643,7 +727,7 @@ impl Extractor<'_> {
         if let Some(hash) = self.stats.hash.as_mut() {
             hash.finish(false, &item.name, crc);
         }
-        let crc_ok = item.crc.is_none_or(|expected| expected == crc);
+        let crc_ok = member_intact(item.crc, crc, block_failed);
         if !crc_ok {
             let message = if self.encrypted {
                 "CRC Failed in encrypted file. Wrong password?"
@@ -657,6 +741,11 @@ impl Extractor<'_> {
         };
         #[cfg(unix)]
         if item.symlink && crc_ok {
+            if link_too_long {
+                let _ = fs::remove_file(&path);
+                self.item_error("Cannot create symbolic link : File name too long", &path);
+                return Ok(());
+            }
             let link = String::from_utf8_lossy(&link_target).into_owned();
             let Some(link_path) = self.link_path(&item, &link) else {
                 let text = format!("Dangerous link path was ignored : {} : {link}", item.name);
@@ -697,7 +786,9 @@ impl Extractor<'_> {
             text.push_str(rest);
             return Some(text);
         }
-        let parts = split_path(&item.name);
+        // Judge the link from where it is actually created: the sanitised
+        // path, not the archive's own name, whose `..` parts are dropped.
+        let (_, parts) = self.out_path(item);
         link_is_safe(&parts, link).then(|| link.to_owned())
     }
 
@@ -882,4 +973,30 @@ pub(super) fn extract(
         set_metadata(path, item);
     }
     ending
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_block_checksum_fails_members_without_their_own_crc() {
+        assert!(member_intact(None, 7, false));
+        assert!(!member_intact(None, 7, true));
+        // A member's own CRC proves its bytes whatever the block said.
+        assert!(member_intact(Some(7), 7, true));
+        assert!(!member_intact(Some(7), 8, false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_are_judged_from_their_sanitised_place() {
+        // `../../pivot` lands at the top of the output folder.
+        assert!(!link_is_safe(&["pivot".to_owned()], "../../outside"));
+        assert!(!link_is_safe(&["pivot".to_owned()], "../outside"));
+        assert!(link_is_safe(
+            &["deep".to_owned(), "pivot".to_owned()],
+            "../sibling"
+        ));
+    }
 }

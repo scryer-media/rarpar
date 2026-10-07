@@ -553,6 +553,99 @@ fn trailing_data_and_par3_inside_extract_cleanly() {
     assert_tree(&dir.path().join("b"));
 }
 
+/// One non-solid LZMA2 archive of `(name, data, is_link)` entries, in order.
+#[cfg(unix)]
+fn write_entries(path: &Path, entries: &[(&str, &[u8], bool)]) {
+    let mut out = Vec::new();
+    {
+        let mut writer = ArchiveWriter::new(Cursor::new(&mut out)).unwrap();
+        writer.set_content_methods(lzma2());
+        for &(name, data, link) in entries {
+            let mut entry = ArchiveEntry::new_file(name);
+            if link {
+                // A Unix symlink, as p7zip records one.
+                entry.has_windows_attributes = true;
+                entry.windows_attributes = 0x8000 | (0o120_777 << 16);
+            }
+            writer.push_archive_entry(entry, Some(data)).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    std::fs::write(path, out).unwrap();
+}
+
+/// A link named `../../pivot` is created at `out/pivot`, so its target is
+/// judged from there: `../../outside` escapes and is refused, and the member
+/// meant to go through it cannot leave the output folder.
+#[cfg(unix)]
+#[test]
+fn links_are_judged_from_where_they_are_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    write_entries(
+        &work.join("pivot.7z"),
+        &[
+            ("../../pivot", b"../../outside", true),
+            ("pivot/planted.txt", b"stray bytes", false),
+        ],
+    );
+    let (_, err) = expect(&facade(&work, &["x", "-y", "-oout", "pivot.7z"], b""), 2);
+    assert!(
+        err.contains("Dangerous link path was ignored : ../../pivot : ../../outside"),
+        "{err}"
+    );
+    assert!(std::fs::symlink_metadata(dir.path().join("outside")).is_err());
+    let pivot = work.join("out/pivot");
+    assert!(!std::fs::symlink_metadata(&pivot).unwrap().is_symlink());
+}
+
+/// A folder in the output tree that is already a symbolic link is never
+/// written through.
+#[cfg(unix)]
+#[test]
+fn members_are_never_written_through_a_linked_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let victim = dir.path().join("victim");
+    std::fs::create_dir_all(work.join("out")).unwrap();
+    std::fs::create_dir(&victim).unwrap();
+    std::fs::write(victim.join("ledger.txt"), b"keep me").unwrap();
+    std::os::unix::fs::symlink(&victim, work.join("out/shelf")).unwrap();
+    write_entries(
+        &work.join("shelf.7z"),
+        &[("shelf/ledger.txt", b"overwritten", false)],
+    );
+    let (_, err) = expect(&facade(&work, &["x", "-y", "-oout", "shelf.7z"], b""), 2);
+    assert!(
+        err.contains("Dangerous link via another link was ignored : shelf/ledger.txt"),
+        "{err}"
+    );
+    assert_eq!(std::fs::read(victim.join("ledger.txt")).unwrap(), b"keep me");
+}
+
+/// A symlink member whose target is longer than any path is refused as it
+/// streams, not buffered whole.
+#[cfg(unix)]
+#[test]
+fn oversized_link_targets_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = vec![b'a'; 1 << 20];
+    write_entries(
+        &dir.path().join("long.7z"),
+        &[("long.lnk", &target, true)],
+    );
+    let (_, err) = expect(&facade(dir.path(), &["x", "-y", "-oout", "long.7z"], b""), 2);
+    assert!(
+        err.contains("Cannot create symbolic link : File name too long"),
+        "{err}"
+    );
+    assert!(
+        std::fs::symlink_metadata(dir.path().join("out/long.lnk"))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    );
+}
+
 #[test]
 fn overwrite_modes_and_prompt() {
     let dir = tempfile::tempdir().unwrap();
