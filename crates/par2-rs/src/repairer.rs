@@ -14060,6 +14060,72 @@ mod tests {
             .unwrap();
     }
 
+    fn set_modified_time(path: &Path, modified: std::time::SystemTime) {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+    }
+
+    /// Flip the first byte of every recovery payload in place while keeping
+    /// each volume's length, inode and mtime: damage only a read can see.
+    fn corrupt_recovery_payloads_keeping_stat(set: &Par2FileSet) {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        assert!(!set.recovery_slices.is_empty());
+        for slice in set.recovery_slices.values() {
+            let (path, offset, _) = slice.data.file_span().expect("file-backed payload");
+            let modified = fs::metadata(path).unwrap().modified().unwrap();
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap();
+            let mut byte = [0u8; 1];
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            file.read_exact(&mut byte).unwrap();
+            byte[0] ^= 0xFF;
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            file.write_all(&byte).unwrap();
+            file.set_times(std::fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+        }
+    }
+
+    /// Planning takes the scan's authentication of each recovery payload
+    /// while its volume still fingerprints as it did then, so it reads none of
+    /// them: the payloads below are corrupted behind an unchanged stat, and a
+    /// plan that re-hashed even one would have rejected it. Once a volume's
+    /// stat moves, planning reads and hashes the payloads again and rejects
+    /// every one.
+    #[test]
+    fn plan_trusts_payloads_a_scan_authenticated_until_the_volume_changes() {
+        let dir = tempdir().unwrap();
+        let data = (0..640u32).map(|i| (i % 251) as u8 + 1).collect::<Vec<_>>();
+        create_recoverable_set(dir.path(), &[("invented.bin", &data)]);
+        let par2_paths = par2_paths_in(dir.path());
+        let settled = std::time::SystemTime::now() - Duration::from_secs(3600);
+        for path in &par2_paths {
+            set_modified_time(path, settled);
+        }
+        let set = Par2FileSet::from_paths(&par2_paths).unwrap();
+        damage_first_slice(&dir.path().join("invented.bin"));
+        let access = crate::disk::DiskFileAccess::new(dir.path().to_path_buf(), &set);
+        let verification = verify_all(&set, &access);
+        assert_eq!(verification.total_missing_blocks, 1);
+
+        corrupt_recovery_payloads_keeping_stat(&set);
+        let plan = crate::repair::plan_repair_with_memory_limit(&set, &verification, None)
+            .expect("the scan's authentication stands while the stat is unchanged");
+        assert_eq!(plan.recovery_exponents.len(), 1);
+
+        for path in &par2_paths {
+            bump_modified_time(path);
+        }
+        assert!(matches!(
+            crate::repair::plan_repair_with_memory_limit(&set, &verification, None),
+            Err(Par2Error::InsufficientRecoveryData { .. })
+        ));
+    }
+
     /// One way a repair input can change, named for assertion messages.
     type InputMutation = (&'static str, fn(&Path));
 
