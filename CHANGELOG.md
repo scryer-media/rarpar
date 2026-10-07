@@ -107,7 +107,9 @@ documented in each crate's own changelog so those notes ship with the crate.
   `--dry-run` repair reports `"status": "planned"` with `"dry_run": true`
   instead of `"repaired"`. A `--dry-run` removal refuses a missing or
   damaged host as a removal would, and reports `"status": "planned"` with
-  `"dry_run": true` for an intact set. In place, `insert`, `repair` and
+  `"dry_run": true` for an intact set. A `--dry-run` insertion no longer
+  creates the `-d` output directory or in-place staging directories, and
+  still refuses an existing output. In place, `insert`, `repair` and
   `remove` stage each output in its own volume's directory, so the final
   rename never crosses a filesystem.
 - `par3 inside repair` and `remove` refuse a host name recorded in the set
