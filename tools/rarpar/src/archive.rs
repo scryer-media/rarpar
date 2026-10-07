@@ -1092,9 +1092,20 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
     } else {
         None
     };
-    staged
-        .persist(output)
-        .map_err(|error| RarparError::Io(error.error))?;
+    // Without `--overwrite` the install refuses, atomically, an archive that
+    // appeared at the output name during the build; the preflight above only
+    // saw the name before the build began.
+    if cli.overwrite {
+        staged.persist(output)
+    } else {
+        staged.persist_noclobber(output)
+    }
+    .map_err(|error| match error.error.kind() {
+        std::io::ErrorKind::AlreadyExists if !cli.overwrite => {
+            RarparError::Unsafe(format!("output exists: {}", output.display()))
+        }
+        _ => RarparError::Io(error.error),
+    })?;
     if let Some(sibling) = sibling {
         written.extend(sibling.install()?);
     }

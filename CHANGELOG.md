@@ -452,6 +452,12 @@ documented in each crate's own changelog so those notes ship with the crate.
   extraction is an error of that member, named with its path and the
   system's reason, so the summary counts it under `Sub items Errors` and the
   command exits 2 instead of 0.
+- `par3 archive` without `--overwrite` installs the archive with a
+  no-clobber rename, so an archive that appears at the output name while
+  the build runs is refused as "output exists" instead of replaced; the
+  preflight only saw the name before the build began.
+- rarpar requires unrar-rs 0.10.9, the version that carries the restore and
+  decoder fixes it advertises, so a lockfile cannot resolve an older one.
 
 ### Library versions
 
