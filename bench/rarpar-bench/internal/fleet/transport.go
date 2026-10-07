@@ -295,6 +295,18 @@ func (transport *Transport) RemoveAll(ctx context.Context, paths ...string) erro
 	return err
 }
 
+// clearRunRoot removes whatever an earlier attempt left under this run id
+// before anything is uploaded. `fleet run --run-id` may reuse an id whose
+// staging survived an interrupted or cleanup-disabled run; its DONE sentinel
+// and evidence archive would otherwise still be there when collection starts
+// polling, and collection would accept the old evidence as this run's.
+func clearRunRoot(ctx context.Context, transport *Transport, layout RemoteLayout) error {
+	if err := transport.RemoveAll(ctx, layout.Base, layout.Scratch); err != nil {
+		return fmt.Errorf("clearing earlier staging under %s: %w", layout.Base, err)
+	}
+	return nil
+}
+
 // readMissingMarker is printed in place of an absent file.
 const readMissingMarker = "__PENDING__"
 

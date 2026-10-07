@@ -183,6 +183,27 @@ func WindowsRunScript(machine Machine, defaults RunDefaults, runID string, layou
 	return script.String()
 }
 
+// stageAndStartWindows clears any earlier staging under this run id, uploads
+// the bundle and the run script, and starts the runner detached.
+func stageAndStartWindows(ctx context.Context, transport *Transport, layout RemoteLayout, bundleDir, upload string) (string, error) {
+	if err := clearRunRoot(ctx, transport, layout); err != nil {
+		return "", err
+	}
+	if err := transport.UploadDir(ctx, bundleDir, layout.Bin); err != nil {
+		return "", err
+	}
+	if err := transport.UploadDir(ctx, upload, layout.Base); err != nil {
+		return "", err
+	}
+	// Execute the FILE, detached from the SSH session. The run is never an
+	// inline command string.
+	stdout, _, err := transport.RunPowerShell(ctx, psStartDetachedScript(layout.Script, layout.Log, layout.Base))
+	if err != nil {
+		return "", fmt.Errorf("starting the PowerShell runner: %w", err)
+	}
+	return stdout, nil
+}
+
 func quotePowerShellList(values []string) string {
 	quoted := make([]string, 0, len(values))
 	for _, value := range values {
@@ -221,17 +242,9 @@ func (orch *orchestrator) runWindows(ctx context.Context, machine Machine, hostS
 	if err := os.WriteFile(filepath.Join(orch.runDir, "run-"+machine.Name+".ps1"), scriptBytes, 0o644); err != nil {
 		return err
 	}
-	if err := transport.UploadDir(ctx, hostState.BundleDir, layout.Bin); err != nil {
-		return err
-	}
-	if err := transport.UploadDir(ctx, upload, layout.Base); err != nil {
-		return err
-	}
-	// Execute the FILE, detached from the SSH session. The run is never an
-	// inline command string.
-	stdout, _, err := transport.RunPowerShell(ctx, psStartDetachedScript(layout.Script, layout.Log, layout.Base))
+	stdout, err := stageAndStartWindows(ctx, transport, layout, hostState.BundleDir, upload)
 	if err != nil {
-		return fmt.Errorf("machine %s: starting the PowerShell runner: %w", machine.Name, err)
+		return fmt.Errorf("machine %s: %w", machine.Name, err)
 	}
 	orch.state.Record(hostState, "start", "run.ps1 started detached (%s)", strings.TrimSpace(stdout))
 	orch.state.SetStatus(hostState, StatusRunning)

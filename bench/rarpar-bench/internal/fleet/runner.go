@@ -635,6 +635,9 @@ func (orch *orchestrator) runMachine(ctx context.Context, machine Machine, hostS
 		return err
 	}
 
+	if err := clearRunRoot(ctx, transport, layout); err != nil {
+		return fmt.Errorf("machine %s: %w", machine.Name, err)
+	}
 	orch.log("machine %s: uploading bundle to %s", machine.Name, layout.Bin)
 	if err := transport.UploadDir(ctx, hostState.BundleDir, layout.Bin); err != nil {
 		return err
