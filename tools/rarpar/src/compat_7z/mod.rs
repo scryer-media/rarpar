@@ -133,7 +133,10 @@ impl Session {
             },
             prompt,
         );
-        let line = self.read_line();
+        let line = {
+            let _quiet = EchoOff::stdin();
+            self.read_line()
+        };
         write_to(
             if self.out_target == 0 {
                 2
@@ -145,6 +148,100 @@ impl Session {
         let line = line?;
         self.password = Some(line.clone());
         Some(line)
+    }
+}
+
+/// Terminal echo switched off while a password is typed, and restored when
+/// this is dropped. 7-Zip does this on Windows; it is done on a Unix
+/// terminal too, so a typed password is never shown. Input that is not a
+/// terminal is left alone.
+struct EchoOff {
+    #[cfg(unix)]
+    fd: i32,
+    #[cfg(unix)]
+    saved: libc::termios,
+    #[cfg(windows)]
+    console: *mut std::ffi::c_void,
+    #[cfg(windows)]
+    saved: u32,
+}
+
+impl EchoOff {
+    fn stdin() -> Option<Self> {
+        #[cfg(unix)]
+        return Self::on(0);
+        #[cfg(windows)]
+        return Self::on_console();
+        #[cfg(not(any(unix, windows)))]
+        return None;
+    }
+
+    #[cfg(unix)]
+    fn on(fd: i32) -> Option<Self> {
+        // SAFETY: `termios` is plain data that `tcgetattr` fills; the calls
+        // only read and set the terminal state of `fd`.
+        unsafe {
+            if libc::isatty(fd) != 1 {
+                return None;
+            }
+            let mut saved: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut saved) != 0 {
+                return None;
+            }
+            let mut quiet = saved;
+            quiet.c_lflag &= !libc::ECHO;
+            (libc::tcsetattr(fd, libc::TCSANOW, &quiet) == 0).then_some(Self { fd, saved })
+        }
+    }
+
+    #[cfg(windows)]
+    fn on_console() -> Option<Self> {
+        const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+        const ENABLE_ECHO_INPUT: u32 = 0x0004;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetStdHandle(which: u32) -> *mut std::ffi::c_void;
+            fn GetConsoleMode(console: *mut std::ffi::c_void, mode: *mut u32) -> i32;
+        }
+        // SAFETY: the handle is the process's own standard input, checked
+        // before use; the mode is a plain integer.
+        unsafe {
+            let console = GetStdHandle(STD_INPUT_HANDLE);
+            if console.is_null() || console as isize == -1 {
+                return None;
+            }
+            let mut saved = 0u32;
+            if GetConsoleMode(console, &mut saved) == 0 {
+                return None;
+            }
+            (set_console_mode(console, saved & !ENABLE_ECHO_INPUT) != 0)
+                .then_some(Self { console, saved })
+        }
+    }
+}
+
+#[cfg(windows)]
+unsafe fn set_console_mode(console: *mut std::ffi::c_void, mode: u32) -> i32 {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetConsoleMode(console: *mut std::ffi::c_void, mode: u32) -> i32;
+    }
+    // SAFETY: the caller passes a console handle it read the mode from.
+    unsafe { SetConsoleMode(console, mode) }
+}
+
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        // SAFETY: restores the state read from the same terminal in `on`.
+        #[cfg(unix)]
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved);
+        }
+        // SAFETY: restores the mode read from the same console handle.
+        #[cfg(windows)]
+        unsafe {
+            set_console_mode(self.console, self.saved);
+        }
     }
 }
 
@@ -1077,5 +1174,54 @@ fn run_extract(session: &mut Session, options: Options, archives: Vec<(String, u
         EXIT_FATAL
     } else {
         EXIT_OK
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The echo flag of the terminal `fd`.
+    #[cfg(unix)]
+    fn echoes(fd: i32) -> bool {
+        // SAFETY: reads the state of a terminal the test opened.
+        unsafe {
+            let mut state: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(fd, &mut state), 0);
+            state.c_lflag & libc::ECHO != 0
+        }
+    }
+
+    /// A password typed at a terminal is not echoed, and the terminal's own
+    /// state comes back afterwards; input that is not a terminal is left
+    /// alone.
+    #[cfg(unix)]
+    #[test]
+    fn echo_is_off_only_while_a_password_is_read() {
+        // SAFETY: a pseudo-terminal pair the test owns and closes.
+        unsafe {
+            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(master >= 0);
+            assert_eq!(libc::grantpt(master), 0);
+            assert_eq!(libc::unlockpt(master), 0);
+            let name = libc::ptsname(master);
+            assert!(!name.is_null());
+            let terminal = libc::open(name, libc::O_RDWR | libc::O_NOCTTY);
+            assert!(terminal >= 0);
+            assert!(echoes(terminal));
+            {
+                let _quiet = EchoOff::on(terminal).expect("a terminal");
+                assert!(!echoes(terminal));
+            }
+            assert!(echoes(terminal));
+            libc::close(terminal);
+            libc::close(master);
+
+            let mut pipe = [0i32; 2];
+            assert_eq!(libc::pipe(pipe.as_mut_ptr()), 0);
+            assert!(EchoOff::on(pipe[0]).is_none());
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
     }
 }

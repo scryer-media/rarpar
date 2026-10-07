@@ -53,6 +53,10 @@ documented in each crate's own changelog so those notes ship with the crate.
 - 7-Zip facade: a command-line argument that is not valid Unicode is a
   command-line error (exit code 7). It was read with U+FFFD in place of its
   bytes, so it could name a different archive, which `-sdel` then deleted.
+- 7-Zip facade: a password typed at the prompt is no longer echoed. Echo is
+  switched off on a Unix terminal and on the Windows console while the
+  password is read, and restored after; the Windows prompt already said it
+  would not be echoed. Input that is not a terminal is read as before.
 - par3cmdline facade: the block-map report is counted from ranges, so a set
   with a huge block count no longer walks every block; non-UTF-8 arguments
   reach the files they name byte for byte on Unix; `\` separates path
