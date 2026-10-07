@@ -4,10 +4,11 @@
 
 - `ExecutionOptions` gains a hidden, bench-only `disk_verify_whole_first`
   switch. `Some(false)` makes disk verification hash a file's extents and the
-  whole file side by side in one pass instead of trying the whole file first;
-  the default (`None`) is unchanged. The `engine_perf` example exposes it as
-  `PAR3_BENCH_WHOLE_FILE_FIRST=0` so the cost of the second read pass can be
-  measured on remote mounts.
+  whole file side by side in one pass instead of trying the whole file first,
+  and `Some(true)` forces whole file first; the default (`None`) picks by
+  mount kind, below. The `engine_perf` example exposes it as
+  `PAR3_BENCH_WHOLE_FILE_FIRST=0|1` so both orders can be measured on any
+  mount.
 - Source verification (`evidence::verify_source`, and through it session
   verification and repair assessment, on both the whole-file and the extent
   pass) and the packet scanner (`ingest::PacketScanner`) now read a source
@@ -24,6 +25,20 @@
   `scan_work` for what it asks and refunded what a short read did not
   return beyond one stripe, so a whole scan still costs its bytes and a poll
   that finds nothing one stripe. Evidence is unchanged.
+- New `mount` module: `MountKind { Local, Remote, Unknown }` and
+  `SourceAccess::mount_kind` (default `Unknown`). `DiskSourceAccess` probes
+  each source directory once (`statfs` `f_type` on Linux: NFS and SMB/CIFS
+  are remote, FUSE is unknown; `f_fstypename` on macOS: `nfs`, `smbfs`,
+  `afpfs` and `webdav` are remote; `GetDriveTypeW` on Windows: a remote drive
+  is remote) and caches the answer. Disk verification now hashes a file on a
+  remote mount whole and by extent side by side in one pass, so a damaged
+  file is not fetched over the network a second time; local and unknown
+  mounts keep whole file first, which hashes an intact file once. A forced
+  `disk_verify_whole_first` wins over the mount kind, and a wrapper that
+  forwards `open_file` should forward `mount_kind` too.
+  `ExecutionDiagnostics::verify_order` reports the order that ran and the
+  mount kinds behind it, and `engine_perf` prints them. Evidence is
+  unchanged.
 - **Behaviour change:** the streaming creation engine (`creation::CreationPlan`)
   now derives the InputSetID the way the reference does — and the way
   `create::create` already did, through the same code — from each file's full

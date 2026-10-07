@@ -164,8 +164,8 @@ func TestEngineCommandPassesBufferedDurabilityPerOp(t *testing.T) {
 }
 
 func TestParseEngineOutput(t *testing.T) {
-	stdout := `{"whole_file_first":false}
-{"status":"Ready"}
+	stdout := `{"status":"Ready"}
+{"mount_local":0,"mount_remote":2,"mount_unknown":0,"verify_whole_first":0,"verify_single_pass":2,"whole_file_first":false,"mount_kind":"remote"}
 {"internal_stage":"Sync","seconds":0.25}
 {"stripe_passes":3}
 {"file_read_bytes":1048576,"file_read_calls":4,"file_write_bytes":2048,"file_write_calls":2,"file_opens":9,"file_syncs":5,"file_clones":0,"snapshots":1}
@@ -177,7 +177,7 @@ func TestParseEngineOutput(t *testing.T) {
 	if counters.ReadBytes != 1048576 || counters.ReadCalls != 4 || counters.WriteBytes != 2048 || counters.Opens != 9 || counters.Syncs != 5 || counters.Snapshots != 1 {
 		t.Errorf("counters = %+v", counters)
 	}
-	if counters.WholeFileFirst == nil || *counters.WholeFileFirst || counters.Status != "Ready" || counters.SyncSeconds != 0.25 || counters.StripePasses != 3 {
+	if counters.WholeFileFirst == nil || *counters.WholeFileFirst || counters.Status != "Ready" || counters.SyncSeconds != 0.25 || counters.StripePasses != 3 || counters.MountKind != "remote" {
 		t.Errorf("counters = %+v", counters)
 	}
 	if _, ok := ParseEngineOutput(`{"status":"Ready"}`); ok {

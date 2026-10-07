@@ -7,6 +7,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use crate::mount::MountKind;
 use crate::runtime::{EngineError, EngineResult};
 
 /// Stable caller-assigned identity, independent of a file's name or location.
@@ -80,6 +81,16 @@ pub trait SourceAccess: Send + Sync {
     fn open_file(&self, _source: SourceId) -> io::Result<Option<SourceFile>> {
         Ok(None)
     }
+
+    /// The kind of filesystem `source` is on, which picks the order disk
+    /// verification hashes it in unless
+    /// [`ExecutionOptions::disk_verify_whole_first`] forces one.
+    /// [`DiskSourceAccess`] probes each source directory once; a wrapper
+    /// around it forwards this. Anything else is [`MountKind::Unknown`] and
+    /// keeps the default order.
+    fn mount_kind(&self, _source: SourceId) -> MountKind {
+        MountKind::Unknown
+    }
 }
 
 /// Disk source registry. Sequential readers hold one shared lease until dropped.
@@ -114,6 +125,8 @@ pub struct DiskSourceAccess {
     paths: BTreeMap<SourceId, PathBuf>,
     options: ExecutionOptions,
     handles: Arc<ReadHandles>,
+    /// Mount kinds by source directory, each probed once.
+    mounts: Mutex<HashMap<PathBuf, MountKind>>,
 }
 
 impl DiskSourceAccess {
@@ -123,6 +136,7 @@ impl DiskSourceAccess {
             paths: BTreeMap::new(),
             options,
             handles: Arc::default(),
+            mounts: Mutex::default(),
         }
     }
 
@@ -588,6 +602,28 @@ impl SourceAccess for DiskSourceAccess {
         self.handles
             .offer(source, epoch, &file, capacity, &self.options.handles);
         Ok(Some(SourceFile(file)))
+    }
+
+    /// Probed once per directory, never per file: sources of one set share a
+    /// directory or a few.
+    fn mount_kind(&self, source: SourceId) -> MountKind {
+        let Ok(path) = self.path(source) else {
+            return MountKind::Unknown;
+        };
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => std::path::Path::new("."),
+        };
+        let mut mounts = self
+            .mounts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(kind) = mounts.get(dir) {
+            return *kind;
+        }
+        let kind = crate::mount::probe(dir);
+        mounts.insert(dir.to_path_buf(), kind);
+        kind
     }
 }
 

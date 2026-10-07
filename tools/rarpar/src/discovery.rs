@@ -815,8 +815,14 @@ fn label_related(label: &str, path: Option<&Path>) -> bool {
     stem == label || name.starts_with(label)
 }
 
-fn read_prefix(path: &Path, len: usize) -> std::io::Result<Vec<u8>> {
+/// Read at most `len` bytes from the start of `path` for a format check.
+///
+/// The read is advised as random access, so it pulls in no read-ahead: a
+/// cached prefix beyond the bytes asked for makes a later sequential read of
+/// the file over NFS split each large request in two.
+pub(crate) fn read_prefix(path: &Path, len: usize) -> std::io::Result<Vec<u8>> {
     let mut file = File::open(path)?;
+    no_read_ahead(&file);
     let mut buf = vec![0u8; len];
     // A short `read` is not EOF; an under-filled prefix would make
     // magic-number checks miss real PAR2 files.
@@ -831,6 +837,31 @@ fn read_prefix(path: &Path, len: usize) -> std::io::Result<Vec<u8>> {
     buf.truncate(filled);
     Ok(buf)
 }
+
+/// Turn off read-ahead for `file`. Advice only: a refusal changes nothing
+/// but the cache.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn no_read_ahead(file: &File) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the descriptor is open for the call; the advice reads no memory.
+    unsafe {
+        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM);
+    }
+}
+
+/// Turn off read-ahead for `file`. Advice only: a refusal changes nothing
+/// but the cache.
+#[cfg(target_os = "macos")]
+fn no_read_ahead(file: &File) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the descriptor is open for the call; F_RDAHEAD takes an int.
+    unsafe {
+        libc::fcntl(file.as_raw_fd(), libc::F_RDAHEAD, 0);
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn no_read_ahead(_file: &File) {}
 
 fn looks_like_par2(path: &Path, prefix: &[u8]) -> bool {
     prefix.starts_with(PAR2_MAGIC) || is_ext(path, "par2")
