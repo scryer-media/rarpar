@@ -21,6 +21,34 @@ const Project = "rarpar-nfs"
 // the page cache cannot keep a whole file between two read passes.
 var Clients = []string{"bench-client", "bench-client-lowmem"}
 
+// ClientFlags are the `par3 run` flags the client sets itself: the binaries
+// it built, the machine label, and one target per mount plus the local
+// control. Passthrough arguments must not set them again.
+var ClientFlags = []string{"reference", "candidate", "engine-perf", "machine", "target", "target-meta", "work"}
+
+// HostFlags are the flags the host role sets on top of the client's: the
+// output directory, which must stay on the /results mount or the evidence
+// dies with the one-off client container.
+var HostFlags = append([]string{"out"}, ClientFlags...)
+
+// CheckPassthrough refuses passthrough arguments that would override a flag
+// the rig sets itself, in any spelling Go's flag parser accepts.
+func CheckPassthrough(args, owned []string) error {
+	for _, arg := range args {
+		if !strings.HasPrefix(arg, "-") {
+			continue
+		}
+		name := strings.TrimPrefix(strings.TrimPrefix(arg, "-"), "-")
+		name, _, _ = strings.Cut(name, "=")
+		for _, flag := range owned {
+			if name == flag {
+				return fmt.Errorf("suite argument %q: the rig sets --%s itself", arg, flag)
+			}
+		}
+	}
+	return nil
+}
+
 // HostOptions drive `nfs run` and `nfs down` on the host.
 type HostOptions struct {
 	Docker  string
@@ -116,6 +144,9 @@ func (o *HostOptions) Validate() error {
 		if !strings.Contains(entry, "=") {
 			return fmt.Errorf("--env %q: want VAR=value", entry)
 		}
+	}
+	if err := CheckPassthrough(o.SuiteArgs, HostFlags); err != nil {
+		return err
 	}
 	if o.LoadEvery <= 0 {
 		o.LoadEvery = time.Minute

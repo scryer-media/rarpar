@@ -125,6 +125,9 @@ func runNFSClient(ctx context.Context, args []string, stdout io.Writer) error {
 	if len(own) != 0 {
 		return fmt.Errorf("nfs client takes its settings from the environment; suite arguments go after --")
 	}
+	if err := nfsrig.CheckPassthrough(suite, nfsrig.ClientFlags); err != nil {
+		return err
+	}
 	config, err := nfsrig.ClientConfigFromEnv(os.Getenv)
 	if err != nil {
 		return err

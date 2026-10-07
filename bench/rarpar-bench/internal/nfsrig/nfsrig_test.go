@@ -198,3 +198,29 @@ func TestHostCommands(t *testing.T) {
 		}
 	}
 }
+
+// Passthrough arguments cannot override a flag the rig sets: an --out after
+// the rig's own would win in Go's flag parser and leave the evidence inside
+// the one-off client container.
+func TestPassthroughCannotOverrideRigFlags(t *testing.T) {
+	for _, args := range [][]string{
+		{"--out", "/tmp/run"},
+		{"-out=/tmp/run"},
+		{"--profile", "full", "--out=/tmp/run"},
+		{"--target", "extra=/mnt/x"},
+		{"-reference", "/opt/other"},
+		{"--work", "/tmp/w"},
+	} {
+		options := HostOptions{Compose: "c", Source: "s", Results: "r", Label: "a", SuiteArgs: args}
+		if err := options.Validate(); err == nil || !strings.Contains(err.Error(), "the rig sets") {
+			t.Errorf("host accepted passthrough %q: %v", args, err)
+		}
+	}
+	// The client gets the host's --out as passthrough and must take it.
+	if err := CheckPassthrough([]string{"--out", "/results/a", "--profile", "full", "--outline"}, ClientFlags); err != nil {
+		t.Errorf("client refused the host's --out: %v", err)
+	}
+	if err := CheckPassthrough([]string{"--machine=other"}, ClientFlags); err == nil {
+		t.Error("client accepted --machine")
+	}
+}
