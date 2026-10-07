@@ -489,7 +489,7 @@ type Results struct {
 	Status   string   `json:"status"`
 	Failures []string `json:"failures,omitempty"`
 	// RSSSummary is every rarpar row's peak RSS against its scenario's
-	// reference, worst rarpar/reference ratio first (see RSSSummary).
+	// reference, worst (lowest) reference/rarpar ratio first (see RSSSummary).
 	RSSSummary []procmeasure.RSSScenario `json:"rss_summary,omitempty"`
 }
 

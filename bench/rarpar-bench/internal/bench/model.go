@@ -297,9 +297,8 @@ type Comparison struct {
 	Backend             string            `json:"backend"`
 	CandidateRAR5Phases *RAR5PhaseSummary `json:"candidate_rar5_phases,omitempty"`
 	// CPU is user+system time and RSS the peak resident set, median [min,
-	// max] over the measured samples. Unlike Ratio (reference/rarpar wall
-	// time, the relative speed), CPURatio and RSSRatio are rarpar/reference
-	// medians: below 1 rarpar used less.
+	// max] over the measured samples. CPURatio and RSSRatio are
+	// reference/rarpar medians like Ratio: above 1 rarpar used less.
 	CandidateCPUNanos  ValueSummary `json:"candidate_cpu_nanos"`
 	ReferenceCPUNanos  ValueSummary `json:"reference_cpu_nanos"`
 	CPURatio           *float64     `json:"cpu_ratio,omitempty"`
@@ -337,7 +336,7 @@ type Report struct {
 	ReferencePAR2 *BinaryIdentity `json:"reference_par2,omitempty"`
 	Comparisons   []Comparison    `json:"comparisons"`
 	// RSSSummary lists every compared case's rarpar and reference peak
-	// RSS, worst rarpar/reference ratio first.
+	// RSS, worst (lowest) reference/rarpar ratio first.
 	RSSSummary []procmeasure.RSSScenario `json:"rss_summary"`
 	Omitted    []string                  `json:"omitted,omitempty"`
 }

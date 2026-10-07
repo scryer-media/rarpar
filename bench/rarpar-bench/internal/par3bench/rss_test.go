@@ -35,8 +35,8 @@ func rssResults() *Results {
 	return results
 }
 
-// Every rarpar row is listed against its scenario's reference, worst
-// rarpar/reference ratio first; a row whose reference did not finish has no
+// Every rarpar row is listed against its scenario's reference, worst (lowest)
+// reference/rarpar ratio first; a row whose reference did not finish has no
 // ratio and comes last.
 func TestRSSSummaryIsWorstRatioFirst(t *testing.T) {
 	summary := RSSSummary(rssResults())
@@ -54,9 +54,9 @@ func TestRSSSummaryIsWorstRatioFirst(t *testing.T) {
 		rows = append(rows, got{scenario.Scenario, scenario.Variant, ratio, scenario.Note})
 	}
 	want := []got{
-		{"u/create", "rarpar-w1-buffered", 3, ""},
-		{"u/create", "rarpar-w1", 1.5, ""},
-		{"u/verify", "rarpar-w1", 0.25, ""},
+		{"u/create", "rarpar-w1-buffered", 1.0 / 3, ""},
+		{"u/create", "rarpar-w1", 2.0 / 3, ""},
+		{"u/verify", "rarpar-w1", 4, ""},
 		{"v/create", "rarpar-w1", -1, "reference DNF"},
 	}
 	if len(rows) != len(want) {
@@ -90,8 +90,8 @@ func TestReportShowsPeakRSSPerScenario(t *testing.T) {
 	for _, want := range []string{
 		"## Peak RSS per scenario",
 		"| scenario | variant | rarpar MiB | reference MiB | RSS ratio | source | note |",
-		"| u/create | rarpar-w1-buffered | 60.0 [58.0–64.0] | 20.0 [20.0–24.0] | 3.000 | rusage | - |",
-		"| u/verify | rarpar-w1 | 10.0 [10.0–10.0] | 40.0 [40.0–40.0] | 0.250 | rusage | - |",
+		"| u/create | rarpar-w1-buffered | 60.0 [58.0–64.0] | 20.0 [20.0–24.0] | 0.333 | rusage | - |",
+		"| u/verify | rarpar-w1 | 10.0 [10.0–10.0] | 40.0 [40.0–40.0] | 4.000 | rusage | - |",
 		"| v/create | rarpar-w1 | 12.0 [12.0–12.0] | - | - | rusage | reference DNF |",
 		procmeasure.MultiProcessNote,
 	} {

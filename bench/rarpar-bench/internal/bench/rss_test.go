@@ -216,7 +216,7 @@ func rssRunRecord() RunRecord {
 }
 
 // The report carries CPU and peak RSS medians [min, max] with
-// rarpar/reference ratios, and an rss_summary sorted worst ratio first.
+// reference/rarpar ratios, and an rss_summary sorted worst (lowest) ratio first.
 func TestReportSummarizesPeakRSS(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "raw.json")
 	if err := writeJSON(path, rssRunRecord()); err != nil {
@@ -233,20 +233,20 @@ func TestReportSummarizesPeakRSS(t *testing.T) {
 	if low.CaseID != "case-low" || low.CandidateRSSBytes != (ValueSummary{Median: 50 << 20, Min: 40 << 20, Max: 60 << 20}) || low.ReferenceRSSBytes.Median != 100<<20 {
 		t.Fatalf("case-low RSS %#v / %#v", low.CandidateRSSBytes, low.ReferenceRSSBytes)
 	}
-	if low.RSSRatio == nil || *low.RSSRatio != 0.5 || low.CPURatio == nil || *low.CPURatio != 1 {
+	if low.RSSRatio == nil || *low.RSSRatio != 2 || low.CPURatio == nil || *low.CPURatio != 1 {
 		t.Fatalf("case-low ratios rss %v cpu %v", low.RSSRatio, low.CPURatio)
 	}
 	if low.CandidateRSSSource != procmeasure.RSSSourceRusage || low.ReferenceRSSSource != procmeasure.RSSSourceRusage {
 		t.Fatalf("sources %q %q", low.CandidateRSSSource, low.ReferenceRSSSource)
 	}
-	if len(report.RSSSummary) != 2 || report.RSSSummary[0].Scenario != "case-high" || *report.RSSSummary[0].Ratio != 2 || report.RSSSummary[1].Scenario != "case-low" {
+	if len(report.RSSSummary) != 2 || report.RSSSummary[0].Scenario != "case-high" || *report.RSSSummary[0].Ratio != 0.5 || report.RSSSummary[1].Scenario != "case-low" {
 		t.Fatalf("rss summary not worst-first: %#v", report.RSSSummary)
 	}
 	encoded, err := json.Marshal(report)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range []string{`"rss_summary":[{"scenario":"case-high"`, `"rss_ratio":0.5`, `"candidate_rss_bytes":{"median":52428800`, `"rarpar_rss_source":"rusage"`} {
+	for _, field := range []string{`"rss_summary":[{"scenario":"case-high"`, `"rss_ratio":2`, `"candidate_rss_bytes":{"median":52428800`, `"rarpar_rss_source":"rusage"`} {
 		if !strings.Contains(string(encoded), field) {
 			t.Fatalf("report JSON lacks %s: %s", field, encoded)
 		}
@@ -273,10 +273,10 @@ func TestReportMarkdownShowsRSSBesideWallAndCPU(t *testing.T) {
 	markdown := string(data)
 	for _, want := range []string{
 		"| case | workload | reference | side | wall s | CPU s | RSS MiB | wall ratio | CPU ratio | RSS ratio |",
-		"| case-low | RAR fixture case-low | UnRAR | rarpar | 1.000 [1.000–1.000] | 3.000 [3.000–3.000] | 50.0 [40.0–60.0] | 0.500 | 1.000 | 0.500 |",
+		"| case-low | RAR fixture case-low | UnRAR | rarpar | 1.000 [1.000–1.000] | 3.000 [3.000–3.000] | 50.0 [40.0–60.0] | 2.000 | 1.000 | 2.000 |",
 		"| | | | reference | 2.000 [2.000–2.000] | 3.000 [3.000–3.000] | 100.0 [100.0–100.0] | 1.000 | 1.000 | 1.000 |",
 		"## Peak RSS per scenario",
-		"| case-high | 80.0 [70.0–90.0] | 40.0 [40.0–40.0] | 2.000 | rusage | - |",
+		"| case-high | 80.0 [70.0–90.0] | 40.0 [40.0–40.0] | 0.500 | rusage | - |",
 		"- `rusage`: " + procmeasure.DescribeRSSSource(procmeasure.RSSSourceRusage),
 	} {
 		if !strings.Contains(markdown, want) {

@@ -367,7 +367,7 @@ func TestReportShowsMediansRangesAndRatios(t *testing.T) {
 	for _, want := range []string{
 		"| reference | none (never syncs) | 2.000 [1.000–3.000] |",
 		"| rarpar-w1 | durable (default) | 1.000 [0.500–1.500] |",
-		"| 0.500 | 0.500 | 1.000 |",
+		"| 2.000 | 2.000 | 1.000 |",
 		"payloads-only",
 		"f.bin.1",
 		"recovery payloads 3/3 equal",
@@ -416,8 +416,8 @@ func TestReportShowsDurabilityRowsAndReferenceDNF(t *testing.T) {
 	for _, want := range []string{
 		"| variant | durability | wall s |",
 		"| reference | none (never syncs) | 4.000 [4.000–4.000] |",
-		"| rarpar-w1 | durable (default) | 2.000 [2.000–2.000] | 2.000 [2.000–2.000] | 10 [10–10] | 0.500 | 0.500 | 1.000 |",
-		"| rarpar-w1-buffered | buffered | 1.000 [1.000–1.000] | 1.000 [1.000–1.000] | 10 [10–10] | 0.250 | 0.250 | 1.000 |",
+		"| rarpar-w1 | durable (default) | 2.000 [2.000–2.000] | 2.000 [2.000–2.000] | 10 [10–10] | 2.000 | 2.000 | 1.000 |",
+		"| rarpar-w1-buffered | buffered | 1.000 [1.000–1.000] | 1.000 [1.000–1.000] | 10 [10–10] | 4.000 | 4.000 | 1.000 |",
 		"| rarpar-w1 | 1.000 [1.000–1.000] |", // verify: no durability column
 		"| reference | none (never syncs) | DNF | - | - | - | - | - |",
 		"- reference DNF: exit 6: Failed to open Recovery File",
@@ -473,7 +473,7 @@ func TestPeakRSSIsARequiredRowField(t *testing.T) {
 			{Config: "u", Op: OpVerify, Variant: "rarpar-w1", Tool: ToolCandidate, Status: StatusOK, Measurement: Measurement{WallSeconds: 1, MaxRSSBytes: 10 << 20}},
 		}})
 	if !strings.Contains(report, "| variant | wall s | CPU s | RSS MiB | wall ratio | CPU ratio | RSS ratio |") ||
-		!strings.Contains(report, "| rarpar-w1 | 1.000 [1.000–1.000] | 0.000 [0.000–0.000] | 10 [10–10] | 0.500 | - | 0.250 |") {
+		!strings.Contains(report, "| rarpar-w1 | 1.000 [1.000–1.000] | 0.000 [0.000–0.000] | 10 [10–10] | 2.000 | - | 4.000 |") {
 		t.Fatalf("report lacks the RSS column or ratio:\n%s", report)
 	}
 }

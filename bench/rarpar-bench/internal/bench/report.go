@@ -143,12 +143,13 @@ func summarizeValues(executions []Execution, value func(Execution) int64) ValueS
 	return ValueSummary{Median: median, Min: low, Max: high}
 }
 
-// medianRatio is rarpar/reference medians, or nil without both figures.
+// medianRatio is reference/rarpar medians (above 1 rarpar used less), or
+// nil without both figures.
 func medianRatio(candidate, reference ValueSummary) *float64 {
 	if candidate.Median <= 0 || reference.Median <= 0 {
 		return nil
 	}
-	value := float64(candidate.Median) / float64(reference.Median)
+	value := float64(reference.Median) / float64(candidate.Median)
 	return &value
 }
 

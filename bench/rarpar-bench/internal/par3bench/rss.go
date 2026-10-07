@@ -5,8 +5,8 @@ import (
 )
 
 // RSSSummary compares every rarpar row's peak RSS with its scenario's
-// reference row (same configuration, operation and target), worst
-// rarpar/reference ratio first. Engine rows are not the shipped CLI and are
+// reference row (same configuration, operation and target), worst (lowest)
+// reference/rarpar ratio first. Engine rows are not the shipped CLI and are
 // left out, as they are from the ratio columns.
 func RSSSummary(results *Results) []procmeasure.RSSScenario {
 	type key struct{ config, op, variant string }

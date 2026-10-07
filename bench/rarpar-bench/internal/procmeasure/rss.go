@@ -69,8 +69,9 @@ type RSSScenario struct {
 	ReferenceMedianBytes int64  `json:"reference_median_bytes,omitempty"`
 	ReferenceMinBytes    int64  `json:"reference_min_bytes,omitempty"`
 	ReferenceMaxBytes    int64  `json:"reference_max_bytes,omitempty"`
-	// Ratio is rarpar/reference medians: above 1 rarpar peaked higher. It is
-	// absent when the scenario has no reference figure.
+	// Ratio is reference/rarpar medians: above 1 rarpar peaked lower, the
+	// same direction as every other ratio the harnesses report. It is absent
+	// when the scenario has no reference figure.
 	Ratio           *float64 `json:"ratio,omitempty"`
 	RarparSource    string   `json:"rarpar_rss_source"`
 	ReferenceSource string   `json:"reference_rss_source,omitempty"`
@@ -112,7 +113,7 @@ func JoinSources(sources []string) string {
 // sides' figures and sources are set.
 func CompleteRSSScenario(scenario *RSSScenario) {
 	if scenario.ReferenceMedianBytes > 0 && scenario.RarparMedianBytes > 0 {
-		value := float64(scenario.RarparMedianBytes) / float64(scenario.ReferenceMedianBytes)
+		value := float64(scenario.ReferenceMedianBytes) / float64(scenario.RarparMedianBytes)
 		scenario.Ratio = &value
 	}
 	if scenario.Ratio != nil && scenario.RarparSource != scenario.ReferenceSource {
@@ -120,8 +121,9 @@ func CompleteRSSScenario(scenario *RSSScenario) {
 	}
 }
 
-// SortRSSScenarios orders the summary worst rarpar ratio first, so an RSS
-// regression is at the top; scenarios without a ratio follow, by name.
+// SortRSSScenarios orders the summary worst rarpar ratio (the lowest) first,
+// so an RSS regression is at the top; scenarios without a ratio follow, by
+// name.
 func SortRSSScenarios(scenarios []RSSScenario) {
 	sort.SliceStable(scenarios, func(i, j int) bool {
 		left, right := scenarios[i], scenarios[j]
@@ -129,7 +131,7 @@ func SortRSSScenarios(scenarios []RSSScenario) {
 			return left.Ratio != nil
 		}
 		if left.Ratio != nil && *left.Ratio != *right.Ratio {
-			return *left.Ratio > *right.Ratio
+			return *left.Ratio < *right.Ratio
 		}
 		if left.Scenario != right.Scenario {
 			return left.Scenario < right.Scenario
@@ -160,7 +162,7 @@ func RenderRSSSummary(b *strings.Builder, scenarios []RSSScenario) {
 		fmt.Fprintln(b)
 		return
 	}
-	fmt.Fprintln(b, "Peak resident set, MiB, median [min–max] over the measured runs. Ratio is rarpar/reference medians: above 1.000 rarpar peaked higher. Sorted worst ratio first.")
+	fmt.Fprintln(b, "Peak resident set, MiB, median [min–max] over the measured runs. Ratio is reference/rarpar medians: above 1.000 rarpar peaked lower. Sorted worst (lowest) ratio first.")
 	fmt.Fprintln(b, MultiProcessNote)
 	fmt.Fprintln(b)
 	variants := false

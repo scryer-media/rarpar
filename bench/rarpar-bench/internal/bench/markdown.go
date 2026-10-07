@@ -10,7 +10,7 @@ import (
 
 // RenderReportMarkdown renders the human-readable companion of report.json:
 // one row per compared case with wall, CPU and peak RSS medians [min–max]
-// and their rarpar/reference ratios, after the peak RSS per scenario summary.
+// and their reference/rarpar ratios, after the peak RSS per scenario summary.
 func RenderReportMarkdown(report Report) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# rarpar benchmark: %s\n\n", report.Plan.ID)
@@ -27,14 +27,14 @@ func RenderReportMarkdown(report Report) string {
 	if len(report.Comparisons) > 0 {
 		fmt.Fprintln(&b, "## Cases")
 		fmt.Fprintln(&b)
-		fmt.Fprintln(&b, "Wall and CPU (user+sys) are seconds, RSS is peak MiB; cells are median [min–max]. Ratios are rarpar/reference medians: below 1.000 rarpar used less (report.json's `ratio` is the inverse wall ratio, the relative speed).")
+		fmt.Fprintln(&b, "Wall and CPU (user+sys) are seconds, RSS is peak MiB; cells are median [min–max]. Every ratio is reference/rarpar medians: above 1.000 rarpar was faster or used less (report.json's `ratio`, `cpu_ratio` and `rss_ratio` read the same way).")
 		fmt.Fprintln(&b)
 		fmt.Fprintln(&b, "| case | workload | reference | side | wall s | CPU s | RSS MiB | wall ratio | CPU ratio | RSS ratio |")
 		fmt.Fprintln(&b, "|---|---|---|---|---|---|---|---|---|---|")
 		for _, comparison := range report.Comparisons {
 			wallRatio := "-"
 			if comparison.Ratio > 0 {
-				wallRatio = fmt.Sprintf("%.3f", 1/comparison.Ratio)
+				wallRatio = fmt.Sprintf("%.3f", comparison.Ratio)
 			}
 			fmt.Fprintf(&b, "| %s | %s | %s | rarpar | %s | %s | %s | %s | %s | %s |\n",
 				comparison.CaseID, markdownCell(comparison.Workload), comparison.ReferenceLabel,
