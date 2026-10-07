@@ -433,6 +433,9 @@ fn uncovered_volumes(cli: &Cli, args: &Par3InsideArgs, sets: &[Rar5Set]) -> Vec<
         };
         let mut present: Vec<(u64, PathBuf, usize)> = entries
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            // Only a file can be a volume: a directory at a volume's name
+            // must not mask that volume as present.
+            .filter(|candidate| candidate.is_file())
             .filter_map(|candidate| {
                 let (candidate_stem, number) = part_number(&candidate)?;
                 let width = candidate.file_name()?.to_str()?.len() - stem.len() - ".part.rar".len();

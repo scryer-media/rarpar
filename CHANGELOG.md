@@ -82,7 +82,9 @@ documented in each crate's own changelog so those notes ship with the crate.
   writing anything, so an output never lands outside the chosen directory.
   Missing-volume gaps are enumerated only up to the volumes present plus the
   hosts the sets record, so a volume renamed to a huge `.partN.rar` suffix
-  yields a report instead of unbounded work.
+  yields a report instead of unbounded work. Only regular files count as
+  present volumes, so a directory named like a missing `.partN.rar` volume
+  no longer masks it and lets verification report the set healthy.
 - Release binaries are built with the `sevenz` feature, so `par3 archive`
   and the 7-Zip facade ship in them, and the `cargo xtask` feature audit
   refuses a release build without it.

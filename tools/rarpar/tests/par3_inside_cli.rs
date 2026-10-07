@@ -204,6 +204,46 @@ fn inside_reports_a_missing_volume_no_independent_set_covers() {
     );
 }
 
+/// A directory at a missing volume's name does not stand in for the volume.
+#[test]
+fn inside_reports_a_missing_volume_masked_by_a_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let Some(sources) = originals(root) else {
+        return;
+    };
+    let first = sources[0].to_str().unwrap();
+    run(
+        root,
+        &[
+            "par3",
+            "inside",
+            "insert",
+            first,
+            "-d",
+            "protected",
+            "-s",
+            "4096",
+            "-r",
+            "10",
+            "--placement",
+            "independent",
+        ],
+        0,
+    );
+    let protected = root.join("protected");
+    std::fs::remove_file(protected.join(name(3))).unwrap();
+    std::fs::create_dir(protected.join(name(3))).unwrap();
+    let entry = protected.join(name(1));
+    let entry = entry.to_str().unwrap();
+    let verified = run(root, &["par3", "inside", "verify", entry], 1);
+    assert_eq!(verified["repairable"], false);
+    assert_eq!(
+        verified["unprotected_missing_volumes"],
+        serde_json::json!([name(3)])
+    );
+}
+
 /// A volume renamed to a huge suffix, whose end header says another follows,
 /// is reported against a bound the inputs justify instead of having every
 /// number up to its suffix enumerated.
