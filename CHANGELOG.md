@@ -14,6 +14,9 @@ documented in each crate's own changelog so those notes ship with the crate.
   as `-m256MiB`) as a malformed command instead of reading it as bytes; the
   accepted suffixes stay none, `k`, `kb`, `m`, `mb`, `g` and `gb`, in any
   case.
+- The `par3` facade keeps a path holding a literal character in
+  U+10FF00–U+10FFFF on Unix: such a name now opens that file instead of one
+  with a single raw byte in the character's place.
 - The 7-Zip facade keeps archive, output-folder (`-o`), list-file and
   archive-include (`-ai`/`-ax`) paths exactly as given on Unix: a path that
   is not valid UTF-8 now names the same file instead of one with U+FFFD in

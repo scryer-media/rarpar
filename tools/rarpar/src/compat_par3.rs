@@ -242,17 +242,33 @@ const ESCAPE_BASE: u32 = 0x10_FF00;
 /// A native argument or file name as the parser's text. On Unix any byte
 /// that is not UTF-8 becomes a private-use character that [`native`] turns
 /// back into the same byte, so a path is never altered on its way through.
+/// A literal character of that range is escaped too, byte by byte, so the
+/// escaping is injective: a real name holding U+10FF41 comes back as that
+/// character, never as the byte 0x41.
 #[cfg(unix)]
 fn escape(text: &OsStr) -> String {
     use std::os::unix::ffi::OsStrExt;
+    let byte_escape =
+        |byte: u8| char::from_u32(ESCAPE_BASE + u32::from(byte)).expect("private use");
     let mut out = String::new();
     for chunk in text.as_bytes().utf8_chunks() {
-        out.push_str(chunk.valid());
-        for &byte in chunk.invalid() {
-            out.push(char::from_u32(ESCAPE_BASE + u32::from(byte)).expect("private use"));
+        for c in chunk.valid().chars() {
+            if is_escape(c) {
+                let mut buffer = [0; 4];
+                out.extend(c.encode_utf8(&mut buffer).bytes().map(byte_escape));
+            } else {
+                out.push(c);
+            }
         }
+        out.extend(chunk.invalid().iter().copied().map(byte_escape));
     }
     out
+}
+
+/// Whether `c` is in the range [`escape`] carries raw bytes in.
+#[cfg(unix)]
+fn is_escape(c: char) -> bool {
+    (ESCAPE_BASE..ESCAPE_BASE + 0x100).contains(&u32::from(c))
 }
 
 #[cfg(not(unix))]
@@ -266,9 +282,8 @@ fn native(text: &str) -> OsString {
     use std::os::unix::ffi::OsStringExt;
     let mut bytes = Vec::with_capacity(text.len());
     for c in text.chars() {
-        let code = u32::from(c);
-        if (ESCAPE_BASE..ESCAPE_BASE + 0x100).contains(&code) {
-            bytes.push((code - ESCAPE_BASE) as u8);
+        if is_escape(c) {
+            bytes.push((u32::from(c) - ESCAPE_BASE) as u8);
         } else {
             let mut buffer = [0; 4];
             bytes.extend_from_slice(c.encode_utf8(&mut buffer).as_bytes());
@@ -2660,11 +2675,22 @@ mod tests {
             b"caf\xe9.par3",
             b"\xff\xfe/\x80set",
             b"ok\xc3",
+            // Literal characters of the escape range, U+10FF41 and
+            // U+10FFFF, beside an invalid byte.
+            "set\u{10FF41}.par3".as_bytes(),
+            "\u{10FFFF}\u{10FF00}".as_bytes(),
+            b"\xf4\x8f\xbd\x81\xff",
         ] {
             let original = OsStr::from_bytes(bytes);
             assert_eq!(native(&escape(original)), original, "{bytes:?}");
         }
         assert_eq!(escape(OsStr::new("set.par3")), "set.par3");
+        // Injective: a literal U+10FF41 and the byte 0x41 never share a text.
+        assert_ne!(
+            escape(OsStr::new("\u{10FF41}")),
+            escape(OsStr::from_bytes(b"A"))
+        );
+        assert_ne!(native(&escape(OsStr::new("\u{10FF41}"))).as_bytes(), b"A");
         let invocation = parsed(&["v", &escape(OsStr::from_bytes(b"sub\xff/set.par3"))]);
         assert_eq!(
             native(&invocation.par_filename).as_bytes(),

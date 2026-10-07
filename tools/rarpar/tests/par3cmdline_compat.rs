@@ -514,6 +514,40 @@ fn a_differently_cased_par_name_finds_its_volumes() {
     assert_eq!(std::fs::read(root.join("lantern.bin")).unwrap(), original);
 }
 
+/// A path holding a literal character of the range the facade carries raw
+/// bytes in (U+10FF41 here) names that path, not one with the byte 0x41.
+#[cfg(unix)]
+#[test]
+fn escape_range_characters_in_a_path_are_kept() {
+    let par3 = Par3::new();
+    let dir = fixture();
+    let root = dir.path();
+    let name = "kit\u{10FF41}.par3";
+    rarpar(
+        root,
+        &[
+            "par3",
+            "create",
+            "--quiet",
+            "-s",
+            "500",
+            "-c",
+            "2",
+            name,
+            "lantern.bin",
+        ],
+    )
+    .code(0);
+    let original = std::fs::read(root.join("lantern.bin")).unwrap();
+    damage(&root.join("lantern.bin"), 10, 400);
+    // The name the old escaping opened instead: U+10FF41 read as `A`.
+    assert!(!root.join("kitA.par3").exists());
+    par3.run(root, &["r", name])
+        .code(0)
+        .says("Repair complete.");
+    assert_eq!(std::fs::read(root.join("lantern.bin")).unwrap(), original);
+}
+
 /// A protected name that is now a directory is reported, not an I/O abort.
 #[test]
 fn a_directory_at_a_protected_name_is_not_file() {
