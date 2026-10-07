@@ -119,11 +119,15 @@ impl PacketSink for CollectingSink<'_> {
         // about to occupy on top of the packet's own metadata.
         self.budget.charge_bytes(size_of::<ScannedPacket>())?;
         budget::reserve_fallible(&mut self.packets, 1)?;
+        let admission = self.budget.scan_admission(&packet, &recovery_set_id);
         self.packets.push(ScannedPacket {
             packet,
             offset,
             recovery_set_id,
         });
+        if let Some(admission) = admission {
+            admission.record();
+        }
         Ok(())
     }
 }
@@ -517,7 +521,6 @@ fn parse_recovery_packet_from_reader(
     header_bytes: &[u8; HEADER_SIZE],
     offset: u64,
     path: &Arc<Path>,
-    authenticated_at: Option<&FileStatFingerprint>,
     budget: &PacketScanBudget,
 ) -> Result<Packet> {
     let body_len =
@@ -551,21 +554,14 @@ fn parse_recovery_packet_from_reader(
     // Keep the hash for repair-time revalidation: the file may change after
     // this authenticated scan without changing its retained span. The
     // fingerprint lets that revalidation skip the read while it has not.
-    let data = match authenticated_at {
-        Some(fingerprint) => RecoverySliceData::file_backed_authenticated(
-            Arc::clone(path),
-            payload_offset,
-            payload_len,
-            header.packet_hash,
-            fingerprint.clone(),
-        ),
-        None => RecoverySliceData::file_backed_shared(
-            Arc::clone(path),
-            payload_offset,
-            payload_len,
-            Some(header.packet_hash),
-        ),
-    };
+    // When the volume's fingerprint settled, the budget holds it and the
+    // authentication is recorded only if the sink keeps this packet.
+    let data = RecoverySliceData::file_backed_shared(
+        Arc::clone(path),
+        payload_offset,
+        payload_len,
+        Some(header.packet_hash),
+    );
     Ok(Packet::RecoverySlice(RecoverySlicePacket {
         exponent,
         data,
@@ -663,6 +659,9 @@ pub fn scan_packets_from_path_bounded(
     crate::file_cache::advise_sequential(&file, path, file_len);
     let mut reader = BufReader::with_capacity(256 * 1024, file);
     let shared_path: Arc<Path> = Arc::from(path);
+    if let Some(fingerprint) = authenticated_at {
+        budget.note_scan_fingerprint(&shared_path, fingerprint);
+    }
     let mut interned_path_charged = false;
     let mut offset = 0u64;
 
@@ -710,7 +709,6 @@ pub fn scan_packets_from_path_bounded(
                 &header_bytes,
                 packet_offset,
                 &shared_path,
-                authenticated_at.as_ref(),
                 budget,
             )
             .map(Some),
@@ -1362,7 +1360,7 @@ mod tests {
             panic!("expected a hashed file-backed payload");
         };
         assert!(
-            recovery::scan_authentication(path, *offset, *len, packet_hash).is_some(),
+            recovery::scan_authentication(path, *offset, *len, packet_hash, &rsid, 3).is_some(),
             "a settled scan vouches for the payload it hashed"
         );
 
@@ -1373,7 +1371,10 @@ mod tests {
         else {
             unreachable!();
         };
-        assert!(recovery::scan_authentication(cloned_path, *offset, *len, packet_hash).is_some());
+        assert!(
+            recovery::scan_authentication(cloned_path, *offset, *len, packet_hash, &rsid, 3)
+                .is_some()
+        );
 
         let hand_built = RecoverySliceData::FileBacked {
             path: Arc::clone(path),
@@ -1391,12 +1392,109 @@ mod tests {
             unreachable!();
         };
         assert!(
-            recovery::scan_authentication(hand_path, *hand_offset, *hand_len, packet_hash)
-                .is_none(),
+            recovery::scan_authentication(
+                hand_path,
+                *hand_offset,
+                *hand_len,
+                packet_hash,
+                &rsid,
+                3
+            )
+            .is_none(),
             "a span the scan never hashed is not vouched for"
         );
         assert!(!hand_built.validate_packet_hash(&rsid, 3).unwrap());
         assert!(slice.data.validate_packet_hash(&rsid, 3).unwrap());
+    }
+
+    /// A settled volume of one Main packet and `recovery` recovery packets of
+    /// distinct exponents.
+    fn settled_volume(rsid: [u8; 16], recovery: u32) -> NamedTempFile {
+        let mut stream = make_main_packet_bytes(8, rsid);
+        for exponent in 0..recovery {
+            stream.extend_from_slice(&make_recovery_packet(exponent, &[0x6D; 8], rsid));
+        }
+        let file = NamedTempFile::new().unwrap();
+        file.as_file().write_all(&stream).unwrap();
+        file.as_file()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            )
+            .unwrap();
+        file
+    }
+
+    fn recovery_path(packet: &Packet) -> Option<Arc<Path>> {
+        match packet {
+            Packet::RecoverySlice(RecoverySlicePacket {
+                data: RecoverySliceData::FileBacked { path, .. },
+                ..
+            }) => Some(Arc::clone(path)),
+            _ => None,
+        }
+    }
+
+    /// A scan of a settled volume whose sink keeps nothing records no
+    /// authentication: only payloads a sink keeps can be validated again.
+    /// The same volume scanned into a sink that keeps everything records
+    /// every payload.
+    #[test]
+    fn a_sink_that_keeps_nothing_leaves_no_scan_authentications() {
+        let rsid = [0x8D; 16];
+        let volume = settled_volume(rsid, 16);
+
+        let budget = PacketScanBudget::new(PacketScanLimits::default());
+        let mut seen = None;
+        let mut drop_all = |packet: Packet, _offset: u64, _set_id: RecoverySetId| -> Result<()> {
+            seen = seen.take().or_else(|| recovery_path(&packet));
+            Ok(())
+        };
+        scan_packets_from_path_bounded(volume.path(), &budget, &mut drop_all).unwrap();
+        // Held here, so the allocation the table would be keyed by is live.
+        let path = seen.expect("the volume has recovery packets");
+        assert_eq!(recovery::scan_authentication_count(&path), 0);
+
+        let packets = scan_packets_from_path_with_set_ids(volume.path()).unwrap();
+        let kept = recovery_path(&packets[1].packet).unwrap();
+        assert_eq!(recovery::scan_authentication_count(&kept), 16);
+    }
+
+    /// The authentications a scan records are the payloads its sink kept, so
+    /// a low metadata limit, which stops the sink keeping more, bounds them.
+    #[test]
+    fn a_low_metadata_limit_bounds_the_scan_authentications() {
+        let rsid = [0x8E; 16];
+        let volume = settled_volume(rsid, 64);
+        let limit = 1024;
+        let budget = PacketScanBudget::new(
+            PacketScanLimits::default().with_max_retained_metadata_bytes(limit),
+        );
+        let mut builder = crate::par2_set::Par2FileSetBuilder::new();
+        let mut seen = None;
+        let mut sink = |packet: Packet, offset: u64, set_id: RecoverySetId| -> Result<()> {
+            seen = seen.take().or_else(|| recovery_path(&packet));
+            builder
+                .add_packet_budgeted(packet, offset, Some(set_id), &budget)
+                .map(drop)
+        };
+
+        let result = scan_packets_from_path_bounded(volume.path(), &budget, &mut sink);
+        assert!(
+            matches!(result, Err(Par2Error::ResourceLimitExceeded { .. })),
+            "{result:?}"
+        );
+        let path = seen.expect("the volume has recovery packets");
+        let recorded = recovery::scan_authentication_count(&path);
+        assert!(recorded > 0);
+        assert!(
+            recorded < 64,
+            "{recorded} of 64 recorded under a {limit}-byte limit"
+        );
+        // One retained packet is the Main packet; every other is a recovery
+        // packet the builder kept, and each of those has its record.
+        assert_eq!(recorded, budget.retained_packets() - 1);
+        assert!(budget.retained_bytes() <= limit);
     }
 
     /// An authenticated file-backed span must still detect later mutations.

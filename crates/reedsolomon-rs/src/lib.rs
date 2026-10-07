@@ -55,6 +55,9 @@
 //!
 /// Additive Cantor transforms with SIMD butterflies and a scalar oracle;
 /// codec geometry belongs to callers.
+/// Striped, threaded application of a dense erasure-decode matrix, shared by
+/// the RAR3 and RAR5 recovery coders.
+pub mod decode_apply;
 pub mod fft;
 pub mod gf;
 /// Output-pruned multiplicative GF(2^16) DFT for PAR2 recovery and syndrome rows.

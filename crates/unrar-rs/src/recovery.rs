@@ -10,10 +10,13 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{RarError, RarResult};
 use crate::probe::probe_volume;
 use crate::types::ArchiveFormat;
+use reedsolomon_rs::decode_apply::apply_decode_matrix_gf8;
 use reedsolomon_rs::rar3::Rar3RsCoder;
 use reedsolomon_rs::rar5::Rar5RsCoder;
 
@@ -67,15 +70,28 @@ pub fn restore_volumes_from_paths(
     let expanded_paths = expand_recovery_paths(paths)?;
     let paths = expanded_paths.as_slice();
 
+    // A RAR3 header check hashes the whole `.rev` file, so the files are
+    // read side by side; the results are taken in path order, which keeps
+    // the first error the one a serial scan would have hit.
+    let rev_paths = paths
+        .iter()
+        .filter(|path| is_rev_path(path))
+        .collect::<Vec<_>>();
+    let rev_headers = par_map_in_order(&rev_paths, |path| match read_rar5_rev_header(path) {
+        Ok(Some(header)) => Some(Ok(RevHeader::Rar5(header))),
+        Ok(None) => match read_rar3_rev_header(path) {
+            Ok(Some(header)) => Some(Ok(RevHeader::Rar3(header))),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        },
+        Err(error) => Some(Err(error)),
+    });
     let mut rar5_headers = Vec::new();
     let mut rar3_headers = Vec::new();
-    for path in paths {
-        if is_rev_path(path) {
-            if let Some(header) = read_rar5_rev_header(path)? {
-                rar5_headers.push(header);
-            } else if let Some(header) = read_rar3_rev_header(path)? {
-                rar3_headers.push(header);
-            }
+    for header in rev_headers.into_iter().flatten() {
+        match header? {
+            RevHeader::Rar5(header) => rar5_headers.push(header),
+            RevHeader::Rar3(header) => rar3_headers.push(header),
         }
     }
 
@@ -99,6 +115,27 @@ pub fn restore_volumes_from_paths(
     Err(RarError::CorruptArchive {
         detail: "no valid RAR recovery volumes were found".into(),
     })
+}
+
+enum RevHeader {
+    Rar5(Rar5RevHeader),
+    Rar3(Rar3RevHeader),
+}
+
+/// `items.iter().map(map).collect()`, run on rayon where the build has
+/// worker threads. The results keep the order of `items`, so a caller that
+/// walks them in order sees the same first error a serial loop would.
+fn par_map_in_order<T, R, F>(items: &[T], map: F) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync + Send,
+{
+    if items.len() > 1 && reedsolomon_rs::threading::parallel_enabled() {
+        items.par_iter().map(map).collect()
+    } else {
+        items.iter().map(map).collect()
+    }
 }
 
 fn expand_recovery_paths(paths: &[PathBuf]) -> RarResult<Vec<PathBuf>> {
@@ -242,7 +279,16 @@ fn restore_rar5(
 
     let reference_name = rar5_recovery_reference_name(paths, &rev_headers)?;
 
-    for header in rev_headers {
+    // Every in-range recovery volume's CRC32, computed side by side. They
+    // are consumed in header order below, so a mismatched header or an I/O
+    // error surfaces exactly where the serial checks put it.
+    let rev_crc_ok = par_map_in_order(&rev_headers, |header| {
+        (header.rec_num >= data_count && header.rec_num < total_count).then(|| {
+            verify_file_crc32_region(&header.path, header.data_offset, Some(header.rev_crc))
+        })
+    });
+
+    for (header, crc_ok) in rev_headers.into_iter().zip(rev_crc_ok) {
         let counts_mismatch = header.data_count != data_count || header.rec_count != rec_count;
         let table_mismatch = header
             .data_volumes
@@ -256,10 +302,10 @@ fn restore_rar5(
                 ),
             });
         }
-        if header.rec_num < data_count || header.rec_num >= total_count {
+        let Some(crc_ok) = crc_ok else {
             continue;
-        }
-        if !verify_file_crc32_region(&header.path, header.data_offset, Some(header.rev_crc))? {
+        };
+        if !crc_ok? {
             continue;
         }
         let slot = header.rec_num - data_count;
@@ -282,7 +328,6 @@ fn restore_rar5(
             data_slots[index].path = Some(path.clone());
         }
     }
-
     for (index, slot) in data_slots.iter_mut().enumerate() {
         slot.output_path = slot
             .path
@@ -291,28 +336,259 @@ fn restore_rar5(
             .unwrap_or_else(|| {
                 infer_numbered_volume_path(&reference_name, &output_dir, index, "rar")
             });
-
-        slot.valid = if let Some(path) = &slot.path {
-            let metadata = std::fs::metadata(path).map_err(RarError::Io)?;
-            metadata.len() == slot.file_size && verify_file_crc32_region(path, 0, Some(slot.crc32))?
-        } else {
-            false
-        };
     }
+
+    // When some volumes are absent or the wrong size and the recovery
+    // volumes can cover exactly those, the decode itself reads every other
+    // data volume, so it checks their CRC32s on the way through instead of a
+    // separate pass reading them first. Only if they all match does it
+    // touch anything; otherwise the verdicts it found feed the serial path.
+    let size_ok = par_map_in_order(&data_slots, |slot| -> RarResult<bool> {
+        let Some(path) = &slot.path else {
+            return Ok(false);
+        };
+        Ok(std::fs::metadata(path).map_err(RarError::Io)?.len() == slot.file_size)
+    })
+    .into_iter()
+    .collect::<RarResult<Vec<_>>>();
+    let valid_recovery_count = recovery_slots.iter().filter(|slot| slot.valid).count();
+    let folded = match &size_ok {
+        Ok(size_ok)
+            if (1..=valid_recovery_count).contains(&size_ok.iter().filter(|&&ok| !ok).count()) =>
+        {
+            restore_rar5_folded(
+                &mut data_slots,
+                &recovery_slots,
+                size_ok,
+                rec_count,
+                options,
+            )?
+        }
+        _ => Rar5Folded::Unavailable,
+    };
+
+    let (missing_volume_numbers, restored) = match folded {
+        Rar5Folded::Restored { missing, restored } => (missing, restored),
+        Rar5Folded::Verdicts(verdicts) => {
+            match restore_rar5_checked(
+                &mut data_slots,
+                &recovery_slots,
+                verdicts.into_iter().map(Ok).collect(),
+                rec_count,
+                options,
+            )? {
+                Some(done) => done,
+                None => return Ok(rar5_nothing_missing()),
+            }
+        }
+        Rar5Folded::Unavailable => {
+            // Each data volume is checked against the table (size, then
+            // CRC32) on its own worker; the verdicts are applied in volume
+            // order.
+            let verdicts = par_map_in_order(&data_slots, |slot| -> RarResult<bool> {
+                let Some(path) = &slot.path else {
+                    return Ok(false);
+                };
+                let metadata = std::fs::metadata(path).map_err(RarError::Io)?;
+                Ok(metadata.len() == slot.file_size
+                    && verify_file_crc32_region(path, 0, Some(slot.crc32))?)
+            });
+            match restore_rar5_checked(
+                &mut data_slots,
+                &recovery_slots,
+                verdicts,
+                rec_count,
+                options,
+            )? {
+                Some(done) => done,
+                None => return Ok(rar5_nothing_missing()),
+            }
+        }
+    };
+
+    if options.verify_restored {
+        for (&missing_idx, (path, actual)) in missing_volume_numbers.iter().zip(&restored) {
+            let expected_crc = data_slots[missing_idx].crc32;
+            if *actual != expected_crc {
+                return Err(RarError::DataCrcMismatch {
+                    member: path.display().to_string(),
+                    expected: expected_crc,
+                    actual: *actual,
+                });
+            }
+        }
+    }
+    let restored_paths = restored.into_iter().map(|(path, _)| path).collect();
+
+    let used_recovery_paths = recovery_slots
+        .iter()
+        .filter(|slot| slot.valid)
+        .filter_map(|slot| slot.path.clone())
+        .collect();
+
+    Ok(RecoveryReport {
+        format: ArchiveFormat::Rar5,
+        restored_paths,
+        used_recovery_paths,
+        missing_volume_numbers,
+    })
+}
+
+fn rar5_nothing_missing() -> RecoveryReport {
+    RecoveryReport {
+        format: ArchiveFormat::Rar5,
+        restored_paths: Vec::new(),
+        used_recovery_paths: Vec::new(),
+        missing_volume_numbers: Vec::new(),
+    }
+}
+
+/// The outcome of [`restore_rar5_folded`].
+enum Rar5Folded {
+    /// Every size-matching data volume matched its CRC32: the missing ones
+    /// (by volume number) are restored, with the CRC32 of what was written.
+    Restored {
+        missing: Vec<usize>,
+        restored: Vec<(PathBuf, u32)>,
+    },
+    /// Some size-matching data volume failed its CRC32. Nothing was renamed
+    /// or left behind; these are every data volume's verdicts.
+    Verdicts(Vec<bool>),
+    /// The size-based shape is not one the decoder takes; nothing was read.
+    Unavailable,
+}
+
+/// Restore on the assumption that every data volume of the right size is
+/// intact, checking that assumption with the CRC32s the decode computes as
+/// it reads them.
+///
+/// The decode writes to hidden partial files beside the outputs. Only once
+/// every CRC32 has matched does the restore act, and then in the serial
+/// path's order: bad volumes are renamed to `.bad`, existing outputs are
+/// refused, and the partial files are moved into place. A CRC32 failure
+/// removes the partial files and hands back the verdicts, so the serial path
+/// renames and refuses exactly as it would have after its own checks.
+fn restore_rar5_folded(
+    data_slots: &mut [Rar5DataSlot],
+    recovery_slots: &[Rar5RecoverySlot],
+    size_ok: &[bool],
+    rec_count: usize,
+    options: &RecoveryOptions,
+) -> RarResult<Rar5Folded> {
+    let data_count = data_slots.len();
+    let mut valid_flags = size_ok.to_vec();
+    valid_flags.extend(recovery_slots.iter().map(|slot| slot.valid));
+    let Some(coder) = Rar5RsCoder::new_decoder(data_count, rec_count, &valid_flags) else {
+        return Ok(Rar5Folded::Unavailable);
+    };
+    for (slot, &ok) in data_slots.iter_mut().zip(size_ok) {
+        slot.valid = ok;
+    }
+    let missing = (0..data_count).filter(|&i| !size_ok[i]).collect::<Vec<_>>();
+    let mut partial_paths = Vec::with_capacity(missing.len());
+    let mut partials = Vec::with_capacity(missing.len());
+    let remove_paths = |paths: &[PathBuf]| {
+        for path in paths {
+            let _ = std::fs::remove_file(path);
+        }
+    };
+    for &i in &missing {
+        match create_partial(&data_slots[i].output_path) {
+            Ok((path, file)) => {
+                partial_paths.push(path.clone());
+                partials.push((path, file));
+            }
+            Err(error) => {
+                drop(partials);
+                remove_paths(&partial_paths);
+                return Err(error);
+            }
+        }
+    }
+    let remove_partials = || remove_paths(&partial_paths);
+
+    let pass = match reconstruct_rar5(
+        &coder,
+        data_slots,
+        recovery_slots,
+        &missing,
+        Rar5Outputs::Created(partials),
+        true,
+    ) {
+        Ok(pass) => pass,
+        Err(error) => {
+            remove_partials();
+            return Err(error);
+        }
+    };
+    let verdicts = data_slots
+        .iter()
+        .zip(&pass.data_crcs)
+        .map(|(slot, crc)| slot.valid && *crc == Some(slot.crc32))
+        .collect::<Vec<_>>();
+    if verdicts != size_ok {
+        remove_partials();
+        return Ok(Rar5Folded::Verdicts(verdicts));
+    }
+
+    let finish = (|| -> RarResult<()> {
+        for &i in &missing {
+            rename_invalid_rar5_data_volume(&mut data_slots[i], options)?;
+        }
+        for &i in &missing {
+            let path = &data_slots[i].output_path;
+            if path.exists() && !options.overwrite_existing {
+                return Err(refuse_existing_restored(path));
+            }
+        }
+        for (partial, &i) in partial_paths.iter().zip(&missing) {
+            install_partial(
+                partial,
+                &data_slots[i].output_path,
+                options.overwrite_existing,
+            )?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = finish {
+        remove_partials();
+        return Err(error);
+    }
+
+    let restored = missing
+        .iter()
+        .zip(pass.restored)
+        .map(|(&i, (_, crc))| (data_slots[i].output_path.clone(), crc))
+        .collect();
+    Ok(Rar5Folded::Restored { missing, restored })
+}
+
+/// The missing data volume numbers, and each restored volume's path with the
+/// CRC32 of what was written to it.
+type Rar5Restored = (Vec<usize>, Vec<(PathBuf, u32)>);
+
+/// The serial RAR5 path from known data-volume verdicts: refuse a set the
+/// recovery volumes cannot cover, rename bad volumes, refuse existing
+/// outputs, then decode. `None` when no data volume is missing.
+fn restore_rar5_checked(
+    data_slots: &mut [Rar5DataSlot],
+    recovery_slots: &[Rar5RecoverySlot],
+    verdicts: Vec<RarResult<bool>>,
+    rec_count: usize,
+    options: &RecoveryOptions,
+) -> RarResult<Option<Rar5Restored>> {
+    for (slot, valid) in data_slots.iter_mut().zip(verdicts) {
+        slot.valid = valid?;
+    }
+    let data_count = data_slots.len();
 
     let missing_volume_numbers = data_slots
         .iter()
         .enumerate()
         .filter_map(|(idx, slot)| (!slot.valid).then_some(idx))
         .collect::<Vec<_>>();
-
     if missing_volume_numbers.is_empty() {
-        return Ok(RecoveryReport {
-            format: ArchiveFormat::Rar5,
-            restored_paths: Vec::new(),
-            used_recovery_paths: Vec::new(),
-            missing_volume_numbers,
-        });
+        return Ok(None);
     }
 
     let valid_recovery_count = recovery_slots.iter().filter(|slot| slot.valid).count();
@@ -333,62 +609,146 @@ fn restore_rar5(
     for &missing_idx in &missing_volume_numbers {
         let path = &data_slots[missing_idx].output_path;
         if path.exists() && !options.overwrite_existing {
-            return Err(RarError::CorruptArchive {
-                detail: format!(
-                    "refusing to overwrite existing restored volume {}",
-                    path.display()
-                ),
-            });
+            return Err(refuse_existing_restored(path));
         }
     }
 
-    let mut valid_flags = vec![false; total_count];
-    for (idx, slot) in data_slots.iter().enumerate() {
-        valid_flags[idx] = slot.valid;
-    }
-    for (idx, slot) in recovery_slots.iter().enumerate() {
-        valid_flags[data_count + idx] = slot.valid;
-    }
-
+    let mut valid_flags = data_slots.iter().map(|slot| slot.valid).collect::<Vec<_>>();
+    valid_flags.extend(recovery_slots.iter().map(|slot| slot.valid));
     let coder = Rar5RsCoder::new_decoder(data_count, rec_count, &valid_flags).ok_or_else(|| {
         RarError::CorruptArchive {
             detail: "failed to initialize RAR5 recovery decoder".into(),
         }
     })?;
 
-    let restored_paths = reconstruct_rar5(
+    let output_paths = missing_volume_numbers
+        .iter()
+        .map(|&idx| data_slots[idx].output_path.clone())
+        .collect::<Vec<_>>();
+    let pass = reconstruct_rar5(
         &coder,
-        &data_slots,
-        &recovery_slots,
+        data_slots,
+        recovery_slots,
         &missing_volume_numbers,
-        options,
+        Rar5Outputs::Paths {
+            paths: &output_paths,
+            overwrite_existing: options.overwrite_existing,
+        },
+        false,
     )?;
+    Ok(Some((missing_volume_numbers, pass.restored)))
+}
 
-    if options.verify_restored {
-        for (&missing_idx, path) in missing_volume_numbers.iter().zip(restored_paths.iter()) {
-            let expected_crc = data_slots[missing_idx].crc32;
-            if !verify_file_crc32_region(path, 0, Some(expected_crc))? {
-                return Err(RarError::DataCrcMismatch {
-                    member: path.display().to_string(),
-                    expected: expected_crc,
-                    actual: crc32_file_region(path, 0)?,
-                });
+fn refuse_existing_restored(path: &Path) -> RarError {
+    RarError::CorruptArchive {
+        detail: format!(
+            "refusing to overwrite existing restored volume {}",
+            path.display()
+        ),
+    }
+}
+
+/// Move a finished partial restore to `target`.
+///
+/// With `overwrite_existing` this is a plain rename, which replaces whatever
+/// is at `target`. Without it the existence check the caller made earlier is
+/// only advisory: a file created at `target` since then must still win. The
+/// partial is therefore hard-linked to `target`, which the filesystem refuses
+/// atomically when the name is taken, and the partial name is removed only
+/// once the link stands. A taken name is refused like any other existing
+/// output, and the file at it is left as it was.
+///
+/// A filesystem that cannot hard-link (FAT, some network shares) reports an
+/// error other than `AlreadyExists`. There `target` is created exclusively,
+/// which every filesystem refuses atomically when the name is taken, the
+/// partial's bytes are copied into it, and the partial is removed. That costs
+/// one extra copy of the volume on such filesystems but never a replaced file.
+fn install_partial(partial: &Path, target: &Path, overwrite_existing: bool) -> RarResult<()> {
+    if overwrite_existing {
+        return std::fs::rename(partial, target).map_err(RarError::Io);
+    }
+    match std::fs::hard_link(partial, target) {
+        Ok(()) => std::fs::remove_file(partial).map_err(RarError::Io),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(refuse_existing_restored(target))
+        }
+        Err(_) => copy_partial_exclusively(partial, target),
+    }
+}
+
+/// Install `partial` at `target` by exclusive create and copy, for
+/// filesystems without hard links. A name taken before or during the install
+/// is refused and left as it was; a copy that fails part way removes the
+/// incomplete `target` and keeps the partial for the caller's cleanup.
+fn copy_partial_exclusively(partial: &Path, target: &Path) -> RarResult<()> {
+    let mut output = match OpenOptions::new().write(true).create_new(true).open(target) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(refuse_existing_restored(target));
+        }
+        Err(error) => return Err(RarError::Io(error)),
+    };
+    let copied = File::open(partial)
+        .and_then(|mut input| std::io::copy(&mut input, &mut output))
+        .and_then(|_| output.sync_all());
+    drop(output);
+    if let Err(error) = copied {
+        let _ = std::fs::remove_file(target);
+        return Err(RarError::Io(error));
+    }
+    std::fs::remove_file(partial).map_err(RarError::Io)
+}
+
+/// How many names [`create_partial`] tries before it gives up.
+const PARTIAL_CREATE_ATTEMPTS: usize = 16;
+
+/// Create a fresh hidden sibling of `output` for a speculative restore to
+/// write before it knows the restore stands, returning its path and the file.
+fn create_partial(output: &Path) -> RarResult<(PathBuf, File)> {
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent).map_err(RarError::Io)?;
+    }
+    create_exclusive(|| partial_restore_path(output))
+}
+
+/// Create the first of `next_path`'s names that does not exist yet. The
+/// create is exclusive, so it never opens, truncates or follows a file or
+/// symlink already at a name; such a name is skipped for the next one.
+fn create_exclusive(mut next_path: impl FnMut() -> PathBuf) -> RarResult<(PathBuf, File)> {
+    let mut last_error = None;
+    for _ in 0..PARTIAL_CREATE_ATTEMPTS {
+        let path = next_path();
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_error = Some(error);
             }
+            Err(error) => return Err(RarError::Io(error)),
         }
     }
+    Err(RarError::Io(last_error.unwrap_or_else(|| {
+        std::io::Error::from(std::io::ErrorKind::AlreadyExists)
+    })))
+}
 
-    let used_recovery_paths = recovery_slots
-        .iter()
-        .filter(|slot| slot.valid)
-        .filter_map(|slot| slot.path.clone())
-        .collect();
-
-    Ok(RecoveryReport {
-        format: ArchiveFormat::Rar5,
-        restored_paths,
-        used_recovery_paths,
-        missing_volume_numbers,
-    })
+/// A hidden sibling name of `output` for a speculative restore. The process
+/// id, a per-process counter and the clock's nanoseconds keep restores apart,
+/// within a process and across processes, and make the name unpredictable
+/// enough that [`create_exclusive`] rarely has to skip one.
+fn partial_restore_path(output: &Path) -> PathBuf {
+    static NEXT_PARTIAL: AtomicU64 = AtomicU64::new(0);
+    let name = output
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let serial = NEXT_PARTIAL.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos());
+    output.with_file_name(format!(
+        ".{name}.{}.{serial}.{nanos:09}.partial",
+        std::process::id()
+    ))
 }
 
 fn rar5_recovery_reference_name(
@@ -474,13 +834,39 @@ fn bad_volume_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// What one RAR5 decode pass produced.
+struct Rar5Reconstruction {
+    /// Each restored volume's path and the CRC32 of the bytes written to it.
+    restored: Vec<(PathBuf, u32)>,
+    /// When asked for, the CRC32 of every valid data volume the pass read,
+    /// indexed by volume; `None` for the volumes it did not read.
+    data_crcs: Vec<Option<u32>>,
+}
+
+/// Where [`reconstruct_rar5`] writes the restored volumes.
+enum Rar5Outputs<'a> {
+    /// Opened once the inputs are: each path is created, or with
+    /// `overwrite_existing` truncated where it exists.
+    Paths {
+        paths: &'a [PathBuf],
+        overwrite_existing: bool,
+    },
+    /// Files the caller already created, with their paths.
+    Created(Vec<(PathBuf, File)>),
+}
+
+/// Rebuild the missing data volumes into `outputs` (one per entry of
+/// `missing_volume_numbers`). With `hash_data`, every data volume the decode
+/// reads is hashed on the way through, so a caller that trusted its size can
+/// check it against the table without a second read.
 fn reconstruct_rar5(
     coder: &Rar5RsCoder,
     data_slots: &[Rar5DataSlot],
     recovery_slots: &[Rar5RecoverySlot],
     missing_volume_numbers: &[usize],
-    options: &RecoveryOptions,
-) -> RarResult<Vec<PathBuf>> {
+    outputs: Rar5Outputs<'_>,
+    hash_data: bool,
+) -> RarResult<Rar5Reconstruction> {
     let missing_count = missing_volume_numbers.len();
     let data_count = data_slots.len();
     let max_volume_size = data_slots
@@ -488,7 +874,11 @@ fn reconstruct_rar5(
         .map(|slot| slot.file_size)
         .max()
         .unwrap_or(0);
-    let mut chunk_size = (RAR5_TOTAL_BUFFER_SIZE / missing_count.max(1)).max(2);
+    // Every unit of a chunk is held at once so the whole matrix can be
+    // applied across stripes on every core, and the next chunk's units are
+    // read meanwhile, which bounds the chunk by two sets of units plus the
+    // outputs rather than by the outputs alone.
+    let mut chunk_size = (RAR5_TOTAL_BUFFER_SIZE / (2 * data_count + missing_count).max(1)).max(2);
     if !chunk_size.is_multiple_of(2) {
         chunk_size -= 1;
     }
@@ -524,81 +914,181 @@ fn reconstruct_rar5(
         })
         .collect::<RarResult<Vec<_>>>()?;
 
-    let mut outputs = Vec::with_capacity(missing_count);
-    let mut restored_paths = Vec::with_capacity(missing_count);
-    for &missing_idx in missing_volume_numbers {
-        let path = &data_slots[missing_idx].output_path;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(RarError::Io)?;
+    let (restored_paths, mut outputs): (Vec<PathBuf>, Vec<File>) = match outputs {
+        Rar5Outputs::Paths {
+            paths,
+            overwrite_existing,
+        } => {
+            let mut outputs = Vec::with_capacity(missing_count);
+            for path in paths {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(RarError::Io)?;
+                }
+                let file = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(overwrite_existing)
+                    .create_new(!overwrite_existing)
+                    .open(path)
+                    .map_err(RarError::Io)?;
+                outputs.push(file);
+            }
+            (paths.to_vec(), outputs)
         }
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(options.overwrite_existing)
-            .create_new(!options.overwrite_existing)
-            .open(path)
-            .map_err(RarError::Io)?;
-        outputs.push(file);
-        restored_paths.push(path.clone());
+        Rar5Outputs::Created(created) => created.into_iter().unzip(),
+    };
+
+    // The file each logical unit is read from: the data volume where it is
+    // valid, otherwise the next valid recovery volume, in order. Fixed for
+    // the whole restore, so a chunk's units can be read side by side.
+    // A data unit also carries its hasher and table size when `hash_data`
+    // asks for its CRC32.
+    let mut spare_recovery = recovery_files.iter_mut().filter_map(Option::as_mut);
+    let mut unit_files = Vec::with_capacity(data_count);
+    for (slot, file) in data_slots.iter().zip(data_files.iter_mut()) {
+        let unit = if slot.valid {
+            let file = file.as_mut().ok_or_else(|| RarError::CorruptArchive {
+                detail: "valid RAR5 data slot has no open file".into(),
+            })?;
+            (file, hash_data.then(crc32fast::Hasher::new), slot.file_size)
+        } else {
+            let file = spare_recovery
+                .next()
+                .ok_or_else(|| RarError::CorruptArchive {
+                    detail: "RAR5 recovery volume selection exhausted unexpectedly".into(),
+                })?;
+            (file, None, 0)
+        };
+        unit_files.push(unit);
     }
 
-    let mut input_buf = vec![0u8; chunk_size + 2];
-    let mut out_bufs = vec![vec![0u8; chunk_size + 2]; missing_count];
+    // Two sets of unit buffers: the next chunk is read into one while the
+    // other is decoded and written.
+    let mut input_bufs = vec![vec![0u8; chunk_size]; data_count];
+    let mut next_bufs = vec![vec![0u8; chunk_size]; data_count];
+    let mut out_bufs = vec![vec![0u8; chunk_size]; missing_count];
+    // Each restored volume is hashed as it is written, so verifying it
+    // afterwards does not read it back.
+    let mut hashers = vec![crc32fast::Hasher::new(); missing_count];
+    let output_sizes = missing_volume_numbers
+        .iter()
+        .map(|&idx| data_slots[idx].file_size)
+        .collect::<Vec<_>>();
+    let chunk_at = |offset: u64| (max_volume_size - offset).min(chunk_size as u64) as usize;
+
+    let read_chunk = |bufs: &mut [Vec<u8>],
+                      units: &mut [(&mut File, Option<crc32fast::Hasher>, u64)],
+                      offset: u64|
+     -> RarResult<()> {
+        let bytes = chunk_at(offset);
+        let rs_len = bytes + (bytes & 1);
+        par_zip_mut(bufs, units, |input_buf, unit| {
+            let (file, hasher, size) = unit;
+            // `read_padded` zeroes what the file does not fill; the odd pad
+            // byte of a final odd-length chunk lies past what it is handed.
+            input_buf[bytes..rs_len].fill(0);
+            read_padded(file, &mut input_buf[..bytes])?;
+            if let Some(hasher) = hasher {
+                let hash_len = size.saturating_sub(offset).min(bytes as u64);
+                hasher.update(&input_buf[..hash_len as usize]);
+            }
+            Ok(())
+        })
+        .into_iter()
+        .collect()
+    };
+
     let mut processed = 0u64;
-
+    if processed < max_volume_size {
+        read_chunk(&mut input_bufs, &mut unit_files, processed)?;
+    }
     while processed < max_volume_size {
-        let remaining = (max_volume_size - processed) as usize;
-        let bytes_to_process = remaining.min(chunk_size);
+        let bytes_to_process = chunk_at(processed);
         let rs_len = bytes_to_process + (bytes_to_process & 1);
-        let mut next_recovery = 0usize;
+        let next = processed + bytes_to_process as u64;
 
-        for data_num in 0..data_count {
-            input_buf[..rs_len].fill(0);
-            if data_slots[data_num].valid {
-                if let Some(file) = &mut data_files[data_num] {
-                    read_padded(file, &mut input_buf[..bytes_to_process])?;
+        let (read_ahead, written) = rayon::join(
+            || {
+                if next < max_volume_size {
+                    read_chunk(&mut next_bufs, &mut unit_files, next)
+                } else {
+                    Ok(())
                 }
-            } else {
-                while next_recovery < recovery_files.len()
-                    && recovery_files[next_recovery].is_none()
-                {
-                    next_recovery += 1;
-                }
-                let recovery = recovery_files
-                    .get_mut(next_recovery)
-                    .and_then(Option::as_mut)
-                    .ok_or_else(|| RarError::CorruptArchive {
-                        detail: "RAR5 recovery volume selection exhausted unexpectedly".into(),
-                    })?;
-                read_padded(recovery, &mut input_buf[..bytes_to_process])?;
-                next_recovery += 1;
-            }
+            },
+            || -> RarResult<()> {
+                let units = input_bufs
+                    .iter()
+                    .map(|buf| &buf[..rs_len])
+                    .collect::<Vec<_>>();
+                let mut output_slices = out_bufs
+                    .iter_mut()
+                    .map(|buf| &mut buf[..rs_len])
+                    .collect::<Vec<_>>();
+                coder.apply_units(&units, &mut output_slices);
 
-            let mut output_slices = out_bufs
-                .iter_mut()
-                .map(|buf| &mut buf[..rs_len])
-                .collect::<Vec<_>>();
-            coder.update_outputs(data_num, &input_buf[..rs_len], &mut output_slices);
-        }
-
-        for (out_idx, &missing_idx) in missing_volume_numbers.iter().enumerate() {
-            let remaining_for_file = data_slots[missing_idx].file_size.saturating_sub(processed);
-            let write_len = remaining_for_file.min(bytes_to_process as u64) as usize;
-            if write_len > 0 {
-                outputs[out_idx]
-                    .write_all(&out_bufs[out_idx][..write_len])
-                    .map_err(RarError::Io)?;
-            }
-        }
-
-        processed += bytes_to_process as u64;
+                let mut sinks = outputs
+                    .iter_mut()
+                    .zip(hashers.iter_mut())
+                    .zip(output_sizes.iter())
+                    .collect::<Vec<_>>();
+                par_zip_mut(&mut sinks, &mut out_bufs, |sink, buf| {
+                    let ((output, hasher), size) = sink;
+                    let write_len = (**size)
+                        .saturating_sub(processed)
+                        .min(bytes_to_process as u64) as usize;
+                    if write_len > 0 {
+                        output.write_all(&buf[..write_len]).map_err(RarError::Io)?;
+                        hasher.update(&buf[..write_len]);
+                    }
+                    Ok(())
+                })
+                .into_iter()
+                .collect()
+            },
+        );
+        written?;
+        read_ahead?;
+        std::mem::swap(&mut input_bufs, &mut next_bufs);
+        processed = next;
     }
 
     for output in &mut outputs {
         output.flush().map_err(RarError::Io)?;
     }
 
-    Ok(restored_paths)
+    Ok(Rar5Reconstruction {
+        restored: restored_paths
+            .into_iter()
+            .zip(hashers.into_iter().map(crc32fast::Hasher::finalize))
+            .collect(),
+        data_crcs: unit_files
+            .into_iter()
+            .map(|(_, hasher, _)| hasher.map(crc32fast::Hasher::finalize))
+            .collect(),
+    })
+}
+
+/// Run `task` over the pairs of two equally long slices, on rayon where the
+/// build has worker threads, returning the results in order.
+fn par_zip_mut<A, B, R, F>(left: &mut [A], right: &mut [B], task: F) -> Vec<R>
+where
+    A: Send,
+    B: Send,
+    R: Send,
+    F: Fn(&mut A, &mut B) -> R + Sync + Send,
+{
+    debug_assert_eq!(left.len(), right.len());
+    if left.len() > 1 && reedsolomon_rs::threading::parallel_enabled() {
+        left.par_iter_mut()
+            .zip(right.par_iter_mut())
+            .map(|(a, b)| task(a, b))
+            .collect()
+    } else {
+        left.iter_mut()
+            .zip(right.iter_mut())
+            .map(|(a, b)| task(a, b))
+            .collect()
+    }
 }
 
 fn read_rar5_rev_header(path: &Path) -> RarResult<Option<Rar5RevHeader>> {
@@ -749,7 +1239,19 @@ fn restore_rar3(
     }
 
     let output_dir = recovery_output_dir(paths, options);
-    let reference_name = rar3_recovery_reference_name(paths)?;
+    // Whether each candidate data volume is intact (headers, then the
+    // end-of-archive data CRC when it has one), checked side by side. Both
+    // the reference-name search and the slot assignment below read these in
+    // path order, so errors surface where the serial checks raised them.
+    let data_paths = paths
+        .iter()
+        .filter(|path| !is_rev_path(path))
+        .collect::<Vec<_>>();
+    let mut data_valid = par_map_in_order(&data_paths, |path| rar3_data_volume_is_valid(path))
+        .into_iter()
+        .map(Some)
+        .collect::<Vec<_>>();
+    let reference_name = rar3_recovery_reference_name(&data_paths, &mut data_valid)?;
 
     let mut slots = vec![None::<PathBuf>; total_count];
     let mut invalid_data_paths = vec![None::<PathBuf>; data_count];
@@ -771,19 +1273,16 @@ fn restore_rar3(
         }
     }
 
-    for path in paths {
-        if is_rev_path(path) {
-            continue;
-        }
+    for (path, valid) in data_paths.iter().zip(data_valid.iter_mut()) {
         if let Some(index) = parse_rar3_data_volume_number(path)
             && index < data_count
         {
-            if rar3_data_volume_is_valid(path)? {
-                slots[index] = Some(path.clone());
+            if take_rar3_validity(valid, path)? {
+                slots[index] = Some((*path).clone());
                 invalid_data_paths[index] = None;
             } else {
                 slots[index] = None;
-                invalid_data_paths[index] = Some(path.clone());
+                invalid_data_paths[index] = Some((*path).clone());
             }
         }
     }
@@ -877,9 +1376,12 @@ fn restore_rar3(
     })
 }
 
-fn rar3_recovery_reference_name(paths: &[PathBuf]) -> RarResult<&Path> {
-    for path in paths.iter().filter(|path| !is_rev_path(path)) {
-        if rar3_data_volume_is_valid(path)? {
+fn rar3_recovery_reference_name<'a>(
+    data_paths: &[&'a PathBuf],
+    data_valid: &mut [Option<RarResult<bool>>],
+) -> RarResult<&'a Path> {
+    for (path, valid) in data_paths.iter().zip(data_valid.iter_mut()) {
+        if take_rar3_validity(valid, path)? {
             return Ok(path);
         }
     }
@@ -887,6 +1389,19 @@ fn rar3_recovery_reference_name(paths: &[PathBuf]) -> RarResult<&Path> {
     Err(RarError::CorruptArchive {
         detail: "RAR3 recovery restore requires at least one valid data volume".into(),
     })
+}
+
+/// A precomputed `rar3_data_volume_is_valid` verdict. The first read takes
+/// it, whatever it was, and a second read of the same path recomputes it from
+/// the file as the serial code did: the volume the reference-name search
+/// accepted is checked again when the slots are assigned, so one that changed
+/// after the side-by-side check does not enter the reconstruction on a stale
+/// verdict.
+fn take_rar3_validity(slot: &mut Option<RarResult<bool>>, path: &Path) -> RarResult<bool> {
+    match slot.take() {
+        Some(verdict) => verdict,
+        None => rar3_data_volume_is_valid(path),
+    }
 }
 
 fn rar3_data_volume_is_valid(path: &Path) -> RarResult<bool> {
@@ -1000,66 +1515,69 @@ fn reconstruct_rar3(
     let erasures = (0..total_count)
         .filter(|&idx| slots[idx].is_none())
         .collect::<Vec<_>>();
-    let mut buffers = vec![vec![0u8; chunk_size]; total_count];
+    let present = (0..total_count)
+        .filter(|&idx| slots[idx].is_some())
+        .collect::<Vec<_>>();
 
-    // One byte per missing volume per column, interleaved, filled in parallel
-    // and scattered back afterwards. Allocated once for the whole restore: the
-    // previous shape collected a `Vec<Vec<u8>>` with one entry per byte
-    // position, which cost two heap allocations for every single byte
-    // reconstructed and held millions of one-byte `Vec`s live at a time.
-    let missing_count = missing_volume_numbers.len();
-    let mut restored = vec![0u8; chunk_size * missing_count];
-
-    // Built once and cloned into each rayon split below. A clone is a flat
-    // copy of the tables; `new` would rebuild the GF tables and the generator
-    // polynomial per split, and its only failure is one we can report here
-    // instead of from inside the column loop.
-    let coder_template = Rar3RsCoder::new(rec_count).ok_or_else(|| RarError::CorruptArchive {
+    // For a fixed erasure set the scalar column decoder is a linear map, so
+    // it is derived once as a matrix (by running that decoder on unit
+    // vectors) and applied to whole regions with the gf8 kernels. Only the
+    // rows of missing data volumes are kept, and only the columns of present
+    // volumes: an erased position reads as zero, so its column contributes
+    // nothing. The matrix is the decoder's own map, so the bytes are the same
+    // ones the per-column decode produced.
+    let coder = Rar3RsCoder::new(rec_count).ok_or_else(|| RarError::CorruptArchive {
         detail: "RAR3 recovery set has invalid recovery count".into(),
     })?;
+    let matrix = coder.decode_matrix(total_count, &erasures).map(|full| {
+        rar3_missing_rows(
+            &full,
+            total_count,
+            &erasures,
+            &present,
+            missing_volume_numbers,
+        )
+    });
+
+    let mut buffers = vec![vec![0u8; chunk_size]; present.len()];
+    let missing_count = missing_volume_numbers.len();
+    let mut restored = vec![vec![0u8; chunk_size]; missing_count];
+
+    // The open file of each present volume, in `present` order, so a
+    // chunk's volumes can be read side by side.
+    let mut present_files = inputs.iter_mut().flatten().collect::<Vec<_>>();
 
     loop {
+        let reads = par_zip_mut(&mut buffers, &mut present_files, |buffer, file| {
+            read_padded(file, buffer)
+        });
         let mut max_read = 0usize;
-        for idx in 0..total_count {
-            buffers[idx].fill(0);
-            if let Some(file) = &mut inputs[idx] {
-                let read = read_padded(file, &mut buffers[idx])?;
-                max_read = max_read.max(read);
-            }
+        for read in reads {
+            max_read = max_read.max(read?);
         }
         if max_read == 0 {
             break;
         }
+        // Reported here rather than up front so a set with nothing to read
+        // fails or succeeds exactly as the column decoder did.
+        let matrix = matrix.as_ref().ok_or_else(|| RarError::CorruptArchive {
+            detail: "RAR3 recovery decoder failed".into(),
+        })?;
 
-        // One coder per rayon split, boxed and reused across that split's
-        // columns: the erasure pattern is the same for every column, which is
-        // exactly the case the coder's cached locator polynomial exists for.
-        restored[..max_read * missing_count]
-            .par_chunks_mut(missing_count)
-            .enumerate()
-            .try_for_each_init(
-                || Box::new(coder_template.clone()),
-                |coder, (pos, out)| {
-                    decode_rar3_column(coder, &buffers, pos, &erasures, missing_volume_numbers, out)
-                },
-            )?;
+        let input_refs = buffers
+            .iter()
+            .map(|buffer| &buffer[..max_read])
+            .collect::<Vec<_>>();
+        let mut output_refs = restored
+            .iter_mut()
+            .map(|buffer| &mut buffer[..max_read])
+            .collect::<Vec<_>>();
+        apply_decode_matrix_gf8(matrix, &input_refs, &mut output_refs);
 
-        if missing_count == 1 {
-            buffers[missing_volume_numbers[0]][..max_read].copy_from_slice(&restored[..max_read]);
-        } else {
-            for (missing_idx, &volume_idx) in missing_volume_numbers.iter().enumerate() {
-                let buffer = &mut buffers[volume_idx];
-                for pos in 0..max_read {
-                    buffer[pos] = restored[pos * missing_count + missing_idx];
-                }
-            }
-        }
-
-        for (out_idx, &missing_idx) in missing_volume_numbers.iter().enumerate() {
-            outputs[out_idx]
-                .write_all(&buffers[missing_idx][..max_read])
-                .map_err(RarError::Io)?;
-        }
+        let writes = par_zip_mut(&mut outputs, &mut restored, |output, buffer| {
+            output.write_all(&buffer[..max_read]).map_err(RarError::Io)
+        });
+        writes.into_iter().collect::<RarResult<()>>()?;
     }
 
     for (out_idx, output) in outputs.iter_mut().enumerate() {
@@ -1069,43 +1587,26 @@ fn reconstruct_rar3(
     Ok(())
 }
 
-/// Reconstruct the missing bytes at one column position into `out`, which
-/// holds one byte per entry of `missing_volume_numbers`.
-///
-/// Deliberately a function of its own and never inlined. Rayon's
-/// `bridge_producer_consumer::helper` recurses once per split and inlines the
-/// consumer's map closure into every level; under fat LTO that placed the
-/// coder's GF tables and the decoder's scratch polynomials — some 35 KiB —
-/// in each recursive frame, and a 2 MiB worker overflowed on a set of four
-/// 22 MiB volumes. Keeping the decode in a leaf frame bounds what the
-/// recursion carries to a few pointers, whatever the optimizer decides.
-///
-/// The column itself is a stack array rather than a `Vec`: this runs once per
-/// byte of the restored volumes, so a heap allocation here is a heap
-/// allocation per reconstructed byte.
-#[inline(never)]
-fn decode_rar3_column(
-    coder: &mut Rar3RsCoder,
-    buffers: &[Vec<u8>],
-    pos: usize,
+/// The rows of a full RAR3 decode matrix (one per erasure, one column per
+/// volume position) that rebuild the missing data volumes, restricted to the
+/// columns of the present volumes, in the order `apply_decode_matrix_gf8`
+/// takes them.
+fn rar3_missing_rows(
+    full: &[u8],
+    total: usize,
     erasures: &[usize],
+    present: &[usize],
     missing_volume_numbers: &[usize],
-    out: &mut [u8],
-) -> RarResult<()> {
-    let mut storage = [0u8; MAX_RAR3_SET];
-    let column = &mut storage[..buffers.len()];
-    for (slot, buffer) in column.iter_mut().zip(buffers) {
-        *slot = buffer[pos];
+) -> Vec<u8> {
+    let mut rows = Vec::with_capacity(missing_volume_numbers.len() * present.len());
+    for &missing in missing_volume_numbers {
+        let row = erasures
+            .iter()
+            .position(|&era| era == missing)
+            .expect("every missing data volume is an erasure");
+        rows.extend(present.iter().map(|&col| full[row * total + col]));
     }
-    if !coder.decode(column, erasures) {
-        return Err(RarError::CorruptArchive {
-            detail: "RAR3 recovery decoder failed".into(),
-        });
-    }
-    for (slot, &idx) in out.iter_mut().zip(missing_volume_numbers) {
-        *slot = column[idx];
-    }
-    Ok(())
+    rows
 }
 
 fn finalize_rar3_restored_output(
@@ -1175,10 +1676,7 @@ fn truncate_rar3_last_volume_padding(output: &mut File) -> RarResult<()> {
 }
 
 fn read_rar3_rev_header(path: &Path) -> RarResult<Option<Rar3RevHeader>> {
-    let data = match std::fs::read(path) {
-        Ok(data) => data,
-        Err(e) => return Err(RarError::Io(e)),
-    };
+    let mut file = File::open(path).map_err(RarError::Io)?;
     if !rar3_rev_uses_new_style_footer(path) {
         return Ok(
             parse_old_rar3_rev_name(path).map(|(data_count, rec_count, rec_position)| {
@@ -1192,20 +1690,24 @@ fn read_rar3_rev_header(path: &Path) -> RarResult<Option<Rar3RevHeader>> {
             }),
         );
     }
-    if data.len() < 7 {
+    // The footer is the last seven bytes: three set parameters, then the
+    // CRC32 of everything before the CRC. The volume is streamed through
+    // the CRC rather than read whole into memory.
+    let len = file.metadata().map_err(RarError::Io)?.len();
+    if len < 7 {
+        return Ok(None);
+    }
+    let actual_crc = crc32_stream(&mut file, len - 4)?;
+    let mut footer = [0u8; 7];
+    file.seek(SeekFrom::Start(len - 7)).map_err(RarError::Io)?;
+    file.read_exact(&mut footer).map_err(RarError::Io)?;
+    if actual_crc != le_u32(&footer[3..]) {
         return Ok(None);
     }
 
-    let crc_offset = data.len() - 4;
-    let expected_crc = le_u32(&data[crc_offset..]);
-    if crc32fast::hash(&data[..crc_offset]) != expected_crc {
-        return Ok(None);
-    }
-
-    let param_offset = data.len() - 7;
-    let data_count = data[param_offset] as usize + 1;
-    let rec_count = data[param_offset + 1] as usize + 1;
-    let rec_position = data[param_offset + 2] as usize + 1;
+    let data_count = footer[0] as usize + 1;
+    let rec_count = footer[1] as usize + 1;
+    let rec_position = footer[2] as usize + 1;
     if data_count == 0
         || rec_count == 0
         || rec_position == 0
@@ -1593,32 +2095,36 @@ fn verify_file_crc32_region(path: &Path, offset: u64, expected: Option<u32>) -> 
 
 fn crc32_file_prefix(path: &Path, len: u64) -> RarResult<u32> {
     let mut file = File::open(path).map_err(RarError::Io)?;
-    let mut remaining = len;
-    let mut hasher = crc32fast::Hasher::new();
-    let mut buf = [0u8; 64 * 1024];
-    while remaining > 0 {
-        let max_read = remaining.min(buf.len() as u64) as usize;
-        let read = file.read(&mut buf[..max_read]).map_err(RarError::Io)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buf[..read]);
-        remaining -= read as u64;
-    }
-    Ok(hasher.finalize())
+    crc32_stream(&mut file, len)
 }
 
 fn crc32_file_region(path: &Path, offset: u64) -> RarResult<u32> {
     let mut file = File::open(path).map_err(RarError::Io)?;
     file.seek(SeekFrom::Start(offset)).map_err(RarError::Io)?;
+    crc32_stream(&mut file, u64::MAX)
+}
+
+/// Read size for the whole-file CRC passes: large enough that a volume is a
+/// few hundred reads rather than tens of thousands, small enough to stay in
+/// L2 while it is hashed.
+const CRC_READ_SIZE: usize = 256 * 1024;
+
+/// CRC32 of the next `limit` bytes of `file`, or of everything up to the end
+/// when the file is shorter.
+fn crc32_stream(file: &mut File, limit: u64) -> RarResult<u32> {
+    let mut remaining = limit;
     let mut hasher = crc32fast::Hasher::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buf).map_err(RarError::Io)?;
-        if read == 0 {
-            break;
-        }
+    let mut buf = vec![0u8; CRC_READ_SIZE];
+    while remaining > 0 {
+        let max_read = remaining.min(buf.len() as u64) as usize;
+        let read = match file.read(&mut buf[..max_read]) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(RarError::Io(error)),
+        };
         hasher.update(&buf[..read]);
+        remaining -= read as u64;
     }
     Ok(hasher.finalize())
 }
@@ -2149,6 +2655,285 @@ mod tests {
         );
     }
 
+    /// A two-data, one-recovery RAR5 set written into `dir` with its first
+    /// data volume missing: the second data volume and the `.rev` are
+    /// present. Returns the present paths and the bytes the restore must put
+    /// at `{stem}.part1.rar`. The recovery payload is arbitrary; the missing
+    /// volume is whatever the decoder rebuilds from it, and the table carries
+    /// that volume's size and CRC32, so the set is consistent by construction.
+    fn synthetic_rar5_set(dir: &Path, stem: &str, seed: u8) -> (Vec<PathBuf>, Vec<u8>) {
+        let mut second = build_probe_rar5_archive(
+            crate::header::main_archive::flags::VOLUME
+                | crate::header::main_archive::flags::VOLUME_NUMBER,
+            Some(1),
+        );
+        second.extend((0..97u8).map(|i| i.wrapping_mul(7) ^ seed));
+        let first_len = second.len() + 23;
+        let rs_len = first_len + (first_len & 1);
+        let payload = (0..rs_len)
+            .map(|i| (i as u8).wrapping_mul(13) ^ seed)
+            .collect::<Vec<_>>();
+
+        let coder = Rar5RsCoder::new_decoder(2, 1, &[false, true, true]).unwrap();
+        let mut second_unit = second.clone();
+        second_unit.resize(rs_len, 0);
+        let mut first = vec![0u8; rs_len];
+        coder.apply_units(&[&payload, &second_unit], &mut [&mut first[..]]);
+        first.truncate(first_len);
+
+        let mut raw = vec![1u8]; // version
+        raw.extend_from_slice(&2u16.to_le_bytes()); // data count
+        raw.extend_from_slice(&1u16.to_le_bytes()); // recovery count
+        raw.extend_from_slice(&2u16.to_le_bytes()); // recovery volume number
+        raw.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+        for volume in [&first, &second] {
+            raw.extend_from_slice(&(volume.len() as u64).to_le_bytes());
+            raw.extend_from_slice(&crc32fast::hash(volume).to_le_bytes());
+        }
+        let mut rev = build_rar5_rev_from_raw(&raw);
+        rev.extend_from_slice(&payload);
+
+        let second_path = dir.join(format!("{stem}.part2.rar"));
+        let rev_path = dir.join(format!("{stem}.part1.rev"));
+        std::fs::write(&second_path, &second).unwrap();
+        std::fs::write(&rev_path, &rev).unwrap();
+        (vec![second_path, rev_path], first)
+    }
+
+    /// Hidden or `.partial` names in `dir`, other than `keep`.
+    fn stray_partials(dir: &Path, keep: &[&Path]) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                let name = path.file_name().unwrap().to_string_lossy();
+                (name.starts_with('.') || name.ends_with(".partial"))
+                    && !keep.contains(&path.as_path())
+            })
+            .collect()
+    }
+
+    fn restore_into(dir: &Path, overwrite_existing: bool) -> RecoveryOptions {
+        RecoveryOptions {
+            output_dir: Some(dir.to_path_buf()),
+            overwrite_existing,
+            verify_restored: true,
+        }
+    }
+
+    /// The speculative partial used to sit at `.<name>.<pid>.partial` and was
+    /// opened truncating, so a file planted there was clobbered. A regular
+    /// file at that name must now be left as it is, and the restore must
+    /// still land byte for byte with nothing left behind.
+    #[test]
+    fn rar5_folded_restore_leaves_a_file_at_the_old_partial_name_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, expected) = synthetic_rar5_set(dir.path(), "fixture_alpha", 0x11);
+        let output = dir.path().join("fixture_alpha.part1.rar");
+        let planted = dir.path().join(format!(
+            ".fixture_alpha.part1.rar.{}.partial",
+            std::process::id()
+        ));
+        std::fs::write(&planted, b"not yours").unwrap();
+
+        let report = restore_volumes_from_paths(&paths, &restore_into(dir.path(), false)).unwrap();
+
+        assert_eq!(report.restored_paths, vec![output.clone()]);
+        assert!(std::fs::read(&output).unwrap() == expected);
+        assert_eq!(std::fs::read(&planted).unwrap(), b"not yours");
+        assert_eq!(
+            stray_partials(dir.path(), &[&planted]),
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    /// A symlink at the old predictable partial name must be neither
+    /// followed nor truncated: its target keeps its bytes.
+    #[cfg(unix)]
+    #[test]
+    fn rar5_folded_restore_does_not_follow_a_symlink_at_the_old_partial_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let (paths, expected) = synthetic_rar5_set(dir.path(), "fixture_beta", 0x22);
+        let victim = elsewhere.path().join("victim.bin");
+        std::fs::write(&victim, b"keep these bytes").unwrap();
+        let planted = dir.path().join(format!(
+            ".fixture_beta.part1.rar.{}.partial",
+            std::process::id()
+        ));
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        restore_volumes_from_paths(&paths, &restore_into(dir.path(), false)).unwrap();
+
+        assert!(std::fs::read(dir.path().join("fixture_beta.part1.rar")).unwrap() == expected);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep these bytes");
+        assert!(
+            std::fs::symlink_metadata(&planted)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            stray_partials(dir.path(), &[&planted]),
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    /// The exclusive create skips a taken name, a symlink included, without
+    /// opening it, and takes the next one.
+    #[test]
+    fn create_exclusive_skips_a_taken_name_without_opening_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let taken = dir.path().join(".taken.partial");
+        let fresh = dir.path().join(".fresh.partial");
+        std::fs::write(&taken, b"already here").unwrap();
+        let mut names = [taken.clone(), fresh.clone()].into_iter();
+
+        let (path, mut file) = create_exclusive(|| names.next().unwrap()).unwrap();
+        file.write_all(b"new").unwrap();
+        drop(file);
+
+        assert_eq!(path, fresh);
+        assert_eq!(std::fs::read(&taken).unwrap(), b"already here");
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"new");
+
+        let error = create_exclusive(|| taken.clone()).unwrap_err();
+        assert!(
+            matches!(&error, RarError::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&taken).unwrap(), b"already here");
+    }
+
+    /// A file that appears at the output name after the restore staged its
+    /// partial, and so after the existence check, is refused and kept: the
+    /// install never replaces it, and the partial is left for cleanup.
+    #[test]
+    fn installing_a_partial_refuses_an_output_created_after_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("fixture_epsilon.part1.rar");
+        let (partial, mut file) = create_partial(&target).unwrap();
+        file.write_all(b"restored bytes").unwrap();
+        drop(file);
+        std::fs::write(&target, b"arrived meanwhile").unwrap();
+
+        let error = install_partial(&partial, &target, false).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to overwrite existing restored volume"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"arrived meanwhile");
+        assert_eq!(std::fs::read(&partial).unwrap(), b"restored bytes");
+    }
+
+    /// The copy install for filesystems without hard links refuses a name
+    /// taken before it starts and leaves that file alone, and otherwise
+    /// copies the partial's bytes into place and removes the partial.
+    #[test]
+    fn copying_a_partial_exclusively_never_replaces_a_taken_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("fixture_zeta.part1.rar");
+        let (partial, mut file) = create_partial(&target).unwrap();
+        file.write_all(b"restored bytes").unwrap();
+        drop(file);
+        std::fs::write(&target, b"arrived meanwhile").unwrap();
+
+        let error = copy_partial_exclusively(&partial, &target).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to overwrite existing restored volume"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"arrived meanwhile");
+        assert_eq!(std::fs::read(&partial).unwrap(), b"restored bytes");
+
+        std::fs::remove_file(&target).unwrap();
+        copy_partial_exclusively(&partial, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"restored bytes");
+        assert!(!partial.exists());
+    }
+
+    /// Without a file in the way the install moves the partial into place
+    /// and leaves no partial name behind; with `overwrite_existing` it
+    /// replaces what is there.
+    #[test]
+    fn installing_a_partial_moves_it_into_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("fixture_zeta.part1.rar");
+        let (partial, mut file) = create_partial(&target).unwrap();
+        file.write_all(b"first restore").unwrap();
+        drop(file);
+        install_partial(&partial, &target, false).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"first restore");
+        assert_eq!(stray_partials(dir.path(), &[]), Vec::<PathBuf>::new());
+
+        let (partial, mut file) = create_partial(&target).unwrap();
+        file.write_all(b"second restore").unwrap();
+        drop(file);
+        install_partial(&partial, &target, true).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"second restore");
+        assert_eq!(stray_partials(dir.path(), &[]), Vec::<PathBuf>::new());
+    }
+
+    /// Two restores of distinct sets into one directory at once in one
+    /// process: each lands byte for byte and neither leaves a partial.
+    #[test]
+    fn rar5_folded_restores_side_by_side_do_not_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let sets = [("fixture_gamma", 0x33), ("fixture_delta", 0x44)]
+            .map(|(stem, seed)| (stem, synthetic_rar5_set(dir.path(), stem, seed)));
+        let options = restore_into(dir.path(), false);
+
+        std::thread::scope(|scope| {
+            let handles = sets
+                .iter()
+                .map(|(_, (paths, _))| scope.spawn(|| restore_volumes_from_paths(paths, &options)))
+                .collect::<Vec<_>>();
+            for handle in handles {
+                handle.join().unwrap().unwrap();
+            }
+        });
+
+        for (stem, (_, expected)) in &sets {
+            let output = dir.path().join(format!("{stem}.part1.rar"));
+            assert!(std::fs::read(&output).unwrap() == *expected, "{stem}");
+        }
+        assert_eq!(stray_partials(dir.path(), &[]), Vec::<PathBuf>::new());
+    }
+
+    /// With `overwrite_existing`, a restore into a separate output directory
+    /// replaces a target already there on every platform (the install is a
+    /// rename onto it), and without it the restore refuses as before.
+    #[test]
+    fn rar5_folded_restore_replaces_an_existing_target_when_asked() {
+        let source = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let (paths, expected) = synthetic_rar5_set(source.path(), "fixture_epsilon", 0x55);
+        let target = out.path().join("fixture_epsilon.part1.rar");
+        std::fs::write(&target, b"stale volume").unwrap();
+
+        let error = restore_volumes_from_paths(&paths, &restore_into(out.path(), false))
+            .expect_err("an existing target without overwrite is refused");
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to overwrite existing restored volume"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"stale volume");
+        assert_eq!(stray_partials(out.path(), &[]), Vec::<PathBuf>::new());
+
+        let report = restore_volumes_from_paths(&paths, &restore_into(out.path(), true)).unwrap();
+
+        assert_eq!(report.restored_paths, vec![target.clone()]);
+        assert!(std::fs::read(&target).unwrap() == expected);
+        assert_eq!(stray_partials(out.path(), &[]), Vec::<PathBuf>::new());
+    }
+
     #[test]
     fn rar3_data_volume_validity_accepts_rar4_family_archive() {
         let dir = tempfile::tempdir().unwrap();
@@ -2189,11 +2974,39 @@ mod tests {
         assert!(!rar3_data_volume_is_valid(&path).unwrap());
     }
 
+    /// The reference-name search consumes the side-by-side verdict, so the
+    /// slot assignment checks the volume again: one that was intact when
+    /// first checked and was damaged since is then reported invalid instead
+    /// of entering the reconstruction on its stale verdict.
+    #[test]
+    fn rar3_reference_search_leaves_the_slot_assignment_to_recheck_the_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture_eta.part01.rar");
+        let mut bytes = rar4_archive_with_recovery_flag();
+        append_rar4_end_data_crc(&mut bytes, false);
+        std::fs::write(&path, &bytes).unwrap();
+        let data_paths = [&path];
+        let mut data_valid = vec![Some(rar3_data_volume_is_valid(&path))];
+
+        let reference = rar3_recovery_reference_name(&data_paths, &mut data_valid).unwrap();
+        assert_eq!(reference, path.as_path());
+
+        let mut damaged = rar4_archive_with_recovery_flag();
+        append_rar4_end_data_crc(&mut damaged, true);
+        std::fs::write(&path, damaged).unwrap();
+        assert!(!take_rar3_validity(&mut data_valid[0], &path).unwrap());
+    }
+
     #[test]
     fn rar3_recovery_reference_requires_valid_data_volume() {
-        let paths = vec![PathBuf::from("/tmp/movie.part01_02_03.rev")];
+        let paths = [PathBuf::from("/tmp/movie.part01_02_03.rev")];
+        let data_paths = paths
+            .iter()
+            .filter(|path| !is_rev_path(path))
+            .collect::<Vec<_>>();
+        let mut data_valid = data_paths.iter().map(|_| None).collect::<Vec<_>>();
 
-        let err = rar3_recovery_reference_name(&paths)
+        let err = rar3_recovery_reference_name(&data_paths, &mut data_valid)
             .expect_err("RAR3 .rev-only restore needs a data volume");
 
         match err {
@@ -2211,9 +3024,11 @@ mod tests {
         let valid = dir.path().join("movie.part02.rar");
         std::fs::write(&invalid, b"not a rar").unwrap();
         std::fs::write(&valid, rar4_archive_with_recovery_flag()).unwrap();
-        let paths = vec![invalid, valid.clone()];
+        let paths = [invalid, valid.clone()];
+        let data_paths = paths.iter().collect::<Vec<_>>();
+        let mut data_valid = data_paths.iter().map(|_| None).collect::<Vec<_>>();
 
-        let reference = rar3_recovery_reference_name(&paths).unwrap();
+        let reference = rar3_recovery_reference_name(&data_paths, &mut data_valid).unwrap();
 
         assert_eq!(reference, valid.as_path());
     }

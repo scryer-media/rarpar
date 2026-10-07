@@ -27,13 +27,15 @@ pub struct Rar3RsCoder {
     // columns.
     syn_data: [usize; MAX_PAR + 1],
     ee_pol: [usize; MAX_PAR + 1],
-    // The erasure set the cached locator polynomial (`el_pol`, `error_locs`,
-    // `dnm`) was built for. A coder is reused across every column of a
-    // volume set, where the erasures never change, but nothing stops a caller
-    // handing it a different set, and a locator for the wrong positions
+    // The erasure set and block length the cached locator polynomial
+    // (`el_pol`, `error_locs`, `dnm`) was built for. A coder is reused across
+    // every column of a volume set, where neither ever changes, but nothing
+    // stops a caller handing it a different set or a block of another length,
+    // and the locator depends on both: one built for the wrong positions
     // "corrects" the wrong bytes without any signal.
     locator_erasures: [usize; MAX_PAR + 1],
     locator_len: usize,
+    locator_data_size: usize,
 }
 
 impl Rar3RsCoder {
@@ -61,6 +63,7 @@ impl Rar3RsCoder {
             ee_pol: [0; MAX_PAR + 1],
             locator_erasures: [0; MAX_PAR + 1],
             locator_len: 0,
+            locator_data_size: 0,
         };
         coder.gf_init();
         coder.pn_init();
@@ -110,10 +113,12 @@ impl Rar3RsCoder {
             return true;
         }
 
-        let locator_stale =
-            !self.first_block_done || self.locator_erasures[..self.locator_len] != *erasures;
+        let locator_stale = !self.first_block_done
+            || self.locator_data_size != data_size
+            || self.locator_erasures[..self.locator_len] != *erasures;
         if locator_stale {
             self.first_block_done = true;
+            self.locator_data_size = data_size;
             self.locator_len = erasures.len();
             self.locator_erasures[..erasures.len()].copy_from_slice(erasures);
             self.el_pol.fill(0);
@@ -171,6 +176,59 @@ impl Rar3RsCoder {
         }
 
         self.err_count <= self.par_size
+    }
+
+    /// The decoder for a fixed erasure set as a dense GF(2⁸) matrix.
+    ///
+    /// For a given block length and erasure set, [`decode`](Self::decode) is
+    /// linear in the block: syndromes, the error evaluator and the Forney
+    /// step are sums of field products of the block bytes with constants
+    /// that depend only on the erasures. This runs `decode` itself on each
+    /// unit vector, so the matrix is the scalar decoder's map, bit for bit.
+    ///
+    /// The result is row-major, `erasures.len()` rows of `total` columns: the
+    /// value `decode` writes at `erasures[r]` is
+    /// `Σ_j matrix[r * total + j] · block[j]` over every position `j`,
+    /// including the erased ones (whose current bytes `decode` also reads).
+    /// The coefficients run through [`gf8`](crate::gf8), which uses the same
+    /// polynomial, `0x11D`.
+    ///
+    /// Returns `None` when `decode` would refuse this shape (an empty or
+    /// over-long block, too many erasures, an erasure out of range), or when
+    /// the map changes a position outside `erasures`, which a matrix of
+    /// erasure rows could not express.
+    pub fn decode_matrix(&self, total: usize, erasures: &[usize]) -> Option<Vec<u8>> {
+        if total == 0 || total > MAX_PAR {
+            return None;
+        }
+        // Derive from fresh locator state: whatever `self` cached was built
+        // for some earlier block, not necessarily this length and erasure set.
+        let mut coder = self.clone();
+        coder.first_block_done = false;
+        let rows = erasures.len();
+        let mut matrix = vec![0u8; rows * total];
+        let mut block = [0u8; MAX_PAR];
+        for column in 0..total {
+            let block = &mut block[..total];
+            block.fill(0);
+            block[column] = 1;
+            if !coder.decode(block, erasures) {
+                return None;
+            }
+            for (pos, &value) in block.iter().enumerate() {
+                if erasures.contains(&pos) {
+                    continue;
+                }
+                let identity = u8::from(pos == column);
+                if value != identity {
+                    return None;
+                }
+            }
+            for (row, &era) in erasures.iter().enumerate() {
+                matrix[row * total + column] = block[era];
+            }
+        }
+        Some(matrix)
     }
 
     fn gf_init(&mut self) {
@@ -293,6 +351,122 @@ mod tests {
         assert_eq!(&data[..source.len()], source);
     }
 
+    fn xorshift_bytes(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 32) as u8
+            })
+            .collect()
+    }
+
+    /// The decode matrix reproduces the scalar decoder on arbitrary columns,
+    /// codewords or not, both as a plain scalar sum and through the striped
+    /// gf8 driver RAR3 recovery runs it with.
+    fn decode_matrix_matches_scalar(par_size: usize, total: usize, erasures: &[usize]) {
+        let coder = Rar3RsCoder::new(par_size).unwrap();
+        let matrix = coder.decode_matrix(total, erasures).unwrap();
+        assert_eq!(matrix.len(), erasures.len() * total);
+
+        let columns = 300usize;
+        let mut scalar = coder.clone();
+        // Volume-major regions, as recovery holds them: region j is byte j of
+        // every column.
+        let mut regions = vec![vec![0u8; columns]; total];
+        let mut expected = vec![vec![0u8; columns]; erasures.len()];
+        for col in 0..columns {
+            let mut block = xorshift_bytes(total, (col as u64) << 8 | par_size as u64);
+            if col % 5 == 0 {
+                // A real codeword with its erased bytes zeroed, the shape
+                // recovery actually decodes.
+                let encoder = Rar3RsCoder::new(par_size).unwrap();
+                let data_len = total - par_size;
+                let mut parity = vec![0u8; par_size];
+                encoder.encode(&block[..data_len], &mut parity);
+                block[data_len..].copy_from_slice(&parity);
+                for &era in erasures {
+                    block[era] = 0;
+                }
+            }
+            for (j, region) in regions.iter_mut().enumerate() {
+                region[col] = block[j];
+            }
+            for row in 0..erasures.len() {
+                let via_matrix = (0..total).fold(0u8, |acc, j| {
+                    acc ^ crate::gf8::mul(matrix[row * total + j], block[j])
+                });
+                expected[row][col] = via_matrix;
+            }
+            assert!(scalar.decode(&mut block, erasures));
+            for (row, &era) in erasures.iter().enumerate() {
+                assert_eq!(
+                    expected[row][col], block[era],
+                    "par {par_size} total {total} column {col} erasure {era}"
+                );
+            }
+        }
+
+        let region_refs = regions.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let mut outputs = vec![vec![0u8; columns]; erasures.len()];
+        let mut output_refs = outputs
+            .iter_mut()
+            .map(Vec::as_mut_slice)
+            .collect::<Vec<_>>();
+        crate::decode_apply::apply_decode_matrix_gf8(&matrix, &region_refs, &mut output_refs);
+        assert_eq!(outputs, expected);
+    }
+
+    #[test]
+    fn decode_matrix_matches_scalar_decoder() {
+        decode_matrix_matches_scalar(1, 6, &[2]);
+        decode_matrix_matches_scalar(3, 9, &[0, 4, 7]);
+        // An erased recovery position alongside the data ones.
+        decode_matrix_matches_scalar(3, 14, &[3, 6, 12]);
+        // The 41 + 10 shape with eight missing data volumes and one absent
+        // recovery volume.
+        decode_matrix_matches_scalar(10, 51, &[2, 6, 10, 14, 18, 22, 26, 30, 45]);
+    }
+
+    #[test]
+    fn decode_matrix_matches_scalar_decoder_at_the_largest_block() {
+        // 255 positions, the field limit, with half or nearly all of them
+        // parity and every parity symbol spent.
+        let half = (0..254).step_by(2).collect::<Vec<_>>();
+        decode_matrix_matches_scalar(128, 255, &half);
+        let nearly_all = (0..254).collect::<Vec<_>>();
+        decode_matrix_matches_scalar(254, 255, &nearly_all);
+
+        // In a 255-symbol block the locator search evaluates x = 1 twice
+        // (roots 0 and 255), so an erasure at the last position is counted
+        // twice. With every parity symbol spent the scalar decoder refuses
+        // the block, and the matrix refuses the same shape.
+        let with_last = (1..255).collect::<Vec<_>>();
+        let mut block = xorshift_bytes(255, 1);
+        assert!(
+            !Rar3RsCoder::new(254)
+                .unwrap()
+                .decode(&mut block, &with_last)
+        );
+        assert!(
+            Rar3RsCoder::new(254)
+                .unwrap()
+                .decode_matrix(255, &with_last)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn decode_matrix_refuses_what_decode_refuses() {
+        let coder = Rar3RsCoder::new(2).unwrap();
+        assert!(coder.decode_matrix(0, &[]).is_none());
+        assert!(coder.decode_matrix(256, &[0]).is_none());
+        assert!(coder.decode_matrix(6, &[0, 1, 2]).is_none());
+        assert!(coder.decode_matrix(6, &[6]).is_none());
+    }
+
     #[test]
     fn rejects_too_many_erasures() {
         let mut decoder = Rar3RsCoder::new(1).unwrap();
@@ -408,6 +582,45 @@ mod tests {
                 &source[..],
                 "erasures {erasures:?}"
             );
+        }
+    }
+
+    /// The locator also depends on the block length. A coder that decoded a
+    /// block of one length and is then handed the same erasures in a block
+    /// of another length rebuilds it, and the decode matrix it derives for
+    /// the new length is a fresh coder's.
+    #[test]
+    fn reused_coder_rebuilds_its_locator_when_the_block_length_changes() {
+        let erasures = [1usize, 4];
+        let encoder = Rar3RsCoder::new(2).unwrap();
+        let mut reused = Rar3RsCoder::new(2).unwrap();
+        for source in [
+            &[17u8, 250, 3, 99, 128, 64][..],
+            &[5, 6, 7, 8, 9, 10, 11, 12, 13],
+        ] {
+            let mut parity = [0u8; 2];
+            encoder.encode(source, &mut parity);
+            let mut block = source.to_vec();
+            block.extend_from_slice(&parity);
+            let total = block.len();
+            for &era in &erasures {
+                block[era] = 0;
+            }
+
+            assert_eq!(
+                reused.decode_matrix(total, &erasures),
+                Rar3RsCoder::new(2).unwrap().decode_matrix(total, &erasures),
+                "total {total}"
+            );
+            let mut via_fresh = block.clone();
+            assert!(
+                Rar3RsCoder::new(2)
+                    .unwrap()
+                    .decode(&mut via_fresh, &erasures)
+            );
+            assert!(reused.decode(&mut block, &erasures), "total {total}");
+            assert_eq!(block, via_fresh, "total {total}");
+            assert_eq!(&block[..source.len()], source, "total {total}");
         }
     }
 }

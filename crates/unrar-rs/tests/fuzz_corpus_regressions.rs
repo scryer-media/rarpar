@@ -126,6 +126,22 @@ extract_timeout_regressions! {
     timeout_f869e3ff => "timeout-f869e3ff3f08eaeceee3b951d9d0b8ebef03f069",
 }
 
+/// The `rar_extract` crash artifact from the ClusterFuzzLite run on
+/// 2026-10-07: a RAR3 PPMd member whose model drives a frequency total past
+/// the range coder's `range`. `range / scale` came out 0 and the next
+/// division was by zero, an assertion in debug builds and a panic in release
+/// builds. The coder now records the fault and the member fails as corrupt.
+#[test]
+fn crash_4146aa87_ppmd_frequency_total_past_the_range() {
+    let bytes =
+        include_bytes!("../fuzz/corpus/rar_extract/crash-4146aa8768584233b7b2e85c41b538b488f8b498");
+    let extracted_ok = replay("crash-4146aa87", bytes);
+    assert_eq!(
+        extracted_ok, 0,
+        "a PPMd stream that outran its range coder decoded"
+    );
+}
+
 /// The `rar_headers` artifact: a file header at offset 2423 declaring
 /// `packed_size = 2^64 - 80`, which as the `i64` `SeekFrom::Current` takes is
 /// `-80`. The scan seeked backwards onto the same header and pushed a

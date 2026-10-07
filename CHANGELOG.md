@@ -3,7 +3,7 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
-## rarpar 0.8.1
+## rarpar 0.6.0
 
 ### CLI Changes
 
@@ -27,6 +27,258 @@ documented in each crate's own changelog so those notes ship with the crate.
 - `par3 verify` and `par3 repair` read a source in whole-mebibyte requests
   instead of 64 KiB ones, and repair reads each recovery and data packet it
   uses once, authenticating it from the bytes it decodes.
+- `rar restore-volumes`, and the extraction commands that restore a missing
+  volume from RAR3 (RAR 2.9-4.x) `.rev` files, rebuild those volumes about
+  eight times faster: the decoder is applied as a matrix to whole regions on
+  every core instead of byte column by byte column. Restored volumes are
+  byte-identical to before.
+- Restoring several missing volumes from RAR5 `.rev` files multiplies on every
+  core: about twice as fast with eight of 41 volumes missing.
+- Restoring from `.rev` files reads and checks the volumes side by side,
+  hashes restored volumes as they are written, and for RAR5 checks the intact
+  data volumes during the decode instead of reading them twice. Restoring a
+  2.1 GB set with one or eight of 41 volumes missing now takes about 0.25 to
+  0.33 s for either RAR3 or RAR5, against 1 to 5.6 s for RARLAB unrar 7.20.
+  Damaged volumes are renamed to `.bad` exactly as before.
+- **Experimental:** `rarpar par3 inside insert|verify|repair|remove` embeds
+  PAR3 recovery inside existing RAR5 archives and RAR5 volume sets made by
+  RARLAB rar, verifies and repairs them from it, and takes it out again. The
+  region layout is not part of the PAR3 specification yet: it may change
+  before it is stable, and output from this version may not verify with a
+  later one. Every run says so on stderr (silenced by `--quiet`), `--json`
+  reports carry `"experimental": true`, and the help text starts with
+  "EXPERIMENTAL:". No flag is needed to run it. The par3cmdline, unrar and
+  7-Zip front ends do not read these regions.
+- One PAR3 set covers a whole volume set, with one File packet per volume.
+  Each File's chunks are the archive's bytes before the region, one
+  unprotected chunk holding the region, and the bytes after it, so the File's
+  hash is the hash of the original archive. Archive bytes are never changed,
+  and no RAR archive is created or recompressed.
+- `--layout trailing` (the default) appends the region after the
+  end-of-archive header and any volume padding. It works on every RAR5
+  archive, including ones with encrypted headers (`-hp`) and locked ones.
+  `--layout service` instead places a stored `PAR3` service header with the
+  skip-if-unknown flag before the end-of-archive header; it is refused for
+  `-hp` and locked archives. `--layout block` uses an unassigned header type
+  with the skip flag and is kept for comparison only.
+- Reader behaviour after insertion, across 15 RARLAB-made fixtures (stored,
+  compressed, solid, recovery record, quick open, comment, encrypted files,
+  encrypted headers, locked, service headers, many files, SFX, and stored,
+  recovery-record and solid volume sets) and one 4.6 GB archive, each listed,
+  tested and extracted by RARLAB unrar 7.23, 7-Zip 7zz and unrar-rs and
+  compared with the archive before insertion: trailing gives the same result
+  in unrar and unrar-rs, and 7-Zip warns "data after end of archive"; service
+  gives the same result in all three; block makes 7-Zip refuse the archive and
+  unrar-rs warn about an unknown header.
+- `--placement spread` (the default) gives every volume the set's metadata
+  and an even share of the recovery packets, so any one volume, the first and
+  last included, can be rebuilt. `last` puts all recovery in the last volume
+  and cannot rebuild that volume; `independent` writes one set per volume and
+  cannot rebuild any lost volume. Rebuilding a lost volume needs about one
+  volume's worth of recovery: on a 1 GiB set of ten volumes it failed at 2%
+  and 5% and succeeded at 11%, 12% and 15%.
+- `insert` takes `-s`, `-c` and `-r` (5% by default) as `par3 create` does;
+  the default block size is the smallest power of two from 4096 that keeps
+  at most 2048 blocks. Output goes to `-d DIR` or, with `--in-place`, over the
+  input. Insertion is deterministic: the same archive and options give the
+  same bytes. RAR4 archives, unknown trailing data and archives that already
+  hold PAR3 packets are refused.
+- `verify` finds the other volumes of a set by the names recorded in the set
+  and by `.partN.rar` numbering, follows renamed sets, and reports each
+  volume's data and region separately. A missing volume that no set covers
+  is reported and fails the run.
+- `repair` rebuilds damaged and missing volumes in place, keeping numbered
+  backups (`--no-backup` to drop them), or into `-d DIR`. It rebuilds the
+  region as well as the data: the layout and packet count are solved from the
+  region's checked length, and lost recovery packets are recomputed from the
+  rebuilt data, so the output matches the protected file byte for byte.
+- `remove` writes the archives without their regions, checked against the
+  hash recorded in the set; the result is byte-identical to the original.
+- On 1 GiB (one archive, stored random data) inserting took 0.72, 0.88 and
+  1.5 s wall at 2%, 5% and 15%, for regions of 22, 55 and 162 MB, and
+  repairing burst or scattered damage took 1.6 to 2.6 s. RARLAB `rar` adds a
+  recovery record of about the same size in 1.0 to 1.7 s and repairs a burst
+  in 4.4 to 8.8 s; at 2% it could not repair the scattered damage PAR3
+  repaired. Neither recovers an archive whose end, with the region, is cut
+  off.
+- RARLAB `rar r` on an archive holding a region: with the archive intact, or
+  with only the region damaged, it reports nothing to repair and writes
+  nothing. With damaged data and a recovery record it writes `fixed.NAME`,
+  repaired and byte-identical to the original archive, without the region,
+  for all three layouts; inserting again under the original name reproduces
+  the protected file byte for byte. Without a recovery record it writes
+  `rebuilt.NAME`, also without the region, with the damaged data still
+  damaged; `par3 inside repair` restores that archive exactly.
+- New `sevenz` feature, on by default, brings in sevenz-turbo (7z reading
+  and writing) and blake3. Builds without it behave as 0.6.0 did.
+- `rarpar par3 archive OUTPUT.7z INPUTS...` writes a 7z archive and computes
+  its PAR3 recovery data from the bytes as they reach the disk, in one pass,
+  without reading the archive back. By default the set is written beside the
+  archive as `OUTPUT.par3` and recovery volumes, laid out as
+  `par3 c -s<size> -c<count>|-r<percent>` lays them out over the finished
+  archive; with `--inside` it is appended after the 7z end header, laid out
+  as `par3 i -r<percent>` appends it. 7z readers stop at the end header and
+  ignore it. Options: `--base-path`, `--level 0..9` (0 stores), `--filter`
+  (x86, arm, arm-thumb, arm64, ia64, sparc, ppc, riscv), `--no-solid`,
+  `-s`/`-c`/`-r` for the sibling set, and `--inside` with `-r 0..250`.
+  Archives that fit in half of `--par3-memory-mib` are held and coded at the
+  end; larger ones are coded as they stream. A final layout no streaming lane
+  covered falls back to one read of the finished archive, reported as
+  `read_back` in `--json` output. Every non-Creator packet is byte-identical
+  to par3cmdline 0.0.1's over the same archive.
+- `rarpar par3 archive --format zip OUTPUT.zip INPUTS...` writes a ZIP
+  instead, through the zip crate: each file stored (`--level 0`) or deflated
+  on its own through flate2's zlib-rs backend at `--level 1..9`, with no
+  encryption. Deflate runs as one stream per member, on one thread. The
+  writer streams, with data descriptors, so no byte is rewritten; members
+  larger than 4 GiB less 16 MiB get ZIP64 sizes from the start, and the archive gets the
+  ZIP64 end records when it passes 4 GiB or 65,535 entries. Directories are
+  stored with a trailing slash, and every entry keeps its modification time
+  (local time, 1980 to 2107) and, on Unix, its permission bits. `--filter`
+  and `--no-solid` are 7z only and refused with `--format zip`. The sibling
+  set is laid out as for 7z. With `--inside` the set follows par3cmdline's
+  ZIP layout: the end records (22 bytes, or 98 with the ZIP64 records) form
+  their own protected chunk after the data chunk, the packets follow as an
+  unprotected chunk, and a copy of the end records ends the file as a fourth
+  chunk, protected by the same blocks as the original. Every non-Creator
+  packet is byte-identical to par3cmdline 0.0.1's `i -r<percent>` over the
+  same ZIP, and with the same Creator text so is the whole file. `--json` output now names the `format`.
+- Where `--format zip --inside` differs from the request it was built to:
+  - The copy of the end records after the packets is protected, as
+    par3cmdline protects it, rather than only the original archive's bytes.
+  - The central directory stays where the writer put it and only the end
+    records are copied after the packets, as par3cmdline lays it out. The
+    zip crate and par3cmdline read such a file, and 7-Zip reads it with a
+    "data after the end of archive" warning and exit code 0; Info-ZIP `unzip` extracts it with a
+    warning and exit code 2, and Python's `zipfile` refuses it.
+  - A layout where par3cmdline's size estimate and the packets it writes
+    would disagree (a data tail under 40 bytes ahead of whole footer
+    blocks, which only a block size of 98 bytes or less can produce) is refused
+    rather than written.
+- The par3cmdline front end now runs `vs` and `rs` on ZIP and 7z files that
+  carry their PAR3 packets inside them, where 0.6.0 refused them:
+  - `vs` judges such a file by its protected chunks alone, as par3cmdline
+    does: "protected data is complete" when every protected chunk verifies,
+    otherwise "damaged" with par3cmdline's count of available bytes. It
+    never reports on the appended packets themselves.
+  - `rs` restores the protected bytes, then refills the packet region as
+    par3cmdline's `copy_inside_data` does: every complete packet still found
+    in the damaged file, in file order, then zeros. The damaged file is kept
+    as `<name>.1`.
+  - `i`, `ti` and `d` are still refused: they write recovery data, which is
+    left to `rarpar par3 archive --inside`.
+- Three par3cmdline front-end lines that `v` and `r` share with `vs` and
+  `rs` now match par3cmdline:
+  - without a Root packet, the Creator, Comment and Start header lines are
+    printed;
+  - with a Root packet but no File packet, the message is "File Packet or
+    Directory Packet is missing.";
+  - the recovery block count is printed only when both a Matrix packet and a
+    Recovery Data packet are held, and a 16-bit Cauchy repair prints
+    "Computing Reed Solomon matrix:".
+- rarpar accepts 7-Zip's extract, test and list command lines. Started under
+  the name `7z`, `7za`, `7zz` or `7zr` (a link or copy of the binary), or as
+  `rarpar 7z ...`, it runs `x`, `e`, `t` and `l` on 7z archives (single
+  files, `.001` split sets, solid and non-solid, encrypted data and
+  encrypted headers, with trailing data such as an inside PAR3 set). It
+  decodes LZMA, LZMA2, PPMd, BZip2, Deflate and Copy, with the BCJ, BCJ2 and
+  ARM64 filters and AES-256. It parses 7-Zip's whole switch table, so an
+  unknown or malformed switch gets 7-Zip's "Command Line Error" and exit
+  code 7. Of the switches, it acts on `-o`, `-p`, `-y`, `-ao[a|s|t|u]`,
+  `-i`, `-x`, `-r`, `-an`, `-ai`, `-t`, `-so`, `-bso`, `-bse`, `-bb`, `-ba`,
+  `-slt`, `-scrc`, `-sdel`, `-ssc`, `-spd`, `-spm` and `-mmt`, with list
+  files (`@file`) and wildcards in archive and member names. It prints
+  7-Zip 26.01's lines on standard output and standard error, including the archive information block, `l` and `l -slt`
+  listings, overwrite and password prompts on standard input, per-item
+  errors ("CRC Failed", "Data Error", "Wrong password?", "Unexpected end of
+  data", "Unsupported Method"), the closing summary and `-scrc` sums, and
+  exits with 7-Zip's codes (0, 1, 2, 7, 8, 255). Extracted files are
+  byte-identical to 7-Zip's, with the same names, modes and times. The
+  command lines SABnzbd and NZBGet run work unchanged.
+- Where the 7-Zip front end differs from 7-Zip:
+  - Only 7z archives (and `.001` split sets of them) are read. `-t` with any
+    other type fails to open the archive, as 7-Zip does for a 7z file opened
+    as that type. ZIP, RAR and the other formats 7-Zip reads are not
+    supported.
+  - The commands `a`, `u`, `d`, `rn`, `h`, `b` and `i` fail with "Unsupported
+    command" and exit code 7, the error 7-Zip gives for an unknown command.
+    Creating archives is left to `rarpar par3 archive`.
+  - The banner is one line, "rarpar VERSION (7-Zip compatible decoder) :
+    Copyright (c) the rarpar authors", and the help text lists only the
+    supported commands and switches.
+  - No progress output is printed.
+  - `-si` (archive from standard input) is a command-line error.
+  - `-scrc` computes CRC32 only; other hash types are a command-line error.
+  - The other switches are accepted and ignored. Names are always read and
+    printed as UTF-8 whatever `-scc` and `-scs` say, `-spf` paths are
+    sanitised as without it, `-ax` excludes no archive, and `-t#` and
+    `-tsplit` open the archive as 7z.
+  - A member whose data fails to decode keeps the bytes decoded before the
+    fault, as in 7-Zip, but how many depends on the decoder's buffering. A
+    damaged member may keep fewer bytes than 7-Zip keeps, or, when its block
+    fails within its first 4 KiB or, for LZMA2, within the failing chunk,
+    may not be created at all.
+  - On Windows, symbolic links are written as regular files holding the link
+    target, and times are shown in UTC.
+  - When writing an output file fails, the per-item error and the closing
+    "System ERROR" text approximate 7-Zip's.
+- rarpar's compatibility front ends now cover the consumer side only:
+  decoding, verifying, repairing and listing. Creating recovery data stays
+  with rarpar's first-party commands, `rarpar par create` for PAR2 and
+  `rarpar par3 create` for PAR3, which are unchanged. Each front end refuses
+  the create side in its own tool's command-line style.
+- rarpar accepts par3cmdline's verify, repair and list command lines. Started
+  under the name `par3` (a link or copy of the binary), it runs `v`/`verify`,
+  `r`/`repair` and `l`/`list` with the base path (`-B`), verbosity (`-v`,
+  `-q`), memory (`-m`) and search (`-S`) options, `--`, extra input files and
+  wildcards, and prints par3cmdline's verification, repair and listing
+  reports and its exit codes (0, 3, 4, 6, 8). `-h`, `-V` and `-VV` work as
+  in par3cmdline. Started as `rarpar`, it takes a command line whose first
+  word is a par3cmdline command and whose PAR file argument ends in `.par3`
+  (`.zip` or `.7z` for `i`, `ti`, `d`, `vs` and `rs`). Such command lines
+  previously reached the unrar front end; all others are routed as before.
+- The par3cmdline front end refuses, with exit code 3, after par3cmdline's
+  own argument checks (so a malformed option still gets par3cmdline's
+  message, and `vs` on a file that is not a ZIP still exits 6):
+  - the create-side commands `c`/`create`, `tc`, `e`/`extend`, `te`,
+    `i`/`insert`, `ti` and `d`/`delete`, with a message that points to
+    `rarpar par3 create`;
+  - `vs` and `rs`;
+  - the create-only switches `-b`, `-s`, `-r`, `-rm`, `-c`, `-cf`, `-cm`,
+    `-u`, `-l`, `-n`, `-R`, `-D`, `-d`, `-e`, `-i`, `-lp` and `-C`, with
+    par3cmdline's own "Cannot specify ... unless creating." messages;
+  - `-fu`, `-ff` and `-abs`, which par3cmdline accepts with any command but
+    which only shape creation, with a rarpar message.
+- Removed: the par2cmdline front end (`par2 r ... set.par2`, as SABnzbd runs
+  it) used to ignore every switch except `-B`, including par2cmdline's
+  create-only ones. It now rejects `-b`, `-s`, `-r`, `-c`, `-f`, `-u`, `-l`,
+  `-n` and `-R` with par2cmdline's own messages and exit code 3, as
+  par2cmdline does, so a command line that par2cmdline would refuse is no
+  longer silently repaired. Repair options (`-B`, `-q`, `-v`, `-p`, `-N`,
+  `-m`, `-t`, `-T`) are still accepted. `c`/`create` and `v`/`verify` with a
+  `.par2` argument now exit 3 with a message that points to `rarpar par
+  create` or `rarpar par verify`; they used to reach the unrar front end and
+  exit 7 as an unsupported command. The unrar front end already accepted
+  only `x`, `e`, `t`, `l` and `lb` and is unchanged.
+- Where the par3cmdline front end differs from par3cmdline:
+  - Repair is all or nothing: rarpar never repairs part of a set.
+    "Repair is possible partially." is never printed; a repair that is not
+    possible changes nothing.
+  - A misnamed input found among the extra files is used as a source and the
+    file is rebuilt under its own name; par3cmdline renames it. "files have
+    the wrong name" is never printed.
+  - `-m` sets the engine's memory budget, and a budget too small to read or
+    repair the set fails with exit code 8; par3cmdline treats it as a hint.
+    Without `-m` the budget is 256 MiB, as for `rarpar par3`.
+  - `-S` is checked between the extents searched in extra files, not inside
+    one.
+  - Permissions and timestamps are not checked or restored.
+  - Recovery files beside the named PAR file are loaded in name order, not
+    directory order.
+  - Of the timing lines only the repair's "done in ... seconds." is printed,
+    and the `-v` packet statistics are not printed.
+  - `-V` prints "par3cmdline version 0.0.1 (rarpar facade)", and `-VV`
+    prints a rarpar notice instead of par3cmdline's copyright.
 
 ### Fixes
 
@@ -203,284 +455,19 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ### Library versions
 
-- par3-rs 0.5.1: mebibyte source reads, the verification order by mount
-  kind, single-read packet authentication during repair,
-  `session_repair::create_directory`, and the RAR5 PAR-inside fixes.
+- par3-rs 0.5.1 (pinned exactly): mebibyte source reads, the verification
+  order by mount kind, single-read packet authentication during repair,
+  `session_repair::create_directory`, and the RAR5 PAR-inside support and
+  fixes.
 - par2-rs 0.10.8: strict verify reads a damaged file once, repair planning
   trusts the scan's recovery packet authentication while a volume's stat is
   unchanged, and `identify_par2_files_for_set` skips the files a set
-  protects that are present at their recorded lengths. Other library
-  versions are unchanged.
-
-## rarpar 0.8.0
-
-### CLI Changes
-
-- **Experimental:** `rarpar par3 inside insert|verify|repair|remove` embeds
-  PAR3 recovery inside existing RAR5 archives and RAR5 volume sets made by
-  RARLAB rar, verifies and repairs them from it, and takes it out again. The
-  region layout is not part of the PAR3 specification yet: it may change
-  before it is stable, and output from this version may not verify with a
-  later one. Every run says so on stderr (silenced by `--quiet`), `--json`
-  reports carry `"experimental": true`, and the help text starts with
-  "EXPERIMENTAL:". No flag is needed to run it. The par3cmdline, unrar and
-  7-Zip front ends do not read these regions.
-- One PAR3 set covers a whole volume set, with one File packet per volume.
-  Each File's chunks are the archive's bytes before the region, one
-  unprotected chunk holding the region, and the bytes after it, so the File's
-  hash is the hash of the original archive. Archive bytes are never changed,
-  and no RAR archive is created or recompressed.
-- `--layout trailing` (the default) appends the region after the
-  end-of-archive header and any volume padding. It works on every RAR5
-  archive, including ones with encrypted headers (`-hp`) and locked ones.
-  `--layout service` instead places a stored `PAR3` service header with the
-  skip-if-unknown flag before the end-of-archive header; it is refused for
-  `-hp` and locked archives. `--layout block` uses an unassigned header type
-  with the skip flag and is kept for comparison only.
-- Reader behaviour after insertion, across 15 RARLAB-made fixtures (stored,
-  compressed, solid, recovery record, quick open, comment, encrypted files,
-  encrypted headers, locked, service headers, many files, SFX, and stored,
-  recovery-record and solid volume sets) and one 4.6 GB archive, each listed,
-  tested and extracted by RARLAB unrar 7.23, 7-Zip 7zz and unrar-rs and
-  compared with the archive before insertion: trailing gives the same result
-  in unrar and unrar-rs, and 7-Zip warns "data after end of archive"; service
-  gives the same result in all three; block makes 7-Zip refuse the archive and
-  unrar-rs warn about an unknown header.
-- `--placement spread` (the default) gives every volume the set's metadata
-  and an even share of the recovery packets, so any one volume, the first and
-  last included, can be rebuilt. `last` puts all recovery in the last volume
-  and cannot rebuild that volume; `independent` writes one set per volume and
-  cannot rebuild any lost volume. Rebuilding a lost volume needs about one
-  volume's worth of recovery: on a 1 GiB set of ten volumes it failed at 2%
-  and 5% and succeeded at 11%, 12% and 15%.
-- `insert` takes `-s`, `-c` and `-r` (5% by default) as `par3 create` does;
-  the default block size is the smallest power of two from 4096 that keeps
-  at most 2048 blocks. Output goes to `-d DIR` or, with `--in-place`, over the
-  input. Insertion is deterministic: the same archive and options give the
-  same bytes. RAR4 archives, unknown trailing data and archives that already
-  hold PAR3 packets are refused.
-- `verify` finds the other volumes of a set by the names recorded in the set
-  and by `.partN.rar` numbering, follows renamed sets, and reports each
-  volume's data and region separately. A missing volume that no set covers
-  is reported and fails the run.
-- `repair` rebuilds damaged and missing volumes in place, keeping numbered
-  backups (`--no-backup` to drop them), or into `-d DIR`. It rebuilds the
-  region as well as the data: the layout and packet count are solved from the
-  region's checked length, and lost recovery packets are recomputed from the
-  rebuilt data, so the output matches the protected file byte for byte.
-- `remove` writes the archives without their regions, checked against the
-  hash recorded in the set; the result is byte-identical to the original.
-- On 1 GiB (one archive, stored random data) inserting took 0.72, 0.88 and
-  1.5 s wall at 2%, 5% and 15%, for regions of 22, 55 and 162 MB, and
-  repairing burst or scattered damage took 1.6 to 2.6 s. RARLAB `rar` adds a
-  recovery record of about the same size in 1.0 to 1.7 s and repairs a burst
-  in 4.4 to 8.8 s; at 2% it could not repair the scattered damage PAR3
-  repaired. Neither recovers an archive whose end, with the region, is cut
-  off.
-- RARLAB `rar r` on an archive holding a region: with the archive intact, or
-  with only the region damaged, it reports nothing to repair and writes
-  nothing. With damaged data and a recovery record it writes `fixed.NAME`,
-  repaired and byte-identical to the original archive, without the region,
-  for all three layouts; inserting again under the original name reproduces
-  the protected file byte for byte. Without a recovery record it writes
-  `rebuilt.NAME`, also without the region, with the damaged data still
-  damaged; `par3 inside repair` restores that archive exactly.
-
-### Library versions
-
-- par3-rs `=0.5.0`; par2-rs and unrar-rs are unchanged.
-
-## rarpar 0.7.0
-
-### CLI Changes
-
-- New `sevenz` feature, on by default, brings in sevenz-turbo (7z reading
-  and writing) and blake3. Builds without it behave as 0.6.0 did.
-- `rarpar par3 archive OUTPUT.7z INPUTS...` writes a 7z archive and computes
-  its PAR3 recovery data from the bytes as they reach the disk, in one pass,
-  without reading the archive back. By default the set is written beside the
-  archive as `OUTPUT.par3` and recovery volumes, laid out as
-  `par3 c -s<size> -c<count>|-r<percent>` lays them out over the finished
-  archive; with `--inside` it is appended after the 7z end header, laid out
-  as `par3 i -r<percent>` appends it. 7z readers stop at the end header and
-  ignore it. Options: `--base-path`, `--level 0..9` (0 stores), `--filter`
-  (x86, arm, arm-thumb, arm64, ia64, sparc, ppc, riscv), `--no-solid`,
-  `-s`/`-c`/`-r` for the sibling set, and `--inside` with `-r 0..250`.
-  Archives that fit in half of `--par3-memory-mib` are held and coded at the
-  end; larger ones are coded as they stream. A final layout no streaming lane
-  covered falls back to one read of the finished archive, reported as
-  `read_back` in `--json` output. Every non-Creator packet is byte-identical
-  to par3cmdline 0.0.1's over the same archive.
-- `rarpar par3 archive --format zip OUTPUT.zip INPUTS...` writes a ZIP
-  instead, through the zip crate: each file stored (`--level 0`) or deflated
-  on its own through flate2's zlib-rs backend at `--level 1..9`, with no
-  encryption. Deflate runs as one stream per member, on one thread. The
-  writer streams, with data descriptors, so no byte is rewritten; members
-  larger than 4 GiB less 16 MiB get ZIP64 sizes from the start, and the archive gets the
-  ZIP64 end records when it passes 4 GiB or 65,535 entries. Directories are
-  stored with a trailing slash, and every entry keeps its modification time
-  (local time, 1980 to 2107) and, on Unix, its permission bits. `--filter`
-  and `--no-solid` are 7z only and refused with `--format zip`. The sibling
-  set is laid out as for 7z. With `--inside` the set follows par3cmdline's
-  ZIP layout: the end records (22 bytes, or 98 with the ZIP64 records) form
-  their own protected chunk after the data chunk, the packets follow as an
-  unprotected chunk, and a copy of the end records ends the file as a fourth
-  chunk, protected by the same blocks as the original. Every non-Creator
-  packet is byte-identical to par3cmdline 0.0.1's `i -r<percent>` over the
-  same ZIP, and with the same Creator text so is the whole file. `--json` output now names the `format`.
-- Where `--format zip --inside` differs from the request it was built to:
-  - The copy of the end records after the packets is protected, as
-    par3cmdline protects it, rather than only the original archive's bytes.
-  - The central directory stays where the writer put it and only the end
-    records are copied after the packets, as par3cmdline lays it out. The
-    zip crate and par3cmdline read such a file, and 7-Zip reads it with a
-    "data after the end of archive" warning and exit code 0; Info-ZIP `unzip` extracts it with a
-    warning and exit code 2, and Python's `zipfile` refuses it.
-  - A layout where par3cmdline's size estimate and the packets it writes
-    would disagree (a data tail under 40 bytes ahead of whole footer
-    blocks, which only a block size of 98 bytes or less can produce) is refused
-    rather than written.
-- The par3cmdline front end now runs `vs` and `rs` on ZIP and 7z files that
-  carry their PAR3 packets inside them, where 0.6.0 refused them:
-  - `vs` judges such a file by its protected chunks alone, as par3cmdline
-    does: "protected data is complete" when every protected chunk verifies,
-    otherwise "damaged" with par3cmdline's count of available bytes. It
-    never reports on the appended packets themselves.
-  - `rs` restores the protected bytes, then refills the packet region as
-    par3cmdline's `copy_inside_data` does: every complete packet still found
-    in the damaged file, in file order, then zeros. The damaged file is kept
-    as `<name>.1`.
-  - `i`, `ti` and `d` are still refused: they write recovery data, which is
-    left to `rarpar par3 archive --inside`.
-- Three par3cmdline front-end lines that `v` and `r` share with `vs` and
-  `rs` now match par3cmdline:
-  - without a Root packet, the Creator, Comment and Start header lines are
-    printed;
-  - with a Root packet but no File packet, the message is "File Packet or
-    Directory Packet is missing.";
-  - the recovery block count is printed only when both a Matrix packet and a
-    Recovery Data packet are held, and a 16-bit Cauchy repair prints
-    "Computing Reed Solomon matrix:".
-- rarpar accepts 7-Zip's extract, test and list command lines. Started under
-  the name `7z`, `7za`, `7zz` or `7zr` (a link or copy of the binary), or as
-  `rarpar 7z ...`, it runs `x`, `e`, `t` and `l` on 7z archives (single
-  files, `.001` split sets, solid and non-solid, encrypted data and
-  encrypted headers, with trailing data such as an inside PAR3 set). It
-  decodes LZMA, LZMA2, PPMd, BZip2, Deflate and Copy, with the BCJ, BCJ2 and
-  ARM64 filters and AES-256. It parses 7-Zip's whole switch table, so an
-  unknown or malformed switch gets 7-Zip's "Command Line Error" and exit
-  code 7. Of the switches, it acts on `-o`, `-p`, `-y`, `-ao[a|s|t|u]`,
-  `-i`, `-x`, `-r`, `-an`, `-ai`, `-t`, `-so`, `-bso`, `-bse`, `-bb`, `-ba`,
-  `-slt`, `-scrc`, `-sdel`, `-ssc`, `-spd`, `-spm` and `-mmt`, with list
-  files (`@file`) and wildcards in archive and member names. It prints
-  7-Zip 26.01's lines on standard output and standard error, including the archive information block, `l` and `l -slt`
-  listings, overwrite and password prompts on standard input, per-item
-  errors ("CRC Failed", "Data Error", "Wrong password?", "Unexpected end of
-  data", "Unsupported Method"), the closing summary and `-scrc` sums, and
-  exits with 7-Zip's codes (0, 1, 2, 7, 8, 255). Extracted files are
-  byte-identical to 7-Zip's, with the same names, modes and times. The
-  command lines SABnzbd and NZBGet run work unchanged.
-- Where the 7-Zip front end differs from 7-Zip:
-  - Only 7z archives (and `.001` split sets of them) are read. `-t` with any
-    other type fails to open the archive, as 7-Zip does for a 7z file opened
-    as that type. ZIP, RAR and the other formats 7-Zip reads are not
-    supported.
-  - The commands `a`, `u`, `d`, `rn`, `h`, `b` and `i` fail with "Unsupported
-    command" and exit code 7, the error 7-Zip gives for an unknown command.
-    Creating archives is left to `rarpar par3 archive`.
-  - The banner is one line, "rarpar VERSION (7-Zip compatible decoder) :
-    Copyright (c) the rarpar authors", and the help text lists only the
-    supported commands and switches.
-  - No progress output is printed.
-  - `-si` (archive from standard input) is a command-line error.
-  - `-scrc` computes CRC32 only; other hash types are a command-line error.
-  - The other switches are accepted and ignored. Names are always read and
-    printed as UTF-8 whatever `-scc` and `-scs` say, `-spf` paths are
-    sanitised as without it, `-ax` excludes no archive, and `-t#` and
-    `-tsplit` open the archive as 7z.
-  - A member whose data fails to decode keeps the bytes decoded before the
-    fault, as in 7-Zip, but how many depends on the decoder's buffering. A
-    damaged member may keep fewer bytes than 7-Zip keeps, or, when its block
-    fails within its first 4 KiB or, for LZMA2, within the failing chunk,
-    may not be created at all.
-  - On Windows, symbolic links are written as regular files holding the link
-    target, and times are shown in UTC.
-  - When writing an output file fails, the per-item error and the closing
-    "System ERROR" text approximate 7-Zip's.
-
-### Library versions
-
+  protects that are present at recorded lengths no PAR2 volume can have.
+- reedsolomon-rs 0.4.9 and unrar-rs 0.10.9: the RAR recovery-volume restore
+  above.
 - sevenz-turbo 0.26.1, zip 8.6 (with flate2's zlib-rs backend) and blake3
   for the `sevenz` feature; crc-fast, filetime and libc are now also used by
-  rarpar itself. par3-rs stays
-  `=0.4.5`; par2-rs and unrar-rs are unchanged.
-
-## rarpar 0.6.0
-
-### CLI Changes
-
-- rarpar's compatibility front ends now cover the consumer side only:
-  decoding, verifying, repairing and listing. Creating recovery data stays
-  with rarpar's first-party commands, `rarpar par create` for PAR2 and
-  `rarpar par3 create` for PAR3, which are unchanged. Each front end refuses
-  the create side in its own tool's command-line style.
-- rarpar accepts par3cmdline's verify, repair and list command lines. Started
-  under the name `par3` (a link or copy of the binary), it runs `v`/`verify`,
-  `r`/`repair` and `l`/`list` with the base path (`-B`), verbosity (`-v`,
-  `-q`), memory (`-m`) and search (`-S`) options, `--`, extra input files and
-  wildcards, and prints par3cmdline's verification, repair and listing
-  reports and its exit codes (0, 3, 4, 6, 8). `-h`, `-V` and `-VV` work as
-  in par3cmdline. Started as `rarpar`, it takes a command line whose first
-  word is a par3cmdline command and whose PAR file argument ends in `.par3`
-  (`.zip` or `.7z` for `i`, `ti`, `d`, `vs` and `rs`). Such command lines
-  previously reached the unrar front end; all others are routed as before.
-- The par3cmdline front end refuses, with exit code 3, after par3cmdline's
-  own argument checks (so a malformed option still gets par3cmdline's
-  message, and `vs` on a file that is not a ZIP still exits 6):
-  - the create-side commands `c`/`create`, `tc`, `e`/`extend`, `te`,
-    `i`/`insert`, `ti` and `d`/`delete`, with a message that points to
-    `rarpar par3 create`;
-  - `vs` and `rs`;
-  - the create-only switches `-b`, `-s`, `-r`, `-rm`, `-c`, `-cf`, `-cm`,
-    `-u`, `-l`, `-n`, `-R`, `-D`, `-d`, `-e`, `-i`, `-lp` and `-C`, with
-    par3cmdline's own "Cannot specify ... unless creating." messages;
-  - `-fu`, `-ff` and `-abs`, which par3cmdline accepts with any command but
-    which only shape creation, with a rarpar message.
-- Removed: the par2cmdline front end (`par2 r ... set.par2`, as SABnzbd runs
-  it) used to ignore every switch except `-B`, including par2cmdline's
-  create-only ones. It now rejects `-b`, `-s`, `-r`, `-c`, `-f`, `-u`, `-l`,
-  `-n` and `-R` with par2cmdline's own messages and exit code 3, as
-  par2cmdline does, so a command line that par2cmdline would refuse is no
-  longer silently repaired. Repair options (`-B`, `-q`, `-v`, `-p`, `-N`,
-  `-m`, `-t`, `-T`) are still accepted. `c`/`create` and `v`/`verify` with a
-  `.par2` argument now exit 3 with a message that points to `rarpar par
-  create` or `rarpar par verify`; they used to reach the unrar front end and
-  exit 7 as an unsupported command. The unrar front end already accepted
-  only `x`, `e`, `t`, `l` and `lb` and is unchanged.
-- Where the par3cmdline front end differs from par3cmdline:
-  - Repair is all or nothing: rarpar never repairs part of a set.
-    "Repair is possible partially." is never printed; a repair that is not
-    possible changes nothing.
-  - A misnamed input found among the extra files is used as a source and the
-    file is rebuilt under its own name; par3cmdline renames it. "files have
-    the wrong name" is never printed.
-  - `-m` sets the engine's memory budget, and a budget too small to read or
-    repair the set fails with exit code 8; par3cmdline treats it as a hint.
-    Without `-m` the budget is 256 MiB, as for `rarpar par3`.
-  - `-S` is checked between the extents searched in extra files, not inside
-    one.
-  - Permissions and timestamps are not checked or restored.
-  - Recovery files beside the named PAR file are loaded in name order, not
-    directory order.
-  - Of the timing lines only the repair's "done in ... seconds." is printed,
-    and the `-v` packet statistics are not printed.
-  - `-V` prints "par3cmdline version 0.0.1 (rarpar facade)", and `-VV`
-    prints a rarpar notice instead of par3cmdline's copyright.
-
-### Library versions
-
-- par3-rs 0.4.5 (pinned exactly), which needs reedsolomon-rs 0.4.8. par2-rs
-  and unrar-rs are unchanged.
+  rarpar itself.
 
 ## rarpar 0.5.4
 
