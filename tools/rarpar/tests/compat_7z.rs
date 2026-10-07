@@ -1400,6 +1400,49 @@ fn excluded_archives_are_never_processed_or_deleted() {
     assert_tree(&dir.path().join("out"));
 }
 
+/// An archive named both positionally and by an `-ai` rule is one archive:
+/// counted once, extracted once, and under `-sdel` deleted once, exit 0.
+#[test]
+fn overlapping_archive_selectors_process_an_archive_once() {
+    let dir = tempfile::tempdir().unwrap();
+    write_archive(&dir.path().join("crate.7z"), SOLID);
+    let (out, _) = expect(
+        &facade(dir.path(), &["l", "crate.7z", "-ai!crate.7z"], b""),
+        0,
+    );
+    assert!(out.contains("1 file, "), "{out}");
+    assert_eq!(
+        out.matches("Listing archive: crate.7z\n").count(),
+        1,
+        "{out}"
+    );
+    let (out, _) = expect(
+        &facade(
+            dir.path(),
+            &[
+                "x",
+                "-sdel",
+                "crate.7z",
+                "-ai!crate.7z",
+                "-ai!*.7z",
+                "-y",
+                "-oout",
+            ],
+            b"",
+        ),
+        0,
+    );
+    assert!(out.contains("1 file, "), "{out}");
+    assert_eq!(
+        out.matches("Extracting archive: crate.7z\n").count(),
+        1,
+        "{out}"
+    );
+    assert!(out.contains("Everything is Ok"), "{out}");
+    assert!(!dir.path().join("crate.7z").exists());
+    assert_tree(&dir.path().join("out"));
+}
+
 /// `-air` matches its name in every folder below, as `-ai` does in one.
 #[test]
 fn recursive_archive_includes_descend() {

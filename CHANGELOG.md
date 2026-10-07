@@ -183,6 +183,10 @@ documented in each crate's own changelog so those notes ship with the crate.
   reported in the directory's spelling, instead of verifying only the named
   volume and reporting the family healthy. Elsewhere stems still match
   exactly.
+- 7-Zip facade: an archive two selectors both name (a positional name and an
+  `-ai` rule, say) is processed once, so `-sdel` deletes it once and exits 0
+  instead of failing on the second pass, and without `-sdel` it is no longer
+  extracted or prompted for twice.
 
 ### Library versions
 
