@@ -989,9 +989,26 @@ fn file_name(path: &Path) -> Option<&str> {
     path.file_name().and_then(|name| name.to_str())
 }
 
+/// Check that a host name recorded in a set is one safe file name: a single
+/// component, with no `/`, that passes
+/// [`crate::paths::validate_relative_path`]. A recorded name comes from the
+/// set's own packets, so an absolute name or one with `..` would leave the
+/// directory it is resolved in.
+pub fn validate_host_name(name: &str) -> EngineResult<()> {
+    if name.contains('/') {
+        return Err(EngineError::Unsupported(
+            "recorded host name is not a single file name",
+        ));
+    }
+    crate::paths::validate_relative_path(name)?;
+    Ok(())
+}
+
 /// Open every set found in `paths`. Hosts recorded in a set but absent from
 /// `paths` are looked up next to the given files under their recorded names
-/// and, when the given files were renamed, under the renamed stem.
+/// and, when the given files were renamed, under the renamed stem. A recorded
+/// name that is not one safe file name ([`validate_host_name`]) is never
+/// looked up.
 pub fn open(paths: &[PathBuf], options: &ExecutionOptions) -> EngineResult<Vec<Rar5Set>> {
     let mut known: Vec<PathBuf> = Vec::new();
     for path in paths {
@@ -1016,7 +1033,11 @@ pub fn open(paths: &[PathBuf], options: &ExecutionOptions) -> EngineResult<Vec<R
     for set_names in recorded_names(&candidates, shared, options)? {
         for (name, renamed) in set_names {
             for directory in known.iter().filter_map(|path| path.parent()) {
-                for name in [Some(&name), renamed.as_ref()].into_iter().flatten() {
+                for name in [Some(&name), renamed.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .filter(|name| validate_host_name(name).is_ok())
+                {
                     let path = directory.join(name);
                     if !known.contains(&path) && !extra.contains(&path) && path.is_file() {
                         extra.push(path);
@@ -1825,6 +1846,25 @@ mod tests {
         );
         assert_eq!(stem_change("same.rar", "same.rar"), None);
         assert_eq!(stem_change("\u{e9}", "\u{129}"), None);
+    }
+
+    /// A recorded host name is joined to a directory only when it is one safe
+    /// file name.
+    #[test]
+    fn recorded_host_names_must_be_one_safe_component() {
+        assert!(validate_host_name("invented_title.part1.rar").is_ok());
+        for name in [
+            "/var/invented_title.part1.rar",
+            "../invented_title.part1.rar",
+            "..",
+            ".",
+            "nested/invented_title.part1.rar",
+            "nested\\invented_title.part1.rar",
+            "C:invented_title.part1.rar",
+            "",
+        ] {
+            assert!(validate_host_name(name).is_err(), "{name:?}");
+        }
     }
 
     /// A Start packet's block size near `u64::MAX` is refused rather than

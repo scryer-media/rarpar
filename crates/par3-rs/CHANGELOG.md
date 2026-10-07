@@ -35,6 +35,10 @@
   - `open` refuses a set whose Start packet records a block size too large
     for a Recovery Data packet length (`EngineError::Unsupported`) instead
     of wrapping that length to zero and aborting on a division by zero.
+  - `open` looks up a recorded host name beside the given files only when it
+    is one safe file name, so an absolute name or one with `..` no longer
+    reaches a file outside their directories. New `validate_host_name`
+    makes that check.
 - A derived carrier (`CarrierPlan::derived`) looks up its available Recovery
   Data packets in one pass over the payloads instead of one pass per
   recovery index, so regenerating a region of a set with tens of thousands

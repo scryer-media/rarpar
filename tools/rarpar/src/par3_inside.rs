@@ -319,14 +319,8 @@ fn host_names(set: &Rar5Set) -> Result<Vec<String>, RarparError> {
 }
 
 fn check_host_name(name: &str) -> Result<(), RarparError> {
-    if name.contains('/') {
-        return Err(RarparError::Unsafe(format!(
-            "recorded host name is not a single file name: {name}"
-        )));
-    }
-    par3_rs::paths::validate_relative_path(name).map_err(|violation| {
-        RarparError::Unsafe(format!("recorded host name {name:?}: {violation}"))
-    })
+    rar5::validate_host_name(name)
+        .map_err(|error| RarparError::Unsafe(format!("recorded host name {name:?}: {error}")))
 }
 
 /// The directory `path` is in.
