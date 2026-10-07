@@ -1440,20 +1440,21 @@ fn print_header(set: &Par3Set, file_order: &[usize], noise: i32, block_map: bool
 /// repeat one already mapped, as its block map reports them.
 fn tail_packing(set: &Par3Set) -> (u64, u64) {
     let block_size = set.block_size();
-    // Per block: the (tail offset, size) of each slice mapped onto it.
-    let mut blocks: BTreeMap<u64, Vec<(u64, u64)>> = BTreeMap::new();
-    let (mut packed, mut deduplicated) = (0, 0);
+    let mut map = BlockMap::default();
     for file in set.files() {
         for chunk in file.chunks() {
-            let par3_rs::ChunkDescription::Protected { length, tail, .. } = chunk else {
+            let par3_rs::ChunkDescription::Protected {
+                length,
+                first_block_index,
+                tail,
+            } = chunk
+            else {
                 continue;
             };
-            for index in chunk.full_block_indices(block_size) {
-                let slices = blocks.entry(index).or_default();
-                if !slices.is_empty() {
-                    deduplicated += 1;
-                }
-                slices.push((0, block_size));
+            if let Some(first) = first_block_index
+                && block_size != 0
+            {
+                map.full_blocks(*first, length / block_size);
             }
             if let par3_rs::ChunkTail::Described {
                 block_index,
@@ -1461,18 +1462,104 @@ fn tail_packing(set: &Par3Set) -> (u64, u64) {
                 ..
             } = tail
             {
-                let size = length % block_size.max(1);
-                let slices = blocks.entry(*block_index).or_default();
-                if slices.contains(&(*offset, size)) {
-                    deduplicated += 1;
-                } else if !slices.is_empty() {
-                    packed += 1;
-                }
-                slices.push((*offset, size));
+                map.tail(*block_index, *offset, length % block_size.max(1));
             }
         }
     }
-    (packed, deduplicated)
+    (map.packed, map.deduplicated)
+}
+
+/// The block map par3cmdline builds for its report, kept as ranges so a set
+/// that declares an enormous chunk costs work in its number of chunks, not in
+/// its number of blocks.
+#[derive(Default)]
+struct BlockMap {
+    /// Blocks some chunk fills completely, as disjoint `start -> end`
+    /// (exclusive) ranges in a 65-bit index space.
+    full: BTreeMap<u128, u128>,
+    /// Per block: the (offset, size) of each tail mapped onto it.
+    tails: BTreeMap<u64, Vec<(u64, u64)>>,
+    /// Blocks holding tails that no full range covers yet.
+    tail_only: BTreeSet<u64>,
+    packed: u64,
+    deduplicated: u64,
+}
+
+impl BlockMap {
+    /// Map `count` whole blocks from `first`, wrapping past `u64::MAX` the
+    /// way par3cmdline's index arithmetic does. Every block that already
+    /// held a slice counts as deduplicated.
+    fn full_blocks(&mut self, first: u64, count: u64) {
+        let start = u128::from(first);
+        let end = start + u128::from(count);
+        let limit = 1u128 << 64;
+        if end > limit {
+            self.full_range(start, limit);
+            self.full_range(0, end - limit);
+        } else {
+            self.full_range(start, end);
+        }
+    }
+
+    fn full_range(&mut self, mut start: u128, mut end: u128) {
+        if start >= end {
+            return;
+        }
+        // Blocks already filled: overlap with every range touching this one.
+        let mut overlap = 0u128;
+        let touching: Vec<(u128, u128)> = self
+            .full
+            .range(..=end)
+            .rev()
+            .take_while(|&(_, &range_end)| range_end >= start)
+            .map(|(&range_start, &range_end)| (range_start, range_end))
+            .collect();
+        for (range_start, range_end) in touching {
+            overlap += range_end.min(end).saturating_sub(range_start.max(start));
+            self.full.remove(&range_start);
+            start = start.min(range_start);
+            end = end.max(range_end);
+        }
+        // Blocks that held only tails until now.
+        let first = u64::try_from(start).unwrap_or(u64::MAX);
+        let tails: Vec<u64> = self
+            .tail_only
+            .range(first..)
+            .take_while(|&&block| u128::from(block) < end)
+            .copied()
+            .collect();
+        for block in &tails {
+            self.tail_only.remove(block);
+        }
+        self.full.insert(start, end);
+        let repeated = overlap + tails.len() as u128;
+        self.deduplicated = self
+            .deduplicated
+            .saturating_add(u64::try_from(repeated).unwrap_or(u64::MAX));
+    }
+
+    fn covered(&self, block: u64) -> bool {
+        let block = u128::from(block);
+        self.full
+            .range(..=block)
+            .next_back()
+            .is_some_and(|(_, &end)| end > block)
+    }
+
+    /// Map a tail of `size` bytes at `offset` within `block`.
+    fn tail(&mut self, block: u64, offset: u64, size: u64) {
+        let covered = self.covered(block);
+        let slices = self.tails.entry(block).or_default();
+        if slices.contains(&(offset, size)) {
+            self.deduplicated = self.deduplicated.saturating_add(1);
+        } else if covered || !slices.is_empty() {
+            self.packed = self.packed.saturating_add(1);
+        }
+        slices.push((offset, size));
+        if !covered {
+            self.tail_only.insert(block);
+        }
+    }
 }
 
 fn print_listing(set: &Par3Set, file_order: &[usize], directory_order: &[usize], detail: u8) {
@@ -2439,5 +2526,41 @@ mod tests {
         assert!(!wildcard_match(b"*.txt", b"alpha.bin"));
         assert!(wildcard_match(b"alpha.bin", b"alpha.bin"));
         assert!(!wildcard_match(b"alpha", b"alpha.bin"));
+    }
+
+    #[test]
+    fn block_map_counts_as_the_per_block_walk_does() {
+        let mut map = BlockMap::default();
+        map.full_blocks(0, 4); // blocks 0..4
+        map.full_blocks(2, 4); // 2 and 3 repeat
+        assert_eq!((map.packed, map.deduplicated), (0, 2));
+        map.tail(9, 0, 10);
+        map.tail(9, 10, 5); // shares block 9
+        map.tail(9, 0, 10); // repeats the first tail
+        map.tail(5, 0, 7); // lands on a full block
+        assert_eq!((map.packed, map.deduplicated), (2, 3));
+        // A full range over a tail-only block counts it once.
+        map.full_blocks(8, 3); // 8, 9, 10: only 9 held slices
+        assert_eq!((map.packed, map.deduplicated), (2, 4));
+        map.full_blocks(9, 1);
+        assert_eq!((map.packed, map.deduplicated), (2, 5));
+    }
+
+    #[test]
+    fn block_map_takes_a_full_index_space_chunk_without_expanding_it() {
+        // A chunk of u64::MAX one-byte blocks, then another over the same
+        // space: counted from ranges, never materialised.
+        let mut map = BlockMap::default();
+        map.full_blocks(0, u64::MAX);
+        assert_eq!(map.deduplicated, 0);
+        map.full_blocks(1, u64::MAX); // 1..=u64::MAX: all but the last repeat
+        assert_eq!(map.deduplicated, u64::MAX - 1);
+        map.tail(u64::MAX, 0, 1);
+        assert_eq!(map.packed, 1);
+        // Index arithmetic wraps past u64::MAX onto block 0.
+        let mut map = BlockMap::default();
+        map.full_blocks(u64::MAX, 2);
+        map.full_blocks(0, 1);
+        assert_eq!(map.deduplicated, 1);
     }
 }
