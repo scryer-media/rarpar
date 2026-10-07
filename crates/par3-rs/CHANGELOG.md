@@ -87,6 +87,10 @@
     scan before rescanning through the final provider, so a set whose
     packets need a bit over half the memory budget is no longer refused for
     holding two packet inventories at once.
+  - `open` binds a host by name to a file carrying no packets only in a
+    directory that holds a file carrying the set's own packets, so when one
+    call spans several directories a missing volume is never bound to an
+    unrelated same-named archive beside another set.
 - A derived carrier (`CarrierPlan::derived`) looks up its available Recovery
   Data packets in one pass over the payloads instead of one pass per
   recovery index, so regenerating a region of a set with tens of thousands

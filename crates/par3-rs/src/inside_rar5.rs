@@ -1429,18 +1429,29 @@ fn open_set(
     // then a lone host and a lone file.
     // Among files of the recorded name, one carrying this set's packets wins;
     // one carrying only another set's packets is never this set's host.
+    // A file with no packets at all is taken by name only in a directory
+    // that holds a file carrying this set's packets: one invocation may span
+    // several directories, and a same-named file beside another set is not
+    // this set's host.
+    let tied: BTreeSet<&Path> = candidates
+        .iter()
+        .filter(|c| c.carries(id))
+        .filter_map(|c| c.path.parent())
+        .collect();
     let mut used = BTreeSet::new();
     for host in &mut hosts {
         let named = |c: &&Candidate| {
             file_name(&c.path) == Some(host.name.as_str()) && !used.contains(&c.source)
         };
         let ours = |c: &&Candidate| c.carries(id);
-        let foreign = |c: &&Candidate| c.carries_other_than(id);
+        let packetless_beside_ours = |c: &&Candidate| {
+            !c.carries_other_than(id) && c.path.parent().is_some_and(|dir| tied.contains(dir))
+        };
         if let Some(candidate) = candidates
             .iter()
             .filter(named)
             .find(ours)
-            .or_else(|| candidates.iter().filter(named).find(|c| !foreign(c)))
+            .or_else(|| candidates.iter().filter(named).find(packetless_beside_ours))
         {
             used.insert(candidate.source);
             host.source = Some(candidate.source);
@@ -2274,6 +2285,35 @@ mod tests {
             .find(|set| set.hosts[0].name == "gamma.part1.rar")
             .unwrap();
         assert_eq!(gamma.status, RepairStatus::Complete);
+        drop(sets);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// When one invocation spans two directories, a missing host of the set
+    /// in one is never bound by name to an unrelated packetless RAR of that
+    /// name in the other.
+    #[test]
+    fn a_same_named_packetless_file_in_another_directory_is_not_bound() {
+        let dir = scratch_dir("other-directory");
+        let first = insert_synthetic(
+            &dir.join("alpha"),
+            &["set.part1.rar", "set.part2.rar"],
+            60,
+            false,
+        );
+        let second = insert_synthetic(&dir.join("beta"), &["beta-notes.rar"], 70, false);
+        std::fs::remove_file(&first[1]).unwrap();
+        let unrelated = dir.join("beta").join("set.part2.rar");
+        std::fs::write(&unrelated, synthetic_rar5(None, 80)).unwrap();
+        let paths = [first[0].clone(), second[0].clone()];
+        let sets = open(&paths, &ExecutionOptions::default()).unwrap();
+        let alpha = sets
+            .iter()
+            .find(|set| set.hosts[0].name == "set.part1.rar")
+            .unwrap();
+        assert_eq!(alpha.hosts[0].path.as_ref(), Some(&first[0]));
+        assert_eq!(alpha.hosts[1].path, None);
+        assert_eq!(alpha.needs_repair(), vec![1]);
         drop(sets);
         std::fs::remove_dir_all(&dir).unwrap();
     }
