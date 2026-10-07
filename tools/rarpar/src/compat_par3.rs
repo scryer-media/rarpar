@@ -14,7 +14,7 @@
 //! message and par3cmdline's invalid-command code, after par3cmdline's own
 //! argument checks, never ignored.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -1064,19 +1064,24 @@ fn visible_entries(directory: &Path) -> std::io::Result<Vec<(String, bool)>> {
 
 #[derive(Debug, Default)]
 struct InputList {
+    /// Names in discovery order.
     files: Vec<String>,
     directories: Vec<String>,
+    /// Membership of `files` and `directories`, so a wildcard over many
+    /// names is not a rescan per name.
+    file_set: HashSet<String>,
+    directory_set: HashSet<String>,
 }
 
 impl InputList {
     fn add_file(&mut self, name: String) {
-        if !self.files.contains(&name) {
+        if self.file_set.insert(name.clone()) {
             self.files.push(name);
         }
     }
 
     fn add_directory(&mut self, name: String) -> bool {
-        if self.directories.contains(&name) {
+        if !self.directory_set.insert(name.clone()) {
             return false;
         }
         self.directories.push(name);
