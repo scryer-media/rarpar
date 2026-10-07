@@ -19,6 +19,11 @@
   logical units of a chunk at once through `apply_decode_matrix_gf16`, and
   `Rar5RsCoder::matrix` exposes the inverted decode rows. The result is the
   one a full `update_outputs` pass leaves.
+- `Rar3RsCoder::decode` rebuilds its cached erasure locator when the block
+  length changes, not only when the erasure set does; a coder reused across
+  blocks of different lengths with the same erasures no longer corrects the
+  wrong positions. `decode_matrix` derives its matrix from fresh locator
+  state rather than from whatever block the coder decoded last.
 
 ## 0.4.8
 

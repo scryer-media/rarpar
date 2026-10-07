@@ -45,7 +45,15 @@ Fewer redundant reads on the verify and repair paths.
   to the fingerprint and is left to the verification of the repaired files.
   The scan's record is kept privately beside the payload, keyed by the
   volume's interned path, so `RecoverySliceData::FileBacked` keeps exactly
-  the fields it had in 0.10.7.
+  the fields it had in 0.10.7. Only the recovery packets a sink keeps are
+  recorded: the scan notes each settled volume's fingerprint in its
+  `PacketScanBudget`, and the record (length, packet hash, recovery set ID
+  and exponent) is written when the set builder, the repair inventory
+  loader or the collecting scanners retain the packet. A duplicate or
+  otherwise dropped packet leaves no record, so the records never outnumber
+  the retained packets the budget's metadata limit already bounds. Packets
+  delivered to a caller's own `PacketSink` are not recorded and are re-hashed
+  at repair time as before.
 
 ### Added
 
@@ -53,9 +61,14 @@ Fewer redundant reads on the verify and repair paths.
   the set's recovery set ID that skips the files the set protects instead of
   opening each one and reading its first 64 bytes. An entry is skipped only
   when it is a regular file at a protected name with the length the set
-  records for it; any other entry at a protected name, such as a renamed
-  volume standing where a data file is missing, is read and identified like
-  every other candidate. `identify_par2_files` is unchanged.
+  records for it, and that length could not be a PAR2 file of whole packets
+  (shorter than a packet header, or not a multiple of 4). Name and length
+  alone never exclude an entry: a renamed volume standing at a protected
+  name, whether at some other length or at exactly the recorded one, is read
+  and identified like every other candidate, so the walk returns every
+  volume `identify_par2_files` returns. Only a volume truncated to a length
+  that is not a multiple of 4 and then sitting at a protected name with
+  exactly that length is passed over. `identify_par2_files` is unchanged.
 
 ### API
 

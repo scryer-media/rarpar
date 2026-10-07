@@ -58,6 +58,16 @@
   division by zero in release builds). The coder records the fault, and the
   member fails with `CorruptArchive` or a CRC mismatch instead. Found by the
   `rar_extract` fuzz target; the input is kept as a regression test.
+- A RAR5 restore without `overwrite_existing` no longer replaces a file that
+  appears at a restored volume's name after the existence check. Each
+  restored volume is hard-linked into place, which the filesystem refuses
+  atomically when the name is taken, and the restore fails with the usual
+  refusal while the file at that name is left untouched. Filesystems that
+  cannot hard-link fall back to checking and renaming.
+- A RAR3 restore checks the data volume it takes its names from again when
+  it assigns the volumes to slots, as the serial restore did, instead of
+  reusing the verdict of the side-by-side check. A volume damaged after that
+  check is treated as missing rather than fed to the reconstruction.
 
 ## 0.10.8
 

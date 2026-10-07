@@ -117,7 +117,7 @@ impl Par2FileSet {
             let mut accepted = 0usize;
             let mut sink = |packet: Packet, offset: u64, _set_id: RecoverySetId| -> Result<()> {
                 accepted += 1;
-                match builder.add_packet_budgeted(packet, offset, &budget) {
+                match builder.add_packet_budgeted(packet, offset, None, &budget) {
                     Ok(_) => {}
                     // A budget refusal is the caller's problem, not a per-file
                     // diagnostic: it means the inventory would be incomplete.
@@ -160,7 +160,7 @@ impl Par2FileSet {
         let budget = PacketScanBudget::new(PacketScanLimits::default());
         let mut builder = Par2FileSetBuilder::new();
         for packet in packets {
-            builder.add_packet_budgeted(packet, 0, &budget)?;
+            builder.add_packet_budgeted(packet, 0, None, &budget)?;
         }
         builder.build()
     }
@@ -403,10 +403,10 @@ impl PacketSink for BuilderSink<'_> {
         &mut self,
         packet: Packet,
         offset: u64,
-        _recovery_set_id: RecoverySetId,
+        recovery_set_id: RecoverySetId,
     ) -> Result<()> {
         self.builder
-            .add_packet_budgeted(packet, offset, self.budget)?;
+            .add_packet_budgeted(packet, offset, Some(recovery_set_id), self.budget)?;
         Ok(())
     }
 }
@@ -498,10 +498,16 @@ impl Par2FileSetBuilder {
     ///
     /// A duplicate, an unknown packet, or a packet past a logical bound costs
     /// the budget nothing: it is never charged in the first place.
+    ///
+    /// `scanned_under` is the recovery set ID the packet's header named when a
+    /// scan under `budget` handed it over, and `None` for a packet from
+    /// anywhere else. A scanned recovery payload the builder keeps has its
+    /// scan authentication recorded; one it drops leaves none behind.
     pub(crate) fn add_packet_budgeted(
         &mut self,
         packet: Packet,
         offset: u64,
+        scanned_under: Option<RecoverySetId>,
         budget: &PacketScanBudget,
     ) -> Result<PacketAdmission> {
         if !self.would_retain(&packet) {
@@ -511,8 +517,14 @@ impl Par2FileSetBuilder {
         }
         let bytes = packet_retained_bytes(&packet);
         budget.charge_retained(bytes)?;
+        let scan_admission =
+            scanned_under.and_then(|set_id| budget.scan_admission(&packet, &set_id));
         let admission = self.add_packet(packet, offset)?;
-        if admission != PacketAdmission::Retained {
+        if admission == PacketAdmission::Retained {
+            if let Some(scan_admission) = scan_admission {
+                scan_admission.record();
+            }
+        } else {
             budget.release_retained(bytes);
         }
         Ok(admission)

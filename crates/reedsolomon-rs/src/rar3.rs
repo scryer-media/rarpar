@@ -27,13 +27,15 @@ pub struct Rar3RsCoder {
     // columns.
     syn_data: [usize; MAX_PAR + 1],
     ee_pol: [usize; MAX_PAR + 1],
-    // The erasure set the cached locator polynomial (`el_pol`, `error_locs`,
-    // `dnm`) was built for. A coder is reused across every column of a
-    // volume set, where the erasures never change, but nothing stops a caller
-    // handing it a different set, and a locator for the wrong positions
+    // The erasure set and block length the cached locator polynomial
+    // (`el_pol`, `error_locs`, `dnm`) was built for. A coder is reused across
+    // every column of a volume set, where neither ever changes, but nothing
+    // stops a caller handing it a different set or a block of another length,
+    // and the locator depends on both: one built for the wrong positions
     // "corrects" the wrong bytes without any signal.
     locator_erasures: [usize; MAX_PAR + 1],
     locator_len: usize,
+    locator_data_size: usize,
 }
 
 impl Rar3RsCoder {
@@ -61,6 +63,7 @@ impl Rar3RsCoder {
             ee_pol: [0; MAX_PAR + 1],
             locator_erasures: [0; MAX_PAR + 1],
             locator_len: 0,
+            locator_data_size: 0,
         };
         coder.gf_init();
         coder.pn_init();
@@ -110,10 +113,12 @@ impl Rar3RsCoder {
             return true;
         }
 
-        let locator_stale =
-            !self.first_block_done || self.locator_erasures[..self.locator_len] != *erasures;
+        let locator_stale = !self.first_block_done
+            || self.locator_data_size != data_size
+            || self.locator_erasures[..self.locator_len] != *erasures;
         if locator_stale {
             self.first_block_done = true;
+            self.locator_data_size = data_size;
             self.locator_len = erasures.len();
             self.locator_erasures[..erasures.len()].copy_from_slice(erasures);
             self.el_pol.fill(0);
@@ -196,7 +201,10 @@ impl Rar3RsCoder {
         if total == 0 || total > MAX_PAR {
             return None;
         }
+        // Derive from fresh locator state: whatever `self` cached was built
+        // for some earlier block, not necessarily this length and erasure set.
         let mut coder = self.clone();
+        coder.first_block_done = false;
         let rows = erasures.len();
         let mut matrix = vec![0u8; rows * total];
         let mut block = [0u8; MAX_PAR];
@@ -574,6 +582,45 @@ mod tests {
                 &source[..],
                 "erasures {erasures:?}"
             );
+        }
+    }
+
+    /// The locator also depends on the block length. A coder that decoded a
+    /// block of one length and is then handed the same erasures in a block
+    /// of another length rebuilds it, and the decode matrix it derives for
+    /// the new length is a fresh coder's.
+    #[test]
+    fn reused_coder_rebuilds_its_locator_when_the_block_length_changes() {
+        let erasures = [1usize, 4];
+        let encoder = Rar3RsCoder::new(2).unwrap();
+        let mut reused = Rar3RsCoder::new(2).unwrap();
+        for source in [
+            &[17u8, 250, 3, 99, 128, 64][..],
+            &[5, 6, 7, 8, 9, 10, 11, 12, 13],
+        ] {
+            let mut parity = [0u8; 2];
+            encoder.encode(source, &mut parity);
+            let mut block = source.to_vec();
+            block.extend_from_slice(&parity);
+            let total = block.len();
+            for &era in &erasures {
+                block[era] = 0;
+            }
+
+            assert_eq!(
+                reused.decode_matrix(total, &erasures),
+                Rar3RsCoder::new(2).unwrap().decode_matrix(total, &erasures),
+                "total {total}"
+            );
+            let mut via_fresh = block.clone();
+            assert!(
+                Rar3RsCoder::new(2)
+                    .unwrap()
+                    .decode(&mut via_fresh, &erasures)
+            );
+            assert!(reused.decode(&mut block, &erasures), "total {total}");
+            assert_eq!(block, via_fresh, "total {total}");
+            assert_eq!(&block[..source.len()], source, "total {total}");
         }
     }
 }

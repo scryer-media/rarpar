@@ -542,7 +542,11 @@ fn restore_rar5_folded(
             }
         }
         for (partial, &i) in partial_paths.iter().zip(&missing) {
-            std::fs::rename(partial, &data_slots[i].output_path).map_err(RarError::Io)?;
+            install_partial(
+                partial,
+                &data_slots[i].output_path,
+                options.overwrite_existing,
+            )?;
         }
         Ok(())
     })();
@@ -641,6 +645,37 @@ fn refuse_existing_restored(path: &Path) -> RarError {
             "refusing to overwrite existing restored volume {}",
             path.display()
         ),
+    }
+}
+
+/// Move a finished partial restore to `target`.
+///
+/// With `overwrite_existing` this is a plain rename, which replaces whatever
+/// is at `target`. Without it the existence check the caller made earlier is
+/// only advisory: a file created at `target` since then must still win. The
+/// partial is therefore hard-linked to `target`, which the filesystem refuses
+/// atomically when the name is taken, and the partial name is removed only
+/// once the link stands. A taken name is refused like any other existing
+/// output, and the file at it is left as it was.
+///
+/// A filesystem that cannot hard-link (FAT, some network shares) reports an
+/// error other than `AlreadyExists`; there the install falls back to checking
+/// for `target` and renaming, which narrows the window but cannot close it.
+fn install_partial(partial: &Path, target: &Path, overwrite_existing: bool) -> RarResult<()> {
+    if overwrite_existing {
+        return std::fs::rename(partial, target).map_err(RarError::Io);
+    }
+    match std::fs::hard_link(partial, target) {
+        Ok(()) => std::fs::remove_file(partial).map_err(RarError::Io),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(refuse_existing_restored(target))
+        }
+        Err(_) => {
+            if target.symlink_metadata().is_ok() {
+                return Err(refuse_existing_restored(target));
+            }
+            std::fs::rename(partial, target).map_err(RarError::Io)
+        }
     }
 }
 
@@ -1337,15 +1372,14 @@ fn rar3_recovery_reference_name<'a>(
 }
 
 /// A precomputed `rar3_data_volume_is_valid` verdict. The first read takes
-/// it, so an error is moved out rather than cloned; a second read of the same
-/// path recomputes it, as the serial code did.
+/// it, whatever it was, and a second read of the same path recomputes it from
+/// the file as the serial code did: the volume the reference-name search
+/// accepted is checked again when the slots are assigned, so one that changed
+/// after the side-by-side check does not enter the reconstruction on a stale
+/// verdict.
 fn take_rar3_validity(slot: &mut Option<RarResult<bool>>, path: &Path) -> RarResult<bool> {
     match slot.take() {
-        Some(Ok(valid)) => {
-            *slot = Some(Ok(valid));
-            Ok(valid)
-        }
-        Some(Err(error)) => Err(error),
+        Some(verdict) => verdict,
         None => rar3_data_volume_is_valid(path),
     }
 }
@@ -2751,6 +2785,52 @@ mod tests {
         assert_eq!(std::fs::read(&taken).unwrap(), b"already here");
     }
 
+    /// A file that appears at the output name after the restore staged its
+    /// partial, and so after the existence check, is refused and kept: the
+    /// install never replaces it, and the partial is left for cleanup.
+    #[test]
+    fn installing_a_partial_refuses_an_output_created_after_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("fixture_epsilon.part1.rar");
+        let (partial, mut file) = create_partial(&target).unwrap();
+        file.write_all(b"restored bytes").unwrap();
+        drop(file);
+        std::fs::write(&target, b"arrived meanwhile").unwrap();
+
+        let error = install_partial(&partial, &target, false).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to overwrite existing restored volume"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"arrived meanwhile");
+        assert_eq!(std::fs::read(&partial).unwrap(), b"restored bytes");
+    }
+
+    /// Without a file in the way the install moves the partial into place
+    /// and leaves no partial name behind; with `overwrite_existing` it
+    /// replaces what is there.
+    #[test]
+    fn installing_a_partial_moves_it_into_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("fixture_zeta.part1.rar");
+        let (partial, mut file) = create_partial(&target).unwrap();
+        file.write_all(b"first restore").unwrap();
+        drop(file);
+        install_partial(&partial, &target, false).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"first restore");
+        assert_eq!(stray_partials(dir.path(), &[]), Vec::<PathBuf>::new());
+
+        let (partial, mut file) = create_partial(&target).unwrap();
+        file.write_all(b"second restore").unwrap();
+        drop(file);
+        install_partial(&partial, &target, true).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"second restore");
+        assert_eq!(stray_partials(dir.path(), &[]), Vec::<PathBuf>::new());
+    }
+
     /// Two restores of distinct sets into one directory at once in one
     /// process: each lands byte for byte and neither leaves a partial.
     #[test]
@@ -2844,6 +2924,29 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
 
         assert!(!rar3_data_volume_is_valid(&path).unwrap());
+    }
+
+    /// The reference-name search consumes the side-by-side verdict, so the
+    /// slot assignment checks the volume again: one that was intact when
+    /// first checked and was damaged since is then reported invalid instead
+    /// of entering the reconstruction on its stale verdict.
+    #[test]
+    fn rar3_reference_search_leaves_the_slot_assignment_to_recheck_the_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture_eta.part01.rar");
+        let mut bytes = rar4_archive_with_recovery_flag();
+        append_rar4_end_data_crc(&mut bytes, false);
+        std::fs::write(&path, &bytes).unwrap();
+        let data_paths = [&path];
+        let mut data_valid = vec![Some(rar3_data_volume_is_valid(&path))];
+
+        let reference = rar3_recovery_reference_name(&data_paths, &mut data_valid).unwrap();
+        assert_eq!(reference, path.as_path());
+
+        let mut damaged = rar4_archive_with_recovery_flag();
+        append_rar4_end_data_crc(&mut damaged, true);
+        std::fs::write(&path, damaged).unwrap();
+        assert!(!take_rar3_validity(&mut data_valid[0], &path).unwrap());
     }
 
     #[test]

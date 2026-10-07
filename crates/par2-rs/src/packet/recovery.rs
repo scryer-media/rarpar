@@ -39,7 +39,8 @@ pub enum RecoverySliceData {
 /// instead of reading and hashing the payload again.
 ///
 /// The record lives here rather than in [`RecoverySliceData::FileBacked`] so
-/// that variant keeps exactly its public fields. Every payload of one scan
+/// that variant keeps exactly its public fields. Only payloads a sink kept are
+/// recorded (see [`ScanAdmission`]). Every payload of one scan
 /// shares one `Arc<Path>`, and clones of a payload share it too, so the
 /// allocation's address names the scan. The entry holds a `Weak` to that
 /// allocation, which keeps the address from being reused while the entry
@@ -117,6 +118,74 @@ pub(super) fn scan_authentication(
     (entry.spans.get(&offset) == Some(&span)).then(|| entry.fingerprint.clone())
 }
 
+/// A scanned recovery payload's authentication, waiting for its packet to be
+/// admitted.
+///
+/// The scanner hashes every recovery payload it reads, but only the payloads a
+/// sink keeps can ever be validated again, so only those are recorded in the
+/// side table: [`PacketScanBudget::scan_admission`] builds this before the
+/// packet is handed over, and [`Self::record`] runs once the sink has kept it.
+/// A packet the sink drops, as a duplicate or for any other reason, leaves
+/// nothing behind, so the table never holds more spans than the inventories
+/// built from scans retain, and those are metered by their budgets.
+///
+/// [`PacketScanBudget::scan_admission`]: super::PacketScanBudget::scan_admission
+pub(crate) struct ScanAdmission {
+    path: Arc<Path>,
+    offset: u64,
+    span: AuthenticatedSpan,
+    fingerprint: FileStatFingerprint,
+}
+
+impl ScanAdmission {
+    /// The admission for `packet`, scanned from a recovery packet whose header
+    /// named `recovery_set_id`, when it is a hashed file-backed payload over a
+    /// path the scan fingerprinted. `fingerprint` looks that path up.
+    pub(crate) fn for_packet(
+        packet: &RecoverySlicePacket,
+        recovery_set_id: &[u8; 16],
+        fingerprint: impl FnOnce(&Arc<Path>) -> Option<FileStatFingerprint>,
+    ) -> Option<Self> {
+        let RecoverySliceData::FileBacked {
+            path,
+            offset,
+            len,
+            packet_hash: Some(packet_hash),
+        } = &packet.data
+        else {
+            return None;
+        };
+        let fingerprint = fingerprint(path)?;
+        Some(Self {
+            path: Arc::clone(path),
+            offset: *offset,
+            span: AuthenticatedSpan {
+                len: *len,
+                packet_hash: *packet_hash,
+                recovery_set_id: *recovery_set_id,
+                exponent: packet.exponent,
+            },
+            fingerprint,
+        })
+    }
+
+    /// Record the authentication now that its packet has been kept.
+    pub(crate) fn record(self) {
+        record_scan_authentication(&self.path, self.offset, self.span, self.fingerprint);
+    }
+}
+
+/// How many spans the side table holds for `path`'s scan.
+#[cfg(test)]
+pub(crate) fn scan_authentication_count(path: &Arc<Path>) -> usize {
+    SCAN_AUTHENTICATIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .and_then(|table| table.get(&interned_path_key(path)))
+        .map_or(0, |entry| entry.spans.len())
+}
+
 impl RecoverySliceData {
     pub fn in_memory(data: Bytes) -> Self {
         Self::InMemory(data)
@@ -147,41 +216,6 @@ impl RecoverySliceData {
             offset,
             len,
             packet_hash,
-        }
-    }
-
-    /// A file-backed slice whose payload the scanner has just authenticated
-    /// against `packet_hash` under `recovery_set_id` and `exponent`, with the
-    /// volume fingerprinted as it was opened.
-    ///
-    /// The fingerprint is taken before any byte is read, so a write that
-    /// lands during or after the scan moves it and sends validation back to
-    /// the bytes.
-    pub(crate) fn file_backed_authenticated(
-        path: Arc<Path>,
-        offset: u64,
-        len: usize,
-        packet_hash: [u8; 16],
-        recovery_set_id: [u8; 16],
-        exponent: RecoveryExponent,
-        fingerprint: FileStatFingerprint,
-    ) -> Self {
-        record_scan_authentication(
-            &path,
-            offset,
-            AuthenticatedSpan {
-                len,
-                packet_hash,
-                recovery_set_id,
-                exponent,
-            },
-            fingerprint,
-        );
-        Self::FileBacked {
-            path,
-            offset,
-            len,
-            packet_hash: Some(packet_hash),
         }
     }
 
