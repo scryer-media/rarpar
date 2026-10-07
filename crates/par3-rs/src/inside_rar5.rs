@@ -2162,6 +2162,9 @@ mod tests {
             assert_eq!(set.hosts.len(), 1);
             assert_eq!(set.hosts[0].path.as_ref(), Some(path));
         }
+        // The open sets hold their hosts open; Windows refuses to delete a
+        // directory while a file inside it is still open.
+        drop(sets);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2242,6 +2245,7 @@ mod tests {
             .find(|set| set.hosts[0].name == "gamma.part1.rar")
             .unwrap();
         assert_eq!(gamma.status, RepairStatus::Complete);
+        drop(sets);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2290,6 +2294,7 @@ mod tests {
         std::fs::remove_file(&destinations[1]).unwrap();
         let written = set.remove(&destinations).unwrap();
         assert_eq!(written.len(), 2);
+        drop(set);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
