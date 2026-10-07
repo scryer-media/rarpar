@@ -439,3 +439,54 @@ fn inside_dry_run_insertion_creates_nothing() {
         std::fs::read(&source).unwrap()
     );
 }
+
+/// On a case-insensitive filesystem a volume named in other casing than its
+/// directory entry still finds every volume of its set. Skips where the
+/// filesystem is case-sensitive.
+#[test]
+fn inside_finds_the_set_from_a_name_in_other_casing() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let Some(sources) = originals(root) else {
+        return;
+    };
+    let shouted = root.join("original").join(name(1).to_uppercase());
+    if !shouted.is_file() {
+        eprintln!("skipping: the filesystem is case-sensitive");
+        return;
+    }
+    let shouted = shouted.to_str().unwrap();
+    let inserted = run(
+        root,
+        &[
+            "par3",
+            "inside",
+            "insert",
+            shouted,
+            "-d",
+            "protected",
+            "-s",
+            "4096",
+            "-c",
+            "14",
+        ],
+        0,
+    );
+    assert_eq!(inserted["outputs"].as_array().unwrap().len(), sources.len());
+    let protected = root.join("protected").join(name(3).to_uppercase());
+    let protected = protected.to_str().unwrap();
+    run(root, &["par3", "inside", "verify", protected], 0);
+    run(
+        root,
+        &["par3", "inside", "remove", protected, "-d", "stripped"],
+        0,
+    );
+    for (part, source) in sources.iter().enumerate() {
+        assert_eq!(
+            std::fs::read(root.join("stripped").join(name(part + 1))).unwrap(),
+            std::fs::read(source).unwrap(),
+            "volume {} after removal",
+            part + 1
+        );
+    }
+}

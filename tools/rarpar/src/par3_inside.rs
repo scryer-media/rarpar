@@ -110,7 +110,7 @@ fn volume_set(paths: &[PathBuf]) -> Result<Vec<PathBuf>, RarparError> {
     if paths.len() != 1 {
         return Ok(paths.to_vec());
     }
-    let path = &paths[0];
+    let path = &as_listed(&paths[0]);
     let Some((stem, _)) = part_number(path) else {
         return Ok(paths.to_vec());
     };
@@ -135,6 +135,53 @@ fn volume_set(paths: &[PathBuf]) -> Result<Vec<PathBuf>, RarparError> {
         }
     }
     Ok(volumes.into_iter().map(|(_, path)| path).collect())
+}
+
+/// `path` spelled as its directory lists it. On a case-insensitive
+/// filesystem a caller can name `SET.PART1.RAR` for the entry
+/// `set.part1.rar`; set discovery matches sibling names against the stem, so
+/// it takes the stem from the entry, not from the caller's spelling.
+fn as_listed(path: &Path) -> PathBuf {
+    let Some(name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+    let directory = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return path.to_path_buf();
+    };
+    let wanted = name.to_string_lossy().to_lowercase();
+    let mut listed = None;
+    for entry in entries.flatten() {
+        let found = entry.file_name();
+        if found == name {
+            return path.to_path_buf();
+        }
+        if found.to_string_lossy().to_lowercase() == wanted && same_file(path, &entry.path()) {
+            listed = Some(found);
+        }
+    }
+    listed.map_or_else(|| path.to_path_buf(), |found| path.with_file_name(found))
+}
+
+/// Whether two paths name one file.
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// Whether two paths name one file. Only asked of names equal but for case,
+/// which name one file on the case-insensitive filesystems this platform
+/// uses whenever the caller's spelling opened at all.
+#[cfg(not(unix))]
+fn same_file(a: &Path, _b: &Path) -> bool {
+    a.is_file()
 }
 
 /// `(stem, N)` for `stem.partN.rar`.
@@ -387,9 +434,9 @@ fn open(cli: &Cli, args: &Par3InsideArgs) -> Result<Vec<Rar5Set>, RarparError> {
     }
     // Every present volume of a given `.partN.rar` set, so sets embedded per
     // volume are all opened.
-    let mut paths = args.archives.clone();
-    for path in &args.archives {
-        let Some((stem, _)) = part_number(path) else {
+    let mut paths: Vec<PathBuf> = args.archives.iter().map(|path| as_listed(path)).collect();
+    for path in paths.clone() {
+        let Some((stem, _)) = part_number(&path) else {
             continue;
         };
         let directory = path
@@ -414,6 +461,7 @@ fn uncovered_volumes(cli: &Cli, args: &Par3InsideArgs, sets: &[Rar5Set]) -> Vec<
     let covered: Vec<String> = sets.iter().flat_map(Rar5Set::current_names).collect();
     let mut missing = Vec::new();
     for path in &args.archives {
+        let path = &as_listed(path);
         let Some((stem, _)) = part_number(path) else {
             continue;
         };
