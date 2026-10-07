@@ -11,6 +11,9 @@
 //! the default is sync-files. The selected policy is recorded in metrics.
 //! PAR3_BENCH_REPAIR_DURABILITY=buffered does the same for repair.
 //! PAR3_BENCH_CREATOR replaces the Creator packet text of `create`.
+//! PAR3_BENCH_WHOLE_FILE_FIRST=0 makes disk verification hash extents and the
+//! whole file in one pass instead of the whole file first; `1` or unset keeps
+//! the default. The selected order is recorded in metrics.
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -67,6 +70,9 @@ impl SourceAccess for Counted {
     fn open_file(&self, source: SourceId) -> std::io::Result<Option<par3_rs::source::SourceFile>> {
         self.0.open_file(source)
     }
+    fn mount_kind(&self, source: SourceId) -> par3_rs::mount::MountKind {
+        self.0.mount_kind(source)
+    }
 }
 
 fn files(directory: &Path, extension: &str) -> Result<Vec<PathBuf>> {
@@ -111,6 +117,13 @@ fn main() -> Result<()> {
     options.workers = args[4].parse()?;
     options.memory = MemoryBudget::new(args[5].parse::<usize>()? * (1 << 20));
     options.retained_bytes = options.retained_bytes.min(options.memory.limit() / 2);
+    options.disk_verify_whole_first = match std::env::var("PAR3_BENCH_WHOLE_FILE_FIRST").as_deref()
+    {
+        Err(std::env::VarError::NotPresent) => None,
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => return Err("invalid PAR3_BENCH_WHOLE_FILE_FIRST".into()),
+    };
     let mut access = DiskSourceAccess::with_options(options.clone());
     let mut sources = Vec::new();
     for (index, path) in files(data, "bin")?.into_iter().enumerate() {
@@ -396,7 +409,7 @@ fn main() -> Result<()> {
     );
     let io = options.diagnostics.file_io();
     println!(
-        "{{\"file_read_bytes\":{},\"file_read_calls\":{},\"file_write_bytes\":{},\"file_write_calls\":{},\"file_opens\":{},\"file_syncs\":{},\"file_clones\":{},\"snapshots\":{},\"scan_work_used\":{},\"memory_limit\":{},\"workers\":{}}}",
+        "{{\"file_read_bytes\":{},\"file_read_calls\":{},\"file_write_bytes\":{},\"file_write_calls\":{},\"file_opens\":{},\"file_syncs\":{},\"file_clones\":{},\"file_in_place\":{},\"snapshots\":{},\"scan_work_used\":{},\"memory_limit\":{},\"workers\":{}}}",
         io.read_bytes,
         io.read_calls,
         io.write_bytes,
@@ -404,11 +417,35 @@ fn main() -> Result<()> {
         options.diagnostics.file_opens(),
         sync.completed,
         options.diagnostics.file_clones(),
+        options.diagnostics.file_in_place_repairs(),
         SNAPSHOTS.load(Ordering::Relaxed),
         options.scan_work.used(),
         options.memory.limit(),
         options.workers
     );
+    // The verification order that ran and the mount kinds that chose it;
+    // `whole_file_first` and `mount_kind` appear when every file agreed.
+    let order = options.diagnostics.verify_order();
+    let mut line = format!(
+        "{{\"mount_local\":{},\"mount_remote\":{},\"mount_unknown\":{},\"verify_whole_first\":{},\"verify_single_pass\":{}",
+        order.local, order.remote, order.unknown, order.whole_first, order.single_pass
+    );
+    match (order.whole_first, order.single_pass) {
+        (0, 0) => {}
+        (_, 0) => line.push_str(",\"whole_file_first\":true"),
+        (0, _) => line.push_str(",\"whole_file_first\":false"),
+        _ => {}
+    }
+    for (name, count) in [
+        ("local", order.local),
+        ("remote", order.remote),
+        ("unknown", order.unknown),
+    ] {
+        if count != 0 && count == order.local + order.remote + order.unknown {
+            line.push_str(&format!(",\"mount_kind\":\"{name}\""));
+        }
+    }
+    println!("{line}}}");
     let source = options.diagnostics.source_io();
     let admission = options.diagnostics.admission();
     println!(

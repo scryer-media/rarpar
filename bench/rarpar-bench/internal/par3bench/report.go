@@ -46,10 +46,25 @@ type Row struct {
 	BlockOut Stat
 	ReadOps  Stat
 	WriteOps Stat
-	Failed   int
-	Identity string
-	Repaired string
-	Extra    string
+	// Target is the storage target; Load the harness machine's 1-minute
+	// load average before each run.
+	Target string
+	Load   Stat
+	// Engine counters (engine rows) and NFS client counters (NFS targets),
+	// medians over the measured runs; HasEngine / HasNFS say whether any
+	// run carried them.
+	HasEngine                                            bool
+	EngineReadBytes, EngineReadCalls                     Stat
+	EngineWriteBytes, EngineWriteCalls                   Stat
+	EngineOpens, EngineSyncs, EngineSyncSeconds          Stat
+	EngineClones                                         Stat
+	HasNFS                                               bool
+	NFSRead, NFSWrite, NFSCommit, NFSMeta, NFSAll        Stat
+	NFSServerReadBytes, NFSServerWriteBytes, NFSReadRTTs Stat
+	Failed                                               int
+	Identity                                             string
+	Repaired                                             string
+	Extra                                                string
 }
 
 // Summarize groups measured (non-warmup) runs into rows, in variant order.
@@ -82,11 +97,13 @@ func Summarize(results *Results) []Row {
 				if len(runs) == 0 && !didNotFinish {
 					continue
 				}
-				row := Row{Config: config.ID, Op: op, Variant: variant.Name, Tool: variant.Tool, Durability: variant.EffectiveDurability()}
+				row := Row{Config: config.ID, Op: op, Variant: variant.Name, Tool: variant.Tool, Durability: variant.EffectiveDurability(), Target: variant.Target}
 				if didNotFinish {
 					row.DNF = describeDNF(stopped)
 				}
-				var wall, cpu, rss, bin, bout, rops, wops []float64
+				var wall, cpu, rss, bin, bout, rops, wops, load []float64
+				engine := make([][]float64, 8)
+				nfs := make([][]float64, 8)
 				identities := map[string]bool{}
 				repaired := map[string]bool{}
 				extras := map[string]bool{}
@@ -102,6 +119,21 @@ func Summarize(results *Results) []Row {
 					bout = append(bout, float64(run.BlockOutOps))
 					rops = append(rops, float64(run.ReadOps))
 					wops = append(wops, float64(run.WriteOps))
+					load = append(load, run.LoadAverage)
+					if e := run.Engine; e != nil {
+						row.HasEngine = true
+						for i, value := range []float64{float64(e.ReadBytes), float64(e.ReadCalls), float64(e.WriteBytes),
+							float64(e.WriteCalls), float64(e.Opens), float64(e.Syncs), e.SyncSeconds, float64(e.Clones)} {
+							engine[i] = append(engine[i], value)
+						}
+					}
+					if n := run.NFS; n != nil {
+						row.HasNFS = true
+						for i, value := range []int64{n.Op("READ"), n.Op("WRITE"), n.Op("COMMIT"), n.MetadataOps(), n.TotalOps(),
+							n.ServerReadBytes, n.ServerWriteBytes, n.Ops["READ"].RTTMS} {
+							nfs[i] = append(nfs[i], float64(value))
+						}
+					}
 					if run.Identity != nil {
 						identities[run.Identity.Verdict()] = true
 					}
@@ -114,6 +146,12 @@ func Summarize(results *Results) []Row {
 				}
 				row.Wall, row.CPU, row.RSS = stat(wall), stat(cpu), stat(rss)
 				row.BlockIn, row.BlockOut, row.ReadOps, row.WriteOps = stat(bin), stat(bout), stat(rops), stat(wops)
+				row.Load = stat(load)
+				row.EngineReadBytes, row.EngineReadCalls, row.EngineWriteBytes = stat(engine[0]), stat(engine[1]), stat(engine[2])
+				row.EngineWriteCalls, row.EngineOpens, row.EngineSyncs, row.EngineSyncSeconds = stat(engine[3]), stat(engine[4]), stat(engine[5]), stat(engine[6])
+				row.EngineClones = stat(engine[7])
+				row.NFSRead, row.NFSWrite, row.NFSCommit, row.NFSMeta = stat(nfs[0]), stat(nfs[1]), stat(nfs[2]), stat(nfs[3])
+				row.NFSAll, row.NFSServerReadBytes, row.NFSServerWriteBytes, row.NFSReadRTTs = stat(nfs[4]), stat(nfs[5]), stat(nfs[6]), stat(nfs[7])
 				row.Identity = strings.Join(sortedKeys(identities), "/")
 				row.Repaired = strings.Join(sortedKeys(repaired), "/")
 				row.Extra = strings.Join(sortedKeys(extras), " ")
@@ -182,6 +220,30 @@ func RenderReport(results *Results) string {
 		fmt.Fprintf(&b, "- Per-run timeout %s (reference %s); a reference run that exits non-zero, is killed, times out, or writes missing, unreadable or truncated carriers is **DNF** and the rest of the matrix still runs\n",
 			formatTimeout(results.TimeoutSeconds), formatTimeout(results.ReferenceTimeoutSeconds))
 	}
+	if len(results.Rows) > 0 {
+		fmt.Fprintf(&b, "- Row kinds: %s", strings.Join(results.Rows, ", "))
+		if len(results.EngineWorkers) > 0 {
+			fmt.Fprintf(&b, "; engine rows (par3-rs engine_perf, not the shipped CLI, no ratios) at workers %v", results.EngineWorkers)
+		}
+		fmt.Fprintln(&b)
+	}
+	if results.DropCaches {
+		fmt.Fprintln(&b, "- Page cache dropped before every timed run (cold reads)")
+	}
+	for _, target := range results.Targets {
+		name := target.Target
+		if name == "" {
+			name = "work"
+		}
+		fmt.Fprintf(&b, "- Target `%s`: %s", name, target.StorageLabel())
+		if target.MountPoint != "" {
+			fmt.Fprintf(&b, "; mount %s from %s (%s)", target.MountPoint, target.Source, target.MountOptions)
+		}
+		if target.NFSOptions != "" {
+			fmt.Fprintf(&b, "; NFS client options `%s`", target.NFSOptions)
+		}
+		fmt.Fprintln(&b)
+	}
 	fmt.Fprintf(&b, "- Started %s, finished %s, status **%s**\n\n", results.StartedUTC, results.FinishedUTC, results.Status)
 	fmt.Fprintln(&b, "Wall and CPU (user+sys) are seconds, RSS is peak MiB; cells are median [min–max]. Ratios are rarpar/reference medians: below 1.000 rarpar used less. The reference is single-threaded. Every rarpar row, durable and buffered, is compared with the same reference row.")
 	fmt.Fprintln(&b, "Carriers: `identical` = byte-identical to the reference's set; `payloads-only` = every recovery block's payload matches but packet metadata differs; `DIFFERENT` = recovery payloads differ.")
@@ -198,7 +260,7 @@ func RenderReport(results *Results) string {
 	references := map[string]Row{}
 	for _, row := range rows {
 		if row.Tool == ToolReference {
-			references[row.Config+"/"+row.Op] = row
+			references[row.Config+"/"+row.Op+"@"+row.Target] = row
 		}
 	}
 	configs := map[string]ConfigSummary{}
@@ -248,7 +310,7 @@ func RenderReport(results *Results) string {
 			fmt.Fprintln(&b, header)
 			fmt.Fprintln(&b, rule)
 		}
-		reference := references[group]
+		reference, hasReference := references[group+"@"+row.Target]
 		line := fmt.Sprintf("| %s |", row.Variant)
 		if writes(row.Op) {
 			line += fmt.Sprintf(" %s |", durabilityLabel(row))
@@ -263,6 +325,8 @@ func RenderReport(results *Results) string {
 				self = "-"
 			}
 			line += fmt.Sprintf(" %s | %s | %s | %s | %s | %s |", seconds(row.Wall), seconds(row.CPU), mebibytes(row.RSS), self, self, self)
+		case row.Tool == ToolEngine || !hasReference:
+			line += fmt.Sprintf(" %s | %s | %s | - | - | - |", seconds(row.Wall), seconds(row.CPU), mebibytes(row.RSS))
 		case reference.DNF != "":
 			line += fmt.Sprintf(" %s | %s | %s | - | - | - |", seconds(row.Wall), seconds(row.CPU), mebibytes(row.RSS))
 		default:
@@ -288,6 +352,7 @@ func RenderReport(results *Results) string {
 			writeDNFDetail(&b, rows, group, configs[row.Config])
 			writeIdentityDetail(&b, results, row.Config, row.Op)
 			writeIOCounts(&b, results, row.Config, row.Op)
+			writeDiskWork(&b, rows, group)
 		}
 	}
 	if len(results.EnginePerfRuns) > 0 {
@@ -446,4 +511,45 @@ func short(digest string) string {
 		return digest[:16]
 	}
 	return digest
+}
+
+// writeDiskWork tabulates the engine's disk-work counters and the NFS
+// client's operation counts for one configuration and operation, when any
+// row carried them.
+func writeDiskWork(b *strings.Builder, rows []Row, group string) {
+	var selected []Row
+	for _, row := range rows {
+		if row.Config+"/"+row.Op == group && (row.HasEngine || row.HasNFS) {
+			selected = append(selected, row)
+		}
+	}
+	if len(selected) == 0 {
+		return
+	}
+	fmt.Fprintln(b, "Disk work per run (medians [min–max]). Engine: par3-rs ExecutionDiagnostics (engine rows only; clones are reflink copies, which write no bytes). NFS: client mountstats deltas over the run (NFS targets only); meta = every op but READ/WRITE/COMMIT; wire MiB = bytes the client read from / wrote to the server. Load = 1-minute load average before the run.")
+	fmt.Fprintln(b)
+	fmt.Fprintln(b, "| variant | eng read MiB | eng reads | eng write MiB | eng writes | clones | opens | fsyncs | fsync s | NFS READ | NFS WRITE | NFS COMMIT | NFS meta | NFS ops | wire read MiB | wire write MiB | load |")
+	fmt.Fprintln(b, "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+	for _, row := range selected {
+		engine := "| - | - | - | - | - | - | - | - |"
+		if row.HasEngine {
+			engine = fmt.Sprintf("| %s | %s | %s | %s | %s | %s | %s | %s |", mebibytes(row.EngineReadBytes), count(row.EngineReadCalls),
+				mebibytes(row.EngineWriteBytes), count(row.EngineWriteCalls), count(row.EngineClones), count(row.EngineOpens), count(row.EngineSyncs),
+				seconds(row.EngineSyncSeconds))
+		}
+		nfs := " - | - | - | - | - | - | - |"
+		if row.HasNFS {
+			nfs = fmt.Sprintf(" %s | %s | %s | %s | %s | %s | %s |", count(row.NFSRead), count(row.NFSWrite), count(row.NFSCommit),
+				count(row.NFSMeta), count(row.NFSAll), mebibytes(row.NFSServerReadBytes), mebibytes(row.NFSServerWriteBytes))
+		}
+		fmt.Fprintf(b, "| %s %s%s %s |\n", row.Variant, engine, nfs, loadText(row.Load))
+	}
+	fmt.Fprintln(b)
+}
+
+func loadText(s Stat) string {
+	if s.N == 0 || s.Max == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%.1f [%.1f–%.1f]", s.Median, s.Min, s.Max)
 }

@@ -67,6 +67,11 @@ impl std::fmt::Debug for PayloadRef {
 }
 
 impl PayloadRef {
+    /// Whether this payload is read from `source` of `access`.
+    pub(crate) fn reads_from(&self, access: &Arc<dyn SourceAccess>, source: SourceId) -> bool {
+        Arc::ptr_eq(&self.access, access) && self.source == source
+    }
+
     pub(crate) fn same_binding(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.access, &other.access)
             && self.source == other.source
@@ -155,15 +160,33 @@ impl PayloadRef {
         &self,
         options: &ExecutionOptions,
     ) -> Result<(), (EngineError, bool)> {
-        let spent = |error: EngineError| (error, false);
-        options.validate().map_err(spent)?;
-        ensure_snapshot(self.access.as_ref(), self.source, self.snapshot).map_err(spent)?;
+        options.validate().map_err(|error| (error, false))?;
         let size = options.stripe_bytes.min(64 << 10);
         let _buffer_reservation = options
             .memory
             .reserve_as(MemoryCategory::CarrierPackets, size)
-            .map_err(spent)?;
-        let mut buffer = vec![0; size];
+            .map_err(|error| (error, false))?;
+        self.reauthenticate_in(options, &mut vec![0; size])
+    }
+
+    /// [`Self::reauthenticate`] through a buffer the caller already holds, so
+    /// a codec whose stripes took the budget can still authenticate a payload
+    /// before it uses it. The packet is read in `buffer`-sized pieces, and
+    /// `buffer` holds nothing useful afterwards.
+    pub(crate) fn reauthenticate_in(
+        &self,
+        options: &ExecutionOptions,
+        buffer: &mut [u8],
+    ) -> Result<(), (EngineError, bool)> {
+        let spent = |error: EngineError| (error, false);
+        options.validate().map_err(spent)?;
+        ensure_snapshot(self.access.as_ref(), self.source, self.snapshot).map_err(spent)?;
+        if buffer.is_empty() {
+            return Err(spent(EngineError::InvalidState(
+                "empty reauthentication buffer",
+            )));
+        }
+        let size = buffer.len();
         let mut hash = FingerprintHasher::new();
         let mut offset = 24;
         while offset < self.header.length {
@@ -183,6 +206,74 @@ impl PayloadRef {
         // Everything from here on has cost a full pass over the packet.
         ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)
             .map_err(|error| (error, true))?;
+        if hash.finalize() != self.header.hash {
+            return Err((
+                Par3Error::PacketHashMismatch {
+                    offset: self.packet_offset,
+                }
+                .into(),
+                true,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Read the whole payload into the front of `out`, zero the rest, and
+    /// authenticate the packet over the bytes just read: one read in place of
+    /// [`Self::reauthenticate`] followed by [`Self::read_at`].
+    ///
+    /// The packet's header and the identity fields ahead of its payload were
+    /// authenticated when it was admitted and are held here; only the payload
+    /// is read again, and the hash over the two is the packet's own. The bytes
+    /// in `out` are the ones the hash vouched for, so a caller that consumes
+    /// them only after this returns `Ok` never uses an unverified byte. `out`
+    /// must be at least [`Self::len`] bytes; what it holds after an error is
+    /// unspecified. The error carries whether a whole pass was spent, as
+    /// [`Self::reauthenticate`]'s does.
+    pub(crate) fn read_authenticated(
+        &self,
+        options: &ExecutionOptions,
+        out: &mut [u8],
+    ) -> Result<(), (EngineError, bool)> {
+        let spent = |error: EngineError| (error, false);
+        options.validate().map_err(spent)?;
+        let len = usize::try_from(self.len())
+            .ok()
+            .filter(|len| *len <= out.len())
+            .ok_or_else(|| spent(EngineError::InvalidState("payload wider than its buffer")))?;
+        ensure_snapshot(self.access.as_ref(), self.source, self.snapshot).map_err(spent)?;
+        out[len..].fill(0);
+        if len != 0 {
+            read_exact_at(
+                &options.diagnostics,
+                self.access.as_ref(),
+                self.source,
+                self.data_offset,
+                &mut out[..len],
+            )
+            .map_err(spent)?;
+        }
+        // From here on the payload has been read, as a reauthentication would
+        // have read it.
+        ensure_snapshot(self.access.as_ref(), self.source, self.snapshot)
+            .map_err(|error| (error, true))?;
+        let mut hash = FingerprintHasher::new();
+        hash.update(&self.header.length.to_le_bytes());
+        hash.update(self.header.input_set_id.as_bytes());
+        hash.update(&self.header.packet_type.signature());
+        match self.kind {
+            PayloadKind::Data { index } => hash.update(&index.to_le_bytes()),
+            PayloadKind::Recovery {
+                root,
+                matrix,
+                index,
+            } => {
+                hash.update(&root);
+                hash.update(&matrix);
+                hash.update(&index.to_le_bytes());
+            }
+        }
+        hash.update(&out[..len]);
         if hash.finalize() != self.header.hash {
             return Err((
                 Par3Error::PacketHashMismatch {
@@ -450,6 +541,9 @@ pub enum ScanEvent {
 
 struct ScanReadAhead {
     bytes: Vec<u8>,
+    /// The scanner's stripe: the least scanning work one fill is charged,
+    /// and the most a fill asks for once the work budget cannot cover more.
+    unit: usize,
     offset: u64,
     len: usize,
     /// Bytes have been read from the source since its generation was last
@@ -470,10 +564,18 @@ impl ScanReadAhead {
         if offset < self.offset || offset - self.offset >= self.len as u64 {
             self.len = 0;
             self.unchecked = true;
-            let take = source_len
+            let mut take = source_len
                 .saturating_sub(offset)
                 .min(self.bytes.len() as u64) as usize;
-            options.scan_work.charge(take)?;
+            // A fill is charged what it asks for, and handed back what a
+            // short read did not return beyond one stripe: a whole scan
+            // costs its bytes and an empty poll a stripe, whatever the
+            // read-ahead's size. A budget too low for a full fill still
+            // admits a stripe, as a stripe-sized read-ahead would.
+            if take <= self.unit || options.scan_work.charge(take).is_err() {
+                take = take.min(self.unit);
+                options.scan_work.charge(take)?;
+            }
             let read =
                 options
                     .diagnostics
@@ -481,6 +583,9 @@ impl ScanReadAhead {
             if read > take {
                 return Err(EngineError::InvalidState("invalid source read length"));
             }
+            options
+                .scan_work
+                .refund(take - read.max(self.unit).min(take));
             self.offset = offset;
             self.len = read;
         }
@@ -619,6 +724,17 @@ impl<'k, W: std::io::Write> AuthenticatingWriter<'k, W> {
 
     pub(crate) fn get_ref(&self) -> &W {
         &self.inner
+    }
+
+    /// The writer underneath, once every packet has been checked.
+    pub(crate) fn into_inner(self) -> W {
+        self.inner
+    }
+
+    /// The writer underneath, for bytes outside any packet. They are neither
+    /// authenticated nor counted toward [`Self::finish`].
+    pub(crate) fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
     }
 
     /// Require exactly `expected` bytes written, every one inside an
@@ -809,12 +925,13 @@ impl<W: std::io::Write> std::io::Write for AuthenticatingWriter<'_, W> {
 /// arrivals. A hole returns `NeedData`; use `seek` to scan a later available
 /// range and a separate scanner to revisit the hole later. Neither operation
 /// assumes that holes contain zero bytes.
-/// A budgeted read-ahead stripe reuses bytes across packet boundaries. Seeking
+/// A budgeted read-ahead reuses bytes across packet boundaries. Seeking
 /// discards it. The source generation is checked before any packet, end or
 /// missing-byte boundary is returned, unless no byte has been read since the
 /// last check, so packets parsed from bytes already confirmed cost no further
-/// check. The scanner
-/// reserves two stripes of at most 64 KiB each. A provider may also pin a
+/// check. The scanner reserves a stripe of at most 64 KiB and a read-ahead of
+/// at most a mebibyte, no larger than the source; a budget without room for
+/// that read-ahead gets a stripe-sized one. A provider may also pin a
 /// budgeted handle for the scanner and its authenticated packets' lifetime.
 pub struct PacketScanner {
     access: Arc<dyn SourceAccess>,
@@ -851,9 +968,30 @@ impl PacketScanner {
             offset: 0,
         })?;
         let size = options.stripe_bytes.clamp(HEADER_SIZE, 64 << 10);
-        let reservation = options
+        // The read-ahead is the scan's read size, sized for the source
+        // rather than the stripe, so that a carrier on a network mount is
+        // not fetched in small requests. A budget without room for it scans
+        // with a stripe-sized one instead.
+        let ahead = crate::source::sequential_read_bytes(&options, snapshot.len).max(size);
+        let wide = match options
             .memory
-            .reserve_as(MemoryCategory::CarrierPackets, size * 2)?;
+            .reserve_as(MemoryCategory::CarrierPackets, size + ahead)
+        {
+            Ok(reservation) if ahead == size || options.memory.available() >= 128 << 10 => {
+                Some(reservation)
+            }
+            Ok(_) | Err(EngineError::ResourceLimit(_)) => None,
+            Err(error) => return Err(error),
+        };
+        let (reservation, ahead) = match wide {
+            Some(reservation) => (reservation, ahead),
+            None => (
+                options
+                    .memory
+                    .reserve_as(MemoryCategory::CarrierPackets, size * 2)?,
+                size,
+            ),
+        };
         Ok(Self {
             access,
             source,
@@ -868,7 +1006,8 @@ impl PacketScanner {
             packets: 0,
             buffer: vec![0; size],
             read_ahead: ScanReadAhead {
-                bytes: vec![0; size],
+                bytes: vec![0; ahead],
+                unit: size,
                 offset: 0,
                 len: 0,
                 unchecked: false,
@@ -1419,7 +1558,38 @@ impl IncrementalSet {
         payload: &PayloadRef,
         options: &ExecutionOptions,
     ) -> EngineResult<()> {
-        match payload.reauthenticate(options) {
+        self.charge(payload, payload.reauthenticate(options))
+    }
+
+    /// [`Self::validate_payload`] through a buffer the caller already holds:
+    /// see [`PayloadRef::reauthenticate_in`].
+    pub(crate) fn validate_payload_in(
+        &self,
+        payload: &PayloadRef,
+        options: &ExecutionOptions,
+        buffer: &mut [u8],
+    ) -> EngineResult<()> {
+        self.charge(payload, payload.reauthenticate_in(options, buffer))
+    }
+
+    /// [`Self::validate_payload`] fused with the read that consumes the
+    /// payload: see [`PayloadRef::read_authenticated`]. A failure is charged
+    /// exactly as a failed reauthentication is.
+    pub(crate) fn read_payload(
+        &self,
+        payload: &PayloadRef,
+        options: &ExecutionOptions,
+        out: &mut [u8],
+    ) -> EngineResult<()> {
+        self.charge(payload, payload.read_authenticated(options, out))
+    }
+
+    fn charge(
+        &self,
+        payload: &PayloadRef,
+        checked: Result<(), (EngineError, bool)>,
+    ) -> EngineResult<()> {
+        match checked {
             Ok(()) => Ok(()),
             Err((error, spent)) => {
                 // A pass was spent whenever the packet was read and hashed

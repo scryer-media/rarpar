@@ -1284,10 +1284,15 @@ impl Par3RepairSession {
     }
 
     /// Reconstruct damaged files into an explicitly selected output directory.
-    /// Sources remain read-only; a staged output is installed only after every
-    /// protected extent matches its authenticated checksum (and, when it is
-    /// read back, the whole-file fingerprint too). Each staged output is
-    /// synchronized before installation; see [`Self::repair_with_durability`].
+    /// A staged output is installed only after every protected extent matches
+    /// its authenticated checksum (and, when it is read back, the whole-file
+    /// fingerprint too). Each staged output is synchronized before
+    /// installation; see [`Self::repair_with_durability`]. Sources are only
+    /// read, except that on macOS and Linux, with `backup` off and no clone
+    /// available, a damaged file whose destination is that very file (single
+    /// link, handed over by its registry, read by nothing else in the repair)
+    /// is patched in place: only its damaged extents are written, and it is
+    /// then read back whole before it is reported repaired.
     pub fn repair(
         &mut self,
         output: &Path,

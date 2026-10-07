@@ -231,6 +231,12 @@ func fullProfile() Profile {
 				Damage: spread("lost-2000x32k", []int{0}, 2000),
 				Note:   "set C oversized: 1.5 GiB, 32 KiB blocks (49152 + 4916 blocks)",
 			},
+			{
+				ID: "c-fft", Dataset: "c", BlockSize: 32 * KiB, Recovery: 4916,
+				Codec: "fft", ExpectedField: "fft-gf16",
+				Damage: spread("lost-2000x32k", []int{0}, 2000),
+				Note:   "set C with the FFT codec on both sides (reference -e8, one cohort, capacity 8192): the reference's Cauchy is quadratic at this block count",
+			},
 		},
 	}
 	profile.Configs = append(profile.Configs, smoke.Configs...)

@@ -28,6 +28,8 @@ use par3_rs::session::{Par3RepairSession, RepairStatus};
 use par3_rs::source::{DiskSourceAccess, SourceAccess, SourceId};
 use par3_rs::{Fingerprint, InputSetId, Par3Error, Par3Set, ScanLimits};
 
+mod inside;
+
 const RET_SUCCESS: u8 = 0;
 const RET_INVALID_COMMAND: u8 = 3;
 const RET_INSUFFICIENT_DATA: u8 = 4;
@@ -920,11 +922,6 @@ fn refuse_unsupported(invocation: &Invocation) -> Result<(), Failure> {
                 "rarpar does not write PAR3 data into, or remove it from, a ZIP or 7z file (i, ti and d are not supported).",
             );
         }
-        _ if invocation.self_target => {
-            return refuse(
-                "rarpar cannot verify or repair PAR3 data inside a ZIP or 7z file (vs and rs are not supported).",
-            );
-        }
         _ => {}
     }
     // par3cmdline accepts these with any command; they only shape creation.
@@ -1301,6 +1298,86 @@ fn tree_order(set: &Par3Set) -> (Vec<usize>, Vec<usize>) {
     (file_order, directory_order)
 }
 
+/// What par3cmdline prints from the Creator, Comment and Start packets before
+/// it finds that the set's tree is incomplete. Returns whether a Root packet
+/// was found (so a File or Directory packet is what is missing).
+fn print_partial_header(packets: &[IngestedPacket], noise: i32) -> bool {
+    let root = packets
+        .iter()
+        .filter_map(IngestedPacket::metadata)
+        .find_map(|packet| match packet.body() {
+            par3_rs::PacketBody::Root(root) => Some(root.clone()),
+            _ => None,
+        });
+    if noise < 0 {
+        return root.is_some();
+    }
+    let bodies = || {
+        packets
+            .iter()
+            .filter_map(IngestedPacket::metadata)
+            .map(par3_rs::Packet::body)
+    };
+    if let Some(text) = bodies().find_map(|body| match body {
+        par3_rs::PacketBody::Creator(creator) => Some(creator.text().into_owned()),
+        _ => None,
+    }) {
+        println!();
+        println!("Creator text:");
+        println!("{}", text.trim_end_matches([' ', '\n', '\r', '\t']));
+    }
+    if let Some(text) = bodies().find_map(|body| match body {
+        par3_rs::PacketBody::Comment(comment) => Some(comment.text().into_owned()),
+        _ => None,
+    }) {
+        let text = text.trim_end_matches([' ', '\n', '\r', '\t']);
+        println!();
+        if text.contains('\n') {
+            println!("Comment text:");
+            println!("{text}");
+        } else {
+            println!("Comment text: {text}");
+        }
+    }
+    let start = bodies().find_map(|body| match body {
+        par3_rs::PacketBody::Start(start) => Some((start.block_size, start.galois_field)),
+        _ => None,
+    });
+    let (block_size, size, generator) = start.map_or((0, 0, 0), |(block_size, field)| {
+        let generator = if field.size == 0 {
+            0
+        } else {
+            field.generator | (1 << (u64::from(field.size) * 8))
+        };
+        (block_size, field.size, generator)
+    });
+    println!();
+    println!("Block size = {block_size}");
+    if noise >= 1 {
+        println!("Galois field size = {size}");
+        println!("Galois field generator = 0x{generator:X}");
+    }
+    if let Some(root) = &root {
+        println!("Block count = {}", root.lowest_unused_block_index);
+        println!("Root attribute = {}", root.attributes);
+    }
+    root.is_some()
+}
+
+/// par3cmdline's 16-bit Cauchy decoder announces its matrix solve; the 8-bit
+/// one solves silently.
+fn print_matrix_solve(set: &Par3Set, started: Instant) {
+    let cauchy = matches!(
+        set.matrix_packets().first().map(|packet| packet.body()),
+        Some(par3_rs::PacketBody::CauchyMatrix(_))
+    );
+    if cauchy && set.galois_field().size == 2 {
+        println!();
+        println!("Computing Reed Solomon matrix:");
+        println!("done in {:.1} seconds.", started.elapsed().as_secs_f64());
+    }
+}
+
 fn print_header(set: &Par3Set, file_order: &[usize], noise: i32, block_map: bool) {
     if noise < 0 {
         return;
@@ -1551,10 +1628,12 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
     let set = match incremental.metadata() {
         Ok(Some(set)) => set,
         Ok(None) => {
-            return Err(
-                Failure::new(RET_INSUFFICIENT_DATA, "There is no Root Packet.")
-                    .with_trailer(trailer),
-            );
+            let message = if print_partial_header(&packets, noise) {
+                "File Packet or Directory Packet is missing."
+            } else {
+                "There is no Root Packet."
+            };
+            return Err(Failure::new(RET_INSUFFICIENT_DATA, message).with_trailer(trailer));
         }
         Err(error) => return Err(engine_failure(error, trailer)),
     };
@@ -1691,6 +1770,18 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
         .map(|need| (need.additional, need.cohorts))
         .collect();
 
+    // Files with unprotected chunks ("PAR inside") are judged by their
+    // protected chunks alone, as par3cmdline judges them.
+    let layout = session.layout().map_err(session_failure)?;
+    let embedded_layout = |name: &str| {
+        layout
+            .as_ref()
+            .and_then(|layout| layout.files().iter().find(|file| file.path == name))
+            .filter(|file| inside::has_unprotected(file))
+            .cloned()
+    };
+    let mut embedded: BTreeMap<String, Vec<std::ops::Range<u64>>> = BTreeMap::new();
+
     if noise >= 0 {
         println!();
         println!("Verifying input files:");
@@ -1704,6 +1795,24 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
             Err(_) => FileState::Missing,
             Ok(meta) if !meta.is_file() => FileState::NotFile,
             Ok(meta) if meta.len() == 0 && file.size() == 0 => FileState::Found,
+            Ok(meta) if embedded_layout(file.path()).is_some() => {
+                let size = meta.len();
+                let unresolved = assessed
+                    .get(file.path())
+                    .map(|(_, unresolved)| unresolved.as_slice())
+                    .unwrap_or_default();
+                let layout = embedded_layout(file.path()).expect("checked above");
+                let standing = inside::assess(&layout, unresolved, size);
+                embedded.insert(file.path().to_owned(), standing.found);
+                if standing.complete {
+                    FileState::Complete
+                } else {
+                    FileState::Damaged {
+                        available: standing.available,
+                        size,
+                    }
+                }
+            }
             Ok(meta) => {
                 let size = meta.len();
                 match assessed.get(file.path()) {
@@ -1731,6 +1840,9 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
                 FileState::Missing => println!("Target: \"{}\" - missing.", file.path()),
                 FileState::NotFile => println!("Target: \"{}\" - not file.", file.path()),
                 FileState::Found => println!("Target: \"{}\" - found.", file.path()),
+                FileState::Complete if embedded.contains_key(file.path()) => {
+                    println!("Target: \"{}\" - protected data is complete.", file.path())
+                }
                 FileState::Complete => println!("Target: \"{}\" - complete.", file.path()),
                 FileState::Damaged { available, size } => println!(
                     "Target: \"{}\" - damaged. {available} of {size} bytes available.",
@@ -1749,9 +1861,10 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
         .iter()
         .filter(|(_, state)| matches!(state, FileState::Damaged { .. }))
         .count();
+    // Bytes outside the protected chunks never make a repair necessary.
     if missing_directories.is_empty()
         && missing_files + damaged_files == 0
-        && status == RepairStatus::Complete
+        && (status == RepairStatus::Complete || !embedded.is_empty())
     {
         if noise >= -1 {
             println!();
@@ -1789,7 +1902,9 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
         if missing_files + damaged_files > 0 {
             println!("You have {available} out of {block_count} input blocks available.");
         }
-        if recovery_blocks > 0 || lost_blocks > 0 {
+        // par3cmdline reports the count for each Matrix packet it holds,
+        // once it holds any Recovery Data packet.
+        if !set.matrix_packets().is_empty() && recovery_blocks > 0 {
             let codes = match set.matrix_packets().first().map(|packet| packet.body()) {
                 Some(par3_rs::PacketBody::FftMatrix(_)) => "FFT based Reed-Solomon Codes",
                 _ => "Cauchy Reed-Solomon Codes",
@@ -1850,19 +1965,54 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
     let mut repaired = Vec::new();
     if status == RepairStatus::Ready {
         let started = Instant::now();
-        let report = session.repair(base, true).map_err(session_failure)?;
-        if noise >= 0 && lost_blocks > 0 {
-            println!();
-            println!("Recovering lost input blocks:");
-            println!("done in {:.1} seconds.", started.elapsed().as_secs_f64());
-        }
-        for installed in report.installed {
-            let name = destinations
-                .iter()
-                .find(|(_, path)| **path == installed.path)
-                .map(|(name, _)| name.clone())
-                .unwrap_or_else(|| installed.path.to_string_lossy().into_owned());
-            repaired.push(name);
+        let self_repair = match set.files() {
+            [file] if invocation.self_target && embedded.contains_key(file.path()) => {
+                Some(file.path().to_owned())
+            }
+            _ => None,
+        };
+        if let Some(name) = self_repair {
+            let layout = embedded_layout(&name).expect("embedded file layout");
+            let matrix = set
+                .matrix_packets()
+                .first()
+                .map(par3_rs::Packet::hash)
+                .ok_or_else(|| Failure::new(RET_LOGIC_ERROR, "There is no Matrix Packet."))?;
+            let installed = inside::self_repair(
+                &mut session,
+                base,
+                &destinations[&name],
+                id,
+                matrix,
+                &layout,
+                &embedded[&name],
+            )
+            .map_err(session_failure)?;
+            if noise >= 0 && lost_blocks > 0 {
+                print_matrix_solve(&set, started);
+                println!();
+                println!("Recovering lost input blocks:");
+                println!("done in {:.1} seconds.", started.elapsed().as_secs_f64());
+            }
+            if installed {
+                repaired.push(name);
+            }
+        } else {
+            let report = session.repair(base, true).map_err(session_failure)?;
+            if noise >= 0 && lost_blocks > 0 {
+                print_matrix_solve(&set, started);
+                println!();
+                println!("Recovering lost input blocks:");
+                println!("done in {:.1} seconds.", started.elapsed().as_secs_f64());
+            }
+            for installed in report.installed {
+                let name = destinations
+                    .iter()
+                    .find(|(_, path)| **path == installed.path)
+                    .map(|(name, _)| name.clone())
+                    .unwrap_or_else(|| installed.path.to_string_lossy().into_owned());
+                repaired.push(name);
+            }
         }
     }
     if noise >= 0 {
@@ -1874,7 +2024,11 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
                 let fixed = repaired.contains(name);
                 println!(
                     "Target: \"{name}\" - {}.",
-                    if fixed { "repaired" } else { "failed" }
+                    match (fixed, embedded.contains_key(name)) {
+                        (false, _) => "failed",
+                        (true, true) => "protected data was repaired",
+                        (true, false) => "repaired",
+                    }
                 );
             }
         }

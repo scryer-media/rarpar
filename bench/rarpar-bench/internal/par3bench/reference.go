@@ -125,7 +125,10 @@ func BuildReference(ctx context.Context, options ReferenceBuildOptions) (Referen
 		GOOS: runtime.GOOS, GOARCH: runtime.GOARCH,
 	}
 	configure := []string{"-D", "CMAKE_BUILD_TYPE=Release", "-S", filepath.Join(srcRoot, "src"), "-B", buildDir}
-	if runtime.GOOS == "darwin" {
+	// The port patch is also what builds the reference on Linux arm64: it
+	// keeps upstream's x86-only SIMD flags off non-x86 CPUs, and its Darwin
+	// hunks are guarded, so the Linux code paths are unchanged.
+	if portPatchApplies(runtime.GOOS, runtime.GOARCH) {
 		if !strings.Contains(generator.URL, macOSPatchCommit) {
 			return ReferenceBuild{}, fmt.Errorf("the macOS port patch is for par3cmdline %s; the lock pins %s — refresh the patch with the pin", macOSPatchCommit, generator.URL)
 		}
@@ -139,7 +142,7 @@ func BuildReference(ctx context.Context, options ReferenceBuildOptions) (Referen
 		sum := sha256.Sum256(macOSPatch)
 		build.Patch = filepath.Base(patchPath)
 		build.PatchSHA256 = hex.EncodeToString(sum[:])
-		options.logf("applied the bench-only macOS port patch (sha256 %s)", build.PatchSHA256)
+		options.logf("applied the bench-only port patch (sha256 %s)", build.PatchSHA256)
 		if runtime.GOARCH == "arm64" {
 			include := filepath.Join(srcRoot, "inc")
 			if err := fetchPinned(ctx, sse2neon.URL, sse2neon.SHA256, sse2neon.BLAKE3, filepath.Join(include, "sse2neon", "sse2neon.h")); err != nil {
@@ -168,6 +171,12 @@ func BuildReference(ctx context.Context, options ReferenceBuildOptions) (Referen
 		return ReferenceBuild{}, err
 	}
 	return build, nil
+}
+
+// portPatchApplies reports whether the bench-only port patch is applied:
+// on macOS, and on Linux arm64, where upstream's x86 compile flags fail.
+func portPatchApplies(goos, goarch string) bool {
+	return goos == "darwin" || (goos == "linux" && goarch == "arm64")
 }
 
 // findReferenceBinary handles single-config generators (build/par3cmd/par3)

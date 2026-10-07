@@ -848,6 +848,192 @@ impl CreationPlan {
         Ok(packet_bytes)
     }
 
+    /// Assemble one embedded file per host from its body view and an optional
+    /// tail view, planned in that order as `SourceId(2k)` and `SourceId(2k+1)`.
+    /// Each file becomes `body, gap, tail`: the gap is one unprotected chunk
+    /// holding a format prefix of `prefix(carrier)` bytes and then host `k`'s
+    /// carrier, which is the whole metadata and `counts[k]` recovery packets,
+    /// taken in host order from one contiguous recovery range. The file
+    /// fingerprint covers the body and the tail, so it is the fingerprint of
+    /// the host as it was before insertion. Returns each host's gap as
+    /// `(prefix, carrier)` lengths.
+    pub(crate) fn embedded_set_layout(
+        &mut self,
+        tails: &[bool],
+        counts: &[u64],
+        prefix: &dyn Fn(u64) -> u64,
+    ) -> EngineResult<Vec<(u64, u64)>> {
+        if self.options.codec != CreationCodec::Cauchy
+            || self.options.store_data
+            || tails.len() != counts.len()
+            || tails.is_empty()
+            || counts.iter().sum::<u64>() != self.options.recovery_count
+            || self.options.recovery_count == 0
+        {
+            return Err(EngineError::Unsupported("embedded creation geometry"));
+        }
+        let mut views: BTreeMap<SourceId, PlannedFile> = std::mem::take(&mut self.files)
+            .into_iter()
+            .map(|file| (file.source, file))
+            .collect();
+        let mut tail_views = Vec::new();
+        for (host, &tail) in tails.iter().enumerate() {
+            let mut file = views
+                .remove(&SourceId(2 * host as u64))
+                .ok_or(EngineError::InvalidState("embedded source views"))?;
+            let tail = if tail {
+                Some(
+                    views
+                        .remove(&SourceId(2 * host as u64 + 1))
+                        .ok_or(EngineError::InvalidState("embedded source views"))?,
+                )
+            } else {
+                None
+            };
+            // The quick hash covers the first 16 KiB of the host, which is
+            // the body only when the body reaches that far.
+            if file.snapshot.len < 16 * 1024 {
+                file.packet.quick_rolling_hash = 0;
+            }
+            file.packet
+                .chunks
+                .push(ChunkDescription::Unprotected { length: 1 });
+            if let Some(tail) = &tail {
+                file.packet
+                    .chunks
+                    .extend(tail.packet.chunks.iter().cloned());
+            }
+            tail_views.push(tail);
+            self.files.push(file);
+        }
+        if !views.is_empty() {
+            return Err(EngineError::InvalidState("embedded source views"));
+        }
+        let size = self.options.execution.stripe_bytes.min(64 << 10);
+        let _memory = self
+            .options
+            .execution
+            .memory
+            .reserve_as(MemoryCategory::OutputStaging, size)?;
+        let mut buffer = vec![0; size];
+        for (file, tail) in self.files.iter_mut().zip(&tail_views) {
+            let Some(tail) = tail else { continue };
+            // The fingerprint of body and tail together needs the body again.
+            let mut hash = FingerprintHasher::new();
+            for (source, snapshot) in [(file.source, file.snapshot), (tail.source, tail.snapshot)] {
+                let mut at = 0;
+                while at < snapshot.len {
+                    self.options.execution.cancel.check()?;
+                    let take = (snapshot.len - at).min(size as u64) as usize;
+                    read_exact_at(
+                        &self.options.execution.diagnostics,
+                        self.access.as_ref(),
+                        source,
+                        at,
+                        &mut buffer[..take],
+                    )?;
+                    hash.update(&buffer[..take]);
+                    at += take as u64;
+                }
+                ensure_snapshot(self.access.as_ref(), source, snapshot)?;
+            }
+            file.packet.fingerprint = hash.finalize();
+        }
+        self.build_metadata()?;
+        let metadata_size = self.requirements.metadata_bytes;
+        let packet = self
+            .options
+            .block_size
+            .checked_add(88)
+            .ok_or(EngineError::resource_limit("embedded packet bytes"))?;
+        let mut gaps = Vec::with_capacity(counts.len());
+        for (file, &count) in self.files.iter_mut().zip(counts) {
+            let carrier = packet
+                .checked_mul(count)
+                .and_then(|bytes| bytes.checked_add(metadata_size))
+                .ok_or(EngineError::resource_limit("embedded packet bytes"))?;
+            let lead = prefix(carrier);
+            let gap = file
+                .packet
+                .chunks
+                .iter_mut()
+                .find(|chunk| matches!(chunk, ChunkDescription::Unprotected { .. }))
+                .expect("planned gap");
+            *gap = ChunkDescription::Unprotected {
+                length: lead
+                    .checked_add(carrier)
+                    .ok_or(EngineError::resource_limit("embedded gap"))?,
+            };
+            gaps.push((lead, carrier));
+        }
+        self.build_metadata()?;
+        if self.requirements.metadata_bytes != metadata_size {
+            return Err(EngineError::InvalidState(
+                "embedded metadata length changed",
+            ));
+        }
+        self.repeat_metadata = false;
+        self.volumes.clear();
+        self.data_volumes.clear();
+        self.requirements.output_sizes.clear();
+        let mut first = self.options.first_recovery;
+        for &count in counts {
+            self.volumes.push((first, count));
+            self.requirements
+                .output_sizes
+                .push(packet * count + metadata_size);
+            first += count;
+        }
+        self.requirements.source_bytes = self
+            .files
+            .iter()
+            .flat_map(|file| file.packet.chunks.iter())
+            .try_fold(0u64, |total, chunk| total.checked_add(chunk.length()))
+            .ok_or(EngineError::resource_limit("embedded file length"))?;
+        Ok(gaps)
+    }
+
+    /// Encode once and write host `k`'s carrier, its metadata and then its
+    /// recovery packets, to `outs[k]`, after `before(k)` has run. Sources are
+    /// checked as [`Self::execute`] checks them.
+    pub(crate) fn write_embedded_set<W: Write>(
+        &self,
+        outs: &mut [W],
+        scratch_directory: &Path,
+        mut before: impl FnMut(usize, &mut W) -> EngineResult<()>,
+        mut after: impl FnMut(usize, &mut W) -> EngineResult<()>,
+    ) -> EngineResult<()> {
+        let _progress = self
+            .options
+            .execution
+            .stage(crate::runtime::Stage::Create)?;
+        if self.volumes.len() != outs.len() || !self.data_volumes.is_empty() {
+            return Err(EngineError::InvalidState("embedded carrier layout"));
+        }
+        for file in &self.files {
+            ensure_snapshot(self.access.as_ref(), file.source, file.snapshot)?;
+        }
+        let mut spool = self.encode(scratch_directory)?;
+        for (index, out) in outs.iter_mut().enumerate() {
+            before(index, out)?;
+            self.write_output(index + 1, &mut spool, out)?;
+            after(index, out)?;
+        }
+        drop(spool);
+        for file in &self.files {
+            ensure_snapshot(self.access.as_ref(), file.source, file.snapshot)?;
+        }
+        Ok(())
+    }
+
+    /// Each embedded file's fingerprint, in host order.
+    pub(crate) fn embedded_fingerprints(&self) -> Vec<[u8; 16]> {
+        self.files
+            .iter()
+            .map(|file| file.packet.fingerprint)
+            .collect()
+    }
+
     /// Execute into explicit local output and scratch directories. Existing
     /// destinations are never replaced. Every carrier is staged and authenticated
     /// before installation; scratch storage is removed after success.

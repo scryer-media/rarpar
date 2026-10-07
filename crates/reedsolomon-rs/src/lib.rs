@@ -68,6 +68,9 @@ pub mod matrix_tiled;
 pub mod metal_gf16;
 pub mod rar3;
 pub mod rar5;
+/// SVE2 kernels behind the NEON tiers of `gf8` and `gf_simd`.
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+mod sve2;
 pub mod threading;
 /// Closed-form erasure solve for consecutive PAR2 recovery exponents.
 pub mod vandermonde_solve;

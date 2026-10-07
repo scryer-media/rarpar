@@ -355,35 +355,97 @@ impl TransformField {
         self.transform_lane(rows, Some(zero), origin, inverse, backend, cancelled)
     }
 
-    fn transform_lane<S: Lane>(
+    fn transform_lane<S: Lane, R: AsRef<[S]> + AsMut<[S]>>(
         &self,
-        rows: &mut [Vec<S>],
+        rows: &mut [R],
         zero: Option<&[bool]>,
         origin: usize,
         inverse: bool,
         backend: crate::gf_simd::LinearBackend,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), TransformError> {
+        self.transform_sum(
+            rows,
+            zero,
+            origin,
+            inverse,
+            backend,
+            None::<&mut [&mut [S]]>,
+            cancelled,
+        )
+    }
+
+    /// [`Self::transform_lane`], then, with `sum`, each row added into the
+    /// same row of `sum`: tile by tile where the transform tiles, so each
+    /// tile is added while it is still in the cache. Rows known zero after
+    /// the transform are not added. `sum` must hold as many rows, as wide.
+    #[allow(clippy::too_many_arguments)]
+    fn transform_sum<S: Lane, R: AsRef<[S]> + AsMut<[S]>, T: AsRef<[S]> + AsMut<[S]>>(
+        &self,
+        rows: &mut [R],
+        zero: Option<&[bool]>,
+        origin: usize,
+        inverse: bool,
+        backend: crate::gf_simd::LinearBackend,
+        mut sum: Option<&mut [T]>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError> {
         self.validate_transform(rows, zero, origin, cancelled)?;
+        validate_sum(rows, sum.as_deref())?;
         let n = rows.len();
-        let width = rows.first().map_or(0, Vec::len);
+        let width = rows.first().map_or(0, |row| row.as_ref().len());
         let schedule = Schedule {
             origin,
             inverse,
             backend,
             radix4: Self::fused(width, backend),
         };
-        // Whole rows, sweep by sweep: alone, the kernels are bound by their
-        // own work, not by the memory the rows stream through, so gathering
-        // them as the pooled transforms do would only add the copies. Each
-        // unit is made as its group comes and the flags are carried sweep to
-        // sweep; a slab walk keeps every sweep's units and flags, as it runs
-        // them all over each slab.
+        // A bank beyond a tile, on a target that tiles, runs tile by tile
+        // in place: every sweep of a pass over one tile while it stays in
+        // the cache; see `Walk`.
+        if let Some(walk) = Walk::engaged(n, width, size_of::<S>(), &schedule, 1) {
+            let flags = sweep_flags(n, zero, &schedule);
+            return self.transform_tiles_alone(
+                rows,
+                &schedule,
+                flags.as_deref(),
+                &walk,
+                sum,
+                cancelled,
+            );
+        }
+        let known = self.sweep_rows(rows, zero, &schedule, cancelled)?;
+        if let Some(sum) = &mut sum {
+            for (index, (to, from)) in sum.iter_mut().zip(rows.iter()).enumerate() {
+                if cancelled() {
+                    return Err(TransformError::Cancelled);
+                }
+                if !known.as_ref().is_some_and(|known| known[index]) {
+                    xor_into(to.as_mut(), from.as_ref());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The transform of `schedule` over whole rows, sweep by sweep, with
+    /// the known-zero flags after it. Each unit is made as its group comes
+    /// and the flags are carried sweep to sweep; a tiled transform keeps
+    /// every sweep's units and flags, as it runs them all over each tile.
+    fn sweep_rows<S: Lane, R: AsMut<[S]>>(
+        &self,
+        rows: &mut [R],
+        zero: Option<&[bool]>,
+        schedule: &Schedule,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<bool>>, TransformError> {
+        let n = rows.len();
+        let width = rows.first_mut().map_or(0, |row| row.as_mut().len());
         let mut known = zero.map(<[bool]>::to_vec);
-        for sweep in sweeps(n.trailing_zeros(), inverse, schedule.radix4) {
+        for sweep in sweeps(n.trailing_zeros(), schedule.inverse, schedule.radix4) {
             let units = FreshUnits {
                 field: self,
-                schedule: &schedule,
+                schedule,
                 sweep,
                 width,
             };
@@ -396,18 +458,19 @@ impl TransformField {
                 cancelled,
             )?;
             if let Some(known) = &mut known {
-                advance(known, sweep, origin, inverse, &mut |_| {});
+                advance(known, sweep, schedule.origin, schedule.inverse, &mut |_| {});
             }
         }
-        Ok(())
+        Ok(known)
     }
 
-    /// Bytes beyond the scratch that [`Self::transform_in_pool`] of `n`
-    /// rows `width` wide of `size`-byte symbols, `inverse` or forward with
-    /// `backend`, keeps on a pool of `threads` workers while it walks the
-    /// bank in slabs: the butterflies of every sweep, prepared once for all
-    /// the slabs, and the known-zero flags before each. None when it does
-    /// not walk; see [`walks`].
+    /// Bytes beside the rows that a transform of `n` rows `width` wide of
+    /// `size`-byte symbols, `inverse` or forward with `backend`, keeps on
+    /// `threads` workers (one for the calling thread alone) while it runs
+    /// the bank tile by tile: the butterflies of every sweep, prepared once
+    /// for all the tiles, the known-zero flags before each, and each
+    /// worker's list of the rows of its tile. None when it does not tile;
+    /// see [`walks`].
     pub fn walk_units_bytes(
         &self,
         n: usize,
@@ -417,19 +480,29 @@ impl TransformField {
         backend: crate::gf_simd::LinearBackend,
         threads: usize,
     ) -> usize {
-        if !walks(n, width, size, inverse, backend, threads) {
-            return 0;
-        }
         let schedule = Schedule {
             origin: 0,
             inverse,
             backend,
             radix4: Self::fused(width, backend),
         };
+        let threads = threads.max(1);
+        let Some(walk) = Walk::engaged(n, width, size, &schedule, threads) else {
+            return 0;
+        };
+        let views = walk
+            .passes
+            .iter()
+            .map(|(_, pass)| pass.rows)
+            .max()
+            .unwrap_or(0)
+            .saturating_mul(size_of::<&mut [u16]>())
+            .saturating_mul(threads);
         match size {
             1 => self.units_bytes::<u8>(n, &schedule),
             _ => self.units_bytes::<u16>(n, &schedule),
         }
+        .saturating_add(views)
     }
 
     /// Bytes [`Self::units`] of `schedule` over `n` rows take, with the
@@ -451,8 +524,8 @@ impl TransformField {
 
     /// The butterflies of every sweep of `schedule` over `n` rows `width`
     /// wide, prepared once and kept: their maps are what a sweep costs
-    /// beyond its rows, and a slab transform runs the same ones over every
-    /// slab.
+    /// beyond its rows, and a tiled transform runs the same ones over every
+    /// tile.
     fn units<S: Lane>(&self, n: usize, width: usize, schedule: &Schedule) -> Vec<KeptUnits<'_, S>> {
         self.units_of(
             n,
@@ -566,41 +639,81 @@ impl TransformField {
         Ok(())
     }
 
-    /// A pooled transform of a bank beyond the scratch: the workers share
-    /// the tasks of each pass of `walk`, every worker gathering its tasks'
-    /// rows into its own contiguous scratch; see [`Walk`] and
-    /// [`pass_tasks`]. A pass ends on every worker before the next begins.
-    fn transform_walk<S: Lane>(
+    /// [`Self::transform_tiles`] on the calling thread alone, tile after
+    /// tile.
+    fn transform_tiles_alone<S: Lane, R: AsMut<[S]>, T: AsMut<[S]>>(
         &self,
-        rows: &mut [Vec<S>],
+        rows: &mut [R],
+        schedule: &Schedule,
+        flags: Option<&[Vec<bool>]>,
+        walk: &Walk,
+        sum: Option<&mut [T]>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError> {
+        let units = self.units(rows.len(), walk.window, schedule);
+        let shared = SharedRows::of(rows);
+        let sum = sum.map(|sum| SharedRows::of(sum));
+        let after = flags.and_then(<[Vec<bool>]>::last);
+        let last = walk.passes.len() - 1;
+        for (index, (sweeps, pass)) in walk.passes.iter().enumerate() {
+            let flags = flags.map(|flags| &flags[sweeps.clone()]);
+            let sum = sum.as_ref().filter(|_| index == last);
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            tile_tasks(
+                &shared,
+                &next,
+                *pass,
+                None,
+                0,
+                |views, _, place, columns| {
+                    self.run_sweeps(views, &units[sweeps.clone()], flags, place, cancelled)?;
+                    if let Some(sum) = sum {
+                        add_tile(sum, views, place, columns, after);
+                    }
+                    Ok(())
+                },
+                cancelled,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// A pooled transform of a bank beyond a tile: the workers share the
+    /// tiles of each pass of `walk`, each running the pass's sweeps over its
+    /// tile in place; see [`Walk`] and [`tile_tasks`]. A pass ends on every
+    /// worker before the next begins. With `sum`, each tile of the last
+    /// pass is then added into the same columns of the same rows of `sum`,
+    /// rows still known zero after the last sweep skipped.
+    #[allow(clippy::too_many_arguments)]
+    fn transform_tiles<S: Lane, R: AsMut<[S]>, T: AsMut<[S]>>(
+        &self,
+        rows: &mut [R],
         schedule: &Schedule,
         flags: Option<&[Vec<bool>]>,
         walk: &Walk,
         pool: &rayon::ThreadPool,
+        sum: Option<&mut [T]>,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<(), TransformError> {
         let units = self.units(rows.len(), walk.window, schedule);
         let shared = SharedRows::of(rows);
-        for (sweeps, pass) in &walk.passes {
-            let flags = pass_flags(flags, sweeps);
-            let work = |rows: &mut [S], _: &mut [S], place, _: &std::ops::Range<usize>| {
-                let mut windows: Vec<&mut [S]> = rows.chunks_exact_mut(walk.window).collect();
-                self.run_sweeps(
-                    &mut windows,
-                    &units[sweeps.clone()],
-                    flags.0,
-                    place,
-                    cancelled,
-                )
+        let sum = sum.map(|sum| SharedRows::of(sum));
+        let after = flags.and_then(<[Vec<bool>]>::last);
+        let last = walk.passes.len() - 1;
+        for (index, (sweeps, pass)) in walk.passes.iter().enumerate() {
+            let flags = flags.map(|flags| &flags[sweeps.clone()]);
+            let sum = sum.as_ref().filter(|_| index == last);
+            let work = |views: &mut [&mut [S]], _: &mut [S], place: Place, columns: &_| {
+                self.run_sweeps(views, &units[sweeps.clone()], flags, place, cancelled)?;
+                if let Some(sum) = sum {
+                    add_tile(sum, views, place, columns, after);
+                }
+                Ok(())
             };
             let next = std::sync::atomic::AtomicUsize::new(0);
-            pool.broadcast(|_| {
-                pass_tasks(
-                    &shared, &next, *pass, None, flags.1, flags.2, 0, work, cancelled,
-                )
-            })
-            .into_iter()
-            .collect::<Result<(), TransformError>>()?;
+            pool.broadcast(|_| tile_tasks(&shared, &next, *pass, None, 0, work, cancelled))
+                .into_iter()
+                .collect::<Result<(), TransformError>>()?;
         }
         Ok(())
     }
@@ -627,27 +740,30 @@ impl TransformField {
     ///     derivative_high(inverse_high(X)))),   X = inverse_low(rows)
     /// ```
     ///
-    /// and that takes three passes, each holding a slab of a block or a
-    /// class in scratch of its own through every step it applies: blocks
-    /// (inverse low half, and for a block holding a row of `at` the whole
-    /// first term), classes (the inner part of the second term), then only
-    /// the blocks holding a row of `at` (its last half). The derivative never
-    /// leaves the scratch, and the bank is read and written once per pass,
-    /// instead of once per pass of each step and once per set bit of every
-    /// row index for the derivative. Every butterfly takes the factor and
-    /// order the separate steps take, and the arithmetic is exact, so `out`
-    /// holds exactly the rows the separate steps would leave.
+    /// and that takes three passes, each running a tile of a block or a
+    /// class, in place, through every step it applies: blocks (inverse low
+    /// half, and for a block holding a row of `at` the whole first term),
+    /// classes (the inner part of the second term), then only the blocks
+    /// holding a row of `at` (its last half). The derivative and what
+    /// follows it run in scratch as large as the tile, so it never reaches
+    /// the bank, and the bank is read and written once per pass, instead of
+    /// once per pass of each step and once per set bit of every row index
+    /// for the derivative. Every butterfly takes the factor and order the
+    /// separate steps take, and the arithmetic is exact, so `out` holds
+    /// exactly the rows the separate steps would leave.
     ///
-    /// With `pool` the workers share each pass's slabs, each gathering into
-    /// at most [`TRANSFORM_SCRATCH_BYTES`] of its own; without, the calling
-    /// thread walks them. A domain under 16 rows runs the separate steps.
+    /// With `pool` the workers share each pass's tiles, each taking scratch
+    /// of at most half [`TRANSFORM_TILE_BYTES`] of its own; without, the
+    /// calling thread runs them. A domain under 16 rows runs the separate
+    /// steps. Rows may be any equally wide slices of 16-bit words: `Vec`s,
+    /// or the rows of a [`RowBank`].
     #[allow(clippy::too_many_arguments)]
-    pub fn derivative_at(
+    pub fn derivative_at<R: AsRef<[u16]> + AsMut<[u16]>, O: AsRef<[u16]> + AsMut<[u16]>>(
         &self,
-        rows: &mut [Vec<u16>],
+        rows: &mut [R],
         zero: Option<&[bool]>,
         at: &[usize],
-        out: &mut [Vec<u16>],
+        out: &mut [O],
         backend: crate::gf_simd::LinearBackend,
         pool: Option<&rayon::ThreadPool>,
         cancelled: &(dyn Fn() -> bool + Sync),
@@ -658,12 +774,12 @@ impl TransformField {
     /// [`Self::derivative_at`] on byte rows of the 8-bit field. Any other
     /// field returns `Field`.
     #[allow(clippy::too_many_arguments)]
-    pub fn derivative_u8_at(
+    pub fn derivative_u8_at<R: AsRef<[u8]> + AsMut<[u8]>, O: AsRef<[u8]> + AsMut<[u8]>>(
         &self,
-        rows: &mut [Vec<u8>],
+        rows: &mut [R],
         zero: Option<&[bool]>,
         at: &[usize],
-        out: &mut [Vec<u8>],
+        out: &mut [O],
         backend: crate::gf_simd::LinearBackend,
         pool: Option<&rayon::ThreadPool>,
         cancelled: &(dyn Fn() -> bool + Sync),
@@ -675,8 +791,8 @@ impl TransformField {
     /// Bytes [`Self::derivative_at`] keeps beside the rows and `out` for `n`
     /// rows `width` wide of `size`-byte symbols with `backend` on `threads`
     /// workers (one without a pool): the butterflies of its sweeps, prepared
-    /// once, the known-zero and slab flags, the workers' scratch, and the
-    /// bookkeeping of the call and of each worker. A narrower width never
+    /// once, the known-zero and block flags, the workers' scratch and row
+    /// lists, and the bookkeeping of the call and of each worker. A narrower width never
     /// needs more. Zero where it runs the separate steps, including any
     /// `size` but 1 or 2.
     pub fn derivative_at_bytes(
@@ -740,13 +856,15 @@ impl TransformField {
             .saturating_mul(n)
             .saturating_add((sweeps + 1) * size_of::<Vec<bool>>())
             .saturating_add(2 * ((n >> split.low) + 1) * size_of::<usize>());
-        // Each worker's slab scratch, the list of its windows a task sweeps,
-        // and the pool's bookkeeping to hand it a pass; then the sweep lists
-        // and the rest of a call's own bookkeeping.
-        let worker = (2 * split.window)
+        // Each worker's scratch beside its tile, the lists of its tile's
+        // rows and of the scratch's, and the pool's bookkeeping to hand it a
+        // pass; then the sweep lists and the rest of a call's own
+        // bookkeeping.
+        let worker = split
+            .window
             .saturating_mul(split.group())
             .saturating_mul(size)
-            .saturating_add(split.group() * size_of::<&mut [u16]>())
+            .saturating_add(2 * split.group() * size_of::<&mut [u16]>())
             .saturating_add(DERIVATIVE_WORKER_BYTES);
         let call = 4 * sweeps * size_of::<Sweep>() + DERIVATIVE_CALL_BYTES;
         units(true)
@@ -775,21 +893,21 @@ impl TransformField {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn derivative_at_lane<S: Lane>(
+    fn derivative_at_lane<S: Lane, R: AsRef<[S]> + AsMut<[S]>, O: AsRef<[S]> + AsMut<[S]>>(
         &self,
-        rows: &mut [Vec<S>],
+        rows: &mut [R],
         zero: Option<&[bool]>,
         at: &[usize],
-        out: &mut [Vec<S>],
+        out: &mut [O],
         backend: crate::gf_simd::LinearBackend,
         pool: Option<&rayon::ThreadPool>,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<DerivativeWork, TransformError> {
         self.validate_transform(rows, zero, 0, cancelled)?;
         let n = rows.len();
-        let width = rows.first().map_or(0, Vec::len);
+        let width = rows.first().map_or(0, |row| row.as_ref().len());
         if out.len() != at.len()
-            || out.iter().any(|row| row.len() != width)
+            || out.iter().any(|row| row.as_ref().len() != width)
             || at.windows(2).any(|pair| pair[0] >= pair[1])
             || at.last().is_some_and(|&row| row >= n)
         {
@@ -802,7 +920,7 @@ impl TransformField {
             derivative_rows(rows, cancelled)?;
             self.transform_lane(rows, None, 0, false, backend, cancelled)?;
             for (out, &row) in out.iter_mut().zip(at) {
-                out.copy_from_slice(&rows[row]);
+                out.as_mut().copy_from_slice(rows[row].as_ref());
             }
             let full = (n as u64 / 2) * u64::from(levels);
             return Ok(DerivativeWork {
@@ -852,6 +970,10 @@ impl TransformField {
         });
         let low_flags = flags.as_deref().map(|flags| &flags[..=inverse_low.len()]);
         let high_flags = flags.as_deref().map(|flags| &flags[inverse_low.len()..]);
+        // Rows still known zero after each half of the inverse hold zero and
+        // are not read by the derivative.
+        let low_after = low_flags.and_then(<[Vec<bool>]>::last);
+        let high_after = high_flags.and_then(<[Vec<bool>]>::last);
         // The rows of `at` each block holds: slots `first[b]..first[b + 1]`.
         let mut first = vec![0usize; span + 1];
         for &row in at {
@@ -861,12 +983,11 @@ impl TransformField {
             first[b + 1] += first[b];
         }
         let kept: Vec<usize> = (0..span).filter(|&b| first[b] < first[b + 1]).collect();
-        // Rows a later pass never reads are not put back: outside the kept
-        // blocks after the classes, and every row after the last pass.
+        // Rows a later pass never reads are not stored: outside the kept
+        // blocks after the classes.
         let idle: Vec<bool> = (0..n)
             .map(|row| first[row >> low] == first[(row >> low) + 1])
             .collect();
-        let done = vec![true; n];
         let shared = SharedRows::of(rows);
         let results = SharedRows::of(out);
         fn windows<S>(rows: &mut [S], window: usize) -> Vec<&mut [S]> {
@@ -889,23 +1010,21 @@ impl TransformField {
             pool,
             blocks,
             None,
-            low_flags.map(|flags| flags[0].as_slice()),
-            low_flags.map(|flags| flags[inverse_low.len()].as_slice()),
             block * window,
-            |rows: &mut [S], spare: &mut [S], place: Place, columns: &std::ops::Range<usize>| {
-                self.run_sweeps(
-                    &mut windows(rows, window),
-                    &inverse_low_units,
-                    low_flags,
-                    place,
-                    cancelled,
-                )?;
+            |views: &mut [&mut [S]],
+             spare: &mut [S],
+             place: Place,
+             columns: &std::ops::Range<usize>| {
+                self.run_sweeps(views, &inverse_low_units, low_flags, place, cancelled)?;
                 if slots(place).next().is_none() {
                     return Ok(());
                 }
-                derivative_blocks(rows, spare, block, window, cancelled)?;
+                let w = columns.len();
+                let spare = &mut spare[..block * w];
+                let zero = |k: usize| low_after.is_some_and(|after| after[place.row(k)]);
+                derivative_views(views, spare, zero, cancelled)?;
                 self.run_sweeps(
-                    &mut windows(spare, window),
+                    &mut windows(spare, w),
                     &forward_low_units,
                     None,
                     place,
@@ -915,14 +1034,15 @@ impl TransformField {
                     // SAFETY: this task alone holds these columns of the
                     // result rows of its block.
                     unsafe { results.columns_mut(slot, columns) }
-                        .copy_from_slice(&spare[local * window..][..columns.len()]);
+                        .copy_from_slice(&spare[local * w..][..w]);
                 }
                 Ok(())
             },
             cancelled,
         )?;
-        // Classes: inverse high half, high-bit derivative and forward high
-        // half, all in scratch; put back only where a kept block reads it.
+        // Classes: inverse high half in place, then the high-bit derivative
+        // and forward high half in scratch; stored only where a kept block
+        // reads it.
         let classes = Pass {
             window,
             rows: span,
@@ -933,26 +1053,28 @@ impl TransformField {
             pool,
             classes,
             None,
-            high_flags.map(|flags| flags[0].as_slice()),
-            Some(&idle),
             span * window,
-            |rows: &mut [S], spare: &mut [S], place: Place, _: &std::ops::Range<usize>| {
+            |views: &mut [&mut [S]],
+             spare: &mut [S],
+             place: Place,
+             columns: &std::ops::Range<usize>| {
+                self.run_sweeps(views, &inverse_high_units, high_flags, place, cancelled)?;
+                let w = columns.len();
+                let spare = &mut spare[..span * w];
+                let zero = |k: usize| high_after.is_some_and(|after| after[place.row(k)]);
+                derivative_views(views, spare, zero, cancelled)?;
                 self.run_sweeps(
-                    &mut windows(rows, window),
-                    &inverse_high_units,
-                    high_flags,
-                    place,
-                    cancelled,
-                )?;
-                derivative_blocks(rows, spare, span, window, cancelled)?;
-                self.run_sweeps(
-                    &mut windows(spare, window),
+                    &mut windows(spare, w),
                     &forward_high_units,
                     None,
                     place,
                     cancelled,
                 )?;
-                rows.copy_from_slice(spare);
+                for (k, (view, from)) in views.iter_mut().zip(spare.chunks_exact(w)).enumerate() {
+                    if !idle[place.row(k)] {
+                        view.copy_from_slice(from);
+                    }
+                }
                 Ok(())
             },
             cancelled,
@@ -964,21 +1086,16 @@ impl TransformField {
             pool,
             blocks,
             Some(&kept),
-            None,
-            Some(&done),
             0,
-            |rows: &mut [S], _: &mut [S], place: Place, columns: &std::ops::Range<usize>| {
-                self.run_sweeps(
-                    &mut windows(rows, window),
-                    &forward_low_units,
-                    None,
-                    place,
-                    cancelled,
-                )?;
+            |views: &mut [&mut [S]],
+             _: &mut [S],
+             place: Place,
+             columns: &std::ops::Range<usize>| {
+                self.run_sweeps(views, &forward_low_units, None, place, cancelled)?;
                 for (slot, local) in slots(place) {
                     // SAFETY: as in the first pass.
                     let result = unsafe { results.columns_mut(slot, columns) };
-                    xor_into(result, &rows[local * window..][..columns.len()]);
+                    add_into(result, views[local]);
                 }
                 Ok(())
             },
@@ -992,8 +1109,8 @@ impl TransformField {
         })
     }
 
-    /// One pass of [`Self::derivative_at`]: its tasks shared by the pool's
-    /// workers, or walked by the calling thread; see [`pass_tasks`].
+    /// One pass of [`Self::derivative_at`]: its tiles shared by the pool's
+    /// workers, or run by the calling thread; see [`tile_tasks`].
     #[allow(clippy::too_many_arguments)]
     fn run_pass<S: Lane>(
         &self,
@@ -1001,19 +1118,18 @@ impl TransformField {
         pool: Option<&rayon::ThreadPool>,
         pass: Pass,
         groups: Option<&[usize]>,
-        before: Option<&[bool]>,
-        after: Option<&[bool]>,
         spare: usize,
-        work: impl Fn(&mut [S], &mut [S], Place, &std::ops::Range<usize>) -> Result<(), TransformError>
+        work: impl Fn(
+            &mut [&mut [S]],
+            &mut [S],
+            Place,
+            &std::ops::Range<usize>,
+        ) -> Result<(), TransformError>
         + Sync,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<(), TransformError> {
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let tasks = || {
-            pass_tasks(
-                shared, &next, pass, groups, before, after, spare, &work, cancelled,
-            )
-        };
+        let tasks = || tile_tasks(shared, &next, pass, groups, spare, &work, cancelled);
         match pool {
             Some(pool) if pool.current_num_threads() > 1 => {
                 pool.broadcast(|_| tasks()).into_iter().collect()
@@ -1022,16 +1138,187 @@ impl TransformField {
         }
     }
 
+    /// A transform of equally wide slices of 16-bit words: `Vec`s, or the
+    /// rows of a [`RowBank`]. `zero` flags rows known zero, as for
+    /// [`Self::transform_known_zero_with_backend`]; with `pool` it runs as
+    /// [`Self::transform_in_pool`] does, and without, on the calling thread
+    /// as [`Self::transform_with_backend`] does. A bank beyond
+    /// [`TRANSFORM_TILE_BYTES`] runs in column tiles on a target that
+    /// tiles; see [`walks`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn transform_rows<R: AsRef<[u16]> + AsMut<[u16]> + Send>(
+        &self,
+        rows: &mut [R],
+        zero: Option<&[bool]>,
+        origin: usize,
+        inverse: bool,
+        backend: crate::gf_simd::LinearBackend,
+        pool: Option<&rayon::ThreadPool>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError> {
+        self.transform_rows_lane(
+            rows,
+            zero,
+            origin,
+            inverse,
+            backend,
+            pool,
+            None::<&mut [&mut [u16]]>,
+            cancelled,
+        )
+    }
+
+    /// [`Self::transform_rows`] on byte rows of the 8-bit field. Any other
+    /// field returns `Field`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn transform_u8_rows<R: AsRef<[u8]> + AsMut<[u8]> + Send>(
+        &self,
+        rows: &mut [R],
+        zero: Option<&[bool]>,
+        origin: usize,
+        inverse: bool,
+        backend: crate::gf_simd::LinearBackend,
+        pool: Option<&rayon::ThreadPool>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError> {
+        self.byte_lane()?;
+        self.transform_rows_lane(
+            rows,
+            zero,
+            origin,
+            inverse,
+            backend,
+            pool,
+            None::<&mut [&mut [u8]]>,
+            cancelled,
+        )
+    }
+
+    /// [`Self::transform_rows`], then every row of the result added (XORed)
+    /// into the same row of `sum`, which must hold as many rows, as wide.
+    /// Where the transform tiles, each tile is added as its last pass
+    /// leaves it, while it is still in the cache, so the sum costs no pass
+    /// over the bank of its own. Rows known zero after the transform are
+    /// not added. A cancelled call leaves `sum` with some tiles added.
+    #[allow(clippy::too_many_arguments)]
+    pub fn transform_rows_adding<
+        R: AsRef<[u16]> + AsMut<[u16]> + Send,
+        T: AsRef<[u16]> + AsMut<[u16]> + Send,
+    >(
+        &self,
+        rows: &mut [R],
+        zero: Option<&[bool]>,
+        origin: usize,
+        inverse: bool,
+        backend: crate::gf_simd::LinearBackend,
+        pool: Option<&rayon::ThreadPool>,
+        sum: &mut [T],
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError> {
+        self.transform_rows_lane(
+            rows,
+            zero,
+            origin,
+            inverse,
+            backend,
+            pool,
+            Some(sum),
+            cancelled,
+        )
+    }
+
+    /// [`Self::transform_rows_adding`] on byte rows of the 8-bit field. Any
+    /// other field returns `Field`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn transform_u8_rows_adding<
+        R: AsRef<[u8]> + AsMut<[u8]> + Send,
+        T: AsRef<[u8]> + AsMut<[u8]> + Send,
+    >(
+        &self,
+        rows: &mut [R],
+        zero: Option<&[bool]>,
+        origin: usize,
+        inverse: bool,
+        backend: crate::gf_simd::LinearBackend,
+        pool: Option<&rayon::ThreadPool>,
+        sum: &mut [T],
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError> {
+        self.byte_lane()?;
+        self.transform_rows_lane(
+            rows,
+            zero,
+            origin,
+            inverse,
+            backend,
+            pool,
+            Some(sum),
+            cancelled,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transform_rows_lane<
+        S: Lane,
+        R: AsRef<[S]> + AsMut<[S]> + Send,
+        T: AsRef<[S]> + AsMut<[S]> + Send,
+    >(
+        &self,
+        rows: &mut [R],
+        zero: Option<&[bool]>,
+        origin: usize,
+        inverse: bool,
+        backend: crate::gf_simd::LinearBackend,
+        pool: Option<&rayon::ThreadPool>,
+        sum: Option<&mut [T]>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError> {
+        match pool {
+            Some(pool) => self
+                .transform_sum_in_pool(rows, zero, origin, inverse, backend, pool, sum, cancelled),
+            None => self.transform_sum(rows, zero, origin, inverse, backend, sum, cancelled),
+        }
+    }
+
+    /// [`Self::derivative`] of equally wide slices of 16-bit words, as for
+    /// [`Self::transform_rows`]: with `pool` as [`Self::derivative_in_pool`]
+    /// runs, and without, on the calling thread.
+    pub fn differentiate_rows<R: AsRef<[u16]> + AsMut<[u16]>>(
+        &self,
+        rows: &mut [R],
+        pool: Option<&rayon::ThreadPool>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError> {
+        match pool {
+            Some(pool) => self.derivative_lane_in_pool(rows, pool, cancelled),
+            None => self.derivative_lane(rows, cancelled),
+        }
+    }
+
+    /// [`Self::differentiate_rows`] on byte rows of the 8-bit field. Any
+    /// other field returns `Field`.
+    pub fn differentiate_u8_rows<R: AsRef<[u8]> + AsMut<[u8]>>(
+        &self,
+        rows: &mut [R],
+        pool: Option<&rayon::ThreadPool>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError> {
+        self.byte_lane()?;
+        match pool {
+            Some(pool) => self.derivative_lane_in_pool(rows, pool, cancelled),
+            None => self.derivative_lane(rows, cancelled),
+        }
+    }
+
     /// Run transform stages inside a caller-owned, bounded worker pool. No
     /// global pool is used. Small stripes execute synchronously to avoid task
     /// overhead; cancellation is checked before each butterfly pair. A bank
-    /// beyond [`TRANSFORM_SCRATCH_BYTES`] is walked in slabs on a target
-    /// that gathers (see [`walks`]), each worker taking at most that much
-    /// scratch and all of them together at most the bank's worth, rounded
-    /// up to whole 64-symbol runs; a cancelled walk leaves the rows with
-    /// some slabs put back and some
-    /// not, so they hold no transform of anything, as a cancelled sweep
-    /// over whole rows leaves them with some butterflies done.
+    /// beyond [`TRANSFORM_TILE_BYTES`] runs in column tiles, in place, on a
+    /// target that tiles (see [`walks`]), the workers sharing the tiles of
+    /// each pass; a cancelled transform leaves the rows with some tiles
+    /// done and some not, so they hold no transform of anything, as a
+    /// cancelled sweep over whole rows leaves them with some butterflies
+    /// done.
     pub fn transform_in_pool(
         &self,
         rows: &mut [Vec<u16>],
@@ -1093,9 +1380,95 @@ impl TransformField {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn transform_lane_in_pool<S: Lane>(
+    fn transform_lane_in_pool<S: Lane, R: AsRef<[S]> + AsMut<[S]> + Send>(
         &self,
-        rows: &mut [Vec<S>],
+        rows: &mut [R],
+        zero: Option<&[bool]>,
+        origin: usize,
+        inverse: bool,
+        backend: crate::gf_simd::LinearBackend,
+        pool: &rayon::ThreadPool,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError> {
+        self.transform_sum_in_pool(
+            rows,
+            zero,
+            origin,
+            inverse,
+            backend,
+            pool,
+            None::<&mut [&mut [S]]>,
+            cancelled,
+        )
+    }
+
+    /// [`Self::transform_sum`] inside a caller-owned pool.
+    #[allow(clippy::too_many_arguments)]
+    fn transform_sum_in_pool<
+        S: Lane,
+        R: AsRef<[S]> + AsMut<[S]> + Send,
+        T: AsRef<[S]> + AsMut<[S]> + Send,
+    >(
+        &self,
+        rows: &mut [R],
+        zero: Option<&[bool]>,
+        origin: usize,
+        inverse: bool,
+        backend: crate::gf_simd::LinearBackend,
+        pool: &rayon::ThreadPool,
+        sum: Option<&mut [T]>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError> {
+        let n = rows.len();
+        let width = rows.first().map_or(0, |row| row.as_ref().len());
+        // The synchronous cutoff is 64 KiB of row storage in either lane.
+        if pool.current_num_threads() == 1 || (size_of::<S>() * width).saturating_mul(n) < 65536 {
+            return self.transform_sum(rows, zero, origin, inverse, backend, sum, cancelled);
+        }
+        self.validate_transform(rows, zero, origin, cancelled)?;
+        validate_sum(rows, sum.as_deref())?;
+        let schedule = Schedule {
+            origin,
+            inverse,
+            backend,
+            radix4: Self::fused(width, backend),
+        };
+        let threads = pool.current_num_threads();
+        if let Some(walk) = Walk::engaged(n, width, size_of::<S>(), &schedule, threads) {
+            let flags = sweep_flags(n, zero, &schedule);
+            return self.transform_tiles(
+                rows,
+                &schedule,
+                flags.as_deref(),
+                &walk,
+                pool,
+                sum,
+                cancelled,
+            );
+        }
+        self.sweep_lane_in_pool(rows, zero, origin, inverse, backend, pool, cancelled)?;
+        let Some(sum) = sum else {
+            return Ok(());
+        };
+        // Untiled, the sum is added on the calling thread, a row at a time:
+        // handing the rows to the pool once more costs its workers another
+        // rendezvous per transform, more than the adds themselves.
+        let after = sweep_flags(n, zero, &schedule).and_then(|mut flags| flags.pop());
+        for (index, (to, from)) in sum.iter_mut().zip(rows.iter()).enumerate() {
+            if cancelled() {
+                return Err(TransformError::Cancelled);
+            }
+            if !after.as_ref().is_some_and(|after| after[index]) {
+                add_into(to.as_mut(), from.as_ref());
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sweep_lane_in_pool<S: Lane, R: AsMut<[S]> + Send>(
+        &self,
+        rows: &mut [R],
         zero: Option<&[bool]>,
         origin: usize,
         inverse: bool,
@@ -1105,26 +1478,13 @@ impl TransformField {
     ) -> Result<(), TransformError> {
         use rayon::prelude::*;
         let n = rows.len();
-        // The synchronous cutoff is 64 KiB of row storage in either lane.
-        if pool.current_num_threads() == 1
-            || rows
-                .first()
-                .is_none_or(|row| size_of_val(row.as_slice()).saturating_mul(n) < 65536)
-        {
-            return self.transform_lane(rows, zero, origin, inverse, backend, cancelled);
-        }
-        self.validate_transform(rows, zero, origin, cancelled)?;
-        let width = rows.first().map_or(0, Vec::len);
+        let width = rows.first_mut().map_or(0, |row| row.as_mut().len());
         let schedule = Schedule {
             origin,
             inverse,
             backend,
             radix4: Self::fused(width, backend),
         };
-        if let Some(walk) = Walk::engaged(n, width, size_of::<S>(), &schedule, pool) {
-            let flags = sweep_flags(n, zero, &schedule);
-            return self.transform_walk(rows, &schedule, flags.as_deref(), &walk, pool, cancelled);
-        }
         let mut known = zero.map(<[bool]>::to_vec);
         pool.install(|| {
             for sweep in sweeps(n.trailing_zeros(), inverse, schedule.radix4) {
@@ -1146,8 +1506,8 @@ impl TransformField {
                                             return Err(TransformError::Cancelled);
                                         }
                                         pair(
-                                            left,
-                                            right,
+                                            left.as_mut(),
+                                            right.as_mut(),
                                             [zero(base + at), zero(base + half + at)],
                                         );
                                         Ok(())
@@ -1177,7 +1537,7 @@ impl TransformField {
                                                 zero(base + k * quarter + at)
                                             }),
                                         };
-                                        quad([a, b, c, d].map(Vec::as_mut_slice), flags);
+                                        quad([a, b, c, d].map(AsMut::as_mut), flags);
                                         Ok(())
                                     })
                             },
@@ -1192,9 +1552,9 @@ impl TransformField {
         })
     }
 
-    fn validate_transform<S: Lane>(
+    fn validate_transform<S: Lane, R: AsRef<[S]>>(
         &self,
-        rows: &[Vec<S>],
+        rows: &[R],
         zero: Option<&[bool]>,
         origin: usize,
         cancelled: &dyn Fn() -> bool,
@@ -1212,15 +1572,16 @@ impl TransformField {
             if cancelled() {
                 return Err(TransformError::Cancelled);
             }
-            if row.len() != rows[0].len() || (S::ranged(self) && !S::admits(self, row)) {
+            let row = row.as_ref();
+            if row.len() != rows[0].as_ref().len() || (S::ranged(self) && !S::admits(self, row)) {
                 return Err(TransformError::Geometry);
             }
         }
         debug_assert!(
             zero.is_none_or(|zero| {
-                rows.iter()
-                    .zip(zero)
-                    .all(|(row, &zero)| !zero || row.iter().all(|&value| value == S::default()))
+                rows.iter().zip(zero).all(|(row, &zero)| {
+                    !zero || row.as_ref().iter().all(|&value| value == S::default())
+                })
             }),
             "a row flagged as known zero holds a nonzero symbol"
         );
@@ -1354,9 +1715,10 @@ impl TransformField {
     /// derivative on its own columns of every row, so the rows come out
     /// exactly as [`Self::derivative`] leaves them. Small stripes execute
     /// synchronously, as in [`Self::transform_in_pool`]. On a target that
-    /// gathers, a bank beyond half [`TRANSFORM_SCRATCH_BYTES`] is gathered
-    /// a window of every row at a time, each worker taking at most that
-    /// scratch and all of them together at most twice the bank.
+    /// tiles, a bank beyond half [`TRANSFORM_TILE_BYTES`] runs a tile of a
+    /// window of every row at a time, each worker differentiating into
+    /// scratch as large as its tile, at most that much, and all of them
+    /// together at most the bank.
     pub fn derivative_in_pool(
         &self,
         rows: &mut [Vec<u16>],
@@ -1378,15 +1740,15 @@ impl TransformField {
         self.derivative_lane_in_pool(rows, pool, cancelled)
     }
 
-    fn derivative_lane_in_pool<S: Lane>(
+    fn derivative_lane_in_pool<S: Lane, R: AsRef<[S]> + AsMut<[S]>>(
         &self,
-        rows: &mut [Vec<S>],
+        rows: &mut [R],
         pool: &rayon::ThreadPool,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<(), TransformError> {
         use rayon::prelude::*;
         let n = rows.len();
-        let width = rows.first().map_or(0, Vec::len);
+        let width = rows.first().map_or(0, |row| row.as_ref().len());
         let threads = pool.current_num_threads();
         // The same 64 KiB synchronous cutoff as the pooled transforms, and
         // no column share narrower than one 64-byte cache line.
@@ -1397,15 +1759,14 @@ impl TransformField {
             return self.derivative_lane(rows, cancelled);
         }
         self.validate_derivative(rows)?;
-        // Gathered where the transforms would gather, for the same reason:
-        // every row is read once per set bit of its index, and from scratch
-        // of the worker's own those reads hit the cache; see
-        // `Self::derivative_pass`.
-        if let Some(pass) = POOL_GATHERS
+        // Tiled where the transforms tile, for the same reason: every row is
+        // read once per set bit of its index, and within a tile those reads
+        // hit the cache; see `Self::derivative_pass`.
+        if let Some(pass) = COLUMN_TILES
             .then(|| Self::derivative_pass::<S>(n, width, threads))
             .flatten()
         {
-            return Self::derivative_gathered(rows, pass, pool, cancelled);
+            return Self::derivative_tiled(rows, pass, pool, cancelled);
         }
         // One pointer per row, the same size as the row handles themselves.
         let shared = SharedRows::of(rows);
@@ -1437,82 +1798,69 @@ impl TransformField {
         })
     }
 
-    fn validate_derivative<S: Lane>(&self, rows: &[Vec<S>]) -> Result<(), TransformError> {
+    fn validate_derivative<S: Lane, R: AsRef<[S]>>(
+        &self,
+        rows: &[R],
+    ) -> Result<(), TransformError> {
         let n = rows.len();
         if !n.is_power_of_two()
             || n > self.order()
-            || rows.iter().any(|row| row.len() != rows[0].len())
+            || rows
+                .iter()
+                .any(|row| row.as_ref().len() != rows[0].as_ref().len())
         {
             return Err(TransformError::Geometry);
         }
         Ok(())
     }
 
-    fn derivative_lane<S: Lane>(
+    fn derivative_lane<S: Lane, R: AsRef<[S]> + AsMut<[S]>>(
         &self,
-        rows: &mut [Vec<S>],
+        rows: &mut [R],
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), TransformError> {
         self.validate_derivative(rows)?;
-        // Whole rows, for the reason the sequential transform sweeps them.
+        // Whole rows: alone, the XORs are bound by their own work.
         derivative_rows(rows, cancelled)
     }
 
-    /// The pass a derivative of a bank beyond the scratch gathers in on
-    /// `threads` workers: every row at once, at a window narrow enough for
-    /// the rows and a second copy of them to share the scratch, and for the
-    /// workers' gathers together to stay within twice the bank; none when
-    /// the scratch-sized windows, or whole cache lines, would leave a
-    /// worker idle, and the pool shares the columns instead. See
-    /// [`derivative_blocks`].
+    /// The pass a derivative of a bank beyond a tile runs in on `threads`
+    /// workers: every row at once, at a window narrow enough for the tile
+    /// and a second copy of it to share [`TRANSFORM_TILE_BYTES`], and for
+    /// the workers' copies together to stay within the bank; none when the
+    /// tile-sized windows, or whole cache lines, would leave a worker idle,
+    /// and the pool shares the columns instead.
     fn derivative_pass<S: Lane>(n: usize, width: usize, threads: usize) -> Option<Pass> {
-        Pass::narrow::<S>(n, width, TRANSFORM_SCRATCH_BYTES / 2, threads)
+        Pass::narrow::<S>(n, width, TRANSFORM_TILE_BYTES / 2, threads)
     }
 
-    /// A pooled derivative of validated `rows`, gathered in `pass`: the
-    /// workers share its tasks, each gathering a window of every row into
-    /// its own scratch, differentiating there and putting the rows back;
-    /// see [`pass_tasks`].
-    fn derivative_gathered<S: Lane>(
-        rows: &mut [Vec<S>],
+    /// A pooled derivative of validated `rows`, tiled in `pass`: the workers
+    /// share its tiles, each differentiating its tile into scratch of its
+    /// own, as long, and copying the result back over the tile; see
+    /// [`tile_tasks`].
+    fn derivative_tiled<S: Lane, R: AsMut<[S]>>(
+        rows: &mut [R],
         pass: Pass,
         pool: &rayon::ThreadPool,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<(), TransformError> {
         let n = rows.len();
-        // One pointer per row, the same size as the row handles themselves.
         let shared = SharedRows::of(rows);
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let work = Self::derivative_work::<S>(pass, cancelled);
-        pool.broadcast(|_| {
-            pass_tasks(
-                &shared,
-                &next,
-                pass,
-                None,
-                None,
-                None,
-                n * pass.window,
-                &work,
-                cancelled,
-            )
-        })
-        .into_iter()
-        .collect()
-    }
-
-    /// The work of a gathered derivative: the rows differentiated into the
-    /// spare scratch, then copied back for the pass to put them back.
-    fn derivative_work<S: Lane>(
-        pass: Pass,
-        cancelled: &(dyn Fn() -> bool + Sync),
-    ) -> impl Fn(&mut [S], &mut [S], Place, &std::ops::Range<usize>) -> Result<(), TransformError> + Sync
-    {
-        move |rows, spare, _, _| {
-            derivative_blocks(rows, spare, pass.rows, pass.window, cancelled)?;
-            rows.copy_from_slice(spare);
+        let work = |views: &mut [&mut [S]],
+                    spare: &mut [S],
+                    _: Place,
+                    columns: &std::ops::Range<usize>| {
+            let spare = &mut spare[..n * columns.len()];
+            derivative_views(views, spare, |_| false, cancelled)?;
+            for (view, from) in views.iter_mut().zip(spare.chunks_exact(columns.len())) {
+                view.copy_from_slice(from);
+            }
             Ok(())
-        }
+        };
+        pool.broadcast(|_| tile_tasks(&shared, &next, pass, None, n * pass.window, work, cancelled))
+            .into_iter()
+            .collect()
     }
 
     /// Evaluate an erasure locator at received positions and its derivative at
@@ -1730,8 +2078,8 @@ fn advance(
 }
 
 /// Differentiate whole `rows` in place; see [`TransformField::derivative`].
-fn derivative_rows<S: Lane>(
-    rows: &mut [Vec<S>],
+fn derivative_rows<S: Lane, R: AsRef<[S]> + AsMut<[S]>>(
+    rows: &mut [R],
     cancelled: &dyn Fn() -> bool,
 ) -> Result<(), TransformError> {
     let n = rows.len();
@@ -1748,47 +2096,93 @@ fn derivative_rows<S: Lane>(
         let mut sources = [&[] as &[S]; 16];
         let mut count = 0;
         for bit in (0..n.trailing_zeros()).filter(|bit| index & (1 << bit) == 0) {
-            sources[count] = remaining[(index | (1 << bit)) - index - 1].as_slice();
+            sources[count] = remaining[(index | (1 << bit)) - index - 1].as_ref();
             count += 1;
         }
-        xor_sum(&mut done[index], &sources[..count]);
+        xor_sum(done[index].as_mut(), &sources[..count]);
     }
     Ok(())
 }
 
-/// Differentiate `rows` rows of `window` symbols, contiguous in `from`, into
-/// `into`, as long; see [`TransformField::derivative`]. Bit by bit: the
-/// coefficients one set bit above a block of rows with that bit clear lie
-/// `1 << bit` rows on, contiguous, so each bit is one pass of XORs of whole
-/// blocks, and no row is handled on its own.
-fn derivative_blocks<S: Lane>(
-    from: &[S],
+/// Differentiate the equally wide rows `from`, one tile of a bank, into
+/// `into`, as many rows as long, one after another; see
+/// [`TransformField::derivative`]. Each row is stored once, the XOR of the
+/// rows one set bit above it; rows `zero` flags by their index in `from`
+/// hold zero and are not read.
+fn derivative_views<S: Lane>(
+    from: &[&mut [S]],
     into: &mut [S],
-    rows: usize,
-    window: usize,
+    zero: impl Fn(usize) -> bool,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<(), TransformError> {
-    debug_assert!(from.len() == rows * window && into.len() == from.len());
-    into.fill(S::default());
-    for bit in 0..rows.trailing_zeros() {
+    let n = from.len();
+    let width = from.first().map_or(0, |row| row.len());
+    debug_assert!(into.len() == n * width);
+    if width == 0 {
+        return Ok(());
+    }
+    for (index, out) in into.chunks_exact_mut(width).enumerate() {
         if cancelled() {
             return Err(TransformError::Cancelled);
         }
-        let block = window << bit;
-        let pairs = into
-            .chunks_exact_mut(block * 2)
-            .zip(from.chunks_exact(block * 2));
-        #[cfg(target_arch = "x86_64")]
-        if is_x86_feature_detected!("avx2") {
-            for (into, from) in pairs {
-                // SAFETY: AVX2 was detected.
-                unsafe { xor_into_avx2(&mut into[..block], &from[block..]) };
+        let mut sources = [&[] as &[S]; 16];
+        let mut count = 0;
+        for bit in (0..n.trailing_zeros()).filter(|bit| index & (1 << bit) == 0) {
+            let source = index | (1 << bit);
+            if !zero(source) {
+                sources[count] = &*from[source];
+                count += 1;
             }
+        }
+        xor_sum(out, &sources[..count]);
+    }
+    Ok(())
+}
+
+/// Add `from` into `into`, as long: the AVX2 form where it runs.
+fn add_into<S: Lane>(into: &mut [S], from: &[S]) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 was detected.
+        unsafe { xor_into_avx2(into, from) };
+        return;
+    }
+    xor_into(into, from);
+}
+
+/// Add the tile `views`, the rows of `place` at `columns`, into the same
+/// columns of the same rows of `sum`, but for rows `after` flags known zero.
+fn add_tile<S: Lane>(
+    sum: &SharedRows<S>,
+    views: &[&mut [S]],
+    place: Place,
+    columns: &std::ops::Range<usize>,
+    after: Option<&Vec<bool>>,
+) {
+    for (k, view) in views.iter().enumerate() {
+        let row = place.row(k);
+        if after.is_some_and(|after| after[row]) {
             continue;
         }
-        for (into, from) in pairs {
-            xor_into(&mut into[..block], &from[block..]);
-        }
+        // SAFETY: the task adding this tile alone holds these columns of
+        // these rows of `sum`; see `SharedRows::columns`.
+        add_into(unsafe { sum.columns_mut(row, columns) }, view);
+    }
+}
+
+/// Check that `sum`, when given, has a row as wide for every row of `rows`.
+fn validate_sum<S, R: AsRef<[S]>, T: AsRef<[S]>>(
+    rows: &[R],
+    sum: Option<&[T]>,
+) -> Result<(), TransformError> {
+    if let Some(sum) = sum
+        && (sum.len() != rows.len()
+            || sum
+                .iter()
+                .zip(rows)
+                .any(|(to, from)| to.as_ref().len() != from.as_ref().len()))
+    {
+        return Err(TransformError::Geometry);
     }
     Ok(())
 }
@@ -1811,13 +2205,15 @@ unsafe fn xor_into_avx2<S: Lane>(into: &mut [S], from: &[S]) {
     xor_into(into, from)
 }
 
-/// Scratch each worker of a pooled transform or derivative may take for
-/// the rows it gathers, at most; see [`TransformField::transform_in_pool`].
-/// None is taken on a target that does not gather; see [`POOL_GATHERS`].
-pub const TRANSFORM_SCRATCH_BYTES: usize = 512 << 10;
+/// The bytes of rows one tile of a tiled transform holds, at most: a bank
+/// beyond this, on a target that tiles, runs a tile at a time; see
+/// [`COLUMN_TILES`]. A tiled transform takes no scratch; a tiled
+/// derivative, and each pass of [`TransformField::derivative_at`], takes
+/// as much again per worker for what it computes beside the tile.
+pub const TRANSFORM_TILE_BYTES: usize = 512 << 10;
 
 /// What [`TransformField::derivative_at_bytes`] allows each worker beyond
-/// its slab scratch and windows, for the pool's handing it each pass.
+/// its scratch and row lists, for the pool's handing it each pass.
 const DERIVATIVE_WORKER_BYTES: usize = 2 << 10;
 
 /// What [`TransformField::derivative_at_bytes`] allows a call beyond the
@@ -1825,26 +2221,28 @@ const DERIVATIVE_WORKER_BYTES: usize = 2 << 10;
 /// and the passes' small state.
 const DERIVATIVE_CALL_BYTES: usize = 4 << 10;
 
-/// Whether the pooled transforms and derivatives of this target gather a
-/// bank beyond the scratch into slabs. Apple silicon streams the whole-row
-/// sweeps faster than the gathers and scatters cost: on an M-series, the
-/// slab walk of 4096 rows of 32768 16-bit symbols ran half as long again
-/// as the whole-row sweeps, and the gathered derivative twice as long. So
-/// there the pool sweeps whole rows, as every pool does for a bank within
-/// the scratch, and takes no scratch. It is also the default for whether a
-/// caller takes the split slab steps of [`TransformField::derivative_at`]
-/// at all, on one worker as on a pool, since they gather the same way; see
+/// Whether the transforms and derivatives of this target run a bank beyond
+/// [`TRANSFORM_TILE_BYTES`] in column tiles, in place: each tile, a group
+/// of rows at a window of columns, takes every sweep of a pass while it
+/// stays in the cache. On x86_64 that runs a transform in two thirds to
+/// three quarters of the time the whole-row sweeps take on one worker, and
+/// in under half of it on eight, where the sweeps are bound by memory.
+/// Apple silicon streams the whole-row sweeps about as fast as the tiles
+/// run, on one worker and on a pool, so there every transform and
+/// derivative sweeps whole rows, and a pool sweeps them a level at a time
+/// across the workers. It is also the default for whether a caller takes
+/// the split steps of [`TransformField::derivative_at`] at all, on one
+/// worker as on a pool, since they tile the same way; see
 /// [`derivative_at_walks`].
-pub const POOL_GATHERS: bool = !cfg!(target_vendor = "apple");
+pub const COLUMN_TILES: bool = !cfg!(target_vendor = "apple");
 
-/// Whether [`TransformField::transform_in_pool`] of `n` rows `width` wide
-/// of `size`-byte symbols (one for the 8-bit field's byte rows, two for
-/// 16-bit words), `inverse` or forward with `backend`, on a pool of
-/// `threads` workers, walks the bank in slabs: a bank beyond
-/// [`TRANSFORM_SCRATCH_BYTES`] over three levels or more, on a target
-/// that gathers, when every pass of the walk has tasks enough for the
-/// workers. Otherwise the pool sweeps the whole rows, a level at a time
-/// across the workers.
+/// Whether a transform of `n` rows `width` wide of `size`-byte symbols
+/// (one for the 8-bit field's byte rows, two for 16-bit words), `inverse`
+/// or forward with `backend`, on `threads` workers (one for the calling
+/// thread alone, as without a pool), runs the bank in column tiles: a bank
+/// beyond [`TRANSFORM_TILE_BYTES`] over three levels or more, on a target
+/// that tiles, when every pass has a tile for every worker. Otherwise the
+/// rows are swept whole, a level at a time, across the workers of a pool.
 pub fn walks(
     n: usize,
     width: usize,
@@ -1859,10 +2257,10 @@ pub fn walks(
         backend,
         radix4: TransformField::fused(width, backend),
     };
-    threads > 1 && POOL_GATHERS && Walk::of(n, width, size, &schedule, threads).is_some()
+    Walk::engaged(n, width, size, &schedule, threads.max(1)).is_some()
 }
 
-/// Where the rows of a gathered group come from: local row `k` is row
+/// Where the rows of a tile's group come from: local row `k` is row
 /// `first + k * stride` of the bank.
 #[derive(Clone, Copy)]
 struct Place {
@@ -1883,8 +2281,9 @@ impl Place {
     }
 }
 
-/// One pass of a walk over the bank: each task gathers a group of `rows`
-/// rows, consecutive or `stride` apart, at a window of `window` columns.
+/// One pass of a walk over the bank: each task takes a tile, a group of
+/// `rows` rows, consecutive or `stride` apart, at a window of `window`
+/// columns, in place.
 #[derive(Clone, Copy)]
 struct Pass {
     window: usize,
@@ -1938,9 +2337,9 @@ impl Pass {
 }
 
 /// Where [`TransformField::derivative_at`] splits a domain's levels, and
-/// the slab its passes gather: `low` levels inside each block, the rest
-/// inside each class, and a window of columns wide enough for the larger
-/// of the two groups and its derivative to share the scratch.
+/// the tile its passes take: `low` levels inside each block, the rest
+/// inside each class, and a window of columns narrow enough for the larger
+/// of the two groups and its derivative to stay in the cache.
 #[derive(Clone, Copy)]
 struct Split {
     low: u32,
@@ -1955,7 +2354,7 @@ impl Split {
     /// and, with more workers than groups in the narrower pass, no wider
     /// than an even share of the width between the workers on each group,
     /// rounded up to whole runs; so a narrow width can still leave some
-    /// workers without a slab. None below 16 rows, where a block or class
+    /// workers without a tile. None below 16 rows, where a block or class
     /// would be under four, and for any `size` but 1 or 2.
     fn of(n: usize, width: usize, size: usize, threads: usize) -> Option<Split> {
         let levels = n.trailing_zeros();
@@ -1964,7 +2363,7 @@ impl Split {
         }
         let low = levels / 2;
         let group = 1usize << (levels - low);
-        let mut window = (TRANSFORM_SCRATCH_BYTES / (2 * group * size) / 64 * 64).max(64);
+        let mut window = (TRANSFORM_TILE_BYTES / (2 * group * size) / 64 * 64).max(64);
         let groups = 1usize << low;
         if threads > groups {
             let share = width.div_ceil(threads.div_ceil(groups));
@@ -2004,27 +2403,26 @@ pub struct DerivativeWork {
 }
 
 /// Whether [`TransformField::derivative_at`] over `n` rows `width` wide of
-/// `size`-byte symbols splits the domain and walks it in slabs, rather than
+/// `size`-byte symbols splits the domain and walks it in tiles, rather than
 /// running the separate steps: from 16 rows of 1- or 2-byte symbols, and
-/// only for a bank beyond [`TRANSFORM_SCRATCH_BYTES`], where the passes it
+/// only for a bank beyond [`TRANSFORM_TILE_BYTES`], where the passes it
 /// saves are passes over memory rather than over the cache. It says nothing
 /// of the target: a caller deciding whether to take the split steps at all,
-/// with a pool or one worker alone, also asks [`POOL_GATHERS`].
+/// with a pool or one worker alone, also asks [`COLUMN_TILES`].
 pub fn derivative_at_walks(n: usize, width: usize, size: usize) -> bool {
     Split::of(n, width, size, 1).is_some()
-        && n.saturating_mul(width).saturating_mul(size) > TRANSFORM_SCRATCH_BYTES
+        && n.saturating_mul(width).saturating_mul(size) > TRANSFORM_TILE_BYTES
 }
 
-/// How a transform of a bank beyond the scratch walks it: each pass gathers
-/// groups of rows at a window of columns into contiguous scratch, where they
-/// stay cache resident through a range of the sweeps, and puts them back.
+/// How a transform of a bank beyond [`TRANSFORM_TILE_BYTES`] walks it: each
+/// pass takes tiles, groups of rows at a window of columns, in place, and
+/// runs a range of the sweeps over each tile while it stays in the cache.
 /// The bank is thus read and written once per pass instead of once per
-/// sweep, the rows' own addresses never meet in a cache set, and the
-/// kernels run over whole windows. One pass over every row when the domain
+/// sweep, and the kernels run over whole windows. One pass over every row when the domain
 /// is short enough for that window to be wide; otherwise two, split at a
 /// level `h`: the sweeps below `h` touch only rows within one block of
 /// `2^h` consecutive rows, and those at `h` and above only rows `2^h`
-/// apart, so each pass gathers those groups, in the order the sweeps run.
+/// apart, so each pass takes those groups, in the order the sweeps run.
 struct Walk {
     /// The window of every pass, in symbols; the units are built this wide.
     window: usize,
@@ -2033,32 +2431,32 @@ struct Walk {
 }
 
 impl Walk {
-    /// Rows at least this wide, in bytes, are gathered in one pass.
+    /// Rows at least this wide, in bytes, are walked in one pass.
     const WIDE_ROW_BYTES: usize = 2048;
 
-    /// The walk a pooled transform of `schedule` over `n` rows `width` wide
-    /// of `size`-byte symbols takes on `pool`: [`Self::of`] on a target that
-    /// gathers, when every pass of it has tasks enough to keep the pool
-    /// busy; otherwise none, and the pool sweeps whole rows.
+    /// The tiles a transform of `schedule` over `n` rows `width` wide of
+    /// `size`-byte symbols takes on `threads` workers: [`Self::of`] on a
+    /// target that tiles, when every pass of it has tiles enough to keep
+    /// the workers busy; otherwise none, and the rows are swept whole.
     fn engaged(
         n: usize,
         width: usize,
         size: usize,
         schedule: &Schedule,
-        pool: &rayon::ThreadPool,
+        threads: usize,
     ) -> Option<Walk> {
-        POOL_GATHERS
-            .then(|| Self::of(n, width, size, schedule, pool.current_num_threads()))
+        COLUMN_TILES
+            .then(|| Self::of(n, width, size, schedule, threads))
             .flatten()
     }
 
     /// The walk of `schedule` over `n` rows `width` wide of `size`-byte
     /// symbols on `threads` workers: [`Self::planned`], when every pass of
-    /// it has a slab per worker, with each window then no wider than the
+    /// it has a tile per worker, with each window then no wider than the
     /// runs split across the workers a pass's groups leave without one, so
-    /// the workers' slabs together never outreach the bank's rows rounded
-    /// up to whole runs, whatever the scratch would let each gather. None
-    /// when there is no walk or its slabs would leave workers idle.
+    /// the workers' tiles together never outreach the bank's rows rounded
+    /// up to whole runs, whatever the tile size would let each take. None
+    /// when there is no walk or its tiles would leave workers idle.
     fn of(
         n: usize,
         width: usize,
@@ -2087,12 +2485,13 @@ impl Walk {
     }
 
     /// The walk of `schedule` over `n` rows `width` wide of `size`-byte
-    /// symbols with the widest slabs the scratch holds, or none when the
-    /// bank fits the scratch or the domain has fewer than three levels, so
-    /// gathering would cost as much as the sweeps it saves.
+    /// symbols with the widest tiles [`TRANSFORM_TILE_BYTES`] holds, or none
+    /// when the bank fits one tile or the domain has fewer than three
+    /// levels, so tiling would cost as much as the sweeps it saves.
     fn planned(n: usize, width: usize, size: usize, schedule: &Schedule) -> Option<Walk> {
+        let budget = TRANSFORM_TILE_BYTES;
         let levels = n.trailing_zeros();
-        if levels < 3 || n * width * size <= TRANSFORM_SCRATCH_BYTES {
+        if levels < 3 || n * width * size <= budget {
             return None;
         }
         let sweeps: Vec<Sweep> = sweeps(levels, schedule.inverse, schedule.radix4).collect();
@@ -2100,8 +2499,7 @@ impl Walk {
         // `rows` rows fits; a pass never has rows enough for one run to
         // overflow it (at most twice the square root of the domain's, or a
         // whole domain short enough for wide rows).
-        let window =
-            |rows: usize| width.min((TRANSFORM_SCRATCH_BYTES / (rows * size) / 64 * 64).max(64));
+        let window = |rows: usize| width.min((budget / (rows * size) / 64 * 64).max(64));
         let one = window(n);
         if one * size >= Self::WIDE_ROW_BYTES {
             let pass = Pass {
@@ -2164,56 +2562,35 @@ impl Walk {
     }
 }
 
-/// The known-zero flags of a pass over the sweeps `sweeps`, from those of
-/// every sweep: the flags before each of its sweeps, then the flags before
-/// its first and after its last, which rows need not be gathered or put
-/// back; all none when there are none.
-#[allow(clippy::type_complexity)]
-fn pass_flags<'a>(
-    flags: Option<&'a [Vec<bool>]>,
-    sweeps: &std::ops::Range<usize>,
-) -> (
-    Option<&'a [Vec<bool>]>,
-    Option<&'a [bool]>,
-    Option<&'a [bool]>,
-) {
-    (
-        flags.map(|flags| &flags[sweeps.clone()]),
-        flags.map(|flags| flags[sweeps.start].as_slice()),
-        flags.map(|flags| flags[sweeps.end].as_slice()),
-    )
-}
-
-/// One worker's share of `pass` over `shared`: tasks taken from `next` until
-/// none remain, each a group of rows at a window of columns gathered into
-/// scratch of this worker's own, `pass.rows` rows of `pass.window` symbols
-/// contiguous, given to `work` with `spare` more symbols of scratch and
-/// where the group lies, and put back. Rows flagged in `before` are known
-/// zero on the way in and are cleared rather than gathered; rows flagged in
-/// `after` are known zero on the way out and are not put back. A short last
-/// window keeps whatever its padding columns held: `work` treats every
-/// column on its own, so they touch nothing that is put back. One worker
-/// alone walks every task in order; several share them, and no two tasks
-/// of one pass share a symbol. `groups`, when given, names the only groups
-/// the pass visits, in order; `work` is also handed the columns it holds.
+/// One worker's share of `pass` over `shared`, in place: tasks taken from
+/// `next` until none remain, each a tile, a group of `pass.rows` rows at a
+/// window of columns, handed to `work` as one slice of each row, straight
+/// into the bank, with `spare` symbols of scratch of this worker's own, where
+/// the group lies and the columns it holds. A short last window is just
+/// narrower. One worker alone runs every task in order; several share them,
+/// and no two tasks of one pass share a symbol. `groups`, when given, names
+/// the only groups the pass visits, in order.
 #[allow(clippy::too_many_arguments)]
-fn pass_tasks<S: Lane>(
+fn tile_tasks<S: Lane, C: Fn() -> bool + ?Sized>(
     shared: &SharedRows<S>,
     next: &std::sync::atomic::AtomicUsize,
     pass: Pass,
     groups: Option<&[usize]>,
-    before: Option<&[bool]>,
-    after: Option<&[bool]>,
     spare: usize,
-    work: impl Fn(&mut [S], &mut [S], Place, &std::ops::Range<usize>) -> Result<(), TransformError>,
-    cancelled: &dyn Fn() -> bool,
+    work: impl Fn(
+        &mut [&mut [S]],
+        &mut [S],
+        Place,
+        &std::ops::Range<usize>,
+    ) -> Result<(), TransformError>,
+    cancelled: &C,
 ) -> Result<(), TransformError> {
     use std::sync::atomic::Ordering;
     let (n, width) = (shared.0.len(), shared.1);
     let windows = width.div_ceil(pass.window);
     let tasks = groups.map_or_else(|| pass.tasks(n, width), |groups| groups.len() * windows);
-    let mut scratch = vec![S::default(); pass.rows * pass.window + spare];
-    let (rows, spare) = scratch.split_at_mut(pass.rows * pass.window);
+    let mut spare = vec![S::default(); spare];
+    let mut views = Vec::with_capacity(pass.rows);
     loop {
         let task = next.fetch_add(1, Ordering::Relaxed);
         if task >= tasks {
@@ -2226,26 +2603,11 @@ fn pass_tasks<S: Lane>(
         let place = pass.place(groups.map_or(group, |groups| groups[group]));
         let at = task % windows;
         let columns = at * pass.window..width.min((at + 1) * pass.window);
-        let w = columns.len();
-        for (k, window) in rows.chunks_exact_mut(pass.window).enumerate() {
-            let row = place.row(k);
-            if before.is_some_and(|known| known[row]) {
-                window[..w].fill(S::default());
-            } else {
-                // SAFETY: this task alone touches these columns of these
-                // rows; see `SharedRows::columns`.
-                window[..w].copy_from_slice(unsafe { shared.columns(row, &columns) });
-            }
-        }
-        work(rows, spare, place, &columns)?;
-        for (k, window) in rows.chunks_exact(pass.window).enumerate() {
-            let row = place.row(k);
-            if after.is_some_and(|known| known[row]) {
-                continue;
-            }
-            // SAFETY: as above, and the window is this task's own.
-            unsafe { shared.columns_mut(row, &columns) }.copy_from_slice(&window[..w]);
-        }
+        views.clear();
+        // SAFETY: this task alone touches these columns of these rows, and
+        // the group's rows are distinct; see `SharedRows::columns`.
+        views.extend((0..pass.rows).map(|k| unsafe { shared.columns_mut(place.row(k), &columns) }));
+        work(&mut views, &mut spare, place, &columns)?;
     }
 }
 
@@ -2283,8 +2645,8 @@ trait Units<S: Lane> {
     fn quad(&self, group: usize) -> impl Fn([&mut [S]; 4], [bool; 4]) + '_;
 }
 
-/// The units of one sweep prepared for every group and kept, for the slab
-/// walk to run over every slab.
+/// The units of one sweep prepared for every group and kept, for the tiled
+/// walk to run over every tile.
 enum KeptUnits<'a, S> {
     Radix2(u32, Vec<Box<PairUnit<'a, S>>>),
     Radix4(u32, Vec<Box<QuadUnit<'a, S>>>),
@@ -2379,7 +2741,7 @@ fn sweeps_between(from: u32, to: u32, inverse: bool, radix4: bool) -> impl Itera
     })
 }
 
-/// Equally wide rows, taken mutably for the duration of a slab walk or a
+/// Equally wide rows, taken mutably for the duration of a tiled walk or a
 /// pooled derivative whose tasks each touch only their own range of columns.
 struct SharedRows<S>(Vec<*mut S>, usize);
 
@@ -2391,16 +2753,21 @@ unsafe impl<S: Send + Sync> Sync for SharedRows<S> {}
 impl<S> SharedRows<S> {
     /// The rows, which the caller leaves alone while this lives: one pointer
     /// per row, the same size as the row handles themselves.
-    fn of(rows: &mut [Vec<S>]) -> Self {
-        let width = rows.first().map_or(0, Vec::len);
-        Self(rows.iter_mut().map(|row| row.as_mut_ptr()).collect(), width)
+    fn of<R: AsMut<[S]>>(rows: &mut [R]) -> Self {
+        let width = rows.first_mut().map_or(0, |row| row.as_mut().len());
+        Self(
+            rows.iter_mut()
+                .map(|row| row.as_mut().as_mut_ptr())
+                .collect(),
+            width,
+        )
     }
 
     /// Columns `columns` of row `row`.
     ///
     /// # Safety
     /// `row` must be in bounds and `columns` within the width, and no mutable
-    /// slice may overlap the result while it lives. A slab walk gives each
+    /// slice may overlap the result while it lives. A tiled walk gives each
     /// task its own columns; a pooled derivative does too, and within them
     /// reads only rows past the one it writes.
     unsafe fn columns(&self, row: usize, columns: &std::ops::Range<usize>) -> &[S] {
@@ -2550,6 +2917,200 @@ fn walsh(
         half *= 2;
     }
     Ok(())
+}
+
+/// The symbols a [`RowBank`] holds: the 8-bit field's bytes and the 16-bit
+/// field's words. Sealed.
+pub trait Symbol: Copy + Default + Send + Sync + sealed::Sealed + 'static {}
+
+impl Symbol for u8 {}
+impl Symbol for u16 {}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for u8 {}
+    impl Sealed for u16 {}
+}
+
+/// Equally wide rows of symbols in one zeroed, page-aligned allocation, row
+/// after row: a transform bank without an allocation, a header and a page
+/// boundary per row. [`Self::rows_mut`] hands out one slice per row, which
+/// every row-slice method of [`TransformField`] takes.
+///
+/// A row whose bytes are a whole multiple of 512 is followed by a cache
+/// line of padding, at most [`Self::ROW_PAD`] bytes, so rows a power of two
+/// apart do not start in the same cache set: a tile of such rows, which a
+/// tiled transform runs in place, would otherwise evict itself from the
+/// cache's ways long before it outgrew its capacity.
+///
+/// The memory comes from the allocator zeroed, so a bank costs no pass over
+/// its rows to clear them, and pages no row has touched yet need not be
+/// resident.
+pub struct RowBank<S: Symbol> {
+    base: std::ptr::NonNull<S>,
+    rows: usize,
+    width: usize,
+    bytes: usize,
+    /// The mapping behind a bank of [`HUGE_PAGE_BYTES`] or more on Linux
+    /// x86_64, which owns the memory in place of the allocator.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    mapping: Option<memmap2::MmapMut>,
+}
+
+/// The bytes of a transparent huge page: a bank at least this large on
+/// Linux x86_64 is mapped on its own and asks for huge pages, so a tile's
+/// rows, each in a page of its own at base pages, share a handful of
+/// translations instead of taking one each.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const HUGE_PAGE_BYTES: usize = 2 << 20;
+
+// SAFETY: a bank owns its symbols, which are plain integers; shared and
+// exclusive access go through `&self` and `&mut self` as for a `Vec`.
+unsafe impl<S: Symbol> Send for RowBank<S> {}
+// SAFETY: as above.
+unsafe impl<S: Symbol> Sync for RowBank<S> {}
+
+impl<S: Symbol> RowBank<S> {
+    /// The alignment of a bank's first row: a page on every target this
+    /// crate serves, and a multiple of every cache line.
+    pub const ALIGN: usize = 4096;
+
+    /// The most padding a bank puts after each row, in bytes.
+    pub const ROW_PAD: usize = 64;
+
+    /// The symbols from the start of one row to the start of the next.
+    fn pitch(width: usize) -> Option<usize> {
+        let bytes = width.checked_mul(size_of::<S>())?;
+        Some(if bytes != 0 && bytes.is_multiple_of(512) {
+            width + Self::ROW_PAD / size_of::<S>()
+        } else {
+            width
+        })
+    }
+
+    /// The bytes a bank of `rows` rows `width` symbols wide allocates: the
+    /// rows and their padding, rounded up to whole pages. None when that
+    /// overflows. Never more than `rows * (width * size + ROW_PAD)` rounded
+    /// up to a page.
+    #[must_use]
+    pub fn allocation_bytes(rows: usize, width: usize) -> Option<usize> {
+        rows.checked_mul(Self::pitch(width)?)?
+            .checked_mul(size_of::<S>())?
+            .checked_next_multiple_of(Self::ALIGN)
+    }
+
+    /// A bank of `rows` rows `width` symbols wide, every symbol zero. None
+    /// when its size overflows or the allocator refuses it.
+    #[must_use]
+    pub fn zeroed(rows: usize, width: usize) -> Option<Self> {
+        let bytes = Self::allocation_bytes(rows, width)?;
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if bytes >= HUGE_PAGE_BYTES {
+            // An anonymous mapping is zeroed and page-aligned; the advice is
+            // a hint, and the bank works the same without it.
+            let mut mapping = memmap2::MmapMut::map_anon(bytes).ok()?;
+            let _ = mapping.advise(memmap2::Advice::HugePage);
+            let base = std::ptr::NonNull::new(mapping.as_mut_ptr().cast::<S>())?;
+            return Some(Self {
+                base,
+                rows,
+                width,
+                bytes,
+                mapping: Some(mapping),
+            });
+        }
+        let base = if bytes == 0 {
+            std::ptr::NonNull::dangling()
+        } else {
+            let layout = std::alloc::Layout::from_size_align(bytes, Self::ALIGN).ok()?;
+            // SAFETY: the layout has a nonzero size.
+            std::ptr::NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) }.cast::<S>())?
+        };
+        Some(Self {
+            base,
+            rows,
+            width,
+            bytes,
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            mapping: None,
+        })
+    }
+
+    /// Rows in the bank.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Symbols in each row.
+    #[must_use]
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    /// The symbols from the start of one row to the start of the next.
+    fn stride(&self) -> usize {
+        Self::pitch(self.width).expect("a pitch that fitted when the bank was made")
+    }
+
+    /// Every symbol, row after row with each row's padding.
+    fn symbols_mut(&mut self) -> &mut [S] {
+        let len = self.rows * self.stride();
+        // SAFETY: the allocation holds `rows * stride` symbols, zeroed when
+        // made and initialized ever since, and `&mut self` makes this the
+        // only reference to them; a bank of no bytes has a dangling, aligned
+        // base and no symbols.
+        unsafe { std::slice::from_raw_parts_mut(self.base.as_ptr(), len) }
+    }
+
+    /// Row `row`.
+    ///
+    /// # Panics
+    /// When `row` is not below [`Self::rows`].
+    #[must_use]
+    pub fn row(&self, row: usize) -> &[S] {
+        assert!(row < self.rows, "row {row} of a bank of {}", self.rows);
+        // SAFETY: as in `symbols_mut`, for shared access to one row.
+        unsafe {
+            std::slice::from_raw_parts(self.base.as_ptr().add(row * self.stride()), self.width)
+        }
+    }
+
+    /// One slice per row, in order, each [`Self::width`] symbols.
+    pub fn rows_mut(&mut self) -> Vec<&mut [S]> {
+        let (rows, width, stride) = (self.rows, self.width, self.stride());
+        if width == 0 {
+            return (0..rows).map(|_| <&mut [S]>::default()).collect();
+        }
+        self.symbols_mut()
+            .chunks_exact_mut(stride)
+            .map(|row| &mut row[..width])
+            .collect()
+    }
+}
+
+impl<S: Symbol> Drop for RowBank<S> {
+    fn drop(&mut self) {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if self.mapping.is_some() {
+            return;
+        }
+        if self.bytes != 0 {
+            let layout = std::alloc::Layout::from_size_align(self.bytes, Self::ALIGN)
+                .expect("the layout the bank was allocated with");
+            // SAFETY: allocated in `zeroed` with this layout.
+            unsafe { std::alloc::dealloc(self.base.as_ptr().cast(), layout) };
+        }
+    }
+}
+
+impl<S: Symbol + std::fmt::Debug> std::fmt::Debug for RowBank<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RowBank")
+            .field("rows", &self.rows)
+            .field("width", &self.width)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]
@@ -3018,8 +3579,8 @@ mod tests {
                 (32, 100),
                 (64, 65),
                 (256, 300),
-                // Wide enough for the pool to transform them slab by slab in
-                // both lanes, with a short last slab.
+                // Wide enough for the pool to transform them tile by tile in
+                // both lanes, with a short last tile.
                 (256, 6200),
                 (1024, 1100),
             ] {
@@ -3123,13 +3684,33 @@ mod tests {
         );
     }
 
-    /// A pooled transform or derivative of a bank beyond the scratch gathers
-    /// its rows, in one pass or two, and must come out exactly as the
-    /// sequential one, which sweeps the whole rows, does. The walk and the
-    /// gathered derivative are driven directly as well as through the
-    /// pooled entry points, which take them only on a target that gathers.
+    /// The whole-row sweeps of a transform alone, never tiled: the oracle
+    /// every tiled transform must match.
+    fn swept<S: Lane>(
+        field: &TransformField,
+        rows: &mut [Vec<S>],
+        origin: usize,
+        inverse: bool,
+        backend: crate::gf_simd::LinearBackend,
+    ) {
+        let schedule = Schedule {
+            origin,
+            inverse,
+            backend,
+            radix4: TransformField::fused(rows[0].len(), backend),
+        };
+        field.sweep_rows(rows, None, &schedule, &|| false).unwrap();
+    }
+
+    /// A transform or derivative of a bank beyond a tile runs it in column
+    /// tiles, in place, in one pass or two, and must come out exactly as the
+    /// whole-row sweeps leave it, on one worker and on a pool, over `Vec`
+    /// rows and over a [`RowBank`]'s, with and without known zeros, and with
+    /// each tile added into a sum. The tiled paths are driven directly as
+    /// well as through the entry points, which take them only on a target
+    /// that tiles.
     #[test]
-    fn pooled_walks_match_whole_row_sweeps() {
+    fn tiled_transforms_match_whole_row_sweeps() {
         use crate::gf_simd::LinearBackend;
         let never = || false;
         let pool = rayon::ThreadPoolBuilder::new()
@@ -3141,13 +3722,13 @@ mod tests {
             let mask = (field.order() - 1) as u16;
             // One pass with word windows of 1024, 4096 and 16384 symbols
             // and byte windows of 2048 and 8192, each shape ending in a
-            // short window; one pass over a bank the scratch would gather
-            // in three word windows, narrowed to share the rows across the
-            // three workers (and in two byte windows, so no byte walk); then
-            // two passes, over a domain of 10 levels, split evenly, and of
-            // 9, split unevenly, forward and inverse; and two passes over
-            // rows of 65 words of a 12-level domain, which hold fewer
-            // whole lines than workers, so the derivative is not gathered.
+            // short window; one pass over a bank tiled in three word
+            // windows, narrowed to share the rows across the three workers
+            // (and in two byte windows, so no pooled byte tiles); then two
+            // passes, over a domain of 10 levels, split evenly, and of 9,
+            // split unevenly, forward and inverse; and two passes over rows
+            // of 65 words of a 12-level domain, which hold fewer whole lines
+            // than workers, so the derivative is not tiled.
             for (count, width, passes) in [
                 (256usize, 6200usize, 1usize),
                 (64, 20000, 1),
@@ -3182,13 +3763,13 @@ mod tests {
                         assert_eq!(high.stride, low.rows);
                         assert_eq!(low.rows * high.rows, count);
                     }
-                    // Every pass has a task per worker, and the workers'
-                    // slabs together never outreach the bank.
+                    // Every pass has a tile per worker, and the workers'
+                    // tiles together never outreach the bank.
                     for (_, pass) in &walk.passes {
                         assert!(pass.tasks(count, width) >= threads, "{count}x{width}");
                         assert!(
                             threads * pass.rows * pass.window <= count * width.div_ceil(64) * 64,
-                            "{count}x{width}: {threads} slabs of {}x{}",
+                            "{count}x{width}: {threads} tiles of {}x{}",
                             pass.rows,
                             pass.window
                         );
@@ -3220,6 +3801,25 @@ mod tests {
                     .iter()
                     .map(|row| row.iter().map(|&v| v as u8).collect())
                     .collect();
+                // What every sum starts from, and a bank of the same rows.
+                let base: Vec<Vec<u16>> = (0..count)
+                    .map(|row| {
+                        random_bytes(width * 2, (row * 11 + 3) as u64)
+                            .chunks_exact(2)
+                            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]) & mask)
+                            .collect()
+                    })
+                    .collect();
+                let bank = |rows: &[Vec<u16>]| {
+                    let mut bank = RowBank::<u16>::zeroed(count, width).unwrap();
+                    for (to, from) in bank.rows_mut().into_iter().zip(rows) {
+                        to.copy_from_slice(from);
+                    }
+                    bank
+                };
+                let rows_of = |bank: &RowBank<u16>| -> Vec<Vec<u16>> {
+                    (0..count).map(|row| bank.row(row).to_vec()).collect()
+                };
                 for origin in [0, field.order() - count] {
                     for inverse in [false, true] {
                         for backend in [LinearBackend::Scalar, LinearBackend::Auto] {
@@ -3228,15 +3828,17 @@ mod tests {
                                  {inverse}, {backend:?}"
                             );
                             let mut expected = original.clone();
+                            swept(&field, &mut expected, origin, inverse, backend);
+                            let added: Vec<Vec<u16>> = base
+                                .iter()
+                                .zip(&expected)
+                                .map(|(a, b)| a.iter().zip(b).map(|(a, b)| a ^ b).collect())
+                                .collect();
+                            let mut rows = original.clone();
                             field
-                                .transform_with_backend(
-                                    &mut expected,
-                                    origin,
-                                    inverse,
-                                    backend,
-                                    &never,
-                                )
+                                .transform_with_backend(&mut rows, origin, inverse, backend, &never)
                                 .unwrap();
+                            assert_eq!(rows, expected, "alone, {what}");
                             let mut rows = original.clone();
                             field
                                 .transform_in_pool(
@@ -3251,6 +3853,29 @@ mod tests {
                                 )
                                 .unwrap();
                             assert_eq!(rows, expected, "pooled known zero, {what}");
+                            for pool in [None, Some(&pool)] {
+                                let mut rows = bank(&original);
+                                let mut sum = bank(&base);
+                                field
+                                    .transform_rows_adding(
+                                        &mut rows.rows_mut(),
+                                        Some(&zero),
+                                        origin,
+                                        inverse,
+                                        backend,
+                                        pool,
+                                        &mut sum.rows_mut(),
+                                        &never,
+                                    )
+                                    .unwrap();
+                                assert_eq!(rows_of(&rows), expected, "bank rows, {what}");
+                                assert_eq!(
+                                    rows_of(&sum),
+                                    added,
+                                    "bank sum, pool {}, {what}",
+                                    pool.is_some()
+                                );
+                            }
                             let schedule = Schedule {
                                 origin,
                                 inverse,
@@ -3259,22 +3884,41 @@ mod tests {
                             };
                             for zero in [None, Some(zero.as_slice())] {
                                 let flags = sweep_flags(count, zero, &schedule);
+                                let what = format!("zero {}, {what}", zero.is_some());
                                 let walk = Walk::of(count, width, 2, &schedule, threads).unwrap();
                                 let mut rows = original.clone();
+                                let mut sum = base.clone();
                                 field
-                                    .transform_walk(
+                                    .transform_tiles(
                                         &mut rows,
                                         &schedule,
                                         flags.as_deref(),
                                         &walk,
                                         &pool,
+                                        Some(&mut sum),
                                         &never,
                                     )
                                     .unwrap();
-                                assert_eq!(rows, expected, "walk, zero {}, {what}", zero.is_some());
+                                assert_eq!(rows, expected, "pooled tiles, {what}");
+                                assert_eq!(sum, added, "pooled tile sum, {what}");
+                                let walk = Walk::of(count, width, 2, &schedule, 1).unwrap();
+                                let mut rows = bank(&original);
+                                let mut sum = base.clone();
+                                field
+                                    .transform_tiles_alone(
+                                        &mut rows.rows_mut(),
+                                        &schedule,
+                                        flags.as_deref(),
+                                        &walk,
+                                        Some(&mut sum),
+                                        &never,
+                                    )
+                                    .unwrap();
+                                assert_eq!(rows_of(&rows), expected, "tiles alone, {what}");
+                                assert_eq!(sum, added, "tile sum alone, {what}");
                                 // Byte rows take windows twice as wide, which
                                 // at the shortest shape leave a worker idle,
-                                // so there is no byte walk of it.
+                                // so there are no pooled byte tiles of it.
                                 let byte_walk = (bits == 8)
                                     .then(|| Walk::of(count, width, 1, &schedule, threads))
                                     .flatten();
@@ -3284,21 +3928,17 @@ mod tests {
                                 if let Some(walk) = byte_walk {
                                     let mut rows = bytes.clone();
                                     field
-                                        .transform_walk(
+                                        .transform_tiles(
                                             &mut rows,
                                             &schedule,
                                             flags.as_deref(),
                                             &walk,
                                             &pool,
+                                            None::<&mut [Vec<u8>]>,
                                             &never,
                                         )
                                         .unwrap();
-                                    assert_eq!(
-                                        widen(&rows),
-                                        expected,
-                                        "byte walk, zero {}, {what}",
-                                        zero.is_some()
-                                    );
+                                    assert_eq!(widen(&rows), expected, "byte tiles, {what}");
                                 }
                             }
                             if bits == 8 {
@@ -3320,24 +3960,46 @@ mod tests {
                                     expected,
                                     "pooled bytes known zero, {what}"
                                 );
+                                let mut rows = bytes.clone();
+                                field
+                                    .transform_u8_rows(
+                                        &mut rows,
+                                        Some(&zero),
+                                        origin,
+                                        inverse,
+                                        backend,
+                                        None,
+                                        &never,
+                                    )
+                                    .unwrap();
+                                assert_eq!(widen(&rows), expected, "byte rows alone, {what}");
                             }
                         }
                     }
                 }
                 let mut expected = original.clone();
-                field.derivative(&mut expected, &never).unwrap();
+                derivative_rows(&mut expected, &never).unwrap();
                 let mut rows = original.clone();
                 field.derivative_in_pool(&mut rows, &pool, &never).unwrap();
                 assert_eq!(
                     rows, expected,
                     "pooled derivative, GF(2^{bits}) {count}x{width}"
                 );
+                let mut rows = bank(&original);
+                field
+                    .differentiate_rows(&mut rows.rows_mut(), Some(&pool), &never)
+                    .unwrap();
+                assert_eq!(
+                    rows_of(&rows),
+                    expected,
+                    "bank derivative, GF(2^{bits}) {count}x{width}"
+                );
                 if let Some(pass) = TransformField::derivative_pass::<u16>(count, width, threads) {
                     let mut rows = original.clone();
-                    TransformField::derivative_gathered(&mut rows, pass, &pool, &never).unwrap();
+                    TransformField::derivative_tiled(&mut rows, pass, &pool, &never).unwrap();
                     assert_eq!(
                         rows, expected,
-                        "gathered derivative, GF(2^{bits}) {count}x{width}"
+                        "tiled derivative, GF(2^{bits}) {count}x{width}"
                     );
                 }
                 if bits == 8 {
@@ -3358,13 +4020,57 @@ mod tests {
                         pass.window
                     );
                     let mut rows = bytes.clone();
-                    TransformField::derivative_gathered(&mut rows, pass, &pool, &never).unwrap();
+                    TransformField::derivative_tiled(&mut rows, pass, &pool, &never).unwrap();
                     assert_eq!(
                         widen(&rows),
                         expected,
-                        "gathered byte derivative, {count}x{width}"
+                        "tiled byte derivative, {count}x{width}"
                     );
                 }
+            }
+        }
+    }
+
+    /// A bank is zeroed, its rows are distinct, as wide as asked and in
+    /// order, and its allocation is whole pages aligned to one.
+    #[test]
+    fn row_banks_are_zeroed_aligned_rows() {
+        assert_eq!(RowBank::<u16>::allocation_bytes(3, 1000), Some(8192));
+        assert_eq!(RowBank::<u8>::allocation_bytes(0, 1000), Some(0));
+        assert_eq!(RowBank::<u16>::allocation_bytes(usize::MAX, 2), None);
+        // Rows of whole multiples of 512 bytes are a cache line apart more.
+        assert_eq!(RowBank::<u16>::allocation_bytes(64, 2048), Some(266_240));
+        assert_eq!(RowBank::<u8>::allocation_bytes(2, 512), Some(4096));
+        for (rows, width) in [(5usize, 1000usize), (4, 0), (0, 7), (1, 2048), (9, 256)] {
+            let mut bank = RowBank::<u16>::zeroed(rows, width).unwrap();
+            assert_eq!((bank.rows(), bank.width()), (rows, width));
+            let mut slices = bank.rows_mut();
+            assert_eq!(slices.len(), rows);
+            for (index, row) in slices.iter_mut().enumerate() {
+                assert_eq!(row.len(), width);
+                assert!(row.iter().all(|&value| value == 0));
+                row.fill(index as u16 + 1);
+            }
+            if let Some(first) = slices.first() {
+                assert!(
+                    (first.as_ptr() as usize).is_multiple_of(RowBank::<u16>::ALIGN) || width == 0
+                );
+            }
+            for pair in slices.windows(2) {
+                let gap = pair[1].as_ptr() as usize - pair[0].as_ptr() as usize;
+                let bytes = width * 2;
+                assert_eq!(
+                    gap,
+                    if bytes != 0 && bytes.is_multiple_of(512) {
+                        bytes + 64
+                    } else {
+                        bytes
+                    }
+                );
+            }
+            drop(slices);
+            for row in 0..rows {
+                assert!(bank.row(row).iter().all(|&value| value == row as u16 + 1));
             }
         }
     }
@@ -3647,8 +4353,8 @@ mod tests {
         };
         let shapes = (0..=9)
             .flat_map(|levels| WIDTHS.map(|width| (1usize << levels, width)))
-            // The last two are wide enough for the pool to take them slab by
-            // slab, in both lanes, with a short last slab.
+            // The last two are wide enough for the pool to take them tile by
+            // tile, in both lanes, with a short last tile.
             .chain([
                 (256, 300),
                 (128, 1031),

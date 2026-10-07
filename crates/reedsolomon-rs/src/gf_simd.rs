@@ -51,7 +51,8 @@ pub enum LinearKernel {
     /// x86 SSSE3 byte shuffles.
     Ssse3,
     /// x86 AVX2 byte shuffles, or GFNI affine transforms where
-    /// [`linear_uses_gfni`] holds.
+    /// [`linear_uses_gfni`] holds; the 8-bit shuffle maps run on 512-bit
+    /// vectors where [`linear_uses_avx512`] holds.
     Avx2,
 }
 
@@ -74,6 +75,64 @@ pub fn linear_uses_gfni() -> bool {
     #[allow(unreachable_code)]
     false
 }
+
+/// Whether [`LinearBackend::Auto`] maps run the wasm simd128 kernels: true
+/// exactly in a `wasm32` build with `-C target-feature=+simd128` (a
+/// `+relaxed-simd` build takes the relaxed swizzle in the same kernels).
+/// wasm has no runtime detection, so this is a property of the artifact.
+/// [`LinearBackend::kernel`] keeps reporting [`LinearKernel::Scalar`] there,
+/// as its variant set predates the wasm tier; this says which one runs.
+pub fn linear_uses_wasm_simd128() -> bool {
+    cfg!(all(target_arch = "wasm32", target_feature = "simd128"))
+}
+
+/// Whether the aarch64 kernels take their SVE2 form: the GF(2^8) and
+/// GF(2^16) region and grouped-input kernels and the [`LinearMap8`] and
+/// [`LinearMap16`] maps run as vector-length-agnostic SVE2 loops instead of
+/// NEON. Setting `WEAVER_SVE2=0` pins NEON so an SVE2 host can A/B the two
+/// without a rebuild. The variable is read once and cached; it never enables
+/// a kernel whose features are absent. Always false off aarch64.
+pub fn uses_sve2() -> bool {
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    return crate::sve2::enabled();
+    #[allow(unreachable_code)]
+    false
+}
+
+/// Whether the nibble-shuffle AVX2 kernels of [`LinearMap8`] run on 512-bit
+/// vectors; the remainder below 64 bytes stays on the 256-bit kernels. Only
+/// hosts without the GFNI form ([`linear_uses_gfni`]) take them: AVX512BW
+/// without GFNI, such as Skylake-SP. The affine form stays at 256 bits,
+/// where 512 measured a wash on Zen 4 and 2-4% slower end to end on
+/// Sapphire Rapids. Setting `WEAVER_LINEAR_AVX512=0` pins the 256-bit
+/// kernels so an AVX-512 host can A/B the two without a rebuild. The
+/// variable is read once and cached; it never enables a kernel whose
+/// features are absent.
+pub fn linear_uses_avx512() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        return *ENABLED.get_or_init(|| {
+            !std::env::var_os("WEAVER_LINEAR_AVX512").is_some_and(|v| v == "0")
+                && !linear_uses_gfni()
+                && is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("avx512bw")
+                && is_x86_feature_detected!("avx512vl")
+        });
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
+/// Shortest row, in bytes, a [`LinearMap8`] operation hands to its SVE2 form.
+/// Each SVE2 call loads its tables afresh, and on Neoverse V2 that set-up left
+/// 64-symbol transform rows about 1% behind NEON, while 4096-symbol rows
+/// gained. Shorter rows keep the NEON kernels. `map_in_place` always stays on
+/// NEON, which was 1-4% faster there at every measured size. [`LinearMap16`]
+/// has no SVE2 form: its fused butterfly and radix-4 measured 1-2% behind NEON
+/// on one thread and 1-5% ahead on four to eight, which is a wash.
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+const SVE2_MIN_ROW_BYTES: usize = 1024;
 
 impl LinearBackend {
     /// Resolve this selection on the executing CPU.
@@ -107,6 +166,9 @@ pub struct LinearMap16 {
     /// the AVX2 kernel takes its GFNI form.
     #[cfg(target_arch = "x86_64")]
     affine: Option<[u64; 4]>,
+    /// The wasm simd128 kernels run this map; see [`linear_uses_wasm_simd128`].
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    simd: bool,
 }
 
 impl LinearMap16 {
@@ -130,6 +192,8 @@ impl LinearMap16 {
             #[cfg(target_arch = "x86_64")]
             affine: (kernel == LinearKernel::Avx2 && linear_uses_gfni())
                 .then(|| affine_matrices_from_images(&basis)),
+            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+            simd: backend == LinearBackend::Auto,
         }
     }
 
@@ -185,6 +249,18 @@ impl LinearMap16 {
             }
             return symbols;
         }
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        if self.simd {
+            let bytes = source.len() / 16 * 32;
+            // SAFETY: as above; the prefix is whole 32-byte blocks.
+            let (source, destination) = unsafe {
+                (
+                    std::slice::from_raw_parts(source.as_ptr().cast::<u8>(), bytes),
+                    std::slice::from_raw_parts_mut(destination.as_mut_ptr().cast::<u8>(), bytes),
+                )
+            };
+            return fused16_wasm::accumulate(&self.tables, source, destination) / 2;
+        }
         let _ = (source, destination, self.kernel);
         0
     }
@@ -203,6 +279,16 @@ pub struct LinearMap8 {
     /// its GFNI form.
     #[cfg(target_arch = "x86_64")]
     affine: Option<u64>,
+    /// The wasm simd128 kernels run this map; see [`linear_uses_wasm_simd128`].
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    simd: bool,
+    /// Whether the NEON kernel takes its SVE2 form ([`uses_sve2`]).
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    sve2: bool,
+    /// Whether the AVX2 kernel runs on 512-bit vectors
+    /// ([`linear_uses_avx512`]).
+    #[cfg(target_arch = "x86_64")]
+    wide: bool,
 }
 
 impl LinearMap8 {
@@ -220,6 +306,12 @@ impl LinearMap8 {
         Self {
             #[cfg(target_arch = "x86_64")]
             affine: (kernel == LinearKernel::Avx2 && linear_uses_gfni()).then(|| plan.affine()),
+            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+            simd: backend == LinearBackend::Auto,
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            sve2: kernel == LinearKernel::Neon && uses_sve2(),
+            #[cfg(target_arch = "x86_64")]
+            wide: kernel == LinearKernel::Avx2 && linear_uses_avx512(),
             plan,
             kernel,
         }
@@ -235,14 +327,24 @@ impl LinearMap8 {
             // only after detecting GFNI, and each kernel bounds every load and
             // store by the equal slice lengths asserted above.
             #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            LinearKernel::Neon if self.sve2 && source.len() >= SVE2_MIN_ROW_BYTES => unsafe {
+                self.plan.sve2(source, destination)
+            },
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             LinearKernel::Neon => unsafe { self.plan.neon(source, destination) },
             #[cfg(target_arch = "x86_64")]
-            LinearKernel::Avx2 => match self.affine {
-                Some(affine) => unsafe { self.plan.accumulate_gfni(affine, source, destination) },
-                None => unsafe { self.plan.avx2(source, destination) },
+            LinearKernel::Avx2 => match (self.affine, self.wide) {
+                (Some(affine), _) => unsafe {
+                    self.plan.accumulate_gfni(affine, source, destination)
+                },
+                // SAFETY: `wide` is set only after detecting AVX512BW/VL.
+                (None, true) => unsafe { self.plan.avx512(source, destination) },
+                (None, false) => unsafe { self.plan.avx2(source, destination) },
             },
             #[cfg(target_arch = "x86_64")]
             LinearKernel::Ssse3 => unsafe { self.plan.ssse3(source, destination) },
+            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+            _ if self.simd => self.plan.wasm_simd128(source, destination),
             _ => self.plan.scalar(source, destination),
         }
     }
@@ -263,14 +365,23 @@ impl LinearMap8 {
             // SAFETY (all three): the kernel's ISA was detected when the map
             // was built, and both rows have the length asserted by the caller.
             #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            LinearKernel::Neon if self.sve2 && left.len() >= SVE2_MIN_ROW_BYTES => unsafe {
+                self.plan.butterfly_sve2::<INVERSE>(left, right)
+            },
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             LinearKernel::Neon => unsafe { self.plan.butterfly_neon::<INVERSE>(left, right) },
             #[cfg(target_arch = "x86_64")]
-            LinearKernel::Avx2 => match self.affine {
-                Some(affine) => unsafe { self.plan.butterfly_gfni::<INVERSE>(affine, left, right) },
-                None => unsafe { self.plan.butterfly_avx2::<INVERSE>(left, right) },
+            LinearKernel::Avx2 => match (self.affine, self.wide) {
+                (Some(affine), _) => unsafe {
+                    self.plan.butterfly_gfni::<INVERSE>(affine, left, right)
+                },
+                (None, true) => unsafe { self.plan.butterfly_avx512::<INVERSE>(left, right) },
+                (None, false) => unsafe { self.plan.butterfly_avx2::<INVERSE>(left, right) },
             },
             #[cfg(target_arch = "x86_64")]
             LinearKernel::Ssse3 => unsafe { self.plan.butterfly_ssse3::<INVERSE>(left, right) },
+            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+            _ if self.simd => self.plan.butterfly_wasm::<INVERSE>(left, right),
             _ => 0,
         };
         self.plan
@@ -295,28 +406,45 @@ impl LinearMap8 {
             // SAFETY (all three): as in `butterfly_in`; all four rows have
             // the length asserted by the caller.
             #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            LinearKernel::Neon if outer.sve2 && a.len() >= SVE2_MIN_ROW_BYTES => unsafe {
+                crate::gf8::MulPlan::radix4_sve2::<INVERSE>(
+                    plans,
+                    [&mut *a, &mut *b, &mut *c, &mut *d],
+                )
+            },
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             LinearKernel::Neon => unsafe {
                 crate::gf8::MulPlan::radix4_neon::<INVERSE>(
                     plans,
                     [&mut *a, &mut *b, &mut *c, &mut *d],
                 )
             },
+            // The three maps share one backend, so one map's width and form
+            // hold for all of them.
             #[cfg(target_arch = "x86_64")]
-            LinearKernel::Avx2 => match [outer.affine, inner[0].affine, inner[1].affine] {
-                [Some(o), Some(x), Some(y)] => unsafe {
-                    crate::gf8::MulPlan::radix4_gfni::<INVERSE>(
-                        plans,
-                        [o, x, y],
-                        [&mut *a, &mut *b, &mut *c, &mut *d],
-                    )
-                },
-                _ => unsafe {
-                    crate::gf8::MulPlan::radix4_avx2::<INVERSE>(
-                        plans,
-                        [&mut *a, &mut *b, &mut *c, &mut *d],
-                    )
-                },
-            },
+            LinearKernel::Avx2 => {
+                match ([outer.affine, inner[0].affine, inner[1].affine], outer.wide) {
+                    ([Some(o), Some(x), Some(y)], _) => unsafe {
+                        crate::gf8::MulPlan::radix4_gfni::<INVERSE>(
+                            plans,
+                            [o, x, y],
+                            [&mut *a, &mut *b, &mut *c, &mut *d],
+                        )
+                    },
+                    (_, true) => unsafe {
+                        crate::gf8::MulPlan::radix4_avx512::<INVERSE>(
+                            plans,
+                            [&mut *a, &mut *b, &mut *c, &mut *d],
+                        )
+                    },
+                    (_, false) => unsafe {
+                        crate::gf8::MulPlan::radix4_avx2::<INVERSE>(
+                            plans,
+                            [&mut *a, &mut *b, &mut *c, &mut *d],
+                        )
+                    },
+                }
+            }
             #[cfg(target_arch = "x86_64")]
             LinearKernel::Ssse3 => unsafe {
                 crate::gf8::MulPlan::radix4_ssse3::<INVERSE>(
@@ -324,6 +452,11 @@ impl LinearMap8 {
                     [&mut *a, &mut *b, &mut *c, &mut *d],
                 )
             },
+            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+            _ if outer.simd => crate::gf8::MulPlan::radix4_wasm::<INVERSE>(
+                plans,
+                [&mut *a, &mut *b, &mut *c, &mut *d],
+            ),
             _ => 0,
         };
         crate::gf8::MulPlan::radix4_scalar::<INVERSE>(
@@ -345,12 +478,15 @@ impl LinearMap8 {
             #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             LinearKernel::Neon => unsafe { self.plan.map_neon(row) },
             #[cfg(target_arch = "x86_64")]
-            LinearKernel::Avx2 => match self.affine {
-                Some(affine) => unsafe { self.plan.map_gfni(affine, row) },
-                None => unsafe { self.plan.map_avx2(row) },
+            LinearKernel::Avx2 => match (self.affine, self.wide) {
+                (Some(affine), _) => unsafe { self.plan.map_gfni(affine, row) },
+                (None, true) => unsafe { self.plan.map_avx512(row) },
+                (None, false) => unsafe { self.plan.map_avx2(row) },
             },
             #[cfg(target_arch = "x86_64")]
             LinearKernel::Ssse3 => unsafe { self.plan.map_ssse3(row) },
+            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+            _ if self.simd => self.plan.map_wasm(row),
             _ => 0,
         };
         self.plan.map_scalar(&mut row[done..]);
@@ -429,7 +565,8 @@ impl LinearMap16 {
         #[cfg_attr(
             not(any(
                 target_arch = "x86_64",
-                all(target_arch = "aarch64", target_endian = "little")
+                all(target_arch = "aarch64", target_endian = "little"),
+                all(target_arch = "wasm32", target_feature = "simd128")
             )),
             allow(unused_mut)
         )]
@@ -463,6 +600,18 @@ impl LinearMap16 {
                 }
             } / 2;
         }
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        if self.simd {
+            let bytes = left.len() * 2;
+            // SAFETY: as above.
+            let (l, r) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), bytes),
+                    std::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), bytes),
+                )
+            };
+            done = fused16_wasm::butterfly::<INVERSE>(&self.tables, l, r) / 2;
+        }
         for (l, r) in left[done..].iter_mut().zip(&mut right[done..]) {
             let (mut x, mut y) = (*l, *r);
             fused_butterfly!(INVERSE, x, y, self, std::ops::BitXor::bitxor, Self::apply);
@@ -492,7 +641,8 @@ impl LinearMap16 {
         #[cfg_attr(
             not(any(
                 target_arch = "x86_64",
-                all(target_arch = "aarch64", target_endian = "little")
+                all(target_arch = "aarch64", target_endian = "little"),
+                all(target_arch = "wasm32", target_feature = "simd128")
             )),
             allow(unused_mut)
         )]
@@ -526,6 +676,17 @@ impl LinearMap16 {
                     _ => 0,
                 }
             } / 2;
+        }
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        if outer.simd {
+            let bytes = a.len() * 2;
+            let tables = [&outer.tables, &inner_a.tables, &inner_b.tables];
+            // SAFETY: as above.
+            let view = |row: &mut [u16]| unsafe {
+                std::slice::from_raw_parts_mut(row.as_mut_ptr().cast::<u8>(), bytes)
+            };
+            let rows = [view(a), view(b), view(c), view(d)];
+            done = fused16_wasm::radix4::<INVERSE>(tables, rows) / 2;
         }
         for at in done..a.len() {
             let (mut w, mut x, mut y, mut z) = (a[at], b[at], c[at], d[at]);
@@ -616,6 +777,13 @@ impl LinearMap16 {
                     }
                     _ => 0,
                 }
+            } / 2;
+        }
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        if self.simd {
+            // SAFETY: the caller's bounds.
+            return unsafe {
+                fused16_wasm::map_region(&self.tables, source, destination, symbols * 2)
             } / 2;
         }
         let _ = (source, destination, symbols);
@@ -757,6 +925,196 @@ mod fused16_neon {
             at += 32;
         }
         at
+    }
+}
+
+/// Fused transform kernels for 16-bit symbols on wasm simd128, the NEON
+/// shape without `vld2q_u8`: two shuffles split a 32-byte block into its
+/// sixteen low and sixteen high bytes, so every swizzle works on all sixteen
+/// lanes, and two shuffles weave the planes back on store. Also the body of
+/// the GF(2^16) multiply-accumulate kernel, `mul_acc_region_wasm_simd128`.
+/// Compile-time selected: the module exists only in a `+simd128` build.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+mod fused16_wasm {
+    use super::MulTables;
+    use crate::gf8::fused_wasm::{drive, swizzle};
+    use core::arch::wasm32::*;
+
+    /// A block as its low-byte and high-byte planes.
+    type Planes = (v128, v128);
+
+    #[inline(always)]
+    fn tables(tables: &MulTables) -> [v128; 8] {
+        // SAFETY: each load reads exactly one 16-byte table.
+        std::array::from_fn(|at| unsafe { v128_load(tables.tables[at].as_ptr().cast()) })
+    }
+
+    #[inline(always)]
+    fn xor(a: Planes, b: Planes) -> Planes {
+        (v128_xor(a.0, b.0), v128_xor(a.1, b.1))
+    }
+
+    /// Product planes of sixteen symbols: `t[2n]` and `t[2n + 1]` map nibble
+    /// `n` of the symbol to its low and high product bytes.
+    #[inline(always)]
+    fn map(t: &[v128; 8], value: Planes) -> Planes {
+        let mask = u8x16_splat(0x0f);
+        let lo0 = v128_and(value.0, mask);
+        let lo1 = u8x16_shr(value.0, 4);
+        let hi0 = v128_and(value.1, mask);
+        let hi1 = u8x16_shr(value.1, 4);
+        (
+            v128_xor(
+                v128_xor(swizzle(t[0], lo0), swizzle(t[2], lo1)),
+                v128_xor(swizzle(t[4], hi0), swizzle(t[6], hi1)),
+            ),
+            v128_xor(
+                v128_xor(swizzle(t[1], lo0), swizzle(t[3], lo1)),
+                v128_xor(swizzle(t[5], hi0), swizzle(t[7], hi1)),
+            ),
+        )
+    }
+
+    /// Load `U` blocks of sixteen little-endian symbols, each split into
+    /// byte planes.
+    ///
+    /// # Safety
+    /// `at` must address `32 * U` readable bytes.
+    #[inline(always)]
+    unsafe fn load<const U: usize>(at: *const u8) -> [Planes; U] {
+        std::array::from_fn(|k| {
+            // SAFETY: the caller's bound; wasm loads have no alignment
+            // requirement.
+            let (a, b) = unsafe {
+                (
+                    v128_load(at.add(32 * k).cast()),
+                    v128_load(at.add(32 * k + 16).cast()),
+                )
+            };
+            (
+                i8x16_shuffle::<0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30>(a, b),
+                i8x16_shuffle::<1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31>(a, b),
+            )
+        })
+    }
+
+    /// Weave byte planes back into little-endian symbols; the exact inverse
+    /// of [`load`].
+    ///
+    /// # Safety
+    /// `at` must address `32 * U` writable bytes.
+    #[inline(always)]
+    unsafe fn store<const U: usize>(at: *mut u8, value: [Planes; U]) {
+        for (k, (lo, hi)) in value.into_iter().enumerate() {
+            let a = i8x16_shuffle::<0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23>(lo, hi);
+            let b = i8x16_shuffle::<8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31>(
+                lo, hi,
+            );
+            // SAFETY: the caller's bound.
+            unsafe {
+                v128_store(at.add(32 * k).cast(), a);
+                v128_store(at.add(32 * k + 16).cast(), b);
+            }
+        }
+    }
+
+    /// XOR the image of every symbol of `source` into `destination`; returns
+    /// the bytes processed, a multiple of 32. Slices must have equal lengths.
+    pub(super) fn accumulate(tables: &MulTables, source: &[u8], destination: &mut [u8]) -> usize {
+        assert_eq!(source.len(), destination.len());
+        let t = self::tables(tables);
+        let (from, to) = (source.as_ptr(), destination.as_mut_ptr());
+        // SAFETY: `drive!` hands each block an offset with `U` whole 32-byte
+        // blocks of both equally long, distinct slices from it.
+        drive!(source.len(), 32, |at, U| unsafe {
+            let value = load::<U>(from.add(at));
+            let mut sum = load::<U>(to.add(at));
+            for k in 0..U {
+                sum[k] = xor(sum[k], map(&t, value[k]));
+            }
+            store(to.add(at), sum);
+        })
+    }
+
+    /// Returns the bytes processed, a multiple of 32. Rows must have equal
+    /// lengths.
+    pub(super) fn butterfly<const INVERSE: bool>(
+        tables: &MulTables,
+        left: &mut [u8],
+        right: &mut [u8],
+    ) -> usize {
+        assert_eq!(left.len(), right.len());
+        let t = self::tables(tables);
+        let (lp, rp) = (left.as_mut_ptr(), right.as_mut_ptr());
+        // SAFETY: as in `accumulate`, for two distinct rows.
+        drive!(left.len(), 32, |at, U| unsafe {
+            let (mut l, mut r) = (load::<U>(lp.add(at)), load::<U>(rp.add(at)));
+            for k in 0..U {
+                let (mut x, mut y) = (l[k], r[k]);
+                crate::gf_simd::fused_butterfly!(INVERSE, x, y, &t, xor, map);
+                (l[k], r[k]) = (x, y);
+            }
+            store(lp.add(at), l);
+            store(rp.add(at), r);
+        })
+    }
+
+    /// Returns the bytes processed, a multiple of 32. All four rows must have
+    /// equal lengths.
+    pub(super) fn radix4<const INVERSE: bool>(
+        tables: [&MulTables; 3],
+        rows: [&mut [u8]; 4],
+    ) -> usize {
+        let [outer, inner_a, inner_b] = tables.map(self::tables);
+        let width = rows[0].len();
+        assert!(rows.iter().all(|row| row.len() == width));
+        let rows = rows.map(<[u8]>::as_mut_ptr);
+        // SAFETY: as in `accumulate`, for four distinct rows. One block at a
+        // time: see `UNROLL`.
+        drive!(width, 32, 1, |at, U| unsafe {
+            let mut values = rows.map(|row| load::<U>(row.add(at)));
+            for k in 0..U {
+                let [mut a, mut b, mut c, mut d] = values.map(|row| row[k]);
+                crate::gf_simd::fused_radix4!(
+                    INVERSE,
+                    [a, b, c, d],
+                    &outer,
+                    &inner_a,
+                    &inner_b,
+                    xor,
+                    map
+                );
+                for (row, value) in values.iter_mut().zip([a, b, c, d]) {
+                    row[k] = value;
+                }
+            }
+            for (row, value) in rows.into_iter().zip(values) {
+                store(row.add(at), value);
+            }
+        })
+    }
+
+    /// Stores the image of each symbol of `source` at the same position of
+    /// `destination`; returns the bytes processed, a multiple of 32.
+    ///
+    /// # Safety
+    /// `source` must address `bytes` readable bytes and `destination` as many
+    /// writable ones. The two are either the same pointer or do not overlap.
+    pub(super) unsafe fn map_region(
+        tables: &MulTables,
+        source: *const u8,
+        destination: *mut u8,
+        bytes: usize,
+    ) -> usize {
+        let t = self::tables(tables);
+        // SAFETY: both hold whole blocks from `at`; each block is loaded
+        // before it is stored, so a shared pointer is rewritten in place.
+        drive!(bytes, 32, |at, U| unsafe {
+            store(
+                destination.add(at),
+                load::<U>(source.add(at)).map(|value| map(&t, value)),
+            )
+        })
     }
 }
 
@@ -1296,51 +1654,78 @@ mod fused_tests {
     }
 
     /// Every kernel this host can run, scalar included, each with whether it
-    /// takes its GFNI form. The vector tiers are forced one at a time, so
-    /// SSSE3 is covered on an AVX2 host and the AVX2 shuffles on a GFNI host.
-    fn kernels() -> Vec<(LinearKernel, bool)> {
-        let mut kernels = vec![(LinearKernel::Scalar, false)];
+    /// takes its alternate form and whether its 8-bit maps run on 512-bit
+    /// vectors: GFNI for the x86 AVX2 kernel, the simd128 kernels for
+    /// `Scalar` in a `+simd128` wasm build (which has no `LinearKernel` of
+    /// its own), the 512-bit nibble shuffles for AVX2 on an AVX512BW host.
+    /// The vector tiers are forced one at a time, so SSSE3 is covered on an
+    /// AVX2 host and the AVX2 shuffles on a GFNI host.
+    fn kernels() -> Vec<(LinearKernel, bool, bool)> {
+        #[cfg_attr(
+            not(any(
+                target_arch = "x86_64",
+                all(target_arch = "aarch64", target_endian = "little"),
+                all(target_arch = "wasm32", target_feature = "simd128")
+            )),
+            allow(unused_mut)
+        )]
+        let mut kernels = vec![(LinearKernel::Scalar, false, false)];
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        kernels.push((LinearKernel::Scalar, true, false));
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         if std::arch::is_aarch64_feature_detected!("neon") {
-            kernels.push((LinearKernel::Neon, false));
+            kernels.push((LinearKernel::Neon, false, false));
         }
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("ssse3") {
-                kernels.push((LinearKernel::Ssse3, false));
+                kernels.push((LinearKernel::Ssse3, false, false));
             }
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("ssse3") {
-                kernels.push((LinearKernel::Avx2, false));
-                if is_x86_feature_detected!("gfni") {
-                    kernels.push((LinearKernel::Avx2, true));
+                kernels.push((LinearKernel::Avx2, false, false));
+                let gfni = is_x86_feature_detected!("gfni");
+                if gfni {
+                    kernels.push((LinearKernel::Avx2, true, false));
+                }
+                if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vl") {
+                    kernels.push((LinearKernel::Avx2, false, true));
+                } else {
+                    eprintln!("SKIP fused_tests 512-bit 8-bit tiers: host lacks avx512bw+vl");
                 }
             }
-            if !kernels.contains(&(LinearKernel::Avx2, true)) {
+            if !kernels.contains(&(LinearKernel::Avx2, true, false)) {
                 eprintln!("SKIP fused_tests GFNI affine tier: host lacks gfni+avx2+ssse3");
             }
         }
         kernels
     }
 
-    /// A 16-bit map forced onto one entry of [`kernels`].
-    fn map16(basis: [u16; 16], (kernel, gfni): (LinearKernel, bool)) -> LinearMap16 {
+    /// A 16-bit map forced onto one entry of [`kernels`]; the 16-bit maps
+    /// have no 512-bit form, so the width flag is ignored.
+    fn map16(basis: [u16; 16], (kernel, gfni, _): (LinearKernel, bool, bool)) -> LinearMap16 {
         let _ = gfni;
         LinearMap16 {
             kernel,
             #[cfg(target_arch = "x86_64")]
             affine: gfni.then(|| affine_matrices_from_images(&basis)),
+            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+            simd: gfni,
             ..LinearMap16::new(basis, LinearBackend::Scalar)
         }
     }
 
     /// An 8-bit map forced onto one entry of [`kernels`].
-    fn map8(basis: [u8; 8], (kernel, gfni): (LinearKernel, bool)) -> LinearMap8 {
-        let _ = gfni;
+    fn map8(basis: [u8; 8], (kernel, gfni, wide): (LinearKernel, bool, bool)) -> LinearMap8 {
+        let _ = (gfni, wide);
         let map = LinearMap8::new(basis, LinearBackend::Scalar);
         LinearMap8 {
             kernel,
             #[cfg(target_arch = "x86_64")]
             affine: gfni.then(|| map.plan.affine()),
+            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+            simd: gfni,
+            #[cfg(target_arch = "x86_64")]
+            wide,
             ..map
         }
     }
@@ -1433,7 +1818,10 @@ mod fused_tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_radix4_quad_missing_one_affine_matrix_matches_the_scalar_tier() {
-        let (gfni, shuffle) = ((LinearKernel::Avx2, true), (LinearKernel::Avx2, false));
+        let (gfni, shuffle) = (
+            (LinearKernel::Avx2, true, false),
+            (LinearKernel::Avx2, false, false),
+        );
         if !kernels().contains(&gfni) {
             eprintln!(
                 "SKIP a_radix4_quad_missing_one_affine_matrix_matches_the_scalar_tier: host \
@@ -1441,7 +1829,15 @@ mod fused_tests {
             );
             return;
         }
-        let scalar = (LinearKernel::Scalar, false);
+        let scalar = (LinearKernel::Scalar, false, false);
+        // The 512-bit quad, where the host has it: the outer map decides the
+        // width for all three, and an affine inner map still takes the
+        // shuffle form there (only a quad of three affine maps runs GFNI).
+        let wide = [
+            (LinearKernel::Avx2, false, true),
+            (LinearKernel::Avx2, true, false),
+        ];
+        let wide = kernels().contains(&wide[0]).then_some(wide);
         let lengths = [
             0usize, 1, 7, 15, 16, 17, 31, 32, 33, 47, 63, 64, 65, 95, 96, 97, 127, 129, 1031,
         ];
@@ -1461,6 +1857,13 @@ mod fused_tests {
             map8(basis8[1], shuffle),
             map8(basis8[2], gfni),
         ];
+        let m8_wide = wide.map(|[gfni, shuffle]| {
+            [
+                map8(basis8[0], gfni),
+                map8(basis8[1], shuffle),
+                map8(basis8[2], gfni),
+            ]
+        });
         let o16 = basis16.map(|basis| map16(basis, scalar));
         let o8 = basis8.map(|basis| map8(basis, scalar));
         for &length in &lengths {
@@ -1489,12 +1892,18 @@ mod fused_tests {
                     assert_eq!(actual, expected, "16-bit radix-4, {what}");
 
                     let mut actual = rows8.clone();
-                    let mut expected = rows8;
+                    let mut expected = rows8.clone();
                     let [a, b, c, d] = actual.each_mut().map(Vec::as_mut_slice);
                     LinearMap8::radix4(&m8[0], [&m8[1], &m8[2]], [a, b, c, d], inverse);
                     let [a, b, c, d] = expected.each_mut().map(Vec::as_mut_slice);
                     LinearMap8::radix4(&o8[0], [&o8[1], &o8[2]], [a, b, c, d], inverse);
                     assert_eq!(actual, expected, "8-bit radix-4, {what}");
+                    if let Some(m8) = &m8_wide {
+                        let mut actual = rows8;
+                        let [a, b, c, d] = actual.each_mut().map(Vec::as_mut_slice);
+                        LinearMap8::radix4(&m8[0], [&m8[1], &m8[2]], [a, b, c, d], inverse);
+                        assert_eq!(actual, expected, "8-bit 512-bit radix-4, {what}");
+                    }
                 }
             }
         }
@@ -2010,21 +2419,12 @@ pub fn mul_acc_region(factor: u16, src: &[u8], dst: &mut [u8]) {
     let tables = precompute_mul_tables(factor);
 
     // wasm dispatch is purely compile-time: the SIMD artifact is built with a
-    // fixed `target_feature` set, so the flavor is selected here, not at
-    // runtime. relaxed-simd takes precedence over plain simd128 (it is the
-    // richer build); wasm without simd128 falls through to the scalar tail.
-    #[cfg(all(target_arch = "wasm32", target_feature = "relaxed-simd"))]
+    // fixed `target_feature` set, so the tier is selected here, not at
+    // runtime. A `+relaxed-simd` build takes the relaxed swizzle inside the
+    // same kernel; wasm without simd128 falls through to the scalar tail.
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     {
-        unsafe { mul_acc_region_wasm_simd128::<true>(&tables, src, dst) };
-        return;
-    }
-    #[cfg(all(
-        target_arch = "wasm32",
-        target_feature = "simd128",
-        not(target_feature = "relaxed-simd")
-    ))]
-    {
-        unsafe { mul_acc_region_wasm_simd128::<false>(&tables, src, dst) };
+        mul_acc_region_wasm_simd128(&tables, src, dst);
         return;
     }
 
@@ -2042,6 +2442,16 @@ pub fn mul_acc_region(factor: u16, src: &[u8], dst: &mut [u8]) {
             unsafe { mul_acc_region_ssse3(&tables, src, dst) };
             return;
         }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    if crate::sve2::enabled() {
+        // SAFETY: SVE2 was detected; the slices are distinct, of the asserted
+        // equal and even length.
+        unsafe {
+            crate::sve2::map16_acc(&tables.tables, src.as_ptr(), dst.as_mut_ptr(), src.len())
+        };
+        return;
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -2264,6 +2674,24 @@ pub fn mul_acc_input_batch(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
             unsafe { mul_acc_input_batch_avx2(dst, factors_and_srcs) };
             return;
         }
+    }
+
+    // SVE2 takes the table batches; above three sources the NEON CLMUL
+    // kernel below stays faster on a 128-bit SVE2 core (see
+    // `mul_acc_input_batch_sve2`).
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    if crate::sve2::enabled() && !(factors_and_srcs.len() > 3 && clmul_batch_enabled()) {
+        // SAFETY: SVE2 was detected; every source has the destination's
+        // length and is a shared borrow distinct from it.
+        unsafe {
+            mul_acc_input_batch_sve2(
+                dst,
+                factors_and_srcs
+                    .iter()
+                    .map(|fs| (fs.factor, None, fs.src.as_ptr())),
+            )
+        };
+        return;
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -3889,6 +4317,20 @@ pub fn mul_acc_input_batch_prepared(dst: &mut [u8], factors_and_srcs: &[Prepared
         }
     }
 
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    if crate::sve2::enabled() && !(factors_and_srcs.len() > 3 && clmul_batch_enabled()) {
+        // SAFETY: as in `mul_acc_input_batch`.
+        unsafe {
+            mul_acc_input_batch_sve2(
+                dst,
+                factors_and_srcs
+                    .iter()
+                    .map(|fs| (fs.prepared.factor, Some(fs.prepared), fs.src.as_ptr())),
+            )
+        };
+        return;
+    }
+
     #[cfg(target_arch = "aarch64")]
     {
         // CLMUL preparation is six broadcasts, so larger prepared batches use
@@ -4577,121 +5019,26 @@ unsafe fn mul_acc_region_neon(tables: &MulTables, src: &[u8], dst: &mut [u8]) {
 }
 
 // ---------------------------------------------------------------------------
-// wasm simd128 kernel: 16 bytes (8 GF elements) per iteration
+// wasm simd128 kernel: 32 bytes (16 GF elements) per iteration
 //
-// Uses the same split-nibble algorithm as the NEON kernel above. Eight
-// precomputed 16-byte
-// tables map each of the four input nibbles to its low/high product byte, and
-// the eight table lookups are byte swizzles (wasm's PSHUFB/VTBL equivalent).
+// The split-nibble algorithm of the NEON kernel above, on all sixteen lanes:
+// two shuffles split a 32-byte block into its sixteen low and sixteen high
+// bytes, eight swizzles produce sixteen products, and two shuffles weave them
+// back. The earlier form loaded 16 bytes and split them into planes of which
+// only the low eight lanes were consumed, so half of every swizzle was
+// discarded; this one does the same eight swizzles per 32 bytes instead.
+// The body is `fused16_wasm::accumulate`, shared with the FFT linear maps.
 //
-// Two flavors share one body via the `$lookup` macro parameter:
-//   * `i8x16_swizzle` (simd128)            — out-of-range indices yield 0, but
-//     our nibble indices are pre-masked to 0..=15 so no lane is ever cleared.
-//   * `i8x16_relaxed_swizzle` (relaxed-simd) — identical here; it merely drops
-//     the x86 lane-clamp that the plain form must emit, since we already
-//     guarantee in-range indices. Same bytes out, fewer instructions in.
-//
-// Lane bookkeeping mirrors NEON exactly:
-//   * deinterleave lo/hi bytes: `vuzp1q_u8`/`vuzp2q_u8(s, s)` become
-//     `i8x16_shuffle` gathering the even/odd byte lanes into lanes 0..=7 (only
-//     those eight are consumed downstream, one per GF word).
-//   * reinterleave: `vzip1q_u8(lo, hi)` becomes an `i8x16_shuffle` weaving
-//     result_lo[k]/result_hi[k] into [rlo0, rhi0, rlo1, rhi1, ...].
-//   * `vshrq_n_u8(x, 4)` becomes `u8x16_shr(x, 4)` (logical, u8x16.shr_u).
+// A `+relaxed-simd` build takes `i8x16.relaxed_swizzle`, identical here: the
+// nibble indices are already in 0..=15 (see `gf8::fused_wasm::swizzle`).
 //
 // Dispatch is compile-time: the artifact is built with `+simd128` (and
 // optionally `+relaxed-simd`), so there is no runtime feature detection.
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-unsafe fn mul_acc_region_wasm_simd128<const RELAXED: bool>(
-    tables: &MulTables,
-    src: &[u8],
-    dst: &mut [u8],
-) {
-    use core::arch::wasm32::*;
-
-    let len = src.len();
-    let mut offset = 0usize;
-
-    // `i8x16_relaxed_swizzle` is only defined when the relaxed-simd feature is
-    // enabled, so the `RELAXED` arm is compiled out entirely without it.
-    macro_rules! lookup {
-        ($table:expr, $idx:expr) => {{
-            #[cfg(target_feature = "relaxed-simd")]
-            {
-                if RELAXED {
-                    i8x16_relaxed_swizzle($table, $idx)
-                } else {
-                    i8x16_swizzle($table, $idx)
-                }
-            }
-            #[cfg(not(target_feature = "relaxed-simd"))]
-            {
-                let _ = RELAXED;
-                i8x16_swizzle($table, $idx)
-            }
-        }};
-    }
-
-    unsafe {
-        let mask_0f = u8x16_splat(0x0F);
-
-        let t0 = v128_load(tables.tables[0].as_ptr() as *const v128);
-        let t1 = v128_load(tables.tables[1].as_ptr() as *const v128);
-        let t2 = v128_load(tables.tables[2].as_ptr() as *const v128);
-        let t3 = v128_load(tables.tables[3].as_ptr() as *const v128);
-        let t4 = v128_load(tables.tables[4].as_ptr() as *const v128);
-        let t5 = v128_load(tables.tables[5].as_ptr() as *const v128);
-        let t6 = v128_load(tables.tables[6].as_ptr() as *const v128);
-        let t7 = v128_load(tables.tables[7].as_ptr() as *const v128);
-
-        while offset + 16 <= len {
-            let s = v128_load(src.as_ptr().add(offset) as *const v128);
-            let d = v128_load(dst.as_ptr().add(offset) as *const v128);
-
-            // Deinterleave: gather even (lo) / odd (hi) bytes into lanes 0..=7.
-            // Only the low eight lanes are consumed downstream, mirroring the
-            // NEON `vuzp1q_u8`/`vuzp2q_u8(s, s)` pair.
-            let lo_bytes =
-                i8x16_shuffle::<0, 2, 4, 6, 8, 10, 12, 14, 0, 2, 4, 6, 8, 10, 12, 14>(s, s);
-            let hi_bytes =
-                i8x16_shuffle::<1, 3, 5, 7, 9, 11, 13, 15, 1, 3, 5, 7, 9, 11, 13, 15>(s, s);
-
-            // Extract nibbles.
-            let lo_n0 = v128_and(lo_bytes, mask_0f);
-            let lo_n1 = v128_and(u8x16_shr(lo_bytes, 4), mask_0f);
-            let hi_n0 = v128_and(hi_bytes, mask_0f);
-            let hi_n1 = v128_and(u8x16_shr(hi_bytes, 4), mask_0f);
-
-            // 8 lookups.
-            let p0_lo = lookup!(t0, lo_n0);
-            let p0_hi = lookup!(t1, lo_n0);
-            let p1_lo = lookup!(t2, lo_n1);
-            let p1_hi = lookup!(t3, lo_n1);
-            let p2_lo = lookup!(t4, hi_n0);
-            let p2_hi = lookup!(t5, hi_n0);
-            let p3_lo = lookup!(t6, hi_n1);
-            let p3_hi = lookup!(t7, hi_n1);
-
-            // XOR contributions.
-            let result_lo = v128_xor(v128_xor(p0_lo, p1_lo), v128_xor(p2_lo, p3_lo));
-            let result_hi = v128_xor(v128_xor(p0_hi, p1_hi), v128_xor(p2_hi, p3_hi));
-
-            // Reinterleave: [rlo0, rhi0, rlo1, rhi1, ...] (lanes 16..=23 pick the
-            // low bytes of result_hi), mirroring NEON `vzip1q_u8`.
-            let product = i8x16_shuffle::<0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23>(
-                result_lo, result_hi,
-            );
-
-            // XOR-accumulate.
-            let result = v128_xor(d, product);
-            v128_store(dst.as_mut_ptr().add(offset) as *mut v128, result);
-
-            offset += 16;
-        }
-    }
-
-    // Scalar tail.
-    if offset < len {
+fn mul_acc_region_wasm_simd128(tables: &MulTables, src: &[u8], dst: &mut [u8]) {
+    let offset = fused16_wasm::accumulate(tables, src, dst);
+    // Scalar tail (fewer than sixteen symbols).
+    if offset < src.len() {
         mul_acc_region_scalar(tables.factor, &src[offset..], &mut dst[offset..]);
     }
 }
@@ -7603,6 +7950,51 @@ unsafe fn mul_acc_multi_region_neon(factors_and_dsts: &mut [FactorDst<'_>], src:
 // kernels.
 // ---------------------------------------------------------------------------
 
+/// The SVE2 grouped-input table kernel over lane-major sources, in groups
+/// of [`crate::sve2::GF16_TABLE_BATCH`]. Zero factors are skipped; a
+/// prepared factor lends its cached tables. It runs where the dispatch would
+/// otherwise take the NEON table kernel: three sources or fewer, or every
+/// batch under `WEAVER_GF16_CLMUL_BATCH=0`. Above three sources the NEON
+/// CLMUL kernel stays: on Neoverse V2 it beat both this kernel and an SVE2
+/// CLMUL port by 13-20%.
+///
+/// # Safety
+/// SVE2 must be available; every source pointer must address `dst.len()`
+/// readable bytes that do not overlap `dst`.
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+unsafe fn mul_acc_input_batch_sve2<'a>(
+    dst: &mut [u8],
+    inputs: impl Iterator<Item = (u16, Option<&'a PreparedInputFactor>, *const u8)>,
+) {
+    use crate::sve2::GF16_TABLE_BATCH;
+    let mut inputs = inputs.filter(|(factor, _, _)| *factor != 0);
+    let mut sources = [std::ptr::null(); GF16_TABLE_BATCH];
+    let mut tables = [[[0; 16]; 8]; GF16_TABLE_BATCH];
+    loop {
+        let mut count = 0;
+        for (factor, prepared, source) in inputs.by_ref().take(GF16_TABLE_BATCH) {
+            sources[count] = source;
+            tables[count] = match prepared {
+                Some(prepared) => prepared.arm_tables().tables,
+                None => precompute_mul_tables(factor).tables,
+            };
+            count += 1;
+        }
+        if count == 0 {
+            return;
+        }
+        // SAFETY: the caller's contract, for `count` sources.
+        unsafe {
+            crate::sve2::gf16_batch_tables(
+                dst.as_mut_ptr(),
+                dst.len(),
+                &tables[..count],
+                &sources[..count],
+            );
+        }
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 unsafe fn mul_acc_input_batch_neon(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
     use std::arch::aarch64::*;
@@ -8038,6 +8430,37 @@ mod tests {
                     dst_dispatched, dst_scalar,
                     "mismatch for factor={factor:#06x} size={size}"
                 );
+            }
+        }
+    }
+
+    /// The dispatched tier against the scalar one on pseudo-random bytes at
+    /// every even length up to 160 (all tails of the 16-, 32-, 64- and
+    /// 128-byte kernels), unaligned starts, and factors 0, 1 and a spread.
+    #[test]
+    fn dispatched_matches_scalar_at_every_alignment() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let bytes: Vec<u8> = (0..512)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 32) as u8
+            })
+            .collect();
+        for factor in [0u16, 1, 2, 3, 0x100, 0x1234, 0x8000, 0xbeef, 0xffff] {
+            for offset in [0usize, 1, 3] {
+                for size in (0..=160).step_by(2) {
+                    let src = &bytes[offset..offset + size];
+                    let start = &bytes[200 + offset..200 + offset + size];
+                    let (mut dispatched, mut scalar) = (start.to_vec(), start.to_vec());
+                    mul_acc_region(factor, src, &mut dispatched);
+                    mul_acc_region_scalar(factor, src, &mut scalar);
+                    assert_eq!(
+                        dispatched, scalar,
+                        "factor {factor:#06x}, offset {offset}, size {size}"
+                    );
+                }
             }
         }
     }

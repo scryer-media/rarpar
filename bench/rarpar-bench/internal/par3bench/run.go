@@ -122,7 +122,20 @@ type Options struct {
 	Timeout time.Duration
 	// ReferenceTimeout bounds every reference process (default: Timeout).
 	ReferenceTimeout time.Duration
-	Log              io.Writer
+	// Targets are the storage locations every row runs on, interleaved.
+	// Empty means one unnamed target at Work.
+	Targets []Target
+	// Rows selects the timed row kinds (KnownRowKinds). Empty means the
+	// reference and rarpar, plus engine when EngineWorkers is set.
+	Rows []string
+	// EngineWorkers adds timed engine_perf rows (needs EnginePerf), one per
+	// worker count and durability; EngineVariants adds env-variant rows of
+	// them, as KernelVariants does for rarpar.
+	EngineWorkers  []int
+	EngineVariants []KernelVariant
+	// DropCaches drops the page cache before every timed run (Linux, root).
+	DropCaches bool
+	Log        io.Writer
 }
 
 // Variant is one benchmarked tool configuration.
@@ -136,6 +149,9 @@ type Variant struct {
 	// the reference. Results written before durability rows existed have it
 	// empty on rarpar rows too; those ran durable.
 	Durability string `json:"durability,omitempty"`
+	// Target is the storage target the row runs on; its name is the
+	// suffix after "@" in Name. Empty for a run with one unnamed target.
+	Target string `json:"target,omitempty"`
 }
 
 // EffectiveDurability is the variant's durability mode: "" for the
@@ -162,7 +178,8 @@ func (v Variant) dirName() string {
 	if v.Tool == ToolReference {
 		return "ref"
 	}
-	return strings.TrimPrefix(v.Name, "rarpar-")
+	name, _, _ := strings.Cut(v.Name, "@")
+	return strings.TrimPrefix(name, "rarpar-")
 }
 
 // Variants expands the reference plus every candidate worker/kernel row, each
@@ -198,6 +215,63 @@ func Variants(workers []int, kernels []KernelVariant, durabilities []string) []V
 		}
 	}
 	return variants
+}
+
+// EngineRows lists the timed engine_perf rows: one per worker count and
+// durability, then one per env variant, named like the rarpar rows.
+func EngineRows(workers []int, variants []KernelVariant, durabilities []string) []Variant {
+	if len(durabilities) == 0 {
+		durabilities = KnownDurabilities
+	}
+	var rows []Variant
+	add := func(base Variant) {
+		for _, durability := range KnownDurabilities {
+			if !contains(durabilities, durability) {
+				continue
+			}
+			row := base
+			row.Durability = durability
+			if durability != DurabilityDurable {
+				row.Name += "-" + durability
+			}
+			rows = append(rows, row)
+		}
+	}
+	for _, count := range workers {
+		add(Variant{Name: fmt.Sprintf("engine-w%d", count), Tool: ToolEngine, Workers: count})
+	}
+	for _, variant := range variants {
+		for _, count := range workers {
+			add(Variant{Name: fmt.Sprintf("engine-w%d-%s", count, variant.Name), Tool: ToolEngine,
+				Workers: count, Kernel: variant.Name, Env: variant.Env})
+		}
+	}
+	return rows
+}
+
+// MatrixRows is every timed row of a run: the CLI rows and the engine rows,
+// filtered to the selected kinds, then once per named target ("NAME@TARGET").
+func MatrixRows(workers []int, kernels []KernelVariant, durabilities []string,
+	engineWorkers []int, engineVariants []KernelVariant, kinds []string, targets []Target) []Variant {
+	all := append(Variants(workers, kernels, durabilities), EngineRows(engineWorkers, engineVariants, durabilities)...)
+	var rows []Variant
+	for _, row := range all {
+		if len(kinds) == 0 || contains(kinds, row.Tool) {
+			rows = append(rows, row)
+		}
+	}
+	if len(targets) == 0 || (len(targets) == 1 && targets[0].Name == "") {
+		return rows
+	}
+	var expanded []Variant
+	for _, target := range targets {
+		for _, row := range rows {
+			row.Name += "@" + target.Name
+			row.Target = target.Name
+			expanded = append(expanded, row)
+		}
+	}
+	return expanded
 }
 
 // ValidatePinCPUs accepts an empty value, one CPU "N", or an inclusive range
@@ -308,6 +382,17 @@ type RunRecord struct {
 	Repeat    int    `json:"repeat"`
 	Position  int    `json:"position"`
 	Command   string `json:"command"`
+	// Target and Storage say where the run's bytes lived; NFS is the NFS
+	// client's counters moved during the run (only on an NFS target),
+	// Engine the engine's own disk-work counters (engine rows only), and
+	// LoadAverage the 1-minute load average of the machine the harness ran
+	// on, sampled just before the run.
+	Target      string          `json:"target,omitempty"`
+	Storage     *Storage        `json:"storage,omitempty"`
+	NFS         *NFSStats       `json:"nfs,omitempty"`
+	Engine      *EngineCounters `json:"engine,omitempty"`
+	LoadAverage float64         `json:"load_average,omitempty"`
+	DropCaches  bool            `json:"drop_caches,omitempty"`
 	Measurement
 	// Status is "ok", "failed" or "dnf" (reference only). A reference run is
 	// "failed" when it ran but contradicted itself or the harness
@@ -379,17 +464,24 @@ type Results struct {
 	BufferedArgs        map[string][]string `json:"buffered_args,omitempty"`
 	BufferedUnsupported []string            `json:"buffered_unsupported,omitempty"`
 	// TimeoutSeconds / ReferenceTimeoutSeconds bound each timed process.
-	TimeoutSeconds          float64            `json:"timeout_seconds,omitempty"`
-	ReferenceTimeoutSeconds float64            `json:"reference_timeout_seconds,omitempty"`
-	Reference               Binary             `json:"reference"`
-	Candidate               Binary             `json:"candidate"`
-	EnginePerf              *Binary            `json:"engine_perf,omitempty"`
-	Variants                []Variant          `json:"variants"`
-	Configs                 []ConfigSummary    `json:"configs"`
-	Runs                    []RunRecord        `json:"runs"`
-	IOCounts                []IOCountRecord    `json:"io_counts,omitempty"`
-	EnginePerfRuns          []EnginePerfRecord `json:"engine_perf_runs,omitempty"`
-	Notes                   []string           `json:"notes,omitempty"`
+	TimeoutSeconds          float64   `json:"timeout_seconds,omitempty"`
+	ReferenceTimeoutSeconds float64   `json:"reference_timeout_seconds,omitempty"`
+	Reference               Binary    `json:"reference"`
+	Candidate               Binary    `json:"candidate"`
+	EnginePerf              *Binary   `json:"engine_perf,omitempty"`
+	Variants                []Variant `json:"variants"`
+	// Targets describes each storage target's mount; DropCaches records
+	// that every timed run started with an empty page cache.
+	Targets        []Storage          `json:"targets,omitempty"`
+	DropCaches     bool               `json:"drop_caches,omitempty"`
+	Rows           []string           `json:"rows,omitempty"`
+	EngineWorkers  []int              `json:"engine_workers,omitempty"`
+	EngineVariants []KernelVariant    `json:"engine_variants,omitempty"`
+	Configs        []ConfigSummary    `json:"configs"`
+	Runs           []RunRecord        `json:"runs"`
+	IOCounts       []IOCountRecord    `json:"io_counts,omitempty"`
+	EnginePerfRuns []EnginePerfRecord `json:"engine_perf_runs,omitempty"`
+	Notes          []string           `json:"notes,omitempty"`
 	// DNF lists every reference row that did not finish. DNF rows do not
 	// change Status.
 	DNF      []string `json:"dnf,omitempty"`
@@ -406,6 +498,19 @@ type runner struct {
 	// finished marks config/op/variant rows that already ended in DNF; their
 	// remaining runs are skipped.
 	finished map[string]bool
+	// storage describes options.Targets, index for index.
+	storage []Storage
+}
+
+// targetState is one target's directories for the configuration being run.
+type targetState struct {
+	storage   Storage
+	dataDir   string
+	canonical string
+	stageRoot string
+	// damaged holds a damaged copy of the dataset that read-only damaged
+	// stages hard-link from, so they need no private copy per run.
+	damaged string
 }
 
 func (r *runner) logf(format string, args ...any) {
@@ -442,17 +547,35 @@ func RunSuite(ctx context.Context, options Options) (*Results, error) {
 		PinCPUs:        options.PinCPUs,
 		KernelVariants: options.KernelVariants,
 		CandidateArgs:  options.CandidateArgs,
-		Variants:       Variants(options.Workers, options.KernelVariants, options.Durabilities),
+		Variants: MatrixRows(options.Workers, options.KernelVariants, options.Durabilities,
+			options.EngineWorkers, options.EngineVariants, options.Rows, options.Targets),
 		Durabilities:   options.Durabilities,
+		DropCaches:     options.DropCaches,
+		Rows:           options.Rows,
+		EngineWorkers:  options.EngineWorkers,
+		EngineVariants: options.EngineVariants,
 		BufferedArgs:   map[string][]string{},
 
 		TimeoutSeconds:          options.Timeout.Seconds(),
 		ReferenceTimeoutSeconds: options.ReferenceTimeout.Seconds(),
 	}
 	r := &runner{options: options, results: results, journal: journal, guards: map[string]Binary{}, finished: map[string]bool{}}
-	for _, warning := range referencePathWarnings(options.Profile, options.Work) {
-		r.logf("WARNING: %s", warning)
-		results.Notes = append(results.Notes, "work path: "+warning)
+	for i, target := range options.Targets {
+		if err := os.MkdirAll(target.Work, 0o755); err != nil {
+			return nil, err
+		}
+		storage := DescribeStorage(target)
+		r.storage = append(r.storage, storage)
+		results.Targets = append(results.Targets, storage)
+		r.logf("target %q: %s at %s (%s) %s", target.Name, storage.StorageLabel(), storage.MountPoint, storage.Source, storage.NFSOptions)
+		if i > 0 && !contains(options.Rows, ToolReference) {
+			// Only the first target's work path seeds the canonical set.
+			continue
+		}
+		for _, warning := range referencePathWarnings(options.Profile, target.Work) {
+			r.logf("WARNING: %s", warning)
+			results.Notes = append(results.Notes, "work path: "+warning)
+		}
 	}
 	if options.PinCPUs != "" {
 		results.PinApplied = PinSupported()
@@ -525,8 +648,8 @@ func validateOptions(options *Options) error {
 	if options.Reference == "" || options.Candidate == "" {
 		return errors.New("--reference and --candidate are required")
 	}
-	if options.Work == "" || options.Out == "" {
-		return errors.New("--work and --out are required")
+	if (options.Work == "" && len(options.Targets) == 0) || options.Out == "" {
+		return errors.New("--work (or --target) and --out are required")
 	}
 	if len(options.Ops) == 0 {
 		options.Ops = DefaultOps
@@ -573,7 +696,63 @@ func validateOptions(options *Options) error {
 	if err := ValidatePinCPUs(options.PinCPUs); err != nil {
 		return err
 	}
-	if err := CheckVariantNames(Variants(options.Workers, options.KernelVariants, options.Durabilities)); err != nil {
+	if len(options.Rows) == 0 {
+		options.Rows = []string{ToolReference, ToolCandidate}
+		if len(options.EngineWorkers) > 0 {
+			options.Rows = append(options.Rows, ToolEngine)
+		}
+	}
+	for _, kind := range options.Rows {
+		if !contains(KnownRowKinds, kind) {
+			return fmt.Errorf("unknown row kind %q (known: %s)", kind, strings.Join(KnownRowKinds, ", "))
+		}
+	}
+	if contains(options.Rows, ToolEngine) {
+		if options.EnginePerf == "" || len(options.EngineWorkers) == 0 {
+			return errors.New("engine rows need --engine-perf and --engine-workers")
+		}
+		for _, workers := range options.EngineWorkers {
+			if workers < 1 {
+				return fmt.Errorf("engine worker count %d must be at least 1", workers)
+			}
+		}
+	}
+	if len(options.Targets) == 0 {
+		options.Targets = []Target{{Work: options.Work}}
+	}
+	names := map[string]bool{}
+	for i := range options.Targets {
+		target := &options.Targets[i]
+		if len(options.Targets) > 1 && target.Name == "" {
+			return errors.New("every target of a multi-target run needs a name")
+		}
+		if names[target.Name] {
+			return fmt.Errorf("target %q listed twice", target.Name)
+		}
+		names[target.Name] = true
+		if target.Work == "" {
+			return fmt.Errorf("target %q has no work directory", target.Name)
+		}
+		absolute, err := filepath.Abs(target.Work)
+		if err != nil {
+			return err
+		}
+		target.Work = absolute
+	}
+	if options.Work == "" {
+		options.Work = options.Targets[0].Work
+	}
+	if options.DropCaches {
+		if ok, why := DropCachesSupported(); !ok {
+			return errors.New("--drop-caches: " + why)
+		}
+	}
+	rows := MatrixRows(options.Workers, options.KernelVariants, options.Durabilities,
+		options.EngineWorkers, options.EngineVariants, options.Rows, options.Targets)
+	if len(rows) == 0 {
+		return errors.New("the selected row kinds leave no row to run")
+	}
+	if err := CheckVariantNames(rows); err != nil {
 		return err
 	}
 	for _, path := range []*string{&options.Reference, &options.Candidate, &options.EnginePerf, &options.Work, &options.Out} {
@@ -663,7 +842,9 @@ func (r *runner) runsOp(variant Variant, op string) bool {
 	if !variant.RunsOp(op) {
 		return false
 	}
-	if variant.EffectiveDurability() == DurabilityBuffered {
+	// Engine rows select buffered output through their environment
+	// (PAR3_BENCH_<OP>_DURABILITY), not the CLI flag the probe looks for.
+	if variant.EffectiveDurability() == DurabilityBuffered && variant.Tool != ToolEngine {
 		return r.results.BufferedArgs[op] != nil
 	}
 	return true
@@ -787,31 +968,69 @@ func (r *runner) record(record RunRecord) {
 }
 
 func (r *runner) runConfig(ctx context.Context, config Config, dataset Dataset, summary *ConfigSummary) error {
-	dataDir := filepath.Join(r.options.Work, "data", dataset.ID)
-	manifest, err := EnsureDataset(dataDir, dataset, r.logf)
-	if err != nil {
-		return fmt.Errorf("dataset %s: %w", dataset.ID, err)
-	}
-	stageRoot := filepath.Join(r.options.Work, "s", config.ID)
-	if err := os.RemoveAll(stageRoot); err != nil {
-		return err
-	}
-	if !r.options.KeepStages {
-		defer os.RemoveAll(stageRoot)
-	}
 	if err := r.checkBinaries(ctx); err != nil {
 		return err
 	}
+	states := map[string]*targetState{}
+	var first *targetState
+	var manifest DatasetManifest
+	for i, target := range r.options.Targets {
+		state := &targetState{
+			storage:   r.storage[i],
+			dataDir:   filepath.Join(target.Work, "data", dataset.ID),
+			canonical: filepath.Join(target.Work, "k", config.ID),
+			stageRoot: filepath.Join(target.Work, "s", config.ID),
+		}
+		var err error
+		if manifest, err = EnsureDataset(state.dataDir, dataset, r.logf); err != nil {
+			return fmt.Errorf("dataset %s on target %q: %w", dataset.ID, target.Name, err)
+		}
+		if err := os.RemoveAll(state.stageRoot); err != nil {
+			return err
+		}
+		if !r.options.KeepStages {
+			defer os.RemoveAll(state.stageRoot)
+		}
+		states[target.Name] = state
+		if first == nil {
+			first = state
+		}
+	}
 
-	// The canonical carriers: one untimed reference create. Every identity
-	// check compares against it, and every verify and repair, ours included,
-	// reads it, so both tools always work from the same recovery set.
-	canonical := filepath.Join(r.options.Work, "k", config.ID)
-	canonicalSet, source, err := r.seedCanonical(ctx, config, dataset, dataDir, canonical)
+	// The canonical carriers: one untimed reference create on the first
+	// target, copied to the others. Every identity check compares against it,
+	// and every verify and repair, ours included, reads it, so both tools
+	// always work from the same recovery set on every target.
+	canonicalSet, source, err := r.seedCanonical(ctx, config, dataset, first.dataDir, first.canonical)
 	if err != nil {
 		return err
 	}
 	summary.CanonicalSource = source
+	for _, state := range states {
+		if state == first {
+			continue
+		}
+		if err := copyDir(first.canonical, state.canonical); err != nil {
+			return fmt.Errorf("copying the canonical carriers: %w", err)
+		}
+	}
+	if contains(r.options.Ops, OpVerifyDamaged) {
+		for _, state := range states {
+			state.damaged = filepath.Join(filepath.Dir(filepath.Dir(state.canonical)), "x", config.ID)
+			if err := resetDir(state.damaged); err != nil {
+				return err
+			}
+			for _, file := range dataset.Files {
+				if err := copyFile(filepath.Join(state.dataDir, file.Name), filepath.Join(state.damaged, file.Name)); err != nil {
+					return err
+				}
+			}
+			if err := ApplyDamage(state.damaged, dataset, config.BlockSize, config.Damage); err != nil {
+				return err
+			}
+			defer os.RemoveAll(state.damaged)
+		}
+	}
 
 	var failed []string
 	for _, op := range r.options.Ops {
@@ -831,7 +1050,7 @@ func (r *runner) runConfig(ctx context.Context, config Config, dataset Dataset, 
 				if r.finished[key] {
 					continue
 				}
-				record, err := r.runOne(ctx, op, config, dataset, manifest, dataDir, canonical, canonicalSet, source, stageRoot, variant)
+				record, err := r.runOne(ctx, op, config, dataset, manifest, states[variant.Target], canonicalSet, source, variant)
 				if err != nil {
 					return err
 				}
@@ -853,21 +1072,44 @@ func (r *runner) runConfig(ctx context.Context, config Config, dataset Dataset, 
 				}
 			}
 		}
+		// The untimed passes run once, on the first target.
 		if r.options.IOCount {
 			for _, variant := range variants {
-				r.countIO(ctx, op, config, dataset, manifest, dataDir, canonical, stageRoot, variant)
+				if variant.Tool != ToolEngine && variant.Target == r.options.Targets[0].Name {
+					r.countIO(ctx, op, config, dataset, manifest, first.dataDir, first.canonical, first.stageRoot, variant)
+				}
 			}
 		}
-		if r.options.EnginePerf != "" {
+		if r.options.EnginePerf != "" && !contains(r.options.Rows, ToolEngine) {
 			for _, workers := range r.options.Workers {
 				for _, durability := range r.enginePerfDurabilities(op) {
-					r.enginePerf(ctx, op, config, dataset, dataDir, canonical, stageRoot, workers, durability)
+					r.enginePerf(ctx, op, config, dataset, first.dataDir, first.canonical, first.stageRoot, workers, durability)
 				}
 			}
 		}
 	}
 	if len(failed) > 0 {
 		return fmt.Errorf("%d run(s) failed: %s", len(failed), strings.Join(dedupe(failed), "; "))
+	}
+	return nil
+}
+
+// copyDir copies every regular file of source into a fresh destination.
+func copyDir(source, destination string) error {
+	if err := resetDir(destination); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(source)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		if err := copyFile(filepath.Join(source, entry.Name()), filepath.Join(destination, entry.Name())); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -908,7 +1150,11 @@ func (r *runner) seedCanonical(ctx context.Context, config Config, dataset Datas
 	if contains(r.options.Ops, OpCreate) {
 		// The timed reference create would repeat the same failure (or the
 		// same timeout); its row is this DNF.
-		r.finished[rowKey(config.ID, OpCreate, reference.Name)] = true
+		for _, variant := range r.results.Variants {
+			if variant.Tool == ToolReference {
+				r.finished[rowKey(config.ID, OpCreate, variant.Name)] = true
+			}
+		}
 	}
 	r.noteDNF(record, -1)
 
@@ -1134,15 +1380,26 @@ func (r *runner) checkCommand(op string, stage string, variant Variant) Command 
 // cannot write, private copies when it can or when damage is applied) and
 // the canonical carriers.
 func stage(dir string, dataset Dataset, dataDir, canonical string, config Config, op string) error {
+	return stageFrom(dir, dataset, dataDir, canonical, config, op, "")
+}
+
+// stageFrom is stage with an optional pre-damaged copy of the inputs: a
+// verify-damaged stage then hard-links them instead of copying and damaging
+// a private copy per run, since nothing writes to them.
+func stageFrom(dir string, dataset Dataset, dataDir, canonical string, config Config, op, damaged string) error {
 	if err := os.RemoveAll(dir); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	private := op != OpVerify
+	inputs := dataDir
+	if op == OpVerifyDamaged && damaged != "" {
+		inputs = damaged
+	}
+	private := op == OpRepair || (op == OpVerifyDamaged && damaged == "")
 	for _, file := range dataset.Files {
-		source, destination := filepath.Join(dataDir, file.Name), filepath.Join(dir, file.Name)
+		source, destination := filepath.Join(inputs, file.Name), filepath.Join(dir, file.Name)
 		var err error
 		if private {
 			err = copyFile(source, destination)
@@ -1168,36 +1425,73 @@ func stage(dir string, dataset Dataset, dataDir, canonical string, config Config
 			return err
 		}
 	}
-	if op == OpVerifyDamaged || op == OpRepair {
+	if op == OpRepair || (op == OpVerifyDamaged && damaged == "") {
 		return ApplyDamage(dir, dataset, config.BlockSize, config.Damage)
 	}
 	return nil
 }
 
 func (r *runner) runOne(ctx context.Context, op string, config Config, dataset Dataset, manifest DatasetManifest,
-	dataDir, canonical string, canonicalSet CarrierSet, canonicalSource, stageRoot string, variant Variant) (RunRecord, error) {
+	state *targetState, canonicalSet CarrierSet, canonicalSource string, variant Variant) (RunRecord, error) {
+	storage := state.storage
 	record := RunRecord{Config: config.ID, Op: op, Variant: variant.Name, Tool: variant.Tool, Workers: variant.Workers, Kernel: variant.Kernel,
-		Durability: variant.EffectiveDurability()}
-	dir := filepath.Join(stageRoot, op+"-"+variant.dirName())
+		Durability: variant.EffectiveDurability(), Target: variant.Target, Storage: &storage, DropCaches: r.options.DropCaches}
+	dir := filepath.Join(state.stageRoot, op+"-"+variant.dirName())
+	if !r.options.KeepStages {
+		// One stage at a time: a large set staged once per row and op would
+		// otherwise hold many private copies of its inputs at once.
+		defer os.RemoveAll(dir)
+		defer os.RemoveAll(dir + "-spool")
+	}
 	var command Command
 	if op == OpCreate {
-		if err := os.RemoveAll(dir); err != nil {
+		if err := resetDir(dir); err != nil {
 			return record, err
 		}
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return record, err
+		if variant.Tool == ToolEngine {
+			if err := resetDir(dir + "-spool"); err != nil {
+				return record, err
+			}
+			command = r.engineCommand(op, config, state.dataDir, dir, variant)
+		} else {
+			command = r.createCommand(config, dataset, state.dataDir, dir, variant)
 		}
-		command = r.createCommand(config, dataset, dataDir, dir, variant)
 	} else {
-		if err := stage(dir, dataset, dataDir, canonical, config, op); err != nil {
+		if err := stageFrom(dir, dataset, state.dataDir, state.canonical, config, op, state.damaged); err != nil {
 			return record, err
 		}
-		command = r.checkCommand(op, dir, variant)
+		if variant.Tool == ToolEngine {
+			command = r.engineCommand(op, config, state.dataDir, dir, variant)
+		} else {
+			command = r.checkCommand(op, dir, variant)
+		}
 	}
 	record.Command = command.Describe()
+	if r.options.DropCaches {
+		if err := DropCaches(); err != nil {
+			return record, fmt.Errorf("--drop-caches: %w", err)
+		}
+	}
+	record.LoadAverage = LoadAverage()
+	var nfsBefore NFSStats
+	watchNFS := false
+	if storage.IsNFS() {
+		nfsBefore, watchNFS = readNFSStats(storage.MountPoint)
+	}
 	result := Run(ctx, command)
+	if watchNFS {
+		if after, ok := readNFSStats(storage.MountPoint); ok {
+			delta := after.Sub(nfsBefore)
+			record.NFS = &delta
+		}
+	}
 	record.Measurement = result.Measurement
 	record.Status = StatusOK
+	if variant.Tool == ToolEngine {
+		if counters, ok := ParseEngineOutput(result.Stdout); ok {
+			record.Engine = &counters
+		}
+	}
 	if result.Failure != "" {
 		record.Status = StatusFailed
 		record.Failure = result.Failure
@@ -1214,7 +1508,12 @@ func (r *runner) runOne(ctx context.Context, op string, config Config, dataset D
 		return record, nil
 	}
 	accepted := result.ExitCode == 0
-	if op == OpVerifyDamaged {
+	if variant.Tool == ToolEngine && record.Engine == nil && accepted {
+		// engine_perf prints its totals last; without them the op did not
+		// complete as the row claims.
+		accepted = false
+	}
+	if op == OpVerifyDamaged && variant.Tool != ToolEngine {
 		// Damage is expected to be detected. The reference exits 0 once it
 		// finds the damage repairable; rarpar exits 1 for "repair needed".
 		// Either is a clean verdict; anything else is a failure.
@@ -1266,7 +1565,7 @@ func (r *runner) runOne(ctx context.Context, op string, config Config, dataset D
 			record.Failure = "reference-nondeterministic"
 		}
 	case OpRepair:
-		check, err := checkRepair(dir, manifest, canonical)
+		check, err := checkRepair(dir, manifest, state.canonical)
 		if err != nil {
 			return record, err
 		}
