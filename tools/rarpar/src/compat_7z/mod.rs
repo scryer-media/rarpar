@@ -649,7 +649,16 @@ fn find_archives(
             // under it.
             wildcard_names = true;
             let mut matches = Vec::new();
-            folders += walk(dir, Some(mask), &mut matches);
+            match walk(dir, Some(mask), &mut matches) {
+                Ok(passed) => folders += passed,
+                // A folder that is not there holds nothing to match.
+                Err((path, error)) if error.kind() == io::ErrorKind::NotFound && path == dir => {}
+                Err((path, error)) => {
+                    scan_error(session, &path, &error);
+                    missing = Some(error);
+                    continue;
+                }
+            }
             matches.sort();
             found.extend(matches);
             continue;
@@ -684,12 +693,21 @@ fn find_archives(
                 } else {
                     format!("{name}{}", std::path::MAIN_SEPARATOR)
                 };
-                folders += walk(&prefix, None, &mut inside);
+                match walk(&prefix, None, &mut inside) {
+                    Ok(passed) => folders += passed,
+                    // A folder that cannot be read fails the scan, as
+                    // 7-Zip's does: never an empty, successful one.
+                    Err((path, error)) => {
+                        scan_error(session, &path, &error);
+                        missing = Some(error);
+                        continue;
+                    }
+                }
                 inside.sort();
                 found.extend(inside);
             }
             Err(error) => {
-                session.err(&format!("\nERROR: {}\n{name}\n\n", errno_text(&error)));
+                scan_error(session, name, &error);
                 missing = Some(error);
             }
         }
@@ -734,25 +752,45 @@ impl Mask<'_> {
 /// Links are never followed: a linked folder such as `loop -> .` would
 /// recurse without end, and a link out of the folder would reach archives
 /// outside the one that was named.
-fn walk(prefix: &str, mask: Option<Mask>, found: &mut Vec<(String, u64)>) -> u64 {
+///
+/// A folder that cannot be read ends the walk with its path and the error.
+fn walk(
+    prefix: &str,
+    mask: Option<Mask>,
+    found: &mut Vec<(String, u64)>,
+) -> Result<u64, (String, io::Error)> {
     let mut folders = 0;
-    let Ok(listing) = fs::read_dir(if prefix.is_empty() { "." } else { prefix }) else {
-        return 0;
+    let fail = |error| Err((prefix.to_owned(), error));
+    let listing = match fs::read_dir(if prefix.is_empty() { "." } else { prefix }) {
+        Ok(listing) => listing,
+        Err(error) => return fail(error),
     };
-    for entry in listing.flatten() {
-        let Ok(meta) = fs::symlink_metadata(entry.path()) else {
-            continue;
+    for entry in listing {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => return fail(error),
         };
         let entry_name = entry.file_name().to_string_lossy().into_owned();
         let path = format!("{prefix}{entry_name}");
+        let meta = match fs::symlink_metadata(entry.path()) {
+            Ok(meta) => meta,
+            // Gone since the folder was listed.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err((path, error)),
+        };
         if meta.is_dir() {
             let inner = format!("{path}{}", std::path::MAIN_SEPARATOR);
-            folders += 1 + walk(&inner, mask, found);
+            folders += 1 + walk(&inner, mask, found)?;
         } else if meta.is_file() && mask.is_none_or(|mask| mask.matches(&entry_name)) {
             found.push((path, meta.len()));
         }
     }
-    folders
+    Ok(folders)
+}
+
+/// 7-Zip's scan error: the system message and the path it hit.
+fn scan_error(session: &mut Session, path: &str, error: &io::Error) {
+    session.err(&format!("\nERROR: {}\n{path}\n\n", errno_text(error)));
 }
 
 /// The name 7-Zip shows for the archive inside a path, and its default

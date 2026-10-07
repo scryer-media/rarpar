@@ -1380,6 +1380,39 @@ fn recursive_archive_includes_descend() {
     assert!(!out.contains("low.7z"), "{out}");
 }
 
+/// A folder under the named one that cannot be read fails the scan with
+/// 7-Zip's scan error and exit 2, rather than counting as empty: the archive
+/// beside it is not processed, so `-sdel` deletes nothing.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_folder_fails_the_archive_scan() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let locked = dir.path().join("inbox/locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    write_archive(&dir.path().join("inbox/open.7z"), SOLID);
+    write_archive(&locked.join("hidden.7z"), SOLID);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // A privileged user reads the folder anyway: nothing to test there.
+    let readable = std::fs::read_dir(&locked).is_ok();
+    let output = facade(dir.path(), &["x", "-sdel", "-y", "-oout", "inbox"], b"");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if readable {
+        return;
+    }
+    let (out, err) = expect(&output, 2);
+    assert!(
+        err.contains("\nERROR: errno=13 : Permission denied\ninbox/locked/\n\n"),
+        "{err}"
+    );
+    assert!(
+        err.contains("System ERROR:\nerrno=13 : Permission denied\n"),
+        "{err}"
+    );
+    assert!(!out.contains("Extracting archive"), "{out}");
+    assert!(dir.path().join("inbox/open.7z").is_file());
+}
+
 /// With wildcard matching off (`-aiw-`, or `-spd` for the archive name), `*`
 /// is a character of the name: only the archive literally called `set*.7z`
 /// is opened, and `-sdel` never reaches the archives the wildcard would match.

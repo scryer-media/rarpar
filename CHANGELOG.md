@@ -46,6 +46,10 @@ documented in each crate's own changelog so those notes ship with the crate.
   them, so `-aiw-!set*.7z` or `-spd set*.7z` opens (and under `-sdel`
   deletes) only the archive literally named `set*.7z`, and the implicit `*`
   that selects every member stays a wildcard under `-spd`.
+- 7-Zip facade: a folder that cannot be read while scanning for archives
+  (the folder named as the archive, anything below it, or an `-air` walk)
+  fails the command with 7-Zip's scan error and exit code 2, instead of
+  counting as empty and exiting 0 with nothing processed.
 - par3cmdline facade: the block-map report is counted from ranges, so a set
   with a huge block count no longer walks every block; non-UTF-8 arguments
   reach the files they name byte for byte on Unix; `\` separates path
