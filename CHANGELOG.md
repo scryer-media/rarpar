@@ -455,7 +455,7 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ### Library versions
 
-- par3-rs 0.5.1 (pinned exactly): mebibyte source reads, the verification
+- par3-rs 0.5.0 (pinned exactly): mebibyte source reads, the verification
   order by mount kind, single-read packet authentication during repair,
   `session_repair::create_directory`, and the RAR5 PAR-inside support and
   fixes.
