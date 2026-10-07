@@ -237,8 +237,10 @@ fn era_profiles_partition_the_rar_fixtures_by_format() {
             "{name} carries no originals"
         );
     }
-    // The lanes' profiles resolve to what the CI hydration patterns resolved to.
-    assert_eq!(members("unit").len(), 2);
+    // The lanes' profiles resolve to what the CI hydration patterns resolved to:
+    // the two UnRAR fixtures plus the three PAR-inside containers the par3-rs
+    // insertion unit tests install into.
+    assert_eq!(members("unit").len(), 5);
     assert!(
         members("cli")
             .iter()
