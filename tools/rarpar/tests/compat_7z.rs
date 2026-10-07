@@ -1380,6 +1380,33 @@ fn recursive_archive_includes_descend() {
     assert!(!out.contains("low.7z"), "{out}");
 }
 
+/// An argument that is not valid Unicode is a command-line error: it is never
+/// read with U+FFFD in place of its bytes, which would name the archive
+/// beside it, and `-sdel` deletes nothing.
+#[cfg(unix)]
+#[test]
+fn non_unicode_arguments_are_refused() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().unwrap();
+    let lookalike = dir.path().join("crate\u{fffd}.7z");
+    write_archive(&lookalike, SOLID);
+    let output = Command::new(env!("CARGO_BIN_EXE_rarpar"))
+        .current_dir(dir.path())
+        .args(["7z", "x", "-sdel", "-y", "-oout"])
+        .arg(OsStr::from_bytes(b"crate\xff.7z"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let (_, err) = expect(&output, 7);
+    assert!(
+        err.contains("Command Line Error:\nUnsupported argument that is not valid Unicode:\n"),
+        "{err}"
+    );
+    assert!(lookalike.is_file());
+    assert!(!dir.path().join("out").exists());
+}
+
 /// A folder under the named one that cannot be read fails the scan with
 /// 7-Zip's scan error and exit 2, rather than counting as empty: the archive
 /// beside it is not processed, so `-sdel` deletes nothing.

@@ -50,6 +50,9 @@ documented in each crate's own changelog so those notes ship with the crate.
   (the folder named as the archive, anything below it, or an `-air` walk)
   fails the command with 7-Zip's scan error and exit code 2, instead of
   counting as empty and exiting 0 with nothing processed.
+- 7-Zip facade: a command-line argument that is not valid Unicode is a
+  command-line error (exit code 7). It was read with U+FFFD in place of its
+  bytes, so it could name a different archive, which `-sdel` then deleted.
 - par3cmdline facade: the block-map report is counted from ranges, so a set
   with a huge block count no longer walks every block; non-UTF-8 arguments
   reach the files they name byte for byte on Unix; `\` separates path

@@ -40,17 +40,29 @@ pub(crate) fn invoked_as_7z(program: &OsStr) -> bool {
 
 /// Run a 7-Zip command line; the arguments follow the program name.
 pub(crate) fn dispatch(args: &[OsString]) -> u8 {
-    let args: Vec<String> = args
-        .iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
     let mut session = Session {
         out_target: 1,
         err_target: 2,
         log_level: 0,
         password: None,
     };
-    run(&mut session, &args)
+    // An argument that is not valid Unicode is refused, never read with
+    // U+FFFD in place of its bytes: that would name a different archive,
+    // output folder or member, which `-sdel` could then delete.
+    let mut text = Vec::with_capacity(args.len());
+    for arg in args {
+        match arg.to_str() {
+            Some(arg) => text.push(arg.to_owned()),
+            None => {
+                let shown = arg.to_string_lossy().into_owned();
+                return line_error(
+                    &mut session,
+                    &LineError::new("Unsupported argument that is not valid Unicode:", shown),
+                );
+            }
+        }
+    }
+    run(&mut session, &text)
 }
 
 /// Where messages go, and what the user has told us so far.
