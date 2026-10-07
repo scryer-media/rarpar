@@ -31,6 +31,7 @@ x-client: &client
     RIG_BUILD: ${RIG_BUILD:-on}
     RIG_REFERENCE: ${RIG_REFERENCE:-on}
     RIG_EXT4: ${RIG_EXT4:-}
+    RIG_RATE_MBPS: ${RIG_RATE_MBPS:-}
     RARPAR_TOOL_MIRROR_BASE: ${RARPAR_TOOL_MIRROR_BASE:-}
   volumes:
     - /lib/modules:/lib/modules:ro

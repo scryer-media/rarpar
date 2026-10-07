@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/par3bench"
@@ -32,6 +33,9 @@ type ClientConfig struct {
 	// `local-ext4` target, in truncate(1) units ("8G"), or empty for none
 	// (RIG_EXT4).
 	Ext4 string `json:"ext4,omitempty"`
+	// RateMBps throttles the client's link to the server to this many
+	// megabytes a second each way, or 0 for none (RIG_RATE_MBPS).
+	RateMBps int `json:"rate_mbps,omitempty"`
 }
 
 // ClientConfigFromEnv reads the client role's environment.
@@ -63,6 +67,13 @@ func ClientConfigFromEnv(getenv func(string) string) (ClientConfig, error) {
 			return ClientConfig{}, fmt.Errorf("RIG_EXT4=%q: want a size such as 8G", text)
 		}
 		config.Ext4 = text
+	}
+	if text := getenv("RIG_RATE_MBPS"); text != "" {
+		rate, err := strconv.Atoi(text)
+		if err != nil || rate < 1 || rate > 100000 {
+			return ClientConfig{}, fmt.Errorf("RIG_RATE_MBPS=%q: want megabytes a second, 1-100000", text)
+		}
+		config.RateMBps = rate
 	}
 	return config, nil
 }
@@ -105,7 +116,10 @@ type Session struct {
 	// LocalFS is the filesystem type under the local control directory.
 	LocalFS string
 	// Ext4 says the `local-ext4` target is mounted.
-	Ext4         bool
+	Ext4 bool
+	// Link is the throttled link's measured throughput, when RateMBps is set.
+	Link         *LinkCheck
+	shaped       string
 	loop         string
 	localIOSaved string
 	mounted      []string
@@ -136,6 +150,15 @@ func Mount(ctx context.Context, config ClientConfig, log io.Writer) (*Session, e
 		fmt.Fprintln(log, "nfs client: this kernel has no NFS LOCALIO")
 	default:
 		return nil, err
+	}
+	if config.RateMBps > 0 {
+		iface, err := shape(ctx, config.RateMBps, log)
+		session.shaped = iface
+		if err != nil {
+			session.Close()
+			return nil, err
+		}
+		session.Link = &LinkCheck{Interface: iface, RateMBps: config.RateMBps}
 	}
 	options := config.Mount.Options()
 	for _, export := range Exports() {
@@ -169,6 +192,12 @@ func Mount(ctx context.Context, config ClientConfig, log io.Writer) (*Session, e
 	if err := os.MkdirAll(LocalWork, 0o755); err != nil {
 		session.Close()
 		return nil, err
+	}
+	if session.Link != nil {
+		if err := checkLink(ctx, MountAsync, session.Link, log); err != nil {
+			session.Close()
+			return nil, err
+		}
 	}
 	session.LocalFS = backingFS(LocalWork)
 	if config.Ext4 != "" {
@@ -238,10 +267,25 @@ func mountExt4(ctx context.Context, size string, log io.Writer) (string, error) 
 // TargetArgs are this session's `par3 run` target arguments.
 func (s *Session) TargetArgs() []string {
 	args := TargetArgs(s.Markers, s.Config.Mount, s.LocalFS)
+	if s.Link != nil {
+		args = withLinkMeta(args, *s.Link)
+	}
 	if s.Ext4 {
 		args = append(args, Ext4TargetArgs()...)
 	}
 	return args
+}
+
+// withLinkMeta records a throttled link on every NFS target's metadata.
+func withLinkMeta(args []string, link LinkCheck) []string {
+	meta := fmt.Sprintf(",rate_mbps=%d,link_read_mbps=%.1f,link_write_mbps=%.1f", link.RateMBps, link.ReadMBps, link.WriteMBps)
+	out := append([]string(nil), args...)
+	for i := 1; i < len(out); i++ {
+		if out[i-1] == "--target-meta" && strings.HasPrefix(out[i], "nfs-") {
+			out[i] += meta
+		}
+	}
+	return out
 }
 
 // Ext4TargetArgs name the loop-mounted ext4 target.
@@ -267,6 +311,10 @@ func (s *Session) Close() {
 	if s.Ext4 {
 		_ = os.Remove(Ext4Image)
 		s.Ext4 = false
+	}
+	if s.shaped != "" {
+		unshape(s.shaped, s.log)
+		s.shaped = ""
 	}
 	if s.localIOSaved != "" {
 		if err := os.WriteFile(localIOParameter, []byte(s.localIOSaved), 0o644); err != nil {
