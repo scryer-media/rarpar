@@ -402,7 +402,9 @@ documented in each crate's own changelog so those notes ship with the crate.
   protected files beside the set: verify opens 14 files instead of 24.
 - `par3 archive --overwrite` with the archive under an input directory no
   longer packs the previous archive, its PAR3 index or its recovery volumes
-  into the new archive.
+  into the new archive. On Windows and macOS the recovery volumes match
+  without regard to case, as their default volumes name files, so `SET.7z`
+  rebuilt beside `set.vol0+1.par3` no longer packs that stale volume.
 - `par3 archive` counts each recovery row's own allocation against
   `--par3-memory-mib`, so many recovery blocks of a small block size are
   refused before they are allocated instead of overrunning the budget.

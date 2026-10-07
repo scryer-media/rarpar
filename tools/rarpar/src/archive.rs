@@ -40,6 +40,7 @@ use sevenz_turbo::{
 use crate::compat_7z::local_civil_at;
 use crate::error::RarparError;
 use crate::par3::{parent, reject_symlinks};
+use crate::par3_inside::name_key;
 use crate::par3_stream::{
     self, Coding, FileDigest, InsideParams, InsideShape, Lane, RecoveryChoice, SetSpec,
     block_count, build_set, inside_geometry, inside_size, reference_field, sibling_geometry,
@@ -731,17 +732,28 @@ fn exclude_outputs(
             .and_then(|name| name.strip_suffix(".par3"))
         && parent(index).try_exists()?
     {
-        volumes = Some((parent(index).canonicalize()?, format!("{base}.vol")));
+        // Names compare as the platform's file names do: on a volume that
+        // ignores case, `set.vol0+1.par3` is a volume of `SET.par3`.
+        volumes = Some((
+            parent(index).canonicalize()?,
+            name_key(&format!("{base}.vol")),
+            name_key(".par3"),
+        ));
     }
     let is_volume = |path: &Path| {
-        let Some((directory, base)) = &volumes else {
+        let Some((directory, base, suffix)) = &volumes else {
             return false;
         };
-        let Some(rest) = path
+        let Some(name) = path
             .file_name()
             .and_then(|name| name.to_str())
-            .and_then(|name| name.strip_prefix(base.as_str()))
-            .and_then(|rest| rest.strip_suffix(".par3"))
+            .map(name_key)
+        else {
+            return false;
+        };
+        let Some(rest) = name
+            .strip_prefix(base.as_str())
+            .and_then(|rest| rest.strip_suffix(suffix.as_str()))
         else {
             return false;
         };

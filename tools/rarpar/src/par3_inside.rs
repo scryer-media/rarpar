@@ -145,7 +145,7 @@ fn volume_set(paths: &[PathBuf]) -> Result<Vec<PathBuf>, RarparError> {
 /// NTFS's upcase table does; one with a longer uppercase (`ß`) stays itself.
 /// A case-sensitive volume on either platform is rare enough that two
 /// families differing only by case are treated as one there too.
-fn name_key(stem: &str) -> String {
+pub(crate) fn name_key(stem: &str) -> String {
     if !cfg!(any(windows, target_os = "macos")) {
         return stem.to_owned();
     }
