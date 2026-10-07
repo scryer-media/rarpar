@@ -577,3 +577,64 @@ func TestPortPatchAppliesOffX86Linux(t *testing.T) {
 		}
 	}
 }
+
+// A create row of any tool that exits 0 without the set it was asked for
+// fails: verify and repair read the canonical carriers, so nothing else
+// would notice a candidate create that wrote nothing.
+func TestCreateOutputProblemRejectsMissingCarriers(t *testing.T) {
+	config := Config{Recovery: 3}
+	dir := t.TempDir()
+	if _, failure, _ := createOutputProblem(dir, config); failure != "no-carriers" {
+		t.Errorf("an empty create directory: %q, want no-carriers", failure)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "set.par3"), []byte("not a packet stream at all, long enough for one header....."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, failure, _ := createOutputProblem(dir, config); failure != "unreadable-carriers" {
+		t.Errorf("garbage carriers: %q, want unreadable-carriers", failure)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "set.par3"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, failure, detail := createOutputProblem(dir, config); failure != "truncated-carriers" {
+		t.Errorf("an index with no recovery blocks: %q (%s), want truncated-carriers", failure, detail)
+	}
+}
+
+// par3cmdline's verify exits 0 whatever it finds; rarpar's exits 1 when the
+// set is not intact. A damaged-verify row accepts only its own tool's code.
+func TestDamagedVerifyExitCodesAreChosenByTool(t *testing.T) {
+	cases := []struct {
+		tool string
+		exit int
+		want bool
+	}{
+		{ToolReference, 0, true},
+		{ToolReference, 1, false},
+		{ToolReference, 2, false},
+		{ToolCandidate, 1, true},
+		{ToolCandidate, 0, false},
+		{ToolCandidate, 2, false},
+		{ToolEngine, 0, false},
+	}
+	for _, c := range cases {
+		if got := damagedVerifyAccepted(c.tool, c.exit); got != c.want {
+			t.Errorf("%s exit %d: accepted %t, want %t", c.tool, c.exit, got, c.want)
+		}
+	}
+}
+
+func TestVersionProbeProblem(t *testing.T) {
+	if problem := versionProbeProblem(Result{}, "par3cmdline version 0.0.1"); problem != "" {
+		t.Errorf("a clean probe: %q", problem)
+	}
+	if problem := versionProbeProblem(Result{}, ""); problem == "" {
+		t.Error("a probe that printed nothing must not identify the binary")
+	}
+	if problem := versionProbeProblem(Result{Measurement: Measurement{ExitCode: 3}, Stdout: "usage\n"}, "usage"); problem == "" {
+		t.Error("a probe that exited 3 must not identify the binary")
+	}
+	if problem := versionProbeProblem(Result{Failure: "start-failed"}, ""); problem == "" {
+		t.Error("a probe that did not start must not identify the binary")
+	}
+}

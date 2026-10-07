@@ -884,9 +884,29 @@ func (r *runner) identify(ctx context.Context, path, versionFlag string) (Binary
 			return Binary{}, r.quarantined(ctx, path, "refused to start: "+fmt.Sprint(result.Err))
 		}
 		binary.Version = strings.TrimSpace(firstLine(result.Stdout + result.Stderr))
+		if problem := versionProbeProblem(result, binary.Version); problem != "" {
+			// A binary that cannot answer its version probe is not the tool
+			// the run names; every row it ran would be a DNF or a failure
+			// that says nothing about the tool.
+			return Binary{}, fmt.Errorf("binary %s: version probe %s %s", path, versionFlag, problem)
+		}
 	}
 	r.guards[path] = binary
 	return binary, nil
+}
+
+// versionProbeProblem says why a version probe does not identify a binary,
+// or "" when it exited 0 and printed a version.
+func versionProbeProblem(result Result, version string) string {
+	switch {
+	case result.Failure != "":
+		return fmt.Sprintf("failed (%s: %v)", result.Failure, result.Err)
+	case result.ExitCode != 0:
+		return fmt.Sprintf("exited %d: %s", result.ExitCode, lastLine(result))
+	case version == "":
+		return "exited 0 but printed no version"
+	}
+	return ""
 }
 
 func firstLine(text string) string {
@@ -1176,12 +1196,9 @@ func (r *runner) seedCanonical(ctx context.Context, config Config, dataset Datas
 		return CarrierSet{}, "", fmt.Errorf("the reference did not finish the canonical create and rarpar's fallback create failed too (exit %d %s): %s",
 			result.ExitCode, result.Failure, lastLine(result))
 	}
-	set, err := ReadCarrierSet(canonical)
-	if err != nil {
-		return CarrierSet{}, "", fmt.Errorf("rarpar's fallback canonical carriers: %w", err)
-	}
-	if len(set.Files) == 0 {
-		return CarrierSet{}, "", errors.New("rarpar's fallback canonical create wrote no carriers")
+	set, failure, detail := createOutputProblem(canonical, config)
+	if failure != "" {
+		return CarrierSet{}, "", fmt.Errorf("rarpar's fallback canonical create (%s): %s", failure, detail)
 	}
 	r.results.Notes = append(r.results.Notes, fmt.Sprintf("%s: the reference did not finish the canonical create, so rarpar (durable, %d workers) wrote the carriers every verify and repair read; create identity verdicts are unavailable for this set", config.ID, workers))
 	return set, ToolCandidate, nil
@@ -1226,17 +1243,25 @@ func referenceCreateProblem(result Result, dir string, config Config) (string, s
 	if result.ExitCode != 0 {
 		return fmt.Sprintf("exit-%d", result.ExitCode), ""
 	}
+	_, failure, detail := createOutputProblem(dir, config)
+	return failure, detail
+}
+
+// createOutputProblem reads a create's carrier directory and classifies it:
+// unreadable, empty, or short of the requested recovery blocks. The failure
+// is "" when the set is whole.
+func createOutputProblem(dir string, config Config) (CarrierSet, string, string) {
 	set, err := ReadCarrierSet(dir)
 	if err != nil {
-		return "unreadable-carriers", err.Error()
+		return set, "unreadable-carriers", err.Error()
 	}
 	if len(set.Files) == 0 {
-		return "no-carriers", "the reference exited 0 but wrote no .par3 files"
+		return set, "no-carriers", "the create exited 0 but wrote no .par3 files"
 	}
 	if got := int64(len(set.recovery)); got != config.Recovery {
-		return "truncated-carriers", fmt.Sprintf("%d of %d recovery blocks present", got, config.Recovery)
+		return set, "truncated-carriers", fmt.Sprintf("%d of %d recovery blocks present", got, config.Recovery)
 	}
-	return "", ""
+	return set, "", ""
 }
 
 // noteDNF lists a DNF row in the results and the log.
@@ -1514,10 +1539,7 @@ func (r *runner) runOne(ctx context.Context, op string, config Config, dataset D
 		accepted = false
 	}
 	if op == OpVerifyDamaged && variant.Tool != ToolEngine {
-		// Damage is expected to be detected. The reference exits 0 once it
-		// finds the damage repairable; rarpar exits 1 for "repair needed".
-		// Either is a clean verdict; anything else is a failure.
-		accepted = result.ExitCode == 0 || result.ExitCode == 1
+		accepted = damagedVerifyAccepted(variant.Tool, result.ExitCode)
 	}
 	if !accepted {
 		record.Status = StatusFailed
@@ -1545,11 +1567,16 @@ func (r *runner) runOne(ctx context.Context, op string, config Config, dataset D
 				return record, nil
 			}
 		}
-		set, err := ReadCarrierSet(dir)
-		if err != nil {
+		// Every tool's create must leave the whole set it was asked for: a
+		// candidate that exits 0 with no or short carriers did not create,
+		// whatever verify and repair (which read the canonical set) report.
+		set, failure, detail := createOutputProblem(dir, config)
+		if failure != "" {
 			record.Status = StatusFailed
-			record.Failure = "unreadable-carriers"
-			record.Error = err.Error()
+			record.Failure = failure
+			record.Error = detail
+			record.StderrTail = result.Stderr
+			record.StderrLine = lastLine(result)
 			return record, nil
 		}
 		if canonicalSource != ToolReference {
@@ -1578,6 +1605,20 @@ func (r *runner) runOne(ctx context.Context, op string, config Config, dataset D
 		}
 	}
 	return record, nil
+}
+
+// damagedVerifyAccepted reports whether a verify of a damaged tree exited
+// with the status that tool gives for damage it detected. par3cmdline exits 0
+// from verify whatever it finds; rarpar exits 1 when the set is not intact,
+// so a rarpar verify exiting 0 here reported damaged inputs as healthy.
+func damagedVerifyAccepted(tool string, exitCode int) bool {
+	switch tool {
+	case ToolReference:
+		return exitCode == 0
+	case ToolCandidate:
+		return exitCode == 1
+	}
+	return false
 }
 
 // checkRepair hashes every protected file after a repair and lists what else
