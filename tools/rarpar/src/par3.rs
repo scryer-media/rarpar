@@ -129,8 +129,16 @@ fn scan(paths: &[PathBuf], options: &ExecutionOptions) -> Result<Vec<LoadedSet>,
     }
     let access: Arc<dyn SourceAccess> = Arc::new(disk);
     let mut sets: BTreeMap<(InputSetId, PathBuf), LoadedSet> = BTreeMap::new();
+    // Carriers share a directory or a few; resolve each one once.
+    let mut directories: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
     for (index, path) in paths.iter().enumerate() {
-        let directory = parent(path).canonicalize()?;
+        let directory = match directories.entry(parent(path)) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.get().clone(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let resolved = entry.key().canonicalize()?;
+                entry.insert(resolved).clone()
+            }
+        };
         let mut scanner = PacketScanner::new(
             access.clone(),
             SourceId(index as u64),
@@ -332,8 +340,17 @@ fn collect_files(
     } else if meta.is_dir() {
         for entry in std::fs::read_dir(root)? {
             let entry = entry?;
+            // The entry's own type does not follow links, so a regular file
+            // here needs no further stat of its path.
             let kind = entry.file_type()?;
-            if kind.is_file() || (kind.is_dir() && !cli.no_recursive && depth < cli.max_depth) {
+            if kind.is_file() {
+                files.insert(entry.path());
+                if files.len() > cli.max_files {
+                    return Err(RarparError::Resource(
+                        "PAR3 discovery exceeded --max-files".into(),
+                    ));
+                }
+            } else if kind.is_dir() && !cli.no_recursive && depth < cli.max_depth {
                 collect_files(&entry.path(), cli, depth + 1, files)?;
             }
         }
@@ -356,9 +373,11 @@ fn load_selected(
     let mut files = BTreeSet::new();
     if input.is_dir() {
         collect_files(&input, cli, 0, &mut files)?;
+        files.retain(|path| is_carrier_candidate(path));
     } else {
         files.insert(input.clone());
         // Siblings are candidates only; authenticated identities select the set.
+        // Each is sniffed here once and not again below.
         for entry in std::fs::read_dir(parent(&input))? {
             let entry = entry?;
             if entry.file_type()?.is_file() && is_carrier_candidate(&entry.path()) {
@@ -371,10 +390,7 @@ fn load_selected(
             }
         }
     }
-    let paths: Vec<_> = files
-        .into_iter()
-        .filter(|path| *path == input || is_carrier_candidate(path))
-        .collect();
+    let paths: Vec<_> = files.into_iter().collect();
     let options = carrier_options(options, paths.len())?;
     let mut sets = scan(&paths, &options)?;
     sets.retain(|set| {
@@ -639,7 +655,7 @@ fn verify_repair_loaded(
     for (name, id) in bindings {
         session.bind_file(&name, id)?;
     }
-    let assessment = session.assess()?;
+    let mut assessment = session.assess()?;
     let unresolved: Vec<_> = assessment
         .files
         .iter()
@@ -684,8 +700,10 @@ fn verify_repair_loaded(
                 }
             }
         }
+        // Only a search can change the verdict; an untouched set keeps it
+        // rather than checking every source again.
+        assessment = session.assess()?;
     }
-    let assessment = session.assess()?;
     let mut success = assessment.status == RepairStatus::Complete;
     let ready = assessment.status == RepairStatus::Ready;
     let mut report = json!({

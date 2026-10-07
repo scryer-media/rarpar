@@ -90,6 +90,11 @@ documented in each crate's own changelog so those notes ship with the crate.
 - Release binaries are built with the `sevenz` feature, so `par3 archive`
   and the 7-Zip facade ship in them, and the `cargo xtask` feature audit
   refuses a release build without it.
+- `par3 verify` and `repair` assess the set once unless a placement search
+  ran, resolve each carrier directory once, sniff each sibling once, and take
+  a directory entry's type from the listing; on a three-file set with 52
+  recovery blocks, verify drops from 181 path stats to 60 and repair from 324
+  to 111, with the same bytes read.
 
 ### Library versions
 
