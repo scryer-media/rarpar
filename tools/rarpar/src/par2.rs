@@ -1152,24 +1152,52 @@ mod tests {
     fn volume_discovery_does_not_open_the_files_the_set_protects() {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../crates/par2-rs/tests/fixtures/rar5_lz_plain");
-        for entry in std::fs::read_dir(&fixture).unwrap() {
-            let entry = entry.unwrap();
-            std::fs::copy(entry.path(), temp.path().join(entry.file_name())).unwrap();
+        let mut sources = Vec::new();
+        for (index, name) in [
+            "orchard-notes.part1.bin",
+            "orchard-notes.part2.bin",
+            "orchard-notes.part3.bin",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = temp.path().join(name);
+            std::fs::write(&path, vec![0x31 + index as u8; 3000]).unwrap();
+            sources.push(path);
         }
-        std::fs::rename(
-            temp.path()
-                .join("fixture_rar5_lz_plain_repair.vol02+2.par2"),
-            temp.path().join("relocated-volume"),
-        )
-        .unwrap();
-        let main = temp.path().join("fixture_rar5_lz_plain_repair.par2");
-        let seed = par2_rs::Par2FileSet::from_paths(std::slice::from_ref(&main)).unwrap();
-        let data = temp.path().join("fixture_rar5_lz_plain.part3.rar");
-        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let mut options = Par2CreatorOptions::with_output(
+            temp.path().join("orchard-notes.par2"),
+            Some(temp.path().to_path_buf()),
+            sources.clone(),
+        );
+        options.block_sizing = BlockSizing::Bytes(512);
+        options.recovery_amount = RecoveryAmount::Count(6);
+        let creator = Par2Creator::new(options);
+        let plan = creator.plan().unwrap();
+        let outcome = creator.create(&plan).unwrap();
+        assert!(
+            outcome.volume_paths.len() >= 2,
+            "{:?}",
+            outcome.volume_paths
+        );
+
+        let relocated = &outcome.volume_paths[0];
+        std::fs::rename(relocated, temp.path().join("relocated-volume")).unwrap();
+        let mut expected: Vec<String> = outcome
+            .output_paths
+            .iter()
+            .filter(|path| *path != relocated)
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .chain(["relocated-volume".to_owned()])
+            .collect();
+        expected.sort();
+
+        let seed =
+            par2_rs::Par2FileSet::from_paths(std::slice::from_ref(&outcome.main_path)).unwrap();
+        let data = &sources[2];
+        std::fs::set_permissions(data, std::fs::Permissions::from_mode(0o000)).unwrap();
         // A process that can read it anyway proves nothing either way.
-        if std::fs::File::open(&data).is_ok() {
+        if std::fs::File::open(data).is_ok() {
             return;
         }
 
@@ -1179,17 +1207,6 @@ mod tests {
             .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         found.sort();
-        assert_eq!(
-            found,
-            [
-                "fixture_rar5_lz_plain_repair.par2",
-                "fixture_rar5_lz_plain_repair.vol00+2.par2",
-                "fixture_rar5_lz_plain_repair.vol04+2.par2",
-                "fixture_rar5_lz_plain_repair.vol06+2.par2",
-                "fixture_rar5_lz_plain_repair.vol08+2.par2",
-                "fixture_rar5_lz_plain_repair.vol10+2.par2",
-                "relocated-volume",
-            ]
-        );
+        assert_eq!(found, expected);
     }
 }
