@@ -24,6 +24,8 @@ The CLI version for these changes is assigned when the CLI is released.
   eight times faster: the decoder is applied as a matrix to whole regions on
   every core instead of byte column by byte column. Restored volumes are
   byte-identical to before.
+- Restoring several missing volumes from RAR5 `.rev` files multiplies on every
+  core: about twice as fast with eight of 41 volumes missing.
 
 ### Library versions
 

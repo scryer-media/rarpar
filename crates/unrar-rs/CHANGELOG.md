@@ -13,8 +13,16 @@
   2.1 GB took 3.7-5.5 s and 51-53 CPU-s with one volume missing and
   4.3-5.1 s with eight missing; it now takes 0.5 s and 0.64-1.07 s. RARLAB
   unrar 7.20 takes 4.1-4.4 s and 4.6-4.7 s on the same sets.
-- `reedsolomon-rs` requirement raised to 0.4.9 for `decode_matrix` and
-  `apply_decode_matrix_gf8`.
+- RAR5 recovery-volume restore reads every unit of a chunk before decoding
+  it and applies the whole decode matrix with `Rar5RsCoder::apply_units`, on
+  every core, instead of multiplying unit by unit on one thread. The working
+  set stays at 64 MiB, now shared by the units and the outputs. On the same
+  host, a 2.1 GB 41 + 10 set with eight volumes missing went from 1.22-1.27 s
+  to 0.55 s (unrar 7.20: 1.31 s); with one missing, where the restore is
+  bound by reading and checking the volumes, from 0.51 s to 0.48 s. Restored
+  bytes are unchanged.
+- `reedsolomon-rs` requirement raised to 0.4.9 for `decode_matrix`,
+  `apply_decode_matrix_gf8` and `Rar5RsCoder::apply_units`.
 
 ## 0.10.8
 

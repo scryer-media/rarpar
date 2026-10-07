@@ -488,7 +488,10 @@ fn reconstruct_rar5(
         .map(|slot| slot.file_size)
         .max()
         .unwrap_or(0);
-    let mut chunk_size = (RAR5_TOTAL_BUFFER_SIZE / missing_count.max(1)).max(2);
+    // Every unit of a chunk is held at once so the whole matrix can be
+    // applied across stripes on every core, which bounds the chunk by the
+    // units plus the outputs rather than by the outputs alone.
+    let mut chunk_size = (RAR5_TOTAL_BUFFER_SIZE / (data_count + missing_count).max(1)).max(2);
     if !chunk_size.is_multiple_of(2) {
         chunk_size -= 1;
     }
@@ -542,8 +545,8 @@ fn reconstruct_rar5(
         restored_paths.push(path.clone());
     }
 
-    let mut input_buf = vec![0u8; chunk_size + 2];
-    let mut out_bufs = vec![vec![0u8; chunk_size + 2]; missing_count];
+    let mut input_bufs = vec![vec![0u8; chunk_size]; data_count];
+    let mut out_bufs = vec![vec![0u8; chunk_size]; missing_count];
     let mut processed = 0u64;
 
     while processed < max_volume_size {
@@ -552,11 +555,16 @@ fn reconstruct_rar5(
         let rs_len = bytes_to_process + (bytes_to_process & 1);
         let mut next_recovery = 0usize;
 
-        for data_num in 0..data_count {
-            input_buf[..rs_len].fill(0);
+        for (data_num, input_buf) in input_bufs.iter_mut().enumerate() {
+            // `read_padded` zeroes what the file does not fill; the odd pad
+            // byte of a final odd-length chunk lies past what it is handed.
+            input_buf[bytes_to_process..rs_len].fill(0);
             if data_slots[data_num].valid {
-                if let Some(file) = &mut data_files[data_num] {
-                    read_padded(file, &mut input_buf[..bytes_to_process])?;
+                match &mut data_files[data_num] {
+                    Some(file) => {
+                        read_padded(file, &mut input_buf[..bytes_to_process])?;
+                    }
+                    None => input_buf[..bytes_to_process].fill(0),
                 }
             } else {
                 while next_recovery < recovery_files.len()
@@ -573,13 +581,17 @@ fn reconstruct_rar5(
                 read_padded(recovery, &mut input_buf[..bytes_to_process])?;
                 next_recovery += 1;
             }
-
-            let mut output_slices = out_bufs
-                .iter_mut()
-                .map(|buf| &mut buf[..rs_len])
-                .collect::<Vec<_>>();
-            coder.update_outputs(data_num, &input_buf[..rs_len], &mut output_slices);
         }
+
+        let units = input_bufs
+            .iter()
+            .map(|buf| &buf[..rs_len])
+            .collect::<Vec<_>>();
+        let mut output_slices = out_bufs
+            .iter_mut()
+            .map(|buf| &mut buf[..rs_len])
+            .collect::<Vec<_>>();
+        coder.apply_units(&units, &mut output_slices);
 
         for (out_idx, &missing_idx) in missing_volume_numbers.iter().enumerate() {
             let remaining_for_file = data_slots[missing_idx].file_size.saturating_sub(processed);

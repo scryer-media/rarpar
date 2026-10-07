@@ -12,6 +12,13 @@
   folding groups of sources through `gf8::mul_acc_input_batch`. Zero
   coefficients are skipped. The output does not depend on the stripe size,
   thread count or kernel tier.
+- `decode_apply::apply_decode_matrix_gf16` is the same driver over GF(2^16),
+  folding groups through `gf_simd::mul_acc_input_batch_prepared` with every
+  coefficient prepared once per matrix rather than once per stripe.
+- `rar5::Rar5RsCoder::apply_units` rebuilds every missing row from all the
+  logical units of a chunk at once through `apply_decode_matrix_gf16`, and
+  `Rar5RsCoder::matrix` exposes the inverted decode rows. The result is the
+  one a full `update_outputs` pass leaves.
 
 ## 0.4.8
 
