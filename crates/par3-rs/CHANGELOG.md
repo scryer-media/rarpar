@@ -32,6 +32,9 @@
   - `open` indexes a host's packets by offset once and checks each expected
     region slot with a lookup, so verify, repair and remove over a region of
     tens of thousands of small recovery packets are no longer quadratic.
+  - `open` refuses a set whose Start packet records a block size too large
+    for a Recovery Data packet length (`EngineError::Unsupported`) instead
+    of wrapping that length to zero and aborting on a division by zero.
 - A derived carrier (`CarrierPlan::derived`) looks up its available Recovery
   Data packets in one pass over the payloads instead of one pass per
   recovery index, so regenerating a region of a set with tens of thousands

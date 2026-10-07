@@ -1242,7 +1242,7 @@ fn open_set(
         ));
     }
     // Gaps and region layout.
-    let packet = block_size + RECOVERY_OVERHEAD;
+    let recovery_len = packet_len(block_size)?;
     let mut region_layout = None;
     let mut hosts = Vec::new();
     for &file in &order {
@@ -1265,7 +1265,7 @@ fn open_set(
             if gap.end != entry.len && candidate == Rar5Layout::Trailing {
                 continue;
             }
-            if let Some((prefix, count)) = solve(candidate, length, metadata_bytes, packet) {
+            if let Some((prefix, count)) = solve(candidate, length, metadata_bytes, recovery_len) {
                 solved = Some((candidate, prefix, count));
                 break;
             }
@@ -1336,8 +1336,8 @@ fn open_set(
                 continue;
             };
             let offset = packet.origin().offset;
-            if offset >= start && (offset - start).is_multiple_of(packet_len(block_size)) {
-                let slot = (offset - start) / packet_len(block_size);
+            if offset >= start && (offset - start).is_multiple_of(recovery_len) {
+                let slot = (offset - start) / recovery_len;
                 if slot < host.recovery.end && index >= before + slot {
                     first = Some(index - before - slot);
                     break 'base;
@@ -1450,7 +1450,7 @@ fn open_set(
             if recovery_at.contains(&(offset, index)) {
                 found += 1;
             }
-            offset += packet;
+            offset += recovery_len;
         }
         host.packets_found = found;
         let snapshot = access.snapshot(source)?;
@@ -1487,13 +1487,22 @@ fn open_set(
     })
 }
 
-fn packet_len(block_size: u64) -> u64 {
-    block_size + RECOVERY_OVERHEAD
+/// The length of one Recovery Data packet for `block_size`, refused when the
+/// Start packet records a block size too large for that length to exist.
+fn packet_len(block_size: u64) -> EngineResult<u64> {
+    block_size
+        .checked_add(RECOVERY_OVERHEAD)
+        .ok_or(EngineError::Unsupported(
+            "block size too large for a recovery packet",
+        ))
 }
 
 /// The region header length and recovery count that fill a gap of `gap`
 /// bytes in `layout`, if any.
 fn solve(layout: Rar5Layout, gap: u64, metadata: u64, packet: u64) -> Option<(u64, u64)> {
+    if packet == 0 {
+        return None;
+    }
     for prefix in 0..=64u64 {
         let Some(carrier) = gap.checked_sub(prefix) else {
             break;
@@ -1816,6 +1825,26 @@ mod tests {
         );
         assert_eq!(stem_change("same.rar", "same.rar"), None);
         assert_eq!(stem_change("\u{e9}", "\u{129}"), None);
+    }
+
+    /// A Start packet's block size near `u64::MAX` is refused rather than
+    /// wrapping the recovery packet length to zero, and a zero length never
+    /// reaches a modulo.
+    #[test]
+    fn oversized_block_sizes_are_refused_not_wrapped() {
+        assert!(matches!(
+            packet_len(u64::MAX - (RECOVERY_OVERHEAD - 1)),
+            Err(EngineError::Unsupported(_))
+        ));
+        assert!(matches!(
+            packet_len(u64::MAX),
+            Err(EngineError::Unsupported(_))
+        ));
+        assert_eq!(packet_len(u64::MAX - RECOVERY_OVERHEAD).unwrap(), u64::MAX);
+        assert_eq!(packet_len(4096).unwrap(), 4096 + RECOVERY_OVERHEAD);
+        for layout in [Rar5Layout::Trailing, Rar5Layout::Block, Rar5Layout::Service] {
+            assert_eq!(solve(layout, 1 << 20, 512, 0), None);
+        }
     }
 
     /// Across filesystems a repaired host is copied beside its destination,
