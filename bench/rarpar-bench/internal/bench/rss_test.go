@@ -32,7 +32,31 @@ func TestMain(m *testing.M) {
 		touch(value)
 		os.Exit(0)
 	}
+	if path := os.Getenv(holdEnv); path != "" {
+		hold(path)
+		os.Exit(0)
+	}
 	os.Exit(m.Run())
+}
+
+// holdEnv makes the test binary a tool that runs until it is killed: it opens
+// the FIFO named there for writing, says "ready", and then blocks opening
+// the FIFO beside it (".never"), which nothing ever writes to.
+const holdEnv = "RARPAR_BENCH_TEST_HOLD_FIFO"
+
+func hold(path string) {
+	alive, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		os.Exit(2)
+	}
+	if _, err := alive.WriteString("ready\n"); err != nil {
+		os.Exit(2)
+	}
+	never, err := os.Open(path + ".never")
+	if err == nil {
+		never.Close()
+	}
+	alive.Close()
 }
 
 func touch(value string) []byte {
