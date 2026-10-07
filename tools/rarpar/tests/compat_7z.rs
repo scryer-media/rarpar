@@ -1369,6 +1369,56 @@ fn sdel_keeps_an_archive_nothing_was_extracted_from() {
     assert_tree(&dir.path().join("out"));
 }
 
+/// An archive `-sdel` cannot delete is an archive with errors: the run says
+/// which volumes are left instead of "Everything is Ok", and exits 2.
+#[cfg(unix)]
+#[test]
+fn sdel_reports_volumes_it_could_not_delete() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let shelf = dir.path().join("shelf");
+    std::fs::create_dir(&shelf).unwrap();
+    let whole = dir.path().join("whole.7z");
+    write_archive(&whole, SOLID);
+    let bytes = std::fs::read(&whole).unwrap();
+    let pieces = bytes.chunks(40_000).count();
+    assert!(pieces > 1, "the set must be split");
+    for (index, piece) in bytes.chunks(40_000).enumerate() {
+        std::fs::write(shelf.join(format!("crate.7z.{:03}", index + 1)), piece).unwrap();
+    }
+    std::fs::set_permissions(&shelf, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // A process that may delete regardless (root) cannot show the failure.
+    let probe = shelf.join("crate.7z.001");
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(shelf.join("probe"))
+        .is_ok()
+    {
+        std::fs::set_permissions(&shelf, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipping: a read-only directory does not stop this process");
+        return;
+    }
+    let out_arg = format!("-o{}", dir.path().join("out").display());
+    let output = facade(&shelf, &["x", "-sdel", "-y", &out_arg, "crate.7z.001"], b"");
+    std::fs::set_permissions(&shelf, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (out, err) = expect(&output, 2);
+    assert!(!out.contains("Everything is Ok"), "{out}");
+    assert!(out.contains("Archives with Errors: 1"), "{out}");
+    assert!(
+        err.contains("ERROR: Can't delete archive file: crate.7z.001"),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!(
+            "Volumes not deleted: {pieces} of {pieces}: crate.7z.001, "
+        )),
+        "{err}"
+    );
+    assert!(probe.is_file());
+    assert_tree(&dir.path().join("out"));
+}
+
 /// Archive, output-folder and list-file paths that are not UTF-8 name the
 /// file they were given as, on a filesystem that stores such names.
 #[cfg(unix)]

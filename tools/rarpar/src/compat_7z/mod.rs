@@ -1030,11 +1030,39 @@ fn run_extract(session: &mut Session, options: Options, archives: Vec<(PathBuf, 
         let any_selected = selected.iter().any(|&wanted| wanted);
         match extract::extract(session, &setup, &mut stats, opened, selected) {
             Ending::Done(0) => {
-                ok += 1;
-                session.out("Everything is Ok\n");
+                // Delete before the verdict: an archive -sdel could not
+                // delete is an archive with errors, not "Everything is Ok".
+                let mut kept = Vec::new();
                 if delete_after && !setup.test && any_selected {
                     for volume in &set.paths {
-                        let _ = fs::remove_file(volume);
+                        if let Err(error) = fs::remove_file(volume) {
+                            kept.push((volume, error));
+                        }
+                    }
+                }
+                if kept.is_empty() {
+                    ok += 1;
+                    session.out("Everything is Ok\n");
+                } else {
+                    with_errors += 1;
+                    for (volume, error) in &kept {
+                        session.err(&format!(
+                            "\nERROR: Can't delete archive file: {}\n{}\n",
+                            volume.to_string_lossy(),
+                            errno_text(error)
+                        ));
+                    }
+                    if set.paths.len() > 1 {
+                        let left: Vec<String> = kept
+                            .iter()
+                            .map(|(volume, _)| volume.to_string_lossy().into_owned())
+                            .collect();
+                        session.err(&format!(
+                            "Volumes not deleted: {} of {}: {}\n",
+                            kept.len(),
+                            set.paths.len(),
+                            left.join(", ")
+                        ));
                     }
                 }
             }

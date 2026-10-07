@@ -17,6 +17,10 @@ documented in each crate's own changelog so those notes ship with the crate.
 - The `par3` facade keeps a path holding a literal character in
   U+10FF00–U+10FFFF on Unix: such a name now opens that file instead of one
   with a single raw byte in the character's place.
+- The 7-Zip facade reports an archive `-sdel` could not delete: each
+  volume left behind is named on stderr (with a count for a split set), the
+  archive counts as one with errors instead of "Everything is Ok", and the
+  run exits 2.
 - The 7-Zip facade opens the volumes of a split (`.001`) set as reads reach
   them and keeps at most four open, so a set with more volumes than the
   process may hold open lists and extracts instead of failing with "too
