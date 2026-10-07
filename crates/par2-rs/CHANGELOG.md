@@ -35,7 +35,11 @@ Fewer redundant reads on the verify and repair paths.
   `RecoverySliceData::validate_packet_hash` accepts the scan's verdict while
   the path still fingerprints the same, and reads and hashes the payload as
   before when the volume changed, was replaced, is no longer a regular file,
-  or was too fresh to vouch for. Payloads built by any other constructor,
+  or was too fresh to vouch for. The verdict holds only for the recovery set
+  ID and exponent the scan hashed the payload under, both of which the packet
+  hash covers: a recovery packet of another set that `Par2FileSet::from_paths`
+  took in from a mixed volume is hashed against this set's ID and rejected,
+  as before. Payloads built by any other constructor,
   or as a `FileBacked` literal naming a span the scan did not hash, are always
   re-hashed. A same-length rewrite that also restores the mtime is invisible
   to the fingerprint and is left to the verification of the repaired files.
