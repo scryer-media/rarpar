@@ -26,6 +26,12 @@ The CLI version for these changes is assigned when the CLI is released.
   byte-identical to before.
 - Restoring several missing volumes from RAR5 `.rev` files multiplies on every
   core: about twice as fast with eight of 41 volumes missing.
+- Restoring from `.rev` files reads and checks the volumes side by side,
+  hashes restored volumes as they are written, and for RAR5 checks the intact
+  data volumes during the decode instead of reading them twice. Restoring a
+  2.1 GB set with one or eight of 41 volumes missing now takes about 0.25 to
+  0.33 s for either RAR3 or RAR5, against 1 to 5.6 s for RARLAB unrar 7.20.
+  Damaged volumes are renamed to `.bad` exactly as before.
 
 ### Library versions
 

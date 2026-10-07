@@ -6648,6 +6648,147 @@ fn test_recovery_volumes_restore_every_recoverable_loss() {
     }
 }
 
+/// Copy the 10+2 RAR5 recovery set into a fresh directory, leaving out the
+/// data volumes in `drop`, and return the directory with the copied paths.
+fn rar5_recovery_set_without(drop: &[usize]) -> (tempfile::TempDir, Vec<std::path::PathBuf>) {
+    let dir = tempfile::tempdir().unwrap();
+    let names = (1..=10)
+        .filter(|volume| !drop.contains(volume))
+        .map(|volume| format!("rar5_recovery_volumes.part{volume:02}.rar"))
+        .chain(["part01", "part02"].map(|rev| format!("rar5_recovery_volumes.{rev}.rev")));
+    let paths = names
+        .map(|name| {
+            let dst = dir.path().join(&name);
+            std::fs::copy(fixture("rar5", &name), &dst).unwrap();
+            dst
+        })
+        .collect();
+    (dir, paths)
+}
+
+fn rar5_volume(dir: &tempfile::TempDir, volume: usize) -> std::path::PathBuf {
+    dir.path()
+        .join(format!("rar5_recovery_volumes.part{volume:02}.rar"))
+}
+
+/// Flip one byte of a present volume, keeping its size.
+fn corrupt_in_place(path: &std::path::Path) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0x5A;
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// Names in `dir` other than the RAR set's own volumes and backups: a
+/// restore must leave no partial files behind.
+fn stray_files(dir: &tempfile::TempDir) -> Vec<String> {
+    std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with('.') || name.ends_with(".partial"))
+        .collect()
+}
+
+fn rar5_restore_options(dir: &tempfile::TempDir) -> unrar_rs::RecoveryOptions {
+    unrar_rs::RecoveryOptions {
+        output_dir: Some(dir.path().to_path_buf()),
+        overwrite_existing: false,
+        verify_restored: true,
+    }
+}
+
+/// A missing volume plus a same-size volume with a damaged byte. The decode
+/// that trusts the volume's size finds its CRC32 wrong, so the restore falls
+/// back to the checked path: the damaged volume becomes `.bad`, both are
+/// rebuilt as RARLAB wrote them, and no partial file is left.
+#[test]
+fn test_rar5_restore_redoes_when_a_same_size_volume_fails_its_crc() {
+    let (dir, paths) = rar5_recovery_set_without(&[5]);
+    let damaged = rar5_volume(&dir, 3);
+    corrupt_in_place(&damaged);
+    let damaged_bytes = std::fs::read(&damaged).unwrap();
+
+    let report = unrar_rs::restore_volumes_from_paths(&paths, &rar5_restore_options(&dir)).unwrap();
+
+    assert_eq!(report.missing_volume_numbers, vec![2, 4]);
+    assert_eq!(
+        report.restored_paths,
+        vec![rar5_volume(&dir, 3), rar5_volume(&dir, 5)]
+    );
+    for volume in [3, 5] {
+        let name = format!("rar5_recovery_volumes.part{volume:02}.rar");
+        assert!(
+            std::fs::read(rar5_volume(&dir, volume)).unwrap()
+                == std::fs::read(fixture("rar5", &name)).unwrap(),
+            "{name} differs from RARLAB's volume"
+        );
+    }
+    let backup = dir.path().join("rar5_recovery_volumes.part03.rar.bad");
+    assert!(std::fs::read(backup).unwrap() == damaged_bytes);
+    assert_eq!(stray_files(&dir), Vec::<String>::new());
+}
+
+/// A missing volume plus two damaged same-size ones is more than two
+/// recovery volumes cover. The refusal must match the checked path's: the
+/// full count, no `.bad` rename, nothing restored and nothing left behind,
+/// even though the decode trusting sizes had already written its outputs.
+#[test]
+fn test_rar5_restore_refuses_unchanged_when_crc_failures_exceed_recovery() {
+    let (dir, paths) = rar5_recovery_set_without(&[5]);
+    for volume in [3, 7] {
+        corrupt_in_place(&rar5_volume(&dir, volume));
+    }
+
+    let error = unrar_rs::restore_volumes_from_paths(&paths, &rar5_restore_options(&dir))
+        .expect_err("three losses exceed two recovery volumes");
+
+    assert!(
+        error
+            .to_string()
+            .contains("insufficient RAR5 recovery volumes: need 3, have 2"),
+        "{error}"
+    );
+    assert!(!rar5_volume(&dir, 5).exists());
+    for volume in [3, 7] {
+        assert!(rar5_volume(&dir, volume).exists());
+        assert!(
+            !dir.path()
+                .join(format!("rar5_recovery_volumes.part{volume:02}.rar.bad"))
+                .exists()
+        );
+    }
+    assert_eq!(stray_files(&dir), Vec::<String>::new());
+}
+
+/// A truncated volume is bad by size alone, so the decode trusting the
+/// other sizes stands: it is renamed to `.bad` and rebuilt with the missing
+/// one, byte for byte, with no partial file left.
+#[test]
+fn test_rar5_restore_renames_a_short_volume_and_rebuilds_it() {
+    let (dir, paths) = rar5_recovery_set_without(&[8]);
+    let short = rar5_volume(&dir, 2);
+    let bytes = std::fs::read(&short).unwrap();
+    std::fs::write(&short, &bytes[..bytes.len() - 100]).unwrap();
+
+    let report = unrar_rs::restore_volumes_from_paths(&paths, &rar5_restore_options(&dir)).unwrap();
+
+    assert_eq!(report.missing_volume_numbers, vec![1, 7]);
+    for volume in [2, 8] {
+        let name = format!("rar5_recovery_volumes.part{volume:02}.rar");
+        assert!(
+            std::fs::read(rar5_volume(&dir, volume)).unwrap()
+                == std::fs::read(fixture("rar5", &name)).unwrap(),
+            "{name} differs from RARLAB's volume"
+        );
+    }
+    assert!(
+        dir.path()
+            .join("rar5_recovery_volumes.part02.rar.bad")
+            .exists()
+    );
+    assert_eq!(stray_files(&dir), Vec::<String>::new());
+}
+
 #[test]
 fn test_recovery_restore_is_idempotent_for_complete_sets() {
     let rar5_names = (1..=10)

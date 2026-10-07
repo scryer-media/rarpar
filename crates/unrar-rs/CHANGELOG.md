@@ -21,6 +21,26 @@
   to 0.55 s (unrar 7.20: 1.31 s); with one missing, where the restore is
   bound by reading and checking the volumes, from 0.51 s to 0.48 s. Restored
   bytes are unchanged.
+- Recovery-volume restore reads side by side. The `.rev` headers, the
+  recovery-volume CRC32s and the data-volume checks run on every core and
+  are applied in volume order, so errors surface where they did. Each chunk
+  of the decode is read from all of its volumes at once, and a restored
+  volume is hashed as it is written instead of read back to verify it. RAR3
+  `.rev` CRC32s are computed in 256 KiB reads instead of loading each file
+  whole.
+- RAR5 restore no longer reads the intact data volumes twice. When the
+  volumes that are absent or the wrong size are ones the recovery volumes
+  can cover, the decode checks the other volumes' CRC32s as it reads them
+  and writes to hidden partial files; only when every CRC32 matches are bad
+  volumes renamed to `.bad` and the partial files moved into place. If one
+  fails, the partial files are removed and the restore continues as before
+  from the verdicts the decode found, so renames and refusals are unchanged.
+  The next chunk is read while the current one is decoded, inside the same
+  64 MiB working set.
+- On the 2.1 GB 41 + 10 sets above, restores now take 0.26 s (RAR3) and
+  0.25 s (RAR5) with one volume missing and 0.32 s and 0.33 s with eight
+  missing, against 4.4-4.6 s, 0.98-1.09 s, 4.7-5.6 s and 1.37-1.51 s for
+  unrar 7.20. Peak RSS is 70-73 MiB in every case (unrar: 79-353 MiB).
 - `reedsolomon-rs` requirement raised to 0.4.9 for `decode_matrix`,
   `apply_decode_matrix_gf8` and `Rar5RsCoder::apply_units`.
 
