@@ -423,6 +423,16 @@ fn renamed_hosts_are_matched_and_missing_siblings_found_by_stem() {
 }
 
 #[test]
+fn prepare_hosts_refuses_an_empty_host_list() {
+    for layout in LAYOUTS {
+        assert!(matches!(
+            rar5::prepare_hosts(&[], layout, &ExecutionOptions::default()),
+            Err(EngineError::InvalidState("insert host count"))
+        ));
+    }
+}
+
+#[test]
 fn rar4_and_double_insertion_are_refused() {
     let options = ExecutionOptions::default();
     if let Some(rar4) = fixture("rar4", "generated_matrix_rar4_lz_plain.part1.rar") {

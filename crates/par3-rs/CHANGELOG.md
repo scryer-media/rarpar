@@ -15,6 +15,8 @@
     or a `.partN.rar` name): their volume numbers and end flags are
     encrypted, so a family missing its last parts could not be told from a
     complete one.
+  - `prepare_hosts` returns `EngineError::InvalidState` for an empty host
+    list instead of panicking, as `insert_set` does.
   - `prepare_hosts` records the revision it inspected, and `insert_set`
     refuses a host that changed since, instead of using stale framing
     offsets.

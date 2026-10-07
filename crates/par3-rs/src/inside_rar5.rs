@@ -415,6 +415,9 @@ pub fn prepare_hosts(
     layout: Rar5Layout,
     options: &ExecutionOptions,
 ) -> EngineResult<Vec<Rar5Host>> {
+    if paths.is_empty() {
+        return Err(EngineError::InvalidState("insert host count"));
+    }
     let disk: Arc<dyn SourceAccess> = Arc::new(disk_access(paths, options));
     let mut hosts = Vec::new();
     for (index, path) in paths.iter().enumerate() {
