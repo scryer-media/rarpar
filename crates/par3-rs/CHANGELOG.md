@@ -6,6 +6,12 @@
   before it writes anything, and stages every stripped host before it
   installs one; if installing any fails, the ones already installed are
   removed. A failed removal no longer leaves a partial result behind.
+- `inside::rar5` infers a region's recovery-index base from every recovery
+  packet found, not the first one at an aligned slot: the base lies within
+  the range every found index allows, and the one most slots agree on wins.
+  Two swapped packets of a zero-based region no longer derive base 1, so
+  repair restores the region byte for byte instead of writing indices one
+  too high.
 
 ## 0.5.1
 

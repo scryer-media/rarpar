@@ -1316,10 +1316,21 @@ fn open_set(
             host.matched_by = Some("name");
         }
     }
-    // Recovery index base from a packet found at its slot in a host bound
-    // by name; without one, indices start at zero.
-    let mut first = None;
-    'base: for (position, host) in hosts.iter().enumerate() {
+    // Recovery index base, from every recovery packet of this set in a host
+    // bound by name. Every index found bounds the base: the region holds
+    // `total` consecutive indices, so the base lies in
+    // `max - total + 1 ..= min`. Within that range, each packet found at a
+    // packet-aligned slot votes for the base that puts it there, and the
+    // base most packets agree on wins (the lowest on a tie). One packet
+    // moved to another slot therefore cannot outvote the rest, and cannot
+    // derive a base that would leave a found index outside the region.
+    // Without votes the base is the in-range value nearest zero; without any
+    // recovery packet, zero.
+    let total: u64 = hosts.iter().map(|host| host.recovery.end).sum();
+    let mut votes: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut lowest: Option<u64> = None;
+    let mut highest: Option<u64> = None;
+    for (position, host) in hosts.iter().enumerate() {
         let Some(source) = host.source else { continue };
         let candidate = candidates
             .iter()
@@ -1332,16 +1343,40 @@ fn open_set(
             else {
                 continue;
             };
+            lowest = Some(lowest.map_or(index, |low| low.min(index)));
+            highest = Some(highest.map_or(index, |high| high.max(index)));
             let offset = packet.origin().offset;
             if offset >= start && (offset - start).is_multiple_of(packet_len(block_size)) {
                 let slot = (offset - start) / packet_len(block_size);
                 if slot < host.recovery.end && index >= before + slot {
-                    first = Some(index - before - slot);
-                    break 'base;
+                    *votes.entry(index - before - slot).or_default() += 1;
                 }
             }
         }
     }
+    let first = match (lowest, highest) {
+        (Some(low), Some(high)) => {
+            let floor = (high + 1).saturating_sub(total);
+            let ceiling = low;
+            let in_range = |base: &u64| floor <= *base && *base <= ceiling;
+            let voted = votes
+                .iter()
+                .filter(|(base, _)| in_range(base))
+                .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+                .map(|(base, _)| *base);
+            match voted {
+                Some(base) => Some(base),
+                None if floor <= ceiling => Some(floor),
+                // Inconsistent indices (more distinct ones than the region
+                // holds): fall back to the strongest vote.
+                None => votes
+                    .iter()
+                    .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+                    .map(|(base, _)| *base),
+            }
+        }
+        _ => None,
+    };
     let mut base = first.unwrap_or(0);
     for host in &mut hosts {
         let count = host.recovery.end;

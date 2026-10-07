@@ -705,3 +705,59 @@ fn removal_installs_nothing_when_a_later_destination_exists() {
         );
     }
 }
+
+/// Two recovery packets swapped in place leave a zero-based region: the
+/// moved packet cannot outvote every other slot, so repair puts each packet
+/// back at its own slot and restores the region byte for byte.
+#[test]
+fn swapped_recovery_packets_keep_the_zero_base() {
+    let Some(source) = fixture("rar5", "rar5_lz.rar") else {
+        return;
+    };
+    let tree = common::TempTree::new("rar5-swapped-recovery");
+    let recovery = 8;
+    let inserted = insert(
+        tree.path(),
+        std::slice::from_ref(&source),
+        Rar5Layout::Trailing,
+        Rar5Placement::Spread,
+        1024,
+        recovery,
+    );
+    let clean = std::fs::read(&inserted[0]).unwrap();
+    let gap = open_one(&inserted).hosts[0].gap.clone();
+    let region = &clean[gap.start as usize..gap.end as usize];
+    let starts: Vec<usize> = region
+        .windows(8)
+        .enumerate()
+        .filter(|(_, window)| *window == b"PAR3\0PKT")
+        .map(|(at, _)| gap.start as usize + at)
+        .collect();
+    // The recovery packets close the region, all of one length.
+    let packets = &starts[starts.len() - recovery as usize..];
+    let length = packets[1] - packets[0];
+    assert!(
+        packets.windows(2).all(|pair| pair[1] - pair[0] == length)
+            && gap.end as usize - packets[recovery as usize - 1] == length,
+        "recovery packets are not evenly spaced"
+    );
+    let (first, second) = (packets[0], packets[1]);
+    let mut bytes = clean.clone();
+    bytes[first..first + length].copy_from_slice(&clean[second..second + length]);
+    bytes[second..second + length].copy_from_slice(&clean[first..first + length]);
+    let path = tree
+        .path()
+        .join("swapped")
+        .join(inserted[0].file_name().unwrap());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+
+    let mut set = open_one(std::slice::from_ref(&path));
+    assert!(set.hosts[0].complete);
+    assert!(!set.hosts[0].region_intact);
+    let report = repair_into(&mut set, tree.path(), "swapped");
+    assert_eq!(report.len(), 1);
+    assert!(!report[0].data_rebuilt);
+    assert_eq!(report[0].regenerated, 0, "every packet was present");
+    assert_eq!(std::fs::read(&report[0].path).unwrap(), clean);
+}
