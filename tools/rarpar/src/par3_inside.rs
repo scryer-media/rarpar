@@ -472,6 +472,12 @@ fn uncovered_volumes(cli: &Cli, args: &Par3InsideArgs, sets: &[Rar5Set]) -> Vec<
 
 fn verify(cli: &Cli, args: &Par3InsideArgs) -> Result<(bool, Value), RarparError> {
     let sets = open(cli, args)?;
+    // Verifying no set proves nothing, so an archive without one fails.
+    if sets.is_empty() {
+        return Err(RarparError::Data(
+            "no embedded PAR3 set found in the given archives".to_owned(),
+        ));
+    }
     let uncovered = uncovered_volumes(cli, args, &sets);
     let healthy = uncovered.is_empty() && sets.iter().all(|set| set.needs_repair().is_empty());
     let repairable = uncovered.is_empty()

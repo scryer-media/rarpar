@@ -422,3 +422,28 @@ fn inside_dry_run_removal_checks_like_a_removal() {
     assert_eq!(dry, code(false));
     assert!(!root.join("stripped").join(name(3)).exists());
 }
+
+/// An ordinary RAR5 archive carries no embedded set, so verifying it fails
+/// instead of reporting nothing checked as intact.
+#[test]
+fn inside_verify_without_an_embedded_set_fails() {
+    let single = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/unrar-rs/tests/fixtures/rar5/rar5_store.rar");
+    if !single.is_file() {
+        eprintln!("skipping: fixture {} is not present", single.display());
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let plain = temp.path().join("plain-host.rar");
+    std::fs::copy(&single, &plain).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rarpar"))
+        .current_dir(temp.path())
+        .args(["--json", "par3", "inside", "verify"])
+        .arg(&plain)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr={stderr}");
+    assert!(stderr.contains("no PAR3 packets found"), "{stderr}");
+    assert!(output.stdout.is_empty());
+}
