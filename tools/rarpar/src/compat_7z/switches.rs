@@ -1,5 +1,11 @@
 //! 7-Zip's command-line switch table and parser (`CommandLineParser.cpp`,
 //! `ArchiveCommandLine.cpp`), kept to its exact matching and error rules.
+//!
+//! Matching works on each argument's text; a switch's value and every
+//! non-switch also keep the argument's own bytes, so a path that is not valid
+//! UTF-8 names the same file it was given as.
+
+use std::ffi::{OsStr, OsString};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -126,12 +132,16 @@ pub(super) struct Switch {
     /// Index into the switch's character set, when one followed it.
     pub post_char: Option<usize>,
     pub strings: Vec<String>,
+    /// Each of `strings` exactly as the command line gave it.
+    pub raw: Vec<OsString>,
 }
 
 /// A parsed command line.
 pub(super) struct Parsed {
     switches: Vec<Switch>,
     pub non_switches: Vec<String>,
+    /// Each of `non_switches` exactly as the command line gave it.
+    pub raw_non_switches: Vec<OsString>,
     /// Where `--` stopped switch parsing, as an index into `non_switches`.
     pub stop_index: Option<usize>,
 }
@@ -149,6 +159,20 @@ impl LineError {
             message: message.into(),
             argument: argument.into(),
         }
+    }
+}
+
+/// `arg` without its first `skip` bytes, which are ASCII, keeping the rest
+/// exactly as given (on Unix, bytes that are not UTF-8 included).
+pub(super) fn raw_tail(arg: &OsStr, skip: usize) -> OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        OsStr::from_bytes(&arg.as_bytes()[skip..]).to_owned()
+    }
+    #[cfg(not(unix))]
+    {
+        OsString::from(&arg.to_string_lossy()[skip..])
     }
 }
 
@@ -172,7 +196,7 @@ impl Parsed {
     }
 }
 
-fn parse_switch(arg: &str, switches: &mut [Switch]) -> Result<(), &'static str> {
+fn parse_switch(arg: &str, raw: &OsStr, switches: &mut [Switch]) -> Result<(), &'static str> {
     let rest = &arg[1..];
     let mut best: Option<usize> = None;
     for (index, form) in FORMS.iter().enumerate() {
@@ -218,6 +242,9 @@ fn parse_switch(arg: &str, switches: &mut [Switch]) -> Result<(), &'static str> 
         }
         Kind::Str => {
             switch.strings.push(tail.to_owned());
+            // The dash and the key are ASCII: the value starts at the same
+            // byte in the raw argument.
+            switch.raw.push(raw_tail(raw, 1 + form.key.len()));
             return Ok(());
         }
         _ => {}
@@ -229,27 +256,31 @@ fn parse_switch(arg: &str, switches: &mut [Switch]) -> Result<(), &'static str> 
 }
 
 /// `CParser::ParseStrings`.
-pub(super) fn parse(args: &[String]) -> Result<Parsed, LineError> {
+pub(super) fn parse(args: &[OsString]) -> Result<Parsed, LineError> {
     let mut switches = vec![Switch::default(); FORMS.len()];
     let mut non_switches = Vec::new();
+    let mut raw_non_switches = Vec::new();
     let mut stop_index = None;
-    for arg in args {
+    for raw in args {
+        let arg = raw.to_string_lossy();
         if stop_index.is_none() {
             if arg == "--" {
                 stop_index = Some(non_switches.len());
                 continue;
             }
             if arg.starts_with('-') {
-                parse_switch(arg, &mut switches)
+                parse_switch(&arg, raw, &mut switches)
                     .map_err(|message| LineError::new(message, arg.clone()))?;
                 continue;
             }
         }
-        non_switches.push(arg.clone());
+        non_switches.push(arg.into_owned());
+        raw_non_switches.push(raw.clone());
     }
     Ok(Parsed {
         switches,
         non_switches,
+        raw_non_switches,
         stop_index,
     })
 }
@@ -258,7 +289,11 @@ pub(super) fn parse(args: &[String]) -> Result<Parsed, LineError> {
 mod tests {
     use super::*;
 
-    fn args(list: &[&str]) -> Vec<String> {
+    fn args(list: &[&str]) -> Vec<OsString> {
+        list.iter().map(OsString::from).collect()
+    }
+
+    fn strings(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_owned()).collect()
     }
 
@@ -312,7 +347,20 @@ mod tests {
     #[test]
     fn double_dash_stops_switches() {
         let parsed = parse(&args(&["x", "--", "-name.7z"])).unwrap();
-        assert_eq!(parsed.non_switches, args(&["x", "-name.7z"]));
+        assert_eq!(parsed.non_switches, strings(&["x", "-name.7z"]));
         assert_eq!(parsed.stop_index, Some(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn values_and_names_keep_their_bytes() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let name = OsString::from_vec(b"arch\xffive.7z".to_vec());
+        let mut out = b"-o".to_vec();
+        out.extend_from_slice(b"out\xfe/");
+        let parsed = parse(&[OsString::from("x"), OsString::from_vec(out), name.clone()]).unwrap();
+        assert_eq!(parsed.raw_non_switches[1], name);
+        assert_eq!(parsed.get("o").raw[0].as_bytes(), b"out\xfe/");
+        assert_eq!(parsed.non_switches[1], "arch\u{FFFD}ive.7z");
     }
 }

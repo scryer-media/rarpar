@@ -14,6 +14,11 @@ documented in each crate's own changelog so those notes ship with the crate.
   as `-m256MiB`) as a malformed command instead of reading it as bytes; the
   accepted suffixes stay none, `k`, `kb`, `m`, `mb`, `g` and `gb`, in any
   case.
+- The 7-Zip facade keeps archive, output-folder (`-o`), list-file and
+  archive-include (`-ai`/`-ax`) paths exactly as given on Unix: a path that
+  is not valid UTF-8 now names the same file instead of one with U+FFFD in
+  place of its odd bytes. Folder walks and `-o` with `*` keep such names
+  too.
 
 ## rarpar 0.8.1
 

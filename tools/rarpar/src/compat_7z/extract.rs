@@ -1,6 +1,7 @@
 //! `x`, `e` and `t`: decode the selected items the way 7-Zip's extract
 //! callback does, in archive order, block by block.
 
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -31,8 +32,12 @@ enum FolderError {
 /// Create the folders `parts` names under `base`, one component at a time,
 /// refusing any that is a symbolic link. `base` itself is the caller's own
 /// output folder and is trusted.
-fn confined_folders(base: &str, parts: &[String]) -> Result<(), FolderError> {
-    let mut path = PathBuf::from(if base.is_empty() { "." } else { base });
+fn confined_folders(base: &OsStr, parts: &[String]) -> Result<(), FolderError> {
+    let mut path = PathBuf::from(if base.is_empty() {
+        OsStr::new(".")
+    } else {
+        base
+    });
     if !base.is_empty() {
         fs::create_dir_all(&path).map_err(FolderError::Io)?;
     }
@@ -84,8 +89,8 @@ pub(super) struct Setup {
     pub test: bool,
     pub flat: bool,
     pub to_stdout: bool,
-    /// The output folder prefix, ending in a separator.
-    pub out_dir: String,
+    /// The output folder prefix, ending in a separator, exactly as given.
+    pub out_dir: OsString,
     pub overwrite: Overwrite,
     pub threads: u32,
 }
@@ -183,7 +188,7 @@ const FIRST_READ: usize = 4 << 10;
 /// An opened member's destination: the file written, if any.
 #[derive(Default)]
 struct Output {
-    path: Option<String>,
+    path: Option<PathBuf>,
     file: Option<File>,
 }
 
@@ -241,7 +246,7 @@ struct Extractor<'a> {
     encrypted: bool,
     /// The member being written, and once its output is open, the path
     /// it went to (`Some(None)` when it is not written to a file).
-    in_progress: Option<(usize, Option<Option<String>>)>,
+    in_progress: Option<(usize, Option<Option<PathBuf>>)>,
     stop: Option<Stop>,
     dirs: Vec<(PathBuf, Item)>,
     buffer: Vec<u8>,
@@ -288,16 +293,15 @@ fn correct_parts(name: &str, is_dir: bool) -> Vec<String> {
     parts
 }
 
-/// 7-Zip's `AutoRenamePath`: the first free `name_N.ext`.
-fn auto_rename(path: &str) -> Option<String> {
-    let slash = path
-        .rfind(['/', std::path::MAIN_SEPARATOR])
-        .map_or(0, |at| at + 1);
-    let (stem, extension) = match path.rfind('.') {
-        Some(dot) if dot > slash => (&path[..dot], &path[dot..]),
-        _ => (path, ""),
+/// 7-Zip's `AutoRenamePath`: the first free `name_N.ext`. The file name is a
+/// member's, so text; the folder it is in is kept as given.
+fn auto_rename(path: &Path) -> Option<PathBuf> {
+    let file = path.file_name()?.to_string_lossy().into_owned();
+    let (stem, extension) = match file.rfind('.') {
+        Some(dot) if dot > 0 => (&file[..dot], &file[dot..]),
+        _ => (file.as_str(), ""),
     };
-    let name = |n: u32| format!("{stem}_{n}{extension}");
+    let name = |n: u32| path.with_file_name(format!("{stem}_{n}{extension}"));
     let exists = |n: u32| fs::symlink_metadata(name(n)).is_ok();
     let (mut left, mut right) = (1u32, 1u32 << 30);
     while left != right {
@@ -401,7 +405,7 @@ fn decode_message(error: &SevenZError, encrypted: bool) -> &'static str {
 }
 
 impl Extractor<'_> {
-    fn out_path(&self, item: &Item) -> (String, Vec<String>) {
+    fn out_path(&self, item: &Item) -> (PathBuf, Vec<String>) {
         let mut parts = correct_parts(&item.name, item.is_dir);
         if self.setup.flat
             && let Some(last) = parts.pop()
@@ -409,8 +413,8 @@ impl Extractor<'_> {
             parts = vec![last];
         }
         let mut path = self.setup.out_dir.clone();
-        path.push_str(&parts.join(std::path::MAIN_SEPARATOR_STR));
-        (path, parts)
+        path.push(parts.join(std::path::MAIN_SEPARATOR_STR));
+        (PathBuf::from(path), parts)
     }
 
     fn operation_line(&mut self, item: &Item, test: bool) {
@@ -461,7 +465,6 @@ impl Extractor<'_> {
             return;
         }
         let (path, parts) = self.out_path(item);
-        let path = PathBuf::from(path);
         match confined_folders(&self.setup.out_dir, &parts) {
             Ok(()) => {}
             Err(FolderError::Link) => {
@@ -479,16 +482,17 @@ impl Extractor<'_> {
     }
 
     /// The overwrite decision for an existing output; `None` skips the file.
-    fn resolve_existing(&mut self, path: String, item: &Item) -> Result<Option<String>, Stop> {
+    fn resolve_existing(&mut self, path: PathBuf, item: &Item) -> Result<Option<PathBuf>, Stop> {
         let Ok(existing) = fs::symlink_metadata(&path) else {
             return Ok(Some(path));
         };
+        let shown = path.to_string_lossy().into_owned();
         if self.overwrite == Overwrite::Skip {
             return Ok(None);
         }
         if self.overwrite == Overwrite::Ask {
             let mut text = String::from("\nWould you like to replace the existing file:\n");
-            text.push_str(&format!("  Path:     {path}\n"));
+            text.push_str(&format!("  Path:     {shown}\n"));
             text.push_str(&format!("  Size:     {}\n", smart_size(existing.len())));
             if let Ok(modified) = existing.modified() {
                 let secs = match modified.duration_since(std::time::UNIX_EPOCH) {
@@ -538,18 +542,18 @@ impl Extractor<'_> {
             Overwrite::Rename => match auto_rename(&path) {
                 Some(renamed) => Ok(Some(renamed)),
                 None => {
-                    self.item_error("Cannot create name for file", &path);
+                    self.item_error("Cannot create name for file", &shown);
                     Ok(None)
                 }
             },
             Overwrite::RenameExisting => {
                 let Some(renamed) = auto_rename(&path) else {
-                    self.item_error("Cannot create name for file", &path);
+                    self.item_error("Cannot create name for file", &shown);
                     return Ok(None);
                 };
                 if let Err(error) = fs::rename(&path, &renamed) {
                     let text = format!("Cannot rename existing file : {}", errno_text(&error));
-                    self.item_error(&text, &path);
+                    self.item_error(&text, &shown);
                     return Ok(None);
                 }
                 Ok(Some(path))
@@ -568,7 +572,7 @@ impl Extractor<'_> {
                             "Cannot delete output file"
                         };
                         let text = format!("{what} : {}", errno_text(&error));
-                        self.item_error(&text, &path);
+                        self.item_error(&text, &shown);
                         Ok(None)
                     }
                     _ => Ok(Some(path)),
@@ -577,7 +581,7 @@ impl Extractor<'_> {
         }
     }
 
-    fn create(&mut self, path: &str) -> Option<File> {
+    fn create(&mut self, path: &Path) -> Option<File> {
         let mut options = OpenOptions::new();
         options.write(true).create(true).truncate(true);
         // Never write through a link planted at the member's own name.
@@ -587,7 +591,7 @@ impl Extractor<'_> {
             Ok(file) => Some(file),
             Err(error) => {
                 let text = format!("Cannot open output file : {}", errno_text(&error));
-                self.item_error(&text, path);
+                self.item_error(&text, &path.to_string_lossy());
                 None
             }
         }
@@ -743,7 +747,10 @@ impl Extractor<'_> {
         if item.symlink && crc_ok {
             if link_too_long {
                 let _ = fs::remove_file(&path);
-                self.item_error("Cannot create symbolic link : File name too long", &path);
+                self.item_error(
+                    "Cannot create symbolic link : File name too long",
+                    &path.to_string_lossy(),
+                );
                 return Ok(());
             }
             let link = String::from_utf8_lossy(&link_target).into_owned();
@@ -756,40 +763,35 @@ impl Extractor<'_> {
             let _ = fs::remove_file(&path);
             if let Err(error) = std::os::unix::fs::symlink(&link_path, &path) {
                 let text = format!("Cannot create symbolic link : {}", errno_text(&error));
-                self.item_error(&text, &path);
+                self.item_error(&text, &path.to_string_lossy());
                 return Ok(());
             }
         }
         let _ = &link_target;
-        set_metadata(Path::new(&path), &item);
+        set_metadata(&path, &item);
         Ok(())
     }
 
     /// Where a link points once extracted: relative targets must stay in
     /// the output folder, absolute ones are re-rooted there, as 7-Zip does.
     #[cfg(unix)]
-    fn link_path(&self, item: &Item, link: &str) -> Option<String> {
+    fn link_path(&self, item: &Item, link: &str) -> Option<PathBuf> {
         if let Some(rest) = link.strip_prefix('/') {
             if !link_is_safe(&[String::new()], rest) {
                 return None;
             }
             let base = if self.setup.out_dir.is_empty() {
-                ".".to_owned()
+                OsStr::new(".")
             } else {
-                self.setup.out_dir.clone()
+                self.setup.out_dir.as_os_str()
             };
-            let base = std::path::absolute(&base).ok()?;
-            let mut text = base.to_string_lossy().into_owned();
-            if !text.ends_with('/') {
-                text.push('/');
-            }
-            text.push_str(rest);
-            return Some(text);
+            // `rest` is relative: `link_is_safe` refused another leading `/`.
+            return Some(std::path::absolute(base).ok()?.join(rest));
         }
         // Judge the link from where it is actually created: the sanitised
         // path, not the archive's own name, whose `..` parts are dropped.
         let (_, parts) = self.out_path(item);
-        link_is_safe(&parts, link).then(|| link.to_owned())
+        link_is_safe(&parts, link).then(|| PathBuf::from(link))
     }
 
     fn drain(&mut self, data: &mut dyn Read) -> Result<(), Stop> {
@@ -814,7 +816,7 @@ impl Extractor<'_> {
             }
             self.item_error(message, &item.name);
             if let Some(Some(path)) = opened {
-                set_metadata(Path::new(&path), &item);
+                set_metadata(&path, &item);
             }
         }
         for &index in files {

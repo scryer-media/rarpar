@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use censor::{Censor, MarkMode, NameOption, Recursion, has_wildcard, wildcard_match};
 use extract::{Ending, HashSums, Overwrite, Setup, Stats};
 use format::{archive_method, smart_size};
-use switches::{LineError, Parsed};
+use switches::{LineError, Parsed, raw_tail};
 use volume::{OpenFailure, Opened, VolumeSet, open_archive, volume_set};
 
 const EXIT_OK: u8 = 0;
@@ -40,17 +40,88 @@ pub(crate) fn invoked_as_7z(program: &OsStr) -> bool {
 
 /// Run a 7-Zip command line; the arguments follow the program name.
 pub(crate) fn dispatch(args: &[OsString]) -> u8 {
-    let args: Vec<String> = args
-        .iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
     let mut session = Session {
         out_target: 1,
         err_target: 2,
         log_level: 0,
         password: None,
     };
-    run(&mut session, &args)
+    run(&mut session, args)
+}
+
+/// Whether `path` ends in a path separator.
+fn ends_with_separator(path: &OsStr) -> bool {
+    path.to_string_lossy()
+        .ends_with(['/', std::path::MAIN_SEPARATOR])
+}
+
+/// `path` split after its last separator: the folder prefix (ending in the
+/// separator, or empty) and the file name, each exactly as given.
+fn split_folder(path: &OsStr) -> (OsString, OsString) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_bytes();
+        match bytes.iter().rposition(|&byte| byte == b'/') {
+            Some(at) => (
+                OsStr::from_bytes(&bytes[..=at]).to_owned(),
+                OsStr::from_bytes(&bytes[at + 1..]).to_owned(),
+            ),
+            None => (OsString::new(), path.to_owned()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let text = path.to_string_lossy();
+        match text.rfind(['/', std::path::MAIN_SEPARATOR]) {
+            Some(at) => (text[..=at].into(), text[at + 1..].into()),
+            None => (OsString::new(), path.to_owned()),
+        }
+    }
+}
+
+/// `text` with every `*` replaced by `with`, the rest kept as given.
+fn replace_star(text: &OsStr, with: &OsStr) -> OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let mut out = Vec::with_capacity(text.len());
+        for &byte in text.as_bytes() {
+            if byte == b'*' {
+                out.extend_from_slice(with.as_bytes());
+            } else {
+                out.push(byte);
+            }
+        }
+        OsString::from_vec(out)
+    }
+    #[cfg(not(unix))]
+    {
+        text.to_string_lossy()
+            .replace('*', &with.to_string_lossy())
+            .into()
+    }
+}
+
+/// `name` without its last `.extension`, as 7-Zip names the `*` folder.
+fn strip_extension(name: &OsStr) -> OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = name.as_bytes();
+        match bytes.iter().rposition(|&byte| byte == b'.') {
+            Some(dot) if dot > 0 => OsStr::from_bytes(&bytes[..dot]).to_owned(),
+            _ => name.to_owned(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let text = name.to_string_lossy();
+        match text.rfind('.') {
+            Some(dot) if dot > 0 => text[..dot].into(),
+            _ => name.to_owned(),
+        }
+    }
 }
 
 /// Where messages go, and what the user has told us so far.
@@ -225,9 +296,10 @@ enum Command {
 /// One `-i`/`-x`/`-ai` argument: its options and its names.
 fn wildcard_switch(
     text: &str,
+    raw: &OsStr,
     include: bool,
     default: Recursion,
-    names: &mut Vec<(NameOption, String)>,
+    names: &mut Vec<(NameOption, OsString)>,
 ) -> Result<(), LineError> {
     let invalid = |message: &str| LineError::new(message, text.to_owned());
     let mut option = NameOption {
@@ -285,34 +357,51 @@ fn wildcard_switch(
             _ => break,
         }
     }
-    let rest: String = chars[at..].iter().collect();
-    if let Some(name) = rest.strip_prefix('!') {
-        names.push((option, name.to_owned()));
-        Ok(())
-    } else if let Some(file) = rest.strip_prefix('@') {
-        list_file(file, &option, names)
-    } else {
-        Err(invalid("Incorrect wildcard type marker"))
+    // Every option character before `at` is ASCII: the marker is at byte
+    // `at` of the raw argument too.
+    match chars[at] {
+        '!' => {
+            names.push((option, raw_tail(raw, at + 1)));
+            Ok(())
+        }
+        '@' => list_file(&raw_tail(raw, at + 1), &option, names),
+        _ => Err(invalid("Incorrect wildcard type marker")),
+    }
+}
+
+/// A list file's names, one a line, kept as the file's own bytes on Unix.
+fn list_lines(data: &[u8]) -> Vec<OsString> {
+    let data = data.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(data);
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        data.split(|&byte| byte == b'\n')
+            .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+            .map(<[u8]>::trim_ascii)
+            .filter(|line| !line.is_empty())
+            .map(|line| OsStr::from_bytes(line).to_owned())
+            .collect()
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8_lossy(data)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(OsString::from)
+            .collect()
     }
 }
 
 fn list_file(
-    file: &str,
+    file: &OsStr,
     option: &NameOption,
-    names: &mut Vec<(NameOption, String)>,
+    names: &mut Vec<(NameOption, OsString)>,
 ) -> Result<(), LineError> {
-    let data =
-        fs::read(file).map_err(|_| LineError::new("Cannot open list file", file.to_owned()))?;
-    let text = match data.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
-        Some(rest) => String::from_utf8_lossy(rest).into_owned(),
-        None => String::from_utf8_lossy(&data).into_owned(),
-    };
-    for line in text.lines() {
-        let line = line.trim();
-        if !line.is_empty() {
-            names.push((*option, line.to_owned()));
-        }
-    }
+    let data = fs::read(file).map_err(|_| {
+        LineError::new("Cannot open list file", file.to_string_lossy().into_owned())
+    })?;
+    names.extend(list_lines(&data).into_iter().map(|line| (*option, line)));
     Ok(())
 }
 
@@ -320,7 +409,7 @@ fn list_file(
 struct Options {
     command: Command,
     forced_type: Option<String>,
-    archives: Vec<(NameOption, String)>,
+    archives: Vec<(NameOption, OsString)>,
     /// `-ax`: archives that are never opened, so never deleted.
     archive_excludes: Censor,
     censor: Censor,
@@ -334,8 +423,8 @@ struct Options {
 
 /// `Parse2`: the command, the names and the switches that need them.
 fn parse_options(parsed: &Parsed, session: &mut Session) -> Result<Options, LineError> {
-    let mut words = parsed.non_switches.iter();
-    let Some(command_word) = words.next() else {
+    let mut words = parsed.non_switches.iter().zip(&parsed.raw_non_switches);
+    let Some((command_word, _)) = words.next() else {
         return Err(LineError::new("Cannot find command", ""));
     };
     let command = match command_word.to_ascii_lowercase().as_str() {
@@ -395,16 +484,18 @@ fn parse_options(parsed: &Parsed, session: &mut Session) -> Result<Options, Line
     let mut archive_names = Vec::new();
     if !parsed.has("an") {
         match words.next() {
-            Some(name) => archive_names.push((NameOption::default(), name.clone())),
+            Some((_, name)) => archive_names.push((NameOption::default(), name.clone())),
             None => return Err(LineError::new("Cannot find archive name", "")),
         }
     }
-    for text in &parsed.get("ai").strings {
-        wildcard_switch(text, true, Recursion::None, &mut archive_names)?;
+    let ai = parsed.get("ai");
+    for (text, raw) in ai.strings.iter().zip(&ai.raw) {
+        wildcard_switch(text, raw, true, Recursion::None, &mut archive_names)?;
     }
     let mut archive_excluded = Vec::new();
-    for text in &parsed.get("ax").strings {
-        wildcard_switch(text, false, Recursion::None, &mut archive_excluded)?;
+    let ax = parsed.get("ax");
+    for (text, raw) in ax.strings.iter().zip(&ax.raw) {
+        wildcard_switch(text, raw, false, Recursion::None, &mut archive_excluded)?;
     }
     let mut archive_excludes = Censor::new(case_sensitive);
     archive_excludes.add_name(
@@ -418,32 +509,32 @@ fn parse_options(parsed: &Parsed, session: &mut Session) -> Result<Options, Line
         if name.is_empty() {
             return Err(LineError::new("Empty file path", ""));
         }
-        archive_excludes.add_name(option, name);
+        archive_excludes.add_name(option, &name.to_string_lossy());
     }
 
-    let mut names: Vec<(NameOption, String)> = Vec::new();
-    for text in &parsed.get("i").strings {
-        wildcard_switch(text, true, recursion, &mut names)?;
+    let mut names: Vec<(NameOption, OsString)> = Vec::new();
+    let i = parsed.get("i");
+    for (text, raw) in i.strings.iter().zip(&i.raw) {
+        wildcard_switch(text, raw, true, recursion, &mut names)?;
     }
     let has_includes = !names.is_empty();
-    for text in &parsed.get("x").strings {
+    let x = parsed.get("x");
+    for (text, raw) in x.strings.iter().zip(&x.raw) {
         let rest = text.to_ascii_lowercase();
         if rest == "td" || rest == "tf" {
             continue;
         }
-        wildcard_switch(text, false, recursion, &mut names)?;
+        wildcard_switch(text, raw, false, recursion, &mut names)?;
     }
     let mut positional = Vec::new();
     // `--` ends `@listfile` reading for every word after it: judge each
     // word by its own place among the non-switches.
     let first = parsed.non_switches.len() - words.len();
-    for (index, word) in (first..).zip(words) {
-        if let Some(file) = word.strip_prefix('@')
-            && parsed.stop_index.is_none_or(|stop| index < stop)
-        {
-            list_file(file, &default_option, &mut positional)?;
+    for (index, (word, raw)) in (first..).zip(words) {
+        if word.starts_with('@') && parsed.stop_index.is_none_or(|stop| index < stop) {
+            list_file(&raw_tail(raw, 1), &default_option, &mut positional)?;
         } else {
-            positional.push((default_option, word.clone()));
+            positional.push((default_option, raw.clone()));
         }
     }
     let mut censor = Censor::new(case_sensitive);
@@ -461,14 +552,14 @@ fn parse_options(parsed: &Parsed, session: &mut Session) -> Result<Options, Line
         if name.is_empty() {
             return Err(LineError::new("Empty file path", ""));
         }
-        censor.add_name(option, name);
+        censor.add_name(option, &name.to_string_lossy());
     }
 
-    let mut out_dir = String::new();
+    let mut out_dir = OsString::new();
     if parsed.has("o") {
-        out_dir = parsed.get("o").strings[0].clone();
-        if !out_dir.is_empty() && !out_dir.ends_with(['/', std::path::MAIN_SEPARATOR]) {
-            out_dir.push(std::path::MAIN_SEPARATOR);
+        out_dir = parsed.get("o").raw[0].clone();
+        if !out_dir.is_empty() && !ends_with_separator(&out_dir) {
+            out_dir.push(std::path::MAIN_SEPARATOR_STR);
         }
     }
     let mut overwrite = if parsed.has("y") {
@@ -545,7 +636,7 @@ fn stream_target(parsed: &Parsed, key: &str, default: u8) -> u8 {
     }
 }
 
-fn run(session: &mut Session, args: &[String]) -> u8 {
+fn run(session: &mut Session, args: &[OsString]) -> u8 {
     // Parse1: switch syntax, before anything is printed.
     let parsed = match switches::parse(args) {
         Ok(parsed) => parsed,
@@ -617,17 +708,17 @@ fn run(session: &mut Session, args: &[String]) -> u8 {
 fn find_archives(
     session: &mut Session,
     options: &Options,
-) -> Result<(Vec<(String, u64)>, u64), u8> {
+) -> Result<(Vec<(PathBuf, u64)>, u64), u8> {
     let mut found = Vec::new();
     let mut folders = 0u64;
     let mut missing: Option<io::Error> = None;
     let mut wildcard_names = false;
     let case_sensitive = options.names_case_sensitive;
     for (option, name) in &options.archives {
-        let (dir, file) = match name.rfind(['/', std::path::MAIN_SEPARATOR]) {
-            Some(at) => (&name[..=at], &name[at + 1..]),
-            None => ("", name.as_str()),
-        };
+        let (dir, file) = split_folder(name);
+        let dir = Path::new(&dir);
+        let file = file.to_string_lossy();
+        let file = file.as_ref();
         let recursive = match option.recursion {
             Recursion::All => true,
             Recursion::WildcardOnly => has_wildcard(file),
@@ -639,46 +730,51 @@ fn find_archives(
             wildcard_names = true;
             let mut matches = Vec::new();
             folders += walk(dir, Some((file, case_sensitive)), &mut matches);
-            matches.sort();
+            sort_paths(&mut matches);
             found.extend(matches);
             continue;
         }
         if has_wildcard(file) {
             wildcard_names = true;
-            let listing = fs::read_dir(if dir.is_empty() { "." } else { dir });
+            let listing = fs::read_dir(if dir.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                dir
+            });
             let mut matches = Vec::new();
             if let Ok(listing) = listing {
                 for entry in listing.flatten() {
                     let Ok(meta) = fs::metadata(entry.path()) else {
                         continue;
                     };
-                    let entry_name = entry.file_name().to_string_lossy().into_owned();
-                    if meta.is_file() && wildcard_match(file, &entry_name, case_sensitive) {
-                        matches.push((format!("{dir}{entry_name}"), meta.len()));
+                    let entry_name = entry.file_name();
+                    if meta.is_file()
+                        && wildcard_match(file, &entry_name.to_string_lossy(), case_sensitive)
+                    {
+                        matches.push((dir.join(entry_name), meta.len()));
                     }
                 }
             }
-            matches.sort();
+            sort_paths(&mut matches);
             found.extend(matches);
             continue;
         }
         match fs::metadata(name) {
-            Ok(meta) if meta.is_file() => found.push((name.clone(), meta.len())),
+            Ok(meta) if meta.is_file() => found.push((PathBuf::from(name), meta.len())),
             Ok(_) => {
                 // A folder stands for every file under it.
                 folders += 1;
                 let mut inside = Vec::new();
-                let prefix = if name.ends_with(['/', std::path::MAIN_SEPARATOR]) {
-                    name.clone()
-                } else {
-                    format!("{name}{}", std::path::MAIN_SEPARATOR)
-                };
-                folders += walk(&prefix, None, &mut inside);
-                inside.sort();
+                folders += walk(Path::new(name), None, &mut inside);
+                sort_paths(&mut inside);
                 found.extend(inside);
             }
             Err(error) => {
-                session.err(&format!("\nERROR: {}\n{name}\n\n", errno_text(&error)));
+                session.err(&format!(
+                    "\nERROR: {}\n{}\n\n",
+                    errno_text(&error),
+                    name.to_string_lossy()
+                ));
                 missing = Some(error);
             }
         }
@@ -688,7 +784,11 @@ fn find_archives(
         return Err(EXIT_FATAL);
     }
     // `-ax`: an excluded archive is never opened, so never deleted.
-    found.retain(|(path, _)| options.archive_excludes.selects(path, false));
+    found.retain(|(path, _)| {
+        options
+            .archive_excludes
+            .selects(&path.to_string_lossy(), false)
+    });
     if found.is_empty() && (wildcard_names || options.archives.is_empty()) {
         return Err(line_error(
             session,
@@ -704,27 +804,37 @@ fn find_archives(
 /// Links are never followed: a linked folder such as `loop -> .` would
 /// recurse without end, and a link out of the folder would reach archives
 /// outside the one that was named.
-fn walk(prefix: &str, mask: Option<(&str, bool)>, found: &mut Vec<(String, u64)>) -> u64 {
+fn walk(prefix: &Path, mask: Option<(&str, bool)>, found: &mut Vec<(PathBuf, u64)>) -> u64 {
     let mut folders = 0;
-    let Ok(listing) = fs::read_dir(if prefix.is_empty() { "." } else { prefix }) else {
+    let listing = fs::read_dir(if prefix.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        prefix
+    });
+    let Ok(listing) = listing else {
         return 0;
     };
     for entry in listing.flatten() {
         let Ok(meta) = fs::symlink_metadata(entry.path()) else {
             continue;
         };
-        let entry_name = entry.file_name().to_string_lossy().into_owned();
-        let path = format!("{prefix}{entry_name}");
+        let entry_name = entry.file_name();
+        let path = prefix.join(&entry_name);
         if meta.is_dir() {
-            let inner = format!("{path}{}", std::path::MAIN_SEPARATOR);
-            folders += 1 + walk(&inner, mask, found);
+            folders += 1 + walk(&path, mask, found);
         } else if meta.is_file()
-            && mask.is_none_or(|(mask, cs)| wildcard_match(mask, &entry_name, cs))
+            && mask.is_none_or(|(mask, cs)| wildcard_match(mask, &entry_name.to_string_lossy(), cs))
         {
             found.push((path, meta.len()));
         }
     }
     folders
+}
+
+/// Archive paths in the order 7-Zip lists them: by their text, byte by
+/// byte, not component by component.
+fn sort_paths(paths: &mut [(PathBuf, u64)]) {
+    paths.sort_by(|a, b| a.0.as_os_str().cmp(b.0.as_os_str()));
 }
 
 /// The name 7-Zip shows for the archive inside a path, and its default
@@ -813,25 +923,24 @@ fn info_block(path: &str, set: &VolumeSet, opened: &Opened) -> String {
 fn open_path(
     session: &mut Session,
     options: &Options,
-    path: &str,
+    path: &Path,
     size: u64,
 ) -> (VolumeSet, Result<Opened, OpenFailure>) {
     if options.forced_type.is_some() {
         let set = VolumeSet {
-            paths: vec![PathBuf::from(path)],
+            paths: vec![path.to_path_buf()],
             sizes: vec![size],
             split_name: None,
         };
         return (set, Err(OpenFailure::Format("Is not archive")));
     }
-    let set = volume_set(Path::new(path), size);
+    let set = volume_set(path, size);
     let opened = open_archive(&set, &mut || session.ask_password());
     (set, opened)
 }
 
 /// Whether `path` is one of the volumes an earlier archive already read.
-fn already_read(read: &[PathBuf], path: &str) -> bool {
-    let path = Path::new(path);
+fn already_read(read: &[PathBuf], path: &Path) -> bool {
     read.iter().any(|seen| seen == path)
 }
 
@@ -846,7 +955,7 @@ fn break_signaled(session: &mut Session) -> u8 {
     EXIT_BREAK
 }
 
-fn run_extract(session: &mut Session, options: Options, archives: Vec<(String, u64)>) -> u8 {
+fn run_extract(session: &mut Session, options: Options, archives: Vec<(PathBuf, u64)>) -> u8 {
     let command = options.command;
     let hash = options.hash;
     let delete_after = options.delete_after;
@@ -872,13 +981,15 @@ fn run_extract(session: &mut Session, options: Options, archives: Vec<(String, u
     let mut read_volumes: Vec<PathBuf> = Vec::new();
     let mut failure: Option<io::Error> = None;
     let mut aborted = false;
-    for (path, size) in &archives {
-        if already_read(&read_volumes, path) {
+    for (archive, size) in &archives {
+        if already_read(&read_volumes, archive) {
             continue;
         }
+        let shown = archive.to_string_lossy();
+        let path = shown.as_ref();
         tried += 1;
         session.out(&format!("\n{verb} archive: {path}\n"));
-        let (set, opened) = open_path(session, &options, path, *size);
+        let (set, opened) = open_path(session, &options, archive, *size);
         let opened = match opened {
             Ok(opened) => opened,
             Err(OpenFailure::Aborted) => {
@@ -906,19 +1017,13 @@ fn run_extract(session: &mut Session, options: Options, archives: Vec<(String, u
         session.out(&info_block(path, &set, &opened));
         session.out("\n");
         let default_name = {
-            let inner = inner_name(path, &set);
-            let file = Path::new(&inner)
-                .file_name()
-                .map_or(inner.clone(), |name| name.to_string_lossy().into_owned());
-            match file.rfind('.') {
-                Some(dot) if dot > 0 => file[..dot].to_owned(),
-                _ => file,
-            }
+            let inner: &Path = match &set.split_name {
+                Some(name) => Path::new(name),
+                None => archive,
+            };
+            strip_extension(inner.file_name().unwrap_or(inner.as_os_str()))
         };
-        setup.out_dir = base_out.replace('*', &default_name);
-        if setup.out_dir.is_empty() && !setup.test && !setup.to_stdout {
-            setup.out_dir = String::new();
-        }
+        setup.out_dir = replace_star(&base_out, &default_name);
         let selected = extract::selection(&opened.archive.files, &options.censor);
         // An archive is deleted only when something was extracted from it.
         let any_selected = selected.iter().any(|&wanted| wanted);
@@ -998,5 +1103,57 @@ fn run_extract(session: &mut Session, options: Options, archives: Vec<(String, u
         EXIT_FATAL
     } else {
         EXIT_OK
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    fn raw(bytes: &[u8]) -> OsString {
+        OsString::from_vec(bytes.to_vec())
+    }
+
+    #[test]
+    fn path_arguments_keep_their_bytes() {
+        let args = [
+            OsString::from("x"),
+            raw(b"-oout\xfe"),
+            raw(b"-ai!shelf\xfd/more.7z"),
+            raw(b"crate\xff.7z"),
+        ];
+        let parsed = switches::parse(&args).unwrap();
+        let mut session = Session {
+            out_target: 0,
+            err_target: 0,
+            log_level: 0,
+            password: None,
+        };
+        let Ok(options) = parse_options(&parsed, &mut session) else {
+            panic!("the command line parses");
+        };
+        let archives: Vec<&[u8]> = options
+            .archives
+            .iter()
+            .map(|(_, name)| name.as_bytes())
+            .collect();
+        assert_eq!(archives, [&b"crate\xff.7z"[..], b"shelf\xfd/more.7z"]);
+        assert_eq!(options.setup.out_dir.as_bytes(), b"out\xfe/");
+    }
+
+    #[test]
+    fn folder_split_star_and_extension_work_on_bytes() {
+        let (dir, file) = split_folder(&raw(b"a\xff/b\xfe.7z"));
+        assert_eq!(
+            (dir.as_bytes(), file.as_bytes()),
+            (&b"a\xff/"[..], &b"b\xfe.7z"[..])
+        );
+        assert_eq!(strip_extension(&file).as_bytes(), b"b\xfe");
+        assert_eq!(
+            replace_star(&raw(b"o\xfd/*/"), &raw(b"b\xfe")).as_bytes(),
+            b"o\xfd/b\xfe/"
+        );
+        assert!(ends_with_separator(&raw(b"o\xfd/")));
     }
 }

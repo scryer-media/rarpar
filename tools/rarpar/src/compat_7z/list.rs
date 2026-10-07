@@ -213,7 +213,7 @@ fn table(opened: &Opened, selected: &[bool], packed: &[Option<u64>], sum: &mut S
     text
 }
 
-pub(super) fn run(session: &mut Session, options: &Options, archives: Vec<(String, u64)>) -> u8 {
+pub(super) fn run(session: &mut Session, options: &Options, archives: Vec<(PathBuf, u64)>) -> u8 {
     let mut errors = 0u64;
     let mut warnings = 0u64;
     let mut total = Sum::default();
@@ -221,18 +221,17 @@ pub(super) fn run(session: &mut Session, options: &Options, archives: Vec<(Strin
     let mut volume_count = 0u64;
     let mut total_size = 0u64;
     let mut read_volumes: Vec<PathBuf> = Vec::new();
-    for (path, size) in &archives {
-        if read_volumes
-            .iter()
-            .any(|seen| seen == std::path::Path::new(path))
-        {
+    for (archive, size) in &archives {
+        if read_volumes.iter().any(|seen| seen == archive) {
             continue;
         }
+        let shown = archive.to_string_lossy();
+        let path = shown.as_ref();
         total_size += size;
         if options.headers {
             session.out(&format!("\nListing archive: {path}\n\n"));
         }
-        let (set, opened) = open_path(session, options, path, *size);
+        let (set, opened) = open_path(session, options, archive, *size);
         let opened = match opened {
             Ok(opened) => opened,
             Err(OpenFailure::Aborted) => return break_signaled(session),

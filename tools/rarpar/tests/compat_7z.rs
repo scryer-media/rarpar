@@ -1368,3 +1368,53 @@ fn sdel_keeps_an_archive_nothing_was_extracted_from() {
     assert!(!archive.exists());
     assert_tree(&dir.path().join("out"));
 }
+
+/// Archive, output-folder and list-file paths that are not UTF-8 name the
+/// file they were given as, on a filesystem that stores such names.
+#[cfg(unix)]
+#[test]
+fn non_utf8_paths_are_kept_as_given() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    let dir = tempfile::tempdir().unwrap();
+    let raw = |bytes: &[u8]| OsString::from_vec(bytes.to_vec());
+    let archive = dir.path().join(raw(b"crate\xff.7z"));
+    match std::fs::write(&archive, b"") {
+        Ok(()) => {}
+        // APFS refuses names that are not UTF-8 (EILSEQ).
+        Err(error) if cfg!(target_os = "macos") && error.raw_os_error() == Some(92) => return,
+        Err(error) => panic!("{error}"),
+    }
+    write_archive(&archive, SOLID);
+    let list = dir.path().join(raw(b"names\xfe.txt"));
+    std::fs::write(&list, b"ledger.txt\n").unwrap();
+    let run = |args: Vec<OsString>| {
+        Command::new(env!("CARGO_BIN_EXE_rarpar"))
+            .current_dir(dir.path())
+            .arg("7z")
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let output = run(vec![
+        "x".into(),
+        "-y".into(),
+        raw(b"-oout\xfe"),
+        raw(b"crate\xff.7z"),
+    ]);
+    expect(&output, 0);
+    assert_tree(&dir.path().join(raw(b"out\xfe")));
+    // `*` names the folder after the archive, bytes and all.
+    let output = run(vec![
+        "x".into(),
+        "-y".into(),
+        "-ostar/*".into(),
+        raw(b"crate\xff.7z"),
+        raw(b"@names\xfe.txt"),
+    ]);
+    expect(&output, 0);
+    let named = dir.path().join("star").join(raw(b"crate\xff"));
+    assert!(named.join("ledger.txt").is_file());
+    assert!(!named.join("static.bin").exists());
+}
