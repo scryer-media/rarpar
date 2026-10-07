@@ -57,11 +57,17 @@ fn lzma2() -> Vec<EncoderConfiguration> {
     vec![EncoderMethod::LZMA2.into()]
 }
 
+/// AES-256 over LZMA2 with a fixed salt and IV. With the random ones
+/// `AesEncoderOptions::new` draws, a wrong password decrypts to different
+/// bytes on every run, and LZMA2 then either faults ("Data Error") or decodes
+/// garbage that fails the member CRC ("CRC Failed"): the message a test sees
+/// would change from run to run. Fixed values make the archive, and so the
+/// route a wrong password takes, the same every time.
 fn sealed() -> Vec<EncoderConfiguration> {
-    vec![
-        AesEncoderOptions::new(Password::from("lantern")).into(),
-        EncoderMethod::LZMA2.into(),
-    ]
+    let mut aes = AesEncoderOptions::new(Password::from("lantern"));
+    aes.salt = *b"invented-salt-01";
+    aes.iv = *b"invented-iv-0001";
+    vec![aes.into(), EncoderMethod::LZMA2.into()]
 }
 
 const SOLID: Shape = Shape {
