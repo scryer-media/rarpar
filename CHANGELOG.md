@@ -187,6 +187,10 @@ documented in each crate's own changelog so those notes ship with the crate.
   `-ai` rule, say) is processed once, so `-sdel` deletes it once and exits 0
   instead of failing on the second pass, and without `-sdel` it is no longer
   extracted or prompted for twice.
+- 7-Zip facade: a member's time or mode that cannot be restored after
+  extraction is an error of that member, named with its path and the
+  system's reason, so the summary counts it under `Sub items Errors` and the
+  command exits 2 instead of 0.
 
 ### Library versions
 

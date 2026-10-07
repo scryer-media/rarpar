@@ -1632,6 +1632,60 @@ fn sdel_keeps_an_archive_whose_every_member_was_skipped() {
     );
 }
 
+/// A folder mode or time the facade cannot restore is an error of its
+/// member, named with its path and the system's reason: the summary counts
+/// it and the command exits 2. Here the archive lists `nest/inner` before
+/// `nest`, whose mode is `000`; folders get their metadata deepest-last-listed
+/// first, so `nest` is closed before `nest/inner` is reached through it.
+#[cfg(unix)]
+#[test]
+fn metadata_that_cannot_be_restored_is_an_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let mut out = Vec::new();
+    {
+        let mut writer = ArchiveWriter::new(Cursor::new(&mut out)).unwrap();
+        for (name, mode) in [("nest/inner", 0o755u32), ("nest", 0o000)] {
+            let mut entry = ArchiveEntry::new_directory(name);
+            entry.has_windows_attributes = true;
+            entry.windows_attributes = 0x8000 | 0x10 | ((0o040_000 | mode) << 16);
+            writer.push_archive_entry::<&[u8]>(entry, None).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    std::fs::write(dir.path().join("sealed.7z"), out).unwrap();
+    let output = facade(dir.path(), &["x", "-y", "-oout", "sealed.7z"], b"");
+    let nest = dir.path().join("out/nest");
+    let locked = std::fs::metadata(&nest).unwrap().permissions().mode() & 0o777 == 0;
+    // Unlock before asserting, so the temporary folder can be removed.
+    std::fs::set_permissions(&nest, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(locked, "nest keeps its archived mode");
+    // SAFETY: `geteuid` has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        // Permissions do not bind root: nothing to test.
+        return;
+    }
+    let (out, err) = expect(&output, 2);
+    assert!(
+        err.contains(&format!(
+            "ERROR: Cannot set file attribute : errno={} : ",
+            libc::EACCES
+        )) && err.contains(&format!(
+            " : out{0}nest{0}inner\n",
+            std::path::MAIN_SEPARATOR
+        )),
+        "{err}"
+    );
+    assert!(out.contains("Sub items Errors: 1\n"), "{out}");
+    // The same folders without the closed mode extract cleanly.
+    write_archive(&dir.path().join("plain.7z"), SOLID);
+    let (out, _) = expect(
+        &facade(dir.path(), &["x", "-y", "-oplain", "plain.7z"], b""),
+        0,
+    );
+    assert!(out.contains("Everything is Ok"), "{out}");
+}
+
 /// Splits `whole` into `<name>.001`, `<name>.002`, ... under `dir`.
 fn write_volumes(dir: &Path, name: &str, whole: &[u8]) -> Vec<PathBuf> {
     whole
