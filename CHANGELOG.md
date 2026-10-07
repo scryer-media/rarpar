@@ -95,6 +95,10 @@ documented in each crate's own changelog so those notes ship with the crate.
   a directory entry's type from the listing; on a three-file set with 52
   recovery blocks, verify drops from 181 path stats to 60 and repair from 324
   to 111, with the same bytes read.
+- `par verify` and `repair` read and hash the PAR2 volumes once instead of
+  twice, and volume discovery no longer opens the files the set protects to
+  look for renamed volumes; on ten 3 MiB files with 10% recovery, verify
+  reads 34.7 MB in 23 opens instead of 37.9 MB in 38.
 
 ### Library versions
 

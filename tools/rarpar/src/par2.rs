@@ -51,6 +51,10 @@ struct ResolvedPar2Input {
     primary_dir: PathBuf,
     search_dirs: Vec<PathBuf>,
     placement: ParPlacement,
+    /// The set as resolution already scanned it, so the flow does not read and
+    /// hash every volume a second time. `None` when resolution could not
+    /// parse it; the flow then scans again and reports why.
+    scanned: Option<par2_rs::Par2FileSet>,
 }
 
 pub fn run_command(cli: &Cli, command: ParCommand) -> Result<u8, RarparError> {
@@ -64,8 +68,8 @@ pub fn run_command(cli: &Cli, command: ParCommand) -> Result<u8, RarparError> {
         ParCommand::Repair(args) => ("repair", true, args),
         ParCommand::Create(_) => unreachable!("create handled above"),
     };
-    let resolved = resolve_input(cli, &args)?;
-    let outcome = run_flow(&resolved, repair, cli.dry_run, cli.quiet || cli.json)?;
+    let mut resolved = resolve_input(cli, &args)?;
+    let outcome = run_flow(&mut resolved, repair, cli.dry_run, cli.quiet || cli.json)?;
     emit_command_outcome(cli, command_name, &outcome)?;
     Ok(if outcome.success {
         EXIT_SUCCESS
@@ -297,7 +301,8 @@ pub fn dispatch_par2cmdline_compat(args: &[OsString]) -> Option<u8> {
         return Some(PAR2CMDLINE_INVALID_COMMAND_LINE);
     }
     let input = parse_par2cmdline_repair_input(args)?;
-    let resolved = match resolve_compat_input(&input.par2_path, input.base_dir, input.wildcard) {
+    let mut resolved = match resolve_compat_input(&input.par2_path, input.base_dir, input.wildcard)
+    {
         Ok(resolved) => resolved,
         Err(error) => {
             eprintln!("rarpar: {error}");
@@ -306,7 +311,7 @@ pub fn dispatch_par2cmdline_compat(args: &[OsString]) -> Option<u8> {
         }
     };
 
-    match run_flow(&resolved, true, false, true) {
+    match run_flow(&mut resolved, true, false, true) {
         Ok(outcome) => {
             emit_par2cmdline_outcome(&outcome);
             Some(if outcome.success {
@@ -431,9 +436,11 @@ fn resolve_compat_input(
     }
 
     let par2_paths = discover_compat_par2_paths(input, wildcard.as_deref())?;
-    let set_id = par2_rs::Par2FileSet::from_paths(&par2_paths)
-        .map(|set| set.recovery_set_id.to_string())
-        .unwrap_or_else(|_| format!("par2:{}", input.display()));
+    let scanned = par2_rs::Par2FileSet::from_paths(&par2_paths).ok();
+    let set_id = scanned.as_ref().map_or_else(
+        || format!("par2:{}", input.display()),
+        |set| set.recovery_set_id.to_string(),
+    );
     let primary_dir = base_dir.unwrap_or_else(|| {
         input
             .parent()
@@ -448,6 +455,7 @@ fn resolve_compat_input(
         primary_dir,
         search_dirs: Vec::new(),
         placement: ParPlacement::Smart,
+        scanned,
     })
 }
 
@@ -469,7 +477,7 @@ fn emit_par2cmdline_outcome(outcome: &ParOutcome) {
 }
 
 pub fn repair_set(cli: &Cli, set: &Par2Set) -> Result<ParOutcome, RarparError> {
-    let resolved = ResolvedPar2Input {
+    let mut resolved = ResolvedPar2Input {
         set_id: set.id.clone(),
         par2_paths: set.paths.clone(),
         primary_dir: cli
@@ -478,12 +486,13 @@ pub fn repair_set(cli: &Cli, set: &Par2Set) -> Result<ParOutcome, RarparError> {
             .unwrap_or_else(|| set.base_dir.clone()),
         search_dirs: cli.search_dir.clone(),
         placement: cli.par_placement,
+        scanned: None,
     };
-    run_flow(&resolved, true, false, cli.quiet || cli.json)
+    run_flow(&mut resolved, true, false, cli.quiet || cli.json)
 }
 
 fn run_flow(
-    resolved: &ResolvedPar2Input,
+    resolved: &mut ResolvedPar2Input,
     repair: bool,
     dry_run: bool,
     quiet: bool,
@@ -500,7 +509,11 @@ fn run_flow(
     let _cache_retention = repair.then(par2_rs::CacheEvictionDeferral::acquire);
 
     let load_started = std::time::Instant::now();
-    let par2_set = par2_rs::Par2FileSet::from_paths(&resolved.par2_paths)?;
+    let par2_set = match resolved.scanned.take() {
+        Some(set) => set,
+        None => par2_rs::Par2FileSet::from_paths(&resolved.par2_paths)?,
+    };
+    let resolved = &*resolved;
     info!(
         elapsed_ms = load_started.elapsed().as_secs_f64() * 1_000.0,
         "PAR2 set loaded"
@@ -666,9 +679,11 @@ fn resolve_input(cli: &Cli, args: &ParArgs) -> Result<ResolvedPar2Input, RarparE
     } else {
         discover_matching_par2_paths(&args.input)?
     };
-    let set_id = par2_rs::Par2FileSet::from_paths(&par2_paths)
-        .map(|set| set.recovery_set_id.to_string())
-        .unwrap_or_else(|_| format!("par2:{}", args.input.display()));
+    let scanned = par2_rs::Par2FileSet::from_paths(&par2_paths).ok();
+    let set_id = scanned.as_ref().map_or_else(
+        || format!("par2:{}", args.input.display()),
+        |set| set.recovery_set_id.to_string(),
+    );
 
     let primary_dir = cli.working_dir.clone().unwrap_or_else(|| {
         if args.input.is_dir() {
@@ -692,6 +707,7 @@ fn resolve_input(cli: &Cli, args: &ParArgs) -> Result<ResolvedPar2Input, RarparE
         primary_dir,
         search_dirs,
         placement: cli.par_placement,
+        scanned,
     })
 }
 
@@ -761,13 +777,64 @@ fn discover_matching_par2_paths(input: &Path) -> Result<Vec<PathBuf>, RarparErro
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let mut par2_paths = par2_rs::identify_par2_files(parent, &seed_set.recovery_set_id)?;
+    let mut par2_paths = identify_set_volumes(parent, &seed_set)?;
     if par2_paths.is_empty() {
         par2_paths.push(input.to_path_buf());
     }
     par2_paths.sort();
     par2_paths.dedup();
     Ok(par2_paths)
+}
+
+/// [`par2_rs::identify_par2_files`] without opening the files the seed set
+/// protects. Any other sibling may be a renamed volume and has its first
+/// header read; a protected file is data by definition, and sniffing it cost
+/// an open and a read per data file before verification read it in full.
+fn identify_set_volumes(
+    dir: &Path,
+    seed: &par2_rs::Par2FileSet,
+) -> Result<Vec<PathBuf>, RarparError> {
+    use std::io::Read;
+    const HEADER_SIZE: usize = 64;
+    let protected: std::collections::HashSet<&str> = seed
+        .files
+        .values()
+        .map(|description| description.filename.as_str())
+        .collect();
+    let mut matches = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if protected.contains(name)
+            || name.starts_with(".swap.")
+            || name.starts_with(".chunk.")
+            || name.starts_with(".weaver-par2-repair")
+            || name.contains(".weaver-par2-backup.")
+        {
+            continue;
+        }
+        let path = entry.path();
+        // The entry's type does not follow links; a link still counts when it
+        // names a regular file, as `Path::is_file` decides.
+        let kind = entry.file_type()?;
+        if !(kind.is_file() || (kind.is_symlink() && path.is_file())) {
+            continue;
+        }
+        let mut header = Vec::with_capacity(HEADER_SIZE);
+        std::fs::File::open(&path)?
+            .take(HEADER_SIZE as u64)
+            .read_to_end(&mut header)?;
+        if header.len() == HEADER_SIZE
+            && let Ok(parsed) = par2_rs::PacketHeader::parse(&header, 0)
+            && parsed.recovery_set_id == seed.recovery_set_id
+        {
+            matches.push(path);
+        }
+    }
+    Ok(matches)
 }
 
 fn wildcard_match(pattern: &str, text: &str) -> bool {
@@ -1073,5 +1140,56 @@ mod tests {
         // Without a PAR2 argument the command line is not par2cmdline's.
         assert_eq!(refused(&["c", "archive.rar", "file"]), None);
         assert_eq!(refused(&["v", "archive.rar"]), None);
+    }
+
+    /// Volume discovery used to open and read the first 64 bytes of every
+    /// sibling, the set's own data files included, before verification read
+    /// those files in full. A protected file is data by definition and is not
+    /// opened at all: one made unreadable here would fail the sniff. A
+    /// renamed volume under an unprotected name is still found.
+    #[cfg(unix)]
+    #[test]
+    fn volume_discovery_does_not_open_the_files_the_set_protects() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/par2-rs/tests/fixtures/rar5_lz_plain");
+        for entry in std::fs::read_dir(&fixture).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), temp.path().join(entry.file_name())).unwrap();
+        }
+        std::fs::rename(
+            temp.path()
+                .join("fixture_rar5_lz_plain_repair.vol02+2.par2"),
+            temp.path().join("relocated-volume"),
+        )
+        .unwrap();
+        let main = temp.path().join("fixture_rar5_lz_plain_repair.par2");
+        let seed = par2_rs::Par2FileSet::from_paths(std::slice::from_ref(&main)).unwrap();
+        let data = temp.path().join("fixture_rar5_lz_plain.part3.rar");
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // A process that can read it anyway proves nothing either way.
+        if std::fs::File::open(&data).is_ok() {
+            return;
+        }
+
+        let mut found: Vec<String> = identify_set_volumes(temp.path(), &seed)
+            .expect("discovery never touches the unreadable data file")
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                "fixture_rar5_lz_plain_repair.par2",
+                "fixture_rar5_lz_plain_repair.vol00+2.par2",
+                "fixture_rar5_lz_plain_repair.vol04+2.par2",
+                "fixture_rar5_lz_plain_repair.vol06+2.par2",
+                "fixture_rar5_lz_plain_repair.vol08+2.par2",
+                "fixture_rar5_lz_plain_repair.vol10+2.par2",
+                "relocated-volume",
+            ]
+        );
     }
 }
