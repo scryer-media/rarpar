@@ -1729,26 +1729,31 @@ impl Rar5Set {
     /// Write every host without its region to `destinations[k]` (absent).
     /// Every host must be present and verified; the output is checked against
     /// the fingerprint the File packet recorded for the original.
+    ///
+    /// Every destination is checked before anything is written, and every
+    /// stripped host is staged before any is installed: a failure leaves no
+    /// destination behind, installed ones included.
     pub fn remove(&mut self, destinations: &[PathBuf]) -> EngineResult<Vec<PathBuf>> {
         if destinations.len() != self.hosts.len() {
             return Err(EngineError::InvalidState("remove destination count"));
         }
         self.removable()?;
+        let exists = || io::Error::new(io::ErrorKind::AlreadyExists, "remove output exists");
+        for (index, destination) in destinations.iter().enumerate() {
+            if destinations[..index].contains(destination)
+                || std::fs::symlink_metadata(destination).is_ok()
+            {
+                return Err(exists().into());
+            }
+        }
         let options = self.session.options.clone();
         let layout = self.session.layout()?.expect("layout");
         let size = options.stripe_bytes.min(64 << 10);
         let mut buffer = vec![0; size];
-        let mut written = Vec::new();
+        let mut written: Vec<PathBuf> = Vec::new();
         let mut staged = Vec::new();
         let result = (|| -> EngineResult<()> {
             for (host, destination) in self.hosts.iter().zip(destinations) {
-                if std::fs::symlink_metadata(destination).is_ok() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "remove output exists",
-                    )
-                    .into());
-                }
                 let source = host.source.expect("bound");
                 let temporary = crate::session_repair::stage_path(destination, &options)?;
                 staged.push(temporary.clone());
@@ -1781,13 +1786,22 @@ impl Rar5Set {
                 }
                 output.sync_all()?;
                 drop(output);
-                std::fs::hard_link(&temporary, destination)?;
+            }
+            // Linking never replaces a destination: one that appeared since
+            // the check fails here, and the ones already installed go.
+            for (temporary, destination) in staged.iter().zip(destinations) {
+                std::fs::hard_link(temporary, destination)?;
                 written.push(destination.clone());
             }
             Ok(())
         })();
         for path in staged {
             let _ = std::fs::remove_file(path);
+        }
+        if result.is_err() {
+            for path in written.drain(..) {
+                let _ = std::fs::remove_file(path);
+            }
         }
         result.map(|()| written)
     }

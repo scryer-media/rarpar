@@ -655,3 +655,53 @@ fn same_name_hosts_bind_to_their_own_set() {
         .collect();
     assert_eq!(bound.len(), 2);
 }
+
+/// Removal checks every destination before it writes one: a later
+/// destination that already exists fails the removal with nothing
+/// installed, and the existing file is left as it was.
+#[test]
+fn removal_installs_nothing_when_a_later_destination_exists() {
+    let Some(sources) = volumes("generated_matrix_rar5_store_plain", 7) else {
+        return;
+    };
+    let tree = common::TempTree::new("rar5-remove-preflight");
+    let inserted = insert(
+        tree.path(),
+        &sources,
+        Rar5Layout::Trailing,
+        Rar5Placement::Spread,
+        4096,
+        14,
+    );
+    let mut set = open_one(&inserted);
+    let out = tree.path().join("stripped");
+    std::fs::create_dir_all(&out).unwrap();
+    let destinations: Vec<PathBuf> = set.hosts.iter().map(|host| out.join(&host.name)).collect();
+    let squatter = destinations.last().unwrap();
+    std::fs::write(squatter, b"already here").unwrap();
+    let error = set.remove(&destinations).unwrap_err();
+    assert!(
+        matches!(&error, EngineError::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists),
+        "{error:?}"
+    );
+    let left: Vec<_> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(left, [squatter.clone()]);
+    assert_eq!(std::fs::read(squatter).unwrap(), b"already here");
+
+    // A destination named twice is refused the same way.
+    std::fs::remove_file(squatter).unwrap();
+    let mut doubled = destinations.clone();
+    doubled[6] = doubled[0].clone();
+    assert!(set.remove(&doubled).is_err());
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+    set.remove(&destinations).unwrap();
+    for (destination, source) in destinations.iter().zip(&sources) {
+        assert_eq!(
+            std::fs::read(destination).unwrap(),
+            std::fs::read(source).unwrap()
+        );
+    }
+}

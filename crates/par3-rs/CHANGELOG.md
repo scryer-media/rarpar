@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- `Rar5Set::remove` checks every destination (absent, and none named twice)
+  before it writes anything, and stages every stripped host before it
+  installs one; if installing any fails, the ones already installed are
+  removed. A failed removal no longer leaves a partial result behind.
+
 ## 0.5.1
 
 - RAR5 PAR-inside (`inside::rar5`) fixes:
