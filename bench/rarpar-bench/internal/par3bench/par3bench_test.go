@@ -653,3 +653,25 @@ func TestSelectRejectsADuplicateSet(t *testing.T) {
 		t.Fatalf("Select of one set = %d configs, %v", len(selected.Configs), err)
 	}
 }
+
+// strace exits with the traced command's status; a pass whose command did
+// not complete its op publishes no counts.
+func TestTracedRunProblemChecksTheTracedExit(t *testing.T) {
+	createDone := func(code int) bool { return exitAccepted(OpCreate, ToolReference, code) }
+	if err := tracedRunProblem(Result{}, createDone); err != nil {
+		t.Errorf("a clean traced create: %v", err)
+	}
+	if err := tracedRunProblem(Result{Measurement: Measurement{ExitCode: 6}}, createDone); err == nil {
+		t.Error("a traced create that exited 6 must not be counted")
+	}
+	if err := tracedRunProblem(Result{Failure: "timeout"}, createDone); err == nil {
+		t.Error("a traced run that timed out must not be counted")
+	}
+	damaged := func(code int) bool { return exitAccepted(OpVerifyDamaged, ToolCandidate, code) }
+	if err := tracedRunProblem(Result{Measurement: Measurement{ExitCode: 1}}, damaged); err != nil {
+		t.Errorf("rarpar's damaged verdict is a completed verify: %v", err)
+	}
+	if err := tracedRunProblem(Result{}, damaged); err == nil {
+		t.Error("rarpar calling a damaged set intact must not be counted")
+	}
+}

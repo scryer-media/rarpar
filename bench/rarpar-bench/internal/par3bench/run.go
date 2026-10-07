@@ -1532,14 +1532,11 @@ func (r *runner) runOne(ctx context.Context, op string, config Config, dataset D
 		}
 		return record, nil
 	}
-	accepted := result.ExitCode == 0
+	accepted := exitAccepted(op, variant.Tool, result.ExitCode)
 	if variant.Tool == ToolEngine && record.Engine == nil && accepted {
 		// engine_perf prints its totals last; without them the op did not
 		// complete as the row claims.
 		accepted = false
-	}
-	if op == OpVerifyDamaged && variant.Tool != ToolEngine {
-		accepted = damagedVerifyAccepted(variant.Tool, result.ExitCode)
 	}
 	if !accepted {
 		record.Status = StatusFailed
@@ -1607,6 +1604,16 @@ func (r *runner) runOne(ctx context.Context, op string, config Config, dataset D
 	return record, nil
 }
 
+// exitAccepted reports whether a tool's run of op exited with the status of a
+// completed operation: 0, except for a damaged verify, whose status is the
+// tool's verdict on the damage.
+func exitAccepted(op, tool string, exitCode int) bool {
+	if op == OpVerifyDamaged && tool != ToolEngine {
+		return damagedVerifyAccepted(tool, exitCode)
+	}
+	return exitCode == 0
+}
+
 // damagedVerifyAccepted reports whether a verify of a damaged tree exited
 // with the status that tool gives for damage it detected. par3cmdline exits 0
 // from verify whatever it finds; rarpar exits 1 when the set is not intact,
@@ -1670,7 +1677,9 @@ func (r *runner) countIO(ctx context.Context, op string, config Config, dataset 
 		command = r.checkCommand(op, dir, variant)
 	}
 	if record.Error == "" {
-		counts, err := CountIO(ctx, command, stageRoot)
+		counts, err := CountIO(ctx, command, stageRoot, func(exitCode int) bool {
+			return exitAccepted(op, variant.Tool, exitCode)
+		})
 		if err != nil {
 			record.Error = err.Error()
 		}
