@@ -1146,15 +1146,30 @@ fn recorded_names(
     Ok(sets
         .into_iter()
         .map(|names| {
-            let renames: Vec<(String, String)> = candidates
+            // A candidate is paired only with the recorded names that share
+            // its volume tail, and each distinct stem change is kept once, so
+            // a volume set yields one mapping rather than one per volume pair.
+            let mut by_tail: HashMap<&str, Vec<&str>> = HashMap::new();
+            for recorded in &names {
+                if let Some(tail) = volume_tail(recorded) {
+                    by_tail.entry(tail).or_default().push(recorded);
+                }
+            }
+            let mut renames: Vec<(String, String)> = Vec::new();
+            let mut kept: HashSet<(String, String)> = HashSet::new();
+            for actual in candidates
                 .iter()
                 .filter_map(|candidate| file_name(&candidate.path))
-                .flat_map(|actual| {
-                    names
-                        .iter()
-                        .filter_map(move |recorded| stem_change(recorded, actual))
-                })
-                .collect();
+            {
+                let paired = volume_tail(actual).and_then(|tail| by_tail.get(tail));
+                for recorded in paired.into_iter().flatten() {
+                    if let Some(change) = stem_change(recorded, actual)
+                        && kept.insert(change.clone())
+                    {
+                        renames.push(change);
+                    }
+                }
+            }
             names
                 .iter()
                 .map(|name| {
@@ -1167,6 +1182,20 @@ fn recorded_names(
                 .collect()
         })
         .collect())
+}
+
+/// The part of a file name a renamed sibling keeps: from `.partN.` when the
+/// name has one, otherwise from its last dot. `None` for a name without a
+/// dot, which no stem change can come from.
+fn volume_tail(name: &str) -> Option<&str> {
+    if let Some(start) = name.rfind(".part") {
+        let rest = &name[start + ".part".len()..];
+        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits > 0 && rest[digits..].starts_with('.') {
+            return Some(&name[start..]);
+        }
+    }
+    name.rfind('.').map(|start| &name[start..])
 }
 
 /// When `recorded` and `actual` differ only before a common suffix that
@@ -1853,6 +1882,14 @@ mod tests {
         );
         assert_eq!(stem_change("same.rar", "same.rar"), None);
         assert_eq!(stem_change("\u{e9}", "\u{129}"), None);
+    }
+
+    #[test]
+    fn volume_tails_keep_the_part_number() {
+        assert_eq!(volume_tail("vault.part07.rar"), Some(".part07.rar"));
+        assert_eq!(volume_tail("vault.party.rar"), Some(".rar"));
+        assert_eq!(volume_tail("vault.rar"), Some(".rar"));
+        assert_eq!(volume_tail("vault"), None);
     }
 
     /// A recorded host name is joined to a directory only when it is one safe
