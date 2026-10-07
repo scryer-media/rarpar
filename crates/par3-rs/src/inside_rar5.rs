@@ -1099,6 +1099,10 @@ pub fn open(paths: &[PathBuf], options: &ExecutionOptions) -> EngineResult<Vec<R
             }
         }
     }
+    // The discovery inventory holds authenticated packets and their memory
+    // reservations; release it before the rescan builds the final one, so the
+    // two are never charged to the budget together.
+    drop(candidates);
     known.extend(extra);
     let access: Arc<dyn SourceAccess> = Arc::new(disk_access(&known, options));
     // Rescan everything through the final provider so packet origins agree.
@@ -2358,6 +2362,59 @@ mod tests {
         let inserted = insert_synthetic(&dir, &["thrush-ledger.rar"], 40, false);
         let sets = open(&inserted, &ExecutionOptions::default()).unwrap();
         assert_eq!(sets[0].hosts[0].recovery, 0..2);
+        drop(sets);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Opening a set charges the budget for one packet inventory at a time:
+    /// the discovery scan's packets are released before the rescan through
+    /// the final provider takes its own, so a set whose packets need a bit
+    /// over half the budget still opens.
+    #[test]
+    fn opening_never_holds_two_packet_inventories_at_once() {
+        use crate::runtime::{MemoryBudget, MemoryCategory};
+        let dir = scratch_dir("one-inventory");
+        let inserted = insert_synthetic(
+            &dir,
+            &[
+                "kestrel.part1.rar",
+                "kestrel.part2.rar",
+                "kestrel.part3.rar",
+            ],
+            50,
+            false,
+        );
+        let options = || ExecutionOptions {
+            memory: MemoryBudget::new(1 << 30),
+            stripe_bytes: 4096,
+            ..ExecutionOptions::default()
+        };
+        // What one scan of every given file keeps once its scanners are gone.
+        let scanned = options();
+        let access: Arc<dyn SourceAccess> = Arc::new(disk_access(&inserted, &scanned));
+        let inventory: Vec<Candidate> = inserted
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                candidate(&access, path.clone(), SourceId(index as u64), &scanned).unwrap()
+            })
+            .collect();
+        let one = scanned
+            .memory
+            .ledger()
+            .category(MemoryCategory::CarrierPackets)
+            .current;
+        assert!(one > 0, "the scan kept its packets");
+        drop(inventory);
+        let opened = options();
+        let sets = open(&inserted, &opened).unwrap();
+        assert_eq!(sets.len(), 1);
+        let peak = opened
+            .memory
+            .ledger()
+            .category(MemoryCategory::CarrierPackets)
+            .peak;
+        assert!(peak < 2 * one, "peak {peak} holds two inventories of {one}");
         drop(sets);
         std::fs::remove_dir_all(&dir).unwrap();
     }
