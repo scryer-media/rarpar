@@ -21,11 +21,58 @@ documented in each crate's own changelog so those notes ship with the crate.
   instead of 64 KiB ones, and repair reads each recovery and data packet it
   uses once, authenticating it from the bytes it decodes.
 
+### Fixes
+
+- 7-Zip facade extraction stays inside the output folder: a member is never
+  written through a folder that an extracted link created ("Dangerous link
+  via another link was ignored"), files are opened without following a link
+  at their own name, a link is judged from the folder it is created in, and
+  a link target over 4096 bytes is refused while it streams. A member whose
+  solid block failed is reported as failed even when its own CRC matched.
+- 7-Zip facade: after `--`, words starting with `@` are member names, not
+  list files, and `-sdel` no longer deletes an archive when the member
+  filters selected nothing from it.
+- par3cmdline facade: the block-map report is counted from ranges, so a set
+  with a huge block count no longer walks every block; non-UTF-8 arguments
+  reach the files they name byte for byte on Unix; `\` separates path
+  components on Windows; every `-fu` spelling is remembered; unsupported
+  options are refused before any file is read; hidden entries are no longer
+  skipped and an unreadable directory entry no longer stops the listing;
+  only regular files are bound to protected names, so a directory at a
+  protected name reports the file missing; empty directories a set records
+  are created without following links; a moved-file search has no byte or
+  candidate ceiling; directory-tree ordering is linear rather than
+  quadratic; a PAR filename given in another case on a case-insensitive
+  filesystem finds its recovery volumes by their on-disk spelling.
+- par3cmdline facade, PAR-inside (`vs`/`rs`): complete packets are copied by
+  par3cmdline's own window rule, archive reads go through a mebibyte cache
+  and repeated self-repair replaces the previous `.1` backup instead of
+  failing.
+- `par3 archive` checks every recovery-volume name before installing the
+  archive, refusing a symbolic link and, without overwrite, an existing file;
+  a volume is never written through a link. `--max-files` stops the input
+  walk as soon as the limit is passed, the streaming lanes' memory budget
+  counts the state kept per block, ZIP member times are local times (DOS
+  time has no zone), and setuid, setgid and sticky bits are kept in ZIP
+  external attributes.
+- `par3 inside repair` puts a lost host beside the surviving hosts of its
+  own set when one command repairs sets from several directories, and a
+  `--dry-run` repair reports `"status": "planned"` with `"dry_run": true`
+  instead of `"repaired"`. A `--dry-run` removal refuses a missing or
+  damaged host as a removal would, and reports `"status": "planned"` with
+  `"dry_run": true` for an intact set. In place, `insert`, `repair` and
+  `remove` stage each output in its own volume's directory, so the final
+  rename never crosses a filesystem.
+- Release binaries are built with the `sevenz` feature, so `par3 archive`
+  and the 7-Zip facade ship in them, and the `cargo xtask` feature audit
+  refuses a release build without it.
+
 ### Library versions
 
 - par3-rs 0.5.1: mebibyte source reads, the verification order by mount
-  kind, and single-read packet authentication during repair. Other library
-  versions are unchanged.
+  kind, single-read packet authentication during repair,
+  `session_repair::create_directory`, and the RAR5 PAR-inside fixes. Other
+  library versions are unchanged.
 
 ## rarpar 0.8.0
 

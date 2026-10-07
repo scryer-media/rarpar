@@ -2,6 +2,38 @@
 
 ## 0.5.1
 
+- RAR5 PAR-inside (`inside::rar5`) fixes:
+  - A name suffix shared by a recorded and an actual host name is compared on
+    character boundaries; names ending in different characters that share a
+    final UTF-8 byte no longer panic.
+  - `Rar5Set::repair` derives every carrier before it writes any rebuilt
+    host, so a lost volume and damage in another are repaired together.
+  - A host is bound by name only to a file carrying its own set's packets (or
+    none from another set), so sets in different directories whose hosts
+    share a name each bind their own file.
+  - `prepare_hosts` refuses header-encrypted volume families (several hosts,
+    or a `.partN.rar` name): their volume numbers and end flags are
+    encrypted, so a family missing its last parts could not be told from a
+    complete one.
+  - `prepare_hosts` records the revision it inspected, and `insert_set`
+    refuses a host that changed since, instead of using stale framing
+    offsets.
+  - `insert_set` refuses a nonzero `first_recovery`: the region records no
+    recovery-index base.
+  - `placement_counts` returns `EngineResult<Vec<u64>>` and refuses
+    `Rar5Placement::Independent`, which is one `insert_set` per host.
+  - New `Rar5Set::removable`: the checks `Rar5Set::remove` makes, without
+    writing anything.
+  - A rebuilt host staged on another filesystem than its destination is
+    installed by a copy beside the destination, compared byte for byte, then
+    linked in; it no longer fails with a cross-device link error.
+- A derived carrier (`CarrierPlan::derived`) looks up its available Recovery
+  Data packets in one pass over the payloads instead of one pass per
+  recovery index, so regenerating a region of a set with tens of thousands
+  of recovery packets no longer costs a quadratic number of comparisons.
+- New `session_repair::create_directory(base, relative)`: creates a protected
+  directory one component at a time relative to an open handle on `base`,
+  refusing symbolic links, for repairs that only need an empty directory.
 - `ExecutionOptions` gains a hidden, bench-only `disk_verify_whole_first`
   switch. `Some(false)` makes disk verification hash a file's extents and the
   whole file side by side in one pass instead of trying the whole file first,
