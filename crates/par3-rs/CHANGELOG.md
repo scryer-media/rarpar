@@ -25,6 +25,10 @@
   `scan_work` for what it asks and refunded what a short read did not
   return beyond one stripe, so a whole scan still costs its bytes and a poll
   that finds nothing one stripe. Evidence is unchanged.
+  The scanner checks the source's generation once per refill rather than at
+  the top of every poll; a refill whose read fails rechecks it before
+  returning, so a carrier that disappears or is rewritten under the scanner
+  reports `SourceChanged`, not the provider's I/O error.
 - New `mount` module: `MountKind { Local, Remote, Unknown }` and
   `SourceAccess::mount_kind` (default `Unknown`). `DiskSourceAccess` probes
   each source directory once (`statfs` `f_type` on Linux: NFS and SMB/CIFS
