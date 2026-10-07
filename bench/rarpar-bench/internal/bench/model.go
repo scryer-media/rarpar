@@ -1,7 +1,11 @@
 // Package bench owns the deterministic on-disk benchmark contracts.
 package bench
 
-import "time"
+import (
+	"time"
+
+	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/procmeasure"
+)
 
 const (
 	CorpusSchemaVersion = 1
@@ -171,9 +175,15 @@ type Machine struct {
 }
 
 type Measurement struct {
-	WallNanos         int64               `json:"wall_nanos"`
-	UserNanos         int64               `json:"user_nanos,omitempty"`
-	SystemNanos       int64               `json:"system_nanos,omitempty"`
+	WallNanos   int64 `json:"wall_nanos"`
+	UserNanos   int64 `json:"user_nanos,omitempty"`
+	SystemNanos int64 `json:"system_nanos,omitempty"`
+	// MaxRSSBytes is the tool's peak resident set, required on every
+	// successful execution; RSSSource names how it was read (see the
+	// procmeasure RSSSource constants). A tool that exited without one is
+	// a failed execution, never a silent zero.
+	MaxRSSBytes       int64               `json:"max_rss_bytes"`
+	RSSSource         string              `json:"rss_source,omitempty"`
 	ValidationNanos   int64               `json:"validation_nanos"`
 	Instructions      *uint64             `json:"instructions,omitempty"`
 	CollectorNote     string              `json:"collector_note,omitempty"`
@@ -286,6 +296,25 @@ type Comparison struct {
 	CompiledCapability  string            `json:"compiled_capability"`
 	Backend             string            `json:"backend"`
 	CandidateRAR5Phases *RAR5PhaseSummary `json:"candidate_rar5_phases,omitempty"`
+	// CPU is user+system time and RSS the peak resident set, median [min,
+	// max] over the measured samples. Unlike Ratio (reference/rarpar wall
+	// time, the relative speed), CPURatio and RSSRatio are rarpar/reference
+	// medians: below 1 rarpar used less.
+	CandidateCPUNanos  ValueSummary `json:"candidate_cpu_nanos"`
+	ReferenceCPUNanos  ValueSummary `json:"reference_cpu_nanos"`
+	CPURatio           *float64     `json:"cpu_ratio,omitempty"`
+	CandidateRSSBytes  ValueSummary `json:"candidate_rss_bytes"`
+	ReferenceRSSBytes  ValueSummary `json:"reference_rss_bytes"`
+	RSSRatio           *float64     `json:"rss_ratio,omitempty"`
+	CandidateRSSSource string       `json:"candidate_rss_source"`
+	ReferenceRSSSource string       `json:"reference_rss_source"`
+}
+
+// ValueSummary is a median with its range.
+type ValueSummary struct {
+	Median int64 `json:"median"`
+	Min    int64 `json:"min"`
+	Max    int64 `json:"max"`
 }
 
 type RAR5PhaseSummary struct {
@@ -307,7 +336,10 @@ type Report struct {
 	Reference     *BinaryIdentity `json:"reference,omitempty"`
 	ReferencePAR2 *BinaryIdentity `json:"reference_par2,omitempty"`
 	Comparisons   []Comparison    `json:"comparisons"`
-	Omitted       []string        `json:"omitted,omitempty"`
+	// RSSSummary lists every compared case's rarpar and reference peak
+	// RSS, worst rarpar/reference ratio first.
+	RSSSummary []procmeasure.RSSScenario `json:"rss_summary"`
+	Omitted    []string                  `json:"omitted,omitempty"`
 }
 
 func DurationNanos(value time.Duration) int64 { return value.Nanoseconds() }

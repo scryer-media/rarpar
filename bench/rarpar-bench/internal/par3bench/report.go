@@ -5,6 +5,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/procmeasure"
 )
 
 // Stat is a median with its range.
@@ -248,6 +250,7 @@ func RenderReport(results *Results) string {
 	fmt.Fprintln(&b, "Wall and CPU (user+sys) are seconds, RSS is peak MiB; cells are median [min–max]. Ratios are rarpar/reference medians: below 1.000 rarpar used less. The reference is single-threaded. Every rarpar row, durable and buffered, is compared with the same reference row.")
 	fmt.Fprintln(&b, "Carriers: `identical` = byte-identical to the reference's set; `payloads-only` = every recovery block's payload matches but packet metadata differs; `DIFFERENT` = recovery payloads differ.")
 	fmt.Fprintln(&b)
+	procmeasure.RenderRSSSummary(&b, RSSSummary(results))
 
 	windowsCounters := false
 	for _, run := range results.Runs {
