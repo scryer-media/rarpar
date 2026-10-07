@@ -150,13 +150,23 @@ func WindowsRunScript(machine Machine, defaults RunDefaults, runID string, layou
 			args = append(args, q(arg))
 		}
 		write("$p3Work = %s", q(PAR3Work(machine, layout)))
-		write("if (Test-Path -LiteralPath $OraclePar3) {")
+		// The same ownership rule as the POSIX runner: a directory the runner
+		// makes is removed whole, an empty one it adopts is only emptied, and
+		// anything else is refused, never deleted.
+		write("$p3Mark = Join-Path $p3Work %s", q(par3WorkMarker))
+		write("$p3Owned = ''")
+		write("if (Test-Path -LiteralPath $p3Mark -PathType Leaf) { $p3Owned = ([IO.File]::ReadAllText($p3Mark)).Trim() } elseif (Test-Path -LiteralPath $p3Work -PathType Container) { if (-not (Get-ChildItem -LiteralPath $p3Work -Force | Select-Object -First 1)) { $p3Owned = 'adopted' } } elseif (-not (Test-Path -LiteralPath $p3Work)) { try { [IO.Directory]::CreateDirectory($p3Work) | Out-Null; $p3Owned = 'created' } catch { } }")
+		write("if ($p3Owned -ne 'created' -and $p3Owned -ne 'adopted') { $p3Owned = '' }")
+		write("if ($p3Owned -and -not (Test-Path -LiteralPath $p3Mark)) { try { [IO.File]::WriteAllText($p3Mark, $p3Owned, $Utf8NoBom) } catch { $p3Owned = '' } }")
+		write("if (-not $p3Owned) {")
+		write("  Fail 'par3-work-not-dedicated'")
+		write("} elseif (Test-Path -LiteralPath $OraclePar3) {")
 		write("  Gate 'macro-par3'")
 		write("  $p3Args = @('par3','run','--reference',$OraclePar3,'--candidate',$Candidate,'--work',$p3Work,'--out',(Join-Path $R 'par3'),'--machine',$Machine,%s)", strings.Join(args, ","))
 		write("  & $Bench @p3Args *> (Join-Path $R 'par3-run.log')")
 		write("  Check 'macro-par3'")
 		write("} else { Fail 'par3-reference-missing' }")
-		write("if (Test-Path -LiteralPath $p3Work) { Remove-Item -LiteralPath $p3Work -Recurse -Force -ErrorAction SilentlyContinue }")
+		write("if ($p3Owned -eq 'created') { Remove-Item -LiteralPath $p3Work -Recurse -Force -ErrorAction SilentlyContinue } elseif ($p3Owned -eq 'adopted') { Get-ChildItem -LiteralPath $p3Work -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue }")
 	}
 	write("[IO.File]::WriteAllText((Join-Path $R 'perf-NO-COLLECTOR.txt'), \"capabilities.perf = none on Windows hosts; phase timings only`r`n\", $Utf8NoBom)")
 	write("$Finished = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')")

@@ -62,13 +62,20 @@ Copy-Item -LiteralPath (Join-Path $out 'raw.json') -Destination (Join-Path $R 'r
 Check 'report-rar'
 if (Test-Path -LiteralPath $out) { Remove-Item -LiteralPath $out -Recurse -Force -ErrorAction SilentlyContinue }
 $p3Work = 'C:\p3'
-if (Test-Path -LiteralPath $OraclePar3) {
+$p3Mark = Join-Path $p3Work '.rarpar-bench-par3-work'
+$p3Owned = ''
+if (Test-Path -LiteralPath $p3Mark -PathType Leaf) { $p3Owned = ([IO.File]::ReadAllText($p3Mark)).Trim() } elseif (Test-Path -LiteralPath $p3Work -PathType Container) { if (-not (Get-ChildItem -LiteralPath $p3Work -Force | Select-Object -First 1)) { $p3Owned = 'adopted' } } elseif (-not (Test-Path -LiteralPath $p3Work)) { try { [IO.Directory]::CreateDirectory($p3Work) | Out-Null; $p3Owned = 'created' } catch { } }
+if ($p3Owned -ne 'created' -and $p3Owned -ne 'adopted') { $p3Owned = '' }
+if ($p3Owned -and -not (Test-Path -LiteralPath $p3Mark)) { try { [IO.File]::WriteAllText($p3Mark, $p3Owned, $Utf8NoBom) } catch { $p3Owned = '' } }
+if (-not $p3Owned) {
+  Fail 'par3-work-not-dedicated'
+} elseif (Test-Path -LiteralPath $OraclePar3) {
   Gate 'macro-par3'
   $p3Args = @('par3','run','--reference',$OraclePar3,'--candidate',$Candidate,'--work',$p3Work,'--out',(Join-Path $R 'par3'),'--machine',$Machine,'--profile','full','--workers','1,8','--warmups','1','--repeats','5','--timeout','20m')
   & $Bench @p3Args *> (Join-Path $R 'par3-run.log')
   Check 'macro-par3'
 } else { Fail 'par3-reference-missing' }
-if (Test-Path -LiteralPath $p3Work) { Remove-Item -LiteralPath $p3Work -Recurse -Force -ErrorAction SilentlyContinue }
+if ($p3Owned -eq 'created') { Remove-Item -LiteralPath $p3Work -Recurse -Force -ErrorAction SilentlyContinue } elseif ($p3Owned -eq 'adopted') { Get-ChildItem -LiteralPath $p3Work -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue }
 [IO.File]::WriteAllText((Join-Path $R 'perf-NO-COLLECTOR.txt'), "capabilities.perf = none on Windows hosts; phase timings only`r`n", $Utf8NoBom)
 $Finished = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 $Elapsed = [int]([DateTime]::UtcNow - $StartTicks).TotalSeconds

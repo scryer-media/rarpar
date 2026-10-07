@@ -980,7 +980,106 @@ func validatePAR3(state *decodeState, prefix string, machine *Machine) {
 	}
 	if plan.Work != "" {
 		validateHostPath(state, prefix, "par3.work", plan.Work, machine.isWindows())
+		if problem := par3WorkProblem(*machine); problem != "" {
+			state.fail("%s: par3.work must be a dedicated directory: %s", prefix, problem)
+		}
 	}
+}
+
+// hostPathParts splits a host path into its lower-cased components on
+// Windows, or its components elsewhere; the first is the root ("/" or the
+// drive or share).
+func hostPathParts(value string, windows bool) []string {
+	if windows {
+		value = strings.ToLower(strings.ReplaceAll(value, "/", `\`))
+		var root string
+		if strings.HasPrefix(value, `\\`) {
+			fields := strings.SplitN(strings.TrimPrefix(value, `\\`), `\`, 3)
+			root = `\\` + strings.Join(fields[:min(2, len(fields))], `\`)
+			value = ""
+			if len(fields) == 3 {
+				value = fields[2]
+			}
+		} else if at := strings.Index(value, `:\`); at >= 0 {
+			root, value = value[:at+2], value[at+2:]
+		}
+		parts := []string{root}
+		for _, part := range strings.Split(value, `\`) {
+			if part != "" && part != "." {
+				parts = append(parts, part)
+			}
+		}
+		return parts
+	}
+	parts := []string{"/"}
+	for _, part := range strings.Split(value, "/") {
+		if part != "" && part != "." {
+			parts = append(parts, part)
+		}
+	}
+	return parts
+}
+
+// pathWithin reports whether inner is outer or lies under it.
+func pathWithin(inner, outer []string) bool {
+	if len(inner) < len(outer) {
+		return false
+	}
+	for index, part := range outer {
+		if inner[index] != part {
+			return false
+		}
+	}
+	return true
+}
+
+// par3WorkProblem says why [machines.par3].work cannot be the suite's own
+// directory, or "" when it can. The runner deletes what it puts there, so
+// the path must never be a filesystem root, a home directory or the
+// directory holding homes, nor hold or sit in the machine's staging,
+// scratch or corpus paths.
+func par3WorkProblem(machine Machine) string {
+	windows := machine.isWindows()
+	work := hostPathParts(machine.PAR3.Work, windows)
+	for _, part := range work {
+		if part == ".." {
+			return "it must not contain a .. component"
+		}
+	}
+	if len(work) == 1 {
+		return "it is a filesystem root"
+	}
+	homes := [][]string{{"/", "home"}, {"/", "users"}, {"/", "Users"}, {"/", "root"}, {"/", "var", "root"}}
+	if windows {
+		homes = [][]string{{work[0], "users"}}
+	}
+	for _, home := range homes {
+		if pathWithin(home, work) {
+			return "it is or holds the home directories"
+		}
+		// A user's home is the directory right under the homes directory;
+		// /root and /var/root are homes themselves.
+		if len(work) == len(home)+1 && pathWithin(work, home) && home[len(home)-1] != "root" {
+			return "it is a home directory"
+		}
+	}
+	for _, other := range []struct{ name, value string }{
+		{"paths.staging", machine.Paths.Staging},
+		{"paths.scratch", machine.Paths.Scratch},
+		{"paths.corpus", machine.Paths.Corpus},
+	} {
+		if other.value == "" {
+			continue
+		}
+		parts := hostPathParts(other.value, windows)
+		if pathWithin(parts, work) {
+			return "it is or holds " + other.name
+		}
+		if other.name == "paths.corpus" && pathWithin(work, parts) {
+			return "it lies inside paths.corpus"
+		}
+	}
+	return ""
 }
 
 func validateEC2(state *decodeState, prefix string, machine *Machine, settings *Settings) {

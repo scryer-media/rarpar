@@ -385,6 +385,10 @@ func RunScript(machine Machine, defaults RunDefaults, runID string, layout Remot
 	return script.String()
 }
 
+// par3WorkMarker names the file the runner leaves in the macro-par3 work
+// directory to record that the directory is its own and how it came by it.
+const par3WorkMarker = ".rarpar-bench-par3-work"
+
 // PAR3Work is the macro-par3 dataset and stage directory on the host. The
 // reference's name-buffer limit makes its length matter; the plan checks it.
 func PAR3Work(machine Machine, layout RemoteLayout) string {
@@ -446,7 +450,26 @@ func par3Section(machine Machine, layout RemoteLayout, reference string) string 
 			shellQuote(par3ReferenceDir(machine, layout)))
 		write("  > \"$R/par3-build-reference.json\" 2> \"$R/par3-build-reference.log\" || fail par3-build-reference")
 	}
-	write("if [ -x \"$P3_REFERENCE\" ]; then")
+	// The work directory is the suite's own: one the runner makes (removed
+	// whole afterwards) or one it finds empty (only emptied afterwards). The
+	// marker records which, so a rerun after an interrupted run keeps the
+	// same cleanup; anything else there is refused, never deleted.
+	write("P3_MARK=\"$P3_WORK/%s\"", par3WorkMarker)
+	write("P3_OWNED=")
+	write("if [ -f \"$P3_MARK\" ]; then")
+	write("  P3_OWNED=$(cat \"$P3_MARK\")")
+	write("elif [ -d \"$P3_WORK\" ]; then")
+	write("  [ -n \"$(ls -A \"$P3_WORK\")\" ] || P3_OWNED=adopted")
+	write("elif [ ! -e \"$P3_WORK\" ] && mkdir -p \"$P3_WORK\"; then")
+	write("  P3_OWNED=created")
+	write("fi")
+	write("case \"$P3_OWNED\" in created|adopted) ;; *) P3_OWNED= ;; esac")
+	write("if [ -n \"$P3_OWNED\" ] && [ ! -f \"$P3_MARK\" ]; then")
+	write("  printf '%%s\\n' \"$P3_OWNED\" > \"$P3_MARK\" || P3_OWNED=")
+	write("fi")
+	write("if [ -z \"$P3_OWNED\" ]; then")
+	write("  fail par3-work-not-dedicated")
+	write("elif [ -x \"$P3_REFERENCE\" ]; then")
 	write("  gate macro-par3")
 	write("  \"$BENCH\" par3 run --reference \"$P3_REFERENCE\" --candidate \"$CANDIDATE\" --work \"$P3_WORK\" \\")
 	write("    --out \"$R/par3\" --machine \"$MACHINE\" %s \\", strings.Join(quoted, " "))
@@ -457,7 +480,10 @@ func par3Section(machine Machine, layout RemoteLayout, reference string) string 
 	write("else")
 	write("  fail par3-reference-missing")
 	write("fi")
-	write("rm -rf \"$P3_WORK\"")
+	write("case \"$P3_OWNED\" in")
+	write("  created) rm -rf \"$P3_WORK\" ;;")
+	write("  adopted) find \"$P3_WORK\" -mindepth 1 -maxdepth 1 -exec rm -rf {} + ;;")
+	write("esac")
 	write("")
 	return script.String()
 }
