@@ -31,7 +31,8 @@ mounts both and runs the PAR3 suite with three targets, local (the client's
 volume disk), nfs-async and nfs-sync, interleaved in one run. Mount options
 are client environment variables (NFS_VERS, NFS_PROTO, NFS_RSIZE, NFS_WSIZE,
 NFS_HARD, NFS_ACTIMEO, NFS_CLIENT_SYNC, NFS_NCONNECT, NFS_EXTRA_OPTS,
-NFS_LOCALIO). See docs/benchmarking.md.
+NFS_LOCALIO); RIG_RATE_MBPS throttles the client's link each way and
+measures it before the suite. See docs/benchmarking.md.
 `
 
 func runNFS(ctx context.Context, args []string, stdout io.Writer) error {
@@ -163,6 +164,9 @@ func runNFSClient(ctx context.Context, args []string, stdout io.Writer) error {
 			return err
 		}
 		rig := map[string]any{"client": config, "markers": session.Markers, "local_fs": session.LocalFS, "suite_args": suiteArgs}
+		if session.Link != nil {
+			rig["link"] = session.Link
+		}
 		data, err := json.MarshalIndent(rig, "", "  ")
 		if err != nil {
 			return err

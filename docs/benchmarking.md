@@ -420,6 +420,13 @@ on the same virtual disk as the local control: the rig shows protocol cost
 (extra round trips, commits, cache behaviour), not a NAS's disks or a WAN.
 Compare NFS rows with local rows from the same run only.
 
+`--env RIG_RATE_MBPS=80` throttles the client's link to that many MB/s each
+way inside the client's network namespace (a token bucket on its interface,
+and one on an IFB device its inbound traffic is redirected through), so the
+server is unchanged. After mounting, the client writes a 1 GiB file to the
+async export, drops the page cache, reads it back with `dd` and records the
+measured rates in `rig.json` and in every NFS target's metadata.
+
 ## Evidence And Charts
 
 Build a report and render static charts from a completed comparative run:
