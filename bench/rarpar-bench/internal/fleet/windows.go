@@ -95,6 +95,11 @@ func WindowsRunScript(machine Machine, defaults RunDefaults, runID string, layou
 	write("$env:RARPAR_BENCH_WORKSPACE_ROOT = $Base")
 	write("function Log($m) { Write-Output (\"[{0}] {1}\" -f (Get-Date).ToUniversalTime().ToString('HH:mm:ss'), $m) }")
 	write("function Fail($m) { $script:Status = 'failed'; $script:Failures += $m; Log \"FAILURE: $m\" }")
+	// Check follows every external command: PowerShell does not stop on a
+	// native command's non-zero exit, so without it a failed step would still
+	// be collected as status=ok. The failure names the step and its exit code
+	// as one token, as the sentinel's space-separated failures list needs.
+	write("function Check($what) { if ($LASTEXITCODE -ne 0) { Fail ($what + ':exit-' + $LASTEXITCODE) } }")
 	write("function Gate($what) {")
 	write("  $names = @(%s)", quotePowerShellList(defaults.QuietLoadProcessNames))
 	write("  $waited = 0")
@@ -113,13 +118,15 @@ func WindowsRunScript(machine Machine, defaults RunDefaults, runID string, layou
 
 	if machine.hasSuite(SuiteCRCProbe) {
 		write("$probe = Join-Path $Bin 'crc_probe.exe'")
-		write("if (Test-Path -LiteralPath $probe) { Gate 'crc-probe'; & $probe *> (Join-Path $R 'crc_probe.txt') } else { Fail 'crc-probe-binary-missing' }")
+		write("if (Test-Path -LiteralPath $probe) { Gate 'crc-probe'; & $probe *> (Join-Path $R 'crc_probe.txt'); Check 'crc-probe' } else { Fail 'crc-probe-binary-missing' }")
 	}
 	for _, family := range machine.families() {
 		write("& $Bench corpus verify --root $Corpus *> (Join-Path $R 'corpus-verify.txt')")
+		write("Check 'corpus-verify'")
 		write("$plan = Join-Path $W %s", q("plan-"+family+".json"))
 		write("& $Bench plan create --corpus $Corpus --out $plan --seed %s --lane %s --family %s --par2-placement %s --warmups %d --repeats %d *> (Join-Path $R %s)",
 			q(defaults.Seed), q(defaults.Lane), q(family), q(defaults.Par2Placement), machine.Run.Warmups, machine.Run.Repeats, q("plan-"+family+".log"))
+		write("Check %s", q("plan-"+family))
 		write("Copy-Item -LiteralPath $plan -Destination (Join-Path $R %s) -ErrorAction SilentlyContinue", q("plan-"+family+".json"))
 		write("Gate %s", q(family))
 		write("$out = Join-Path $W %s", q("run-"+family))
@@ -128,9 +135,10 @@ func WindowsRunScript(machine Machine, defaults RunDefaults, runID string, layou
 		write("if ($OracleRar) { $benchArgs += @('--reference-rar', $OracleRar) }")
 		write("if ($OraclePar2) { $benchArgs += @('--reference-par2', $OraclePar2) }")
 		write("& $Bench @benchArgs *> (Join-Path $R %s)", q("run-"+family+".log"))
-		write("if ($LASTEXITCODE -ne 0) { Fail %s }", q("run-"+family))
+		write("Check %s", q("run-"+family))
 		write("Copy-Item -LiteralPath (Join-Path $out 'raw.json') -Destination (Join-Path $R %s) -ErrorAction SilentlyContinue", q("raw-"+family+".json"))
 		write("& $Bench report --input (Join-Path $out 'raw.json') --out (Join-Path $R %s) *> (Join-Path $R %s)", q("report-"+family+".json"), q("report-"+family+".log"))
+		write("Check %s", q("report-"+family))
 		write("if (Test-Path -LiteralPath $out) { Remove-Item -LiteralPath $out -Recurse -Force -ErrorAction SilentlyContinue }")
 	}
 	if machine.hasSuite(SuiteMacroPAR3) {
@@ -146,7 +154,7 @@ func WindowsRunScript(machine Machine, defaults RunDefaults, runID string, layou
 		write("  Gate 'macro-par3'")
 		write("  $p3Args = @('par3','run','--reference',$OraclePar3,'--candidate',$Candidate,'--work',$p3Work,'--out',(Join-Path $R 'par3'),'--machine',$Machine,%s)", strings.Join(args, ","))
 		write("  & $Bench @p3Args *> (Join-Path $R 'par3-run.log')")
-		write("  if ($LASTEXITCODE -ne 0) { Fail 'macro-par3' }")
+		write("  Check 'macro-par3'")
 		write("} else { Fail 'par3-reference-missing' }")
 		write("if (Test-Path -LiteralPath $p3Work) { Remove-Item -LiteralPath $p3Work -Recurse -Force -ErrorAction SilentlyContinue }")
 	}

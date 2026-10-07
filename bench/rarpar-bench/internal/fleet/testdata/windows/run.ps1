@@ -25,6 +25,7 @@ foreach ($d in @($R, $W)) { if (-not (Test-Path -LiteralPath $d)) { New-Item -It
 $env:RARPAR_BENCH_WORKSPACE_ROOT = $Base
 function Log($m) { Write-Output ("[{0}] {1}" -f (Get-Date).ToUniversalTime().ToString('HH:mm:ss'), $m) }
 function Fail($m) { $script:Status = 'failed'; $script:Failures += $m; Log "FAILURE: $m" }
+function Check($what) { if ($LASTEXITCODE -ne 0) { Fail ($what + ':exit-' + $LASTEXITCODE) } }
 function Gate($what) {
   $names = @('rarpar-bench','rarpar','par2','unrar','decode_timing','searchend_timing','crc_probe')
   $waited = 0
@@ -41,10 +42,12 @@ Get-ComputerInfo | Out-File -LiteralPath (Join-Path $R 'environment.txt') -Encod
 Get-ChildItem -LiteralPath $Bin | Out-File -LiteralPath (Join-Path $R 'binaries.txt') -Encoding utf8
 Get-ChildItem -LiteralPath $Bin -File | ForEach-Object { Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName } | Out-File -LiteralPath (Join-Path $R 'binaries.txt') -Append -Encoding utf8
 $probe = Join-Path $Bin 'crc_probe.exe'
-if (Test-Path -LiteralPath $probe) { Gate 'crc-probe'; & $probe *> (Join-Path $R 'crc_probe.txt') } else { Fail 'crc-probe-binary-missing' }
+if (Test-Path -LiteralPath $probe) { Gate 'crc-probe'; & $probe *> (Join-Path $R 'crc_probe.txt'); Check 'crc-probe' } else { Fail 'crc-probe-binary-missing' }
 & $Bench corpus verify --root $Corpus *> (Join-Path $R 'corpus-verify.txt')
+Check 'corpus-verify'
 $plan = Join-Path $W 'plan-rar.json'
 & $Bench plan create --corpus $Corpus --out $plan --seed 'rarpar-benchmark-plan-v1' --lane 'cpu' --family 'rar' --par2-placement 'canonical' --warmups 1 --repeats 7 *> (Join-Path $R 'plan-rar.log')
+Check 'plan-rar'
 Copy-Item -LiteralPath $plan -Destination (Join-Path $R 'plan-rar.json') -ErrorAction SilentlyContinue
 Gate 'rar'
 $out = Join-Path $W 'run-rar'
@@ -53,16 +56,17 @@ $benchArgs = @('run','--corpus',$Corpus,'--plan',$plan,'--candidate',$Candidate,
 if ($OracleRar) { $benchArgs += @('--reference-rar', $OracleRar) }
 if ($OraclePar2) { $benchArgs += @('--reference-par2', $OraclePar2) }
 & $Bench @benchArgs *> (Join-Path $R 'run-rar.log')
-if ($LASTEXITCODE -ne 0) { Fail 'run-rar' }
+Check 'run-rar'
 Copy-Item -LiteralPath (Join-Path $out 'raw.json') -Destination (Join-Path $R 'raw-rar.json') -ErrorAction SilentlyContinue
 & $Bench report --input (Join-Path $out 'raw.json') --out (Join-Path $R 'report-rar.json') *> (Join-Path $R 'report-rar.log')
+Check 'report-rar'
 if (Test-Path -LiteralPath $out) { Remove-Item -LiteralPath $out -Recurse -Force -ErrorAction SilentlyContinue }
 $p3Work = 'C:\p3'
 if (Test-Path -LiteralPath $OraclePar3) {
   Gate 'macro-par3'
   $p3Args = @('par3','run','--reference',$OraclePar3,'--candidate',$Candidate,'--work',$p3Work,'--out',(Join-Path $R 'par3'),'--machine',$Machine,'--profile','full','--workers','1,8','--warmups','1','--repeats','5','--timeout','20m')
   & $Bench @p3Args *> (Join-Path $R 'par3-run.log')
-  if ($LASTEXITCODE -ne 0) { Fail 'macro-par3' }
+  Check 'macro-par3'
 } else { Fail 'par3-reference-missing' }
 if (Test-Path -LiteralPath $p3Work) { Remove-Item -LiteralPath $p3Work -Recurse -Force -ErrorAction SilentlyContinue }
 [IO.File]::WriteAllText((Join-Path $R 'perf-NO-COLLECTOR.txt'), "capabilities.perf = none on Windows hosts; phase timings only`r`n", $Utf8NoBom)

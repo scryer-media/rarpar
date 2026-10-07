@@ -352,3 +352,44 @@ func TestWriteZipUsesForwardSlashes(t *testing.T) {
 		t.Fatalf("zip entries = %s", got)
 	}
 }
+
+// PowerShell does not stop on a native command's non-zero exit, so every
+// external command in the run script must be followed by a Check that fails
+// the run with that step's exit code; otherwise a crashed step is collected
+// as status=ok.
+func TestWindowsRunScriptChecksEveryExternalExit(t *testing.T) {
+	config, machine := windowsExample(t)
+	for _, suite := range []string{SuiteCRCProbe, SuiteMacroPAR3} {
+		if !machine.hasSuite(suite) {
+			machine.Suites = append(machine.Suites, suite)
+		}
+	}
+	layout := windowsLayout(machine, "fleet-testrun")
+	script := WindowsRunScript(machine, config.Fleet.Defaults, "fleet-testrun", layout,
+		map[string]string{"rar": `C:\o\UnRAR.exe`, "par2": `C:\o\par2.exe`, "par3": `C:\o\par3.exe`})
+	if !strings.Contains(script, "function Check($what) { if ($LASTEXITCODE -ne 0) { Fail ($what + ':exit-' + $LASTEXITCODE) } }") {
+		t.Fatal("the run script must define Check over $LASTEXITCODE")
+	}
+	lines := strings.Split(script, "\r\n")
+	external := 0
+	for i, line := range lines {
+		at := strings.Index(line, "& $")
+		if at < 0 {
+			continue
+		}
+		external++
+		rest := line[at:]
+		next := ""
+		if i+1 < len(lines) {
+			next = strings.TrimSpace(lines[i+1])
+		}
+		if !strings.Contains(rest, "; Check '") && !strings.HasPrefix(next, "Check '") {
+			t.Errorf("external command without an exit check:\n%s\n%s", line, next)
+		}
+	}
+	// crc_probe, and per family corpus verify, plan, run and report, and the
+	// PAR3 suite.
+	if external < 6 {
+		t.Fatalf("found %d external commands; the script shape changed:\n%s", external, script)
+	}
+}
