@@ -56,7 +56,9 @@ documented in each crate's own changelog so those notes ship with the crate.
   failing.
 - `par3 archive` checks every recovery-volume name before installing the
   archive, refusing a symbolic link and, without overwrite, an existing file;
-  a volume is never written through a link. `--max-files` stops the input
+  a volume is never written through a link. An archive path that would also
+  be its own PAR3 index or a recovery volume (`set.par3`, in any case) is
+  refused before anything is written. `--max-files` stops the input
   walk as soon as the limit is passed, the streaming lanes' memory budget
   counts the state kept per block, ZIP member times are local times (DOS
   time has no zone), and setuid, setgid and sticky bits are kept in ZIP

@@ -325,6 +325,37 @@ fn existing_outputs_and_bad_switches_are_refused() {
     }
 }
 
+/// An archive named like its own PAR3 index is refused before anything is
+/// written, with or without `--overwrite`, in either case of the extension.
+#[test]
+fn an_archive_named_as_its_own_index_is_refused_first() {
+    let dir = fixture(1000);
+    let root = dir.path();
+    for name in ["set.par3", "SET.PAR3", "set.vol0+1.par3"] {
+        for overwrite in [false, true] {
+            let mut args = vec!["par3", "archive", "--base-path", "in"];
+            if overwrite {
+                args.push("--overwrite");
+            }
+            args.push(name);
+            args.extend(MEMBERS);
+            let output = rarpar(root, &args);
+            assert_eq!(output.status.code(), Some(2), "{name} {overwrite}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("would both be written"),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let left: Vec<_> = std::fs::read_dir(root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .filter(|name| name != "in")
+                .collect();
+            assert!(left.is_empty(), "{name} {overwrite}: {left:?}");
+        }
+    }
+}
+
 /// A recovery volume name that is taken is found before the archive is
 /// installed, and a symlink at one is never written through, even with
 /// `--overwrite`.

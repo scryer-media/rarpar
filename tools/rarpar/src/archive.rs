@@ -678,6 +678,29 @@ fn methods(args: &Par3ArchiveArgs, threads: u32) -> (Vec<EncoderConfiguration>, 
     (methods, in_flight)
 }
 
+/// Refuse a plan whose outputs name one file twice, as an archive called
+/// `set.par3` would with its own index: the second write would truncate the
+/// first after it was reported made. Names are compared without ASCII case,
+/// since a case-insensitive volume holds `SET.PAR3` and `set.par3` as one.
+fn refuse_aliases(paths: &[PathBuf]) -> Result<(), RarparError> {
+    for (at, first) in paths.iter().enumerate() {
+        for second in &paths[at + 1..] {
+            let same_name = match (first.file_name(), second.file_name()) {
+                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                _ => false,
+            };
+            if same_name && parent(first) == parent(second) {
+                return Err(RarparError::Usage(format!(
+                    "the archive and its PAR3 set would both be written to {}; \
+                     give the archive a name that does not end in .par3",
+                    second.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparError> {
     let base = args.base_path.clone().unwrap_or(std::env::current_dir()?);
     reject_symlinks(&base)?;
@@ -732,6 +755,7 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
     if !args.inside {
         // The volume names depend on the row count, so list the index only.
         outputs.push(par3_stream::sibling_paths(&stem, 0).0);
+        refuse_aliases(&outputs)?;
     }
     for path in &outputs {
         reject_symlinks(path)?;
@@ -981,7 +1005,10 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
     if geometry.inside.is_none() {
         // The volume names are known now: check them all before the
         // archive is installed, so a collision leaves nothing half made.
-        let (_, volumes) = par3_stream::sibling_paths(&stem, rows.len() as u64);
+        let (index, volumes) = par3_stream::sibling_paths(&stem, rows.len() as u64);
+        let mut planned = vec![output.clone(), index];
+        planned.extend(volumes.iter().map(|(_, _, path)| path.clone()));
+        refuse_aliases(&planned)?;
         for (_, _, path) in &volumes {
             reject_symlinks(path)?;
             if !cli.overwrite && std::fs::symlink_metadata(path).is_ok() {
