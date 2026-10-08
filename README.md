@@ -389,10 +389,11 @@ the archive set; it waits for each later volume instead.
 ## Workspace Packages
 
 - `crates/reedsolomon-rs`: Reed-Solomon finite-field kernels shared by
-  RAR recovery and PAR2 repair. Licensed GPL-3.0-or-later.
+  RAR recovery and PAR2 repair. Licensed Apache-2.0.
 - `crates/unrar-rs`: RAR reading, probing, extraction, and recovery only.
-  Licensed GPL-3.0-or-later; its RAR engine was developed using RARLAB's
-  unRAR source code, which remains governed by the unRAR license restriction.
+  Licensed Apache-2.0 plus the unRAR license restriction: its RAR engine was
+  developed using RARLAB's unRAR source code, which remains governed by that
+  restriction.
 - `crates/par2-rs`: PAR2 packet loading, creation, verification,
   placement-aware repair, and post-repair verification. Licensed
   GPL-3.0-or-later.
@@ -401,7 +402,7 @@ the archive set; it waits for each later volume instead.
   deduplication, Data packets, content placement, recovery-carrier rebuilding,
   and ZIP/7z embedded protection. Powers the CLI's PAR3 operations. See the
   [crate README](crates/par3-rs/README.md) for API boundaries and compatibility.
-  Licensed GPL-3.0-or-later.
+  Licensed Apache-2.0.
 - `tools/rarpar`: the standalone CLI. Licensed GPL-3.0-or-later with a
   GPLv3 section 7 permission to combine with `unrar-rs` — `unrar-rs` is a
   default dependency, so an ordinary build carries the unRAR restriction.
@@ -475,14 +476,21 @@ Status: **Landed** ships; **Building** has an owner now; **Exploring** is a meas
 
 ## License
 
-The workspace is GPL-3.0-or-later, with the UnRAR restriction carried wherever
-`unrar-rs` is used:
+The `rarpar` CLI and `par2-rs` are GPL-3.0-or-later; the other library crates
+are Apache-2.0. The UnRAR restriction is carried wherever `unrar-rs` is used:
 
-- `reedsolomon-rs`, `par2-rs` and `par3-rs` are GPL-3.0-or-later. None of them
-  depends on `unrar-rs`, so none carries the restriction.
-- `unrar-rs` is GPL-3.0-or-later; its RAR engine was developed using
-  RARLAB's unRAR source code, and the unRAR license restriction continues to
-  govern that derived code — see `crates/unrar-rs/LICENSE`.
+- `reedsolomon-rs` and `par3-rs` are Apache-2.0, from `reedsolomon-rs` 0.4.10
+  and `par3-rs` 0.5.1 onward. Neither depends on `unrar-rs`, so neither
+  carries the restriction. `reedsolomon-rs` contains GF(2^16) kernels ported
+  from [ParPar](https://github.com/animetosho/ParPar), which its author
+  released as public domain or CC0.
+- `par2-rs` is GPL-3.0-or-later. Its test suite includes cases adapted from
+  the GPL-2.0-or-later unit tests of par2cmdline, so it was not relicensed
+  with the other libraries. It does not depend on `unrar-rs`.
+- `unrar-rs` is Apache-2.0 plus the unRAR license restriction, from 0.10.10
+  onward; its RAR engine was developed using RARLAB's unRAR source code, and
+  the restriction continues to govern that derived code — see
+  `crates/unrar-rs/LICENSE`.
 - `rarpar` is GPL-3.0-or-later with a GPLv3 section 7 additional permission
   to combine with `unrar-rs` — see `tools/rarpar/LICENSE`.
   `unrar-rs` is a default dependency — `default` enables `runtime`, which
@@ -490,12 +498,16 @@ The workspace is GPL-3.0-or-later, with the UnRAR restriction carried wherever
   release archive contains UnRAR-derived code. Release archives include
   `LICENSE`, `LICENSE.GPL-3.0-or-later`, and `LICENSE.unrar-rs`.
 
+Releases of `reedsolomon-rs` before 0.4.10, `par3-rs` before 0.5.1 and
+`unrar-rs` before 0.10.10 stay under GPL-3.0-or-later (`unrar-rs` with the
+unRAR restriction); the change applies to those versions and later ones only.
+
 The additional restriction applies to the RAR extraction and recovery code in
 `unrar-rs`, and to `rarpar`, which includes it by default. It does not apply
-to the PAR2 or Reed-Solomon crates, which is why those two are published to
-crates.io under a plain `GPL-3.0-or-later` SPDX identifier while `unrar-rs`
-and `rarpar` use `license-file` instead — the combination is not expressible
-as an SPDX identifier.
+to the PAR2, PAR3 or Reed-Solomon crates, which is why those are published to
+crates.io under a plain SPDX identifier (`Apache-2.0`, or `GPL-3.0-or-later`
+for `par2-rs`) while `unrar-rs` and `rarpar` use `license-file` instead — the
+combination is not expressible as an SPDX identifier.
 
 Building `rarpar` with `--no-default-features` and without `runtime` links no
 `unrar-rs` and is GPL-3.0-or-later alone, but no distributed rarpar is built

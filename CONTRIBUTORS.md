@@ -89,10 +89,12 @@ affected Cargo tests.
 
 ## Licensing
 
-- `reedsolomon-rs`, `par2-rs`, and `rarpar` source are
-  GPL-3.0-or-later.
-- `unrar-rs` is GPL-3.0-or-later plus the UnRAR source-code restriction in
+- `reedsolomon-rs` and `par3-rs` source are Apache-2.0.
+- `par2-rs` and `rarpar` source are GPL-3.0-or-later.
+- `unrar-rs` is Apache-2.0 plus the UnRAR source-code restriction in
   `crates/unrar-rs/LICENSE`.
+- Do not bring GPL-licensed code, or a translation of it, into an Apache-2.0
+  crate.
 - Distributed `rarpar` binaries link `unrar-rs` and carry its restriction.
 - Do not move restricted RAR implementation code into PAR2 or Reed-Solomon
   code.

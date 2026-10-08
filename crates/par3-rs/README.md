@@ -453,5 +453,9 @@ recipes are preserved in the repository; damage tests modify protected inputs
 or model unavailable carrier ranges.
 
 [API and migration notes](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/CHANGELOG.md).
-Licensed **GPL-3.0-or-later**; see
+
+## License
+
+Apache-2.0 from version 0.5.1 onward. See
 [LICENSE](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/LICENSE).
+Releases before 0.5.1 stay under GPL-3.0-or-later.
