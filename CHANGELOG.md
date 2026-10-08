@@ -3,6 +3,17 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.6.1
+
+### CLI Changes
+
+- RAR3 PPMd members extract faster: `unrar-rs` 0.11.0 decodes them through
+  the `ppmd-turbo` crate, 1.16-1.71x faster than 0.6.0 on the RAR4 PPMd
+  fixtures (32 MiB order-16 member: 3.41 s wall, from 4.71 s). Output is
+  unchanged, and a PPMd stream that overruns its packed data by more than 64
+  bytes now fails at that symbol rather than at the next output flush. The
+  `ppmd-debug` feature and `UNRAR_RS_RAR4_DEBUG_PPM` are gone.
+
 ## rarpar 0.6.0
 
 ### CLI Changes
