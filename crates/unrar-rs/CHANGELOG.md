@@ -4,20 +4,26 @@
 
 ### Changed
 
-- RAR3 PPMd blocks decode through the `ppmd-turbo` crate. Its `RarDecoder`
-  holds the variant H model across blocks and solid members, and its
-  carry-less range decoder reads the LZ bit stream through a `ByteSource`:
-  the coder reads the bit reader's own buffer in place and returns to it
-  only at a 256-byte window edge, instead of once per byte. The reader still
-  ends exactly where the coder stopped, zeros fed past the end of the packed
-  data are still counted on the reader (the 64-byte allowance is unchanged),
-  and a solid member boundary inside a PPMd block still resumes from the
-  saved coder registers. Output is unchanged. On an Apple M5 Max the RAR4
-  PPMd fixtures extract in the same CPU time as 0.10.9 (32 MiB order-16
-  member: 9.45 CPU-s in both).
-- PPMd model and coder faults still surface as `RarError::CorruptArchive`.
-  `ppmd-turbo` is not part of the public API: no public type or impl names
-  it.
+- RAR3 PPMd blocks decode through the `ppmd-turbo` crate. Its `RarPpmd`
+  holds the variant H model and the carry-less range coder across blocks and
+  solid members and decodes runs of literals up to the escape character
+  straight out of the bit reader's own buffer; the commands after an escape
+  are still read here one symbol at a time, as `Unpack29` reads them. The
+  decoder keeps no input between calls, so a streaming reader joins the end
+  of one fill to the start of the next before offering it a symbol's worth
+  of input. The reader still ends exactly where the coder stopped, a solid
+  member boundary inside a PPMd block still resumes the same coder, and the
+  64-byte allowance for zeros read past the end of the packed data is
+  unchanged. Output is unchanged. On an Apple M5 Max the RAR4 PPMd fixtures
+  extract 1.16-1.71x faster than with 0.10.9 (32 MiB order-16 member: 3.41 s
+  wall, from 4.71 s).
+- A PPMd stream that runs more than 64 bytes past the end of its packed data
+  now fails at that symbol rather than at the next output flush, with the
+  same `RarError::CorruptArchive`.
+- PPMd model and coder faults still surface as `RarError::CorruptArchive`; a
+  model whose memory cannot be allocated surfaces as
+  `RarError::ResourceLimit`. `ppmd-turbo` is not part of the public API: no
+  public type or impl names it.
 
 ### Removed
 

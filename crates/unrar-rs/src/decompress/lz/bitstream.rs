@@ -177,18 +177,20 @@ pub trait BitRead {
         0
     }
 
-    /// Lend the input bytes from the cursor to the end of the reader's
-    /// current buffer, for a byte-oriented consumer (the RAR4 PPMd range
-    /// coder) to read in place instead of one [`Self::read_byte_or_zero`]
-    /// call per byte.
+    /// Lend the input bytes from the cursor on, for a byte-oriented consumer
+    /// (the RAR4 PPMd decoder) to read in place.
     ///
-    /// Empty when the cursor is not on a byte boundary, when the reader
-    /// cannot lend a contiguous buffer, or at the end of the input; the
-    /// caller then falls back to [`Self::read_byte_or_zero`]. Lending moves
-    /// nothing: [`Self::consume_byte_span`] does.
+    /// The span holds at least `min` bytes unless it runs to the end of the
+    /// input, which the flag says. A consumer that keeps no bytes between
+    /// calls can therefore always be offered a whole step's worth of input.
+    /// Lending moves nothing: [`Self::consume_byte_span`] does.
+    ///
+    /// `None` when the cursor is not on a byte boundary or the reader cannot
+    /// lend at all (the default).
     #[doc(hidden)]
-    fn byte_span(&mut self) -> &[u8] {
-        &[]
+    fn byte_span(&mut self, min: usize) -> RarResult<Option<(&[u8], bool)>> {
+        let _ = min;
+        Ok(None)
     }
 
     /// Move the cursor past the first `count` bytes of the span
@@ -749,14 +751,17 @@ impl BitRead for BitReader<'_> {
     }
 
     /// The whole rest of the source is one contiguous slice, so the span is
-    /// everything after the cursor.
+    /// everything after the cursor and always runs to the end of the input.
     #[inline]
-    fn byte_span(&mut self) -> &[u8] {
+    fn byte_span(&mut self, _min: usize) -> RarResult<Option<(&[u8], bool)>> {
         let position = BitReader::position(self);
         if !position.is_multiple_of(8) {
-            return &[];
+            return Ok(None);
         }
-        self.data.get(position / 8..).unwrap_or_default()
+        Ok(Some((
+            self.data.get(position / 8..).unwrap_or_default(),
+            true,
+        )))
     }
 
     /// Drops the accumulator and reloads it lazily at the new byte, the same
@@ -1021,6 +1026,45 @@ impl<R: Read> StreamingBitReader<R> {
         Ok(())
     }
 
+    /// Lay the unread input out contiguously from the start of the buffer and
+    /// read until it holds `min` bytes or the inner reader ends.
+    ///
+    /// The unread bytes are the whole bytes left in the accumulator (the
+    /// cursor is byte-aligned) followed by `buf[buf_pos..buf_len]`; that
+    /// holds whether or not the accumulator straddles two fills. Afterwards
+    /// the accumulator is empty and the cursor sits at buffer byte 0, from
+    /// where `refill` reloads it lazily. Runs once per fill, on at most a
+    /// few hundred bytes, except in the straddling case.
+    #[cold]
+    #[inline(never)]
+    fn gather_byte_span(&mut self, min: usize) -> RarResult<()> {
+        debug_assert!(self.acc_bits.is_multiple_of(8));
+        let held = usize::from(self.acc_bits / 8);
+        let tail = self.buf_len - self.buf_pos;
+        self.buf.copy_within(self.buf_pos..self.buf_len, held);
+        for (index, slot) in self.buf[..held].iter_mut().enumerate() {
+            *slot = (self.acc >> (56 - 8 * index)) as u8;
+        }
+        self.buf_len = held + tail;
+        self.buf_pos = 0;
+        self.acc = 0;
+        self.acc_bits = 0;
+        let limit = self.fill_limit();
+        while self.buf_len < min && !self.eof {
+            let end = (self.buf_len + limit).min(self.buf.len());
+            let n = self
+                .inner
+                .read(&mut self.buf[self.buf_len..end])
+                .map_err(RarError::Io)?;
+            self.buf_len += n;
+            if n == 0 {
+                self.eof = true;
+            }
+        }
+        debug_assert_eq!(self.buffer_bit_position(), Some(0));
+        Ok(())
+    }
+
     #[inline(always)]
     fn peek_bits(&mut self, count: u8) -> RarResult<u32> {
         debug_assert!(count <= 32);
@@ -1217,25 +1261,27 @@ impl<R: Read> BitRead for StreamingBitReader<R> {
         self.zero_bytes_past_eof
     }
 
-    /// The span is the rest of the current fill. An exhausted fill is
-    /// replaced first, so the span is empty only at the end of the input (or
-    /// on a read error, which `read_byte_or_zero` also treats as the end), or
-    /// while the accumulator still straddles two fills (see
-    /// [`Self::buffer_bit_position`]), which resolves within a few bytes of
-    /// the fallback path.
+    /// The span is the rest of the current fill while that holds `min`
+    /// bytes. Near the end of a fill, or while the accumulator still
+    /// straddles two fills (see [`Self::buffer_bit_position`]), the unread
+    /// bytes move to the front of the buffer and further reads top it up
+    /// first ([`Self::gather_byte_span`]). The span runs to the end of the
+    /// input once the inner reader has reported its end.
     #[inline]
-    fn byte_span(&mut self) -> &[u8] {
-        if self.acc_bits == 0 && self.buf_pos >= self.buf_len && self.fill_buffer().is_err() {
-            return &[];
+    fn byte_span(&mut self, min: usize) -> RarResult<Option<(&[u8], bool)>> {
+        if !self.bit_pos.is_multiple_of(8) {
+            return Ok(None);
         }
-        // A fill starts on a byte of the stream, so a byte-aligned buffer
-        // position is a byte-aligned stream position.
-        match self.buffer_bit_position() {
-            Some(bit) if bit.is_multiple_of(8) => {
-                self.buf.get(bit / 8..self.buf_len).unwrap_or_default()
+        // A fill starts on a byte of the stream, so a byte-aligned stream
+        // position is a byte-aligned buffer position.
+        let start = match self.buffer_bit_position() {
+            Some(bit) if self.buf_len - bit / 8 >= min => bit / 8,
+            _ => {
+                self.gather_byte_span(min)?;
+                0
             }
-            _ => &[],
-        }
+        };
+        Ok(Some((&self.buf[start..self.buf_len], self.eof)))
     }
 
     #[inline]
