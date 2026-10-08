@@ -3,6 +3,31 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.6.1
+
+### CLI Changes
+
+- RAR3 PPMd members extract faster: `unrar-rs` 0.11.0 decodes them through
+  the `ppmd-turbo` crate, 1.16-1.71x faster than 0.6.0 on the RAR4 PPMd
+  fixtures (32 MiB order-16 member: 3.41 s wall, from 4.71 s). Output is
+  unchanged, and a PPMd stream that overruns its packed data by more than 64
+  bytes now fails at that symbol rather than at the next output flush. The
+  `ppmd-debug` feature and `UNRAR_RS_RAR4_DEBUG_PPM` are gone.
+- The libraries `rarpar` links changed license: `reedsolomon-rs` 0.4.10 and
+  `par3-rs` 0.5.1 are Apache-2.0, and `unrar-rs` 0.11.0 is Apache-2.0 plus
+  the unRAR license restriction. `par2-rs` stays GPL-3.0-or-later. The CLI
+  itself is unchanged: GPL-3.0-or-later with its section 7 permission to
+  combine with `unrar-rs`, and its binaries still carry the unRAR
+  restriction.
+
+### Library versions
+
+- unrar-rs 0.11.0: RAR3 PPMd decoding through `ppmd-turbo` 0.1.1, and the
+  move to Apache-2.0 plus the unRAR restriction.
+- par3-rs 0.5.1 (pinned exactly) and reedsolomon-rs 0.4.10: the move to
+  Apache-2.0; no code changed.
+- par2-rs 0.10.8: unchanged.
+
 ## rarpar 0.6.0
 
 ### CLI Changes
