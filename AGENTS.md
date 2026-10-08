@@ -32,8 +32,6 @@ and PAR2 workflows.
   developed from RARLAB's unRAR source code, which remains governed by the
   unRAR license restriction documented in `crates/unrar-rs/LICENSE`. The
   combination has no SPDX expression, so the manifest uses `license-file`.
-- Never bring GPL-licensed code, or a translation of it, into an Apache-2.0
-  crate.
 - `rarpar` carries a GPLv3 section 7 permission to combine with `unrar-rs`
   (`tools/rarpar/LICENSE`); binary distributions link `unrar-rs` and must
   preserve the unRAR restriction notice.
