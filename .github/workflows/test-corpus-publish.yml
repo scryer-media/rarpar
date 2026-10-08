@@ -155,7 +155,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
@@ -231,7 +231,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
@@ -289,7 +289,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
@@ -304,7 +304,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends mold nasm
 
       - name: Download the shared inputs
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: corpus-group-inputs
           path: ${{ runner.temp }}/inputs
@@ -377,7 +377,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
@@ -392,7 +392,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends mold nasm
 
       - name: Download every generation artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: corpus-group-*
           path: ${{ runner.temp }}/groups
@@ -521,7 +521,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
@@ -552,13 +552,13 @@ jobs:
           sccache --zero-stats || true
 
       - name: Download the assembled corpus
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: corpus-tree
           path: ${{ runner.temp }}/tree
 
       - name: Download the refreshed ledger
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: corpus-build
           path: ${{ runner.temp }}/build
@@ -671,7 +671,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
@@ -691,13 +691,13 @@ jobs:
           sudo apt-get install -y --no-install-recommends mold nasm
 
       - name: Download the assembled corpus
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: corpus-tree
           path: ${{ runner.temp }}/tree
 
       - name: Download the manifest, provenance and refreshed ledger
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: corpus-build
           path: ${{ runner.temp }}/build
