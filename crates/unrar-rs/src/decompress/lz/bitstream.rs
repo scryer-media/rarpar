@@ -176,6 +176,28 @@ pub trait BitRead {
     fn zero_bytes_past_eof(&self) -> u32 {
         0
     }
+
+    /// Lend the input bytes from the cursor to the end of the reader's
+    /// current buffer, for a byte-oriented consumer (the RAR4 PPMd range
+    /// coder) to read in place instead of one [`Self::read_byte_or_zero`]
+    /// call per byte.
+    ///
+    /// Empty when the cursor is not on a byte boundary, when the reader
+    /// cannot lend a contiguous buffer, or at the end of the input; the
+    /// caller then falls back to [`Self::read_byte_or_zero`]. Lending moves
+    /// nothing: [`Self::consume_byte_span`] does.
+    #[doc(hidden)]
+    fn byte_span(&mut self) -> &[u8] {
+        &[]
+    }
+
+    /// Move the cursor past the first `count` bytes of the span
+    /// [`Self::byte_span`] last lent. `count` never exceeds that span's
+    /// length, and nothing else reads from the reader in between.
+    #[doc(hidden)]
+    fn consume_byte_span(&mut self, count: usize) {
+        debug_assert_eq!(count, 0, "consume_byte_span without a lent span");
+    }
     #[inline(always)]
     fn read_bits64(&mut self, count: u8) -> RarResult<u64> {
         debug_assert!(count <= 64);
@@ -726,6 +748,29 @@ impl BitRead for BitReader<'_> {
         self.zero_bytes_past_eof
     }
 
+    /// The whole rest of the source is one contiguous slice, so the span is
+    /// everything after the cursor.
+    #[inline]
+    fn byte_span(&mut self) -> &[u8] {
+        let position = BitReader::position(self);
+        if !position.is_multiple_of(8) {
+            return &[];
+        }
+        self.data.get(position / 8..).unwrap_or_default()
+    }
+
+    /// Drops the accumulator and reloads it lazily at the new byte, the same
+    /// commit a leased LZ span makes.
+    #[inline]
+    fn consume_byte_span(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let position = BitReader::position(self) + count * 8;
+        debug_assert!(position.is_multiple_of(8) && position <= self.data.len() * 8);
+        self.seek_to_bit(position);
+    }
+
     /// The trait takes `&mut self`, so top the accumulator up first and keep
     /// the register fast path dominant for byte-oriented RAR4 readers.
     #[inline(always)]
@@ -1170,6 +1215,43 @@ impl<R: Read> BitRead for StreamingBitReader<R> {
     #[inline(always)]
     fn zero_bytes_past_eof(&self) -> u32 {
         self.zero_bytes_past_eof
+    }
+
+    /// The span is the rest of the current fill. An exhausted fill is
+    /// replaced first, so the span is empty only at the end of the input (or
+    /// on a read error, which `read_byte_or_zero` also treats as the end), or
+    /// while the accumulator still straddles two fills (see
+    /// [`Self::buffer_bit_position`]), which resolves within a few bytes of
+    /// the fallback path.
+    #[inline]
+    fn byte_span(&mut self) -> &[u8] {
+        if self.acc_bits == 0 && self.buf_pos >= self.buf_len && self.fill_buffer().is_err() {
+            return &[];
+        }
+        // A fill starts on a byte of the stream, so a byte-aligned buffer
+        // position is a byte-aligned stream position.
+        match self.buffer_bit_position() {
+            Some(bit) if bit.is_multiple_of(8) => {
+                self.buf.get(bit / 8..self.buf_len).unwrap_or_default()
+            }
+            _ => &[],
+        }
+    }
+
+    #[inline]
+    fn consume_byte_span(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let Some(bit) = self.buffer_bit_position() else {
+            debug_assert!(false, "consume_byte_span without a lent span");
+            return;
+        };
+        debug_assert!(bit / 8 + count <= self.buf_len);
+        self.bit_pos += count * 8;
+        // A byte-aligned commit never reloads, so it cannot fail.
+        let committed = self.seek_to_buffer_bit(bit + count * 8);
+        debug_assert!(committed.is_ok());
     }
 
     #[inline(always)]
