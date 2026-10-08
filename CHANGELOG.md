@@ -3,17 +3,6 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
-## rarpar 0.6.1
-
-### CLI Changes
-
-- Licensing of the libraries `rarpar` links: `reedsolomon-rs` 0.4.10 and
-  `par3-rs` 0.5.1 are now Apache-2.0, and `unrar-rs` 0.10.10 is Apache-2.0
-  plus the unRAR license restriction. `par2-rs` stays GPL-3.0-or-later. The
-  CLI itself remains GPL-3.0-or-later with its section 7 permission to
-  combine with `unrar-rs`, and its binaries still carry the unRAR
-  restriction. Behaviour is unchanged.
-
 ## rarpar 0.6.0
 
 ### CLI Changes

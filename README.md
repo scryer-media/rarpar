@@ -487,7 +487,7 @@ are Apache-2.0. The UnRAR restriction is carried wherever `unrar-rs` is used:
 - `par2-rs` is GPL-3.0-or-later. Its test suite includes cases adapted from
   the GPL-2.0-or-later unit tests of par2cmdline, so it was not relicensed
   with the other libraries. It does not depend on `unrar-rs`.
-- `unrar-rs` is Apache-2.0 plus the unRAR license restriction, from 0.10.10
+- `unrar-rs` is Apache-2.0 plus the unRAR license restriction, from 0.11.0
   onward; its RAR engine was developed using RARLAB's unRAR source code, and
   the restriction continues to govern that derived code — see
   `crates/unrar-rs/LICENSE`.
@@ -499,7 +499,7 @@ are Apache-2.0. The UnRAR restriction is carried wherever `unrar-rs` is used:
   `LICENSE`, `LICENSE.GPL-3.0-or-later`, and `LICENSE.unrar-rs`.
 
 Releases of `reedsolomon-rs` before 0.4.10, `par3-rs` before 0.5.1 and
-`unrar-rs` before 0.10.10 stay under GPL-3.0-or-later (`unrar-rs` with the
+`unrar-rs` before 0.11.0 stay under GPL-3.0-or-later (`unrar-rs` with the
 unRAR restriction); the change applies to those versions and later ones only.
 
 The additional restriction applies to the RAR extraction and recovery code in

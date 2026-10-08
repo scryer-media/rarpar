@@ -12,14 +12,13 @@
 // Losing `pub` left a set of decoder entry points with no caller inside the
 // crate. They are silenced here rather than deleted because the set is
 // feature-dependent (it differs between a default build and one with
-// `slow-tests` / `ppmd-debug` / `crypto-rust`), and removing decoder entry
+// `slow-tests` / `crypto-rust`), and removing decoder entry
 // points is a deliberate change, not a visibility one. The full inventory is
 // the 0.10.0 removal list, recorded in CHANGELOG.md under 0.9.0.
 #![allow(dead_code)]
 
 pub mod lz;
 pub(crate) mod policy;
-pub mod ppmd;
 pub mod rar4;
 pub(crate) mod rar4_old;
 pub mod store;

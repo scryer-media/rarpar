@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.10.10 (2026-10-08)
+## 0.11.0
 
 ### Changed
 
@@ -8,8 +8,36 @@
   restriction is unchanged and still governs the RAR engine; `LICENSE` keeps
   that paragraph in full and now carries the Apache License 2.0 text.
   Releases up to 0.10.9 stay under GPL-3.0-or-later with the same
-  restriction. No code changed; the `reedsolomon-rs` requirement moves to
-  0.4.10, its first Apache-2.0 release.
+  restriction. The `reedsolomon-rs` requirement moves to 0.4.10, its first
+  Apache-2.0 release.
+- RAR3 PPMd blocks decode through the `ppmd-turbo` crate. Its `RarPpmd`
+  holds the variant H model and the carry-less range coder across blocks and
+  solid members and decodes runs of literals up to the escape character
+  straight out of the bit reader's own buffer; the commands after an escape
+  are still read here one symbol at a time, as `Unpack29` reads them. The
+  decoder keeps no input between calls, so a streaming reader joins the end
+  of one fill to the start of the next before offering it a symbol's worth
+  of input. The reader still ends exactly where the coder stopped, a solid
+  member boundary inside a PPMd block still resumes the same coder, and the
+  64-byte allowance for zeros read past the end of the packed data is
+  unchanged. Output is unchanged. On an Apple M5 Max the RAR4 PPMd fixtures
+  extract 1.16-1.71x faster than with 0.10.9 (32 MiB order-16 member: 3.41 s
+  wall, from 4.71 s).
+- A PPMd stream that runs more than 64 bytes past the end of its packed data
+  now fails at that symbol rather than at the next output flush, with the
+  same `RarError::CorruptArchive`.
+- PPMd model and coder faults still surface as `RarError::CorruptArchive`; a
+  model whose memory cannot be allocated surfaces as
+  `RarError::ResourceLimit`. `ppmd-turbo` is not part of the public API: no
+  public type or impl names it.
+
+### Removed
+
+- The crate's own PPMd model, sub-allocator, SEE and range coder (the
+  crate-private `decompress::ppmd` module), now provided by `ppmd-turbo`.
+- The `ppmd-debug` feature. Its per-symbol trace hooks lived in the removed
+  model, so the feature no longer did anything, and `UNRAR_RS_RAR4_DEBUG_PPM`
+  is no longer read.
 
 ## 0.10.9
 

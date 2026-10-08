@@ -1817,7 +1817,7 @@ mod sha1_x86_vec {
 
         // Measured preference, not widest-first: on every no-SHA-NI x86 part
         // measured so far the SSSE3 kernel outruns the AVX2 one on this
-        // workload — Alder Lake P/E cores (codex-x86, 2026-08-15: AVX2
+        // workload — Alder Lake P/E cores (an Alder Lake-P host, 2026-08-15: AVX2
         // 1.002x/1.20-1.24x vs SSSE3 1.265x/1.37-1.38x) and Haswell (fleet
         // run c4reval-20260815T200644Z: SSSE3 1.284-1.335 vs AVX2
         // 1.211-1.247 against the oracle, all four encrypted cases). The
