@@ -41,6 +41,14 @@
 
 ### Internal
 
+- The streaming bit reader's input buffer is eight bytes longer than its
+  largest fill, which stays 512 KiB. Joining the end of one fill to the start
+  of the next moves the new fill up behind the bytes the accumulator still
+  holds from the old one. A whole fill left no room for that, so a PPMd block
+  header ending within seven bytes of a fill border panicked on the copy. The
+  join is new in this version, so no release carried the panic.
+  `byte_span_gathers_an_accumulator_straddling_two_whole_fills` drives every
+  such offset over whole fills.
 - `ppmd_fixtures_decode_through_short_fills` skips when its two RAR4 PPMd
   archives are not hydrated, as the other RAR4 fixture tests do. Neither is in
   the packaged crate or in the fixture set the no-fixture test lane hydrates,

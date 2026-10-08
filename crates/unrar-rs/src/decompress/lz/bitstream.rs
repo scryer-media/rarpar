@@ -15,6 +15,18 @@ use crate::error::{RarError, RarResult};
 // dictionary window; additional multi-megabyte input staging is pure overhead.
 const STREAMING_INPUT_BUFFER_SIZE: usize = 0x80000;
 
+/// Buffer bytes past the largest fill, which `fill_buffer` never reads into.
+///
+/// A refill that crosses a fill border leaves bytes of the old fill in the
+/// accumulator ahead of a new fill, and the new fill is a whole one when the
+/// source hands over as much as it is asked for. A byte span lent from there
+/// ([`StreamingBitReader::gather_byte_span`]) lays the old bytes out in front
+/// of the fill, which moves the fill up by as many bytes. The accumulator
+/// asks for more with at most seven bytes in it, so its width covers them.
+/// The top-up that follows may read into these bytes: by then the
+/// accumulator is empty.
+const STREAMING_STRADDLE_HEADROOM: usize = std::mem::size_of::<u64>();
+
 /// Readable bytes a leased span keeps in reserve past its border.
 ///
 /// UnRAR keeps its whole input in one buffer and refills it from the outer
@@ -828,7 +840,7 @@ impl<R: Read> StreamingBitReader<R> {
     /// Exposed so callers that recycle buffers across members (RAR4 decoders)
     /// can pre-size a slot without going through a full reader construction.
     pub fn alloc_buffer() -> Box<[u8]> {
-        vec![0u8; STREAMING_INPUT_BUFFER_SIZE].into_boxed_slice()
+        vec![0u8; STREAMING_INPUT_BUFFER_SIZE + STREAMING_STRADDLE_HEADROOM].into_boxed_slice()
     }
 
     /// Build a reader on top of a recycled input buffer.
@@ -851,7 +863,7 @@ impl<R: Read> StreamingBitReader<R> {
     /// not obtain from [`Self::alloc_buffer`]/[`Self::into_buffer`]) is
     /// replaced with a correctly sized allocation.
     pub fn with_buffer(inner: R, buf: Box<[u8]>) -> Self {
-        let buf = if buf.len() >= STREAMING_INPUT_BUFFER_SIZE {
+        let buf = if buf.len() >= STREAMING_INPUT_BUFFER_SIZE + STREAMING_STRADDLE_HEADROOM {
             buf
         } else {
             Self::alloc_buffer()
@@ -874,22 +886,22 @@ impl<R: Read> StreamingBitReader<R> {
         self.buf
     }
 
-    /// Bytes a single fill may read. Always the whole buffer outside tests.
+    /// Bytes a single fill may read: the buffer less
+    /// [`STREAMING_STRADDLE_HEADROOM`]. Always that much outside tests.
     #[cfg(not(test))]
     #[inline(always)]
     fn fill_limit(&self) -> usize {
-        self.buf.len()
+        self.buf.len() - STREAMING_STRADDLE_HEADROOM
     }
 
     /// Test build: honour [`test_hooks::with_fill_cap`], clamped to a usable
-    /// range so a capped fill still makes progress and never reads past the
-    /// buffer.
+    /// range so a capped fill still makes progress and never reads into the
+    /// headroom.
     #[cfg(test)]
     #[inline]
     fn fill_limit(&self) -> usize {
-        test_hooks::fill_cap()
-            .unwrap_or(self.buf.len())
-            .clamp(1, self.buf.len())
+        let whole = self.buf.len() - STREAMING_STRADDLE_HEADROOM;
+        test_hooks::fill_cap().unwrap_or(whole).clamp(1, whole)
     }
 
     #[inline]
@@ -1035,12 +1047,19 @@ impl<R: Read> StreamingBitReader<R> {
     /// the accumulator is empty and the cursor sits at buffer byte 0, from
     /// where `refill` reloads it lazily. Runs once per fill, on at most a
     /// few hundred bytes, except in the straddling case.
+    ///
+    /// Straddling, the accumulator holds bytes of the previous fill that the
+    /// buffer no longer does, so the whole current fill moves up behind them
+    /// and the unread bytes come to more than the fill. Only `fill_buffer`
+    /// starts a fill under a loaded accumulator, and it leaves
+    /// [`STREAMING_STRADDLE_HEADROOM`] free for exactly this.
     #[cold]
     #[inline(never)]
     fn gather_byte_span(&mut self, min: usize) -> RarResult<()> {
         debug_assert!(self.acc_bits.is_multiple_of(8));
         let held = usize::from(self.acc_bits / 8);
         let tail = self.buf_len - self.buf_pos;
+        debug_assert!(held + tail <= self.buf.len());
         self.buf.copy_within(self.buf_pos..self.buf_len, held);
         for (index, slot) in self.buf[..held].iter_mut().enumerate() {
             *slot = (self.acc >> (56 - 8 * index)) as u8;
@@ -1848,6 +1867,72 @@ mod tests {
         for expected in 1..=5u32 {
             assert_eq!(BitRead::read_byte_or_zero(&mut reader), 0);
             assert_eq!(BitRead::zero_bytes_past_eof(&reader), expected);
+        }
+    }
+
+    /// A refill that crosses a fill border leaves the last bytes of the old
+    /// fill in the accumulator, ahead of a new fill that is a whole one when
+    /// the source hands over as much as it is asked for. The bytes a span
+    /// lends from there are those few followed by the entire fill — more than
+    /// one fill's worth, which the buffer must have room to lay out.
+    #[test]
+    fn byte_span_gathers_an_accumulator_straddling_two_whole_fills() {
+        const FILL: usize = STREAMING_INPUT_BUFFER_SIZE;
+        const MIN: usize = 300;
+        let data: Vec<u8> = (0..(2 * FILL + 4096) as u32)
+            .map(|i| (i.wrapping_mul(131) ^ (i >> 5)) as u8)
+            .collect();
+
+        // `back` bytes of the first fill are still unread when the span is
+        // asked for. The accumulator asks for more with at most seven bytes
+        // in it, so up to seven straddle; eight and nine are the same walk
+        // without a straddle.
+        for back in 1..=9usize {
+            // A slice reads out as many bytes as it is asked for, so every
+            // fill is a whole one.
+            let mut reader = StreamingBitReader::new(data.as_slice());
+            let mut at = FILL - back;
+            reader.skip_bits((at * 8) as u32).unwrap();
+            assert_eq!(
+                reader.buffer_bit_position().is_none(),
+                back <= 7,
+                "back {back}: straddling"
+            );
+            if back <= 7 {
+                assert_eq!(reader.buf_len, FILL, "back {back}: a whole second fill");
+            }
+
+            let (span, last) = reader
+                .byte_span(MIN)
+                .unwrap()
+                .expect("a byte-aligned reader lends");
+            assert!(!last, "back {back}");
+            assert!(span.len() >= MIN, "back {back}: {} bytes", span.len());
+            assert!(span == &data[at..at + span.len()], "back {back}");
+            reader.consume_byte_span(MIN);
+            at += MIN;
+            assert_eq!(reader.position(), at * 8, "back {back}");
+            assert_eq!(reader.read_bits(8).unwrap() as u8, data[at], "back {back}");
+            at += 1;
+
+            // Nothing was dropped or repeated: the rest of the stream follows,
+            // through the fill after this one, to the end of the source.
+            loop {
+                let (span, last) = reader
+                    .byte_span(MIN)
+                    .unwrap()
+                    .expect("a byte-aligned reader lends");
+                let count = span.len();
+                assert!(last || count >= MIN, "back {back} at {at}: {count} bytes");
+                assert!(span == &data[at..at + count], "back {back} at {at}");
+                reader.consume_byte_span(count);
+                at += count;
+                if last {
+                    break;
+                }
+            }
+            assert_eq!(at, data.len(), "back {back}");
+            assert_eq!(reader.position(), at * 8, "back {back}");
         }
     }
 }
