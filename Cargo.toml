@@ -10,10 +10,9 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.4.9"
+version = "0.4.10"
 edition = "2024"
 rust-version = "1.97.1"
-license = "GPL-3.0-or-later"
 repository = "https://github.com/scryer-media/rarpar"
 
 [workspace.dependencies]

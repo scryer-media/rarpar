@@ -2,10 +2,10 @@
 name = "par3-rs"
 description = "PAR3 (Parity Volume Set 3.0) packet parsing, set inspection, verification, creation and repair — work in progress"
 readme = "README.md"
-version = "0.5.0"
+version = "0.5.1"
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 repository.workspace = true
 keywords = ["par3", "parchive", "parity", "erasure", "verification"]
 categories = ["parser-implementations", "filesystem"]
@@ -30,7 +30,7 @@ blake3 = { workspace = true, features = ["rayon"] }
 crc-fast = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-reedsolomon-rs = { path = "../reedsolomon-rs", version = "0.4.8", default-features = false }
+reedsolomon-rs = { path = "../reedsolomon-rs", version = "0.4.10", default-features = false }
 rayon = { workspace = true, default-features = false }
 unicode-normalization = { workspace = true }
 
