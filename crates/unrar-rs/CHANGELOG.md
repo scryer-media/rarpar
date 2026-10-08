@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.11.0
+
+### Changed
+
+- RAR3 PPMd blocks decode through the `ppmd-turbo` crate. Its `RarDecoder`
+  holds the variant H model across blocks and solid members, and its
+  carry-less range decoder reads the LZ bit stream through a `ByteSource`:
+  the coder reads the bit reader's own buffer in place and returns to it
+  only at a 256-byte window edge, instead of once per byte. The reader still
+  ends exactly where the coder stopped, zeros fed past the end of the packed
+  data are still counted on the reader (the 64-byte allowance is unchanged),
+  and a solid member boundary inside a PPMd block still resumes from the
+  saved coder registers. Output is unchanged. On an Apple M5 Max the RAR4
+  PPMd fixtures extract in the same CPU time as 0.10.9 (32 MiB order-16
+  member: 9.45 CPU-s in both).
+- PPMd model and coder faults still surface as `RarError::CorruptArchive`.
+  `ppmd-turbo` is not part of the public API: no public type or impl names
+  it.
+
+### Removed
+
+- The crate's own PPMd model, sub-allocator, SEE and range coder (the
+  crate-private `decompress::ppmd` module), now provided by `ppmd-turbo`.
+- The `ppmd-debug` feature. Its per-symbol trace hooks lived in the removed
+  model, so the feature no longer did anything, and `UNRAR_RS_RAR4_DEBUG_PPM`
+  is no longer read.
+
 ## 0.10.9
 
 ### Changed

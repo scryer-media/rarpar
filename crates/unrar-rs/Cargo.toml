@@ -2,7 +2,7 @@
 name = "unrar-rs"
 description = "RAR archive reading, decompression, and streaming extraction only"
 readme = "README.md"
-version = "0.10.9"
+version = "0.11.0"
 edition.workspace = true
 license-file = "LICENSE"
 repository.workspace = true
@@ -47,10 +47,6 @@ slow-tests = []
 # is not public API and carries no semver guarantee. The targets that need it
 # declare it in `required-features`, so a build without it simply skips them.
 unstable-internals = []
-# Compile the forensic per-symbol PPMd trace hooks. The hooks remain runtime
-# controlled by UNRAR_RS_RAR4_DEBUG_PPM, but ordinary builds carry no trace
-# state, branches, counters, or formatting code.
-ppmd-debug = []
 
 [dependencies]
 # TODO(release): ppmd-turbo = "0.1". Until then, the feature/0.1.0
