@@ -20,9 +20,108 @@ use super::lz::bitstream::{BitRead, BitReader, LzSpan, StreamingBitReader};
 use super::lz::block_reader::{BitCursor, cursor_read_bits, cursor_refill};
 use super::lz::huffman::HuffmanTable;
 use super::lz::window::Window;
-use super::ppmd::model::Model;
-use super::ppmd::range::{BitReadRangeDecoder, RangeCode, RangeCoderState};
 use crate::error::{RarError, RarResult};
+use ppmd_turbo::rar::RarDecoder;
+use ppmd_turbo::rc::{ByteSource, RangeCoderState, RangeDecoder, RarRangeDecoder, SourceInput};
+
+/// Lends a [`BitRead`] to the PPMd range decoder as a [`ByteSource`].
+///
+/// RAR3 PPMd data starts on a byte boundary: the reader is byte-aligned
+/// before the block header and every header field after the PPM flag bit
+/// fills out whole bytes. So the coder reads the reader's own buffer in
+/// place: `fill_buf` lends the bytes from the cursor to the end of that
+/// buffer ([`BitRead::byte_span`]) and `consume` moves the cursor past the
+/// ones taken ([`BitRead::consume_byte_span`]). [`SourceInput`] copies a short
+/// window out of the span and comes back only at the window's edge, and on
+/// drop consumes exactly the bytes the coder took, so the reader ends where
+/// the coder stopped.
+///
+/// When the reader cannot lend a span (a cursor off a byte boundary, or a
+/// streaming reader whose accumulator still straddles two fills), one byte is
+/// staged through `read_byte_or_zero` instead. `SourceInput` takes the first
+/// byte of every span it fetches, so a staged byte is always consumed.
+///
+/// Past the end of the input the span is empty, and `SourceInput` feeds the
+/// coder a zero for every empty span it fetches. Each one is recorded through
+/// `read_byte_or_zero` on the reader, so the reader's
+/// [`BitRead::zero_bytes_past_eof`] stays the one count of invented zeros,
+/// cumulative across blocks and members, as when the coder read through
+/// `read_byte_or_zero` directly.
+struct BitReadSource<'r, R: BitRead> {
+    reader: &'r mut R,
+    byte: [u8; 1],
+    staged: bool,
+}
+
+impl<'r, R: BitRead> BitReadSource<'r, R> {
+    fn new(reader: &'r mut R) -> Self {
+        Self {
+            reader,
+            byte: [0],
+            staged: false,
+        }
+    }
+
+    /// The fallback: stages the next byte, or at the end of the input
+    /// records the zero the coder is about to be fed and stages nothing.
+    #[cold]
+    #[inline(never)]
+    fn stage_byte(&mut self) -> bool {
+        if self.reader.has_exact_bits(8).unwrap_or(false) {
+            self.byte[0] = self.reader.read_byte_or_zero();
+            self.staged = true;
+        } else {
+            // Fewer than eight bits left: this returns 0, consumes nothing
+            // and counts the invented byte.
+            let _ = self.reader.read_byte_or_zero();
+        }
+        self.staged
+    }
+}
+
+impl<R: BitRead> ByteSource for BitReadSource<'_, R> {
+    #[inline]
+    fn fill_buf(&mut self) -> &[u8] {
+        if self.staged {
+            return &self.byte;
+        }
+        if !self.reader.byte_span().is_empty() {
+            return self.reader.byte_span();
+        }
+        if self.stage_byte() { &self.byte } else { &[] }
+    }
+
+    #[inline]
+    fn consume(&mut self, amount: usize) {
+        if self.staged {
+            debug_assert!(amount <= 1);
+            self.staged = amount == 0;
+        } else {
+            self.reader.consume_byte_span(amount);
+        }
+    }
+}
+
+impl<R: BitRead> Drop for BitReadSource<'_, R> {
+    fn drop(&mut self) {
+        debug_assert!(!self.staged, "a staged PPMd byte was never consumed");
+    }
+}
+
+/// A PPMd model or coder fault is a corrupt archive. Converted here rather
+/// than through `From`, so `ppmd-turbo` stays out of the public API.
+#[cold]
+fn ppm_error(err: ppmd_turbo::Error) -> RarError {
+    RarError::CorruptArchive {
+        detail: format!("RAR4: {err}"),
+    }
+}
+
+type PpmRangeDecoder<'r, R> = RarRangeDecoder<SourceInput<BitReadSource<'r, R>>>;
+
+fn ppm_zero_bytes_past_eof<R: BitRead>(rc: &PpmRangeDecoder<'_, R>) -> u32 {
+    rc.input().source().reader.zero_bytes_past_eof()
+}
 
 fn rar4_debug_filters_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -79,8 +178,8 @@ const UNPACK_MAX_WRITE: usize = 0x400000;
 /// Zero bytes the PPMd range decoder may be fed past the end of the input
 /// before the member is called corrupt.
 ///
-/// `read_byte_or_zero` pads a truncated stream with zeros (the range-coder
-/// convention), which keeps the decoder producing plausible symbols forever;
+/// The range decoder is fed zeros past the end of its input (the range-coder
+/// convention; see `BitReadSource`), which keeps the decoder producing plausible symbols forever;
 /// unrar tolerates a single such byte at the tail of a well-formed member.
 /// The allowance here is deliberately far above that — the range coder carries
 /// four bytes of lookahead and normalization can pull a few more while the
@@ -1125,7 +1224,7 @@ pub struct Rar4LzDecoder {
     /// Current block type (LZ or PPMd).
     block_type: BlockType,
     /// PPMd model (persists across PPMd blocks within a file).
-    ppm_model: Option<Model>,
+    ppm: RarDecoder,
     /// PPMd escape character (default 2).
     ppm_esc_char: u8,
     /// Whether the RAR3 Huffman tables have been read.
@@ -1226,7 +1325,7 @@ impl Rar4LzDecoder {
             low_dist_rep_count: 0,
             prev_low_dist: 0,
             block_type: BlockType::Lz,
-            ppm_model: None,
+            ppm: RarDecoder::new(),
             ppm_esc_char: 2,
             tables_read: false,
             vm_filters: Vec::new(),
@@ -3629,7 +3728,7 @@ impl Rar4LzDecoder {
         let max_mb = if reset {
             reader.read_bits(8)? as usize
         } else {
-            if self.ppm_model.is_none() {
+            if !self.ppm.has_model() {
                 return Err(RarError::CorruptArchive {
                     detail: "RAR4: PPMd block without model (no reset)".into(),
                 });
@@ -3651,13 +3750,11 @@ impl Rar4LzDecoder {
                     detail: "RAR4: PPMd order too small".into(),
                 });
             }
-            let alloc_size = (max_mb + 1) * 1024 * 1024;
-            trace!("RAR4 PPMd init: order={order}, alloc={alloc_size}");
-            if let Some(model) = self.ppm_model.as_mut() {
-                model.start(order, alloc_size);
-            } else {
-                self.ppm_model = Some(Model::new(order, alloc_size));
-            }
+            let mem_mb = max_mb + 1;
+            trace!("RAR4 PPMd init: order={order}, alloc={mem_mb} MiB");
+            self.ppm
+                .init_model(order as u32, mem_mb as u32)
+                .map_err(ppm_error)?;
         }
 
         Ok(())
@@ -3692,14 +3789,16 @@ impl Rar4LzDecoder {
             // A solid member boundary can fall inside a PPMd block; one range
             // coder stays alive across members, so resume from the saved
             // registers instead of consuming init bytes again.
+            let source = SourceInput::new(BitReadSource::new(reader));
             let mut rc = match self.ppm_rc_state.take() {
-                Some(state) => BitReadRangeDecoder::from_state(reader, state),
-                None => BitReadRangeDecoder::new(reader)?,
+                Some(state) => RarRangeDecoder::from_state(source, state),
+                None => RarRangeDecoder::new(source).map_err(ppm_error)?,
             };
-            let Some(mut ppm_model) = self.ppm_model.take() else {
+            if !self.ppm.has_model() {
                 self.block_type = BlockType::Lz;
                 return Ok(output_size);
-            };
+            }
+            let mut ppm_model = std::mem::take(&mut self.ppm);
             let mut literals = [0u8; 1024];
             let mut literal_len = 0usize;
             // F4/F5 stall accounting. Both live on paths that are already cold:
@@ -3729,11 +3828,11 @@ impl Rar4LzDecoder {
                     // emit the whole declared unpacked size — up to 4.24 GB for
                     // the `rar_extract` timeout corpus. See
                     // `BitRead::zero_bytes_past_eof`.
-                    if rc.zero_bytes_past_eof() > PPM_MAX_ZERO_BYTES_PAST_EOF {
+                    if ppm_zero_bytes_past_eof(&rc) > PPM_MAX_ZERO_BYTES_PAST_EOF {
                         return Err(RarError::CorruptArchive {
                             detail: format!(
                                 "RAR4 PPMd stream ran {} bytes past the end of the packed data                                  at output offset {output_size}",
-                                rc.zero_bytes_past_eof()
+                                ppm_zero_bytes_past_eof(&rc)
                             ),
                         });
                     }
@@ -3741,7 +3840,7 @@ impl Rar4LzDecoder {
                     self.flush_ready_output_to_writer(writer, false)?;
                 }
 
-                let Some(ch) = ppm_model.decode_char_result(&mut rc)? else {
+                let Some(ch) = ppm_model.decode_symbol(&mut rc).map_err(ppm_error)? else {
                     if rar4_debug_filters_enabled() {
                         eprintln!("RAR4 PPM decode_char=-1 at output_size={output_size}");
                         if let Some(path) = std::env::var_os("UNRAR_RS_RAR4_DEBUG_DUMP_PATH") {
@@ -3774,7 +3873,7 @@ impl Rar4LzDecoder {
                     // preceding literals before interpreting the escape.
                     flush_literals!();
                     // Escape sequence — decode the command byte.
-                    let Some(next_ch) = ppm_model.decode_char_result(&mut rc)? else {
+                    let Some(next_ch) = ppm_model.decode_symbol(&mut rc).map_err(ppm_error)? else {
                         if rar4_debug_filters_enabled() {
                             eprintln!("RAR4 PPM next_ch=-1 at output_size={output_size}");
                             if let Some(path) = std::env::var_os("UNRAR_RS_RAR4_DEBUG_DUMP_PATH") {
@@ -3861,7 +3960,9 @@ impl Rar4LzDecoder {
                             let mut length: u32 = 0;
                             let mut failed = false;
                             for i in 0..4 {
-                                let Some(b) = ppm_model.decode_char_result(&mut rc)? else {
+                                let Some(b) =
+                                    ppm_model.decode_symbol(&mut rc).map_err(ppm_error)?
+                                else {
                                     failed = true;
                                     break;
                                 };
@@ -3891,7 +3992,9 @@ impl Rar4LzDecoder {
                             output_size += copy_len as u64;
                         }
                         5 => {
-                            let Some(len_byte) = ppm_model.decode_char_result(&mut rc)? else {
+                            let Some(len_byte) =
+                                ppm_model.decode_symbol(&mut rc).map_err(ppm_error)?
+                            else {
                                 trace!(
                                     "RAR4 PPMd run-length corruption at output_size={output_size}: cleaning up"
                                 );
@@ -3948,7 +4051,7 @@ impl Rar4LzDecoder {
                 // here when the loop stopped on exact output completion.
                 if !end_marker_seen && output_size >= self.current_file_unpacked_size {
                     let esc = self.ppm_esc_char;
-                    if let Ok(Some(ch)) = ppm_model.decode_char_result(&mut rc) {
+                    if let Ok(Some(ch)) = ppm_model.decode_symbol(&mut rc) {
                         if rar4_debug_filters_enabled() {
                             eprintln!(
                                 "RAR4 PPM trailing consume: ch={ch} esc={esc} output_size={output_size}"
@@ -3957,7 +4060,7 @@ impl Rar4LzDecoder {
                         if ch == esc {
                             // Subcode 2 = end of file; anything else only
                             // occurs in malformed streams.
-                            let sub = ppm_model.decode_char_result(&mut rc);
+                            let sub = ppm_model.decode_symbol(&mut rc);
                             if rar4_debug_filters_enabled() {
                                 eprintln!("RAR4 PPM trailing consume subcode: {sub:?}");
                             }
@@ -3969,7 +4072,7 @@ impl Rar4LzDecoder {
                 // the next solid member resumes with these registers.
                 self.ppm_rc_state = Some(rc.state());
             }
-            self.ppm_model = Some(ppm_model);
+            self.ppm = ppm_model;
         }
 
         if switch_to_lz_tables {
@@ -3988,15 +4091,15 @@ impl Rar4LzDecoder {
     /// gets — not an archive error. Malformed VM *data* that `add_vm_code`
     /// rejects still errors: rarpar is deliberately stricter there, matching
     /// [`Self::read_vm_code`].
-    fn read_vm_code_ppm<R: RangeCode>(
+    fn read_vm_code_ppm<D: RangeDecoder>(
         &mut self,
-        model: &mut Model,
-        rc: &mut R,
+        model: &mut RarDecoder,
+        rc: &mut D,
         output_size: u64,
     ) -> RarResult<bool> {
         let corrupt = std::cell::Cell::new(false);
-        let read_model_byte = |model: &mut Model, rc: &mut R| -> RarResult<u8> {
-            match model.decode_char_result(rc)? {
+        let read_model_byte = |model: &mut RarDecoder, rc: &mut D| -> RarResult<u8> {
+            match model.decode_symbol(rc).map_err(ppm_error)? {
                 Some(byte) => Ok(byte),
                 None => {
                     corrupt.set(true);
@@ -4085,7 +4188,7 @@ impl Rar4LzDecoder {
         // blocks all go away for a non-solid member.
         self.reset_vm_filter_state();
         self.ppm_rc_state = None;
-        // `ppm_model` is intentionally retained; see the doc comment.
+        // `ppm` is intentionally retained; see the doc comment.
         self.current_file_base_total = 0;
         self.current_file_written_size = 0;
         Ok(())
@@ -4343,12 +4446,12 @@ mod tests {
     #[test]
     fn non_solid_reset_keeps_ppmd_allocation_for_the_next_header() {
         let mut decoder = Rar4LzDecoder::new(1024 * 1024);
-        decoder.ppm_model = Some(Model::new(16, 1024 * 1024));
+        decoder.ppm.init_model(16, 1).unwrap();
         decoder.block_type = BlockType::Ppm;
 
         decoder.reset();
 
-        assert!(decoder.ppm_model.is_some());
+        assert!(decoder.ppm.has_model());
         assert!(matches!(decoder.block_type, BlockType::Lz));
         assert!(decoder.ppm_rc_state.is_none());
     }
@@ -4360,7 +4463,7 @@ mod tests {
     #[test]
     fn corrupt_ppmd_symbol_cleans_up_and_falls_back_to_lz_like_rar_behavior() {
         let mut decoder = Rar4LzDecoder::new(1024 * 1024);
-        decoder.ppm_model = Some(Model::new(16, 4 * 1024 * 1024));
+        decoder.ppm.init_model(16, 4).unwrap();
         decoder.block_type = BlockType::Ppm;
         let input = [0xff; 4];
         let mut reader = BitReader::new(&input);
@@ -4373,7 +4476,7 @@ mod tests {
         assert!(decoder.member_decode_done);
         assert!(decoder.ppm_rc_state.is_none());
         // The model survives, shrunk to the CleanUp allocation.
-        assert!(decoder.ppm_model.is_some());
+        assert_eq!(decoder.ppm.mem_size(), Some(1024 * 1024));
         assert!(output.is_empty());
     }
 
@@ -4391,10 +4494,12 @@ mod tests {
     #[test]
     fn corrupt_ppmd_vm_code_ends_the_member_instead_of_failing_the_archive() {
         let mut decoder = Rar4LzDecoder::new(1024 * 1024);
-        let mut model = Model::new(16, 4 * 1024 * 1024);
+        let mut model = RarDecoder::new();
+        model.init_model(16, 4).unwrap();
         let input = [0xff; 4];
         let mut reader = BitReader::new(&input);
-        let mut rc = BitReadRangeDecoder::new(&mut reader).unwrap();
+        let mut rc =
+            RarRangeDecoder::new(SourceInput::new(BitReadSource::new(&mut reader))).unwrap();
 
         let result = decoder.read_vm_code_ppm(&mut model, &mut rc, 0);
 
@@ -4404,7 +4509,7 @@ mod tests {
         );
     }
 
-    /// The PPMd arena must survive a member boundary: [`Model::start`]
+    /// The PPMd arena must survive a member boundary: `RarDecoder::init_model`
     /// early-outs when the declared allocation size is unchanged, exactly as
     /// `StartSubAllocator` does (suballoc.cpp:79-83), so the second member of a
     /// multi-member PPMd archive reuses the pages the first one faulted in. A
@@ -4424,32 +4529,20 @@ mod tests {
 
         let one_mb = pack_bits(&init_bits(0));
         decoder.init_ppm(&mut BitReader::new(&one_mb)).unwrap();
-        let model = decoder.ppm_model.as_ref().unwrap();
-        let arena = model.arena_addr();
-        assert_eq!(model.arena_size(), 1024 * 1024);
+        // ppmd-turbo pins the arena address itself
+        // (`init_model_reuses_a_same_sized_arena`); here only the size shows.
+        assert_eq!(decoder.ppm.mem_size(), Some(1024 * 1024));
 
         // Member 2 declares the same size. `prepare_member` keeps the model.
         decoder.prepare_member(false, 0x40000).unwrap();
         decoder.init_ppm(&mut BitReader::new(&one_mb)).unwrap();
-        let model = decoder.ppm_model.as_ref().unwrap();
-        assert_eq!(
-            model.arena_addr(),
-            arena,
-            "a same-size PPMd restart must reuse the arena, not fault in a fresh one"
-        );
-        assert_eq!(model.arena_size(), 1024 * 1024);
+        assert_eq!(decoder.ppm.mem_size(), Some(1024 * 1024));
 
         // Member 3 declares a different size, which must still reallocate.
         let two_mb = pack_bits(&init_bits(1));
         decoder.prepare_member(false, 0x40000).unwrap();
         decoder.init_ppm(&mut BitReader::new(&two_mb)).unwrap();
-        let model = decoder.ppm_model.as_ref().unwrap();
-        assert_eq!(model.arena_size(), 2 * 1024 * 1024);
-        assert_ne!(
-            model.arena_addr(),
-            arena,
-            "a changed PPMd allocation size must replace the arena"
-        );
+        assert_eq!(decoder.ppm.mem_size(), Some(2 * 1024 * 1024));
     }
 
     fn pack_bits(bits: &[u8]) -> Vec<u8> {
@@ -4512,7 +4605,7 @@ mod tests {
             filter_type: Rar4StandardFilter::Delta,
             last_block_length: 8,
         });
-        decoder.ppm_model = Some(Model::new(6, 1024 * 1024));
+        decoder.ppm.init_model(6, 1).unwrap();
 
         decoder.prepare_member(false, 0x40000).unwrap();
 
@@ -4525,7 +4618,7 @@ mod tests {
         assert!(decoder.vm_filters.is_empty());
         assert_eq!(decoder.last_vm_filter, 0);
         // The PPMd arena persists across files exactly as ModelPPM does.
-        assert!(decoder.ppm_model.is_some());
+        assert!(decoder.ppm.has_model());
 
         // The decisive check: a back-reference into the previous member's bytes
         // must zero-fill rather than resurrect them.
@@ -6178,5 +6271,111 @@ mod tests {
                 * (super::RAR4_MT_PIPELINE_DEPTH + 1)
                 <= 1 << 20
         );
+    }
+}
+
+#[cfg(test)]
+mod ppm_source_tests {
+    use super::super::lz::bitstream::test_hooks::with_fill_cap;
+    use super::*;
+    use ppmd_turbo::rc::RangeInput;
+    use std::io::Read;
+
+    /// Hands out at most `step` bytes per `read`.
+    struct Chunked<'a> {
+        data: &'a [u8],
+        step: usize,
+    }
+
+    impl Read for Chunked<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.data.len().min(self.step).min(buf.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Ok(n)
+        }
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len as u32)
+            .map(|i| (i.wrapping_mul(131) ^ (i >> 5)) as u8)
+            .collect()
+    }
+
+    /// The bytes eight bits apart starting at bit `skip` of `data`, with
+    /// zeros once fewer than eight bits remain.
+    fn bytes_from_bit(data: &[u8], skip: usize, count: usize) -> Vec<u8> {
+        let mut reader = BitReader::new(data);
+        reader.skip_bits(skip as u32).unwrap();
+        (0..count)
+            .map(|_| BitRead::read_byte_or_zero(&mut reader))
+            .collect()
+    }
+
+    /// Drains `take` bytes through the coder's input over `reader`, then
+    /// checks the reader sits right after them and still reads the stream.
+    fn check<R: BitRead>(mut reader: R, data: &[u8], skip: usize, take: usize) {
+        reader.skip_bits(skip as u32).unwrap();
+        let start_zeros = reader.zero_bytes_past_eof();
+        let want = bytes_from_bit(data, skip, take + 1);
+        let got: Vec<u8> = {
+            let mut input = SourceInput::new(BitReadSource::new(&mut reader));
+            let got = (0..take).map(|_| input.next_byte()).collect();
+            let real = (data.len() * 8 - skip) / 8;
+            assert_eq!(input.position(), take.min(real));
+            got
+        };
+        assert_eq!(got, want[..take], "skip {skip} take {take}");
+        let real_bits = data.len() * 8 - skip;
+        let taken_bits = (take * 8).min(real_bits - real_bits % 8);
+        assert_eq!(reader.position(), skip + taken_bits);
+        let invented = take.saturating_sub(real_bits / 8) as u32;
+        assert_eq!(reader.zero_bytes_past_eof() - start_zeros, invented);
+        if real_bits - taken_bits >= 8 {
+            assert_eq!(reader.read_bits(8).unwrap() as u8, want[take]);
+        }
+    }
+
+    #[test]
+    fn the_coder_reads_a_slice_reader_in_place_and_leaves_it_after_the_last_byte() {
+        let data = pattern(1500);
+        for skip in [0, 3, 8, 13, 800] {
+            for take in [0, 1, 4, 255, 256, 257, 1000, 1400, 1600] {
+                check(BitReader::new(&data), &data, skip, take);
+            }
+        }
+    }
+
+    /// Short fills put the window edge, the fill edge and the accumulator
+    /// straddling two fills everywhere.
+    #[test]
+    fn the_coder_reads_a_streaming_reader_across_fills_and_leaves_it_after_the_last_byte() {
+        let data = pattern(1500);
+        for (cap, step) in [(1, 1), (7, 3), (64, 64), (300, 1000), (1 << 20, 17)] {
+            with_fill_cap(cap, || {
+                for skip in [0, 3, 8, 13, 800] {
+                    for take in [0, 1, 4, 255, 256, 257, 1000, 1400, 1600] {
+                        let reader = StreamingBitReader::new(Chunked { data: &data, step });
+                        check(reader, &data, skip, take);
+                    }
+                }
+            });
+        }
+    }
+
+    /// Zeros fed past the end accumulate on the reader across coder inputs,
+    /// as solid members resuming one coder do.
+    #[test]
+    fn zeros_past_the_end_accumulate_on_the_reader_across_inputs() {
+        let data = pattern(10);
+        let mut reader = BitReader::new(&data);
+        for round in 1..=3u32 {
+            let mut input = SourceInput::new(BitReadSource::new(&mut reader));
+            for _ in 0..if round == 1 { 15 } else { 5 } {
+                input.next_byte();
+            }
+            drop(input);
+            assert_eq!(reader.zero_bytes_past_eof(), 5 * round);
+        }
     }
 }

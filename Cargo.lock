@@ -2140,6 +2140,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "196a7c80b9a7652aba7cc070827516c2abe4ccdf53d128e1944003cf5726cff1"
 
 [[package]]
+name = "ppmd-turbo"
+version = "0.1.0"
+
+[[package]]
 name = "presser"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2992,6 +2996,7 @@ dependencies = [
  "hmac",
  "libc",
  "memchr",
+ "ppmd-turbo",
  "rayon",
  "reedsolomon-rs",
  "rmp-serde",

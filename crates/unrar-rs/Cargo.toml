@@ -53,6 +53,9 @@ unstable-internals = []
 ppmd-debug = []
 
 [dependencies]
+# TODO(release): ppmd-turbo = "0.1". Until then, the feature/0.1.0
+# checkout of ppmd-turbo beside this worktree.
+ppmd-turbo = { path = "../../../../../ppmd-turbo/.worktrees/0.1.0" }
 reedsolomon-rs = { path = "../reedsolomon-rs", version = "0.4.9", default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }
