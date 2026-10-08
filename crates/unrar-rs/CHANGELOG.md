@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.10.10 (2026-10-08)
+
+### Changed
+
+- Relicensed from GPL-3.0-or-later to Apache-2.0. The unRAR license
+  restriction is unchanged and still governs the RAR engine; `LICENSE` keeps
+  that paragraph in full and now carries the Apache License 2.0 text.
+  Releases up to 0.10.9 stay under GPL-3.0-or-later with the same
+  restriction. No code changed; the `reedsolomon-rs` requirement moves to
+  0.4.10, its first Apache-2.0 release.
+
 ## 0.10.9
 
 ### Changed

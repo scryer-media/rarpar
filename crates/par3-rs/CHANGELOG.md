@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1 (2026-10-08)
+
+- Relicensed from GPL-3.0-or-later to Apache-2.0. Releases up to 0.5.0 stay
+  under GPL-3.0-or-later. No code changed; the `reedsolomon-rs` requirement
+  moves to 0.4.10, its first Apache-2.0 release.
+
 ## 0.5.0
 
 - **Experimental:** `inside::rar5` adds PAR-inside for RAR5 archives and RAR5
