@@ -39,6 +39,13 @@
   model, so the feature no longer did anything, and `UNRAR_RS_RAR4_DEBUG_PPM`
   is no longer read.
 
+### Internal
+
+- `ppmd_fixtures_decode_through_short_fills` skips when its two RAR4 PPMd
+  archives are not hydrated, as the other RAR4 fixture tests do. Neither is in
+  the packaged crate or in the fixture set the no-fixture test lane hydrates,
+  and the test unwrapped the reads.
+
 ## 0.10.9
 
 ### Changed

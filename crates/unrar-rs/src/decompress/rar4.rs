@@ -5656,7 +5656,7 @@ mod tests {
         file.read_exact(&mut magic).is_ok() && &magic == b"Rar!"
     }
 
-    fn fixtures_hydrated(filenames: &[&str]) -> bool {
+    pub(super) fn fixtures_hydrated(filenames: &[&str]) -> bool {
         if filenames.iter().all(|name| fixture_hydrated(name)) {
             return true;
         }
@@ -6445,8 +6445,15 @@ mod ppm_source_tests {
                 .collect()
         }
 
+        // Neither archive is in a packaged crate, nor in the tree the unit
+        // lanes hydrate.
+        const FIXTURES: [&str; 2] = ["rar4_ppm_solid_mv.rar", "rar4_ppm_s2groups.rar"];
+        if !super::tests::fixtures_hydrated(&FIXTURES) {
+            return;
+        }
+
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar4");
-        for name in ["rar4_ppm_solid_mv.rar", "rar4_ppm_s2groups.rar"] {
+        for name in FIXTURES {
             let data = std::fs::read(root.join(name)).unwrap();
             let whole = extract_all(&data);
             assert!(
