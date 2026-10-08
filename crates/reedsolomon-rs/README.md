@@ -72,6 +72,13 @@ Versioned API and migration notes are in [CHANGELOG.md](https://github.com/scrye
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](https://github.com/scryer-media/rarpar/blob/main/crates/reedsolomon-rs/LICENSE).
+Apache-2.0 from version 0.4.10 onward. See [LICENSE](https://github.com/scryer-media/rarpar/blob/main/crates/reedsolomon-rs/LICENSE).
+Releases before 0.4.10 stay under GPL-3.0-or-later.
+
+Several GF(2^16) kernels (the SSSE3 shuffle multiply-add and its block
+prepare and finish steps) are ports of routines from
+[ParPar](https://github.com/animetosho/ParPar) by Anime Tosho, which its
+author released as public domain or CC0. The comments beside each port name
+the routine it follows.
 
 [`par2-rs`]: https://crates.io/crates/par2-rs

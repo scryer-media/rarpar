@@ -1,6 +1,6 @@
 # AGENTS Instructions
 
-This repository contains standalone GPL tools and publishable crates for RAR
+This repository contains a standalone GPL tool and publishable crates for RAR
 and PAR2 workflows.
 
 ## Commands
@@ -24,11 +24,14 @@ and PAR2 workflows.
   version. Record the version impact explicitly for documentation/CI-only PRs.
   Preparing these PR changes is authorized; publication, tags, and deployment
   still require a separate explicit operator instruction.
-- `reedsolomon-rs`, `par2-rs`, `par3-rs`, and `rarpar` source are
-  GPL-3.0-or-later.
-- `unrar-rs` is GPL-3.0-or-later; its RAR engine is developed from RARLAB's
-  unRAR source code, which remains governed by the unRAR license restriction
-  documented in `crates/unrar-rs/LICENSE`.
+- `reedsolomon-rs` and `par3-rs` source are Apache-2.0.
+- `par2-rs` and `rarpar` source are GPL-3.0-or-later. `par2-rs` stays GPL
+  while its test suite carries cases adapted from par2cmdline's
+  GPL-2.0-or-later unit tests.
+- `unrar-rs` is Apache-2.0 plus the unRAR restriction; its RAR engine is
+  developed from RARLAB's unRAR source code, which remains governed by the
+  unRAR license restriction documented in `crates/unrar-rs/LICENSE`. The
+  combination has no SPDX expression, so the manifest uses `license-file`.
 - `rarpar` carries a GPLv3 section 7 permission to combine with `unrar-rs`
   (`tools/rarpar/LICENSE`); binary distributions link `unrar-rs` and must
   preserve the unRAR restriction notice.

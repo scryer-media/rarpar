@@ -170,8 +170,6 @@ backend beside it for the differential tests.
   embedder-installed hook; it implies `crypto-rust` for key derivation.
 - `crc-host`: on `wasm32`, delegates bulk member CRC-32 to an
   embedder-installed hook.
-- `ppmd-debug`: compiles per-symbol PPMd tracing, enabled at run time with
-  `UNRAR_RS_RAR4_DEBUG_PPM`.
 - `slow-tests`: opts in to long-running tests.
 
 ## Volume numbering
@@ -219,6 +217,8 @@ these numbers were measured with:
 This is a Rust port of RARLAB's reference UnRAR implementation, with additional
 optimisations: runtime-dispatched SIMD, a streaming extraction path, and
 cross-volume layout assembly that the reference implementation does not provide.
+The PPMd variant H model and its range coder come from the
+[`ppmd-turbo`](https://github.com/scryer-media/ppmd-turbo) crate.
 
 The RAR format is documented in RARLAB's
 [technical note](https://www.rarlab.com/technote.htm).
@@ -227,7 +227,9 @@ Versioned API and behavior notes are in [CHANGELOG.md](https://github.com/scryer
 
 ## License
 
-GPL-3.0-or-later. The RAR engine was developed using the source code of the
+Apache-2.0 plus the unRAR license restriction, from version 0.11.0 onward.
+Releases before 0.11.0 stay under GPL-3.0-or-later with the same
+restriction. The RAR engine was developed using the source code of the
 unRAR program; all copyrights to the original unRAR code are owned by
 Alexander Roshal, and its license restriction continues to govern the
 unRAR-derived code in this crate:
