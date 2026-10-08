@@ -3881,10 +3881,13 @@ impl Rar4LzDecoder {
                     // coder took all of it, and the literals before the
                     // marker stand.
                     reader.consume_byte_span(offered);
-                    let kept =
-                        (err.at.output.saturating_sub(self.ppm_block_symbols) as usize).min(room);
-                    self.window.put_bytes(&literals[..kept]);
-                    output_size += kept as u64;
+                    // What the coder wrote before the marker is the front of
+                    // the span it was given, and never more than that span.
+                    let written = err.at.output.saturating_sub(self.ppm_block_symbols) as usize;
+                    let span = &literals[..room];
+                    let kept = span.get(..written).unwrap_or(span);
+                    self.window.put_bytes(kept);
+                    output_size += kept.len() as u64;
                     self.debug_ppm_tail("decode_char", output_size);
                     trace!("RAR4 PPMd corruption at output_size={output_size}: cleaning up");
                     ppm_corrupt = true;
