@@ -49,8 +49,7 @@ slow-tests = []
 unstable-internals = []
 
 [dependencies]
-# TODO(release): drop path once 0.1.1 is on crates.io
-ppmd-turbo = { version = "0.1.1", path = "../../../../../ppmd-turbo/.worktrees/apache-only" }
+ppmd-turbo = "0.1.1"
 reedsolomon-rs = { path = "../reedsolomon-rs", version = "0.4.10", default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }
