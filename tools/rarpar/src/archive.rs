@@ -46,7 +46,7 @@ use crate::par3_stream::{
     block_count, build_set, inside_geometry, inside_size, reference_field, sibling_geometry,
     write_inside, write_sibling,
 };
-use crate::sidecar::{Sidecar, SidecarPlan};
+use crate::sidecar::{Sidecar, SidecarPlan, preflight_set};
 
 const MIB: u64 = 1 << 20;
 
@@ -866,8 +866,10 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
     let stem = output.with_extension("");
     let mut outputs = vec![output.clone()];
     if let Some(sidecar) = &par2 {
-        // A fixed recovery count names every volume now.
-        outputs.extend(sidecar.paths(&stem));
+        // A fixed recovery count names every volume now, so the set gets the
+        // streamed sets' preflight, obsolete volumes of an earlier set
+        // included, before the archive is built.
+        outputs.extend(preflight_set(cli, sidecar, &stem)?);
         refuse_aliases(&outputs)?;
     } else if !args.inside {
         // The volume names depend on the row count, so list the index only.
