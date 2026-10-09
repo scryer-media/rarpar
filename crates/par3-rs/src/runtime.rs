@@ -739,15 +739,6 @@ pub struct ExecutionOptions {
     /// FFT butterfly CPU selection; `kernel()` reports the detected shuffle ISA.
     /// This does not change the independent Cauchy dispatch.
     pub fft_backend: reedsolomon_rs::gf_simd::LinearBackend,
-    /// Whether an FFT decode whose bank outgrows a transform tile runs
-    /// its inverse transform, derivative and forward transform fused
-    /// (`reedsolomon_rs`'s `TransformField::derivative_at`). `None`, the
-    /// default, fuses where `reedsolomon_rs::fft::COLUMN_TILES` holds, which
-    /// is every target but Apple silicon, at every worker count. A forced
-    /// value exists so every target's tests run both decodes; output is
-    /// identical either way.
-    #[doc(hidden)]
-    pub fft_fused_decode: Option<bool>,
     /// Whether disk verification hashes a file whole before its extents.
     /// Whole first, an intact file is read once, and a file the whole-file
     /// hash does not settle is read a second time to hash its extents. Side
@@ -785,7 +776,6 @@ impl Default for ExecutionOptions {
             retained_bytes: 64 << 20,
             workers: std::thread::available_parallelism().map_or(1, usize::from),
             fft_backend: reedsolomon_rs::gf_simd::LinearBackend::Auto,
-            fft_fused_decode: None,
             disk_verify_whole_first: None,
             open_handles: 32,
             handles: HandleBudget::new(32),
