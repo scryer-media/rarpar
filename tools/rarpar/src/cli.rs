@@ -260,6 +260,27 @@ pub struct XzCompressArgs {
     /// Memory budget in MiB; fewer threads are used to stay within it. No limit by default.
     #[arg(long, value_name = "MIB", value_parser = clap::value_parser!(u64).range(1..))]
     pub memory_mib: Option<u64>,
+    #[command(flatten)]
+    pub sidecar: SidecarArgs,
+}
+
+/// A recovery set written beside the output in the same pass, from the bytes
+/// as they are written.
+#[derive(Debug, Clone, Args)]
+pub struct SidecarArgs {
+    /// Also write a PAR2 or PAR3 set for the output beside it, computed as it is written.
+    #[arg(long, value_enum, value_name = "FORMAT")]
+    pub sidecar: Option<SidecarFormat>,
+    /// Block (slice) size of the set in bytes; required with --sidecar.
+    #[arg(long, value_name = "BYTES", requires = "sidecar", value_parser = clap::value_parser!(u64).range(1..))]
+    pub sidecar_block_size: Option<u64>,
+    /// Recovery blocks in the set; required with --sidecar.
+    #[arg(long, value_name = "COUNT", requires = "sidecar")]
+    pub sidecar_recovery_count: Option<u64>,
+    /// With standard output, the name it will be saved under: the set records it and is named
+    /// after it, placed under -o like an OUTPUT.
+    #[arg(long, value_name = "NAME", requires = "sidecar")]
+    pub sidecar_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -538,13 +559,23 @@ pub struct Par3ArchiveArgs {
     #[arg(long)]
     pub no_solid: bool,
     /// Append the PAR3 set inside the archive, after its end header, instead of beside it.
-    #[arg(long, conflicts_with_all = ["block_size", "recovery_count"])]
+    #[arg(long, conflicts_with_all = ["block_size", "recovery_count", "sidecar"])]
     pub inside: bool,
-    /// Logical block size in bytes for the sibling set; odd sizes are rounded up.
-    #[arg(short = 's', long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(40..))]
+    /// Format of the set written beside the archive in the same pass: par3 (the default) or par2
+    /// (ZIP only, with a fixed -c).
+    #[arg(long, value_enum, value_name = "FORMAT")]
+    pub sidecar: Option<SidecarFormat>,
+    /// Logical block size in bytes for the sibling set; odd sizes are rounded up (PAR2: to a
+    /// multiple of 4).
+    #[arg(short = 's', long, visible_alias = "sidecar-block-size", default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(40..))]
     pub block_size: u64,
     /// Number of recovery packets in the sibling set (defaults to one).
-    #[arg(short = 'c', long, conflicts_with = "recovery_percent")]
+    #[arg(
+        short = 'c',
+        long,
+        visible_alias = "sidecar-recovery-count",
+        conflicts_with = "recovery_percent"
+    )]
     pub recovery_count: Option<u64>,
     /// Recovery percentage of input blocks, rounded up; with --inside, 0 to 250, and 0 means one block.
     #[arg(short = 'r', long, conflicts_with = "recovery_count")]
@@ -571,6 +602,13 @@ pub enum ArchiveFilter {
     Sparc,
     Ppc,
     Riscv,
+}
+
+/// Format of a recovery set written beside an archive in the same pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SidecarFormat {
+    Par2,
+    Par3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

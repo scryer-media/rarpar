@@ -565,10 +565,14 @@ fn emit(cli: &Cli, report: &Value) -> Result<(), RarparError> {
                     report["protected_bytes"]
                 );
                 println!(
-                    "  {} block(s) of {} bytes, {} recovery block(s), PAR3 set {}",
+                    "  {} block(s) of {} bytes, {} recovery block(s), {} set {}",
                     report["blocks"],
                     report["block_size"],
                     report["recovery_blocks"],
+                    report["set_format"]
+                        .as_str()
+                        .unwrap_or("par3")
+                        .to_uppercase(),
                     report["mode"].as_str().unwrap_or_default()
                 );
             }

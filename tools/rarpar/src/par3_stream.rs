@@ -1120,6 +1120,11 @@ pub(crate) struct StagedSibling {
 }
 
 impl StagedSibling {
+    /// Files already written by [`write_file`], to install onto their paths.
+    pub(crate) fn new(files: Vec<(tempfile::NamedTempFile, PathBuf)>, overwrite: bool) -> Self {
+        StagedSibling { files, overwrite }
+    }
+
     /// Rename every staged file onto its destination, in order.
     pub(crate) fn install(self) -> std::io::Result<Vec<PathBuf>> {
         let mut written = Vec::new();
@@ -1136,20 +1141,13 @@ impl StagedSibling {
     }
 }
 
-/// Write a sibling set: the index file and its recovery volumes, laid out as
-/// par3cmdline lays them out. Every file is written and synced beside its
-/// destination first; nothing is installed until [`StagedSibling::install`],
-/// so a failed write (a full disk, say) leaves every existing file as it was.
-pub(crate) fn write_sibling(
-    stem: &Path,
-    set: &BuiltSet,
-    rows: &[Vec<u8>],
+/// Refuse to write a set over its outputs: a link, dangling or not, is never
+/// written through, and without `overwrite` an existing name is refused.
+pub(crate) fn check_targets<'a>(
+    paths: impl IntoIterator<Item = &'a PathBuf>,
     overwrite: bool,
-) -> std::io::Result<StagedSibling> {
-    let (index, volumes) = sibling_paths(stem, rows.len() as u64);
-    for path in std::iter::once(&index).chain(volumes.iter().map(|(_, _, path)| path)) {
-        // Look at the name itself: a link, dangling or not, is never
-        // written through, and overwriting replaces only a real file.
+) -> std::io::Result<()> {
+    for path in paths {
         match std::fs::symlink_metadata(path) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 return Err(std::io::Error::new(
@@ -1168,6 +1166,24 @@ pub(crate) fn write_sibling(
             Err(error) => return Err(error),
         }
     }
+    Ok(())
+}
+
+/// Write a sibling set: the index file and its recovery volumes, laid out as
+/// par3cmdline lays them out. Every file is written and synced beside its
+/// destination first; nothing is installed until [`StagedSibling::install`],
+/// so a failed write (a full disk, say) leaves every existing file as it was.
+pub(crate) fn write_sibling(
+    stem: &Path,
+    set: &BuiltSet,
+    rows: &[Vec<u8>],
+    overwrite: bool,
+) -> std::io::Result<StagedSibling> {
+    let (index, volumes) = sibling_paths(stem, rows.len() as u64);
+    check_targets(
+        std::iter::once(&index).chain(volumes.iter().map(|(_, _, path)| path)),
+        overwrite,
+    )?;
     let mut files = Vec::new();
     let staged = write_file(&index, |out| {
         out.write_all(&set.creator)?;
@@ -1204,7 +1220,7 @@ pub(crate) fn write_sibling(
 }
 
 /// Write `body` to a new temporary file in `path`'s directory and sync it.
-fn write_file(
+pub(crate) fn write_file(
     path: &Path,
     body: impl FnOnce(&mut BufWriter<std::fs::File>) -> std::io::Result<()>,
 ) -> std::io::Result<tempfile::NamedTempFile> {

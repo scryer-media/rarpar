@@ -11,11 +11,13 @@ use lzma_turbo::xz::{
 };
 use lzma_turbo::{Checksum, ChecksumPlan, LzmaEncProps, MatchFinderKind, XzErrorKind, XzWriter};
 use rarpar::cli::{
-    Cli, XzCheck, XzCommand, XzCompressArgs, XzDecodeArgs, XzDecompressArgs, XzListArgs, XzTestArgs,
+    Cli, SidecarArgs, XzCheck, XzCommand, XzCompressArgs, XzDecodeArgs, XzDecompressArgs,
+    XzListArgs, XzTestArgs,
 };
 use serde_json::{Value, json};
 
 use crate::error::{EXIT_DATA_FAILURE, EXIT_SUCCESS, RarparError};
+use crate::sidecar::{self, SidecarPlan, SidecarWriter};
 use crate::streams::{
     CountingWriter, IO_BUFFER, Input, Tally, input_or_stdin, is_stdio, preflight_output,
     refuse_terminal_stdout, regular_file_metadata, report_writer, resolve_output, write_output,
@@ -285,23 +287,45 @@ fn compress(cli: &Cli, input: &Path, args: &XzCompressArgs) -> Result<Value, Rar
         Some(output) => preflight_output(cli, input, output)?,
         None => refuse_terminal_stdout("compressed data")?,
     }
+    let sidecar = sidecar_target(cli, output.as_deref(), &args.sidecar)?;
+    let memory_estimate = memory_estimate.saturating_add(
+        sidecar
+            .as_ref()
+            .map_or(0, |(plan, _, _)| plan.memory_estimate()),
+    );
     let mut report = json!({"operation":"xz_compress","success":true,"dry_run":cli.dry_run,
         "input":display(input),"output":output.as_deref().map_or("-".into(), display),
         "level":args.level,"extreme":args.extreme,"check":check_name(check_type(args.check)),
         "block_size":block_size,"dictionary_bytes":props.dict_size(),"threads":threads,
         "memory_estimate_bytes":memory_estimate});
+    if let Some((plan, name, stem)) = &sidecar {
+        report["sidecar"] = json!({"format":sidecar::format_name(plan.format),"name":name,
+            "block_size":plan.block_size,"recovery_blocks":plan.rows,
+            "outputs":plan.paths(stem)});
+    }
     if cli.dry_run {
         return Ok(report);
     }
 
     let (source, consumed) = Tally::new(Input::open(input)?.into_reader());
     let mut source = BufReader::with_capacity(IO_BUFFER, source);
+    let mut set = sidecar
+        .as_ref()
+        .map(|(plan, _, _)| plan.start())
+        .transpose()?;
     let written = write_output(
         cli,
         output.as_deref(),
         input_meta.as_ref(),
         ".rarpar-xz-",
         |sink| {
+            let sink: Box<dyn Write + '_> = match set.as_mut() {
+                Some(sidecar) => Box::new(SidecarWriter {
+                    inner: sink,
+                    sidecar,
+                }),
+                None => Box::new(sink),
+            };
             let mut counter = CountingWriter {
                 inner: sink,
                 count: 0,
@@ -322,7 +346,67 @@ fn compress(cli: &Cli, input: &Path, args: &XzCompressArgs) -> Result<Value, Rar
     report["input_bytes"] = json!(consumed);
     report["output_bytes"] = json!(written);
     report["ratio"] = json!(ratio(written, consumed));
+    if let (Some(set), Some((_, name, stem))) = (set, &sidecar) {
+        // The archive is installed; its set follows it, staged then renamed
+        // like the archive.
+        if let Some(directory) = stem
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(directory)?;
+        }
+        let finished = set.finish(name, stem, cli.overwrite)?;
+        let mut summary = finished.report.clone();
+        let (outputs, sizes) = finished.install()?;
+        summary["name"] = json!(name);
+        summary["outputs"] = json!(outputs);
+        summary["output_sizes"] = json!(sizes);
+        report["sidecar"] = summary;
+    }
     Ok(report)
+}
+
+/// The sidecar set `--sidecar` asks for: its plan, the name it records and
+/// the stem its files are named by. A file output names both; standard
+/// output has no name, so `--sidecar-name` gives the one the operator will
+/// save it under. Every file the set will be written to is checked now,
+/// before a byte is read.
+fn sidecar_target(
+    cli: &Cli,
+    output: Option<&Path>,
+    args: &SidecarArgs,
+) -> Result<Option<(SidecarPlan, String, PathBuf)>, RarparError> {
+    let Some(plan) = sidecar::plan_from_args(args)? else {
+        return Ok(None);
+    };
+    let stem = match (output, &args.sidecar_name) {
+        (Some(_), Some(_)) => {
+            return Err(RarparError::Usage(
+                "--sidecar-name is for standard output; a file output names its own set".into(),
+            ));
+        }
+        (Some(output), None) => output.to_path_buf(),
+        (None, Some(name)) => cli.place_output(Path::new(name)),
+        (None, None) => {
+            return Err(RarparError::Usage(
+                "--sidecar on standard output needs --sidecar-name: the set records the name the output will be saved under".into(),
+            ));
+        }
+    };
+    let name = stem
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !is_stdio(Path::new(name)))
+        .ok_or_else(|| {
+            RarparError::Usage(format!(
+                "--sidecar-name must name a file, not {}",
+                stem.display()
+            ))
+        })?;
+    crate::par3::reject_symlinks(&stem)?;
+    sidecar::preflight(&plan.paths(&stem), cli.overwrite)?;
+    plan.check_budget(cli.par3_memory_mib)?;
+    Ok(Some((plan, name, stem)))
 }
 
 fn ratio(compressed: u64, uncompressed: u64) -> Value {
@@ -741,6 +825,18 @@ fn emit(cli: &Cli, report: &Value, data_on_stdout: bool) -> Result<(), RarparErr
                         Some(ratio) => format!(", ratio {ratio:.3}"),
                         None => String::new(),
                     }
+                )?;
+            }
+            let sidecar = &report["sidecar"];
+            if !sidecar.is_null() {
+                let files = sidecar["outputs"].as_array().map_or(0, Vec::len);
+                writeln!(
+                    out,
+                    "  sidecar {} for {}: {} recovery block(s) of {} bytes in {files} file(s)",
+                    sidecar["format"].as_str().unwrap_or_default(),
+                    sidecar["name"].as_str().unwrap_or_default(),
+                    sidecar["recovery_blocks"],
+                    sidecar["block_size"],
                 )?;
             }
         }
