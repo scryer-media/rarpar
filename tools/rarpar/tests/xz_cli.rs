@@ -86,7 +86,7 @@ fn sample(len: usize, seed: u64) -> Vec<u8> {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
-        if state % 7 == 0 {
+        if state.is_multiple_of(7) {
             // A little noise keeps the ratio away from trivial.
             out.push((state >> 24) as u8);
         } else {
