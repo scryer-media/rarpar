@@ -295,17 +295,34 @@ pub(crate) fn obsolete_volume(stem: &Path, outputs: &[PathBuf]) -> io::Result<Op
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
     let prefix = format!("{}.vol", name.strip_suffix(".par2").unwrap_or(&name));
-    let planned: Vec<_> = outputs.iter().filter_map(|path| path.file_name()).collect();
     let mut entries: Vec<_> = std::fs::read_dir(directory)?.collect::<Result<_, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let file_name = entry.file_name();
         let text = file_name.to_string_lossy();
-        if !text.starts_with(&prefix)
-            || !text.ends_with(".par2")
-            || planned.contains(&file_name.as_os_str())
-            || !entry.file_type()?.is_file()
-        {
+        // A name that differs from the set's only in ASCII case is the
+        // set's volume only where the filesystem folds case, which is when
+        // the set's own spelling of it opens the same file.
+        let Some(middle) = text
+            .get(..prefix.len())
+            .filter(|head| head.eq_ignore_ascii_case(&prefix))
+            .and_then(|_| text.get(prefix.len()..))
+            .and_then(|rest| rest.len().checked_sub(5).map(|end| rest.split_at(end)))
+            .filter(|(_, tail)| tail.eq_ignore_ascii_case(".par2"))
+            .map(|(middle, _)| middle)
+        else {
+            continue;
+        };
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let spelled = directory.join(format!("{prefix}{middle}.par2"));
+        let mut planned = false;
+        for output in outputs {
+            planned |= same_file(&path, output)?;
+        }
+        if planned || !same_file(&path, &spelled)? {
             continue;
         }
         if holds_an_authentic_packet(&entry.path())? {
@@ -313,6 +330,24 @@ pub(crate) fn obsolete_volume(stem: &Path, outputs: &[PathBuf]) -> io::Result<Op
         }
     }
     Ok(None)
+}
+
+/// Whether `a` and `b` name the same file; a name that does not exist is
+/// no file.
+fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
+    let (Ok(left), Ok(right)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return Ok(false);
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(left.dev() == right.dev() && left.ino() == right.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (left, right);
+        Ok(a.canonicalize()? == b.canonicalize()?)
+    }
 }
 
 /// Whether `path` holds a PAR2 packet whose MD5 checks, walking packet

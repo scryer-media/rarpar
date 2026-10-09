@@ -691,6 +691,74 @@ fn an_xz_overwrite_whose_sidecar_cannot_be_finished_keeps_the_previous_archive()
     ok(&rarpar(root, &["--quiet", "par", "verify", "out.xz.par2"]));
 }
 
+#[test]
+fn an_overwrite_spelled_in_another_case_refuses_to_leave_obsolete_volumes_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // Only a filesystem that folds case holds `SET.xz` and `set.xz` as one
+    // file; on one that does not, the two are separate sets.
+    std::fs::write(root.join("Probe"), b"").unwrap();
+    if !root.join("PROBE").exists() {
+        eprintln!("skipped: the temporary directory is case-sensitive");
+        return;
+    }
+    std::fs::remove_file(root.join("Probe")).unwrap();
+    std::fs::write(root.join("data"), noise(200_000, 14)).unwrap();
+    for format in ["par2", "par3"] {
+        let compress = |output: &str, count: &str| {
+            rarpar(
+                root,
+                &[
+                    "--overwrite",
+                    "xz",
+                    "compress",
+                    "--sidecar",
+                    format,
+                    "--sidecar-block-size",
+                    "4096",
+                    "--sidecar-recovery-count",
+                    count,
+                    "data",
+                    output,
+                ],
+            )
+        };
+        let snapshot = || {
+            let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(root)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (
+                        entry.file_name().into_string().unwrap(),
+                        std::fs::read(entry.path()).unwrap(),
+                    )
+                })
+                .collect();
+            files.sort();
+            files
+        };
+        ok(&compress("SET.xz", "8"));
+        let before = snapshot();
+        let output = compress("set.xz", "1");
+        code(&output, 3);
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("obsolete"),
+            "{format}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(snapshot() == before, "{format}: the previous set changed");
+        // The same layout, in either spelling, replaces every volume.
+        ok(&compress("set.xz", "8"));
+        for entry in std::fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == format) {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        std::fs::remove_file(root.join("SET.xz")).unwrap();
+    }
+}
+
 #[cfg(feature = "sevenz")]
 mod archives {
     use super::*;
