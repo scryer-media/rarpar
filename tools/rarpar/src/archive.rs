@@ -589,6 +589,8 @@ struct Member {
     name: String,
     directory: bool,
     size: u64,
+    /// Named on the command line, rather than found under a named directory.
+    requested: bool,
 }
 
 /// Every member the inputs name, refusing as soon as the members found plus
@@ -596,13 +598,13 @@ struct Member {
 fn collect(base: &Path, inputs: &[PathBuf], max_files: usize) -> Result<Vec<Member>, RarparError> {
     let too_many = || RarparError::Resource("archiving exceeded --max-files".into());
     let mut members = Vec::new();
-    let mut pending: Vec<PathBuf> = inputs
+    let mut pending: Vec<(PathBuf, bool)> = inputs
         .iter()
         .map(|path| {
             if path.is_absolute() {
-                path.clone()
+                (path.clone(), true)
             } else {
-                base.join(path)
+                (base.join(path), true)
             }
         })
         .collect();
@@ -610,7 +612,7 @@ fn collect(base: &Path, inputs: &[PathBuf], max_files: usize) -> Result<Vec<Memb
     if pending.len() > max_files {
         return Err(too_many());
     }
-    while let Some(path) = pending.pop() {
+    while let Some((path, requested)) = pending.pop() {
         reject_symlinks(&path)?;
         let meta = std::fs::metadata(&path).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
@@ -651,14 +653,16 @@ fn collect(base: &Path, inputs: &[PathBuf], max_files: usize) -> Result<Vec<Memb
                 name,
                 directory: true,
                 size: 0,
+                requested,
             });
-            pending.extend(children.into_iter().rev());
+            pending.extend(children.into_iter().rev().map(|child| (child, false)));
         } else if meta.is_file() {
             members.push(Member {
                 path: canonical,
                 name,
                 directory: false,
                 size: meta.len(),
+                requested,
             });
         } else {
             return Err(RarparError::Usage(format!(
@@ -743,7 +747,10 @@ fn refuse_aliases(paths: &[PathBuf]) -> Result<(), RarparError> {
 /// Drop from `members` the outputs of a previous run this one replaces (with
 /// `--overwrite`, under an input directory): the archive, the index, and,
 /// for a sibling set, recovery volumes of the index's name whatever their row
-/// count. A previous output is never packed into its own replacement.
+/// count. A previous output is never packed into its own replacement. A file
+/// named on the command line is an input the operator asked for, not a
+/// leftover: one that this run would write over is refused, as installing
+/// the set would replace it after it was read.
 fn exclude_outputs(
     members: &mut Vec<Member>,
     outputs: &[PathBuf],
@@ -794,9 +801,19 @@ fn exclude_outputs(
                 .split_once('+')
                 .is_some_and(|(start, count)| digits(start) && digits(count))
     };
-    members.retain(|member| {
-        member.directory || !(existing.contains(&member.path) || is_volume(&member.path))
-    });
+    let is_output = |member: &Member| {
+        !member.directory && (existing.contains(&member.path) || is_volume(&member.path))
+    };
+    if let Some(member) = members
+        .iter()
+        .find(|member| member.requested && is_output(member))
+    {
+        return Err(RarparError::Unsafe(format!(
+            "input {} is an output of this run and would be written over; give the archive another name",
+            member.path.display()
+        )));
+    }
+    members.retain(|member| !is_output(member));
     Ok(())
 }
 

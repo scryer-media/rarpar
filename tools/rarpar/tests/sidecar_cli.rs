@@ -1004,6 +1004,67 @@ mod archives {
     }
 
     #[test]
+    fn an_input_named_like_an_output_of_the_run_is_refused() {
+        // The archive goes next to its inputs, so a set file of its name
+        // that the operator names as an input would be read, then replaced
+        // by the set. The same file found under a named directory is a
+        // leftover of a previous run and is left out of the archive.
+        for (leftover, archive, extra) in [
+            (
+                "set.par2",
+                "in/nested/set.zip",
+                &["--format", "zip", "--sidecar", "par2"][..],
+            ),
+            ("set.par3", "in/nested/set.zip", &["--format", "zip"][..]),
+            (
+                "set.vol0+1.par3",
+                "in/nested/set.7z",
+                &["--format", "7z"][..],
+            ),
+        ] {
+            let dir = fixture();
+            let root = dir.path();
+            let before = noise(5000, 7);
+            std::fs::write(root.join("in/nested").join(leftover), &before).unwrap();
+            let input = format!("nested/{leftover}");
+            let head = [
+                "--overwrite",
+                "par3",
+                "archive",
+                "--base-path",
+                "in",
+                "-s",
+                "8192",
+                "-c",
+                "2",
+            ];
+            let mut args = head.to_vec();
+            args.extend_from_slice(extra);
+            args.extend_from_slice(&[archive, "static.bin", &input]);
+            let output = rarpar(root, &args);
+            code(&output, 3);
+            let message = String::from_utf8_lossy(&output.stderr);
+            assert!(message.contains("is an output of this run"), "{message}");
+            assert_eq!(
+                std::fs::read(root.join("in/nested").join(leftover)).unwrap(),
+                before
+            );
+            assert!(!root.join(archive).exists());
+
+            let mut args = vec!["--json"];
+            args.extend_from_slice(&head);
+            args.extend_from_slice(extra);
+            args.extend_from_slice(&[archive, "nested"]);
+            let output = rarpar(root, &args);
+            ok(&output);
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            // The directory and tally.raw; the leftover is not packed.
+            assert_eq!(report["members"], 2, "{report}");
+            assert!(root.join(archive).exists());
+        }
+    }
+
+    #[test]
     fn a_7z_par2_sidecar_is_refused_before_anything_is_written() {
         let dir = fixture();
         let root = dir.path();
