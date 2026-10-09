@@ -22,6 +22,8 @@ Examples:
   rarpar auto --output ./out ./release
   rarpar cleanup --dry-run ./release
   rarpar --password-file passwords.txt ./release
+  rarpar xz compress --level 9 data.tar
+  rarpar xz decompress data.tar.xz
 
 rarpar is not an official RAR, UnRAR, or PAR2 utility and does not create or
 recompress RAR archives. `rarpar par3 inside` adds or removes a PAR3 region in
@@ -153,6 +155,121 @@ manifest before deletion.")]
         #[command(subcommand)]
         command: Par3Command,
     },
+    /// .xz compression, decompression, integrity testing and listing.
+    #[command(long_about = "\
+Compress to and decompress from the .xz format with lzma-turbo. INPUT and OUTPUT
+may be `-` for standard input and output. Inputs are never deleted, and an
+existing output is rejected unless --overwrite is given. Multi-block files are
+compressed and decompressed on several threads; concatenated streams decode as
+one output.")]
+    Xz {
+        #[command(subcommand)]
+        command: XzCommand,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum XzCommand {
+    /// Compress a file or standard input to .xz.
+    #[command(long_about = "\
+Compress INPUT to OUTPUT. OUTPUT defaults to INPUT with `.xz` appended, beside
+INPUT or in the global --output directory; standard input defaults to standard
+output. --level and --extreme select the xz preset of the same number. The
+stream is cut into blocks of --block-size bytes, which defaults to three times
+the preset's dictionary as xz's threaded mode does, so the output bytes do not
+depend on --threads.")]
+    Compress(XzCompressArgs),
+    /// Decompress an .xz file or standard input.
+    #[command(long_about = "\
+Decompress INPUT to OUTPUT. OUTPUT defaults to INPUT without its `.xz` suffix
+(`.txz` becomes `.tar`), beside INPUT or in the global --output directory;
+standard input defaults to standard output. Every block's integrity check is
+verified. A seekable file with more than one block is decoded on up to
+--threads threads within --memory-mib; anything else is decoded in one pass.")]
+    Decompress(XzDecompressArgs),
+    /// Decode an .xz file and verify its integrity checks without writing output.
+    Test(XzTestArgs),
+    /// Show the stream and block layout, check type, sizes and ratio of an .xz file.
+    List(XzListArgs),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum XzCheck {
+    /// No integrity check.
+    None,
+    /// CRC-32.
+    Crc32,
+    /// CRC-64, the xz default.
+    Crc64,
+    /// SHA-256.
+    Sha256,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct XzCompressArgs {
+    /// File to compress, or `-` for standard input.
+    #[arg(value_name = "INPUT")]
+    pub input: PathBuf,
+    /// Output file or directory, or `-` for standard output.
+    #[arg(value_name = "OUTPUT")]
+    pub output: Option<PathBuf>,
+    /// Compression level: the xz preset, 0 (fastest) to 9.
+    #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u32).range(0..=9))]
+    pub level: u32,
+    /// Use the slower extreme variant of the preset (xz's `-e`).
+    #[arg(long)]
+    pub extreme: bool,
+    /// Uncompressed bytes per block; defaults to three times the preset's dictionary, at least 1 MiB.
+    #[arg(short = 's', long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(1..))]
+    pub block_size: Option<u64>,
+    /// Integrity check stored with every block.
+    #[arg(long, value_enum, default_value_t = XzCheck::Crc64)]
+    pub check: XzCheck,
+    /// Blocks compressed at once (defaults to available CPUs); the output bytes do not depend on it.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=256))]
+    pub threads: Option<u32>,
+    /// Memory budget in MiB; fewer threads are used to stay within it. No limit by default.
+    #[arg(long, value_name = "MIB", value_parser = clap::value_parser!(u64).range(1..))]
+    pub memory_mib: Option<u64>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct XzDecodeArgs {
+    /// Decoder threads for a multi-block file (defaults to available CPUs).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=256))]
+    pub threads: Option<u32>,
+    /// Memory limit in MiB: threads are reduced to fit, and a stream whose
+    /// dictionary alone exceeds it is refused.
+    #[arg(long, value_name = "MIB", default_value_t = 1024, value_parser = clap::value_parser!(u64).range(1..))]
+    pub memory_mib: u64,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct XzDecompressArgs {
+    /// .xz file to decompress, or `-` for standard input.
+    #[arg(value_name = "INPUT")]
+    pub input: PathBuf,
+    /// Output file or directory, or `-` for standard output.
+    #[arg(value_name = "OUTPUT")]
+    pub output: Option<PathBuf>,
+    #[command(flatten)]
+    pub decode: XzDecodeArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct XzTestArgs {
+    /// .xz file to test, or `-` for standard input.
+    #[arg(value_name = "INPUT")]
+    pub input: PathBuf,
+    #[command(flatten)]
+    pub decode: XzDecodeArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct XzListArgs {
+    /// .xz file to list; it must be seekable, so standard input is not accepted.
+    #[arg(value_name = "INPUT")]
+    pub input: PathBuf,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -721,6 +838,111 @@ mod tests {
         ]);
 
         assert!(result.is_err());
+    }
+
+    fn xz(arguments: &[&str]) -> Result<XzCommand, clap::Error> {
+        let mut command = vec!["rarpar", "xz"];
+        command.extend(arguments);
+        let cli = Cli::try_parse_from(command)?;
+        match cli.command.expect("a command is required") {
+            Command::Xz { command } => Ok(command),
+            other => panic!("expected xz, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xz_compress_defaults_follow_xz() {
+        let Ok(XzCommand::Compress(args)) = xz(&["compress", "data.tar"]) else {
+            panic!("expected xz compress");
+        };
+        assert_eq!(args.input, PathBuf::from("data.tar"));
+        assert_eq!(args.output, None);
+        assert_eq!(args.level, 6);
+        assert!(!args.extreme);
+        assert_eq!(args.check, XzCheck::Crc64);
+        assert_eq!(args.block_size, None);
+        assert_eq!(args.threads, None);
+        assert_eq!(args.memory_mib, None);
+    }
+
+    #[test]
+    fn xz_compress_takes_every_option() {
+        let Ok(XzCommand::Compress(args)) = xz(&[
+            "compress",
+            "-",
+            "out.xz",
+            "--level",
+            "9",
+            "--extreme",
+            "-s",
+            "65536",
+            "--check",
+            "sha256",
+            "--threads",
+            "4",
+            "--memory-mib",
+            "512",
+        ]) else {
+            panic!("expected xz compress");
+        };
+        assert_eq!(args.input, PathBuf::from("-"));
+        assert_eq!(args.output, Some(PathBuf::from("out.xz")));
+        assert_eq!(args.level, 9);
+        assert!(args.extreme);
+        assert_eq!(args.block_size, Some(65_536));
+        assert_eq!(args.check, XzCheck::Sha256);
+        assert_eq!(args.threads, Some(4));
+        assert_eq!(args.memory_mib, Some(512));
+    }
+
+    #[test]
+    fn xz_rejects_out_of_range_values() {
+        for arguments in [
+            &["compress", "a", "--level", "10"][..],
+            &["compress", "a", "--threads", "0"],
+            &["compress", "a", "--block-size", "0"],
+            &["compress", "a", "--check", "md5"],
+            &["decompress", "a.xz", "--memory-mib", "0"],
+            &["test", "a.xz", "--threads", "0"],
+            &["list"],
+        ] {
+            assert!(xz(arguments).is_err(), "{arguments:?} should not parse");
+        }
+    }
+
+    #[test]
+    fn xz_decode_actions_share_their_resource_flags() {
+        let Ok(XzCommand::Decompress(args)) = xz(&["decompress", "a.xz", "-", "--threads", "2"])
+        else {
+            panic!("expected xz decompress");
+        };
+        assert_eq!(args.output, Some(PathBuf::from("-")));
+        assert_eq!(args.decode.threads, Some(2));
+        assert_eq!(args.decode.memory_mib, 1024);
+        let Ok(XzCommand::Test(args)) = xz(&["test", "a.xz", "--memory-mib", "64"]) else {
+            panic!("expected xz test");
+        };
+        assert_eq!(args.decode.threads, None);
+        assert_eq!(args.decode.memory_mib, 64);
+        let Ok(XzCommand::List(args)) = xz(&["list", "a.xz"]) else {
+            panic!("expected xz list");
+        };
+        assert_eq!(args.input, PathBuf::from("a.xz"));
+    }
+
+    #[test]
+    fn xz_honours_the_global_flags() {
+        let cli = Cli::try_parse_from([
+            "rarpar",
+            "--json",
+            "--overwrite",
+            "xz",
+            "decompress",
+            "a.xz",
+            "--dry-run",
+        ])
+        .expect("global flags parse around xz");
+        assert!(cli.json && cli.overwrite && cli.dry_run);
     }
 
     #[test]

@@ -15,6 +15,7 @@ mod par3_stream;
 mod password;
 mod rar;
 mod report;
+mod xz;
 
 use std::ffi::OsString;
 use std::process::ExitCode;
@@ -73,6 +74,7 @@ fn run(cli: Cli) -> Result<u8, RarparError> {
         Some(Command::Rar { command }) => run_rar_command(&cli, command),
         Some(Command::Par { command }) => par2::run_command(&cli, command),
         Some(Command::Par3 { command }) => par3::run_command(&cli, command),
+        Some(Command::Xz { command }) => xz::run_command(&cli, command),
         None => {
             if cli.paths.is_empty() {
                 return Err(RarparError::NoInput);
