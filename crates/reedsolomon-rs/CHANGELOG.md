@@ -1,7 +1,10 @@
 # Changelog
 
-## 0.4.11
+## 0.4.10
 
+- Relicensed from GPL-3.0-or-later to Apache-2.0. Releases up to 0.4.9 stay
+  under GPL-3.0-or-later. The README now credits the GF(2^16) kernels ported
+  from ParPar, which is public domain or CC0.
 - `fft::TransformField` can run its transforms as a four-step split (leaf
   2^6). Output is unchanged.
   - `set_four_step` turns it on and `four_step` reports it; it is off by
@@ -14,12 +17,6 @@
     running CPU.
 - `gf_simd::cpu_is_amd` reports whether the CPU vendor is `AuthenticAMD`;
   it is false off x86-64.
-
-## 0.4.10 (2026-10-08)
-
-- Relicensed from GPL-3.0-or-later to Apache-2.0. Releases up to 0.4.9 stay
-  under GPL-3.0-or-later. No code changed. The README now credits the
-  GF(2^16) kernels ported from ParPar, which is public domain or CC0.
 
 ## 0.4.9
 

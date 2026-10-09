@@ -50,7 +50,7 @@ unstable-internals = []
 
 [dependencies]
 ppmd-turbo = "0.1.1"
-reedsolomon-rs = { path = "../reedsolomon-rs", version = "0.4.11", default-features = false }
+reedsolomon-rs = { path = "../reedsolomon-rs", version = "0.4.10", default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 crc-fast = { workspace = true }
