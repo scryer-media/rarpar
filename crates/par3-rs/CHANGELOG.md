@@ -1,10 +1,9 @@
 # Changelog
 
-## 0.5.1
+## 0.5.2
 
-- Relicensed from GPL-3.0-or-later to Apache-2.0. Releases up to 0.5.0 stay
-  under GPL-3.0-or-later. The `reedsolomon-rs` requirement moves to 0.4.10,
-  its first Apache-2.0 release.
+- The `reedsolomon-rs` requirement moves to 0.4.11, for the four-step
+  transform.
 - FFT decode keeps two banks of `capacity` rows instead of a work area the
   width of the transform domain. With workers, on a direct lane over a domain
   wider than twice the capacity, a third bank lets the next fill overlap the
@@ -29,6 +28,12 @@
   `CodecSnapshot::butterflies_skipped` is always zero. The field stays.
 - The FFT experiments behind these choices, including the lanes that were
   dropped, are recorded in [PERFORMANCE.md](PERFORMANCE.md#fft-decode-and-transform-experiments-2026-10).
+
+## 0.5.1 (2026-10-08)
+
+- Relicensed from GPL-3.0-or-later to Apache-2.0. Releases up to 0.5.0 stay
+  under GPL-3.0-or-later. No code changed; the `reedsolomon-rs` requirement
+  moves to 0.4.10, its first Apache-2.0 release.
 
 ## 0.5.0
 
