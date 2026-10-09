@@ -21,8 +21,8 @@
   restriction is unchanged and still governs the RAR engine; `LICENSE` keeps
   that paragraph in full and now carries the Apache License 2.0 text.
   Releases up to 0.10.9 stay under GPL-3.0-or-later with the same
-  restriction. The `reedsolomon-rs` requirement moves to 0.4.10, its first
-  Apache-2.0 release.
+  restriction. The `reedsolomon-rs` requirement moves to 0.4.11; its first
+  Apache-2.0 release is 0.4.10.
 - RAR3 PPMd blocks decode through the `ppmd-turbo` crate. Its `RarPpmd`
   holds the variant H model and the carry-less range coder across blocks and
   solid members and decodes runs of literals up to the escape character

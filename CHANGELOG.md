@@ -51,8 +51,8 @@ documented in each crate's own changelog so those notes ship with the crate.
   unchanged, and a PPMd stream that overruns its packed data by more than 64
   bytes now fails at that symbol rather than at the next output flush. The
   `ppmd-debug` feature and `UNRAR_RS_RAR4_DEBUG_PPM` are gone.
-- The libraries `rarpar` links changed license: `reedsolomon-rs` 0.4.10 and
-  `par3-rs` 0.5.1 are Apache-2.0, and `unrar-rs` 0.11.0 is Apache-2.0 plus
+- The libraries `rarpar` links changed license: `reedsolomon-rs` 0.4.11 and
+  `par3-rs` 0.5.2 are Apache-2.0, and `unrar-rs` 0.11.0 is Apache-2.0 plus
   the unRAR license restriction. `par2-rs` stays GPL-3.0-or-later. The CLI
   itself is unchanged: GPL-3.0-or-later with its section 7 permission to
   combine with `unrar-rs`, and its binaries still carry the unRAR
@@ -69,11 +69,12 @@ documented in each crate's own changelog so those notes ship with the crate.
   caller-set bound on the PPMd model arena (`Limits::max_ppmd_arena_size`,
   default the format's 256 MiB), and the move to Apache-2.0 plus the unRAR
   restriction.
-- par3-rs 0.5.1 (pinned exactly): the move to Apache-2.0, an FFT decode
-  that keeps two banks of `capacity` rows (lower charged memory, faster
-  repair), and the four-step transform on AMD CPUs with AVX2 kernels.
-- reedsolomon-rs 0.4.10: the move to Apache-2.0, and the four-step transform
-  with its CPU gate.
+- par3-rs 0.5.2 (pinned exactly): an FFT decode that keeps two banks of
+  `capacity` rows (lower charged memory, faster repair), and the four-step
+  transform on AMD CPUs with AVX2 kernels, on top of 0.5.1, the move to
+  Apache-2.0.
+- reedsolomon-rs 0.4.11: the four-step transform with its CPU gate, on top
+  of 0.4.10, the move to Apache-2.0.
 - par2-rs 0.10.8: unchanged.
 
 ## rarpar 0.6.0
