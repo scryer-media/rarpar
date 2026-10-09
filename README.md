@@ -215,6 +215,13 @@ variable scheme by default and can be selected as `uniform` with
 `--volume-scheme`, then split with `--volume-count`. `--memory-mib` sets the
 creator's bounded planning/working budget.
 
+With the global `-o DIR`, a relative OUTPUT is written under DIR (an absolute
+OUTPUT wins), but `--base-path` still defaults to the parent of OUTPUT as typed,
+so the inputs are found where they were and an explicit `--base-path` is used
+as given. `rarpar -o sets par create set.par2 input.bin` writes
+`sets/set.par2` protecting `./input.bin`; verify it with the data's directory
+as a search directory (`rarpar par verify sets/set.par2 .`).
+
 Creation honors the global safety/reporting flags:
 
 ```bash
@@ -360,7 +367,7 @@ name inside it, and standard input defaults to standard output. When both
 `-o DIR` and OUTPUT are given, a relative OUTPUT is placed under DIR keeping its
 own subdirectories (`-o out ... sub/a.xz` writes `out/sub/a.xz`), an absolute
 OUTPUT wins and ignores `-o`, and `-` is always standard output; `par3 create`
-places its OUTPUT the same way. Inputs are
+and `par3 archive` place their OUTPUT the same way. Inputs are
 always kept, so `--delete-sources` is refused. An existing output requires
 `--overwrite`; the output is staged beside its destination, installed only once
 complete, and keeps the input's permissions and modification time. Compressed

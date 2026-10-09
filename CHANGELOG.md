@@ -30,9 +30,11 @@ documented in each crate's own changelog so those notes ship with the crate.
   input, reporting damaged and missing slices and whether the set could repair
   them. `par repair` exits 2 when given `-` or `--name`.
 - The global `-o/--output` directory is no longer dropped when a command also
-  takes a positional OUTPUT: for `xz compress`, `xz decompress` and
-  `par3 create`, a relative OUTPUT is placed under it and an absolute one
-  wins.
+  takes a positional OUTPUT: for `xz compress`, `xz decompress`,
+  `par create`, `par3 create` and `par3 archive`, a relative OUTPUT is placed
+  under it and an absolute one wins. Inputs are still found where they were:
+  `par create`'s `--base-path` defaults to the parent of OUTPUT as typed.
+- `par3 create -` no longer needs the `sevenz` feature.
 - RAR3 PPMd members extract faster: `unrar-rs` 0.11.0 decodes them through
   the `ppmd-turbo` crate, 1.16-1.71x faster than 0.6.0 on the RAR4 PPMd
   fixtures (32 MiB order-16 member: 3.41 s wall, from 4.71 s). Output is

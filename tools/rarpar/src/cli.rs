@@ -63,7 +63,8 @@ pub struct Cli {
     pub dry_run: bool,
 
     /// Extraction output directory; multiple detected sets get separate subdirectories. For `xz
-    /// compress`, `xz decompress` and `par3 create`, a relative OUTPUT is placed under it.
+    /// compress`, `xz decompress`, `par create`, `par3 create` and `par3 archive`, a relative
+    /// OUTPUT is placed under it.
     #[arg(short = 'o', long, global = true, value_name = "DIR")]
     pub output: Option<PathBuf>,
 
