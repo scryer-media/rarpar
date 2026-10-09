@@ -14,6 +14,13 @@
 //! recovery row be accumulated before the file's length is known, and lets a
 //! block whose first bytes are written last (a 7z start header) be corrected
 //! afterwards by adding the difference.
+//!
+//! `par3 create -` uses it for a set over standard input in every build; the
+//! archive writer and the PAR-inside geometry exist only with `sevenz`.
+
+// Without `sevenz` only the standard-input set is built; the archive and
+// PAR-inside pieces stay compiled so both builds check the same module.
+#![cfg_attr(not(feature = "sevenz"), allow(dead_code))]
 
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};

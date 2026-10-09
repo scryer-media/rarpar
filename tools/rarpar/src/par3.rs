@@ -899,15 +899,7 @@ fn create(cli: &Cli, args: &Par3CreateArgs) -> Result<(bool, Value), RarparError
         _ => None,
     };
     if let Some(input) = stream {
-        #[cfg(feature = "sevenz")]
         return crate::par3_pipe::create(cli, &input, args);
-        #[cfg(not(feature = "sevenz"))]
-        {
-            let _ = input;
-            return Err(RarparError::Usage(
-                "creating a set from standard input needs the sevenz feature".into(),
-            ));
-        }
     }
     if args.name.is_some() {
         return Err(RarparError::Usage(
