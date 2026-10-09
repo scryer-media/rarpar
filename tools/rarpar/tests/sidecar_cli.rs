@@ -475,6 +475,38 @@ fn an_xz_output_named_like_its_set_index_is_refused_before_anything_is_written()
     }
 }
 
+#[test]
+fn a_par2_sidecar_of_many_tiny_rows_counts_each_row_against_the_memory_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("data"), noise(1000, 6)).unwrap();
+    // 65,535 four-byte rows are 256 KiB of bytes, but each is its own
+    // allocation in a list of vectors: well past 1 MiB in all.
+    let output = rarpar(
+        root,
+        &[
+            "--dry-run",
+            "--par3-memory-mib",
+            "1",
+            "xz",
+            "compress",
+            "--sidecar",
+            "par2",
+            "--sidecar-block-size",
+            "1",
+            "--sidecar-recovery-count",
+            "65535",
+            "data",
+        ],
+    );
+    code(&output, 4);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--par3-memory-mib"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[cfg(feature = "sevenz")]
 mod archives {
     use super::*;
