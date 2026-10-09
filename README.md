@@ -240,6 +240,20 @@ rarpar r -B ./release ./release/release.par2 "*.rar"
 
 The explicit `rarpar par ...` commands remain the general-purpose interface.
 
+`par verify` can check one protected file as it streams in, without saving it
+first: give the set as a path and name the file the stream is with `--name`.
+
+```bash
+curl -s "$URL" | rarpar par verify release.par2 --name part01.rar
+```
+
+The stream is hashed one slice at a time in memory that does not depend on its
+length. The report names the damaged slices, how many are missing from a short
+stream or trail a long one, and whether the set's recovery blocks could repair
+it; an intact stream exits 0 and a damaged one 1. An unknown `--name` exits 2
+and lists the names the set protects. `par repair` works on files on disk only
+and exits 2 when given `-` or `--name`.
+
 PAR3 operations:
 
 ```bash
@@ -262,6 +276,25 @@ one recovery index in each cohort — so `--first-recovery` takes a multiple of
 the cohort count and a recovery count or percentage is completed to the whole
 rows that hold it. Percentage sizing uses the block count after deduplication
 and requires a second planning pass over sources.
+
+`par3 create OUTPUT -` (or an absent FILE when standard input is not a terminal)
+makes a set for one file read from standard input:
+
+```bash
+tar -c ./release | rarpar par3 create release.tar.par3 - \
+  --name release.tar -s 1048576 -c 16
+```
+
+The stream's length is unknown until it ends, so `--name` (the file name the set
+records), `-s/--block-size` and `-c/--recovery-count` are required, and options
+that depend on the length or on seeing the data twice (`-r`, FFT, interleave,
+`--first-recovery`, deduplication, data packets, volume sizing, `--base-path`,
+`--scratch-dir`) are refused. The data is read once as it arrives and never
+buffered or staged to a temporary file; memory is the recovery blocks plus a few
+dozen bytes per input block (twice the recovery blocks until the stream passes
+128 blocks, while the set's field is still open). OUTPUT is a stem or `.par3`
+path, or an existing directory that takes `--name` inside it. The set is laid out
+as `par3 archive` lays out its sibling sets; verify it against the saved file.
 
 Use `--dry-run --json par3 create ...` to obtain output paths, sizes, block counts,
 and scratch requirements without writing. Existing carriers require `--overwrite`;

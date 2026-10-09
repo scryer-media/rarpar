@@ -21,6 +21,14 @@ documented in each crate's own changelog so those notes ship with the crate.
   are always kept,
   existing outputs need `--overwrite`, outputs keep the input's permissions
   and modification time, and `--json` reports every action.
+- `par3 create OUTPUT -` makes a PAR3 set for one file read from standard
+  input in one pass, in memory bounded by the recovery blocks, with no
+  temporary files. It requires `--name`, `-s/--block-size` and
+  `-c/--recovery-count`, and refuses the options that depend on the stream's
+  length. `par3 create`'s `-s` default of 1 MiB is unchanged for files.
+- `par verify SET --name NAME` verifies one protected file read from standard
+  input, reporting damaged and missing slices and whether the set could repair
+  them. `par repair` exits 2 when given `-` or `--name`.
 - RAR3 PPMd members extract faster: `unrar-rs` 0.11.0 decodes them through
   the `ppmd-turbo` crate, 1.16-1.71x faster than 0.6.0 on the RAR4 PPMd
   fixtures (32 MiB order-16 member: 3.41 s wall, from 4.71 s). Output is
