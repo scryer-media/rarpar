@@ -434,6 +434,190 @@ fn an_xz_par2_overwrite_refuses_to_leave_obsolete_volumes_behind() {
     ok(&rarpar(root, &["--quiet", "par", "verify", "data.xz.par2"]));
 }
 
+#[test]
+fn an_xz_output_named_like_its_set_index_is_refused_before_anything_is_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("data"), noise(20_000, 4)).unwrap();
+    for format in ["par2", "par3"] {
+        let alias = format!("archive.{format}");
+        let sized = [
+            "--sidecar",
+            format,
+            "--sidecar-block-size",
+            "4096",
+            "--sidecar-recovery-count",
+            "2",
+        ];
+        // A file OUTPUT, directly and under the global -o directory.
+        for head in [&["--overwrite"][..], &["--overwrite", "-o", "placed"][..]] {
+            let mut args: Vec<&str> = head.to_vec();
+            args.extend(["xz", "compress"]);
+            args.extend(sized);
+            args.extend(["data", &alias]);
+            let output = rarpar(root, &args);
+            code(&output, 2);
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("both be written"),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        // Standard output saved under a name the set's index would take.
+        let mut args = vec!["--overwrite", "xz", "compress"];
+        args.extend(sized);
+        args.extend(["--sidecar-name", &alias, "-"]);
+        let output = through_pipes(root, &args, noise(1000, 1));
+        code(&output, 2);
+        assert!(output.stdout.is_empty());
+        assert!(!root.join(&alias).exists());
+        assert!(!root.join("placed").exists());
+    }
+}
+
+#[test]
+fn a_par2_sidecar_of_many_tiny_rows_counts_each_row_against_the_memory_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("data"), noise(1000, 6)).unwrap();
+    // 65,535 four-byte rows are 256 KiB of bytes, but each is its own
+    // allocation in a list of vectors: well past 1 MiB in all.
+    let output = rarpar(
+        root,
+        &[
+            "--dry-run",
+            "--par3-memory-mib",
+            "1",
+            "xz",
+            "compress",
+            "--sidecar",
+            "par2",
+            "--sidecar-block-size",
+            "1",
+            "--sidecar-recovery-count",
+            "65535",
+            "data",
+        ],
+    );
+    code(&output, 4);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--par3-memory-mib"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn a_sidecar_block_size_that_cannot_be_rounded_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("data"), noise(1000, 8)).unwrap();
+    let largest = u64::MAX.to_string();
+    let even = (u64::MAX - 1).to_string();
+    // PAR3 rounds an odd size up to even, PAR2 up to a multiple of four.
+    for (format, size) in [("par3", &largest), ("par2", &largest), ("par2", &even)] {
+        let output = rarpar(
+            root,
+            &[
+                "--dry-run",
+                "xz",
+                "compress",
+                "--sidecar",
+                format,
+                "--sidecar-block-size",
+                size,
+                "--sidecar-recovery-count",
+                "1",
+                "data",
+            ],
+        );
+        code(&output, 2);
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("cannot be rounded"),
+            "{format} {size}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // A set over standard input takes the same plan.
+    let output = through_pipes(
+        root,
+        &[
+            "--dry-run",
+            "par3",
+            "create",
+            "set.par3",
+            "-",
+            "--name",
+            "piece",
+            "-s",
+            &largest,
+            "-c",
+            "1",
+        ],
+        noise(100, 2),
+    );
+    code(&output, 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_sidecar_for_a_name_that_is_not_utf8_is_refused() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("data"), noise(5000, 10)).unwrap();
+    let bad = OsStr::from_bytes(b"bad\xff.xz");
+    let listing = || {
+        let mut names: Vec<_> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = listing();
+    for format in ["par2", "par3"] {
+        // An xz OUTPUT the set would be named after.
+        let output = Command::new(env!("CARGO_BIN_EXE_rarpar"))
+            .current_dir(root)
+            .args([
+                "xz",
+                "compress",
+                "--sidecar",
+                format,
+                "--sidecar-block-size",
+                "4096",
+                "--sidecar-recovery-count",
+                "2",
+                "data",
+            ])
+            .arg(bad)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        code(&output, 2);
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("UTF-8"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(listing(), before);
+    }
+    // A set over standard input placed at an OUTPUT that is not UTF-8.
+    let output = Command::new(env!("CARGO_BIN_EXE_rarpar"))
+        .current_dir(root)
+        .args(["par3", "create"])
+        .arg(OsStr::from_bytes(b"set\xff.par3"))
+        .args(["-", "--name", "piece", "-s", "4096", "-c", "2"])
+        .stdin(std::fs::File::open(root.join("data")).unwrap())
+        .output()
+        .unwrap();
+    code(&output, 2);
+    assert_eq!(listing(), before);
+}
+
 #[cfg(feature = "sevenz")]
 mod archives {
     use super::*;
@@ -606,6 +790,34 @@ mod archives {
             assert_eq!(report["set_format"], "par3");
             assert_eq!(report["read_back"], false);
             verify_damage_repair(&root.join("out"), "par3", "set.par3", name);
+        }
+    }
+
+    #[test]
+    fn an_archive_named_like_its_sidecar_index_is_refused() {
+        let dir = fixture();
+        let root = dir.path();
+        for (format, set, sized) in [
+            ("zip", "par2", &["-s", "8192", "-c", "2"][..]),
+            ("zip", "par3", &["-s", "8192", "-c", "2"][..]),
+            ("7z", "par3", &["-s", "8192", "-c", "2"][..]),
+        ] {
+            let target = format!("out/set.{set}");
+            let mut args = vec![
+                "--overwrite",
+                "par3",
+                "archive",
+                "--base-path",
+                "in",
+                "--format",
+                format,
+                "--sidecar",
+                set,
+            ];
+            args.extend_from_slice(sized);
+            args.extend_from_slice(&[&target, "static.bin"]);
+            code(&rarpar(root, &args), 2);
+            assert!(!root.join(&target).exists());
         }
     }
 

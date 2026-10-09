@@ -52,9 +52,19 @@ impl SidecarPlan {
         block_size: u64,
         rows: u64,
     ) -> Result<Self, RarparError> {
+        // A Cauchy set over GF(2^16) codes in two-byte symbols, so
+        // par3cmdline rounds an odd block size up; a PAR2 slice is a
+        // multiple of four bytes. The largest sizes have nothing above them.
+        let multiple = match format {
+            SidecarFormat::Par3 => 2,
+            SidecarFormat::Par2 => 4,
+        };
+        if block_size.checked_next_multiple_of(multiple).is_none() {
+            return Err(RarparError::Usage(format!(
+                "--sidecar-block-size {block_size} cannot be rounded up to a multiple of {multiple}"
+            )));
+        }
         let block_size = match format {
-            // A Cauchy set over GF(2^16) codes in two-byte symbols, so
-            // par3cmdline rounds an odd block size up.
             SidecarFormat::Par3 => {
                 sibling_geometry(0, Some(block_size), RecoveryChoice::Count(0)).block_size
             }
@@ -290,6 +300,20 @@ impl Sidecar {
                     geometry.galois,
                     reference_field(geometry.blocks, 0, geometry.recovery, 0)
                 );
+                // A file too short for one block has no recovery rows and
+                // codes in GF(2^8), which a stream asked for 256 rows or more
+                // never started; its coding is empty, so it is made here.
+                if geometry.blocks == 0
+                    && !lane
+                        .codings()
+                        .iter()
+                        .any(|coding| coding.galois() == geometry.galois)
+                {
+                    lane.add_coding(
+                        Coding::new(geometry.galois, 0, 0, block_size)
+                            .map_err(RarparError::Data)?,
+                    );
+                }
                 let codings = lane.codings_mut();
                 codings.retain(|coding| coding.galois() == geometry.galois);
                 let Some(coding) = codings.first_mut() else {
@@ -384,6 +408,14 @@ pub(crate) fn preflight_set(
     plan: &SidecarPlan,
     stem: &Path,
 ) -> Result<Vec<PathBuf>, RarparError> {
+    // The set's files are named after the stem as UTF-8 text; a stem that
+    // is not would place them under another name.
+    if stem.file_name().is_some_and(|name| name.to_str().is_none()) {
+        return Err(RarparError::Usage(format!(
+            "a set's files are named after {} as UTF-8, which it is not",
+            stem.display()
+        )));
+    }
     let paths = plan.paths(stem);
     preflight(&paths, cli.overwrite)?;
     match plan.format {

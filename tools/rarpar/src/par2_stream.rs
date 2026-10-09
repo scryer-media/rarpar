@@ -49,17 +49,20 @@ pub(crate) fn slice_size(requested: u64) -> u64 {
     requested.max(4).next_multiple_of(4)
 }
 
-/// Bytes a lane holds whatever the file's length: its recovery blocks, the
-/// slice being filled and the 16 KiB prefix.
+/// Bytes a lane holds whatever the file's length: its recovery blocks, each
+/// its own allocation in a list of vectors, the factor list a slice is folded
+/// with, the slice being filled and the 16 KiB prefix.
 pub(crate) fn lane_bytes(slice_size: u64, rows: u64) -> u64 {
-    slice_size
-        .saturating_mul(rows)
+    const FACTOR: u64 = std::mem::size_of::<FactorDst<'static>>() as u64;
+    crate::par3_stream::coding_bytes(slice_size, rows)
+        .saturating_add(FACTOR.saturating_mul(rows))
         .saturating_add(slice_size)
         .saturating_add(HASH_16K as u64)
 }
 
-/// Bytes per input slice a lane keeps: its MD5 and CRC-32.
-pub(crate) const BYTES_PER_SLICE: u64 = 20;
+/// Bytes per input slice a lane keeps: its MD5 and CRC-32, their copy in the
+/// checksum packet the set is built with, and the slice's constant.
+pub(crate) const BYTES_PER_SLICE: u64 = 2 * 20 + 2;
 
 /// The recovery blocks of one file's set, accumulated as its bytes arrive.
 pub(crate) struct Par2Lane {

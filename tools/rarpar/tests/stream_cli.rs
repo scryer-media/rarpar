@@ -198,6 +198,33 @@ fn par3_create_from_a_pipe_verifies_and_repairs_like_a_set_made_from_the_file() 
 }
 
 #[test]
+fn par3_create_from_a_pipe_too_short_for_a_block_still_makes_a_set() {
+    // 32 bytes hold no 40-byte block, so the set has no recovery rows and
+    // codes in GF(2^8), whatever the requested count; at 256 rows and above
+    // the stream starts out coding only in GF(2^16).
+    for rows in ["255", "256", "1000"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let data = sample(32, 41);
+        let created = through_pipes(
+            root,
+            &[
+                "--json", "par3", "create", "set.par3", "--name", "tiny.bin", "-s", "40", "-c",
+                rows,
+            ],
+            data.clone(),
+        );
+        ok(&created);
+        let report = json(&created);
+        assert_eq!(report["blocks"], 0, "{rows} rows");
+        assert_eq!(report["recovery_blocks"], 0, "{rows} rows");
+        assert_eq!(report["field_bytes"], 1, "{rows} rows");
+        std::fs::write(root.join("tiny.bin"), &data).unwrap();
+        assert_eq!(par3_verdicts(root, "set.par3").0, Some(0), "{rows} rows");
+    }
+}
+
+#[test]
 fn par3_create_from_a_pipe_honours_dash_and_the_output_directory() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
