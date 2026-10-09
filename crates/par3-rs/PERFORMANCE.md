@@ -3,7 +3,7 @@
 ## FFT decode and transform experiments, 2026-10
 
 Seven experimental FFT-codec lanes were measured against the 0.5.0 default
-on three AWS hosts. Two shipped in 0.5.2; the others were dropped, and their
+on three AWS hosts. Two shipped in 0.5.1; the others were dropped, and their
 code is gone. This section is their record.
 
 ### What shipped
