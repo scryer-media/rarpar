@@ -410,6 +410,20 @@ fn sidecar_target(
                 stem.display()
             ))
         })?;
+    // An output named like its own set's index (`archive.par2` with a PAR2
+    // set) would have the set installed over it, as `par3 archive` refuses.
+    if let Some(alias) = plan.paths(&stem).into_iter().find(|path| {
+        path.file_name()
+            .zip(stem.file_name())
+            .is_some_and(|(set, output)| set.eq_ignore_ascii_case(output))
+    }) {
+        return Err(RarparError::Usage(format!(
+            "the output and its {} set would both be written to {}; give the output a name that does not end in .{}",
+            sidecar::format_name(plan.format),
+            alias.display(),
+            sidecar::format_name(plan.format)
+        )));
+    }
     crate::par3::reject_symlinks(&stem)?;
     sidecar::preflight_set(cli, &plan, &stem)?;
     plan.check_budget(cli.par3_memory_mib)?;

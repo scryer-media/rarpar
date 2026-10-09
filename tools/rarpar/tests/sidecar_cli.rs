@@ -434,6 +434,47 @@ fn an_xz_par2_overwrite_refuses_to_leave_obsolete_volumes_behind() {
     ok(&rarpar(root, &["--quiet", "par", "verify", "data.xz.par2"]));
 }
 
+#[test]
+fn an_xz_output_named_like_its_set_index_is_refused_before_anything_is_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("data"), noise(20_000, 4)).unwrap();
+    for format in ["par2", "par3"] {
+        let alias = format!("archive.{format}");
+        let sized = [
+            "--sidecar",
+            format,
+            "--sidecar-block-size",
+            "4096",
+            "--sidecar-recovery-count",
+            "2",
+        ];
+        // A file OUTPUT, directly and under the global -o directory.
+        for head in [&["--overwrite"][..], &["--overwrite", "-o", "placed"][..]] {
+            let mut args: Vec<&str> = head.to_vec();
+            args.extend(["xz", "compress"]);
+            args.extend(sized);
+            args.extend(["data", &alias]);
+            let output = rarpar(root, &args);
+            code(&output, 2);
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("both be written"),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        // Standard output saved under a name the set's index would take.
+        let mut args = vec!["--overwrite", "xz", "compress"];
+        args.extend(sized);
+        args.extend(["--sidecar-name", &alias, "-"]);
+        let output = through_pipes(root, &args, noise(1000, 1));
+        code(&output, 2);
+        assert!(output.stdout.is_empty());
+        assert!(!root.join(&alias).exists());
+        assert!(!root.join("placed").exists());
+    }
+}
+
 #[cfg(feature = "sevenz")]
 mod archives {
     use super::*;
@@ -606,6 +647,34 @@ mod archives {
             assert_eq!(report["set_format"], "par3");
             assert_eq!(report["read_back"], false);
             verify_damage_repair(&root.join("out"), "par3", "set.par3", name);
+        }
+    }
+
+    #[test]
+    fn an_archive_named_like_its_sidecar_index_is_refused() {
+        let dir = fixture();
+        let root = dir.path();
+        for (format, set, sized) in [
+            ("zip", "par2", &["-s", "8192", "-c", "2"][..]),
+            ("zip", "par3", &["-s", "8192", "-c", "2"][..]),
+            ("7z", "par3", &["-s", "8192", "-c", "2"][..]),
+        ] {
+            let target = format!("out/set.{set}");
+            let mut args = vec![
+                "--overwrite",
+                "par3",
+                "archive",
+                "--base-path",
+                "in",
+                "--format",
+                format,
+                "--sidecar",
+                set,
+            ];
+            args.extend_from_slice(sized);
+            args.extend_from_slice(&[&target, "static.bin"]);
+            code(&rarpar(root, &args), 2);
+            assert!(!root.join(&target).exists());
         }
     }
 
