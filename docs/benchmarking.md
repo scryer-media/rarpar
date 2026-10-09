@@ -391,6 +391,61 @@ disk verification. `--rows engine` keeps only those rows. `--drop-caches`
 drops the page cache before every timed run (Linux, root). Engine rows have no
 reference ratio.
 
+### PAR2 against PAR3
+
+`rarpar-bench par3 versus` runs PAR2 and PAR3 over the same inputs:
+
+```sh
+# Smoke, seconds: every row kind on a 4 MiB set.
+target/rarpar-bench par3 versus --profile versus-smoke \
+  --candidate target/release/rarpar --par2 /path/to/par2 \
+  --work target/vs --out target/par3-versus-smoke
+
+# Re-render the Markdown from a saved results.json.
+target/rarpar-bench par3 versus-report --input target/par3-versus-smoke/results.json
+```
+
+The arms are:
+
+- `par2-rs`: `rarpar par create` and `rarpar par repair`.
+- `par2cmdline-turbo`: the `--par2` binary. Without `--par2`, this arm is
+  skipped and the report says so.
+- `par3-cauchy`: `rarpar par3 create` with the default codec.
+- `par3-fft`: `rarpar par3 create --codec fft`.
+
+Each row fixes one block size, one recovery count and one damage pattern for
+every arm. Each arm creates its own set, then repairs the same damaged copy of
+the inputs together with its own recovery files. Every repaired file is checked
+against the SHA-256 recorded when the inputs were generated; a mismatch, a
+non-zero exit or a missing peak RSS fails the run.
+
+There are two kinds of row:
+
+- An equal-count row runs every arm.
+- An FFT-only row runs the two PAR2 arms against `par3-fft` at 10% and 30%
+  recovery, where Cauchy is not the codec anyone would choose.
+
+The `versus` profile reuses sets A and B from `full`:
+
+- `vs-a-equal` and `vs-b-equal` use 1 MiB blocks at 10% recovery.
+- `vs-a-fft10` and `vs-a-fft30` use 64 KiB blocks.
+
+`versus-smoke` has one row of each kind on a small generated set.
+
+The report gives, per row:
+
+- median wall and CPU time and raw peak RSS for every arm, with the range;
+- a ratio table on one scale, **par2 ÷ par3** median wall time, where a figure
+  above 1 means the PAR3 arm was faster.
+
+Every arm runs at its default thread count, because `rarpar par` has no thread
+flag, so the arms are not thread-matched. `--out` receives `results.json`
+(schema `rarpar-par3-versus-v1`) and `report.md`.
+
+In the fleet, `versus = "versus"` (or `"versus-smoke"`) under
+`[machines.par3]` adds the run after the PAR3 suite. It passes the machine's
+PAR2 oracle as `--par2` when the machine has one.
+
 ### Network-mount rig
 
 `bench/nfs` is a compose project: a kernel nfsd server exporting one `async`

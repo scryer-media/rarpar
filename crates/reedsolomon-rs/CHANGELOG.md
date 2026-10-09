@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.10 (2026-10-08)
+## 0.4.10
 
 - Relicensed from GPL-3.0-or-later to Apache-2.0. Releases up to 0.4.9 stay
   under GPL-3.0-or-later. The README now credits the GF(2^16) kernels ported
