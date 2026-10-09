@@ -290,7 +290,7 @@ fn compress(cli: &Cli, input: &Path, args: &XzCompressArgs) -> Result<Value, Rar
         Some(output) => preflight_output(cli, input, output)?,
         None => refuse_terminal_stdout("compressed data")?,
     }
-    let sidecar = sidecar_target(cli, output.as_deref(), &args.sidecar)?;
+    let sidecar = sidecar_target(cli, input, output.as_deref(), &args.sidecar)?;
     let memory_estimate = memory_estimate.saturating_add(
         sidecar
             .as_ref()
@@ -381,9 +381,11 @@ fn compress(cli: &Cli, input: &Path, args: &XzCompressArgs) -> Result<Value, Rar
 /// the stem its files are named by. A file output names both; standard
 /// output has no name, so `--sidecar-name` gives the one the operator will
 /// save it under. Every file the set will be written to is checked now,
-/// before a byte is read.
+/// before a byte is read, and none of them may be the input: the input is
+/// kept, and the set is installed after it has been read.
 fn sidecar_target(
     cli: &Cli,
+    input: &Path,
     output: Option<&Path>,
     args: &SidecarArgs,
 ) -> Result<Option<(SidecarPlan, String, PathBuf)>, RarparError> {
@@ -436,6 +438,23 @@ fn sidecar_target(
             alias.display(),
             sidecar::format_name(plan.format)
         )));
+    }
+    // With the archive on standard output, `--sidecar-name` can name the
+    // input's own stem (`--sidecar-name foo` while compressing `foo.par3`),
+    // and `--overwrite` would then install the set over the input it was
+    // computed from. The input is a file that exists, so a planned path is
+    // it only if it exists and resolves to the same file.
+    if !is_stdio(input) {
+        let source = input.canonicalize()?;
+        for path in plan.paths(&stem) {
+            if path.exists() && path.canonicalize()? == source {
+                return Err(RarparError::Unsafe(format!(
+                    "the {} set would be written over the input: {}",
+                    sidecar::format_name(plan.format),
+                    path.display()
+                )));
+            }
+        }
     }
     crate::par3::reject_symlinks(&stem)?;
     sidecar::preflight_set(cli, &plan, &stem)?;

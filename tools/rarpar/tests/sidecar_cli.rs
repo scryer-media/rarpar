@@ -476,6 +476,47 @@ fn an_xz_output_named_like_its_set_index_is_refused_before_anything_is_written()
 }
 
 #[test]
+fn an_xz_sidecar_that_would_replace_the_input_is_refused_before_anything_is_written() {
+    for format in ["par2", "par3"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // The input is named like the index of the set `--sidecar-name`
+        // asks for, so installing that set would replace it.
+        let input = format!("source.{format}");
+        let before = noise(20_000, 4);
+        std::fs::write(root.join(&input), &before).unwrap();
+        let output = rarpar(
+            root,
+            &[
+                "--overwrite",
+                "xz",
+                "compress",
+                "--sidecar",
+                format,
+                "--sidecar-block-size",
+                "4096",
+                "--sidecar-recovery-count",
+                "2",
+                "--sidecar-name",
+                "source",
+                &input,
+                "-",
+            ],
+        );
+        code(&output, 3);
+        let message = String::from_utf8_lossy(&output.stderr);
+        assert!(message.contains("over the input"), "{message}");
+        assert!(output.stdout.is_empty());
+        assert_eq!(std::fs::read(root.join(&input)).unwrap(), before);
+        let names: Vec<String> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, [input.as_str()], "{names:?}");
+    }
+}
+
+#[test]
 fn a_par2_sidecar_of_many_tiny_rows_counts_each_row_against_the_memory_limit() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
