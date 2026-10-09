@@ -389,6 +389,100 @@ fn par_verify_reads_one_protected_file_from_a_pipe() {
     assert_eq!(json(&long)["stream"]["trailing_bytes"], 5);
 }
 
+/// Rewrites a PAR2 set's packets as an untrusted writer could: the Main
+/// packet declares `slice_size`, and every packet is re-signed with the set
+/// ID and packet MD5 that follow from it, so the set still parses.
+fn forge_slice_size(par2: &[u8], slice_size: u64) -> Vec<u8> {
+    const MAGIC: &[u8; 8] = b"PAR2\0PKT";
+    const MAIN: &[u8; 16] = b"PAR 2.0\0Main\0\0\0\0";
+    let mut packets = Vec::new();
+    let mut at = 0;
+    while at + 64 <= par2.len() {
+        assert_eq!(&par2[at..at + 8], MAGIC);
+        let len = u64::from_le_bytes(par2[at + 8..at + 16].try_into().unwrap()) as usize;
+        packets.push(par2[at..at + len].to_vec());
+        at += len;
+    }
+    let main = packets
+        .iter_mut()
+        .find(|packet| &packet[48..64] == MAIN)
+        .unwrap();
+    main[64..72].copy_from_slice(&slice_size.to_le_bytes());
+    let set_id = par2_rs::checksum::md5(&main[64..]);
+    let mut out = Vec::new();
+    for mut packet in packets {
+        packet[32..48].copy_from_slice(&set_id);
+        let digest = par2_rs::checksum::md5(&packet[32..]);
+        packet[16..32].copy_from_slice(&digest);
+        out.extend_from_slice(&packet);
+    }
+    out
+}
+
+#[test]
+fn par_verify_from_a_pipe_refuses_a_slice_size_it_cannot_hold() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let (first, _) = par2_set(root);
+    let index = std::fs::read(root.join("set.par2")).unwrap();
+    std::fs::create_dir(root.join("forged")).unwrap();
+    // A slice of 2^62 bytes: the allocation for one slice would abort.
+    std::fs::write(
+        root.join("forged/set.par2"),
+        forge_slice_size(&index, 1 << 62),
+    )
+    .unwrap();
+    let forged = through_pipes(
+        root,
+        &["par", "verify", "forged/set.par2", "--name", "first.bin"],
+        first.clone(),
+    );
+    assert_eq!(
+        forged.status.code(),
+        Some(1),
+        "stderr={}",
+        String::from_utf8_lossy(&forged.stderr)
+    );
+    let message = String::from_utf8_lossy(&forged.stderr);
+    assert!(message.contains("slice"), "{message}");
+    assert!(message.contains("--par3-memory-mib"), "{message}");
+
+    // A slice the budget can hold still verifies; one just past it does not.
+    let budget = through_pipes(
+        root,
+        &[
+            "--par3-memory-mib",
+            "1",
+            "par",
+            "verify",
+            "set.par2",
+            "--name",
+            "first.bin",
+        ],
+        first.clone(),
+    );
+    ok(&budget);
+    std::fs::write(
+        root.join("forged/set.par2"),
+        forge_slice_size(&index, (1 << 20) + 4),
+    )
+    .unwrap();
+    let over = through_pipes(
+        root,
+        &[
+            "--par3-memory-mib",
+            "1",
+            "par",
+            "verify",
+            "forged/set.par2",
+            "--name",
+            "first.bin",
+        ],
+        first,
+    );
+    assert_eq!(over.status.code(), Some(1));
+}
+
 #[test]
 fn par_verify_from_a_pipe_refuses_what_it_cannot_do() {
     let temp = tempfile::tempdir().unwrap();

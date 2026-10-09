@@ -255,7 +255,9 @@ curl -s "$URL" | rarpar par verify release.par2 --name part01.rar
 ```
 
 The stream is hashed one slice at a time in memory that does not depend on its
-length. The report names the damaged slices, how many are missing from a short
+length. That slice must fit `--par3-memory-mib` (default 256 MiB) and the file
+may have at most 32768 slices; a set that declares more exits 1 before any
+slice is allocated. The report names the damaged slices, how many are missing from a short
 stream or trail a long one, and whether the set's recovery blocks could repair
 it; an intact stream exits 0 and a damaged one 1. An unknown `--name` exits 2
 and lists the names the set protects. `par repair` works on files on disk only
