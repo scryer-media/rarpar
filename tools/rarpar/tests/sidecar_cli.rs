@@ -375,6 +375,65 @@ fn xz_sidecar_options_are_checked_before_any_byte_is_read() {
     assert!(!root.join("dry.xz.par3").exists());
 }
 
+#[test]
+fn an_xz_par2_overwrite_refuses_to_leave_obsolete_volumes_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("data"), noise(200_000, 7)).unwrap();
+    let compress = |count: &str| {
+        rarpar(
+            root,
+            &[
+                "--overwrite",
+                "xz",
+                "compress",
+                "--sidecar",
+                "par2",
+                "--sidecar-block-size",
+                "4096",
+                "--sidecar-recovery-count",
+                count,
+                "data",
+            ],
+        )
+    };
+    let snapshot = || {
+        let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (
+                    entry.file_name().into_string().unwrap(),
+                    std::fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect();
+        files.sort();
+        files
+    };
+    ok(&compress("8"));
+    // A file that only looks like a volume is not part of any set.
+    std::fs::write(root.join("data.xz.vol90+9.par2"), b"not a volume").unwrap();
+    let before = snapshot();
+
+    // Fewer volumes would leave authenticated volumes of the old set.
+    let output = compress("1");
+    code(&output, 3);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("obsolete"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(snapshot(), before);
+    // More volumes rename them, which would orphan the old names too.
+    code(&compress("16"), 3);
+    assert_eq!(snapshot(), before);
+
+    // The same layout replaces every volume of the old set.
+    ok(&compress("8"));
+    ok(&rarpar(root, &["--quiet", "par", "verify", "data.xz.par2"]));
+}
+
 #[cfg(feature = "sevenz")]
 mod archives {
     use super::*;

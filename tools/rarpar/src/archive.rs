@@ -1156,6 +1156,15 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
     if geometry.inside.is_none() {
         // The volume names are known now: check them all before the
         // archive is installed, so a collision leaves nothing half made.
+        //
+        // Unlike a streamed set (`sidecar::preflight_set`), this set is not
+        // checked for obsolete volumes of an earlier one. Its row count, and
+        // so its volume names, follow from the archive's size, which is only
+        // known here after the archive is built; the only check possible
+        // before the build would compare against the index name alone and
+        // refuse every rerun that has volumes. Refusing here instead would
+        // throw away the whole build for a check the operator could not
+        // have satisfied up front.
         let (index, volumes) = par3_stream::sibling_paths(&stem, rows.len() as u64);
         let mut planned = vec![output.clone(), index];
         planned.extend(volumes.iter().map(|(_, _, path)| path.clone()));

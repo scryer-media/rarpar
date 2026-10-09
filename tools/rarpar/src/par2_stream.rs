@@ -269,6 +269,82 @@ fn packet(set_id: &[u8; 16], kind: &[u8; 16], body: &[u8]) -> Vec<u8> {
     packet
 }
 
+/// The largest packet read to authenticate a file as a PAR2 volume. Every
+/// volume carries the set's Main, file description and checksum packets,
+/// which stay far below this; larger packets (recovery slices) are skipped.
+const AUTHENTICATING_PACKET_LIMIT: u64 = 1 << 20;
+
+/// The first volume of an earlier set at `stem` that a new set writing
+/// `outputs` would leave behind: a file named `BASE.vol*.par2` beside the
+/// stem, not among `outputs`, holding at least one PAR2 packet whose hash
+/// checks. A file that only has a volume's name is nobody's volume and is
+/// ignored, as `par3 create` ignores unauthenticated carriers.
+pub(crate) fn obsolete_volume(stem: &Path, outputs: &[PathBuf]) -> io::Result<Option<PathBuf>> {
+    let directory = match stem.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    if !directory.is_dir() {
+        return Ok(None);
+    }
+    let name = stem
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let prefix = format!("{}.vol", name.strip_suffix(".par2").unwrap_or(&name));
+    let planned: Vec<_> = outputs.iter().filter_map(|path| path.file_name()).collect();
+    let mut entries: Vec<_> = std::fs::read_dir(directory)?.collect::<Result<_, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let file_name = entry.file_name();
+        let text = file_name.to_string_lossy();
+        if !text.starts_with(&prefix)
+            || !text.ends_with(".par2")
+            || planned.contains(&file_name.as_os_str())
+            || !entry.file_type()?.is_file()
+        {
+            continue;
+        }
+        if holds_an_authentic_packet(&entry.path())? {
+            return Ok(Some(entry.path()));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether `path` holds a PAR2 packet whose MD5 checks, walking packet
+/// headers from the start and reading only packets up to
+/// [`AUTHENTICATING_PACKET_LIMIT`].
+fn holds_an_authentic_packet(path: &Path) -> io::Result<bool> {
+    use par2_rs::packet::header::PacketHeader;
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    let mut offset = 0u64;
+    let mut header = [0u8; HEADER_SIZE];
+    while length.saturating_sub(offset) >= HEADER_SIZE as u64 {
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut header)?;
+        let Ok(parsed) = PacketHeader::parse(&header, offset) else {
+            return Ok(false);
+        };
+        if parsed.length > length - offset {
+            return Ok(false);
+        }
+        if parsed.length <= AUTHENTICATING_PACKET_LIMIT {
+            let mut packet = header.to_vec();
+            packet.resize(parsed.length as usize, 0);
+            file.read_exact(&mut packet[HEADER_SIZE..])?;
+            if parsed.validate_hash(&packet, offset).is_ok() {
+                return Ok(true);
+            }
+        }
+        offset += parsed.length;
+    }
+    Ok(false)
+}
+
 /// The index file and volume paths of a set named by `stem`, as par2-rs
 /// names them: `stem.par2`, then `stem.volFIRST+COUNT.par2` in power-of-two
 /// volumes.
