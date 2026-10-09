@@ -130,10 +130,9 @@ pub(crate) fn default_block_size(level: u32) -> u64 {
 }
 
 /// What one block thread is estimated to hold: its encoder's match finder and
-/// state, the block's input, and the block's compressed output.
-fn per_thread_bytes(level: u32, extreme: bool, block_size: u64) -> u64 {
-    let dict = preset_dict_size(level);
-    let hash_chain = !extreme && level <= 3;
+/// state for a `dict`-byte dictionary, the block's input, and the block's
+/// compressed output.
+fn per_thread_bytes(dict: u64, hash_chain: bool, block_size: u64) -> u64 {
     let encoder = if hash_chain {
         dict * 15 / 2
     } else {
@@ -401,39 +400,44 @@ fn compress(cli: &Cli, args: &XzCompressArgs) -> Result<Value, RarparError> {
     let block_size = args
         .block_size
         .unwrap_or_else(|| default_block_size(args.level));
-    let requested = args.threads.unwrap_or_else(available_threads);
-    let per_thread = per_thread_bytes(args.level, args.extreme, block_size);
-    let threads = match args.memory_mib {
-        None => requested,
-        Some(mib) => {
-            let limit = mib.saturating_mul(MIB);
-            let affordable = limit.saturating_sub(block_size) / per_thread.max(1);
-            if affordable == 0 {
-                return Err(RarparError::Resource(format!(
-                    "level {}{} with {block_size}-byte blocks needs about {} MiB; --memory-mib is {mib}",
-                    args.level,
-                    if args.extreme { " --extreme" } else { "" },
-                    (per_thread + block_size).div_ceil(MIB)
-                )));
-            }
-            requested.min(u32::try_from(affordable).unwrap_or(u32::MAX))
-        }
-    };
     let input_meta = if is_stdio(&args.input) {
         None
     } else {
         Some(open_input(&args.input)?.metadata()?)
     };
+    // A block never holds more than this, so a larger dictionary would only
+    // cost memory: the encoder shrinks it to fit, as 7-Zip's does.
+    let largest_block = input_meta
+        .as_ref()
+        .map_or(block_size, |meta| meta.len().min(block_size));
+    let props = xz_preset(args.level, args.extreme).with_reduce_size(largest_block);
+    let per_thread = per_thread_bytes(
+        u64::from(props.dict_size()),
+        !args.extreme && args.level <= 3,
+        largest_block,
+    );
+    let mut threads = args.threads.unwrap_or_else(available_threads);
     // Threads beyond the number of blocks the input fills would idle.
-    let threads = match &input_meta {
-        Some(meta) => {
-            threads.min(u32::try_from(meta.len().div_ceil(block_size).max(1)).unwrap_or(u32::MAX))
+    if let Some(meta) = &input_meta {
+        let blocks = meta.len().div_ceil(block_size).max(1);
+        threads = threads.min(u32::try_from(blocks).unwrap_or(u32::MAX));
+    }
+    if let Some(mib) = args.memory_mib {
+        let limit = mib.saturating_mul(MIB);
+        let affordable = limit.saturating_sub(largest_block) / per_thread.max(1);
+        if affordable == 0 {
+            return Err(RarparError::Resource(format!(
+                "level {}{} with {block_size}-byte blocks needs about {} MiB; --memory-mib is {mib}",
+                args.level,
+                if args.extreme { " --extreme" } else { "" },
+                (per_thread + largest_block).div_ceil(MIB)
+            )));
         }
-        None => threads,
-    };
+        threads = threads.min(u32::try_from(affordable).unwrap_or(u32::MAX));
+    }
     let memory_estimate = per_thread
         .saturating_mul(u64::from(threads))
-        .saturating_add(block_size);
+        .saturating_add(largest_block);
     if let Some(output) = &output {
         preflight_output(cli, &args.input, output)?;
     } else if io::stdout().is_terminal() {
@@ -444,12 +448,12 @@ fn compress(cli: &Cli, args: &XzCompressArgs) -> Result<Value, RarparError> {
     let mut report = json!({"operation":"xz_compress","success":true,"dry_run":cli.dry_run,
         "input":display(&args.input),"output":output.as_deref().map_or("-".into(), display),
         "level":args.level,"extreme":args.extreme,"check":check_name(check_type(args.check)),
-        "block_size":block_size,"threads":threads,"memory_estimate_bytes":memory_estimate});
+        "block_size":block_size,"dictionary_bytes":props.dict_size(),"threads":threads,
+        "memory_estimate_bytes":memory_estimate});
     if cli.dry_run {
         return Ok(report);
     }
 
-    let props = xz_preset(args.level, args.extreme);
     let source: Box<dyn Read> = if is_stdio(&args.input) {
         Box::new(io::stdin().lock())
     } else {
