@@ -76,7 +76,7 @@ Fewer redundant reads on the verify and repair paths.
   above). `VerifyOptions::default()` is now written out by hand rather than
   derived; every other field keeps its default.
 
-## 0.10.7
+## 0.10.7 (Unreleased)
 
 ### Fixed
 
