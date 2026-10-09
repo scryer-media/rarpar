@@ -402,14 +402,23 @@ fn sidecar_target(
     };
     let name = stem
         .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !is_stdio(Path::new(name)))
         .ok_or_else(|| {
             RarparError::Usage(format!(
                 "--sidecar-name must name a file, not {}",
                 stem.display()
             ))
-        })?;
+        })?
+        // The set records the name as UTF-8 and is named after it, so a
+        // name that is not UTF-8 would give a set for a different path.
+        .to_str()
+        .ok_or_else(|| {
+            RarparError::Usage(format!(
+                "a sidecar set records its file's name as UTF-8; {} is not",
+                stem.display()
+            ))
+        })?
+        .to_owned();
     // An output named like its own set's index (`archive.par2` with a PAR2
     // set) would have the set installed over it, as `par3 archive` refuses.
     if let Some(alias) = plan.paths(&stem).into_iter().find(|path| {

@@ -394,6 +394,14 @@ pub(crate) fn preflight_set(
     plan: &SidecarPlan,
     stem: &Path,
 ) -> Result<Vec<PathBuf>, RarparError> {
+    // The set's files are named after the stem as UTF-8 text; a stem that
+    // is not would place them under another name.
+    if stem.file_name().is_some_and(|name| name.to_str().is_none()) {
+        return Err(RarparError::Usage(format!(
+            "a set's files are named after {} as UTF-8, which it is not",
+            stem.display()
+        )));
+    }
     let paths = plan.paths(stem);
     preflight(&paths, cli.overwrite)?;
     match plan.format {

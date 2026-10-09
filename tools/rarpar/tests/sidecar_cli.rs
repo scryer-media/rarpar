@@ -559,6 +559,65 @@ fn a_sidecar_block_size_that_cannot_be_rounded_is_a_usage_error() {
     code(&output, 2);
 }
 
+#[cfg(unix)]
+#[test]
+fn a_sidecar_for_a_name_that_is_not_utf8_is_refused() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("data"), noise(5000, 10)).unwrap();
+    let bad = OsStr::from_bytes(b"bad\xff.xz");
+    let listing = || {
+        let mut names: Vec<_> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = listing();
+    for format in ["par2", "par3"] {
+        // An xz OUTPUT the set would be named after.
+        let output = Command::new(env!("CARGO_BIN_EXE_rarpar"))
+            .current_dir(root)
+            .args([
+                "xz",
+                "compress",
+                "--sidecar",
+                format,
+                "--sidecar-block-size",
+                "4096",
+                "--sidecar-recovery-count",
+                "2",
+                "data",
+            ])
+            .arg(bad)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        code(&output, 2);
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("UTF-8"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(listing(), before);
+    }
+    // A set over standard input placed at an OUTPUT that is not UTF-8.
+    let output = Command::new(env!("CARGO_BIN_EXE_rarpar"))
+        .current_dir(root)
+        .args(["par3", "create"])
+        .arg(OsStr::from_bytes(b"set\xff.par3"))
+        .args(["-", "--name", "piece", "-s", "4096", "-c", "2"])
+        .stdin(std::fs::File::open(root.join("data")).unwrap())
+        .output()
+        .unwrap();
+    code(&output, 2);
+    assert_eq!(listing(), before);
+}
+
 #[cfg(feature = "sevenz")]
 mod archives {
     use super::*;
