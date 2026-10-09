@@ -882,6 +882,38 @@ fn reject_obsolete_carriers(
 }
 
 fn create(cli: &Cli, args: &Par3CreateArgs) -> Result<(bool, Value), RarparError> {
+    // One file from standard input, `-`, or no file at all when it is piped.
+    let stream = match args.files.as_slice() {
+        [] => Some(crate::streams::input_or_stdin(None).map_err(|_| {
+            RarparError::Usage(
+                "no input files given and standard input is a terminal; give FILES or `-`".into(),
+            )
+        })?),
+        [only] if crate::streams::is_stdio(only) => Some(only.clone()),
+        files if files.iter().any(|file| crate::streams::is_stdio(file)) => {
+            return Err(RarparError::Usage(
+                "`-` reads one file from standard input and cannot be mixed with other inputs"
+                    .into(),
+            ));
+        }
+        _ => None,
+    };
+    if let Some(input) = stream {
+        #[cfg(feature = "sevenz")]
+        return crate::par3_pipe::create(cli, &input, args);
+        #[cfg(not(feature = "sevenz"))]
+        {
+            let _ = input;
+            return Err(RarparError::Usage(
+                "creating a set from standard input needs the sevenz feature".into(),
+            ));
+        }
+    }
+    if args.name.is_some() {
+        return Err(RarparError::Usage(
+            "--name names a file read from standard input; give `-` as the input".into(),
+        ));
+    }
     let execution = options(cli)?;
     if args.files.len() > cli.max_files {
         return Err(RarparError::Resource(
@@ -942,7 +974,7 @@ fn create(cli: &Cli, args: &Par3CreateArgs) -> Result<(bool, Value), RarparError
     }
     let mut config = CreationOptions {
         execution: execution.clone(),
-        block_size: args.block_size,
+        block_size: args.block_size.unwrap_or(1_048_576),
         codec: match args.codec {
             Par3Codec::Cauchy => {
                 if args.capacity_log2.is_some() || args.interleave != 0 {

@@ -7,6 +7,28 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ### CLI Changes
 
+- New `rarpar xz` commands: `compress`, `decompress`, `test` and `list` for
+  `.xz` files, on `lzma-turbo` 0.6.0. Compression takes the xz presets
+  (`--level` 0-9, `--extreme`), a `--check` of `crc32`, `crc64` (default),
+  `sha256` or `none`, and `--block-size`, and compresses up to `--threads`
+  blocks at once; the bytes do not depend on the thread count. Decompression
+  decodes multi-block files on several threads within `--memory-mib` (default
+  1024), handles concatenated streams and padding, and verifies every check.
+  `-` reads standard input or writes standard output, and an absent INPUT is
+  standard input when it is piped. Every action streams a pipe in bounded
+  memory: decompression and `test` decode a pipe on several threads, and
+  `list` reads a pipe in one pass and names what that cannot report. Inputs
+  are always kept,
+  existing outputs need `--overwrite`, outputs keep the input's permissions
+  and modification time, and `--json` reports every action.
+- `par3 create OUTPUT -` makes a PAR3 set for one file read from standard
+  input in one pass, in memory bounded by the recovery blocks, with no
+  temporary files. It requires `--name`, `-s/--block-size` and
+  `-c/--recovery-count`, and refuses the options that depend on the stream's
+  length. `par3 create`'s `-s` default of 1 MiB is unchanged for files.
+- `par verify SET --name NAME` verifies one protected file read from standard
+  input, reporting damaged and missing slices and whether the set could repair
+  them. `par repair` exits 2 when given `-` or `--name`.
 - RAR3 PPMd members extract faster: `unrar-rs` 0.11.0 decodes them through
   the `ppmd-turbo` crate, 1.16-1.71x faster than 0.6.0 on the RAR4 PPMd
   fixtures (32 MiB order-16 member: 3.41 s wall, from 4.71 s). Output is

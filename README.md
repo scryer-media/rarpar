@@ -26,6 +26,8 @@ writing, compression, or modification APIs.
 - Creates PAR2 recovery sets with validated, atomically committed output
   (`par create`).
 - Restores missing RAR volumes from `.rev` recovery volumes when available.
+- Compresses, decompresses, tests and lists `.xz` files on several threads
+  (`xz compress`, `xz decompress`, `xz test`, `xz list`).
 - Extracts RAR archives with integrity checks enabled.
 - Handles encrypted archives through secure password sources or a hidden
   interactive prompt.
@@ -238,6 +240,20 @@ rarpar r -B ./release ./release/release.par2 "*.rar"
 
 The explicit `rarpar par ...` commands remain the general-purpose interface.
 
+`par verify` can check one protected file as it streams in, without saving it
+first: give the set as a path and name the file the stream is with `--name`.
+
+```bash
+curl -s "$URL" | rarpar par verify release.par2 --name part01.rar
+```
+
+The stream is hashed one slice at a time in memory that does not depend on its
+length. The report names the damaged slices, how many are missing from a short
+stream or trail a long one, and whether the set's recovery blocks could repair
+it; an intact stream exits 0 and a damaged one 1. An unknown `--name` exits 2
+and lists the names the set protects. `par repair` works on files on disk only
+and exits 2 when given `-` or `--name`.
+
 PAR3 operations:
 
 ```bash
@@ -260,6 +276,25 @@ one recovery index in each cohort — so `--first-recovery` takes a multiple of
 the cohort count and a recovery count or percentage is completed to the whole
 rows that hold it. Percentage sizing uses the block count after deduplication
 and requires a second planning pass over sources.
+
+`par3 create OUTPUT -` (or an absent FILE when standard input is not a terminal)
+makes a set for one file read from standard input:
+
+```bash
+tar -c ./release | rarpar par3 create release.tar.par3 - \
+  --name release.tar -s 1048576 -c 16
+```
+
+The stream's length is unknown until it ends, so `--name` (the file name the set
+records), `-s/--block-size` and `-c/--recovery-count` are required, and options
+that depend on the length or on seeing the data twice (`-r`, FFT, interleave,
+`--first-recovery`, deduplication, data packets, volume sizing, `--base-path`,
+`--scratch-dir`) are refused. The data is read once as it arrives and never
+buffered or staged to a temporary file; memory is the recovery blocks plus a few
+dozen bytes per input block (twice the recovery blocks until the stream passes
+128 blocks, while the set's field is still open). OUTPUT is a stem or `.par3`
+path, or an existing directory that takes `--name` inside it. The set is laid out
+as `par3 archive` lays out its sibling sets; verify it against the saved file.
 
 Use `--dry-run --json par3 create ...` to obtain output paths, sizes, block counts,
 and scratch requirements without writing. Existing carriers require `--overwrite`;
@@ -301,6 +336,57 @@ budget covers engine allocations; CLI path/report storage is bounded separately
 by `--max-files` and metadata limits. `auto` repairs before rediscovering and
 extracting RAR inputs. Container insertion/self-repair and recovery-carrier
 reconstruction remain explicit library APIs rather than CLI commands.
+
+xz operations:
+
+```bash
+rarpar xz compress data.tar                    # writes data.tar.xz
+rarpar xz compress --level 9 --extreme --threads 8 data.tar
+rarpar xz decompress data.tar.xz ./out         # writes ./out/data.tar
+rarpar xz test data.tar.xz
+rarpar --json xz list data.tar.xz
+tar -c ./release | rarpar xz compress > release.tar.xz
+curl -s "$URL" | rarpar xz decompress --threads 4 | tar -x
+```
+
+`xz compress [INPUT] [OUTPUT]` and `xz decompress [INPUT] [OUTPUT]` take a file,
+or `-` for standard input or output; an absent INPUT is standard input when that
+is not a terminal. Pipes are read and written as the data flows, never staged
+to a temporary file, in memory that does not depend on the stream's length, and
+a slow reader holds rarpar back rather than growing a buffer. OUTPUT defaults to INPUT with `.xz` added
+(compress) or removed (decompress, where `.txz` becomes `.tar`), beside INPUT or
+in the global `--output` directory; an existing directory as OUTPUT takes that
+name inside it, and standard input defaults to standard output. Inputs are
+always kept, so `--delete-sources` is refused. An existing output requires
+`--overwrite`; the output is staged beside its destination, installed only once
+complete, and keeps the input's permissions and modification time. Compressed
+data is not written to a terminal.
+
+`--level` 0-9 and `--extreme` select the xz preset of that number; the default
+is 6 with a CRC-64 check, and `--check` selects `crc32`, `crc64`, `sha256` or
+`none`. The stream is cut into blocks of `--block-size` bytes, by default three
+times the preset's dictionary (at least 1 MiB) as xz's threaded mode does, and
+up to `--threads` blocks (default: available CPUs) are compressed at once. The
+output bytes do not depend on `--threads`. A dictionary larger than the largest
+block is shrunk to fit it. `--memory-mib` caps the estimated encoder memory by
+running fewer threads; there is no cap by default.
+
+Decompression and `xz test` verify every block's check. A file with more than
+one block is decoded on up to `--threads` threads within `--memory-mib` (default
+1024), with fewer threads when the largest block needs it; single-block files
+and files the parallel decoder cannot map are decoded in one pass, whose
+dictionary must fit the same limit. A pipe is decoded as it arrives: on several
+threads, blocks whose headers record their sizes (as rarpar's and xz's threaded
+output do) go to workers, and other blocks are decoded in order.
+Concatenated streams and stream padding decode as one output. `xz list` reads
+the index of every stream from the end of a file and reports each stream's
+offset, sizes, check, padding and blocks. A pipe has no end to seek to, so
+`xz list -` decodes it once and reports the sizes, the stream and block counts,
+each block's uncompressed size and the first stream's check, with `unknown`
+naming what a single forward pass cannot give. With `--json`, every action prints one
+report; when the data itself goes to standard output, reports go to standard
+error. A damaged stream exits 1, an exceeded memory limit 4, and a refused
+output 3.
 
 PAR2 placement defaults to `smart`, which can locate renamed or moved data by
 content. For a conventional expected-path-only verification or repair, use:
