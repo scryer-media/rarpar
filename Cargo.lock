@@ -2253,6 +2253,7 @@ dependencies = [
  "crc-fast",
  "filetime",
  "libc",
+ "lzma-turbo",
  "mimalloc",
  "par2-rs",
  "par3-rs",
