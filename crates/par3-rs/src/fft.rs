@@ -662,7 +662,11 @@ impl FftCodec {
         }
     }
 
-    /// Algorithm 5 of doi:10.1109/TIT.2026.3685291, original outputs only.
+    /// Algorithm 5 of Chen, Lin, Tang, Han, Cai, Yu, Li, Bai and Bai, "Two
+    /// Fast Erasure Decoding Algorithms for Reed-Solomon Codes Based on
+    /// LCH-FFT", IEEE Trans. Inf. Theory 72(6), 2026,
+    /// doi:10.1109/TIT.2026.3685291 (see ATTRIBUTION.md at the repository
+    /// root), original outputs only.
     /// The code dimension includes known-zero padding: N - capacity, not inputs.
     /// In the reference Cantor basis the subspace polynomials are monic and
     /// s_j(v_j) = 1, so the paper's normalization product is one.

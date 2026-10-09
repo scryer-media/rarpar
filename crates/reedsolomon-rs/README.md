@@ -79,6 +79,10 @@ Several GF(2^16) kernels (the SSSE3 shuffle multiply-add and its block
 prepare and finish steps) are ports of routines from
 [ParPar](https://github.com/animetosho/ParPar) by Anime Tosho, which its
 author released as public domain or CC0. The comments beside each port name
-the routine it follows.
+the routine it follows. The additive transforms in `fft` follow Lin,
+Al-Naffouri, Han and Chung (2016), with the four-step factorization of
+Samanta, Badakhshan and Gong (2026); the full references are in the
+repository's
+[ATTRIBUTION.md](https://github.com/scryer-media/rarpar/blob/main/ATTRIBUTION.md).
 
 [`par2-rs`]: https://crates.io/crates/par2-rs

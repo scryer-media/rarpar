@@ -450,7 +450,11 @@ and format facts established by
 [par3cmdline](https://github.com/Parchive/par3cmdline). No reference code was
 copied into the implementation. Official fixture provenance and creation
 recipes are preserved in the repository; damage tests modify protected inputs
-or model unavailable carrier ranges.
+or model unavailable carrier ranges. The FFT codec follows the additive
+transform and erasure decoder of Lin, Al-Naffouri, Han and Chung (2016) and
+the capacity-window decoder of Chen, Lin, Tang, Han and others (2026); the
+full references are in the repository's
+[ATTRIBUTION.md](https://github.com/scryer-media/rarpar/blob/main/ATTRIBUTION.md).
 
 [API and migration notes](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/CHANGELOG.md).
 

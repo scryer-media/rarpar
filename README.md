@@ -621,6 +621,9 @@ The PAR3 FFT lane shipped today is the additive transform of Lin, Al-Naffouri, H
 
 Error-correcting decoders (the Welch-Berlekamp line, Tang and Han 2022) are not on the radar: PAR3 repair knows which blocks are lost from their checksums, so it only ever decodes erasures.
 
+What each shipped paper contributed, and where it is used, is recorded in
+[ATTRIBUTION.md](ATTRIBUTION.md).
+
 
 ## License
 

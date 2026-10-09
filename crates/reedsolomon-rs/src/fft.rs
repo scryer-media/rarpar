@@ -183,8 +183,10 @@ impl TransformField {
         (levels / 2).clamp(1, levels - 1)
     }
 
-    /// LCH-basis form of the row/column factorization (arXiv:2608.20855,
-    /// section V). Projection by the low subspace polynomial shifts a Cantor
+    /// LCH-basis form of the row/column factorization of Samanta, Badakhshan
+    /// and Gong, "On the Additive FFT Techniques over Binary Extension
+    /// Fields", 2026, arXiv:2608.20855, section V (see ATTRIBUTION.md at the
+    /// repository root). Projection by the low subspace polynomial shifts a Cantor
     /// coordinate right by the split. Inverse reverses the two passes.
     fn four_step_serial<S: Lane>(
         &self,
