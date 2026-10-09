@@ -11,6 +11,8 @@ mod par2;
 mod par3;
 mod par3_inside;
 #[cfg(feature = "sevenz")]
+mod par3_pipe;
+#[cfg(feature = "sevenz")]
 mod par3_stream;
 mod password;
 mod rar;

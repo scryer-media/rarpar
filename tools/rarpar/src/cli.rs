@@ -445,16 +445,19 @@ pub struct Par3Args {
 
 #[derive(Debug, Clone, Args)]
 pub struct Par3CreateArgs {
-    /// Output PAR3 path or stem.
+    /// Output PAR3 path or stem; with a stream, an existing directory takes the set named by --name.
     pub output: PathBuf,
-    /// Explicit source files, relative to --base-path (defaults to current directory).
-    #[arg(required = true, num_args = 1..)]
+    /// Explicit source files, relative to --base-path (defaults to current directory), or `-` for
+    /// one file from standard input (the default when no file is given and it is not a terminal).
     pub files: Vec<PathBuf>,
     #[arg(long)]
     pub base_path: Option<PathBuf>,
-    /// Logical block size in bytes.
-    #[arg(short = 's', long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(1..))]
-    pub block_size: u64,
+    /// Name the set records for the file read from standard input.
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+    /// Logical block size in bytes (default 1048576; required for standard input).
+    #[arg(short = 's', long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub block_size: Option<u64>,
     /// Number of global recovery packets (defaults to one); an interleaved set rounds up to whole rows.
     #[arg(short = 'c', long, conflicts_with = "recovery_percent")]
     pub recovery_count: Option<u64>,
@@ -621,6 +624,9 @@ pub struct ParArgs {
     /// Additional directories containing protected data files.
     #[arg(value_name = "SEARCH_DIR")]
     pub search_dirs: Vec<PathBuf>,
+    /// Verify only the protected file NAME, reading its bytes from standard input (verify only).
+    #[arg(long, value_name = "NAME", conflicts_with = "search_dirs")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
