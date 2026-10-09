@@ -14,6 +14,13 @@
 //! recovery row be accumulated before the file's length is known, and lets a
 //! block whose first bytes are written last (a 7z start header) be corrected
 //! afterwards by adding the difference.
+//!
+//! `par3 create -` uses it for a set over standard input in every build; the
+//! archive writer and the PAR-inside geometry exist only with `sevenz`.
+
+// Without `sevenz` only the standard-input set is built; the archive and
+// PAR-inside pieces stay compiled so both builds check the same module.
+#![cfg_attr(not(feature = "sevenz"), allow(dead_code))]
 
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -1113,6 +1120,11 @@ pub(crate) struct StagedSibling {
 }
 
 impl StagedSibling {
+    /// Files already written by [`write_file`], to install onto their paths.
+    pub(crate) fn new(files: Vec<(tempfile::NamedTempFile, PathBuf)>, overwrite: bool) -> Self {
+        StagedSibling { files, overwrite }
+    }
+
     /// Rename every staged file onto its destination, in order.
     pub(crate) fn install(self) -> std::io::Result<Vec<PathBuf>> {
         let mut written = Vec::new();
@@ -1129,20 +1141,13 @@ impl StagedSibling {
     }
 }
 
-/// Write a sibling set: the index file and its recovery volumes, laid out as
-/// par3cmdline lays them out. Every file is written and synced beside its
-/// destination first; nothing is installed until [`StagedSibling::install`],
-/// so a failed write (a full disk, say) leaves every existing file as it was.
-pub(crate) fn write_sibling(
-    stem: &Path,
-    set: &BuiltSet,
-    rows: &[Vec<u8>],
+/// Refuse to write a set over its outputs: a link, dangling or not, is never
+/// written through, and without `overwrite` an existing name is refused.
+pub(crate) fn check_targets<'a>(
+    paths: impl IntoIterator<Item = &'a PathBuf>,
     overwrite: bool,
-) -> std::io::Result<StagedSibling> {
-    let (index, volumes) = sibling_paths(stem, rows.len() as u64);
-    for path in std::iter::once(&index).chain(volumes.iter().map(|(_, _, path)| path)) {
-        // Look at the name itself: a link, dangling or not, is never
-        // written through, and overwriting replaces only a real file.
+) -> std::io::Result<()> {
+    for path in paths {
         match std::fs::symlink_metadata(path) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 return Err(std::io::Error::new(
@@ -1161,8 +1166,28 @@ pub(crate) fn write_sibling(
             Err(error) => return Err(error),
         }
     }
+    Ok(())
+}
+
+/// Write a sibling set: the index file and its recovery volumes, laid out as
+/// par3cmdline lays them out. Every file is written (and, unless
+/// `durability` is buffered, synced) beside its destination first; nothing is
+/// installed until [`StagedSibling::install`], so a failed write (a full
+/// disk, say) leaves every existing file as it was.
+pub(crate) fn write_sibling(
+    stem: &Path,
+    set: &BuiltSet,
+    rows: &[Vec<u8>],
+    overwrite: bool,
+    durability: Durability,
+) -> std::io::Result<StagedSibling> {
+    let (index, volumes) = sibling_paths(stem, rows.len() as u64);
+    check_targets(
+        std::iter::once(&index).chain(volumes.iter().map(|(_, _, path)| path)),
+        overwrite,
+    )?;
     let mut files = Vec::new();
-    let staged = write_file(&index, |out| {
+    let staged = write_file(&index, durability, |out| {
         out.write_all(&set.creator)?;
         for packet in &set.common {
             out.write_all(packet)?;
@@ -1171,7 +1196,7 @@ pub(crate) fn write_sibling(
     })?;
     files.push((staged, index));
     for (start, count, path) in volumes {
-        let staged = write_file(&path, |out| {
+        let staged = write_file(&path, durability, |out| {
             out.write_all(&set.creator)?;
             for packet in &set.common {
                 out.write_all(packet)?;
@@ -1196,9 +1221,37 @@ pub(crate) fn write_sibling(
     Ok(StagedSibling { files, overwrite })
 }
 
-/// Write `body` to a new temporary file in `path`'s directory and sync it.
-fn write_file(
+/// Whether a written set waits for durable storage before it is installed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Durability {
+    /// Each file is synced before it is installed (the default).
+    Sync,
+    /// Buffers are flushed but no storage barrier is requested
+    /// (`--buffered`).
+    Buffered,
+}
+
+impl Durability {
+    pub(crate) fn from_buffered(buffered: bool) -> Self {
+        if buffered {
+            Durability::Buffered
+        } else {
+            Durability::Sync
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Files this thread has synced, for tests of [`Durability`].
+    static SYNCED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Write `body` to a new temporary file in `path`'s directory, and sync it
+/// unless `durability` is [`Durability::Buffered`].
+pub(crate) fn write_file(
     path: &Path,
+    durability: Durability,
     body: impl FnOnce(&mut BufWriter<std::fs::File>) -> std::io::Result<()>,
 ) -> std::io::Result<tempfile::NamedTempFile> {
     let directory = path
@@ -1214,9 +1267,12 @@ fn write_file(
     let mut out = BufWriter::new(staged.reopen()?);
     body(&mut out)?;
     out.flush()?;
-    out.into_inner()
-        .map_err(|error| error.into_error())?
-        .sync_all()?;
+    let file = out.into_inner().map_err(|error| error.into_error())?;
+    if durability == Durability::Sync {
+        file.sync_all()?;
+        #[cfg(test)]
+        SYNCED.with(|synced| synced.set(synced.get() + 1));
+    }
     Ok(staged)
 }
 
@@ -1249,17 +1305,44 @@ mod tests {
             names.sort();
             names
         };
-        let staged = write_sibling(&stem, &set, &rows, true).unwrap();
+        let staged = write_sibling(&stem, &set, &rows, true, Durability::Sync).unwrap();
         assert_eq!(std::fs::read(&index).unwrap(), b"previous index");
         drop(staged);
         assert_eq!(listing(), ["vault.par3"]);
         assert_eq!(std::fs::read(&index).unwrap(), b"previous index");
-        let written = write_sibling(&stem, &set, &rows, true)
+        let written = write_sibling(&stem, &set, &rows, true, Durability::Sync)
             .unwrap()
             .install()
             .unwrap();
         assert_eq!(written.len(), listing().len());
         assert!(std::fs::read(&index).unwrap().starts_with(b"creator"));
+    }
+
+    #[test]
+    fn a_buffered_sibling_set_syncs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let stem = dir.path().join("vault");
+        let set = BuiltSet {
+            set_id: InputSetId([1; 8]),
+            creator: b"creator".to_vec(),
+            common: vec![b"common".to_vec()],
+            root_hash: [2; 16],
+            matrix_hash: Some([3; 16]),
+        };
+        let rows = vec![vec![0u8; 4]; 3];
+        let synced = || SYNCED.with(std::cell::Cell::get);
+        let before = synced();
+        let buffered = write_sibling(&stem, &set, &rows, true, Durability::Buffered)
+            .unwrap()
+            .install()
+            .unwrap();
+        assert_eq!(synced(), before);
+        let durable = write_sibling(&stem, &set, &rows, true, Durability::Sync)
+            .unwrap()
+            .install()
+            .unwrap();
+        assert_eq!(durable, buffered);
+        assert_eq!(synced(), before + durable.len());
     }
 
     #[test]

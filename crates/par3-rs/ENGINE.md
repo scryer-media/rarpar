@@ -468,32 +468,33 @@ at about 1.06x the CPU of the serial run. A 64 MiB set spread over 64 files is
 are the serial ones (1.00x). These are measurements on one host, not a promise
 about any other.
 
-An FFT decode ends with a forward transform over the whole domain and then reads
-only the lost rows. Stages of stride `2^j` or wider never join rows whose low `j`
-bits differ, so those stages are `2^j` independent transforms over the rows that
-share their low bits, and every narrower stage stays inside one aligned block of
-`2^j` rows. Only the blocks holding a lost row need those narrow stages. The
-decoder therefore builds a per-cohort plan — the block width and the list of
-blocks to keep — charges it to `CodecScratch` (the lost-row list, a domain bitmap
-for the transposes, and a small fixed margin), and skips the rest. The rows the
-caller reads are byte-identical to the unpruned transform's, which is the oracle
-the tests use.
+An FFT decode works a capacity-sized window of the domain at a time instead of
+transforming the whole domain at once. It keeps two banks of `capacity` rows: one
+receives the next window of survivors, scaled by their erasure factors, and the
+other accumulates the transformed sum. After the last window, it reads only the
+lost rows out of the sum and scales them by their locator inverses. Each bank is
+charged to `CodecScratch`, and the stripe is sized so two banks fit. The decode
+never holds a work area the width of the domain, so its charged peak follows the
+capacity, not the input count.
 
-The plan is chosen on total work, not on butterflies alone: a split replaces one
-transform call with `2^j + blocks` of them, and each call has a setup the
-butterflies do not pay for (`fft::PLAN_CALL_SYMBOLS`, 8192 symbol operations).
-Where a cohort's rows are too narrow for that to pay — the pinned `fft16`
-reference geometry is 32 symbols a row — the plan stands aside and the full
-transform runs. Measured on this host (`tests/codec_measurements.rs`), with the
-plan in force a 256-row GF8 cohort of 4096-symbol rows skips 19% of the decode's
-butterflies and runs in 2.0–2.3 ms against 2.5–3.5 ms unpruned, and a 512-row
-GF16 cohort of 8192-symbol rows skips 17% and runs in 4.1–4.9 ms against
-4.9–8.6 ms. The input inverse transform is *not* pruned: its zero-tail saving
-lives in the narrow ascending stages, which are exactly the ones inside a block,
-and the derivative between the two transforms makes every row of the workspace a
-dependency of the forward pass. Expressing the remaining cross-block stages
-would need a single-stage transform primitive, which is a change to
-`reedsolomon-rs` rather than to this crate.
+With workers, on a lane that reads rows directly, over a domain wider than twice
+the capacity, the decoder also tries to reserve a third bank. With it, the next
+window fills while the current one is transformed. If the budget refuses that
+bank, the decode runs on two banks with the same reads and output. Repair output
+is the same either way and the same as the earlier full-domain decode, which the
+tests check.
+
+`reedsolomon-rs` can run each FFT transform as a four-step split (leaf 2^6). A
+codec takes it only on AMD CPUs whose linear-map kernel resolves to AVX2
+(`reedsolomon_rs::fft::four_step_preferred`). Within such a codec, a transform
+of `n` points takes it when `n > 1` and either:
+
+* it runs in the worker pool over more than 64 points, or
+* it runs on the calling thread over rows of at least 16 KiB.
+
+Every other CPU and transform keeps the existing transform, and output does
+not change. The measurements behind both choices are in
+[PERFORMANCE.md](PERFORMANCE.md#fft-decode-and-transform-experiments-2026-10).
 
 Cauchy repair recomputes one code-matrix element per surviving block per
 recovery row on every stripe pass; `ExecutionDiagnostics::codec()` counts them.

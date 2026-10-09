@@ -7,6 +7,44 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ### CLI Changes
 
+- New `rarpar xz` commands: `compress`, `decompress`, `test` and `list` for
+  `.xz` files, on `lzma-turbo` 0.6.0. Compression takes the xz presets
+  (`--level` 0-9, `--extreme`), a `--check` of `crc32`, `crc64` (default),
+  `sha256` or `none`, and `--block-size`, and compresses up to `--threads`
+  blocks at once; the bytes do not depend on the thread count. Decompression
+  decodes multi-block files on several threads within `--memory-mib` (default
+  1024), handles concatenated streams and padding, and verifies every check.
+  `-` reads standard input or writes standard output, and an absent INPUT is
+  standard input when it is piped. Every action streams a pipe in bounded
+  memory: decompression and `test` decode a pipe on several threads, and
+  `list` reads a pipe in one pass and names what that cannot report. Inputs
+  are always kept,
+  existing outputs need `--overwrite`, outputs keep the input's permissions
+  and modification time, and `--json` reports every action.
+- `par3 create OUTPUT -` makes a PAR3 set for one file read from standard
+  input in one pass, in memory bounded by the recovery blocks, with no
+  temporary files. It requires `--name`, `-s/--block-size` and
+  `-c/--recovery-count`, and refuses the options that depend on the stream's
+  length. `par3 create`'s `-s` default of 1 MiB is unchanged for files.
+- `par verify SET --name NAME` verifies one protected file read from standard
+  input, reporting damaged and missing slices and whether the set could repair
+  them. `par repair` exits 2 when given `-` or `--name`.
+- The global `-o/--output` directory is no longer dropped when a command also
+  takes a positional OUTPUT: for `xz compress`, `xz decompress`,
+  `par create`, `par3 create` and `par3 archive`, a relative OUTPUT is placed
+  under it and an absolute one wins. Inputs are still found where they were:
+  `par create`'s `--base-path` defaults to the parent of OUTPUT as typed.
+- `par3 create -` no longer needs the `sevenz` feature.
+- `xz compress --sidecar par2|par3` and `par3 archive --sidecar par2|par3`
+  write a conventional PAR2 or PAR3 set beside the archive in the same pass,
+  from the bytes as they are written: no read-back, no temporary files, memory
+  bounded by the recovery blocks within `--par3-memory-mib`. The block size
+  and recovery count are fixed up front (`--sidecar-block-size` and
+  `--sidecar-recovery-count`; aliases of `-s` and `-c` on `par3 archive`). An
+  archive on standard output needs `--sidecar-name` (exit 2 otherwise). A PAR2
+  sidecar is byte for byte the set `par create` makes from the finished
+  archive. `--format 7z --sidecar par2` is refused: the 7z start header is
+  written last, after PAR2's whole-file MD5 has passed it.
 - RAR3 PPMd members extract faster: `unrar-rs` 0.11.0 decodes them through
   the `ppmd-turbo` crate, 1.16-1.71x faster than 0.6.0 on the RAR4 PPMd
   fixtures (32 MiB order-16 member: 3.41 s wall, from 4.71 s). Output is
@@ -19,13 +57,23 @@ documented in each crate's own changelog so those notes ship with the crate.
   itself is unchanged: GPL-3.0-or-later with its section 7 permission to
   combine with `unrar-rs`, and its binaries still carry the unRAR
   restriction.
+- FFT-codec PAR3 repair needs less memory and runs faster: 1.2 to 1.9
+  times faster on the measured hosts, and the 4096 × 16 KiB repair's charged
+  peak falls from 137.9 MB to 15.8 MB. On AMD CPUs with AVX2 kernels, FFT
+  create and repair also take a four-step transform where it measured
+  faster. Output is unchanged.
 
 ### Library versions
 
-- unrar-rs 0.11.0: RAR3 PPMd decoding through `ppmd-turbo` 0.1.1, and the
-  move to Apache-2.0 plus the unRAR restriction.
-- par3-rs 0.5.1 (pinned exactly) and reedsolomon-rs 0.4.10: the move to
-  Apache-2.0; no code changed.
+- unrar-rs 0.11.0: RAR3 PPMd decoding through `ppmd-turbo` 0.1.1, a
+  caller-set bound on the PPMd model arena (`Limits::max_ppmd_arena_size`,
+  default the format's 256 MiB), and the move to Apache-2.0 plus the unRAR
+  restriction.
+- par3-rs 0.5.1 (pinned exactly): the move to Apache-2.0, an FFT decode
+  that keeps two banks of `capacity` rows (lower charged memory, faster
+  repair), and the four-step transform on AMD CPUs with AVX2 kernels.
+- reedsolomon-rs 0.4.10: the move to Apache-2.0, and the four-step transform
+  with its CPU gate.
 - par2-rs 0.10.8: unchanged.
 
 ## rarpar 0.6.0

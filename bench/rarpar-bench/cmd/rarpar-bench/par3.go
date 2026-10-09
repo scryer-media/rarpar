@@ -27,15 +27,21 @@ const par3Usage = `Usage:
         [--target NAME=DIR]... [--target-meta NAME:KEY=V[,KEY=V]]... [--rows reference,rarpar,engine]
         [--engine-workers 8] [--engine-variant NAME:VAR=V[,VAR=V]]... [--drop-caches]
   rarpar-bench par3 report --input results.json [--out report.md]
+  rarpar-bench par3 versus --candidate PATH --work DIR --out DIR [--par2 PATH] [--profile versus-smoke|versus]
+        [--set ID]... [--warmups N] [--repeats N] [--pin-cpus 0-7] [--machine LABEL] [--timeout 20m]
+  rarpar-bench par3 versus-report --input results.json [--out report.md]
 
 The PAR3 suite benchmarks the shipped rarpar CLI against the pinned par3cmdline
 reference on deterministic generated inputs. See docs/benchmarking.md.
+par3 versus compares PAR2 (rarpar par, and par2cmdline-turbo with --par2) with
+PAR3 Cauchy and FFT at one block size, recovery count and damage pattern, on the
+scale par2 ÷ par3 (above 1 = PAR3 faster), with every repair SHA-256 checked.
 `
 
 func runPAR3(ctx context.Context, args []string, stdout io.Writer) error {
 	if len(args) == 0 {
 		fmt.Fprint(os.Stderr, par3Usage)
-		return fmt.Errorf("par3 requires matrix, build-reference, run, or report")
+		return fmt.Errorf("par3 requires matrix, build-reference, run, report, versus, or versus-report")
 	}
 	switch args[0] {
 	case "matrix":
@@ -46,6 +52,10 @@ func runPAR3(ctx context.Context, args []string, stdout io.Writer) error {
 		return runPAR3Suite(ctx, args[1:], stdout)
 	case "report":
 		return runPAR3Report(args[1:], stdout)
+	case "versus":
+		return runPAR3Versus(ctx, args[1:], stdout)
+	case "versus-report":
+		return runPAR3VersusReport(args[1:], stdout)
 	case "-h", "--help", "help":
 		fmt.Fprint(stdout, par3Usage)
 		return nil
@@ -359,6 +369,78 @@ func runPAR3Report(args []string, stdout io.Writer) error {
 		return err
 	}
 	report := par3bench.RenderReport(results)
+	if *out == "" {
+		_, err = fmt.Fprint(stdout, report)
+		return err
+	}
+	return os.WriteFile(workspacePath(*out), []byte(report), 0o644)
+}
+
+func runPAR3Versus(ctx context.Context, args []string, stdout io.Writer) error {
+	flags := flag.NewFlagSet("par3 versus", flag.ContinueOnError)
+	candidate := flags.String("candidate", "", "rarpar binary (runs both par and par3)")
+	par2 := flags.String("par2", "", "optional par2cmdline-turbo binary; its arm is skipped without one")
+	work := flags.String("work", "", "work directory: generated datasets and stages")
+	out := flags.String("out", "", "evidence directory: results.json, report.md")
+	profileName := flags.String("profile", "versus-smoke", "profile: versus-smoke or versus")
+	warmups := flags.Int("warmups", 1, "warmup runs per arm (recorded, not summarised)")
+	repeats := flags.Int("repeats", 5, "measured runs per arm")
+	machine := flags.String("machine", "", "machine label recorded in the results")
+	pin := flags.String("pin-cpus", "", "confine every timed process to an inclusive CPU range, e.g. 0-7")
+	timeout := flags.Duration("timeout", par3bench.DefaultTimeout, "per-run timeout for every timed process")
+	var sets stringList
+	flags.Var(&sets, "set", "restrict to a set ID (repeatable)")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	profile, err := par3bench.LookupVersusProfile(*profileName)
+	if err != nil {
+		return err
+	}
+	if profile, err = profile.Select(sets); err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
+	results, err := par3bench.RunVersus(ctx, par3bench.VersusOptions{
+		Candidate: workspacePath(*candidate), PAR2Turbo: workspacePath(*par2), Work: workspacePath(*work),
+		Out: workspacePath(*out), Profile: profile, Warmups: *warmups, Repeats: *repeats, MachineLabel: *machine,
+		PinCPUs: *pin, Timeout: *timeout, Log: func(format string, args ...any) { fmt.Fprintf(os.Stderr, "par3 versus: "+format+"\n", args...) },
+	})
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprint(stdout, par3bench.RenderVersusReport(results)); err != nil {
+		return err
+	}
+	if results.Status != "ok" {
+		return fmt.Errorf("PAR2/PAR3 comparison finished with failures: %s", strings.Join(results.Failures, "; "))
+	}
+	return nil
+}
+
+func runPAR3VersusReport(args []string, stdout io.Writer) error {
+	flags := flag.NewFlagSet("par3 versus-report", flag.ContinueOnError)
+	input := flags.String("input", "", "results.json from par3 versus")
+	out := flags.String("out", "", "write the Markdown here instead of stdout")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *input == "" {
+		return fmt.Errorf("--input is required")
+	}
+	results, err := par3bench.ReadVersusResults(workspacePath(*input))
+	if err != nil {
+		return err
+	}
+	report := par3bench.RenderVersusReport(results)
 	if *out == "" {
 		_, err = fmt.Fprint(stdout, report)
 		return err

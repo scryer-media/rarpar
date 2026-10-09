@@ -28,6 +28,11 @@ runtime = [
     "dep:par3-rs",
     "dep:unrar-rs",
     "dep:libc",
+    # `rarpar xz`: the .xz codec is lzma-turbo, which sevenz-turbo links too.
+    "dep:lzma-turbo",
+    "dep:filetime",
+    # One-pass PAR3 sets (`par3 create -`, `par3 archive`); par3-rs links it already.
+    "dep:blake3",
 ]
 # Crypto backend selection, forwarded to the libraries. `runtime` deliberately
 # forwards neither: a build that asks for the runtime without naming a backend
@@ -41,11 +46,13 @@ crypto-aws-lc = [
     "par2-rs?/crypto-aws-lc",
     "unrar-rs?/crypto-aws-lc",
     "sevenz-turbo?/aws-lc-crypto",
+    "lzma-turbo?/crypto",
 ]
 crypto-rust = [
     "par2-rs?/crypto-rust",
     "unrar-rs?/crypto-rust",
     "sevenz-turbo?/native-crypto",
+    "lzma-turbo?/native-crypto",
 ]
 # 7z support: one-pass archive-and-protect (`rarpar par3 archive`, 7z or ZIP output), PAR-inside for
 # 7z and ZIP in the par3cmdline facade, and the 7-Zip command-line facade
@@ -55,7 +62,6 @@ crypto-rust = [
 sevenz = [
     "runtime",
     "dep:sevenz-turbo",
-    "dep:blake3",
     "dep:crc-fast",
     "dep:filetime",
     "dep:libc",
@@ -75,6 +81,15 @@ blake3 = { workspace = true, optional = true }
 clap = { workspace = true }
 crc-fast = { workspace = true, optional = true }
 filetime = { workspace = true, optional = true }
+# The .xz codec behind `rarpar xz`. Held at the version sevenz-turbo resolves
+# so the binary links one copy of it; `xz` brings the container, `enc` the
+# writer. The SHA-256 check comes from the crypto backend features above.
+lzma-turbo = { version = "0.6.0", default-features = false, features = [
+    "std",
+    "asm",
+    "xz",
+    "enc",
+], optional = true }
 sevenz-turbo = { version = "0.26.1", default-features = false, features = [
     "aes256",
     "bzip2",

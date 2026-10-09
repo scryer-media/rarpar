@@ -1,10 +1,34 @@
 # Changelog
 
-## 0.5.1 (2026-10-08)
+## 0.5.1
 
 - Relicensed from GPL-3.0-or-later to Apache-2.0. Releases up to 0.5.0 stay
-  under GPL-3.0-or-later. No code changed; the `reedsolomon-rs` requirement
-  moves to 0.4.10, its first Apache-2.0 release.
+  under GPL-3.0-or-later. The `reedsolomon-rs` requirement moves to 0.4.10,
+  its first Apache-2.0 release.
+- FFT decode keeps two banks of `capacity` rows instead of a work area the
+  width of the transform domain. With workers, on a direct lane over a domain
+  wider than twice the capacity, a third bank lets the next fill overlap the
+  current transform. This is now the only FFT decode. On the 4096 × 16 KiB
+  repair with 4 losses, the charged peak falls from 137.9 MB to 15.8 MB, and
+  FFT repair is 1.2 to 1.9 times faster on the measured x86-64 and ARM64
+  hosts. Output is unchanged.
+- FFT transforms use the four-step split (leaf 2^6) only where it measured
+  faster. A codec takes it when the CPU reports `AuthenticAMD` and the
+  linear-map kernel resolves to AVX2. Within such a codec, a transform of
+  `n` points over rows of `row_bytes` takes it when `n > 1` and either:
+  - it runs in the worker pool and `n > 64`, or
+  - it runs on the calling thread and `row_bytes >= 16 KiB`.
+
+  Every other CPU and transform keeps the existing transform. Output is the
+  same either way.
+- The hidden `ExecutionOptions::fft_fused_decode` field is gone, with the
+  decode it selected. It was `#[doc(hidden)]` and outside the documented API,
+  so this is not a breaking change under it; code that set the field no
+  longer compiles.
+- No FFT transform is pruned any more, so
+  `CodecSnapshot::butterflies_skipped` is always zero. The field stays.
+- The FFT experiments behind these choices, including the lanes that were
+  dropped, are recorded in [PERFORMANCE.md](PERFORMANCE.md#fft-decode-and-transform-experiments-2026-10).
 
 ## 0.5.0
 

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use crate::discovery::{ExecutedAction, Par2Set};
 use crate::error::{EXIT_DATA_FAILURE, EXIT_SUCCESS, RarparError};
 use crate::report;
+use crate::streams::{Input, input_or_stdin, is_stdio};
 use par2_rs::{
     BlockSizing, CreationBackend, Par2CreateOutcome, Par2CreatePlan, Par2Creator,
     Par2CreatorOptions, RecoveryAmount, VolumeScheme,
@@ -14,6 +15,7 @@ use rarpar::cli::{
     Cli, ParArgs, ParCommand, ParCreateArgs, ParCreationBackend, ParPlacement, ParVolumeScheme,
 };
 use serde::Serialize;
+use std::io::Read;
 use tracing::info;
 
 pub struct ParOutcome {
@@ -68,6 +70,10 @@ pub fn run_command(cli: &Cli, command: ParCommand) -> Result<u8, RarparError> {
         ParCommand::Repair(args) => ("repair", true, args),
         ParCommand::Create(_) => unreachable!("create handled above"),
     };
+    refuse_standard_input(repair, &args)?;
+    if let Some(name) = &args.name {
+        return verify_stream(cli, &args, name);
+    }
     let mut resolved = resolve_input(cli, &args)?;
     let outcome = run_flow(&mut resolved, repair, cli.dry_run, cli.quiet || cli.json)?;
     emit_command_outcome(cli, command_name, &outcome)?;
@@ -79,6 +85,8 @@ pub fn run_command(cli: &Cli, command: ParCommand) -> Result<u8, RarparError> {
 }
 
 fn run_create(cli: &Cli, args: ParCreateArgs) -> Result<u8, RarparError> {
+    // --base-path defaults to the parent of OUTPUT as typed, so input
+    // discovery does not move when -o places the set elsewhere.
     let base_path = args.base_path.clone().unwrap_or_else(|| {
         args.output
             .parent()
@@ -117,8 +125,11 @@ fn run_create(cli: &Cli, args: ParCreateArgs) -> Result<u8, RarparError> {
             }
         })
         .transpose()?;
-    let mut options =
-        Par2CreatorOptions::with_output(args.output.clone(), Some(base_path), args.files.clone());
+    let mut options = Par2CreatorOptions::with_output(
+        cli.place_output(&args.output),
+        Some(base_path),
+        args.files.clone(),
+    );
     options.block_sizing = match (args.block_size, args.block_count) {
         (Some(bytes), None) => BlockSizing::Bytes(bytes),
         (None, Some(count)) => BlockSizing::Count(count),
@@ -709,6 +720,216 @@ fn resolve_input(cli: &Cli, args: &ParArgs) -> Result<ResolvedPar2Input, RarparE
         search_dirs,
         placement: cli.par_placement,
         scanned,
+    })
+}
+
+/// `par verify --name` reads one protected file from standard input; every
+/// other input is a path. Repair rewrites files in place, so it never reads a
+/// stream.
+fn refuse_standard_input(repair: bool, args: &ParArgs) -> Result<(), RarparError> {
+    let dash = is_stdio(&args.input) || args.search_dirs.iter().any(|dir| is_stdio(dir));
+    if repair && (dash || args.name.is_some()) {
+        return Err(RarparError::Usage(
+            "par repair works on files on disk and does not read standard input; save the stream to a file and repair that".into(),
+        ));
+    }
+    if is_stdio(&args.input) {
+        return Err(RarparError::Usage(
+            "the PAR2 set must be a path; to verify a protected file from standard input, give the set and --name NAME".into(),
+        ));
+    }
+    if dash {
+        return Err(RarparError::Usage(
+            "a search directory cannot be `-`; to verify a protected file from standard input, give --name NAME".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Bytes held to verify a stream one slice at a time, checked before any is
+/// allocated. The Main packet's slice size is untrusted, so a slice must fit
+/// the `--par3-memory-mib` budget (the only memory flag `par verify` honours)
+/// and the file must have no more slices than par2-rs addresses per file;
+/// either failure is an unusable set (exit 1), not an abort.
+fn stream_slice_bytes(
+    slice_size: u64,
+    length: u64,
+    budget_mib: usize,
+) -> Result<usize, RarparError> {
+    const MAX_SLICES_PER_FILE: u64 = 32_768;
+    let budget = (budget_mib as u64).saturating_mul(1 << 20);
+    if slice_size == 0 || !slice_size.is_multiple_of(4) {
+        return Err(RarparError::Data(format!(
+            "the PAR2 set declares {slice_size}-byte slices; PAR2 slices are a non-zero multiple of 4 bytes"
+        )));
+    }
+    if slice_size > budget {
+        return Err(RarparError::Data(format!(
+            "the PAR2 set declares {slice_size}-byte slices; verifying a stream holds one slice, more than --par3-memory-mib allows ({budget_mib} MiB)"
+        )));
+    }
+    if length.div_ceil(slice_size) > MAX_SLICES_PER_FILE {
+        return Err(RarparError::Data(format!(
+            "the PAR2 set gives the file {} slices of {slice_size} bytes; a PAR2 file has at most {MAX_SLICES_PER_FILE}",
+            length.div_ceil(slice_size)
+        )));
+    }
+    usize::try_from(slice_size)
+        .map_err(|_| RarparError::Data(format!("{slice_size}-byte slices are too large")))
+}
+
+/// Verifies the protected file `name` from standard input in one forward
+/// pass: each slice is checked as soon as its bytes have arrived, and only
+/// one slice is held at a time.
+fn verify_stream(cli: &Cli, args: &ParArgs, name: &str) -> Result<u8, RarparError> {
+    let input = input_or_stdin(None).map_err(|_| {
+        RarparError::Usage(
+            "--name reads the protected file from standard input, which is a terminal".into(),
+        )
+    })?;
+    let mut resolved = resolve_input(cli, args)?;
+    let set = match resolved.scanned.take() {
+        Some(set) => set,
+        None => par2_rs::Par2FileSet::from_paths(&resolved.par2_paths)?,
+    };
+    let Some(file_id) = set.recovery_file_ids.iter().copied().find(|id| {
+        set.file_description(id)
+            .is_some_and(|desc| desc.filename == name || desc.par2_name == name)
+    }) else {
+        let mut names: Vec<&str> = set
+            .recovery_file_ids
+            .iter()
+            .filter_map(|id| set.file_description(id))
+            .map(|desc| desc.par2_name.as_str())
+            .collect();
+        names.sort_unstable();
+        return Err(RarparError::Usage(format!(
+            "the PAR2 set protects no file named {name:?}; it protects: {}",
+            names.join(", ")
+        )));
+    };
+    let expected = set.file_description(&file_id).map_or(0, |desc| desc.length);
+    let slice_size = set.slice_size;
+    let slice = stream_slice_bytes(slice_size, expected, cli.par3_memory_mib)?;
+
+    let mut session = par2_rs::VerificationSession::new();
+    for path in &resolved.par2_paths {
+        let packets: Vec<_> = par2_rs::scan_packets_from_path_with_set_ids(path)?
+            .into_iter()
+            .filter(|scanned| scanned.recovery_set_id == set.recovery_set_id)
+            .map(|scanned| scanned.packet)
+            .collect();
+        session.add_par2_data(&packets);
+    }
+
+    let mut source = Input::open(&input)?.into_reader();
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(slice).map_err(|_| {
+        RarparError::Resource(format!(
+            "cannot allocate one {slice_size}-byte slice to verify the stream"
+        ))
+    })?;
+    buffer.resize(slice, 0);
+    let (mut received, mut trailing) = (0u64, 0u64);
+    loop {
+        // Fill one slice, so every feed is a whole slice the session checks
+        // at once instead of buffering.
+        let mut filled = 0;
+        while filled < buffer.len() {
+            match source.read(&mut buffer[filled..]) {
+                Ok(0) => break,
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if filled == 0 {
+            break;
+        }
+        let within = expected.saturating_sub(received).min(filled as u64) as usize;
+        trailing += (filled - within) as u64;
+        if within > 0 {
+            let outcome = session.feed_range(&file_id, received, &buffer[..within]);
+            match outcome.disposition() {
+                par2_rs::FeedDisposition::Verified | par2_rs::FeedDisposition::Duplicate => {}
+                // The stream ended inside a slice: it stays unverified.
+                par2_rs::FeedDisposition::Buffered if filled < buffer.len() => {}
+                other => {
+                    return Err(RarparError::Data(format!(
+                        "the verifier did not settle the slice at offset {received}: {other:?}"
+                    )));
+                }
+            }
+            received += within as u64;
+        }
+        if filled < buffer.len() {
+            break;
+        }
+    }
+
+    let verification = session
+        .verification_result()
+        .ok_or_else(|| RarparError::Data("the PAR2 set has no usable metadata".into()))?;
+    let file = verification
+        .files
+        .iter()
+        .find(|file| file.file_id == file_id)
+        .ok_or_else(|| RarparError::Data(format!("the set has no slices for {name}")))?;
+    // Slices the stream delivered whole; one it ended inside counts as missing.
+    let fed_slices = if received >= expected {
+        file.valid_slices.len()
+    } else {
+        (received / slice_size.max(1)) as usize
+    };
+    let damaged: Vec<usize> = file
+        .valid_slices
+        .iter()
+        .enumerate()
+        .take(fed_slices)
+        .filter(|(_, valid)| !**valid)
+        .map(|(index, _)| index)
+        .collect();
+    let missing = file.valid_slices.len().saturating_sub(fed_slices);
+    let bad = damaged.len() + missing;
+    let success = bad == 0 && trailing == 0;
+    let available = verification.recovery_blocks_available as usize;
+    let message = if success {
+        format!(
+            "{name}: all {} slice(s) verified from standard input",
+            file.valid_slices.len()
+        )
+    } else {
+        format!(
+            "{name}: {} damaged slice(s), {missing} missing, {trailing} byte(s) past its length; {available} recovery block(s) available",
+            damaged.len()
+        )
+    };
+    if cli.json {
+        let report = serde_json::json!({"schema_version":1,"command":"verify","success":success,
+            "repaired":false,"recovery_blocks_needed":serde_json::Value::Null,"message":message,
+            "stream":{"name":name,"bytes":received + trailing,"expected_bytes":expected,
+                "slice_size":slice_size,"slices":file.valid_slices.len(),
+                "damaged_slices":damaged,"missing_slices":missing,"trailing_bytes":trailing,
+                "recovery_blocks_available":available,
+                "repairable":bad <= available && trailing == 0}});
+        println!("{}", serde_json::to_string(&report)?);
+    } else if !cli.quiet {
+        println!("rarpar par verify (standard input as {name})");
+        println!(
+            "  {} of {expected} bytes, {} slice(s) of {slice_size} bytes",
+            received + trailing,
+            file.valid_slices.len()
+        );
+        if !damaged.is_empty() {
+            let list: Vec<String> = damaged.iter().map(usize::to_string).collect();
+            println!("  damaged slices: {}", list.join(", "));
+        }
+        println!("{message}");
+    }
+    Ok(if success {
+        EXIT_SUCCESS
+    } else {
+        EXIT_DATA_FAILURE
     })
 }
 

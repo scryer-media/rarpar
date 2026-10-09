@@ -302,6 +302,67 @@ fn par_create_json_reports_real_outcome_and_writes_outputs() {
 }
 
 #[test]
+fn par_create_places_the_set_under_the_global_output_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::write(root.join("input.bin"), b"0123456789abcdef").unwrap();
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    std::fs::write(root.join("data/other.bin"), b"fedcba9876543210").unwrap();
+    std::fs::create_dir_all(root.join("sets")).unwrap();
+    let create = |extra: &[&str]| {
+        let mut args: Vec<&OsStr> = ["-o", "sets", "par", "create"]
+            .iter()
+            .chain(extra)
+            .map(OsStr::new)
+            .collect();
+        args.extend(
+            ["--block-size", "4", "--recovery-count", "1"]
+                .iter()
+                .map(OsStr::new),
+        );
+        run_in_dir(root, &args)
+    };
+    let succeeded = |output: &Output| {
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    // The set lands under -o; the input is still found beside OUTPUT as typed.
+    succeeded(&create(&["set.par2", "input.bin"]));
+    assert!(root.join("sets/set.par2").is_file());
+    assert!(!root.join("set.par2").exists());
+    let verify = run_in_dir(
+        root,
+        &[
+            OsStr::new("par"),
+            OsStr::new("verify"),
+            OsStr::new("sets/set.par2"),
+            OsStr::new("."),
+        ],
+    );
+    succeeded(&verify);
+
+    // An explicit --base-path is used as given, not moved under -o.
+    succeeded(&create(&["--base-path", "data", "named.par2", "other.bin"]));
+    assert!(root.join("sets/named.par2").is_file());
+    assert!(!root.join("sets/data").exists());
+    let verify = run_in_dir(
+        root,
+        &[
+            OsStr::new("par"),
+            OsStr::new("verify"),
+            OsStr::new("sets/named.par2"),
+            OsStr::new("data"),
+        ],
+    );
+    succeeded(&verify);
+}
+
+#[test]
 fn par_create_progress_reports_true_scan_totals_without_flooding() {
     let temp = tempfile::tempdir().unwrap();
     let sizes = [100_000usize, 50_000, 25_000];

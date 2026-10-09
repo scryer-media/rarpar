@@ -977,6 +977,7 @@ impl RarArchive {
                 fh.compression.method.code(),
                 fh.compression.dict_size,
                 &mut hash_writer,
+                self.limits.max_ppmd_arena_size,
             )?;
             self.enforce_unknown_lz_output_limit(fh, written)?;
             written
@@ -3371,7 +3372,7 @@ impl RarArchive {
                         let written = Self::solid_decode_reader_to_sink(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
-                            self.limits.max_dict_size,
+                            &self.limits,
                             reader,
                             skip_unpacked,
                             &skip_fh,
@@ -3395,7 +3396,7 @@ impl RarArchive {
                         let written = Self::solid_decode_reader_to_sink(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
-                            self.limits.max_dict_size,
+                            &self.limits,
                             reader,
                             skip_unpacked,
                             &skip_fh,
@@ -3406,7 +3407,7 @@ impl RarArchive {
                     let written = Self::solid_decode_reader_to_sink(
                         &mut self.solid_decoder_rar4,
                         &mut self.solid_decoder,
-                        self.limits.max_dict_size,
+                        &self.limits,
                         base_reader,
                         skip_unpacked,
                         &skip_fh,
@@ -3490,7 +3491,7 @@ impl RarArchive {
                         let written = Self::solid_decode_reader_to_sink(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
-                            self.limits.max_dict_size,
+                            &self.limits,
                             reader,
                             skip_unpacked,
                             &skip_fh,
@@ -3511,7 +3512,7 @@ impl RarArchive {
                         let written = Self::solid_decode_reader_to_sink(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
-                            self.limits.max_dict_size,
+                            &self.limits,
                             reader,
                             skip_unpacked,
                             &skip_fh,
@@ -3522,7 +3523,7 @@ impl RarArchive {
                     let written = Self::solid_decode_reader_to_sink(
                         &mut self.solid_decoder_rar4,
                         &mut self.solid_decoder,
-                        self.limits.max_dict_size,
+                        &self.limits,
                         base_reader,
                         skip_unpacked,
                         &skip_fh,
@@ -4321,7 +4322,7 @@ impl RarArchive {
                             Self::solid_decode_reader_to_writer(
                                 &mut self.solid_decoder_rar4,
                                 &mut self.solid_decoder,
-                                self.limits.max_dict_size,
+                                &self.limits,
                                 reader,
                                 unpacked_size,
                                 &fh,
@@ -4331,7 +4332,7 @@ impl RarArchive {
                             Self::solid_decode_reader_to_writer(
                                 &mut self.solid_decoder_rar4,
                                 &mut self.solid_decoder,
-                                self.limits.max_dict_size,
+                                &self.limits,
                                 base_reader,
                                 unpacked_size,
                                 &fh,
@@ -4351,7 +4352,7 @@ impl RarArchive {
                             Self::solid_decode_reader_to_writer(
                                 &mut self.solid_decoder_rar4,
                                 &mut self.solid_decoder,
-                                self.limits.max_dict_size,
+                                &self.limits,
                                 reader,
                                 unpacked_size,
                                 &fh,
@@ -4361,7 +4362,7 @@ impl RarArchive {
                             Self::solid_decode_reader_to_writer(
                                 &mut self.solid_decoder_rar4,
                                 &mut self.solid_decoder,
-                                self.limits.max_dict_size,
+                                &self.limits,
                                 base_reader,
                                 unpacked_size,
                                 &fh,
@@ -4446,7 +4447,7 @@ impl RarArchive {
                         let written = Self::solid_decode_reader_to_writer(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
-                            self.limits.max_dict_size,
+                            &self.limits,
                             reader,
                             unpacked_size,
                             &fh,
@@ -4471,7 +4472,7 @@ impl RarArchive {
                         let written = Self::solid_decode_reader_to_writer(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
-                            self.limits.max_dict_size,
+                            &self.limits,
                             reader,
                             unpacked_size,
                             &fh,
@@ -4483,7 +4484,7 @@ impl RarArchive {
                     let written = Self::solid_decode_reader_to_writer(
                         &mut self.solid_decoder_rar4,
                         &mut self.solid_decoder,
-                        self.limits.max_dict_size,
+                        &self.limits,
                         base_reader,
                         unpacked_size,
                         &fh,
@@ -4932,7 +4933,7 @@ impl RarArchive {
                     Self::solid_decode_reader_to_writer(
                         &mut self.solid_decoder_rar4,
                         &mut self.solid_decoder,
-                        self.limits.max_dict_size,
+                        &self.limits,
                         reader,
                         unpacked_size,
                         &fh,
@@ -4942,7 +4943,7 @@ impl RarArchive {
                     Self::solid_decode_reader_to_writer(
                         &mut self.solid_decoder_rar4,
                         &mut self.solid_decoder,
-                        self.limits.max_dict_size,
+                        &self.limits,
                         base_reader,
                         unpacked_size,
                         &fh,
@@ -5097,7 +5098,7 @@ impl RarArchive {
                     let chunks = Self::solid_decode_reader_to_writer_chunked(
                         &mut self.solid_decoder_rar4,
                         &mut self.solid_decoder,
-                        self.limits.max_dict_size,
+                        &self.limits,
                         reader,
                         &fh,
                         unpacked_size,
@@ -5122,7 +5123,7 @@ impl RarArchive {
                     let chunks = Self::solid_decode_reader_to_writer_chunked(
                         &mut self.solid_decoder_rar4,
                         &mut self.solid_decoder,
-                        self.limits.max_dict_size,
+                        &self.limits,
                         reader,
                         &fh,
                         unpacked_size,
@@ -5138,7 +5139,7 @@ impl RarArchive {
                 let chunks = Self::solid_decode_reader_to_writer_chunked(
                     &mut self.solid_decoder_rar4,
                     &mut self.solid_decoder,
-                    self.limits.max_dict_size,
+                    &self.limits,
                     tracking_reader,
                     &fh,
                     unpacked_size,
@@ -5456,7 +5457,7 @@ impl RarArchive {
             let written = Self::solid_decode_reader_to_writer(
                 &mut self.solid_decoder_rar4,
                 &mut self.solid_decoder,
-                self.limits.max_dict_size,
+                &self.limits,
                 reader,
                 unpacked_size,
                 &fh,
@@ -5517,7 +5518,7 @@ impl RarArchive {
     fn solid_decode_reader_to_sink<R: Read>(
         solid_decoder_rar4: &mut Option<Rar4Decoder>,
         solid_decoder: &mut Option<LzDecoder>,
-        max_dict_size: u64,
+        limits: &Limits,
         compressed: R,
         unpacked_size: u64,
         fh: &FileHeader,
@@ -5526,7 +5527,7 @@ impl RarArchive {
         Self::solid_decode_reader_to_writer(
             solid_decoder_rar4,
             solid_decoder,
-            max_dict_size,
+            limits,
             compressed,
             unpacked_size,
             fh,
@@ -5537,17 +5538,17 @@ impl RarArchive {
     fn solid_decode_reader_to_writer<R: Read, W: Write>(
         solid_decoder_rar4: &mut Option<Rar4Decoder>,
         solid_decoder: &mut Option<LzDecoder>,
-        max_dict_size: u64,
+        limits: &Limits,
         compressed: R,
         unpacked_size: u64,
         fh: &FileHeader,
         writer: &mut W,
     ) -> RarResult<u64> {
         let dict_size = Self::effective_member_dict_size(fh);
-        if dict_size > max_dict_size {
+        if dict_size > limits.max_dict_size {
             return Err(RarError::DictionaryTooLarge {
                 size: dict_size,
-                max: max_dict_size,
+                max: limits.max_dict_size,
             });
         }
 
@@ -5562,6 +5563,7 @@ impl RarArchive {
                 dict_size,
                 fh.compression.version,
                 fh.compression.method.code(),
+                limits.max_ppmd_arena_size,
             )?;
             decoder.decompress_reader_to_writer(compressed, unpacked_size, writer)
         } else {
@@ -5580,7 +5582,7 @@ impl RarArchive {
     fn solid_decode_reader_to_writer_chunked<R: Read, F, W>(
         solid_decoder_rar4: &mut Option<Rar4Decoder>,
         solid_decoder: &mut Option<LzDecoder>,
-        max_dict_size: u64,
+        limits: &Limits,
         compressed: R,
         fh: &FileHeader,
         unpacked_size: u64,
@@ -5594,10 +5596,10 @@ impl RarArchive {
         F: FnMut(usize) -> RarResult<W>,
     {
         let dict_size = Self::effective_member_dict_size(fh);
-        if dict_size > max_dict_size {
+        if dict_size > limits.max_dict_size {
             return Err(RarError::DictionaryTooLarge {
                 size: dict_size,
-                max: max_dict_size,
+                max: limits.max_dict_size,
             });
         }
 
@@ -5612,6 +5614,7 @@ impl RarArchive {
                 dict_size,
                 fh.compression.version,
                 fh.compression.method.code(),
+                limits.max_ppmd_arena_size,
             )?;
             let hash_clone = shared_hash.clone();
             decoder.decompress_reader_to_writer_chunked(
@@ -5889,7 +5892,7 @@ impl RarArchive {
                     Self::solid_decode_reader_to_writer(
                         &mut self.solid_decoder_rar4,
                         &mut self.solid_decoder,
-                        self.limits.max_dict_size,
+                        &self.limits,
                         reader,
                         unpacked_size,
                         fh,
@@ -5906,7 +5909,7 @@ impl RarArchive {
                     Self::solid_decode_reader_to_writer(
                         &mut self.solid_decoder_rar4,
                         &mut self.solid_decoder,
-                        self.limits.max_dict_size,
+                        &self.limits,
                         reader,
                         unpacked_size,
                         fh,
@@ -5917,7 +5920,7 @@ impl RarArchive {
                 Self::solid_decode_reader_to_writer(
                     &mut self.solid_decoder_rar4,
                     &mut self.solid_decoder,
-                    self.limits.max_dict_size,
+                    &self.limits,
                     chained,
                     unpacked_size,
                     fh,
@@ -6206,7 +6209,7 @@ impl RarArchive {
             Self::solid_decode_reader_to_writer(
                 &mut self.solid_decoder_rar4,
                 &mut self.solid_decoder,
-                self.limits.max_dict_size,
+                &self.limits,
                 &mut buf_reader,
                 unpacked_size,
                 fh,
@@ -6635,7 +6638,7 @@ impl RarArchive {
                 Self::solid_decode_reader_to_writer_chunked(
                     &mut self.solid_decoder_rar4,
                     &mut self.solid_decoder,
-                    self.limits.max_dict_size,
+                    &self.limits,
                     reader,
                     fh,
                     unpacked_size,
@@ -6658,7 +6661,7 @@ impl RarArchive {
                 Self::solid_decode_reader_to_writer_chunked(
                     &mut self.solid_decoder_rar4,
                     &mut self.solid_decoder,
-                    self.limits.max_dict_size,
+                    &self.limits,
                     reader,
                     fh,
                     unpacked_size,
@@ -6672,7 +6675,7 @@ impl RarArchive {
             Self::solid_decode_reader_to_writer_chunked(
                 &mut self.solid_decoder_rar4,
                 &mut self.solid_decoder,
-                self.limits.max_dict_size,
+                &self.limits,
                 tracking_reader,
                 fh,
                 unpacked_size,
@@ -6847,7 +6850,7 @@ impl RarArchive {
             Self::solid_decode_reader_to_writer_chunked(
                 &mut self.solid_decoder_rar4,
                 &mut self.solid_decoder,
-                self.limits.max_dict_size,
+                &self.limits,
                 tracking_reader,
                 fh,
                 unpacked_size,

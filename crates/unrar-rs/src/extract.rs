@@ -265,6 +265,7 @@ fn decompress_member_to_writer<W: Write>(
             info.method.code(),
             info.dict_size,
             writer,
+            limits.max_ppmd_arena_size,
         );
     }
 
