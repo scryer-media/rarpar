@@ -404,7 +404,7 @@ fn sidecar_target(
             ))
         })?;
     crate::par3::reject_symlinks(&stem)?;
-    sidecar::preflight(&plan.paths(&stem), cli.overwrite)?;
+    sidecar::preflight_set(cli, &plan, &stem)?;
     plan.check_budget(cli.par3_memory_mib)?;
     Ok(Some((plan, name, stem)))
 }

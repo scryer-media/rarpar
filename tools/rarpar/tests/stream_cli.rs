@@ -256,6 +256,88 @@ fn par3_create_from_a_pipe_honours_dash_and_the_output_directory() {
     assert_eq!(code, Some(0));
 }
 
+#[track_caller]
+fn code_of(output: &Output, expected: i32) {
+    assert_eq!(
+        output.status.code(),
+        Some(expected),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The names in `directory`, sorted.
+fn listing(directory: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn par3_create_from_a_pipe_refuses_to_leave_obsolete_volumes_behind() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::create_dir_all(root.join("sets")).unwrap();
+    let data = sample(200_000, 3);
+    let create = |count: &'static str, overwrite: bool| {
+        let mut args = Vec::new();
+        if overwrite {
+            args.push("--overwrite");
+        }
+        args.extend_from_slice(&[
+            "par3",
+            "create",
+            "sets/set.par3",
+            "-",
+            "--name",
+            "piece.bin",
+            "-s",
+            "4096",
+            "-c",
+            count,
+        ]);
+        through_pipes(root, &args, data.clone())
+    };
+    ok(&create("8", false));
+    let before = listing(&root.join("sets"));
+    assert_eq!(before.len(), 5, "{before:?}");
+    let contents: Vec<Vec<u8>> = before
+        .iter()
+        .map(|name| std::fs::read(root.join("sets").join(name)).unwrap())
+        .collect();
+
+    // Fewer recovery blocks would leave the old set's later volumes behind,
+    // authenticated and beside a set they no longer belong to, as `par3
+    // create` over a file refuses; the old set stays whole.
+    let fewer = create("1", true);
+    assert_eq!(
+        fewer.status.code(),
+        Some(3),
+        "stderr={}",
+        String::from_utf8_lossy(&fewer.stderr)
+    );
+    assert!(String::from_utf8_lossy(&fewer.stderr).contains("obsolete"));
+    assert_eq!(listing(&root.join("sets")), before);
+    for (name, content) in before.iter().zip(&contents) {
+        assert_eq!(
+            &std::fs::read(root.join("sets").join(name)).unwrap(),
+            content
+        );
+    }
+
+    // A larger count renames the volumes (`vol00+01` for 16 blocks), so the
+    // old `vol0+1` would be left too; the same layout replaces every carrier.
+    code_of(&create("16", true), 3);
+    assert_eq!(listing(&root.join("sets")), before);
+    ok(&create("8", true));
+    std::fs::write(root.join("sets/piece.bin"), &data).unwrap();
+    let (code, _) = par3_verdicts(&root.join("sets"), "set.par3");
+    assert_eq!(code, Some(0));
+}
+
 #[test]
 fn par3_create_from_a_pipe_needs_what_the_length_would_choose() {
     let temp = tempfile::tempdir().unwrap();

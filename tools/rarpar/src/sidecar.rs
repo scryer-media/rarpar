@@ -371,6 +371,23 @@ fn output_error(error: std::io::Error) -> RarparError {
     }
 }
 
+/// Check every file `plan` will write under `stem` before any byte is read,
+/// and return them. Beyond [`preflight`], a PAR3 set follows `par3 create`'s
+/// overwrite rule: replacing a set whose authenticated carriers it would not
+/// all overwrite (a previous set with more volumes) is refused.
+pub(crate) fn preflight_set(
+    cli: &rarpar::cli::Cli,
+    plan: &SidecarPlan,
+    stem: &Path,
+) -> Result<Vec<PathBuf>, RarparError> {
+    let paths = plan.paths(stem);
+    preflight(&paths, cli.overwrite)?;
+    if plan.format == SidecarFormat::Par3 {
+        crate::par3::reject_obsolete_sibling_carriers(cli, stem, &paths)?;
+    }
+    Ok(paths)
+}
+
 /// Refuse a planned output that is a link, or that exists without
 /// `--overwrite`, before any byte is read.
 pub(crate) fn preflight(paths: &[PathBuf], overwrite: bool) -> Result<(), RarparError> {
