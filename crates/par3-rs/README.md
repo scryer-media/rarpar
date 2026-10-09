@@ -262,14 +262,14 @@ to 1 MiB only when the budget admits the charge, under `SourceScratch`, and
 falls back rather than failing. Serial, parallel and constrained-memory
 verification produce identical evidence.
 
-An FFT decode charges a transform plan to `CodecScratch` and skips the stages of
-its final forward transform that would produce only rows nobody reads; the rows
-the caller reads are byte-identical either way. The plan is taken only where the
-cohort's rows are wide enough to pay for splitting one transform call into many.
-`ExecutionDiagnostics::codec()` reports transform calls, butterflies performed
-and skipped, multiply-accumulates, and the Cauchy code-matrix factors a repair
-computes — which measure at under half a percent of repair wall time on the
-corpus, so nothing caches them.
+An FFT decode charges two banks of `capacity` rows to `CodecScratch` rather than
+a work area the width of the transform domain; with workers, on a direct lane
+over a domain wider than twice the capacity, a third bank lets the next fill
+overlap the current transform. Every transform runs in full: no stage is pruned.
+`ExecutionDiagnostics::codec()` reports transform calls, butterflies performed,
+multiply-accumulates, and the Cauchy code-matrix factors a repair computes —
+which measure at under half a percent of repair wall time on the corpus, so
+nothing caches them. Its `butterflies_skipped` count is always zero.
 
 Under pressure the engine narrows before it refuses — stripes, worker pools and
 verification batches are admitted at the width the budget actually has, and each

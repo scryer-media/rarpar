@@ -411,9 +411,9 @@ impl FftCodec {
         self.transform_counted(rows, zero, origin, inverse, None, 0)
     }
 
-    /// One additive transform, counted. `skipped` is the butterflies a plan
-    /// removed from what this call would otherwise have had to perform, so the
-    /// diagnostics can report the pruned and unpruned costs side by side.
+    /// One additive transform, counted. `skipped` feeds
+    /// `CodecSnapshot::butterflies_skipped`; nothing prunes a transform, so
+    /// every caller passes zero.
     /// With `sum`, every row of the result is added into the same row of it
     /// as the transform leaves it; see
     /// [`TransformField::transform_rows_adding`].
@@ -432,8 +432,7 @@ impl FftCodec {
         // only once the backend has actually done the work. A cancelled or
         // failed transform performed no butterflies, and counting it as though
         // it had would inflate the codec totals exactly where a host looks to
-        // find out why an operation cost what it did. The pruned path below
-        // has always reported afterwards; these two now agree.
+        // find out why an operation cost what it did.
         let performed = butterflies(rows.len());
         let symbols = rows.first().map_or(0, |row| row.len());
         L::transform(
