@@ -300,6 +300,20 @@ impl Sidecar {
                     geometry.galois,
                     reference_field(geometry.blocks, 0, geometry.recovery, 0)
                 );
+                // A file too short for one block has no recovery rows and
+                // codes in GF(2^8), which a stream asked for 256 rows or more
+                // never started; its coding is empty, so it is made here.
+                if geometry.blocks == 0
+                    && !lane
+                        .codings()
+                        .iter()
+                        .any(|coding| coding.galois() == geometry.galois)
+                {
+                    lane.add_coding(
+                        Coding::new(geometry.galois, 0, 0, block_size)
+                            .map_err(RarparError::Data)?,
+                    );
+                }
                 let codings = lane.codings_mut();
                 codings.retain(|coding| coding.galois() == geometry.galois);
                 let Some(coding) = codings.first_mut() else {
