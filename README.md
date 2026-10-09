@@ -312,11 +312,15 @@ rarpar xz compress --level 9 --extreme --threads 8 data.tar
 rarpar xz decompress data.tar.xz ./out         # writes ./out/data.tar
 rarpar xz test data.tar.xz
 rarpar --json xz list data.tar.xz
-tar -c ./release | rarpar xz compress - > release.tar.xz
+tar -c ./release | rarpar xz compress > release.tar.xz
+curl -s "$URL" | rarpar xz decompress --threads 4 | tar -x
 ```
 
-`xz compress INPUT [OUTPUT]` and `xz decompress INPUT [OUTPUT]` take a file, or
-`-` for standard input or output. OUTPUT defaults to INPUT with `.xz` added
+`xz compress [INPUT] [OUTPUT]` and `xz decompress [INPUT] [OUTPUT]` take a file,
+or `-` for standard input or output; an absent INPUT is standard input when that
+is not a terminal. Pipes are read and written as the data flows, never staged
+to a temporary file, in memory that does not depend on the stream's length, and
+a slow reader holds rarpar back rather than growing a buffer. OUTPUT defaults to INPUT with `.xz` added
 (compress) or removed (decompress, where `.txz` becomes `.tar`), beside INPUT or
 in the global `--output` directory; an existing directory as OUTPUT takes that
 name inside it, and standard input defaults to standard output. Inputs are
@@ -334,14 +338,19 @@ output bytes do not depend on `--threads`. A dictionary larger than the largest
 block is shrunk to fit it. `--memory-mib` caps the estimated encoder memory by
 running fewer threads; there is no cap by default.
 
-Decompression and `xz test` verify every block's check. A seekable file with
-more than one block is decoded on up to `--threads` threads within
-`--memory-mib` (default 1024), with fewer threads when the largest block needs
-it; standard input, single-block files and files the parallel decoder cannot
-map are decoded in one pass, whose dictionary must fit the same limit.
+Decompression and `xz test` verify every block's check. A file with more than
+one block is decoded on up to `--threads` threads within `--memory-mib` (default
+1024), with fewer threads when the largest block needs it; single-block files
+and files the parallel decoder cannot map are decoded in one pass, whose
+dictionary must fit the same limit. A pipe is decoded as it arrives: on several
+threads, blocks whose headers record their sizes (as rarpar's and xz's threaded
+output do) go to workers, and other blocks are decoded in order.
 Concatenated streams and stream padding decode as one output. `xz list` reads
-the index of every stream from the end of the file and reports each stream's
-offset, sizes, check, padding and blocks. With `--json`, every action prints one
+the index of every stream from the end of a file and reports each stream's
+offset, sizes, check, padding and blocks. A pipe has no end to seek to, so
+`xz list -` decodes it once and reports the sizes, the stream and block counts,
+each block's uncompressed size and the first stream's check, with `unknown`
+naming what a single forward pass cannot give. With `--json`, every action prints one
 report; when the data itself goes to standard output, reports go to standard
 error. A damaged stream exits 1, an exceeded memory limit 4, and a refused
 output 3.

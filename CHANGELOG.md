@@ -14,7 +14,11 @@ documented in each crate's own changelog so those notes ship with the crate.
   blocks at once; the bytes do not depend on the thread count. Decompression
   decodes multi-block files on several threads within `--memory-mib` (default
   1024), handles concatenated streams and padding, and verifies every check.
-  `-` reads standard input or writes standard output, inputs are always kept,
+  `-` reads standard input or writes standard output, and an absent INPUT is
+  standard input when it is piped. Every action streams a pipe in bounded
+  memory: decompression and `test` decode a pipe on several threads, and
+  `list` reads a pipe in one pass and names what that cannot report. Inputs
+  are always kept,
   existing outputs need `--overwrite`, outputs keep the input's permissions
   and modification time, and `--json` reports every action.
 - RAR3 PPMd members extract faster: `unrar-rs` 0.11.0 decodes them through
