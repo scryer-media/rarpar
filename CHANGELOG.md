@@ -7,6 +7,16 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ### CLI Changes
 
+- New `rarpar xz` commands: `compress`, `decompress`, `test` and `list` for
+  `.xz` files, on `lzma-turbo` 0.6.0. Compression takes the xz presets
+  (`--level` 0-9, `--extreme`), a `--check` of `crc32`, `crc64` (default),
+  `sha256` or `none`, and `--block-size`, and compresses up to `--threads`
+  blocks at once; the bytes do not depend on the thread count. Decompression
+  decodes multi-block files on several threads within `--memory-mib` (default
+  1024), handles concatenated streams and padding, and verifies every check.
+  `-` reads standard input or writes standard output, inputs are always kept,
+  existing outputs need `--overwrite`, outputs keep the input's permissions
+  and modification time, and `--json` reports every action.
 - RAR3 PPMd members extract faster: `unrar-rs` 0.11.0 decodes them through
   the `ppmd-turbo` crate, 1.16-1.71x faster than 0.6.0 on the RAR4 PPMd
   fixtures (32 MiB order-16 member: 3.41 s wall, from 4.71 s). Output is

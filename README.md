@@ -26,6 +26,8 @@ writing, compression, or modification APIs.
 - Creates PAR2 recovery sets with validated, atomically committed output
   (`par create`).
 - Restores missing RAR volumes from `.rev` recovery volumes when available.
+- Compresses, decompresses, tests and lists `.xz` files on several threads
+  (`xz compress`, `xz decompress`, `xz test`, `xz list`).
 - Extracts RAR archives with integrity checks enabled.
 - Handles encrypted archives through secure password sources or a hidden
   interactive prompt.
@@ -301,6 +303,48 @@ budget covers engine allocations; CLI path/report storage is bounded separately
 by `--max-files` and metadata limits. `auto` repairs before rediscovering and
 extracting RAR inputs. Container insertion/self-repair and recovery-carrier
 reconstruction remain explicit library APIs rather than CLI commands.
+
+xz operations:
+
+```bash
+rarpar xz compress data.tar                    # writes data.tar.xz
+rarpar xz compress --level 9 --extreme --threads 8 data.tar
+rarpar xz decompress data.tar.xz ./out         # writes ./out/data.tar
+rarpar xz test data.tar.xz
+rarpar --json xz list data.tar.xz
+tar -c ./release | rarpar xz compress - > release.tar.xz
+```
+
+`xz compress INPUT [OUTPUT]` and `xz decompress INPUT [OUTPUT]` take a file, or
+`-` for standard input or output. OUTPUT defaults to INPUT with `.xz` added
+(compress) or removed (decompress, where `.txz` becomes `.tar`), beside INPUT or
+in the global `--output` directory; an existing directory as OUTPUT takes that
+name inside it, and standard input defaults to standard output. Inputs are
+always kept, so `--delete-sources` is refused. An existing output requires
+`--overwrite`; the output is staged beside its destination, installed only once
+complete, and keeps the input's permissions and modification time. Compressed
+data is not written to a terminal.
+
+`--level` 0-9 and `--extreme` select the xz preset of that number; the default
+is 6 with a CRC-64 check, and `--check` selects `crc32`, `crc64`, `sha256` or
+`none`. The stream is cut into blocks of `--block-size` bytes, by default three
+times the preset's dictionary (at least 1 MiB) as xz's threaded mode does, and
+up to `--threads` blocks (default: available CPUs) are compressed at once. The
+output bytes do not depend on `--threads`. A dictionary larger than the largest
+block is shrunk to fit it. `--memory-mib` caps the estimated encoder memory by
+running fewer threads; there is no cap by default.
+
+Decompression and `xz test` verify every block's check. A seekable file with
+more than one block is decoded on up to `--threads` threads within
+`--memory-mib` (default 1024), with fewer threads when the largest block needs
+it; standard input, single-block files and files the parallel decoder cannot
+map are decoded in one pass, whose dictionary must fit the same limit.
+Concatenated streams and stream padding decode as one output. `xz list` reads
+the index of every stream from the end of the file and reports each stream's
+offset, sizes, check, padding and blocks. With `--json`, every action prints one
+report; when the data itself goes to standard output, reports go to standard
+error. A damaged stream exits 1, an exceeded memory limit 4, and a refused
+output 3.
 
 PAR2 placement defaults to `smart`, which can locate renamed or moved data by
 content. For a conventional expected-path-only verification or repair, use:
