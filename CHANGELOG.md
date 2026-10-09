@@ -35,6 +35,16 @@ documented in each crate's own changelog so those notes ship with the crate.
   under it and an absolute one wins. Inputs are still found where they were:
   `par create`'s `--base-path` defaults to the parent of OUTPUT as typed.
 - `par3 create -` no longer needs the `sevenz` feature.
+- `xz compress --sidecar par2|par3` and `par3 archive --sidecar par2|par3`
+  write a conventional PAR2 or PAR3 set beside the archive in the same pass,
+  from the bytes as they are written: no read-back, no temporary files, memory
+  bounded by the recovery blocks within `--par3-memory-mib`. The block size
+  and recovery count are fixed up front (`--sidecar-block-size` and
+  `--sidecar-recovery-count`; aliases of `-s` and `-c` on `par3 archive`). An
+  archive on standard output needs `--sidecar-name` (exit 2 otherwise). A PAR2
+  sidecar is byte for byte the set `par create` makes from the finished
+  archive. `--format 7z --sidecar par2` is refused: the 7z start header is
+  written last, after PAR2's whole-file MD5 has passed it.
 - RAR3 PPMd members extract faster: `unrar-rs` 0.11.0 decodes them through
   the `ppmd-turbo` crate, 1.16-1.71x faster than 0.6.0 on the RAR4 PPMd
   fixtures (32 MiB order-16 member: 3.41 s wall, from 4.71 s). Output is

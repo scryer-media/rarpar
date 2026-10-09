@@ -399,6 +399,43 @@ report; when the data itself goes to standard output, reports go to standard
 error. A damaged stream exits 1, an exceeded memory limit 4, and a refused
 output 3.
 
+Sidecar recovery sets in the same pass:
+
+```bash
+rarpar xz compress --sidecar par2 --sidecar-block-size 1048576 \
+  --sidecar-recovery-count 16 data.tar         # data.tar.xz + data.tar.xz.par2 + volumes
+tar -c ./release | rarpar xz compress --sidecar par3 --sidecar-block-size 1048576 \
+  --sidecar-recovery-count 16 --sidecar-name release.tar.xz > release.tar.xz
+rarpar par3 archive --format zip --sidecar par2 -s 1048576 -c 16 set.zip ./release
+```
+
+`xz compress --sidecar par2|par3` and `par3 archive --sidecar par2|par3` feed
+the archive's bytes, as they are written, to a PAR2 or PAR3 creator and write a
+conventional one-file set (an index plus power-of-two recovery volumes) beside
+the archive. The archive is never read back and nothing is staged to a temporary
+file; memory is the recovery blocks, one block, and a few dozen bytes per input
+block, within `--par3-memory-mib` for either format. The archive's length is
+unknown until its last byte, so the block size and recovery count are fixed up
+front: `--sidecar-block-size` and `--sidecar-recovery-count` (both required for
+`xz compress`; on `par3 archive` they are aliases of `-s` and `-c`, and `-c`
+defaults to 1). A PAR2 sidecar records the same packets in the same layout as
+`par create` over the finished archive with the same block size and recovery
+count, byte for byte. Verify and repair with `par verify|repair` or
+`par3 verify|repair` against the archive.
+
+An xz file names its set after itself (`data.tar.xz.par2`); `par3 archive`
+names it after the archive's stem (`set.par2`, as its PAR3 sibling sets are
+named). The set follows the archive's placement under `-o`, is staged beside
+its names and installed after the archive, and every name it will take is
+checked, with the same `--overwrite` and symlink rules, before a byte is
+read. An archive written to standard output has no name to record, so
+`--sidecar` there needs `--sidecar-name NAME`, the name the output will be
+saved under (placed under `-o` like an OUTPUT); otherwise it exits 2. Neither
+command writes multi-volume archives, so one set covers the one archive.
+`par3 archive --format 7z --sidecar par2` is refused (exit 2): the 7z writer
+writes its start header last, over bytes PAR2's whole-file MD5 has already
+taken, so use `--sidecar par3` or run `par create` over the finished 7z.
+
 PAR2 placement defaults to `smart`, which can locate renamed or moved data by
 content. For a conventional expected-path-only verification or repair, use:
 
