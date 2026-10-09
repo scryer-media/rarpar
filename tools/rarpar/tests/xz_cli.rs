@@ -296,9 +296,9 @@ fn standard_input_and_output_stream_both_ways() {
     let report: Value = serde_json::from_slice(&tested.stdout).unwrap();
     assert_eq!(report["output_bytes"], original.len() as u64);
 
-    // The index is at the end of the file, so listing needs a seekable input.
+    // An empty pipe is not an .xz stream.
     let listed = piped(&bin(), root, &["xz", "list", "-"], Vec::new());
-    assert_eq!(listed.status.code(), Some(2));
+    assert_eq!(listed.status.code(), Some(1));
 }
 
 #[test]
@@ -579,5 +579,242 @@ fn interoperates_with_the_system_xz() {
             assert_eq!(totals[4], listed["uncompressed_bytes"].to_string(), "{tag}");
             assert_eq!(totals[6], "CRC64", "{tag}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Real pipes: the binary reads a pipe fed in chunks while its output is read
+// concurrently, so neither side can hold the whole stream.
+
+const PIPE_CHUNK: usize = 64 << 10;
+
+/// Runs rarpar with `input` fed to its standard input in chunks from one
+/// thread while another drains standard error and this one drains standard
+/// output, so the child sees true pipes in both directions.
+fn through_pipes(root: &Path, args: &[&str], input: Vec<u8>) -> Output {
+    use std::io::Read;
+    let mut child = Command::new(bin())
+        .current_dir(root)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let feeder = std::thread::spawn(move || {
+        for chunk in input.chunks(PIPE_CHUNK) {
+            if stdin.write_all(chunk).is_err() {
+                // The child stopped reading; its exit status tells why.
+                return;
+            }
+        }
+    });
+    let mut stderr = child.stderr.take().unwrap();
+    let errors = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let mut stdout = Vec::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut stdout)
+        .unwrap();
+    let status = child.wait().unwrap();
+    feeder.join().unwrap();
+    Output {
+        status,
+        stdout,
+        stderr: errors.join().unwrap(),
+    }
+}
+
+#[track_caller]
+fn stderr_report(output: &Output) -> Value {
+    ok(output);
+    serde_json::from_slice(&output.stderr).unwrap()
+}
+
+#[test]
+fn pipes_stream_through_compress_and_decompress_on_one_and_four_threads() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let original = sample(6 << 20, 23);
+
+    let mut reference: Option<Vec<u8>> = None;
+    for threads in ["1", "4"] {
+        // No INPUT: standard input is a pipe, so it is the input.
+        let compressed = through_pipes(
+            root,
+            &[
+                "--json",
+                "xz",
+                "compress",
+                "--level",
+                "1",
+                "-s",
+                "524288",
+                "--threads",
+                threads,
+            ],
+            original.clone(),
+        );
+        let report = stderr_report(&compressed);
+        assert_eq!(
+            report["input_bytes"],
+            original.len() as u64,
+            "threads {threads}"
+        );
+        assert_eq!(report["output_bytes"], compressed.stdout.len() as u64);
+        // Blocks are cut by size, so the bytes do not depend on the threads.
+        match &reference {
+            Some(bytes) => assert_eq!(&compressed.stdout, bytes, "threads {threads}"),
+            None => reference = Some(compressed.stdout.clone()),
+        }
+
+        for decode_threads in ["1", "4"] {
+            let decoded = through_pipes(
+                root,
+                &[
+                    "--json",
+                    "xz",
+                    "decompress",
+                    "-",
+                    "-",
+                    "--threads",
+                    decode_threads,
+                ],
+                compressed.stdout.clone(),
+            );
+            let report = stderr_report(&decoded);
+            assert!(
+                decoded.stdout == original,
+                "threads {threads}/{decode_threads}"
+            );
+            assert_eq!(report["input_bytes"], compressed.stdout.len() as u64);
+            let expected = if decode_threads == "1" {
+                "sequential"
+            } else {
+                "stream-parallel"
+            };
+            assert_eq!(report["decoder"], expected);
+        }
+    }
+}
+
+#[test]
+fn a_concatenated_stream_pipe_decodes_tests_and_lists() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let first = sample(3 << 20, 29);
+    let second = sample(2 << 20, 31);
+    std::fs::write(root.join("first.bin"), &first).unwrap();
+    std::fs::write(root.join("second.bin"), &second).unwrap();
+    ok(&rarpar(
+        root,
+        &[
+            "xz",
+            "compress",
+            "first.bin",
+            "--level",
+            "1",
+            "-s",
+            "524288",
+        ],
+    ));
+    ok(&rarpar(
+        root,
+        &[
+            "xz",
+            "compress",
+            "second.bin",
+            "--level",
+            "1",
+            "-s",
+            "1048576",
+            "--check",
+            "sha256",
+        ],
+    ));
+    let mut joined = std::fs::read(root.join("first.bin.xz")).unwrap();
+    joined.extend_from_slice(&[0; 8]);
+    joined.extend(std::fs::read(root.join("second.bin.xz")).unwrap());
+    let mut original = first.clone();
+    original.extend_from_slice(&second);
+
+    for threads in ["1", "4"] {
+        let decoded = through_pipes(
+            root,
+            &["--json", "xz", "decompress", "--threads", threads],
+            joined.clone(),
+        );
+        let report = stderr_report(&decoded);
+        assert!(decoded.stdout == original, "threads {threads}");
+        assert_eq!(report["input_bytes"], joined.len() as u64);
+
+        let tested = through_pipes(
+            root,
+            &["--json", "xz", "test", "-", "--threads", threads],
+            joined.clone(),
+        );
+        ok(&tested);
+        let report: Value = serde_json::from_slice(&tested.stdout).unwrap();
+        assert_eq!(report["output_bytes"], original.len() as u64);
+    }
+
+    let listed = through_pipes(root, &["--json", "xz", "list", "-"], joined.clone());
+    ok(&listed);
+    let piped_list: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(piped_list["seekable"], false);
+    assert_eq!(piped_list["stream_count"], 2);
+    assert_eq!(piped_list["block_count"], 6 + 2);
+    assert_eq!(piped_list["compressed_bytes"], joined.len() as u64);
+    assert_eq!(piped_list["uncompressed_bytes"], original.len() as u64);
+    assert_eq!(piped_list["checks"], serde_json::json!(["crc64"]));
+    assert_eq!(
+        piped_list["blocks"][6]["uncompressed_offset"],
+        first.len() as u64
+    );
+    assert!(!piped_list["unknown"].as_array().unwrap().is_empty());
+
+    // The same file listed from disk agrees on everything a pipe can know.
+    std::fs::write(root.join("joined.xz"), &joined).unwrap();
+    let seekable = report(root, &["xz", "list", "joined.xz"]);
+    for key in [
+        "stream_count",
+        "block_count",
+        "uncompressed_bytes",
+        "compressed_bytes",
+    ] {
+        assert_eq!(seekable[key], piped_list[key], "{key}");
+    }
+}
+
+/// Damage in a pipe fails the decode with a data error and writes no report
+/// of success, on one thread or four.
+#[test]
+fn damage_in_a_pipe_is_a_data_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let original = sample(2 << 20, 37);
+    let compressed = through_pipes(
+        root,
+        &["xz", "compress", "--level", "1", "-s", "262144"],
+        original,
+    );
+    ok(&compressed);
+    let mut damaged = compressed.stdout;
+    let middle = damaged.len() / 2;
+    damaged[middle] ^= 0x55;
+    for threads in ["1", "4"] {
+        let tested = through_pipes(
+            root,
+            &["xz", "test", "-", "--threads", threads],
+            damaged.clone(),
+        );
+        assert_eq!(tested.status.code(), Some(1), "threads {threads}");
     }
 }
