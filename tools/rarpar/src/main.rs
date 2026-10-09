@@ -8,15 +8,15 @@ mod compat_unrar;
 mod discovery;
 mod error;
 mod par2;
+mod par2_stream;
 mod par3;
 mod par3_inside;
-#[cfg(feature = "sevenz")]
 mod par3_pipe;
-#[cfg(feature = "sevenz")]
 mod par3_stream;
 mod password;
 mod rar;
 mod report;
+mod sidecar;
 mod streams;
 mod xz;
 

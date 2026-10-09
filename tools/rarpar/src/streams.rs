@@ -151,7 +151,8 @@ pub fn resolve_output(
     output: Option<&Path>,
     default_name: impl FnOnce(&Path) -> Result<PathBuf, RarparError>,
 ) -> Result<Option<PathBuf>, RarparError> {
-    match output {
+    let output = output.map(|path| cli.place_output(path));
+    match output.as_deref() {
         Some(path) if is_stdio(path) => Ok(None),
         Some(path) if !path.is_dir() => Ok(Some(path.to_path_buf())),
         Some(directory) => {

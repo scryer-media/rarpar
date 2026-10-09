@@ -227,6 +227,33 @@ fn par3_create_from_a_pipe_honours_dash_and_the_output_directory() {
     std::fs::write(root.join("sets/piece.bin"), &data).unwrap();
     let (code, _) = par3_verdicts(&root.join("sets"), "piece.bin.par3");
     assert_eq!(code, Some(0));
+
+    // The global -o directory takes a relative OUTPUT, and a directory OUTPUT
+    // inside it still takes --name.
+    std::fs::create_dir_all(root.join("global/inner")).unwrap();
+    ok(&through_pipes(
+        root,
+        &[
+            "-o",
+            "global",
+            "par3",
+            "create",
+            "inner",
+            "-",
+            "--name",
+            "piece.bin",
+            "-s",
+            "4096",
+            "-c",
+            "2",
+        ],
+        data.clone(),
+    ));
+    assert!(root.join("global/inner/piece.bin.par3").is_file());
+    assert!(!root.join("inner").exists());
+    std::fs::write(root.join("global/inner/piece.bin"), &data).unwrap();
+    let (code, _) = par3_verdicts(&root.join("global/inner"), "piece.bin.par3");
+    assert_eq!(code, Some(0));
 }
 
 #[test]

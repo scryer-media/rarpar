@@ -212,6 +212,57 @@ fn default_names_keep_the_input_and_follow_the_global_output_directory() {
 }
 
 #[test]
+fn a_named_output_lands_in_the_global_output_directory_unless_absolute() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let original = sample(20_000, 11);
+    std::fs::write(root.join("data.tar"), &original).unwrap();
+    std::fs::create_dir_all(root.join("out/sub")).unwrap();
+    std::fs::create_dir(root.join("elsewhere")).unwrap();
+
+    // A relative OUTPUT is placed under -o, keeping its own subdirectories.
+    let named = report(
+        root,
+        &["-o", "out", "xz", "compress", "data.tar", "named.xz"],
+    );
+    assert_eq!(named["output"], "out/named.xz");
+    assert!(!root.join("named.xz").exists());
+    let nested = report(
+        root,
+        &["-o", "out", "xz", "compress", "data.tar", "sub/n.xz"],
+    );
+    assert_eq!(nested["output"], "out/sub/n.xz");
+    let decoded = report(
+        root,
+        &["-o", "out", "xz", "decompress", "out/named.xz", "back.tar"],
+    );
+    assert_eq!(decoded["output"], "out/back.tar");
+    assert_eq!(std::fs::read(root.join("out/back.tar")).unwrap(), original);
+
+    // An absolute OUTPUT wins over -o.
+    let absolute = root.join("elsewhere/abs.xz");
+    let absolute_arg = absolute.to_str().unwrap();
+    ok(&rarpar(
+        root,
+        &["-o", "out", "xz", "compress", "data.tar", absolute_arg],
+    ));
+    assert!(absolute.is_file());
+    assert!(!root.join("out/elsewhere").exists());
+
+    // `-` stays standard output.
+    let streamed = rarpar(root, &["-o", "out", "xz", "compress", "data.tar", "-"]);
+    ok(&streamed);
+    let back = piped(
+        &bin(),
+        root,
+        &["xz", "decompress", "-", "-"],
+        streamed.stdout,
+    );
+    ok(&back);
+    assert_eq!(back.stdout, original);
+}
+
+#[test]
 fn an_existing_output_needs_overwrite_and_the_input_is_never_the_output() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();

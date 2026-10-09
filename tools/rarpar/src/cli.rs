@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -62,7 +62,9 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub dry_run: bool,
 
-    /// Extraction output directory; multiple detected sets get separate subdirectories.
+    /// Extraction output directory; multiple detected sets get separate subdirectories. For `xz
+    /// compress`, `xz decompress`, `par create`, `par3 create` and `par3 archive`, a relative
+    /// OUTPUT is placed under it.
     #[arg(short = 'o', long, global = true, value_name = "DIR")]
     pub output: Option<PathBuf>,
 
@@ -120,6 +122,19 @@ pub struct Cli {
     /// Input paths for default auto mode.
     #[arg(value_name = "PATH")]
     pub paths: Vec<PathBuf>,
+}
+
+impl Cli {
+    /// Where a command's positional OUTPUT lands: under the global `-o`
+    /// directory when one is given and OUTPUT is relative (so `sub/out` lands
+    /// in `DIR/sub/out`), as given otherwise. An absolute OUTPUT wins over
+    /// `-o`, and `-` (standard output) is never moved.
+    pub fn place_output(&self, output: &Path) -> PathBuf {
+        match &self.output {
+            Some(directory) if output != Path::new("-") => directory.join(output),
+            _ => output.to_path_buf(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -223,8 +238,9 @@ pub struct XzCompressArgs {
     /// File to compress, or `-` for standard input (the default when it is not a terminal).
     #[arg(value_name = "INPUT")]
     pub input: Option<PathBuf>,
-    /// Output file or directory, or `-` for standard output.
-    #[arg(value_name = "OUTPUT")]
+    /// Output file or directory, or `-` for standard output; a relative OUTPUT is placed under
+    /// the global -o directory when one is given.
+    #[arg(id = "destination", value_name = "OUTPUT")]
     pub output: Option<PathBuf>,
     /// Compression level: the xz preset, 0 (fastest) to 9.
     #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u32).range(0..=9))]
@@ -244,6 +260,27 @@ pub struct XzCompressArgs {
     /// Memory budget in MiB; fewer threads are used to stay within it. No limit by default.
     #[arg(long, value_name = "MIB", value_parser = clap::value_parser!(u64).range(1..))]
     pub memory_mib: Option<u64>,
+    #[command(flatten)]
+    pub sidecar: SidecarArgs,
+}
+
+/// A recovery set written beside the output in the same pass, from the bytes
+/// as they are written.
+#[derive(Debug, Clone, Args)]
+pub struct SidecarArgs {
+    /// Also write a PAR2 or PAR3 set for the output beside it, computed as it is written.
+    #[arg(long, value_enum, value_name = "FORMAT")]
+    pub sidecar: Option<SidecarFormat>,
+    /// Block (slice) size of the set in bytes; required with --sidecar.
+    #[arg(long, value_name = "BYTES", requires = "sidecar", value_parser = clap::value_parser!(u64).range(1..))]
+    pub sidecar_block_size: Option<u64>,
+    /// Recovery blocks in the set; required with --sidecar.
+    #[arg(long, value_name = "COUNT", requires = "sidecar")]
+    pub sidecar_recovery_count: Option<u64>,
+    /// With standard output, the name it will be saved under: the set records it and is named
+    /// after it, placed under -o like an OUTPUT.
+    #[arg(long, value_name = "NAME", requires = "sidecar")]
+    pub sidecar_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -262,8 +299,9 @@ pub struct XzDecompressArgs {
     /// .xz file to decompress, or `-` for standard input (the default when it is not a terminal).
     #[arg(value_name = "INPUT")]
     pub input: Option<PathBuf>,
-    /// Output file or directory, or `-` for standard output.
-    #[arg(value_name = "OUTPUT")]
+    /// Output file or directory, or `-` for standard output; a relative OUTPUT is placed under
+    /// the global -o directory when one is given.
+    #[arg(id = "destination", value_name = "OUTPUT")]
     pub output: Option<PathBuf>,
     #[command(flatten)]
     pub decode: XzDecodeArgs,
@@ -445,7 +483,9 @@ pub struct Par3Args {
 
 #[derive(Debug, Clone, Args)]
 pub struct Par3CreateArgs {
-    /// Output PAR3 path or stem; with a stream, an existing directory takes the set named by --name.
+    /// Output PAR3 path or stem, placed under the global -o directory when OUTPUT is relative and
+    /// -o is given; with a stream, an existing directory takes the set named by --name.
+    #[arg(id = "destination", value_name = "OUTPUT")]
     pub output: PathBuf,
     /// Explicit source files, relative to --base-path (defaults to current directory), or `-` for
     /// one file from standard input (the default when no file is given and it is not a terminal).
@@ -498,6 +538,7 @@ pub struct Par3CreateArgs {
 #[derive(Debug, Clone, Args)]
 pub struct Par3ArchiveArgs {
     /// Output archive path.
+    #[arg(id = "destination", value_name = "OUTPUT")]
     pub output: PathBuf,
     /// Files and directories to archive, relative to --base-path (defaults to current directory).
     #[arg(required = true, num_args = 1..)]
@@ -518,13 +559,23 @@ pub struct Par3ArchiveArgs {
     #[arg(long)]
     pub no_solid: bool,
     /// Append the PAR3 set inside the archive, after its end header, instead of beside it.
-    #[arg(long, conflicts_with_all = ["block_size", "recovery_count"])]
+    #[arg(long, conflicts_with_all = ["block_size", "recovery_count", "sidecar"])]
     pub inside: bool,
-    /// Logical block size in bytes for the sibling set; odd sizes are rounded up.
-    #[arg(short = 's', long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(40..))]
+    /// Format of the set written beside the archive in the same pass: par3 (the default) or par2
+    /// (ZIP only, with a fixed -c).
+    #[arg(long, value_enum, value_name = "FORMAT")]
+    pub sidecar: Option<SidecarFormat>,
+    /// Logical block size in bytes for the sibling set; odd sizes are rounded up (PAR2: to a
+    /// multiple of 4).
+    #[arg(short = 's', long, visible_alias = "sidecar-block-size", default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(40..))]
     pub block_size: u64,
     /// Number of recovery packets in the sibling set (defaults to one).
-    #[arg(short = 'c', long, conflicts_with = "recovery_percent")]
+    #[arg(
+        short = 'c',
+        long,
+        visible_alias = "sidecar-recovery-count",
+        conflicts_with = "recovery_percent"
+    )]
     pub recovery_count: Option<u64>,
     /// Recovery percentage of input blocks, rounded up; with --inside, 0 to 250, and 0 means one block.
     #[arg(short = 'r', long, conflicts_with = "recovery_count")]
@@ -551,6 +602,13 @@ pub enum ArchiveFilter {
     Sparc,
     Ppc,
     Riscv,
+}
+
+/// Format of a recovery set written beside an archive in the same pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SidecarFormat {
+    Par2,
+    Par3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -632,7 +690,7 @@ pub struct ParArgs {
 #[derive(Debug, Clone, Args)]
 pub struct ParCreateArgs {
     /// Output PAR2 path or stem; recovery volumes use this stem as well.
-    #[arg(value_name = "OUTPUT")]
+    #[arg(id = "destination", value_name = "OUTPUT")]
     pub output: PathBuf,
 
     /// Explicit input files to include in the recovery set; no recursion or file-list expansion is performed.
@@ -981,5 +1039,71 @@ mod tests {
             }) => assert_eq!(args.block_count, Some(2)),
             other => panic!("expected par create, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn global_output_directory_and_positional_output_are_both_visible() {
+        let parse = |arguments: &[&str]| {
+            let mut command = vec!["rarpar", "-o", "dir"];
+            command.extend(arguments);
+            Cli::try_parse_from(command).expect("-o and OUTPUT should parse together")
+        };
+
+        let cli = parse(&["xz", "compress", "in.tar", "out.xz"]);
+        assert_eq!(cli.output, Some(PathBuf::from("dir")));
+        let Some(Command::Xz {
+            command: XzCommand::Compress(args),
+        }) = &cli.command
+        else {
+            panic!("expected xz compress");
+        };
+        assert_eq!(args.output, Some(PathBuf::from("out.xz")));
+        assert_eq!(
+            cli.place_output(Path::new("out.xz")),
+            Path::new("dir/out.xz")
+        );
+        assert_eq!(
+            cli.place_output(Path::new("sub/out.xz")),
+            Path::new("dir/sub/out.xz")
+        );
+        assert_eq!(
+            cli.place_output(Path::new("/abs/out.xz")),
+            Path::new("/abs/out.xz")
+        );
+        assert_eq!(cli.place_output(Path::new("-")), Path::new("-"));
+
+        let cli = parse(&["xz", "decompress", "in.xz", "out.tar"]);
+        assert_eq!(cli.output, Some(PathBuf::from("dir")));
+        let Some(Command::Xz {
+            command: XzCommand::Decompress(args),
+        }) = &cli.command
+        else {
+            panic!("expected xz decompress");
+        };
+        assert_eq!(args.output, Some(PathBuf::from("out.tar")));
+
+        let cli = parse(&["par3", "create", "set.par3", "a.bin"]);
+        assert_eq!(cli.output, Some(PathBuf::from("dir")));
+        let Some(Command::Par3 {
+            command: Par3Command::Create(args),
+        }) = &cli.command
+        else {
+            panic!("expected par3 create");
+        };
+        assert_eq!(args.output, PathBuf::from("set.par3"));
+
+        let cli = parse(&["par", "create", "set", "a.bin"]);
+        assert_eq!(cli.output, Some(PathBuf::from("dir")));
+        let Some(Command::Par {
+            command: ParCommand::Create(args),
+        }) = &cli.command
+        else {
+            panic!("expected par create");
+        };
+        assert_eq!(args.output, PathBuf::from("set"));
+
+        // Without -o, the positional no longer leaks into the global option.
+        let cli = Cli::try_parse_from(["rarpar", "xz", "compress", "in.tar", "out.xz"]).unwrap();
+        assert_eq!(cli.output, None);
     }
 }

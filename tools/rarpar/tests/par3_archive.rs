@@ -147,6 +147,29 @@ fn a_sibling_set_repairs_the_archive_it_was_written_with() {
 }
 
 #[test]
+fn a_relative_archive_path_lands_under_the_global_output_directory() {
+    let dir = fixture(20_000);
+    let root = dir.path();
+    let tail = with_args(&MEMBERS, &["-s", "4096", "-c", "2"]);
+    // The members are still found under --base-path; only the archive moves.
+    let report = archive(root, &with_args(&["-o", "placed", "sub/set.7z"], &tail));
+    assert_eq!(report["mode"], "sibling");
+    assert!(root.join("placed/sub/set.par3").is_file());
+    assert!(!root.join("sub").exists());
+    assert_extracts(root, "placed/sub/set.7z");
+
+    // An absolute archive path wins over -o.
+    let absolute = root.join("abs/set.7z");
+    archive(
+        root,
+        &with_args(&["-o", "placed", absolute.to_str().unwrap()], &tail),
+    );
+    assert!(absolute.is_file());
+    assert!(root.join("abs/set.par3").is_file());
+    assert!(!root.join("placed/abs").exists());
+}
+
+#[test]
 fn an_inside_set_repairs_the_archive_that_carries_it() {
     let dir = fixture(150_000);
     let root = dir.path();

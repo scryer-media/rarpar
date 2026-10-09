@@ -31,6 +31,8 @@ runtime = [
     # `rarpar xz`: the .xz codec is lzma-turbo, which sevenz-turbo links too.
     "dep:lzma-turbo",
     "dep:filetime",
+    # One-pass PAR3 sets (`par3 create -`, `par3 archive`); par3-rs links it already.
+    "dep:blake3",
 ]
 # Crypto backend selection, forwarded to the libraries. `runtime` deliberately
 # forwards neither: a build that asks for the runtime without naming a backend
@@ -60,7 +62,6 @@ crypto-rust = [
 sevenz = [
     "runtime",
     "dep:sevenz-turbo",
-    "dep:blake3",
     "dep:crc-fast",
     "dep:filetime",
     "dep:libc",

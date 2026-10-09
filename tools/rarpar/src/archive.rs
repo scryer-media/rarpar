@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use par3_rs::hash::QUICK_HASH_LEN;
 use par3_rs::packet::{CreatorPacket, GaloisField};
-use rarpar::cli::{ArchiveFilter, ArchiveFormat, Cli, Par3ArchiveArgs};
+use rarpar::cli::{ArchiveFilter, ArchiveFormat, Cli, Par3ArchiveArgs, SidecarFormat};
 use serde_json::{Value, json};
 use sevenz_turbo::encoder_options::{EncoderOptions, Lzma2Options};
 use sevenz_turbo::{
@@ -46,6 +46,7 @@ use crate::par3_stream::{
     block_count, build_set, inside_geometry, inside_size, reference_field, sibling_geometry,
     write_inside, write_sibling,
 };
+use crate::sidecar::{Sidecar, SidecarPlan};
 
 const MIB: u64 = 1 << 20;
 
@@ -462,13 +463,43 @@ fn memory_error(needed: u64, budget: u64) -> RarparError {
     ))
 }
 
+/// What the archive's bytes are fed to as they are written.
+enum Guard {
+    /// The PAR3 set, inside or beside the archive, whose geometry follows
+    /// the archive's final length.
+    Par3(Box<Protect>),
+    /// A sidecar set of fixed geometry, which sees each byte once, in order.
+    Sidecar(Box<Sidecar>),
+}
+
+impl Guard {
+    fn feed(&mut self, data: &[u8]) -> io::Result<()> {
+        match self {
+            Guard::Par3(protect) => protect.feed(data),
+            Guard::Sidecar(sidecar) => sidecar.feed(data).map_err(io::Error::other),
+        }
+    }
+
+    fn patch(&mut self, at: u64, bytes: &[u8]) -> io::Result<()> {
+        match self {
+            Guard::Par3(protect) => protect.patch(at, bytes),
+            // Only the 7z writer goes back, and a 7z archive never takes this
+            // set; a writer that did would have its set describe other bytes.
+            Guard::Sidecar(_) => Err(io::Error::other(format!(
+                "the archive writer rewrote {} bytes at {at}, which a one-pass sidecar cannot follow",
+                bytes.len()
+            ))),
+        }
+    }
+}
+
 /// The archive file, seen by the 7z writer, with every byte also fed to
-/// [`Protect`].
+/// [`Guard`].
 struct Tee {
     file: BufWriter<File>,
     position: u64,
     end: u64,
-    protect: Protect,
+    protect: Guard,
 }
 
 impl Write for Tee {
@@ -783,7 +814,9 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
     let base = base.canonicalize()?;
     let mut members = collect(&base, &args.inputs, cli.max_files)?;
 
-    let output = &args.output;
+    // A relative OUTPUT lands under the global -o directory; the inputs are
+    // still found from --base-path (or the current directory).
+    let output = &cli.place_output(&args.output);
     reject_symlinks(output)?;
     let name = output
         .file_name()
@@ -826,9 +859,17 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
             },
         }
     };
+    let par2 = par2_sidecar(args, zip)?;
+    if let Some(sidecar) = &par2 {
+        sidecar.check_budget(cli.par3_memory_mib)?;
+    }
     let stem = output.with_extension("");
     let mut outputs = vec![output.clone()];
-    if !args.inside {
+    if let Some(sidecar) = &par2 {
+        // A fixed recovery count names every volume now.
+        outputs.extend(sidecar.paths(&stem));
+        refuse_aliases(&outputs)?;
+    } else if !args.inside {
         // The volume names depend on the row count, so list the index only.
         outputs.push(par3_stream::sibling_paths(&stem, 0).0);
         refuse_aliases(&outputs)?;
@@ -849,7 +890,8 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
             true,
             json!({"operation":"par3_archive","success":true,"dry_run":true,
                 "archive":output,"format":format_name(args.format),"mode":if args.inside {"inside"} else {"sibling"},
-                "members":members.len(),"input_bytes":input_bytes}),
+                "set_format":if par2.is_some() {"par2"} else {"par3"},
+                "outputs":outputs,"members":members.len(),"input_bytes":input_bytes}),
         ));
     }
 
@@ -916,7 +958,10 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
         file: BufWriter::with_capacity(MIB as usize, file),
         position: 0,
         end: 0,
-        protect,
+        protect: match &par2 {
+            Some(sidecar) => Guard::Sidecar(Box::new(sidecar.start()?)),
+            None => Guard::Par3(Box::new(protect)),
+        },
     };
     let written = if zip {
         write_zip(tee, &members, args.level, &consumed)
@@ -935,11 +980,39 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
     };
     let Tee {
         file,
-        mut protect,
+        protect,
         end: size,
         ..
     } = tee;
     let mut file = file.into_inner().map_err(|error| error.into_error())?;
+    let mut protect = match protect {
+        Guard::Par3(protect) => *protect,
+        Guard::Sidecar(sidecar) => {
+            file.sync_all()?;
+            drop(file);
+            let finished = sidecar.finish(&name, &stem, cli.overwrite)?;
+            let mut set = finished.report.clone();
+            // The set is staged beside its names before the archive is
+            // installed, and installed after it, as a PAR3 sibling is.
+            install_archive(staged, output, cli.overwrite)?;
+            let (written, sizes) = finished.install()?;
+            set["outputs"] = json!(written);
+            set["output_sizes"] = json!(sizes);
+            let mut outputs = vec![output.clone()];
+            outputs.extend(written);
+            return Ok((
+                true,
+                json!({"operation":"par3_archive","success":true,"dry_run":false,
+                    "archive":output,"format":format_name(args.format),
+                    "mode":"sibling","set_format":"par2","outputs":outputs,
+                    "members":members.len(),"input_bytes":input_bytes,
+                    "archive_bytes":size,"protected_bytes":size,"set_id":set["set_id"],
+                    "block_size":set["block_size"],"blocks":set["blocks"],
+                    "recovery_blocks":set["recovery_blocks"],"field_bytes":set["field_bytes"],
+                    "sidecar":set,"read_back":false}),
+            ));
+        }
+    };
 
     // The footer of a ZIP that takes the set inside, found as par3cmdline
     // finds it, among the bytes the lanes have not been fed.
@@ -1104,20 +1177,7 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
     } else {
         None
     };
-    // Without `--overwrite` the install refuses, atomically, an archive that
-    // appeared at the output name during the build; the preflight above only
-    // saw the name before the build began.
-    if cli.overwrite {
-        staged.persist(output)
-    } else {
-        staged.persist_noclobber(output)
-    }
-    .map_err(|error| match error.error.kind() {
-        std::io::ErrorKind::AlreadyExists if !cli.overwrite => {
-            RarparError::Unsafe(format!("output exists: {}", output.display()))
-        }
-        _ => RarparError::Io(error.error),
-    })?;
+    install_archive(staged, output, cli.overwrite)?;
     if let Some(sibling) = sibling {
         written.extend(sibling.install()?);
     }
@@ -1125,13 +1185,66 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
         true,
         json!({"operation":"par3_archive","success":true,"dry_run":false,
             "archive":output,"format":format_name(args.format),
-            "mode":if args.inside {"inside"} else {"sibling"},
+            "mode":if args.inside {"inside"} else {"sibling"},"set_format":"par3",
             "outputs":written,"members":members.len(),"input_bytes":input_bytes,
             "archive_bytes":archive_bytes,"protected_bytes":size,
             "set_id":set.set_id.to_string(),"block_size":geometry.block_size,
             "blocks":geometry.blocks,"recovery_blocks":geometry.rows,
             "field_bytes":geometry.galois.size,"read_back":reread}),
     ))
+}
+
+/// Without `--overwrite` the install refuses, atomically, an archive that
+/// appeared at the output name during the build; the preflight only saw the
+/// name before the build began.
+fn install_archive(
+    staged: tempfile::NamedTempFile,
+    output: &Path,
+    overwrite: bool,
+) -> Result<(), RarparError> {
+    if overwrite {
+        staged.persist(output)
+    } else {
+        staged.persist_noclobber(output)
+    }
+    .map_err(|error| match error.error.kind() {
+        std::io::ErrorKind::AlreadyExists if !overwrite => {
+            RarparError::Unsafe(format!("output exists: {}", output.display()))
+        }
+        _ => RarparError::Io(error.error),
+    })?;
+    Ok(())
+}
+
+/// The PAR2 sidecar `--sidecar par2` asks for. Its block count is fixed
+/// before the archive's first byte: PAR2 hashes the whole file in order, so
+/// only a writer that never goes back over its bytes can feed it, and the
+/// recovery count must be given, not a share of a length not yet known.
+fn par2_sidecar(args: &Par3ArchiveArgs, zip: bool) -> Result<Option<SidecarPlan>, RarparError> {
+    if args.sidecar != Some(SidecarFormat::Par2) {
+        return Ok(None);
+    }
+    if !zip {
+        return Err(RarparError::Usage(
+            "--sidecar par2 needs --format zip: the 7z writer writes its start header last, \
+             over bytes PAR2's whole-file MD5 has already taken; use --sidecar par3, or write \
+             the 7z first and run `par create` over it"
+                .into(),
+        ));
+    }
+    if args.recovery_percent.is_some() {
+        return Err(RarparError::Usage(
+            "--sidecar par2 takes -c/--recovery-count: the archive's length, which a percentage \
+             needs, is known only once it is written"
+                .into(),
+        ));
+    }
+    SidecarPlan::new(
+        SidecarFormat::Par2,
+        args.block_size,
+        args.recovery_count.unwrap_or(1),
+    )
+    .map(Some)
 }
 
 fn format_name(format: ArchiveFormat) -> &'static str {

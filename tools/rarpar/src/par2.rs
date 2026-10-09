@@ -85,6 +85,8 @@ pub fn run_command(cli: &Cli, command: ParCommand) -> Result<u8, RarparError> {
 }
 
 fn run_create(cli: &Cli, args: ParCreateArgs) -> Result<u8, RarparError> {
+    // --base-path defaults to the parent of OUTPUT as typed, so input
+    // discovery does not move when -o places the set elsewhere.
     let base_path = args.base_path.clone().unwrap_or_else(|| {
         args.output
             .parent()
@@ -123,8 +125,11 @@ fn run_create(cli: &Cli, args: ParCreateArgs) -> Result<u8, RarparError> {
             }
         })
         .transpose()?;
-    let mut options =
-        Par2CreatorOptions::with_output(args.output.clone(), Some(base_path), args.files.clone());
+    let mut options = Par2CreatorOptions::with_output(
+        cli.place_output(&args.output),
+        Some(base_path),
+        args.files.clone(),
+    );
     options.block_sizing = match (args.block_size, args.block_count) {
         (Some(bytes), None) => BlockSizing::Bytes(bytes),
         (None, Some(count)) => BlockSizing::Count(count),

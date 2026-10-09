@@ -565,10 +565,14 @@ fn emit(cli: &Cli, report: &Value) -> Result<(), RarparError> {
                     report["protected_bytes"]
                 );
                 println!(
-                    "  {} block(s) of {} bytes, {} recovery block(s), PAR3 set {}",
+                    "  {} block(s) of {} bytes, {} recovery block(s), {} set {}",
                     report["blocks"],
                     report["block_size"],
                     report["recovery_blocks"],
+                    report["set_format"]
+                        .as_str()
+                        .unwrap_or("par3")
+                        .to_uppercase(),
                     report["mode"].as_str().unwrap_or_default()
                 );
             }
@@ -899,15 +903,7 @@ fn create(cli: &Cli, args: &Par3CreateArgs) -> Result<(bool, Value), RarparError
         _ => None,
     };
     if let Some(input) = stream {
-        #[cfg(feature = "sevenz")]
         return crate::par3_pipe::create(cli, &input, args);
-        #[cfg(not(feature = "sevenz"))]
-        {
-            let _ = input;
-            return Err(RarparError::Usage(
-                "creating a set from standard input needs the sevenz feature".into(),
-            ));
-        }
     }
     if args.name.is_some() {
         return Err(RarparError::Usage(
@@ -1026,10 +1022,11 @@ fn create(cli: &Cli, args: &Par3CreateArgs) -> Result<(bool, Value), RarparError
         drop(plan);
         plan = CreationPlan::build(access, &sources, config)?;
     }
-    let stem = if is_carrier(&args.output) {
-        args.output.with_extension("")
+    let output = cli.place_output(&args.output);
+    let stem = if is_carrier(&output) {
+        output.with_extension("")
     } else {
-        args.output.clone()
+        output
     };
     reject_symlinks(&stem)?;
     let outputs: Vec<_> = plan.output_paths(&stem).collect();
