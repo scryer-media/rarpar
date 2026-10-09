@@ -7223,13 +7223,18 @@ fn test_rar4_ppmd_order16_32m_payload() {
     );
 }
 
-/// Classic `.rar`/`.r00` volumes exercise PPMd range decoding across reader
-/// boundaries as well as old-style volume ordering.
-#[test]
-fn test_rar4_ppmd_classic_multivolume_payload() {
-    use sha2::{Digest, Sha256};
+/// SHA-256 of the 256 KiB member of the `rar4_ppm_oldmv` volume set.
+const RAR4_PPM_OLDMV_SHA256: [u8; 32] = [
+    0xc8, 0xf9, 0x58, 0x6b, 0xdf, 0xd5, 0x97, 0x68, 0xd2, 0x67, 0xe8, 0xa8, 0xeb, 0xb8, 0xd9, 0x6e,
+    0x35, 0x06, 0xe4, 0xbe, 0x7f, 0x6c, 0x3c, 0x8a, 0x5a, 0x99, 0xa6, 0x9a, 0xd8, 0x26, 0x05, 0xb0,
+];
 
-    let mut archive = open_multi(
+/// The model arena the `rar4_ppm_oldmv` member's PPMd block header declares:
+/// its memory-size byte is 15, so `(15 + 1) << 20` bytes.
+const RAR4_PPM_OLDMV_ARENA: u64 = 16 << 20;
+
+fn open_rar4_ppm_oldmv() -> unrar_rs::RarArchive {
+    open_multi(
         "rar4",
         &[
             "rar4_ppm_oldmv.rar",
@@ -7237,7 +7242,12 @@ fn test_rar4_ppmd_classic_multivolume_payload() {
             "rar4_ppm_oldmv.r01",
             "rar4_ppm_oldmv.r02",
         ],
-    );
+    )
+}
+
+fn assert_rar4_ppm_oldmv_payload(archive: &mut unrar_rs::RarArchive) {
+    use sha2::{Digest, Sha256};
+
     let opts = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
@@ -7246,15 +7256,50 @@ fn test_rar4_ppmd_classic_multivolume_payload() {
     let result = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(result.len(), 256 * 1024);
     let bytes = result.to_bytes().unwrap();
-    let digest = Sha256::digest(&bytes);
-    assert_eq!(
-        &digest[..],
-        &[
-            0xc8, 0xf9, 0x58, 0x6b, 0xdf, 0xd5, 0x97, 0x68, 0xd2, 0x67, 0xe8, 0xa8, 0xeb, 0xb8,
-            0xd9, 0x6e, 0x35, 0x06, 0xe4, 0xbe, 0x7f, 0x6c, 0x3c, 0x8a, 0x5a, 0x99, 0xa6, 0x9a,
-            0xd8, 0x26, 0x05, 0xb0,
-        ]
+    assert_eq!(Sha256::digest(&bytes)[..], RAR4_PPM_OLDMV_SHA256);
+}
+
+/// Classic `.rar`/`.r00` volumes exercise PPMd range decoding across reader
+/// boundaries as well as old-style volume ordering.
+#[test]
+fn test_rar4_ppmd_classic_multivolume_payload() {
+    let mut archive = open_rar4_ppm_oldmv();
+    assert_rar4_ppm_oldmv_payload(&mut archive);
+}
+
+/// A PPMd block header declaring more model arena than
+/// `Limits::max_ppmd_arena_size` fails the member with the limit error.
+#[test]
+fn test_archive_limits_reject_ppmd_arena_above_limit() {
+    let mut archive = open_rar4_ppm_oldmv();
+    archive.set_limits(unrar_rs::Limits {
+        max_ppmd_arena_size: RAR4_PPM_OLDMV_ARENA - 1,
+        ..Default::default()
+    });
+
+    let result = archive.extract_member(0, &unrar_rs::ExtractOptions::default(), None);
+
+    assert!(
+        matches!(
+            &result,
+            Err(unrar_rs::RarError::ResourceLimit { detail })
+                if detail.contains("max_ppmd_arena_size")
+        ),
+        "{:?}",
+        result.err()
     );
+}
+
+/// A limit equal to the declared arena admits it, and the member decodes to
+/// the same bytes as under the default limit.
+#[test]
+fn test_archive_limits_ppmd_arena_at_declared_size_decodes_unchanged() {
+    let mut archive = open_rar4_ppm_oldmv();
+    archive.set_limits(unrar_rs::Limits {
+        max_ppmd_arena_size: RAR4_PPM_OLDMV_ARENA,
+        ..Default::default()
+    });
+    assert_rar4_ppm_oldmv_payload(&mut archive);
 }
 
 /// Multi-member v29 solid streams end each member with an in-stream marker
