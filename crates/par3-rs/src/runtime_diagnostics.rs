@@ -264,23 +264,19 @@ pub struct AmplificationSnapshot {
 ///
 /// These are counted once per call with the call's own totals, never once per
 /// symbol: a butterfly touches a whole row, and a counter on that inner loop
-/// would cost more than the arithmetic it measures. `skipped` is what a
-/// pruning plan decided not to compute, so `butterflies + skipped` is what the
-/// same decode would have cost without the plan.
+/// would cost more than the arithmetic it measures.
 ///
-/// An FFT decode that walks its domain in slabs runs the inverse transform
-/// as one call, then the forward transform as one call per class and two
-/// per block holding a lost row, each against that block's half of the
-/// derivative. `butterflies` is the work it performed and `skipped` what it
-/// saved against both transforms in full; where most blocks hold a lost
-/// row it performs more than that, and `skipped` is zero.
+/// Every transform runs in full: no FFT path prunes stages, so `butterflies`
+/// is the whole transform cost and `butterflies_skipped` is always zero.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CodecSnapshot {
-    /// Additive-transform invocations, including the ones a plan split.
+    /// Additive-transform invocations.
     pub transform_calls: u64,
     /// Butterflies executed across those calls.
     pub butterflies: u64,
-    /// Butterflies a transform plan established were not needed.
+    /// Always zero. It counted the butterflies a pruning plan left out of a
+    /// transform, and no transform is pruned any more; the field stays so
+    /// code that reads or builds a snapshot still compiles.
     pub butterflies_skipped: u64,
     /// Symbol-wide multiply-accumulates those butterflies performed: one per
     /// butterfly per symbol in the rows it joined.

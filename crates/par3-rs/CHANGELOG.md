@@ -25,6 +25,8 @@
   decode it selected. It was `#[doc(hidden)]` and outside the documented API,
   so this is not a breaking change under it; code that set the field no
   longer compiles.
+- No FFT transform is pruned any more, so
+  `CodecSnapshot::butterflies_skipped` is always zero. The field stays.
 - The FFT experiments behind these choices, including the lanes that were
   dropped, are recorded in [PERFORMANCE.md](PERFORMANCE.md#fft-decode-and-transform-experiments-2026-10).
 
