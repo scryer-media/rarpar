@@ -2,22 +2,27 @@
 //! lzma-turbo.
 
 use std::cell::Cell;
-use std::fs::File;
-use std::io::{self, BufReader, BufWriter, IsTerminal, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use lzma_turbo::xz::{CheckType, XzError, XzOptions, XzParallelReader, XzReader, stream_table};
-use lzma_turbo::{LzmaEncProps, MatchFinderKind, XzErrorKind, XzWriter};
+use lzma_turbo::xz::{
+    CheckType, StreamHeader, XzError, XzOptions, XzParallelReader, XzReader, stream_table,
+};
+use lzma_turbo::{Checksum, ChecksumPlan, LzmaEncProps, MatchFinderKind, XzErrorKind, XzWriter};
 use rarpar::cli::{
     Cli, XzCheck, XzCommand, XzCompressArgs, XzDecodeArgs, XzDecompressArgs, XzListArgs, XzTestArgs,
 };
 use serde_json::{Value, json};
 
 use crate::error::{EXIT_DATA_FAILURE, EXIT_SUCCESS, RarparError};
+use crate::streams::{
+    CountingWriter, IO_BUFFER, Input, Tally, input_or_stdin, is_stdio, preflight_output,
+    refuse_terminal_stdout, regular_file_metadata, report_writer, resolve_output, write_output,
+};
 
 const MIB: u64 = 1 << 20;
-const IO_BUFFER: usize = 1 << 20;
+const STREAM_HEADER_SIZE: usize = 12;
 
 pub fn run_command(cli: &Cli, command: XzCommand) -> Result<u8, RarparError> {
     if cli.delete_sources {
@@ -26,22 +31,22 @@ pub fn run_command(cli: &Cli, command: XzCommand) -> Result<u8, RarparError> {
         ));
     }
     // A report never shares standard output with the data written there.
-    let data_on_stdout = match &command {
-        XzCommand::Compress(args) => {
-            is_stdio(&args.input) && args.output.is_none()
-                || args.output.as_deref().is_some_and(is_stdio)
+    let (input, data_on_stdout) = match &command {
+        XzCommand::Compress(XzCompressArgs { input, output, .. })
+        | XzCommand::Decompress(XzDecompressArgs { input, output, .. }) => {
+            let input = input_or_stdin(input.as_deref())?;
+            let on_stdout = output.as_deref().map_or_else(|| is_stdio(&input), is_stdio);
+            (input, on_stdout)
         }
-        XzCommand::Decompress(args) => {
-            is_stdio(&args.input) && args.output.is_none()
-                || args.output.as_deref().is_some_and(is_stdio)
+        XzCommand::Test(XzTestArgs { input, .. }) | XzCommand::List(XzListArgs { input, .. }) => {
+            (input_or_stdin(input.as_deref())?, false)
         }
-        XzCommand::Test(_) | XzCommand::List(_) => false,
     };
     let result = match command {
-        XzCommand::Compress(args) => compress(cli, &args),
-        XzCommand::Decompress(args) => decompress(cli, &args),
-        XzCommand::Test(args) => test(&args),
-        XzCommand::List(args) => list(&args),
+        XzCommand::Compress(args) => compress(cli, &input, &args),
+        XzCommand::Decompress(args) => decompress(cli, &input, &args),
+        XzCommand::Test(args) => test(&input, &args.decode),
+        XzCommand::List(args) => list(&input, &args),
     };
     match result {
         Ok(report) => {
@@ -61,10 +66,6 @@ pub fn run_command(cli: &Cli, command: XzCommand) -> Result<u8, RarparError> {
             Err(error)
         }
     }
-}
-
-fn is_stdio(path: &Path) -> bool {
-    path.as_os_str() == "-"
 }
 
 // ---------------------------------------------------------------------------
@@ -167,36 +168,6 @@ fn available_threads() -> u32 {
 // ---------------------------------------------------------------------------
 // Paths
 
-/// Where the output of `input` goes when OUTPUT is absent or a directory.
-fn resolve_output(
-    cli: &Cli,
-    input: &Path,
-    output: Option<&Path>,
-    default_name: impl FnOnce(&Path) -> Result<PathBuf, RarparError>,
-) -> Result<Option<PathBuf>, RarparError> {
-    match output {
-        Some(path) if is_stdio(path) => Ok(None),
-        Some(path) if !path.is_dir() => Ok(Some(path.to_path_buf())),
-        Some(directory) => {
-            if is_stdio(input) {
-                return Err(RarparError::Usage(
-                    "standard input has no name; give OUTPUT as a file path".into(),
-                ));
-            }
-            Ok(Some(directory.join(default_name(input)?)))
-        }
-        None if is_stdio(input) => Ok(None),
-        None => {
-            let name = default_name(input)?;
-            let directory = match &cli.output {
-                Some(directory) => directory.clone(),
-                None => input.parent().map(Path::to_path_buf).unwrap_or_default(),
-            };
-            Ok(Some(directory.join(name)))
-        }
-    }
-}
-
 fn compressed_name(input: &Path) -> Result<PathBuf, RarparError> {
     let name = input
         .file_name()
@@ -236,130 +207,6 @@ fn decompressed_name(input: &Path) -> Result<PathBuf, RarparError> {
     }
 }
 
-/// Refuses an output that exists (without --overwrite) or is the input.
-fn preflight_output(cli: &Cli, input: &Path, output: &Path) -> Result<(), RarparError> {
-    if !output.exists() {
-        return Ok(());
-    }
-    if !is_stdio(input) && same_file(input, output)? {
-        return Err(RarparError::Unsafe(format!(
-            "output is the input: {}",
-            output.display()
-        )));
-    }
-    if !cli.overwrite {
-        return Err(RarparError::Unsafe(format!(
-            "output exists; pass --overwrite to replace: {}",
-            output.display()
-        )));
-    }
-    Ok(())
-}
-
-fn same_file(a: &Path, b: &Path) -> Result<bool, RarparError> {
-    Ok(a.canonicalize()? == b.canonicalize()?)
-}
-
-fn open_input(path: &Path) -> Result<File, RarparError> {
-    if !path.exists() {
-        return Err(RarparError::MissingInput(path.to_path_buf()));
-    }
-    if path.is_dir() {
-        return Err(RarparError::Usage(format!(
-            "input is a directory: {}",
-            path.display()
-        )));
-    }
-    Ok(File::open(path)?)
-}
-
-/// An output file staged beside its destination and installed whole.
-struct Staged {
-    file: tempfile::NamedTempFile,
-    destination: PathBuf,
-}
-
-impl Staged {
-    fn create(destination: &Path) -> Result<Self, RarparError> {
-        let directory = match destination.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-            _ => PathBuf::from("."),
-        };
-        std::fs::create_dir_all(&directory)?;
-        let mut builder = tempfile::Builder::new();
-        builder.prefix(".rarpar-xz-");
-        // The output is an ordinary file, not a private temporary.
-        #[cfg(unix)]
-        builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666));
-        Ok(Self {
-            file: builder.tempfile_in(&directory)?,
-            destination: destination.to_path_buf(),
-        })
-    }
-
-    /// Copies the input's permissions and times, then installs the file.
-    fn install(self, cli: &Cli, input: Option<&std::fs::Metadata>) -> Result<(), RarparError> {
-        if let Some(meta) = input {
-            self.file
-                .as_file()
-                .set_permissions(meta.permissions())
-                .or_else(|error| match error.kind() {
-                    io::ErrorKind::PermissionDenied => Ok(()),
-                    _ => Err(error),
-                })?;
-            let modified = filetime::FileTime::from_last_modification_time(meta);
-            let accessed = filetime::FileTime::from_last_access_time(meta);
-            filetime::set_file_handle_times(self.file.as_file(), Some(accessed), Some(modified))?;
-        }
-        let destination = self.destination;
-        if cli.overwrite {
-            self.file.persist(&destination)
-        } else {
-            self.file.persist_noclobber(&destination)
-        }
-        .map_err(|error| match error.error.kind() {
-            io::ErrorKind::AlreadyExists if !cli.overwrite => RarparError::Unsafe(format!(
-                "output exists; pass --overwrite to replace: {}",
-                destination.display()
-            )),
-            _ => RarparError::Io(error.error),
-        })?;
-        Ok(())
-    }
-}
-
-/// Counts the bytes that pass through a reader.
-struct Counting<R> {
-    inner: R,
-    count: u64,
-}
-
-impl<R: Read> Read for Counting<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.count += n as u64;
-        Ok(n)
-    }
-}
-
-/// Counts the bytes that pass through a writer.
-struct CountingWriter<W> {
-    inner: W,
-    count: u64,
-}
-
-impl<W: Write> Write for CountingWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        self.count += n as u64;
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Errors
 
@@ -395,16 +242,12 @@ fn codec_error(error: io::Error) -> RarparError {
 // ---------------------------------------------------------------------------
 // compress
 
-fn compress(cli: &Cli, args: &XzCompressArgs) -> Result<Value, RarparError> {
-    let output = resolve_output(cli, &args.input, args.output.as_deref(), compressed_name)?;
+fn compress(cli: &Cli, input: &Path, args: &XzCompressArgs) -> Result<Value, RarparError> {
+    let output = resolve_output(cli, input, args.output.as_deref(), compressed_name)?;
     let block_size = args
         .block_size
         .unwrap_or_else(|| default_block_size(args.level));
-    let input_meta = if is_stdio(&args.input) {
-        None
-    } else {
-        Some(open_input(&args.input)?.metadata()?)
-    };
+    let input_meta = regular_file_metadata(input)?;
     // A block never holds more than this, so a larger dictionary would only
     // cost memory: the encoder shrinks it to fit, as 7-Zip's does.
     let largest_block = input_meta
@@ -438,15 +281,12 @@ fn compress(cli: &Cli, args: &XzCompressArgs) -> Result<Value, RarparError> {
     let memory_estimate = per_thread
         .saturating_mul(u64::from(threads))
         .saturating_add(largest_block);
-    if let Some(output) = &output {
-        preflight_output(cli, &args.input, output)?;
-    } else if io::stdout().is_terminal() {
-        return Err(RarparError::Usage(
-            "compressed data is not written to a terminal; give OUTPUT or redirect".into(),
-        ));
+    match &output {
+        Some(output) => preflight_output(cli, input, output)?,
+        None => refuse_terminal_stdout("compressed data")?,
     }
     let mut report = json!({"operation":"xz_compress","success":true,"dry_run":cli.dry_run,
-        "input":display(&args.input),"output":output.as_deref().map_or("-".into(), display),
+        "input":display(input),"output":output.as_deref().map_or("-".into(), display),
         "level":args.level,"extreme":args.extreme,"check":check_name(check_type(args.check)),
         "block_size":block_size,"dictionary_bytes":props.dict_size(),"threads":threads,
         "memory_estimate_bytes":memory_estimate});
@@ -454,54 +294,34 @@ fn compress(cli: &Cli, args: &XzCompressArgs) -> Result<Value, RarparError> {
         return Ok(report);
     }
 
-    let source: Box<dyn Read> = if is_stdio(&args.input) {
-        Box::new(io::stdin().lock())
-    } else {
-        Box::new(open_input(&args.input)?)
-    };
-    let mut source = Counting {
-        inner: BufReader::with_capacity(IO_BUFFER, source),
-        count: 0,
-    };
-    let encode = |sink: &mut dyn Write, source: &mut dyn Read| -> Result<u64, RarparError> {
-        let mut counter = CountingWriter {
-            inner: sink,
-            count: 0,
-        };
-        let mut writer = XzWriter::new(&mut counter, &props)
-            .map_err(|error| codec_error(io::Error::other(error)))?;
-        writer
-            .set_check(check_type(args.check))
-            .map_err(|error| codec_error(io::Error::other(error)))?;
-        writer.set_block_size(block_size);
-        writer.set_threads(threads as usize);
-        io::copy(source, &mut writer).map_err(codec_error)?;
-        writer.finish().map_err(codec_error)?;
-        Ok(counter.count)
-    };
-    let written = match &output {
-        None => {
-            let stdout = io::stdout();
-            let mut sink = BufWriter::with_capacity(IO_BUFFER, stdout.lock());
-            let written = encode(&mut sink, &mut source)?;
-            sink.flush()?;
-            written
-        }
-        Some(path) => {
-            let staged = Staged::create(path)?;
-            let written = {
-                let mut sink = BufWriter::with_capacity(IO_BUFFER, staged.file.as_file());
-                let written = encode(&mut sink, &mut source)?;
-                sink.flush()?;
-                written
+    let (source, consumed) = Tally::new(Input::open(input)?.into_reader());
+    let mut source = BufReader::with_capacity(IO_BUFFER, source);
+    let written = write_output(
+        cli,
+        output.as_deref(),
+        input_meta.as_ref(),
+        ".rarpar-xz-",
+        |sink| {
+            let mut counter = CountingWriter {
+                inner: sink,
+                count: 0,
             };
-            staged.install(cli, input_meta.as_ref())?;
-            written
-        }
-    };
-    report["input_bytes"] = json!(source.count);
+            let mut writer = XzWriter::new(&mut counter, &props)
+                .map_err(|error| codec_error(io::Error::other(error)))?;
+            writer
+                .set_check(check_type(args.check))
+                .map_err(|error| codec_error(io::Error::other(error)))?;
+            writer.set_block_size(block_size);
+            writer.set_threads(threads as usize);
+            io::copy(&mut source, &mut writer).map_err(codec_error)?;
+            writer.finish().map_err(codec_error)?;
+            Ok(counter.count)
+        },
+    )?;
+    let consumed = consumed.get();
+    report["input_bytes"] = json!(consumed);
     report["output_bytes"] = json!(written);
-    report["ratio"] = json!(ratio(written, source.count));
+    report["ratio"] = json!(ratio(written, consumed));
     Ok(report)
 }
 
@@ -544,51 +364,49 @@ impl Compressed {
     }
 }
 
-/// Counts what a reader it no longer owns has read.
-struct Tally<R> {
-    inner: R,
-    count: Rc<Cell<u64>>,
-}
-
-impl<R: Read> Read for Tally<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.count.set(self.count.get() + n as u64);
-        Ok(n)
-    }
-}
-
 fn decode_options(args: &XzDecodeArgs, threads: usize) -> XzOptions {
     XzOptions::default()
         .with_threads(threads)
         .with_memory_limit(args.memory_mib.saturating_mul(MIB))
 }
 
-/// Opens `input` for decoding: in parallel when it is a seekable file with
-/// more than one block and more than one thread is allowed, otherwise in one
-/// sequential pass. A file the parallel reader cannot map is decoded
-/// sequentially, which is the authoritative validator of its structure.
+/// Opens `input` for decoding.
+///
+/// A regular file with more than one block is decoded by the parallel reader,
+/// which maps every block from the index first; one it cannot map is decoded
+/// sequentially, which is the authoritative validator of its structure. A
+/// stream (standard input, a pipe, a device) is read forward only: on several
+/// threads, blocks whose headers declare their sizes go to workers as soon as
+/// they have arrived; on one, in a single sequential pass.
 fn open_decode(input: &Path, args: &XzDecodeArgs) -> Result<Decode, RarparError> {
     let threads = args.threads.unwrap_or_else(available_threads) as usize;
-    if is_stdio(input) {
-        let consumed = Rc::new(Cell::new(0));
-        let source = Tally {
-            inner: io::stdin().lock(),
-            count: Rc::clone(&consumed),
-        };
-        let reader = XzReader::with_options(
-            BufReader::with_capacity(IO_BUFFER, source),
-            decode_options(args, 1),
-        );
-        return Ok(Decode {
-            reader: Box::new(reader),
-            decoder: "sequential",
-            threads: 1,
-            blocks: None,
-            compressed: Compressed::Consumed(consumed),
-        });
-    }
-    let file = open_input(input)?;
+    let file = match Input::open(input)? {
+        Input::File { file, .. } => file,
+        Input::Stream(inner) => {
+            let (source, consumed) = Tally::new(inner);
+            let (reader, decoder): (Box<dyn Read>, _) = if threads > 1 {
+                (
+                    Box::new(StreamDecoder::new(source, decode_options(args, threads))),
+                    "stream-parallel",
+                )
+            } else {
+                (
+                    Box::new(XzReader::with_options(
+                        BufReader::with_capacity(IO_BUFFER, source),
+                        decode_options(args, 1),
+                    )),
+                    "sequential",
+                )
+            };
+            return Ok(Decode {
+                reader,
+                decoder,
+                threads,
+                blocks: None,
+                compressed: Compressed::Consumed(consumed),
+            });
+        }
+    };
     let compressed = file.metadata()?.len();
     if threads > 1 {
         match XzParallelReader::with_options(file.try_clone()?, decode_options(args, threads)) {
@@ -620,42 +438,152 @@ fn open_decode(input: &Path, args: &XzDecodeArgs) -> Result<Decode, RarparError>
     })
 }
 
-fn decompress(cli: &Cli, args: &XzDecompressArgs) -> Result<Value, RarparError> {
-    let output = resolve_output(cli, &args.input, args.output.as_deref(), decompressed_name)?;
-    if let Some(output) = &output {
-        preflight_output(cli, &args.input, output)?;
+/// The most compressed input a stream decode reads ahead of the blocks its
+/// workers hold, unless the memory limit is lower.
+const READ_AHEAD: u64 = 64 * MIB;
+
+/// A `Read` over an .xz stream that arrives forward only, decoded by
+/// lzma-turbo's fed decoder.
+///
+/// Memory is bounded by the decoder's memory limit and by what one `read`
+/// asks for, never by the stream's length: input is fed only when the
+/// decoder can do nothing more without it, at most [`READ_AHEAD`] beyond
+/// what workers hold, and output is drained only as far as the caller reads,
+/// so a slow consumer stalls the producer instead of growing a buffer.
+struct StreamDecoder<R> {
+    source: R,
+    decoder: lzma_turbo::XzAdaptiveDecoder,
+    input: Vec<u8>,
+    start: usize,
+    end: usize,
+    eof: bool,
+    output: Vec<u8>,
+    taken: usize,
+    finished: bool,
+    read_ahead: u64,
+}
+
+impl<R: Read> StreamDecoder<R> {
+    fn new(source: R, options: XzOptions) -> Self {
+        let read_ahead = READ_AHEAD.min(options.memory_limit);
+        Self {
+            source,
+            decoder: lzma_turbo::XzAdaptiveDecoder::new(options),
+            input: vec![0; IO_BUFFER],
+            start: 0,
+            end: 0,
+            eof: false,
+            output: Vec::new(),
+            taken: 0,
+            finished: false,
+            read_ahead,
+        }
     }
-    let input_meta = if is_stdio(&args.input) {
-        None
-    } else {
-        Some(open_input(&args.input)?.metadata()?)
-    };
+
+    /// Gives the decoder what it needs to make progress: more input, or the
+    /// next finished block when enough is already in flight.
+    fn advance(&mut self) -> io::Result<()> {
+        if self.decoder.in_flight_bytes() >= self.read_ahead && self.decoder.wait_for_worker() {
+            return Ok(());
+        }
+        if self.start == self.end && !self.eof {
+            self.start = 0;
+            self.end = loop {
+                match self.source.read(&mut self.input) {
+                    Ok(n) => break n,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
+                }
+            };
+            if self.end == 0 {
+                self.eof = true;
+                self.decoder.end_of_input();
+            }
+        }
+        if self.start < self.end {
+            let fed = self
+                .decoder
+                .feed(&self.input[self.start..self.end])
+                .map_err(io::Error::from)?;
+            self.start += fed;
+            if fed > 0 || self.decoder.wait_for_worker() {
+                return Ok(());
+            }
+            return Err(io::Error::from(XzError::at(
+                XzErrorKind::MemoryLimit {
+                    needed: self.decoder.in_flight_bytes() + (self.end - self.start) as u64,
+                    limit: self.read_ahead,
+                },
+                0,
+                0,
+            )));
+        }
+        if self.decoder.wait_for_worker() {
+            return Ok(());
+        }
+        // All input is in and nothing is outstanding, yet the decoder wants
+        // more: the stream stops short.
+        Err(io::Error::from(XzError::at(
+            XzErrorKind::TruncatedInput,
+            0,
+            0,
+        )))
+    }
+}
+
+impl<R: Read> Read for StreamDecoder<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if self.taken < self.output.len() {
+                let n = buf.len().min(self.output.len() - self.taken);
+                buf[..n].copy_from_slice(&self.output[self.taken..self.taken + n]);
+                self.taken += n;
+                return Ok(n);
+            }
+            if self.finished {
+                return Ok(0);
+            }
+            self.output.clear();
+            self.taken = 0;
+            let output = &mut self.output;
+            let status = self
+                .decoder
+                .drain_upto(buf.len(), |_, bytes| output.extend_from_slice(bytes))
+                .map_err(io::Error::from)?;
+            match status {
+                lzma_turbo::DrainStatus::Finished => self.finished = true,
+                lzma_turbo::DrainStatus::Progress => {}
+                lzma_turbo::DrainStatus::NeedsMoreInput if self.output.is_empty() => {
+                    self.advance()?;
+                }
+                lzma_turbo::DrainStatus::NeedsMoreInput => {}
+            }
+        }
+    }
+}
+
+fn decompress(cli: &Cli, input: &Path, args: &XzDecompressArgs) -> Result<Value, RarparError> {
+    let output = resolve_output(cli, input, args.output.as_deref(), decompressed_name)?;
+    if let Some(output) = &output {
+        preflight_output(cli, input, output)?;
+    }
+    let input_meta = regular_file_metadata(input)?;
     let mut report = json!({"operation":"xz_decompress","success":true,"dry_run":cli.dry_run,
-        "input":display(&args.input),"output":output.as_deref().map_or("-".into(), display)});
+        "input":display(input),"output":output.as_deref().map_or("-".into(), display)});
     if cli.dry_run {
         return Ok(report);
     }
-    let mut decode = open_decode(&args.input, &args.decode)?;
-    let written = match &output {
-        None => {
-            let stdout = io::stdout();
-            let mut sink = BufWriter::with_capacity(IO_BUFFER, stdout.lock());
-            let written = io::copy(&mut decode.reader, &mut sink).map_err(codec_error)?;
-            sink.flush()?;
-            written
-        }
-        Some(path) => {
-            let staged = Staged::create(path)?;
-            let written = {
-                let mut sink = BufWriter::with_capacity(IO_BUFFER, staged.file.as_file());
-                let written = io::copy(&mut decode.reader, &mut sink).map_err(codec_error)?;
-                sink.flush()?;
-                written
-            };
-            staged.install(cli, input_meta.as_ref())?;
-            written
-        }
-    };
+    let mut decode = open_decode(input, &args.decode)?;
+    let written = write_output(
+        cli,
+        output.as_deref(),
+        input_meta.as_ref(),
+        ".rarpar-xz-",
+        |sink| io::copy(&mut decode.reader, sink).map_err(codec_error),
+    )?;
     report["input_bytes"] = json!(decode.compressed.bytes());
     report["output_bytes"] = json!(written);
     report["decoder"] = json!(decode.decoder);
@@ -664,11 +592,11 @@ fn decompress(cli: &Cli, args: &XzDecompressArgs) -> Result<Value, RarparError> 
     Ok(report)
 }
 
-fn test(args: &XzTestArgs) -> Result<Value, RarparError> {
-    let mut decode = open_decode(&args.input, &args.decode)?;
+fn test(input: &Path, args: &XzDecodeArgs) -> Result<Value, RarparError> {
+    let mut decode = open_decode(input, args)?;
     let decoded = io::copy(&mut decode.reader, &mut io::sink()).map_err(codec_error)?;
     Ok(
-        json!({"operation":"xz_test","success":true,"status":"ok","input":display(&args.input),
+        json!({"operation":"xz_test","success":true,"status":"ok","input":display(input),
         "input_bytes":decode.compressed.bytes(),"output_bytes":decoded,"decoder":decode.decoder,
         "threads":decode.threads,"blocks":decode.blocks}),
     )
@@ -677,15 +605,11 @@ fn test(args: &XzTestArgs) -> Result<Value, RarparError> {
 // ---------------------------------------------------------------------------
 // list
 
-fn list(args: &XzListArgs) -> Result<Value, RarparError> {
-    if is_stdio(&args.input) {
-        return Err(RarparError::Usage(
-            "xz list reads the index from the end of the file; standard input is not seekable"
-                .into(),
-        ));
-    }
-    let mut file = open_input(&args.input)?;
-    let file_bytes = file.metadata()?.len();
+fn list(input: &Path, args: &XzListArgs) -> Result<Value, RarparError> {
+    let (mut file, file_bytes) = match Input::open(input)? {
+        Input::File { file, meta } => (file, meta.len()),
+        Input::Stream(source) => return list_stream(input, source, args),
+    };
     let streams = stream_table(&mut file, u64::MAX).map_err(|error| codec_error(error.into()))?;
     let mut rows = Vec::with_capacity(streams.len());
     let (mut blocks_total, mut uncompressed_total) = (0usize, 0u64);
@@ -724,10 +648,60 @@ fn list(args: &XzListArgs) -> Result<Value, RarparError> {
             "ratio":ratio(stream.stream_size, uncompressed),"blocks":block_rows}));
     }
     Ok(
-        json!({"operation":"xz_list","success":true,"input":display(&args.input),
+        json!({"operation":"xz_list","success":true,"input":display(input),
         "compressed_bytes":file_bytes,"uncompressed_bytes":uncompressed_total,
         "ratio":ratio(file_bytes, uncompressed_total),"stream_count":streams.len(),
         "block_count":blocks_total,"checks":checks,"streams":rows}),
+    )
+}
+
+/// Lists a forward-only input by decoding it once: the index that holds each
+/// block's compressed size sits after the blocks, and the stream boundaries
+/// are only found by decoding up to them.
+fn list_stream(
+    input: &Path,
+    source: Box<dyn Read>,
+    args: &XzListArgs,
+) -> Result<Value, RarparError> {
+    let (mut source, consumed) = Tally::new(BufReader::with_capacity(IO_BUFFER, source));
+    let mut head = [0u8; STREAM_HEADER_SIZE];
+    source
+        .read_exact(&mut head)
+        .map_err(|error| match error.kind() {
+            io::ErrorKind::UnexpectedEof => {
+                RarparError::Data(XzError::at(XzErrorKind::TruncatedInput, 0, 0).to_string())
+            }
+            _ => RarparError::Io(error),
+        })?;
+    let header = StreamHeader::parse(&head)
+        .map_err(|kind| RarparError::Data(XzError::at(kind, 0, 0).to_string()))?;
+    let options = XzOptions::default()
+        .with_threads(1)
+        .with_memory_limit(args.memory_mib.saturating_mul(MIB))
+        .with_plan(ChecksumPlan::new(Checksum::Crc32));
+    let mut reader = XzReader::with_options(io::Cursor::new(head).chain(source), options);
+    let decoded = io::copy(&mut reader, &mut io::sink()).map_err(codec_error)?;
+    let blocks: Vec<Value> = reader
+        .block_checks()
+        .iter()
+        .enumerate()
+        .map(|(index, block)| {
+            json!({"index":index,"uncompressed_offset":block.unpacked_offset,
+                "uncompressed_bytes":block.len})
+        })
+        .collect();
+    let compressed = consumed.get();
+    let check = check_name(header.flags.check);
+    // The reader counts a stream once its footer is verified, so at the end
+    // of the input its stream index is the number of streams.
+    let streams = reader.stream_index();
+    Ok(
+        json!({"operation":"xz_list","success":true,"input":display(input),"seekable":false,
+        "compressed_bytes":compressed,"uncompressed_bytes":decoded,
+        "ratio":ratio(compressed, decoded),"stream_count":streams,
+        "block_count":blocks.len(),"checks":[check],"blocks":blocks,
+        "unknown":["stream offsets, sizes and padding","block offsets and compressed sizes",
+            "the checks of streams after the first"]}),
     )
 }
 
@@ -735,11 +709,7 @@ fn list(args: &XzListArgs) -> Result<Value, RarparError> {
 // Reports
 
 fn emit(cli: &Cli, report: &Value, data_on_stdout: bool) -> Result<(), RarparError> {
-    let mut out: Box<dyn Write> = if data_on_stdout {
-        Box::new(io::stderr().lock())
-    } else {
-        Box::new(io::stdout().lock())
-    };
+    let mut out = report_writer(data_on_stdout);
     if cli.json {
         writeln!(out, "{}", serde_json::to_string_pretty(report)?)?;
         return Ok(());
@@ -828,6 +798,22 @@ fn emit(cli: &Cli, report: &Value, data_on_stdout: bool) -> Result<(), RarparErr
                         block["uncompressed_bytes"]
                     )?;
                 }
+            }
+            if report["seekable"] == false {
+                for block in report["blocks"].as_array().into_iter().flatten() {
+                    writeln!(
+                        out,
+                        "  block {}: uncompressed offset {}, {} bytes",
+                        block["index"], block["uncompressed_offset"], block["uncompressed_bytes"]
+                    )?;
+                }
+                let unknown: Vec<&str> = report["unknown"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect();
+                writeln!(out, "  read forward once; unknown: {}", unknown.join("; "))?;
             }
         }
         _ => {}

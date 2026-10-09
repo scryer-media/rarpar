@@ -15,6 +15,7 @@ mod par3_stream;
 mod password;
 mod rar;
 mod report;
+mod streams;
 mod xz;
 
 use std::ffi::OsString;

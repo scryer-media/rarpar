@@ -158,10 +158,11 @@ manifest before deletion.")]
     /// .xz compression, decompression, integrity testing and listing.
     #[command(long_about = "\
 Compress to and decompress from the .xz format with lzma-turbo. INPUT and OUTPUT
-may be `-` for standard input and output. Inputs are never deleted, and an
-existing output is rejected unless --overwrite is given. Multi-block files are
-compressed and decompressed on several threads; concatenated streams decode as
-one output.")]
+may be `-` for standard input and output, and an absent INPUT is standard input
+when that is not a terminal. Pipes are read and written as they flow, in memory
+that does not depend on their length. Inputs are never deleted, and an existing
+output is rejected unless --overwrite is given. Multi-block input is compressed
+and decompressed on several threads; concatenated streams decode as one output.")]
     Xz {
         #[command(subcommand)]
         command: XzCommand,
@@ -184,12 +185,24 @@ depend on --threads.")]
 Decompress INPUT to OUTPUT. OUTPUT defaults to INPUT without its `.xz` suffix
 (`.txz` becomes `.tar`), beside INPUT or in the global --output directory;
 standard input defaults to standard output. Every block's integrity check is
-verified. A seekable file with more than one block is decoded on up to
---threads threads within --memory-mib; anything else is decoded in one pass.")]
+verified. A file with more than one block is decoded on up to --threads threads
+within --memory-mib from its index. A pipe is decoded as it arrives: on several
+threads, each block whose header records its sizes goes to a worker, and other
+blocks are decoded in order; with --threads 1 it is decoded in one pass.")]
     Decompress(XzDecompressArgs),
     /// Decode an .xz file and verify its integrity checks without writing output.
+    #[command(long_about = "\
+Decode INPUT as decompress does, verifying every block's integrity check and
+the stream indexes, and write nothing. Exits 1 when the data is damaged.")]
     Test(XzTestArgs),
     /// Show the stream and block layout, check type, sizes and ratio of an .xz file.
+    #[command(long_about = "\
+Show the streams and blocks of an .xz file: offsets, sizes, check types,
+padding and ratio, read from the index at the end of every stream without
+decoding. A forward-only input (standard input or a pipe) has no index to seek
+to, so it is decoded once instead: the report then has the sizes, the stream
+and block counts, each block's uncompressed size and the first stream's check,
+and names what it cannot know (`unknown`).")]
     List(XzListArgs),
 }
 
@@ -207,9 +220,9 @@ pub enum XzCheck {
 
 #[derive(Debug, Clone, Args)]
 pub struct XzCompressArgs {
-    /// File to compress, or `-` for standard input.
+    /// File to compress, or `-` for standard input (the default when it is not a terminal).
     #[arg(value_name = "INPUT")]
-    pub input: PathBuf,
+    pub input: Option<PathBuf>,
     /// Output file or directory, or `-` for standard output.
     #[arg(value_name = "OUTPUT")]
     pub output: Option<PathBuf>,
@@ -246,9 +259,9 @@ pub struct XzDecodeArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct XzDecompressArgs {
-    /// .xz file to decompress, or `-` for standard input.
+    /// .xz file to decompress, or `-` for standard input (the default when it is not a terminal).
     #[arg(value_name = "INPUT")]
-    pub input: PathBuf,
+    pub input: Option<PathBuf>,
     /// Output file or directory, or `-` for standard output.
     #[arg(value_name = "OUTPUT")]
     pub output: Option<PathBuf>,
@@ -258,18 +271,21 @@ pub struct XzDecompressArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct XzTestArgs {
-    /// .xz file to test, or `-` for standard input.
+    /// .xz file to test, or `-` for standard input (the default when it is not a terminal).
     #[arg(value_name = "INPUT")]
-    pub input: PathBuf,
+    pub input: Option<PathBuf>,
     #[command(flatten)]
     pub decode: XzDecodeArgs,
 }
 
 #[derive(Debug, Clone, Args)]
 pub struct XzListArgs {
-    /// .xz file to list; it must be seekable, so standard input is not accepted.
+    /// .xz file to list, or `-` for standard input (the default when it is not a terminal).
     #[arg(value_name = "INPUT")]
-    pub input: PathBuf,
+    pub input: Option<PathBuf>,
+    /// Memory limit in MiB for the decode a forward-only stream is listed by.
+    #[arg(long, value_name = "MIB", default_value_t = 1024, value_parser = clap::value_parser!(u64).range(1..))]
+    pub memory_mib: u64,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -855,7 +871,7 @@ mod tests {
         let Ok(XzCommand::Compress(args)) = xz(&["compress", "data.tar"]) else {
             panic!("expected xz compress");
         };
-        assert_eq!(args.input, PathBuf::from("data.tar"));
+        assert_eq!(args.input, Some(PathBuf::from("data.tar")));
         assert_eq!(args.output, None);
         assert_eq!(args.level, 6);
         assert!(!args.extreme);
@@ -885,7 +901,7 @@ mod tests {
         ]) else {
             panic!("expected xz compress");
         };
-        assert_eq!(args.input, PathBuf::from("-"));
+        assert_eq!(args.input, Some(PathBuf::from("-")));
         assert_eq!(args.output, Some(PathBuf::from("out.xz")));
         assert_eq!(args.level, 9);
         assert!(args.extreme);
@@ -904,7 +920,7 @@ mod tests {
             &["compress", "a", "--check", "md5"],
             &["decompress", "a.xz", "--memory-mib", "0"],
             &["test", "a.xz", "--threads", "0"],
-            &["list"],
+            &["list", "a.xz", "b.xz"],
         ] {
             assert!(xz(arguments).is_err(), "{arguments:?} should not parse");
         }
@@ -927,7 +943,7 @@ mod tests {
         let Ok(XzCommand::List(args)) = xz(&["list", "a.xz"]) else {
             panic!("expected xz list");
         };
-        assert_eq!(args.input, PathBuf::from("a.xz"));
+        assert_eq!(args.input, Some(PathBuf::from("a.xz")));
     }
 
     #[test]
