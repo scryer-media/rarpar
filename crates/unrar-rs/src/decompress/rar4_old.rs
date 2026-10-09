@@ -192,7 +192,9 @@ impl Rar4Decoder {
     /// PPMd arena as well.
     ///
     /// `max_ppmd_arena_size` is applied to the decoder on every call, so a
-    /// cached decoder follows a limit changed between members.
+    /// cached decoder follows a limit changed between members. A PPMd model
+    /// the member continues without a reset header is checked against it
+    /// when the member first decodes with that model.
     pub(crate) fn prepare_slot(
         slot: &mut Option<Self>,
         solid: bool,

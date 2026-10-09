@@ -1251,6 +1251,10 @@ pub struct Rar4LzDecoder {
     /// Largest model arena, in bytes, a PPMd block header may declare
     /// ([`crate::Limits::max_ppmd_arena_size`]).
     ppm_arena_limit: u64,
+    /// Model arena, in bytes, the reset header behind the live PPMd model
+    /// declared (0 without a model). A model continued across a member
+    /// boundary is checked against the limit in force for the new member.
+    ppm_arena_declared: u64,
     /// Symbols decoded since the PPMd block started, counted as `ppm` counts
     /// them for its error positions.
     ppm_block_symbols: u64,
@@ -1362,6 +1366,7 @@ impl Rar4LzDecoder {
             block_type: BlockType::Lz,
             ppm: new_ppm(),
             ppm_arena_limit: crate::limits::RAR_PPMD_MAX_ARENA_SIZE,
+            ppm_arena_declared: 0,
             ppm_block_symbols: 0,
             ppm_esc_char: 2,
             tables_read: false,
@@ -3794,15 +3799,9 @@ impl Rar4LzDecoder {
                 // Checked before `start_block`, which is where the arena is
                 // allocated. Drop the model, as a failed restart poisons
                 // `RarPpmd`, so that no later block continues it.
-                self.ppm.forget();
-                return Err(RarError::ResourceLimit {
-                    detail: format!(
-                        "RAR4: PPMd block declares a {arena}-byte model arena, above the \
-                         {}-byte max_ppmd_arena_size limit",
-                        self.ppm_arena_limit
-                    ),
-                });
+                return Err(self.reject_ppm_arena("block declares", arena));
             }
+            self.ppm_arena_declared = arena;
             Some(PpmParams::rar(order as u32, mem_mb as u32).map_err(ppm_error)?)
         } else {
             None
@@ -3811,6 +3810,21 @@ impl Rar4LzDecoder {
         self.ppm.start_block(params).map_err(ppm_error)?;
 
         Ok(())
+    }
+
+    /// Drop the PPMd model, so that no later block continues it, and build
+    /// the limit error for a `arena`-byte model arena.
+    fn reject_ppm_arena(&mut self, what: &str, arena: u64) -> RarError {
+        self.ppm.forget();
+        self.ppm_arena_declared = 0;
+        self.ppm_resume = false;
+        RarError::ResourceLimit {
+            detail: format!(
+                "RAR4: PPMd {what} a {arena}-byte model arena, above the \
+                 {}-byte max_ppmd_arena_size limit",
+                self.ppm_arena_limit
+            ),
+        }
     }
 
     /// Decode PPMd symbols until block switch, EOF, or output complete.
@@ -3836,6 +3850,14 @@ impl Rar4LzDecoder {
         if !self.ppm.has_model() {
             self.block_type = BlockType::Lz;
             return Ok(output_size);
+        }
+        // The reset-header check in `init_ppm` bounds a model when it starts,
+        // but a member can continue the previous member's model without one:
+        // by resuming a block that member ended inside, or through a header
+        // without the reset flag. Either way the model decodes nothing until
+        // here, so the limit in force for this member bounds it here.
+        if self.ppm_arena_declared > self.ppm_arena_limit {
+            return Err(self.reject_ppm_arena("model continued with", self.ppm_arena_declared));
         }
         // A solid member boundary can fall inside a PPMd block; the decoder
         // keeps its coder registers across members, so the next member
@@ -4076,6 +4098,8 @@ impl Rar4LzDecoder {
             // caller then breaks out of the unpack loop, so the member ends
             // with the output decoded so far instead of an error.
             ppm.cleanup().map_err(ppm_error)?;
+            // `cleanup` restarts the model over a one-MiB arena.
+            self.ppm_arena_declared = 1 << 20;
             self.block_type = BlockType::Lz;
             self.member_decode_done = true;
         }
@@ -4659,6 +4683,79 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, RarError::ResourceLimit { .. }), "{err:?}");
         assert!(!decoder.ppm.has_model());
+    }
+
+    /// A solid member that resumes a PPMd block the previous member ended
+    /// inside reads no block header, so a limit lowered between the members
+    /// must still bound the model it continues. A limit at the declared size
+    /// still admits it.
+    #[test]
+    fn lowered_ppmd_arena_limit_bounds_a_model_resumed_by_the_next_solid_member() {
+        let continued = |limit: u64| {
+            let mut decoder = Rar4LzDecoder::new(0x40000);
+            // max_mb 1 declares a 2 MiB arena under the default limit.
+            decoder
+                .init_ppm(&mut BitReader::new(&ppm_reset_header(1)))
+                .unwrap();
+            decoder.block_type = BlockType::Ppm;
+            // The previous member's output ended inside the block.
+            decoder.ppm_resume = true;
+
+            decoder.prepare_member(true, 0x40000).unwrap();
+            decoder.set_ppm_arena_limit(limit);
+            let input = [0xff; 8];
+            let mut output = Vec::new();
+            let result =
+                decoder.decode_ppm_symbols(&mut BitReader::new(&input), 1, 0, None, &mut output);
+            (decoder, result)
+        };
+
+        let (decoder, result) = continued(1 << 20);
+        assert!(
+            matches!(&result, Err(RarError::ResourceLimit { detail })
+                if detail.contains("max_ppmd_arena_size")),
+            "{result:?}"
+        );
+        assert!(!decoder.ppm.has_model());
+        assert!(!decoder.ppm_resume);
+
+        let (_, result) = continued(2 << 20);
+        assert!(
+            !matches!(result, Err(RarError::ResourceLimit { .. })),
+            "{result:?}"
+        );
+    }
+
+    /// A block header without the reset flag continues the live model, so it
+    /// is bound by the limit in force for the member that reads it, not only
+    /// by the limit the model was started under.
+    #[test]
+    fn lowered_ppmd_arena_limit_bounds_a_model_continued_by_a_header_without_reset() {
+        let mut decoder = Rar4LzDecoder::new(0x40000);
+        decoder
+            .init_ppm(&mut BitReader::new(&ppm_reset_header(1)))
+            .unwrap();
+        decoder.block_type = BlockType::Ppm;
+
+        decoder.prepare_member(true, 0x40000).unwrap();
+        decoder.set_ppm_arena_limit(1 << 20);
+        // 0x0F: order 16 with the reset and new-escape flags clear.
+        let header: Vec<u8> = (0..7).rev().map(|i| (0x0Fu8 >> i) & 1).collect();
+        decoder
+            .init_ppm(&mut BitReader::new(&pack_bits(&header)))
+            .unwrap();
+        let input = [0xff; 8];
+        let mut output = Vec::new();
+        let result =
+            decoder.decode_ppm_symbols(&mut BitReader::new(&input), 1, 0, None, &mut output);
+
+        assert!(
+            matches!(&result, Err(RarError::ResourceLimit { detail })
+                if detail.contains("max_ppmd_arena_size")),
+            "{result:?}"
+        );
+        assert!(!decoder.ppm.has_model());
+        assert!(output.is_empty());
     }
 
     /// The default limit is the format maximum: a header declaring the

@@ -7,7 +7,9 @@
 - `Limits::max_ppmd_arena_size` bounds the PPMd model arena a RAR3 PPMd
   block header may declare (`(mem + 1) << 20` bytes from its memory-size
   byte). A header above the limit fails the member with
-  `RarError::ResourceLimit` before the arena is allocated. The default,
+  `RarError::ResourceLimit` before the arena is allocated. A limit lowered
+  between solid members also bounds a model the next member continues from
+  the previous one without a reset header. The default,
   `limits::RAR_PPMD_MAX_ARENA_SIZE`, is the format's 256 MiB ceiling, so
   existing callers decode exactly what they did; until now that ceiling
   applied whatever the caller's limits said. `Limits` has public fields, so
