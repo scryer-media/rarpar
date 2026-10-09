@@ -356,7 +356,11 @@ to a temporary file, in memory that does not depend on the stream's length, and
 a slow reader holds rarpar back rather than growing a buffer. OUTPUT defaults to INPUT with `.xz` added
 (compress) or removed (decompress, where `.txz` becomes `.tar`), beside INPUT or
 in the global `--output` directory; an existing directory as OUTPUT takes that
-name inside it, and standard input defaults to standard output. Inputs are
+name inside it, and standard input defaults to standard output. When both
+`-o DIR` and OUTPUT are given, a relative OUTPUT is placed under DIR keeping its
+own subdirectories (`-o out ... sub/a.xz` writes `out/sub/a.xz`), an absolute
+OUTPUT wins and ignores `-o`, and `-` is always standard output; `par3 create`
+places its OUTPUT the same way. Inputs are
 always kept, so `--delete-sources` is refused. An existing output requires
 `--overwrite`; the output is staged beside its destination, installed only once
 complete, and keeps the input's permissions and modification time. Compressed

@@ -111,14 +111,14 @@ fn check_options(args: &Par3CreateArgs) -> Result<(String, u64, u64), RarparErro
     Ok((name, block_size, rows))
 }
 
-/// Where the set goes: OUTPUT, or the recorded name inside OUTPUT when that is
-/// an existing directory. (The global `-o/--output` shares OUTPUT's argument
-/// id, so clap fills it with OUTPUT; it is not a second directory here.)
-fn stem_for(output: &Path, name: &str) -> PathBuf {
+/// Where the set goes: OUTPUT (under the global `-o` directory when one is
+/// given), or the recorded name inside it when that is an existing directory.
+fn stem_for(cli: &Cli, output: &Path, name: &str) -> PathBuf {
+    let output = cli.place_output(output);
     if output.is_dir() {
         output.join(name)
     } else {
-        output.to_path_buf()
+        output
     }
 }
 
@@ -128,7 +128,7 @@ pub fn create(
     args: &Par3CreateArgs,
 ) -> Result<(bool, Value), RarparError> {
     let (name, block_size, rows) = check_options(args)?;
-    let stem = stem_for(&args.output, &name);
+    let stem = stem_for(cli, &args.output, &name);
     reject_symlinks(&stem)?;
     // The volumes a full set would have are known now, so a name already
     // taken is refused before the stream is read.

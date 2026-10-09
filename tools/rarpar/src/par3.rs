@@ -1026,10 +1026,11 @@ fn create(cli: &Cli, args: &Par3CreateArgs) -> Result<(bool, Value), RarparError
         drop(plan);
         plan = CreationPlan::build(access, &sources, config)?;
     }
-    let stem = if is_carrier(&args.output) {
-        args.output.with_extension("")
+    let output = cli.place_output(&args.output);
+    let stem = if is_carrier(&output) {
+        output.with_extension("")
     } else {
-        args.output.clone()
+        output
     };
     reject_symlinks(&stem)?;
     let outputs: Vec<_> = plan.output_paths(&stem).collect();
