@@ -22,8 +22,10 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ### Library versions
 
-- unrar-rs 0.11.0: RAR3 PPMd decoding through `ppmd-turbo` 0.1.1, and the
-  move to Apache-2.0 plus the unRAR restriction.
+- unrar-rs 0.11.0: RAR3 PPMd decoding through `ppmd-turbo` 0.1.1, a
+  caller-set bound on the PPMd model arena (`Limits::max_ppmd_arena_size`,
+  default the format's 256 MiB), and the move to Apache-2.0 plus the unRAR
+  restriction.
 - par3-rs 0.5.1 (pinned exactly) and reedsolomon-rs 0.4.10: the move to
   Apache-2.0; no code changed.
 - par2-rs 0.10.8: unchanged.
