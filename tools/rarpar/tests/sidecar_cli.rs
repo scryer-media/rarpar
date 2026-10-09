@@ -618,6 +618,79 @@ fn a_sidecar_for_a_name_that_is_not_utf8_is_refused() {
     assert_eq!(listing(), before);
 }
 
+#[test]
+fn an_xz_overwrite_whose_sidecar_cannot_be_finished_keeps_the_previous_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // A PAR2 set holds at most 32,768 slices. An archive four bytes past
+    // 32,768 eight-byte slices (an .xz is a multiple of four bytes) feeds
+    // every whole slice as it is written, and only finishing the set meets
+    // the 32,769th: the set fails after the archive is complete.
+    let target = 32_768 * 8 + 4;
+    let level0 = ["xz", "compress", "--level", "0", "--threads", "1"];
+    let compressed = |input: &[u8], name: &str| {
+        std::fs::write(root.join("probe"), input).unwrap();
+        let mut args = vec!["--overwrite"];
+        args.extend(level0);
+        args.extend(["probe", name]);
+        ok(&rarpar(root, &args));
+        std::fs::metadata(root.join(name)).unwrap().len() as usize
+    };
+    // Incompressible input grows by a fixed overhead, give or take a chunk
+    // header, so the input of the right length is found near the estimate.
+    let estimate = 262_000 + target - compressed(&noise(262_000, 12), "probe.xz");
+    let data = (estimate - 16..=estimate + 16)
+        .map(|len| noise(len, 12))
+        .find(|data| compressed(data, "probe.xz") == target)
+        .expect("an input that compresses to the target length");
+    std::fs::write(root.join("data"), &data).unwrap();
+
+    std::fs::write(root.join("old"), noise(50_000, 13)).unwrap();
+    let mut args = vec!["xz", "compress"];
+    args.extend([
+        "--sidecar",
+        "par2",
+        "--sidecar-block-size",
+        "4096",
+        "--sidecar-recovery-count",
+        "1",
+        "old",
+        "out.xz",
+    ]);
+    ok(&rarpar(root, &args));
+    let archive = std::fs::read(root.join("out.xz")).unwrap();
+    let set = std::fs::read(root.join("out.xz.par2")).unwrap();
+
+    let mut args = vec!["--overwrite"];
+    args.extend(level0);
+    args.extend([
+        "--sidecar",
+        "par2",
+        "--sidecar-block-size",
+        "8",
+        "--sidecar-recovery-count",
+        "1",
+        "data",
+        "out.xz",
+    ]);
+    let output = rarpar(root, &args);
+    code(&output, 1);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("32768 slices"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        std::fs::read(root.join("out.xz")).unwrap() == archive,
+        "the previous archive was replaced"
+    );
+    assert!(
+        std::fs::read(root.join("out.xz.par2")).unwrap() == set,
+        "the previous set was replaced"
+    );
+    ok(&rarpar(root, &["--quiet", "par", "verify", "out.xz.par2"]));
+}
+
 #[cfg(feature = "sevenz")]
 mod archives {
     use super::*;

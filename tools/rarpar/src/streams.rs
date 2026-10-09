@@ -277,13 +277,27 @@ pub fn write_output<T>(
     prefix: &str,
     write: impl FnOnce(&mut dyn Write) -> Result<T, RarparError>,
 ) -> Result<T, RarparError> {
+    let (value, staged) = stage_output(output, prefix, write)?;
+    if let Some(staged) = staged {
+        staged.install(cli, input)?;
+    }
+    Ok(value)
+}
+
+/// [`write_output`] without the install: a file output comes back staged,
+/// for the caller to install once whatever must accompany it is ready.
+pub fn stage_output<T>(
+    output: Option<&Path>,
+    prefix: &str,
+    write: impl FnOnce(&mut dyn Write) -> Result<T, RarparError>,
+) -> Result<(T, Option<Staged>), RarparError> {
     match output {
         None => {
             let stdout = io::stdout();
             let mut sink = BufWriter::with_capacity(IO_BUFFER, stdout.lock());
             let value = write(&mut sink)?;
             sink.flush()?;
-            Ok(value)
+            Ok((value, None))
         }
         Some(path) => {
             let staged = Staged::create(path, prefix)?;
@@ -293,8 +307,7 @@ pub fn write_output<T>(
                 sink.flush()?;
                 value
             };
-            staged.install(cli, input)?;
-            Ok(value)
+            Ok((value, Some(staged)))
         }
     }
 }

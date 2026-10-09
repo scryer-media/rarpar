@@ -20,7 +20,8 @@ use crate::error::{EXIT_DATA_FAILURE, EXIT_SUCCESS, RarparError};
 use crate::sidecar::{self, SidecarPlan, SidecarWriter};
 use crate::streams::{
     CountingWriter, IO_BUFFER, Input, Tally, input_or_stdin, is_stdio, preflight_output,
-    refuse_terminal_stdout, regular_file_metadata, report_writer, resolve_output, write_output,
+    refuse_terminal_stdout, regular_file_metadata, report_writer, resolve_output, stage_output,
+    write_output,
 };
 
 const MIB: u64 = 1 << 20;
@@ -315,54 +316,57 @@ fn compress(cli: &Cli, input: &Path, args: &XzCompressArgs) -> Result<Value, Rar
         .as_ref()
         .map(|(plan, _, _)| plan.start())
         .transpose()?;
-    let written = write_output(
-        cli,
-        output.as_deref(),
-        input_meta.as_ref(),
-        ".rarpar-xz-",
-        |sink| {
-            let sink: Box<dyn Write + '_> = match set.as_mut() {
-                Some(sidecar) => Box::new(SidecarWriter {
-                    inner: sink,
-                    sidecar,
-                }),
-                None => Box::new(sink),
-            };
-            let mut counter = CountingWriter {
+    // The archive stays staged until its set is staged too, so a set that
+    // cannot be written replaces nothing, as `par3 archive` does.
+    let (written, staged) = stage_output(output.as_deref(), ".rarpar-xz-", |sink| {
+        let sink: Box<dyn Write + '_> = match set.as_mut() {
+            Some(sidecar) => Box::new(SidecarWriter {
                 inner: sink,
-                count: 0,
-            };
-            let mut writer = XzWriter::new(&mut counter, &props)
-                .map_err(|error| codec_error(io::Error::other(error)))?;
-            writer
-                .set_check(check_type(args.check))
-                .map_err(|error| codec_error(io::Error::other(error)))?;
-            writer.set_block_size(block_size);
-            writer.set_threads(threads as usize);
-            io::copy(&mut source, &mut writer).map_err(codec_error)?;
-            writer.finish().map_err(codec_error)?;
-            Ok(counter.count)
-        },
-    )?;
+                sidecar,
+            }),
+            None => Box::new(sink),
+        };
+        let mut counter = CountingWriter {
+            inner: sink,
+            count: 0,
+        };
+        let mut writer = XzWriter::new(&mut counter, &props)
+            .map_err(|error| codec_error(io::Error::other(error)))?;
+        writer
+            .set_check(check_type(args.check))
+            .map_err(|error| codec_error(io::Error::other(error)))?;
+        writer.set_block_size(block_size);
+        writer.set_threads(threads as usize);
+        io::copy(&mut source, &mut writer).map_err(codec_error)?;
+        writer.finish().map_err(codec_error)?;
+        Ok(counter.count)
+    })?;
     let consumed = consumed.get();
     report["input_bytes"] = json!(consumed);
     report["output_bytes"] = json!(written);
     report["ratio"] = json!(ratio(written, consumed));
-    if let (Some(set), Some((_, name, stem))) = (set, &sidecar) {
-        // The archive is installed; its set follows it, staged then renamed
-        // like the archive.
-        if let Some(directory) = stem
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            std::fs::create_dir_all(directory)?;
+    let finished = match (set, &sidecar) {
+        (Some(set), Some((_, name, stem))) => {
+            if let Some(directory) = stem
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(directory)?;
+            }
+            Some(set.finish(
+                name,
+                stem,
+                cli.overwrite,
+                crate::par3_stream::Durability::Sync,
+            )?)
         }
-        let finished = set.finish(
-            name,
-            stem,
-            cli.overwrite,
-            crate::par3_stream::Durability::Sync,
-        )?;
+        _ => None,
+    };
+    if let Some(staged) = staged {
+        staged.install(cli, input_meta.as_ref())?;
+    }
+    if let (Some(finished), Some((_, name, _))) = (finished, &sidecar) {
+        // The archive is installed; its staged set follows it.
         let mut summary = finished.report.clone();
         let (outputs, sizes) = finished.install()?;
         summary["name"] = json!(name);
