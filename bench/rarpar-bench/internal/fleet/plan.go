@@ -281,6 +281,10 @@ func machineSteps(machine Machine, layout RemoteLayout) []string {
 		steps = append(steps, fmt.Sprintf("on host: macro-par3, profile %s, workers %v, rarpar create/repair %s (verify runs once), warmups=%d repeats=%d, %s, reference failures are DNF, work %s",
 			machine.PAR3.Profile, machine.PAR3.Workers, strings.Join(par3Durabilities(machine), "+"), machine.PAR3.Warmups, machine.PAR3.Repeats,
 			timeout, PAR3Work(machine, layout)))
+		if machine.PAR3.Versus != "" {
+			steps = append(steps, fmt.Sprintf("on host: par3 versus, profile %s: PAR2 (rarpar par, plus the par2 oracle when present) against PAR3 Cauchy and FFT, par2 ÷ par3, every repair SHA-256 checked",
+				machine.PAR3.Versus))
+		}
 	}
 	switch machine.Capabilities.Perf {
 	case PerfLinux:
