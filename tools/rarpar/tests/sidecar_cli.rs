@@ -507,6 +507,58 @@ fn a_par2_sidecar_of_many_tiny_rows_counts_each_row_against_the_memory_limit() {
     );
 }
 
+#[test]
+fn a_sidecar_block_size_that_cannot_be_rounded_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("data"), noise(1000, 8)).unwrap();
+    let largest = u64::MAX.to_string();
+    let even = (u64::MAX - 1).to_string();
+    // PAR3 rounds an odd size up to even, PAR2 up to a multiple of four.
+    for (format, size) in [("par3", &largest), ("par2", &largest), ("par2", &even)] {
+        let output = rarpar(
+            root,
+            &[
+                "--dry-run",
+                "xz",
+                "compress",
+                "--sidecar",
+                format,
+                "--sidecar-block-size",
+                size,
+                "--sidecar-recovery-count",
+                "1",
+                "data",
+            ],
+        );
+        code(&output, 2);
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("cannot be rounded"),
+            "{format} {size}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // A set over standard input takes the same plan.
+    let output = through_pipes(
+        root,
+        &[
+            "--dry-run",
+            "par3",
+            "create",
+            "set.par3",
+            "-",
+            "--name",
+            "piece",
+            "-s",
+            &largest,
+            "-c",
+            "1",
+        ],
+        noise(100, 2),
+    );
+    code(&output, 2);
+}
+
 #[cfg(feature = "sevenz")]
 mod archives {
     use super::*;

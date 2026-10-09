@@ -52,9 +52,19 @@ impl SidecarPlan {
         block_size: u64,
         rows: u64,
     ) -> Result<Self, RarparError> {
+        // A Cauchy set over GF(2^16) codes in two-byte symbols, so
+        // par3cmdline rounds an odd block size up; a PAR2 slice is a
+        // multiple of four bytes. The largest sizes have nothing above them.
+        let multiple = match format {
+            SidecarFormat::Par3 => 2,
+            SidecarFormat::Par2 => 4,
+        };
+        if block_size.checked_next_multiple_of(multiple).is_none() {
+            return Err(RarparError::Usage(format!(
+                "--sidecar-block-size {block_size} cannot be rounded up to a multiple of {multiple}"
+            )));
+        }
         let block_size = match format {
-            // A Cauchy set over GF(2^16) codes in two-byte symbols, so
-            // par3cmdline rounds an odd block size up.
             SidecarFormat::Par3 => {
                 sibling_geometry(0, Some(block_size), RecoveryChoice::Count(0)).block_size
             }
