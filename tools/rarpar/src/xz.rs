@@ -59,14 +59,16 @@ pub fn run_command(cli: &Cli, command: XzCommand) -> Result<u8, RarparError> {
                 EXIT_DATA_FAILURE
             })
         }
-        Err(error) => {
-            if cli.json {
-                let report = json!({"operation":"xz","success":false,
-                    "error":error.to_string(),"exit_code":error.exit_code()});
-                emit(cli, &report, data_on_stdout)?;
-            }
-            Err(error)
+        // With --json the failure report is the whole output: returning the
+        // error as well would add a plain-text line after it, on standard
+        // error too when the data holds standard output.
+        Err(error) if cli.json => {
+            let report = json!({"operation":"xz","success":false,
+                "error":error.to_string(),"exit_code":error.exit_code()});
+            emit(cli, &report, data_on_stdout)?;
+            Ok(error.exit_code())
         }
+        Err(error) => Err(error),
     }
 }
 

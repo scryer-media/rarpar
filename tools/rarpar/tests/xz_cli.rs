@@ -869,3 +869,49 @@ fn damage_in_a_pipe_is_a_data_failure() {
         assert_eq!(tested.status.code(), Some(1), "threads {threads}");
     }
 }
+
+#[test]
+fn a_json_failure_with_data_on_stdout_is_one_json_document_on_stderr() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let original = sample(1 << 20, 41);
+    let compressed = through_pipes(root, &["xz", "compress", "-s", "262144"], original);
+    ok(&compressed);
+    let mut damaged = compressed.stdout;
+    let middle = damaged.len() / 2;
+    damaged[middle] ^= 0x55;
+    let cases: [(&[&str], Vec<u8>, i32); 2] = [
+        // A damaged stream decoded to standard output: a data failure.
+        (&["--json", "xz", "decompress"], damaged, 1),
+        // A sidecar with no name for standard output: a usage error.
+        (
+            &[
+                "--json",
+                "xz",
+                "compress",
+                "--sidecar",
+                "par2",
+                "--sidecar-block-size",
+                "4096",
+                "--sidecar-recovery-count",
+                "1",
+            ],
+            sample(10_000, 3),
+            2,
+        ),
+    ];
+    for (args, input, code) in cases {
+        let output = through_pipes(root, args, input);
+        assert_eq!(output.status.code(), Some(code), "{args:?}");
+        // Standard error is exactly one JSON document: no plain-text line
+        // after it.
+        let report: Value = serde_json::from_slice(&output.stderr).unwrap_or_else(|error| {
+            panic!(
+                "{args:?}: {error}: stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+        assert_eq!(report["success"], false);
+        assert_eq!(report["exit_code"], code);
+    }
+}
