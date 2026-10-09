@@ -17,7 +17,8 @@ use serde_json::{Value, json};
 
 use crate::error::RarparError;
 use crate::par3::reject_symlinks;
-use crate::sidecar::{GF16_ORDER, SidecarPlan, preflight};
+use crate::par3_stream::Durability;
+use crate::sidecar::{GF16_ORDER, SidecarPlan, preflight_set};
 use crate::streams::{IO_BUFFER, Input};
 
 /// Refuses the options a set over a stream cannot honour, and names the
@@ -115,14 +116,16 @@ pub fn create(
     let stem = stem_for(cli, &args.output, &name);
     reject_symlinks(&stem)?;
     // The volumes a full set would have are known now, so a name already
-    // taken is refused before the stream is read.
-    let planned: Vec<PathBuf> = plan.paths(&stem);
-    preflight(&planned, cli.overwrite)?;
+    // taken, or a previous set this one would only partly replace, is
+    // refused before the stream is read.
+    let planned: Vec<PathBuf> = preflight_set(cli, &plan, &stem)?;
     plan.check_budget(cli.par3_memory_mib)?;
     let memory_estimate = plan.memory_estimate().saturating_add(IO_BUFFER as u64);
     let mut report = json!({"operation":"par3_create","success":true,"dry_run":cli.dry_run,
         "input":"-","name":name,"block_size":block_size,"recovery_blocks":rows,
-        "memory_estimate_bytes":memory_estimate,"cohorts":1,"scratch_bytes":0});
+        "memory_estimate_bytes":memory_estimate,"cohorts":1,"scratch_bytes":0,
+        "buffered":args.buffered});
+    let durability = Durability::from_buffered(args.buffered);
     if cli.dry_run {
         report["outputs"] = json!(planned);
         return Ok((true, report));
@@ -146,7 +149,7 @@ pub fn create(
     {
         std::fs::create_dir_all(directory)?;
     }
-    let finished = sidecar.finish(&name, &stem, cli.overwrite)?;
+    let finished = sidecar.finish(&name, &stem, cli.overwrite, durability)?;
     let set = finished.report.clone();
     let (outputs, sizes) = finished.install()?;
     for key in [

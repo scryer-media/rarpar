@@ -256,6 +256,122 @@ fn par3_create_from_a_pipe_honours_dash_and_the_output_directory() {
     assert_eq!(code, Some(0));
 }
 
+#[track_caller]
+fn code_of(output: &Output, expected: i32) {
+    assert_eq!(
+        output.status.code(),
+        Some(expected),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn par3_create_from_a_pipe_honours_buffered() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let data = sample(100_000, 7);
+    for (buffered, flag) in [(false, None), (true, Some("--buffered"))] {
+        let mut args = vec![
+            "--json",
+            "par3",
+            "create",
+            "set.par3",
+            "-",
+            "--name",
+            "piece.bin",
+            "-s",
+            "4096",
+            "-c",
+            "2",
+        ];
+        if buffered {
+            args.insert(0, "--overwrite");
+        }
+        args.extend(flag);
+        let created = through_pipes(root, &args, data.clone());
+        ok(&created);
+        // As `par3 create` over a file reports it: --buffered skips the
+        // storage barriers.
+        assert_eq!(json(&created)["buffered"], buffered);
+    }
+    std::fs::write(root.join("piece.bin"), &data).unwrap();
+    let (code, _) = par3_verdicts(root, "set.par3");
+    assert_eq!(code, Some(0));
+}
+
+/// The names in `directory`, sorted.
+fn listing(directory: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn par3_create_from_a_pipe_refuses_to_leave_obsolete_volumes_behind() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::create_dir_all(root.join("sets")).unwrap();
+    let data = sample(200_000, 3);
+    let create = |count: &'static str, overwrite: bool| {
+        let mut args = Vec::new();
+        if overwrite {
+            args.push("--overwrite");
+        }
+        args.extend_from_slice(&[
+            "par3",
+            "create",
+            "sets/set.par3",
+            "-",
+            "--name",
+            "piece.bin",
+            "-s",
+            "4096",
+            "-c",
+            count,
+        ]);
+        through_pipes(root, &args, data.clone())
+    };
+    ok(&create("8", false));
+    let before = listing(&root.join("sets"));
+    assert_eq!(before.len(), 5, "{before:?}");
+    let contents: Vec<Vec<u8>> = before
+        .iter()
+        .map(|name| std::fs::read(root.join("sets").join(name)).unwrap())
+        .collect();
+
+    // Fewer recovery blocks would leave the old set's later volumes behind,
+    // authenticated and beside a set they no longer belong to, as `par3
+    // create` over a file refuses; the old set stays whole.
+    let fewer = create("1", true);
+    assert_eq!(
+        fewer.status.code(),
+        Some(3),
+        "stderr={}",
+        String::from_utf8_lossy(&fewer.stderr)
+    );
+    assert!(String::from_utf8_lossy(&fewer.stderr).contains("obsolete"));
+    assert_eq!(listing(&root.join("sets")), before);
+    for (name, content) in before.iter().zip(&contents) {
+        assert_eq!(
+            &std::fs::read(root.join("sets").join(name)).unwrap(),
+            content
+        );
+    }
+
+    // A larger count renames the volumes (`vol00+01` for 16 blocks), so the
+    // old `vol0+1` would be left too; the same layout replaces every carrier.
+    code_of(&create("16", true), 3);
+    assert_eq!(listing(&root.join("sets")), before);
+    ok(&create("8", true));
+    std::fs::write(root.join("sets/piece.bin"), &data).unwrap();
+    let (code, _) = par3_verdicts(&root.join("sets"), "set.par3");
+    assert_eq!(code, Some(0));
+}
+
 #[test]
 fn par3_create_from_a_pipe_needs_what_the_length_would_choose() {
     let temp = tempfile::tempdir().unwrap();
@@ -387,6 +503,100 @@ fn par_verify_reads_one_protected_file_from_a_pipe() {
     );
     assert_eq!(long.status.code(), Some(1));
     assert_eq!(json(&long)["stream"]["trailing_bytes"], 5);
+}
+
+/// Rewrites a PAR2 set's packets as an untrusted writer could: the Main
+/// packet declares `slice_size`, and every packet is re-signed with the set
+/// ID and packet MD5 that follow from it, so the set still parses.
+fn forge_slice_size(par2: &[u8], slice_size: u64) -> Vec<u8> {
+    const MAGIC: &[u8; 8] = b"PAR2\0PKT";
+    const MAIN: &[u8; 16] = b"PAR 2.0\0Main\0\0\0\0";
+    let mut packets = Vec::new();
+    let mut at = 0;
+    while at + 64 <= par2.len() {
+        assert_eq!(&par2[at..at + 8], MAGIC);
+        let len = u64::from_le_bytes(par2[at + 8..at + 16].try_into().unwrap()) as usize;
+        packets.push(par2[at..at + len].to_vec());
+        at += len;
+    }
+    let main = packets
+        .iter_mut()
+        .find(|packet| &packet[48..64] == MAIN)
+        .unwrap();
+    main[64..72].copy_from_slice(&slice_size.to_le_bytes());
+    let set_id = par2_rs::checksum::md5(&main[64..]);
+    let mut out = Vec::new();
+    for mut packet in packets {
+        packet[32..48].copy_from_slice(&set_id);
+        let digest = par2_rs::checksum::md5(&packet[32..]);
+        packet[16..32].copy_from_slice(&digest);
+        out.extend_from_slice(&packet);
+    }
+    out
+}
+
+#[test]
+fn par_verify_from_a_pipe_refuses_a_slice_size_it_cannot_hold() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let (first, _) = par2_set(root);
+    let index = std::fs::read(root.join("set.par2")).unwrap();
+    std::fs::create_dir(root.join("forged")).unwrap();
+    // A slice of 2^62 bytes: the allocation for one slice would abort.
+    std::fs::write(
+        root.join("forged/set.par2"),
+        forge_slice_size(&index, 1 << 62),
+    )
+    .unwrap();
+    let forged = through_pipes(
+        root,
+        &["par", "verify", "forged/set.par2", "--name", "first.bin"],
+        first.clone(),
+    );
+    assert_eq!(
+        forged.status.code(),
+        Some(1),
+        "stderr={}",
+        String::from_utf8_lossy(&forged.stderr)
+    );
+    let message = String::from_utf8_lossy(&forged.stderr);
+    assert!(message.contains("slice"), "{message}");
+    assert!(message.contains("--par3-memory-mib"), "{message}");
+
+    // A slice the budget can hold still verifies; one just past it does not.
+    let budget = through_pipes(
+        root,
+        &[
+            "--par3-memory-mib",
+            "1",
+            "par",
+            "verify",
+            "set.par2",
+            "--name",
+            "first.bin",
+        ],
+        first.clone(),
+    );
+    ok(&budget);
+    std::fs::write(
+        root.join("forged/set.par2"),
+        forge_slice_size(&index, (1 << 20) + 4),
+    )
+    .unwrap();
+    let over = through_pipes(
+        root,
+        &[
+            "--par3-memory-mib",
+            "1",
+            "par",
+            "verify",
+            "forged/set.par2",
+            "--name",
+            "first.bin",
+        ],
+        first,
+    );
+    assert_eq!(over.status.code(), Some(1));
 }
 
 #[test]

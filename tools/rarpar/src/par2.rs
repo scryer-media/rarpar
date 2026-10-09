@@ -746,6 +746,38 @@ fn refuse_standard_input(repair: bool, args: &ParArgs) -> Result<(), RarparError
     Ok(())
 }
 
+/// Bytes held to verify a stream one slice at a time, checked before any is
+/// allocated. The Main packet's slice size is untrusted, so a slice must fit
+/// the `--par3-memory-mib` budget (the only memory flag `par verify` honours)
+/// and the file must have no more slices than par2-rs addresses per file;
+/// either failure is an unusable set (exit 1), not an abort.
+fn stream_slice_bytes(
+    slice_size: u64,
+    length: u64,
+    budget_mib: usize,
+) -> Result<usize, RarparError> {
+    const MAX_SLICES_PER_FILE: u64 = 32_768;
+    let budget = (budget_mib as u64).saturating_mul(1 << 20);
+    if slice_size == 0 || !slice_size.is_multiple_of(4) {
+        return Err(RarparError::Data(format!(
+            "the PAR2 set declares {slice_size}-byte slices; PAR2 slices are a non-zero multiple of 4 bytes"
+        )));
+    }
+    if slice_size > budget {
+        return Err(RarparError::Data(format!(
+            "the PAR2 set declares {slice_size}-byte slices; verifying a stream holds one slice, more than --par3-memory-mib allows ({budget_mib} MiB)"
+        )));
+    }
+    if length.div_ceil(slice_size) > MAX_SLICES_PER_FILE {
+        return Err(RarparError::Data(format!(
+            "the PAR2 set gives the file {} slices of {slice_size} bytes; a PAR2 file has at most {MAX_SLICES_PER_FILE}",
+            length.div_ceil(slice_size)
+        )));
+    }
+    usize::try_from(slice_size)
+        .map_err(|_| RarparError::Data(format!("{slice_size}-byte slices are too large")))
+}
+
 /// Verifies the protected file `name` from standard input in one forward
 /// pass: each slice is checked as soon as its bytes have arrived, and only
 /// one slice is held at a time.
@@ -778,8 +810,7 @@ fn verify_stream(cli: &Cli, args: &ParArgs, name: &str) -> Result<u8, RarparErro
     };
     let expected = set.file_description(&file_id).map_or(0, |desc| desc.length);
     let slice_size = set.slice_size;
-    let slice = usize::try_from(slice_size)
-        .map_err(|_| RarparError::Resource(format!("{slice_size}-byte slices are too large")))?;
+    let slice = stream_slice_bytes(slice_size, expected, cli.par3_memory_mib)?;
 
     let mut session = par2_rs::VerificationSession::new();
     for path in &resolved.par2_paths {
@@ -792,7 +823,13 @@ fn verify_stream(cli: &Cli, args: &ParArgs, name: &str) -> Result<u8, RarparErro
     }
 
     let mut source = Input::open(&input)?.into_reader();
-    let mut buffer = vec![0u8; slice.max(1)];
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(slice).map_err(|_| {
+        RarparError::Resource(format!(
+            "cannot allocate one {slice_size}-byte slice to verify the stream"
+        ))
+    })?;
+    buffer.resize(slice, 0);
     let (mut received, mut trailing) = (0u64, 0u64);
     loop {
         // Fill one slice, so every feed is a whole slice the session checks

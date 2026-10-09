@@ -42,11 +42,11 @@ use crate::error::RarparError;
 use crate::par3::{parent, reject_symlinks};
 use crate::par3_inside::name_key;
 use crate::par3_stream::{
-    self, Coding, FileDigest, InsideParams, InsideShape, Lane, RecoveryChoice, SetSpec,
+    self, Coding, Durability, FileDigest, InsideParams, InsideShape, Lane, RecoveryChoice, SetSpec,
     block_count, build_set, inside_geometry, inside_size, reference_field, sibling_geometry,
     write_inside, write_sibling,
 };
-use crate::sidecar::{Sidecar, SidecarPlan};
+use crate::sidecar::{Sidecar, SidecarPlan, preflight_set};
 
 const MIB: u64 = 1 << 20;
 
@@ -866,8 +866,10 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
     let stem = output.with_extension("");
     let mut outputs = vec![output.clone()];
     if let Some(sidecar) = &par2 {
-        // A fixed recovery count names every volume now.
-        outputs.extend(sidecar.paths(&stem));
+        // A fixed recovery count names every volume now, so the set gets the
+        // streamed sets' preflight, obsolete volumes of an earlier set
+        // included, before the archive is built.
+        outputs.extend(preflight_set(cli, sidecar, &stem)?);
         refuse_aliases(&outputs)?;
     } else if !args.inside {
         // The volume names depend on the row count, so list the index only.
@@ -990,7 +992,7 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
         Guard::Sidecar(sidecar) => {
             file.sync_all()?;
             drop(file);
-            let finished = sidecar.finish(&name, &stem, cli.overwrite)?;
+            let finished = sidecar.finish(&name, &stem, cli.overwrite, Durability::Sync)?;
             let mut set = finished.report.clone();
             // The set is staged beside its names before the archive is
             // installed, and installed after it, as a PAR3 sibling is.
@@ -1156,6 +1158,15 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
     if geometry.inside.is_none() {
         // The volume names are known now: check them all before the
         // archive is installed, so a collision leaves nothing half made.
+        //
+        // Unlike a streamed set (`sidecar::preflight_set`), this set is not
+        // checked for obsolete volumes of an earlier one. Its row count, and
+        // so its volume names, follow from the archive's size, which is only
+        // known here after the archive is built; the only check possible
+        // before the build would compare against the index name alone and
+        // refuse every rerun that has volumes. Refusing here instead would
+        // throw away the whole build for a check the operator could not
+        // have satisfied up front.
         let (index, volumes) = par3_stream::sibling_paths(&stem, rows.len() as u64);
         let mut planned = vec![output.clone(), index];
         planned.extend(volumes.iter().map(|(_, _, path)| path.clone()));
@@ -1173,7 +1184,13 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
     // The index and volumes are written and synced beside their names before
     // the archive is installed, so a failed write replaces nothing.
     let sibling = if geometry.inside.is_none() {
-        Some(write_sibling(&stem, &set, rows, cli.overwrite)?)
+        Some(write_sibling(
+            &stem,
+            &set,
+            rows,
+            cli.overwrite,
+            Durability::Sync,
+        )?)
     } else {
         None
     };

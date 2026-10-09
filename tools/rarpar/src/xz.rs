@@ -59,14 +59,16 @@ pub fn run_command(cli: &Cli, command: XzCommand) -> Result<u8, RarparError> {
                 EXIT_DATA_FAILURE
             })
         }
-        Err(error) => {
-            if cli.json {
-                let report = json!({"operation":"xz","success":false,
-                    "error":error.to_string(),"exit_code":error.exit_code()});
-                emit(cli, &report, data_on_stdout)?;
-            }
-            Err(error)
+        // With --json the failure report is the whole output: returning the
+        // error as well would add a plain-text line after it, on standard
+        // error too when the data holds standard output.
+        Err(error) if cli.json => {
+            let report = json!({"operation":"xz","success":false,
+                "error":error.to_string(),"exit_code":error.exit_code()});
+            emit(cli, &report, data_on_stdout)?;
+            Ok(error.exit_code())
         }
+        Err(error) => Err(error),
     }
 }
 
@@ -355,7 +357,12 @@ fn compress(cli: &Cli, input: &Path, args: &XzCompressArgs) -> Result<Value, Rar
         {
             std::fs::create_dir_all(directory)?;
         }
-        let finished = set.finish(name, stem, cli.overwrite)?;
+        let finished = set.finish(
+            name,
+            stem,
+            cli.overwrite,
+            crate::par3_stream::Durability::Sync,
+        )?;
         let mut summary = finished.report.clone();
         let (outputs, sizes) = finished.install()?;
         summary["name"] = json!(name);
@@ -404,7 +411,7 @@ fn sidecar_target(
             ))
         })?;
     crate::par3::reject_symlinks(&stem)?;
-    sidecar::preflight(&plan.paths(&stem), cli.overwrite)?;
+    sidecar::preflight_set(cli, &plan, &stem)?;
     plan.check_budget(cli.par3_memory_mib)?;
     Ok(Some((plan, name, stem)))
 }

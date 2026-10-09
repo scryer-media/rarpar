@@ -18,8 +18,8 @@ use serde_json::{Value, json};
 use crate::error::RarparError;
 use crate::par2_stream::{self, Par2Lane};
 use crate::par3_stream::{
-    self, Coding, FileDigest, LANE_BYTES_PER_BLOCK, Lane, RecoveryChoice, SetSpec, StagedSibling,
-    build_set, reference_field, sibling_geometry, sibling_paths, write_sibling,
+    self, Coding, Durability, FileDigest, LANE_BYTES_PER_BLOCK, Lane, RecoveryChoice, SetSpec,
+    StagedSibling, build_set, reference_field, sibling_geometry, sibling_paths, write_sibling,
 };
 
 const MIB: u64 = 1 << 20;
@@ -238,20 +238,21 @@ impl Sidecar {
     }
 
     /// Finish the set for a file recorded as `name`, and write it beside the
-    /// paths `stem` names.
+    /// paths `stem` names, synced first unless `durability` is buffered.
     pub(crate) fn finish(
         self,
         name: &str,
         stem: &Path,
         overwrite: bool,
+        durability: Durability,
     ) -> Result<FinishedSidecar, RarparError> {
         let creator = par3_stream::creator_text();
         let block_size = self.plan.block_size;
         let (staged, report) = match self.lane {
             Inner::Par2(lane) => {
                 let set = lane.finish(name).map_err(RarparError::Data)?;
-                let staged =
-                    par2_stream::write_sidecar(stem, &set, overwrite).map_err(output_error)?;
+                let staged = par2_stream::write_sidecar(stem, &set, overwrite, durability)
+                    .map_err(output_error)?;
                 let set_id: String = set
                     .set_id
                     .iter()
@@ -314,7 +315,8 @@ impl Sidecar {
                 };
                 let set = build_set(&spec);
                 let rows = lane.codings()[0].rows();
-                let staged = write_sibling(stem, &set, rows, overwrite).map_err(output_error)?;
+                let staged =
+                    write_sibling(stem, &set, rows, overwrite, durability).map_err(output_error)?;
                 (
                     staged,
                     json!({"format":"par3","set_id":set.set_id.to_string(),
@@ -369,6 +371,36 @@ fn output_error(error: std::io::Error) -> RarparError {
         std::io::ErrorKind::InvalidInput => RarparError::Unsafe(error.to_string()),
         _ => RarparError::Io(error),
     }
+}
+
+/// Check every file `plan` will write under `stem` before any byte is read,
+/// and return them. Beyond [`preflight`], both formats follow `par3 create`'s
+/// overwrite rule: replacing a set whose authenticated volumes it would not
+/// all overwrite (a previous set with more volumes, or differently named
+/// ones) is refused. The volume names are fixed by the block size and count,
+/// so the whole set is known here.
+pub(crate) fn preflight_set(
+    cli: &rarpar::cli::Cli,
+    plan: &SidecarPlan,
+    stem: &Path,
+) -> Result<Vec<PathBuf>, RarparError> {
+    let paths = plan.paths(stem);
+    preflight(&paths, cli.overwrite)?;
+    match plan.format {
+        SidecarFormat::Par3 => {
+            crate::par3::reject_obsolete_sibling_carriers(cli, stem, &paths)?;
+        }
+        SidecarFormat::Par2 if cli.overwrite => {
+            if let Some(path) = par2_stream::obsolete_volume(stem, &paths)? {
+                return Err(RarparError::Unsafe(format!(
+                    "overwrite would leave an obsolete authenticated PAR2 volume: {}; move the previous set aside or choose a new output directory",
+                    path.display()
+                )));
+            }
+        }
+        SidecarFormat::Par2 => {}
+    }
+    Ok(paths)
 }
 
 /// Refuse a planned output that is a link, or that exists without

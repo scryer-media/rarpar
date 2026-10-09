@@ -828,6 +828,25 @@ fn verify_repair_loaded(
     })
 }
 
+/// The `par3 create` overwrite rule for a set written outside the planned
+/// creator: under `--overwrite`, refuse when a set already named by `stem`
+/// has authenticated carriers that `outputs` would not replace.
+pub(crate) fn reject_obsolete_sibling_carriers(
+    cli: &Cli,
+    stem: &Path,
+    outputs: &[PathBuf],
+) -> Result<(), RarparError> {
+    if !cli.overwrite {
+        return Ok(());
+    }
+    let name = stem.file_name().unwrap_or_default().to_string_lossy();
+    let stem = match name.strip_suffix(".par3") {
+        Some(base) => stem.with_file_name(base),
+        None => stem.to_path_buf(),
+    };
+    reject_obsolete_carriers(cli, &stem, outputs, &options(cli)?)
+}
+
 fn reject_obsolete_carriers(
     cli: &Cli,
     stem: &Path,
