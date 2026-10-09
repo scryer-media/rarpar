@@ -76,6 +76,27 @@ pub fn linear_uses_gfni() -> bool {
     false
 }
 
+/// Whether the executing CPU reports the `AuthenticAMD` vendor string. Read
+/// once and cached; always false off x86-64.
+pub fn cpu_is_amd() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static AMD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        return *AMD.get_or_init(|| {
+            #[allow(unused_unsafe)]
+            // SAFETY: CPUID leaf 0 exists on every x86-64 CPU.
+            let leaf = unsafe { std::arch::x86_64::__cpuid(0) };
+            let mut vendor = [0u8; 12];
+            vendor[..4].copy_from_slice(&leaf.ebx.to_le_bytes());
+            vendor[4..8].copy_from_slice(&leaf.edx.to_le_bytes());
+            vendor[8..].copy_from_slice(&leaf.ecx.to_le_bytes());
+            &vendor == b"AuthenticAMD"
+        });
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
 /// Whether [`LinearBackend::Auto`] maps run the wasm simd128 kernels: true
 /// exactly in a `wasm32` build with `-C target-feature=+simd128` (a
 /// `+relaxed-simd` build takes the relaxed swizzle in the same kernels).

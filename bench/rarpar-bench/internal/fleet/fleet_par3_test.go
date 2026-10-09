@@ -52,6 +52,7 @@ func TestPAR3ConfigValidation(t *testing.T) {
 		{"bad kernel variant", `# kernel_variants = ["name:VAR=value"]`, `kernel_variants = ["novar"]`, "kernel_variants"},
 		{"duplicate worker count", `workers = [1, 8]                         # rarpar rows; the reference is single-threaded`, `workers = [8, 8]`, "appears twice"},
 		{"pin list", `pin_cpus = "0-7"`, `pin_cpus = "0,2"`, "par3.pin_cpus"},
+		{"unknown versus profile", `versus = "versus"`, `versus = "versus-huge"`, "par3.versus"},
 		{"missing par3 oracle", "[machines.oracles.par3]\npolicy = \"source-build\"\nreason = \"par3cmdline publishes no Linux binary; built on the host from the toolchains.json pin\"\nrecipe = \"par3cmdline-onhost\"\nversion",
 			"[machines.oracles.par3x]\npolicy = \"source-build\"\nreason = \"x\"\nrecipe = \"par3cmdline-onhost\"\nversion", "needs [machines.oracles.par3]"},
 		{"onhost recipe takes no url", `recipe = "par3cmdline-onhost"
@@ -97,6 +98,10 @@ func TestPAR3RunScriptSection(t *testing.T) {
 		"'--profile' 'full' '--workers' '1,8' '--warmups' '1' '--repeats' '5' '--timeout' '20m' '--pin-cpus' '0-7'",
 		"gate macro-par3",
 		"fail par3-reference-missing",
+		"gate macro-par3-versus",
+		`set -- par3 versus --candidate "$CANDIDATE" --work "$P3_WORK/vs" --out "$R/par3-versus" --machine "$MACHINE" '--profile' 'versus' '--warmups' '1' '--repeats' '5' '--timeout' '20m' '--pin-cpus' '0-7'`,
+		`[ -n "$ORACLE_PAR2" ] && set -- "$@" --par2 "$ORACLE_PAR2"`,
+		"fail macro-par3-versus",
 	} {
 		if !strings.Contains(script, expected) {
 			t.Fatalf("run script is missing %q", expected)
@@ -127,8 +132,10 @@ func TestPAR3WindowsUsesTheOfficialBinaryAndHostPaths(t *testing.T) {
 	if got := plan.Machines[0].Oracles["par3"].RemotePath; got != `C:\bench\fleet-stage\fleet-testrun\bin\par3.exe` {
 		t.Fatalf("Windows oracle path = %s", got)
 	}
+	machine.PAR3.Versus = "versus"
 	script := WindowsRunScript(machine, config.Fleet.Defaults, "fleet-testrun", layout, map[string]string{"par3": `C:\x\par3.exe`})
-	for _, expected := range []string{"$OraclePar3 = 'C:\\x\\par3.exe'", "Gate 'macro-par3'", "'par3','run','--reference',$OraclePar3", "$p3Work = 'C:\\p3'"} {
+	for _, expected := range []string{"$OraclePar3 = 'C:\\x\\par3.exe'", "Gate 'macro-par3'", "'par3','run','--reference',$OraclePar3", "$p3Work = 'C:\\p3'",
+		"Gate 'macro-par3-versus'", "'par3','versus','--candidate',$Candidate", "if ($OraclePar2) { $vsArgs += @('--par2', $OraclePar2) }", "Check 'macro-par3-versus'"} {
 		if !strings.Contains(script, expected) {
 			t.Fatalf("Windows run script is missing %q", expected)
 		}

@@ -213,6 +213,10 @@ warmups = 1
 repeats = 5
 pin_cpus = "0-7"                         # P-cores on a hybrid part; empty = unpinned
 iocount = false                          # untimed strace -f -c pass (Linux)
+# PAR2 against PAR3 after the suite: rarpar par (plus the par2 oracle when the
+# machine has one) vs PAR3 Cauchy and FFT, par2 ÷ par3. versus | versus-smoke;
+# omit to skip.
+versus = "versus"
 # The reference keeps its volume paths in a 1 KiB buffer and fails on longer
 # lists, so keep the work path short (set C writes 13 volumes: about 40
 # characters at most). The plan warns about a longer path but runs anyway; the

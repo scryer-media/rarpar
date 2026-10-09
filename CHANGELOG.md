@@ -57,6 +57,11 @@ documented in each crate's own changelog so those notes ship with the crate.
   itself is unchanged: GPL-3.0-or-later with its section 7 permission to
   combine with `unrar-rs`, and its binaries still carry the unRAR
   restriction.
+- FFT-codec PAR3 repair needs less memory and runs faster: 1.2 to 1.9
+  times faster on the measured hosts, and the 4096 × 16 KiB repair's charged
+  peak falls from 137.9 MB to 15.8 MB. On AMD CPUs with AVX2 kernels, FFT
+  create and repair also take a four-step transform where it measured
+  faster. Output is unchanged.
 
 ### Library versions
 
@@ -64,8 +69,11 @@ documented in each crate's own changelog so those notes ship with the crate.
   caller-set bound on the PPMd model arena (`Limits::max_ppmd_arena_size`,
   default the format's 256 MiB), and the move to Apache-2.0 plus the unRAR
   restriction.
-- par3-rs 0.5.1 (pinned exactly) and reedsolomon-rs 0.4.10: the move to
-  Apache-2.0; no code changed.
+- par3-rs 0.5.1 (pinned exactly): the move to Apache-2.0, an FFT decode
+  that keeps two banks of `capacity` rows (lower charged memory, faster
+  repair), and the four-step transform on AMD CPUs with AVX2 kernels.
+- reedsolomon-rs 0.4.10: the move to Apache-2.0, and the four-step transform
+  with its CPU gate.
 - par2-rs 0.10.8: unchanged.
 
 ## rarpar 0.6.0

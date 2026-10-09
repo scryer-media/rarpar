@@ -194,6 +194,11 @@ type PAR3Plan struct {
 	// ReferenceTimeoutMinutes overrides TimeoutMinutes for the reference only;
 	// 0 means the same limit.
 	ReferenceTimeoutMinutes int `json:"reference_timeout_minutes,omitempty"`
+	// Versus names a `rarpar-bench par3 versus` profile (versus or
+	// versus-smoke): PAR2 (rarpar par, plus the par2 oracle when the machine
+	// has one) against PAR3 Cauchy and FFT, run after the PAR3 suite with the
+	// same warmups, repeats, pin and timeout. Empty skips it.
+	Versus string `json:"versus,omitempty"`
 }
 
 type Connection struct {
@@ -540,6 +545,7 @@ func decodeMachine(item *section, settings Settings) Machine {
 		Durability:              par3.strings("durability", nil),
 		TimeoutMinutes:          par3.integer("timeout_minutes", 20),
 		ReferenceTimeoutMinutes: par3.integer("reference_timeout_minutes", 0),
+		Versus:                  par3.str("versus", ""),
 	}
 	par3.finish()
 
@@ -936,6 +942,11 @@ func validatePAR3(state *decodeState, prefix string, machine *Machine) {
 	}
 	if _, err := profile.Select(plan.Sets); err != nil {
 		state.fail("%s: par3.sets: %v", prefix, err)
+	}
+	if plan.Versus != "" {
+		if _, err := par3bench.LookupVersusProfile(plan.Versus); err != nil {
+			state.fail("%s: par3.versus: %v", prefix, err)
+		}
 	}
 	if err := par3bench.CheckOps(plan.Ops); err != nil {
 		state.fail("%s: par3.ops: %v", prefix, err)
