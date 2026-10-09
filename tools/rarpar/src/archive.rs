@@ -783,7 +783,9 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
     let base = base.canonicalize()?;
     let mut members = collect(&base, &args.inputs, cli.max_files)?;
 
-    let output = &args.output;
+    // A relative OUTPUT lands under the global -o directory; the inputs are
+    // still found from --base-path (or the current directory).
+    let output = &cli.place_output(&args.output);
     reject_symlinks(output)?;
     let name = output
         .file_name()
