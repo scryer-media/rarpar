@@ -42,7 +42,7 @@ use crate::error::RarparError;
 use crate::par3::{parent, reject_symlinks};
 use crate::par3_inside::name_key;
 use crate::par3_stream::{
-    self, Coding, FileDigest, InsideParams, InsideShape, Lane, RecoveryChoice, SetSpec,
+    self, Coding, Durability, FileDigest, InsideParams, InsideShape, Lane, RecoveryChoice, SetSpec,
     block_count, build_set, inside_geometry, inside_size, reference_field, sibling_geometry,
     write_inside, write_sibling,
 };
@@ -990,7 +990,7 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
         Guard::Sidecar(sidecar) => {
             file.sync_all()?;
             drop(file);
-            let finished = sidecar.finish(&name, &stem, cli.overwrite)?;
+            let finished = sidecar.finish(&name, &stem, cli.overwrite, Durability::Sync)?;
             let mut set = finished.report.clone();
             // The set is staged beside its names before the archive is
             // installed, and installed after it, as a PAR3 sibling is.
@@ -1173,7 +1173,13 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
     // The index and volumes are written and synced beside their names before
     // the archive is installed, so a failed write replaces nothing.
     let sibling = if geometry.inside.is_none() {
-        Some(write_sibling(&stem, &set, rows, cli.overwrite)?)
+        Some(write_sibling(
+            &stem,
+            &set,
+            rows,
+            cli.overwrite,
+            Durability::Sync,
+        )?)
     } else {
         None
     };

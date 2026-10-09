@@ -30,7 +30,7 @@ use par2_rs::{
     mul_acc_multi_region,
 };
 
-use crate::par3_stream::{StagedSibling, check_targets, split_volumes, write_file};
+use crate::par3_stream::{Durability, StagedSibling, check_targets, split_volumes, write_file};
 
 /// The most input slices a PAR2 set can have: one per input-slice constant.
 pub(crate) const MAX_SLICES: u64 = 32_768;
@@ -310,13 +310,14 @@ pub(crate) fn write_sidecar(
     stem: &Path,
     set: &Par2Set,
     overwrite: bool,
+    durability: Durability,
 ) -> io::Result<StagedSibling> {
     let (index, volumes) = sidecar_paths(stem, set.recovery_blocks());
     check_targets(
         std::iter::once(&index).chain(volumes.iter().map(|(_, _, path)| path)),
         overwrite,
     )?;
-    let index_file = write_file(&index, |out| {
+    let index_file = write_file(&index, durability, |out| {
         for packet in &set.critical {
             out.write_all(packet)?;
         }
@@ -324,7 +325,7 @@ pub(crate) fn write_sidecar(
     })?;
     let mut files = vec![(index_file, index)];
     for (first, count, path) in volumes {
-        let staged = write_file(&path, |out| {
+        let staged = write_file(&path, durability, |out| {
             // par2-rs's layout, after par2cmdline's: a volume of `count`
             // blocks carries bit_length(count) copies of each critical packet,
             // spread evenly between its recovery packets, then the creator.

@@ -357,7 +357,12 @@ fn compress(cli: &Cli, input: &Path, args: &XzCompressArgs) -> Result<Value, Rar
         {
             std::fs::create_dir_all(directory)?;
         }
-        let finished = set.finish(name, stem, cli.overwrite)?;
+        let finished = set.finish(
+            name,
+            stem,
+            cli.overwrite,
+            crate::par3_stream::Durability::Sync,
+        )?;
         let mut summary = finished.report.clone();
         let (outputs, sizes) = finished.install()?;
         summary["name"] = json!(name);

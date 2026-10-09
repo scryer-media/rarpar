@@ -18,8 +18,8 @@ use serde_json::{Value, json};
 use crate::error::RarparError;
 use crate::par2_stream::{self, Par2Lane};
 use crate::par3_stream::{
-    self, Coding, FileDigest, LANE_BYTES_PER_BLOCK, Lane, RecoveryChoice, SetSpec, StagedSibling,
-    build_set, reference_field, sibling_geometry, sibling_paths, write_sibling,
+    self, Coding, Durability, FileDigest, LANE_BYTES_PER_BLOCK, Lane, RecoveryChoice, SetSpec,
+    StagedSibling, build_set, reference_field, sibling_geometry, sibling_paths, write_sibling,
 };
 
 const MIB: u64 = 1 << 20;
@@ -238,20 +238,21 @@ impl Sidecar {
     }
 
     /// Finish the set for a file recorded as `name`, and write it beside the
-    /// paths `stem` names.
+    /// paths `stem` names, synced first unless `durability` is buffered.
     pub(crate) fn finish(
         self,
         name: &str,
         stem: &Path,
         overwrite: bool,
+        durability: Durability,
     ) -> Result<FinishedSidecar, RarparError> {
         let creator = par3_stream::creator_text();
         let block_size = self.plan.block_size;
         let (staged, report) = match self.lane {
             Inner::Par2(lane) => {
                 let set = lane.finish(name).map_err(RarparError::Data)?;
-                let staged =
-                    par2_stream::write_sidecar(stem, &set, overwrite).map_err(output_error)?;
+                let staged = par2_stream::write_sidecar(stem, &set, overwrite, durability)
+                    .map_err(output_error)?;
                 let set_id: String = set
                     .set_id
                     .iter()
@@ -314,7 +315,8 @@ impl Sidecar {
                 };
                 let set = build_set(&spec);
                 let rows = lane.codings()[0].rows();
-                let staged = write_sibling(stem, &set, rows, overwrite).map_err(output_error)?;
+                let staged =
+                    write_sibling(stem, &set, rows, overwrite, durability).map_err(output_error)?;
                 (
                     staged,
                     json!({"format":"par3","set_id":set.set_id.to_string(),
