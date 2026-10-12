@@ -8,7 +8,7 @@ documented in each crate's own changelog so those notes ship with the crate.
 ### CLI Changes
 
 - New `rarpar xz` commands: `compress`, `decompress`, `test` and `list` for
-  `.xz` files, on `lzma-turbo` 0.6.0. Compression takes the xz presets
+  `.xz` files, on `lzma-turbo` 0.9.0. Compression takes the xz presets
   (`--level` 0-9, `--extreme`), a `--check` of `crc32`, `crc64` (default),
   `sha256` or `none`, and `--block-size`, and compresses up to `--threads`
   blocks at once; the bytes do not depend on the thread count. Decompression
