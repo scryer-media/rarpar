@@ -1387,13 +1387,12 @@ fn rar_list_and_test_validate_a_real_archive() {
     );
 }
 
-/// Run `rarpar` from `dir` with `RARPAR_TEST_PASSWORD` set to `password`.
-fn run_in_dir_with_password(dir: &Path, password: &str, args: &[&OsStr]) -> Output {
+/// Run `rarpar` from `dir` with `--password-file pass_file`.
+fn run_in_dir_with_password_file(dir: &Path, pass_file: &Path, args: &[&OsStr]) -> Output {
     Command::new(bin())
         .current_dir(dir)
-        .env("RARPAR_TEST_PASSWORD", password)
-        .arg("--password-env")
-        .arg("RARPAR_TEST_PASSWORD")
+        .arg("--password-file")
+        .arg(pass_file)
         .args(args)
         .output()
         .unwrap()
@@ -1447,10 +1446,13 @@ fn rar_test_decrypts_a_member_split_across_volumes() {
     // One encrypted member over five volumes: tested from the first volume
     // alone, its packed data stops at a size that is not a whole number of
     // AES blocks.
+    let temp = tempfile::tempdir().unwrap();
+    let pass_file = temp.path().join("passwords.txt");
+    std::fs::write(&pass_file, "testpass123\n").unwrap();
     let fixture_dir = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar4"]);
-    let test = run_in_dir_with_password(
+    let test = run_in_dir_with_password_file(
         &fixture_dir,
-        "testpass123",
+        &pass_file,
         &[
             OsStr::new("rar"),
             OsStr::new("test"),
@@ -1474,6 +1476,8 @@ fn rar_commands_accept_a_bare_archive_name() {
         temp.path().join("rar5_hp_store.rar"),
     )
     .unwrap();
+    let pass_file = temp.path().join("passwords.txt");
+    std::fs::write(&pass_file, "secretpass\n").unwrap();
 
     // A header-encrypted archive and a volume set both make discovery list
     // the archive's directory, which a bare name's empty parent is not.
@@ -1488,7 +1492,7 @@ fn rar_commands_accept_a_bare_archive_name() {
             vec!["rar", "extract", archive, out.as_str()],
         ] {
             let args = args.iter().map(OsStr::new).collect::<Vec<_>>();
-            let output = run_in_dir_with_password(temp.path(), "secretpass", &args);
+            let output = run_in_dir_with_password_file(temp.path(), &pass_file, &args);
             assert_success(&output, &format!("{args:?}"));
         }
         assert!(temp.path().join(&out).join(member).is_file());
