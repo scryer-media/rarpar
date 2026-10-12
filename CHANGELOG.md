@@ -63,6 +63,11 @@ documented in each crate's own changelog so those notes ship with the crate.
   create and repair also take a four-step transform where it measured
   faster. Output is unchanged.
 
+### Fixes
+
+- `par3 create -` and `--sidecar par3` stop at the first input block
+  GF(2^16) cannot hold, instead of first taking in the rest of the read.
+
 ### Library versions
 
 - unrar-rs 0.11.0: RAR3 PPMd decoding through `ppmd-turbo` 0.1.1, a

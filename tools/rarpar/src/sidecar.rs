@@ -224,22 +224,32 @@ pub(crate) struct FinishedSidecar {
 impl Sidecar {
     pub(crate) fn feed(&mut self, data: &[u8]) -> Result<(), String> {
         let rows = self.plan.rows;
+        let block_size = self.plan.block_size;
         match &mut self.lane {
             Inner::Par2(lane) => lane.feed(data),
             Inner::Par3 { lane, digest, size } => {
-                lane.feed(data)?;
-                digest.update(data, true);
-                *size += data.len() as u64;
+                // GF(2^16) has values for `GF16_ORDER - rows` input blocks.
+                // The lane takes no byte that would complete a block past
+                // them, so a buffer of tiny blocks fails at the limit instead
+                // of first growing per-block state the plan never budgeted.
+                let capacity = GF16_ORDER.saturating_sub(rows);
+                let room = capacity
+                    .saturating_mul(block_size)
+                    .saturating_add(block_size - 1)
+                    .saturating_sub(*size);
+                let fed = &data[..data.len().min(usize::try_from(room).unwrap_or(usize::MAX))];
+                lane.feed(fed)?;
+                digest.update(fed, true);
+                *size += fed.len() as u64;
                 // GF(2^8) stops being the set's field for good once the blocks
                 // pass what it can hold; its rows are memory nothing will use.
                 if lane.block_count() > GF8_MAX_BLOCKS || lane.block_count() + rows > 256 {
                     lane.codings_mut().retain(|coding| coding.galois() != GF8);
                 }
-                if lane.codings().is_empty() {
+                if fed.len() < data.len() {
                     return Err(format!(
-                        "{} blocks of {} bytes and {rows} recovery block(s) do not fit GF(2^16); use a larger block size",
-                        lane.block_count(),
-                        self.plan.block_size
+                        "{} blocks of {block_size} bytes and {rows} recovery block(s) do not fit GF(2^16); use a larger block size",
+                        lane.block_count() + 1,
                     ));
                 }
                 Ok(())
@@ -448,4 +458,28 @@ pub(crate) fn preflight(paths: &[PathBuf], overwrite: bool) -> Result<(), Rarpar
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One buffer of two-byte blocks holds eight times the blocks GF(2^16)
+    /// has values for. The lane stops at the last block that fits, rather
+    /// than taking the whole buffer's per-block state before the check.
+    #[test]
+    fn a_feed_past_gf16_stops_at_the_last_block_that_fits() {
+        let plan = SidecarPlan::new(SidecarFormat::Par3, 2, 1).unwrap();
+        let mut sidecar = plan.start().unwrap();
+        let error = sidecar.feed(&vec![7u8; 1 << 20]).unwrap_err();
+        let Inner::Par3 { lane, size, .. } = &sidecar.lane else {
+            panic!("a PAR3 plan streams into a PAR3 lane");
+        };
+        assert_eq!(lane.block_count(), GF16_ORDER - 1);
+        assert_eq!(*size, (GF16_ORDER - 1) * 2 + 1);
+        assert_eq!(
+            error,
+            "65536 blocks of 2 bytes and 1 recovery block(s) do not fit GF(2^16); use a larger block size"
+        );
+    }
 }
