@@ -131,6 +131,28 @@ pub fn create(
         return Ok((true, report));
     }
 
+    // A pipe cannot be read twice, so the set's directory must take its
+    // files before the first byte is read: create it, and stage and drop
+    // a file there the way the set's files will be staged.
+    let directory = stem
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let unwritable = |error: io::Error| {
+        RarparError::Io(io::Error::new(
+            error.kind(),
+            format!(
+                "{} cannot take the set's files: {error}",
+                directory.display()
+            ),
+        ))
+    };
+    std::fs::create_dir_all(directory).map_err(unwritable)?;
+    tempfile::Builder::new()
+        .prefix(".rarpar-par3-")
+        .tempfile_in(directory)
+        .map_err(unwritable)?;
+
     let mut sidecar = plan.start()?;
     let mut source = Input::open(input)?.into_reader();
     let mut buffer = vec![0u8; IO_BUFFER];
@@ -142,12 +164,6 @@ pub fn create(
             Err(error) => return Err(error.into()),
         };
         sidecar.feed(&buffer[..read]).map_err(RarparError::Data)?;
-    }
-    if let Some(directory) = stem
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(directory)?;
     }
     let finished = sidecar.finish(cli, &name, &stem, durability)?;
     let set = finished.report.clone();

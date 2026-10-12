@@ -69,6 +69,8 @@ documented in each crate's own changelog so those notes ship with the crate.
   stream too short for a block when the previous set's volumes would remain.
 - `par3 create -` and `--sidecar par3` stop at the first input block
   GF(2^16) cannot hold, instead of first taking in the rest of the read.
+- `par3 create -` makes its output directory and checks that it takes files
+  before reading standard input, rather than after consuming the stream.
 
 ### Library versions
 

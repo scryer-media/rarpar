@@ -22,6 +22,12 @@ fn rarpar(root: &Path, args: &[&str]) -> Output {
 /// thread while another drains standard error and this one drains standard
 /// output, so the child sees true pipes in both directions.
 fn through_pipes(root: &Path, args: &[&str], input: Vec<u8>) -> Output {
+    feed_through_pipes(root, args, input).0
+}
+
+/// [`through_pipes`], also saying whether the pipe took every input byte:
+/// false when the child closed it before the stream ended.
+fn feed_through_pipes(root: &Path, args: &[&str], input: Vec<u8>) -> (Output, bool) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rarpar"))
         .current_dir(root)
         .args(args)
@@ -35,9 +41,10 @@ fn through_pipes(root: &Path, args: &[&str], input: Vec<u8>) -> Output {
         for chunk in input.chunks(PIPE_CHUNK) {
             if stdin.write_all(chunk).is_err() {
                 // The child stopped reading; its exit status tells why.
-                return;
+                return false;
             }
         }
+        true
     });
     let mut stderr = child.stderr.take().unwrap();
     let errors = std::thread::spawn(move || {
@@ -53,12 +60,13 @@ fn through_pipes(root: &Path, args: &[&str], input: Vec<u8>) -> Output {
         .read_to_end(&mut stdout)
         .unwrap();
     let status = child.wait().unwrap();
-    feeder.join().unwrap();
-    Output {
+    let fed = feeder.join().unwrap();
+    let output = Output {
         status,
         stdout,
         stderr: errors.join().unwrap(),
-    }
+    };
+    (output, fed)
 }
 
 #[track_caller]
@@ -455,6 +463,50 @@ fn par3_create_from_a_pipe_too_short_for_a_block_leaves_no_volumes_behind() {
     assert_eq!(listing(&root.join("short")), ["set.par3"]);
     std::fs::write(root.join("short/piece.bin"), &data).unwrap();
     assert_eq!(par3_verdicts(&root.join("short"), "set.par3").0, Some(0));
+}
+
+#[test]
+fn par3_create_from_a_pipe_checks_its_directory_before_reading() {
+    // A pipe cannot be read twice, so a set directory that cannot be made or
+    // written fails before the first byte is read: the pipe closes on the
+    // feeder with the stream unread, not once the whole stream is consumed.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let data = sample(8 << 20, 9);
+    let args = |output: &'static str| {
+        vec![
+            "par3", "create", output, "-", "--name", "f", "-s", "4096", "-c", "1",
+        ]
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // A link to nothing cannot be made a directory, even by root.
+        std::os::unix::fs::symlink(root.join("gone"), root.join("dangling")).unwrap();
+        let (dangling, fed) = feed_through_pipes(root, &args("dangling/set.par3"), data.clone());
+        code_of(&dangling, 1);
+        assert!(!fed, "the stream was read before the directory was made");
+        assert!(String::from_utf8_lossy(&dangling.stderr).contains("cannot take the set's files"));
+
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root writes through the mode bits; the case holds where they bind.
+        if std::fs::write(locked.join("probe"), b"").is_err() {
+            let (refused, fed) = feed_through_pipes(root, &args("locked/set.par3"), data.clone());
+            code_of(&refused, 1);
+            assert!(!fed, "the stream was read before the directory was tried");
+            assert!(listing(&locked).is_empty());
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // A dry run still creates nothing.
+    let mut dry = vec!["--dry-run"];
+    dry.extend(args("new/set.par3"));
+    ok(&through_pipes(root, &dry, data));
+    assert!(!root.join("new").exists());
 }
 
 #[test]
