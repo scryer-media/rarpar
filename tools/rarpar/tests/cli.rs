@@ -1442,6 +1442,21 @@ fn rar_list_and_test_follow_the_volume_chain() {
 }
 
 #[test]
+fn rar_list_and_test_refuse_a_missing_archive_as_missing_input() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = temp.path().join("absent.rar");
+    for command in ["list", "test"] {
+        let output = run(&[OsStr::new("rar"), OsStr::new(command), missing.as_os_str()]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "rar {command}: {stderr}");
+        assert!(
+            stderr.contains(&format!("input path does not exist: {}", missing.display())),
+            "rar {command}: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn rar_list_and_test_take_the_volume_set_under_another_case_of_its_name() {
     // Named `SET.part01.rar` over volumes stored as `set.partNN.rar`, the set
     // is all nine volumes where the filesystem ignores case. Where it does
