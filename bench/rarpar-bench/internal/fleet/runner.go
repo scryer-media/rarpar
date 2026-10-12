@@ -445,7 +445,7 @@ func (orch *orchestrator) build(ctx context.Context) error {
 	// The turbo checkouts are part of the bundle content too: two runs with
 	// different lzma-turbo or sevenz-turbo candidates must not share a build
 	// directory any more than two rarpar candidates may.
-	turboID, err := turboTreeID(ctx, bundler.Settings)
+	turboID, err := turboTreeID(ctx, bundler.Settings, orch.options.Machines)
 	if err != nil {
 		return err
 	}

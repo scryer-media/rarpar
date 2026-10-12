@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -128,14 +129,17 @@ func turboSources(settings Settings, machine Machine) [][3]string {
 	return sources
 }
 
-// turboTreeID identifies the turbo checkouts that go into a bundle, for the
-// content-addressed shared bundle name: the HEAD commit of each (a dirty
-// tree is refused later, so the commit does identify the content).
-func turboTreeID(ctx context.Context, settings Settings) (string, error) {
+// turboTreeID identifies the turbo checkouts that go into the run's bundles,
+// for the content-addressed shared bundle name: the HEAD commit of each (a
+// dirty tree is refused later, so the commit does identify the content).
+// Only the suites a selected machine runs count: a configured checkout that
+// no bundle carries neither names one nor has to be a checkout.
+func turboTreeID(ctx context.Context, settings Settings, machines []Machine) (string, error) {
 	var parts []string
 	for _, suite := range []string{SuiteLzmaTurbo, SuiteSevenzTurbo} {
 		path := turboSourcePath(settings, suite)
-		if path == "" {
+		runs := func(machine Machine) bool { return machine.hasSuite(suite) }
+		if path == "" || !slices.ContainsFunc(machines, runs) {
 			continue
 		}
 		output, err := exec.CommandContext(ctx, "git", "-C", path, "rev-parse", "HEAD").Output()

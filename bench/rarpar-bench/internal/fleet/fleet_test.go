@@ -1181,3 +1181,41 @@ func TestTurboConfigValidation(t *testing.T) {
 		}
 	}
 }
+
+// A run's bundles carry only the turbo checkouts its selected machines use,
+// so only those name the bundle and only those have to be checkouts.
+func TestTurboTreeIDCoversOnlyTheSuitesInUse(t *testing.T) {
+	toplevel, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		t.Skip("the test needs the git checkout it runs in")
+	}
+	repo := strings.TrimSpace(string(toplevel))
+	head, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit := strings.TrimSpace(string(head))
+	ctx := context.Background()
+	running := func(suites ...string) []Machine { return []Machine{{Name: "m", Suites: suites}} }
+	settings := Settings{LzmaTurboPath: repo, SevenzTurboPath: filepath.Join(t.TempDir(), "not-a-checkout")}
+
+	id, err := turboTreeID(ctx, settings, running(SuiteLzmaTurbo))
+	if err != nil || id != "lzma-turbo="+commit {
+		t.Fatalf("an lzma-turbo-only run must not read the sevenz-turbo path: id %q, err %v", id, err)
+	}
+	id, err = turboTreeID(ctx, settings, running(SuiteMacroPAR2))
+	if err != nil || id != "" {
+		t.Fatalf("a run without turbo suites names no turbo tree: id %q, err %v", id, err)
+	}
+	_, err = turboTreeID(ctx, settings, append(running(SuiteLzmaTurbo), running(SuiteSevenzTurbo)...))
+	want := "sevenz-turbo: " + settings.SevenzTurboPath + " is not a git checkout"
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("a sevenz-turbo machine still needs its checkout: want %q, got %v", want, err)
+	}
+	// Both suites in use name the bundle as they always have.
+	settings.SevenzTurboPath = repo
+	id, err = turboTreeID(ctx, settings, running(SuiteSevenzTurbo, SuiteLzmaTurbo))
+	if err != nil || id != "lzma-turbo="+commit+"|sevenz-turbo="+commit {
+		t.Fatalf("both suites: id %q, err %v", id, err)
+	}
+}
