@@ -758,3 +758,87 @@ fn par_verify_from_a_pipe_refuses_what_it_cannot_do() {
     let set_on_stdin = through_pipes(root, &["par", "verify", "-"], first.clone());
     usage_error(&set_on_stdin, &["must be a path"]);
 }
+
+/// Rewrites every packet of a .par2 file as an untrusted writer could:
+/// `edit` changes a packet in place or drops it (by returning false), and
+/// every packet kept is re-signed so the file still parses.
+fn rewrite_packets(par2: &[u8], mut edit: impl FnMut(&mut Vec<u8>) -> bool) -> Vec<u8> {
+    const MAGIC: &[u8; 8] = b"PAR2\0PKT";
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at + 64 <= par2.len() {
+        assert_eq!(&par2[at..at + 8], MAGIC);
+        let len = u64::from_le_bytes(par2[at + 8..at + 16].try_into().unwrap()) as usize;
+        let mut packet = par2[at..at + len].to_vec();
+        at += len;
+        if edit(&mut packet) {
+            let digest = par2_rs::checksum::md5(&packet[32..]);
+            packet[16..32].copy_from_slice(&digest);
+            out.extend_from_slice(&packet);
+        }
+    }
+    out
+}
+
+/// Every .par2 file in `directory`, rewritten by [`rewrite_packets`].
+fn rewrite_set(directory: &Path, mut edit: impl FnMut(&mut Vec<u8>) -> bool) {
+    for name in listing(directory) {
+        if name.ends_with(".par2") {
+            let path = directory.join(name);
+            let bytes = std::fs::read(&path).unwrap();
+            std::fs::write(&path, rewrite_packets(&bytes, &mut edit)).unwrap();
+        }
+    }
+}
+
+#[test]
+fn par_verify_from_a_pipe_refuses_a_name_two_files_answer_to() {
+    // PAR2 names that differ only in `\` and `/` are one file name once read,
+    // so --name cannot say which file it means and must not pick one.
+    const FILE_DESC: &[u8; 16] = b"PAR 2.0\0FileDesc";
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::create_dir(root.join("dir")).unwrap();
+    let (a, b) = (sample(100_000, 17), sample(100_000, 19));
+    std::fs::write(root.join("dir/a.bin"), &a).unwrap();
+    std::fs::write(root.join("dir/b.bin"), &b).unwrap();
+    ok(&rarpar(
+        root,
+        &[
+            "par",
+            "create",
+            "set.par2",
+            "dir/a.bin",
+            "dir/b.bin",
+            "-s",
+            "65536",
+            "--recovery-count",
+            "2",
+        ],
+    ));
+    // The name follows the 56-byte head of a FileDesc body.
+    let mut renamed = 0;
+    rewrite_set(root, |packet| {
+        if packet[48..64] == FILE_DESC[..] && packet[120..].starts_with(b"dir/b.bin") {
+            packet[120..129].copy_from_slice(b"dir\\a.bin");
+            renamed += 1;
+        }
+        true
+    });
+    assert!(renamed > 0);
+
+    for data in [&a, &b] {
+        let ambiguous = through_pipes(
+            root,
+            &["par", "verify", "set.par2", "--name", "dir/a.bin"],
+            data.clone(),
+        );
+        usage_error(&ambiguous, &["2 files", "dir/a.bin", "dir\\\\a.bin"]);
+    }
+    // The PAR2 name as written still names one file.
+    ok(&through_pipes(
+        root,
+        &["par", "verify", "set.par2", "--name", "dir\\a.bin"],
+        b,
+    ));
+}

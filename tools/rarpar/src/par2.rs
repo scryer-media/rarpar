@@ -792,21 +792,47 @@ fn verify_stream(cli: &Cli, args: &ParArgs, name: &str) -> Result<u8, RarparErro
         Some(set) => set,
         None => par2_rs::Par2FileSet::from_paths(&resolved.par2_paths)?,
     };
-    let Some(file_id) = set.recovery_file_ids.iter().copied().find(|id| {
-        set.file_description(id)
-            .is_some_and(|desc| desc.filename == name || desc.par2_name == name)
-    }) else {
-        let mut names: Vec<&str> = set
-            .recovery_file_ids
-            .iter()
-            .filter_map(|id| set.file_description(id))
-            .map(|desc| desc.par2_name.as_str())
-            .collect();
-        names.sort_unstable();
-        return Err(RarparError::Usage(format!(
-            "the PAR2 set protects no file named {name:?}; it protects: {}",
-            names.join(", ")
-        )));
+    // Names that differ only in `\` and `/` read as one file name, and a
+    // malformed set can repeat a name, so every file answering to NAME counts.
+    let mut matches: Vec<par2_rs::FileId> = set
+        .recovery_file_ids
+        .iter()
+        .copied()
+        .filter(|id| {
+            set.file_description(id)
+                .is_some_and(|desc| desc.filename == name || desc.par2_name == name)
+        })
+        .collect();
+    matches.sort_unstable();
+    matches.dedup();
+    let file_id = match matches.as_slice() {
+        [file_id] => *file_id,
+        [] => {
+            let mut names: Vec<&str> = set
+                .recovery_file_ids
+                .iter()
+                .filter_map(|id| set.file_description(id))
+                .map(|desc| desc.par2_name.as_str())
+                .collect();
+            names.sort_unstable();
+            return Err(RarparError::Usage(format!(
+                "the PAR2 set protects no file named {name:?}; it protects: {}",
+                names.join(", ")
+            )));
+        }
+        several => {
+            let mut names: Vec<String> = several
+                .iter()
+                .filter_map(|id| set.file_description(id))
+                .map(|desc| format!("{:?}", desc.par2_name))
+                .collect();
+            names.sort_unstable();
+            return Err(RarparError::Usage(format!(
+                "{} files in the PAR2 set are named {name:?} (PAR2 names {}); --name cannot tell them apart",
+                several.len(),
+                names.join(", ")
+            )));
+        }
     };
     let expected = set.file_description(&file_id).map_or(0, |desc| desc.length);
     let slice_size = set.slice_size;

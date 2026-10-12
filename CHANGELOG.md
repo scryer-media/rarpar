@@ -73,6 +73,8 @@ documented in each crate's own changelog so those notes ship with the crate.
   before reading standard input, rather than after consuming the stream.
 - `--json xz` reports `--delete-sources` and a missing INPUT at a terminal as
   its one JSON failure document, not a plain-text error.
+- `par verify --name` refuses (exit 2) a NAME that more than one file in the
+  set answers to, instead of verifying the stream against the first.
 
 ### Library versions
 
