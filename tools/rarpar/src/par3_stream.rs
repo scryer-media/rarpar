@@ -1080,6 +1080,22 @@ pub(crate) fn split_volumes(rows: u64) -> Vec<(u64, u64)> {
     splits
 }
 
+/// `name` without its `.par3` carrier suffix, spelled in any case:
+/// `SET.PAR3` names the set `SET`, as it does for `par3 create` over files.
+pub(crate) fn carrier_base(name: &str) -> &str {
+    const SUFFIX: &str = ".par3";
+    match name.len().checked_sub(SUFFIX.len()) {
+        Some(end)
+            if name
+                .get(end..)
+                .is_some_and(|tail| tail.eq_ignore_ascii_case(SUFFIX)) =>
+        {
+            &name[..end]
+        }
+        _ => name,
+    }
+}
+
 /// The index file and volume paths of a sibling set named by `stem`.
 pub(crate) fn sibling_paths(stem: &Path, rows: u64) -> (PathBuf, Vec<(u64, u64, PathBuf)>) {
     let directory = stem.parent().unwrap_or(Path::new(""));
@@ -1087,7 +1103,7 @@ pub(crate) fn sibling_paths(stem: &Path, rows: u64) -> (PathBuf, Vec<(u64, u64, 
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let base = name.strip_suffix(".par3").unwrap_or(&name).to_owned();
+    let base = carrier_base(&name).to_owned();
     let splits = split_volumes(rows);
     let start_width = splits
         .last()
@@ -1279,6 +1295,35 @@ pub(crate) fn write_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A carrier suffix in any case names the set by the rest of the name,
+    /// in its own spelling; any other name is the set's base as it stands.
+    #[test]
+    fn a_carrier_suffix_in_any_case_is_the_carrier_suffix() {
+        for (name, base) in [
+            ("vault.par3", "vault"),
+            ("VAULT.PAR3", "VAULT"),
+            ("Vault.Par3", "Vault"),
+            ("vault", "vault"),
+            ("vault.xz", "vault.xz"),
+            ("vault.par3.xz", "vault.par3.xz"),
+            ("vaultpar3", "vaultpar3"),
+            ("caf\u{e9}.PAR3", "caf\u{e9}"),
+            ("\u{e9}par3", "\u{e9}par3"),
+        ] {
+            assert_eq!(carrier_base(name), base, "{name}");
+        }
+        let (index, volumes) = sibling_paths(Path::new("dir/SET.PAR3"), 3);
+        assert_eq!(index, Path::new("dir/SET.par3"));
+        let volumes: Vec<_> = volumes.into_iter().map(|(_, _, path)| path).collect();
+        assert_eq!(
+            volumes,
+            [
+                Path::new("dir/SET.vol0+1.par3"),
+                Path::new("dir/SET.vol1+2.par3")
+            ]
+        );
+    }
 
     /// A sibling set is written beside its names and installed only on
     /// `install`: until then, and if it is dropped instead, an existing index
