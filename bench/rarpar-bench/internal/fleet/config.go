@@ -1029,6 +1029,10 @@ func validateTurbo(state *decodeState, prefix string, machine *Machine, settings
 	plan := machine.Turbo
 	if machine.isWindows() {
 		state.fail("%s: the lzma-turbo and sevenz-turbo suites build on the host with a POSIX run script; Windows hosts are not supported", prefix)
+	} else if machine.Bundle.GoOS != "linux" {
+		// bundle.go_os is the OS the turbo harness is cross-compiled for, so it
+		// names the host's OS; the run script installs Linux rustup and 7-Zip.
+		state.fail("%s: the lzma-turbo and sevenz-turbo suites install the Linux rustup and 7-Zip release on the host; bundle.go_os = %q hosts are not supported, only \"linux\"", prefix, machine.Bundle.GoOS)
 	}
 	for _, source := range turboSources(*settings, *machine) {
 		suite, name, path := source[0], source[1], source[2]

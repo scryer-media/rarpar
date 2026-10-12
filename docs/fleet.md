@@ -321,7 +321,8 @@ Budget the session for the profile. The sevenz `fleet` profile is the full
 corpus at three repeats and runs for hours on a 16-thread host; set
 `ec2.max_hours`, `ec2.deadman_minutes`, `fleet.aws.max_session_hours` and
 `fleet.host_timeout_minutes` accordingly, or narrow with `sevenz_only`.
-Windows hosts are refused for these suites.
+Only Linux hosts run these suites: a Windows host, or one whose
+`bundle.go_os` is not `linux` (a macOS host's is `darwin`), is refused.
 
 ## Network-mount rig
 

@@ -1173,6 +1173,9 @@ func TestTurboConfigValidation(t *testing.T) {
 		{"timeout", "timeout_minutes = 60                     # per-case", "timeout_minutes = 0                     # per-case", "turbo.timeout_minutes must be positive"},
 		{"path", `lzma_turbo_path = "/Users/example/dev/lzma-turbo"`, ``, "needs fleet.lzma_turbo_path"},
 		{"relative", `lzma_turbo_path = "/Users/example/dev/lzma-turbo"`, `lzma_turbo_path = "dev/lzma-turbo"`, "must be an absolute path"},
+		// The run script installs Linux rustup and 7-Zip builds, so a macOS
+		// host would pass validation only to fail on the host.
+		{"darwin", "rust_target = \"x86_64-unknown-linux-gnu\"\ngo_os = \"linux\"", "rust_target = \"x86_64-unknown-linux-gnu\"\ngo_os = \"darwin\"", `bundle.go_os = "darwin" hosts are not supported`},
 	}
 	for _, tc := range cases {
 		_, err := loadMutatedExample(t, tc.old, tc.new)
