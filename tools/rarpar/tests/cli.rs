@@ -1409,7 +1409,59 @@ fn assert_success(output: &Output, what: &str) {
 }
 
 #[test]
-fn rar_extract_accepts_a_bare_archive_name() {
+fn rar_list_and_test_follow_the_volume_chain() {
+    // Two members over nine volumes, the second starting in volume 5: naming
+    // the first volume has to reach the second member and every volume of
+    // both.
+    let first = fixture(&[
+        "crates",
+        "unrar-rs",
+        "tests",
+        "fixtures",
+        "rar5",
+        "rar5_mv_store_pair.part01.rar",
+    ]);
+    let list = run(&[OsStr::new("rar"), OsStr::new("list"), first.as_os_str()]);
+    assert_success(&list, "rar list");
+    assert_eq!(
+        String::from_utf8_lossy(&list.stdout),
+        "Silver.Horizon.S02E01.mkv\nSilver.Horizon.S02E02.mkv\n"
+    );
+    let test = run(&[OsStr::new("rar"), OsStr::new("test"), first.as_os_str()]);
+    assert_success(&test, "rar test of a RAR5 volume set");
+
+    let first = fixture(&[
+        "crates",
+        "unrar-rs",
+        "tests",
+        "fixtures",
+        "rar4",
+        "rar4_tiny_volumes.part1.rar",
+    ]);
+    let test = run(&[OsStr::new("rar"), OsStr::new("test"), first.as_os_str()]);
+    assert_success(&test, "rar test of a RAR4 volume set");
+}
+
+#[test]
+fn rar_test_decrypts_a_member_split_across_volumes() {
+    // One encrypted member over five volumes: tested from the first volume
+    // alone, its packed data stops at a size that is not a whole number of
+    // AES blocks.
+    let fixture_dir = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar4"]);
+    let test = run_in_dir_with_password(
+        &fixture_dir,
+        "testpass123",
+        &[
+            OsStr::new("rar"),
+            OsStr::new("test"),
+            OsStr::new("rar4_enc_mv_store.part1.rar"),
+        ],
+    );
+    assert_success(&test, "rar test of an encrypted RAR4 volume set");
+}
+
+#[test]
+fn rar_commands_accept_a_bare_archive_name() {
     let temp = tempfile::tempdir().unwrap();
     let rar4 = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar4"]);
     let rar5 = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar5"]);
@@ -1430,10 +1482,15 @@ fn rar_extract_accepts_a_bare_archive_name() {
         ("rar5_hp_store.rar", "small.txt"),
     ] {
         let out = format!("out-{archive}");
-        let args = ["rar", "extract", archive, out.as_str()];
-        let args = args.iter().map(OsStr::new).collect::<Vec<_>>();
-        let output = run_in_dir_with_password(temp.path(), "secretpass", &args);
-        assert_success(&output, &format!("{args:?}"));
+        for args in [
+            vec!["rar", "list", archive],
+            vec!["rar", "test", archive],
+            vec!["rar", "extract", archive, out.as_str()],
+        ] {
+            let args = args.iter().map(OsStr::new).collect::<Vec<_>>();
+            let output = run_in_dir_with_password(temp.path(), "secretpass", &args);
+            assert_success(&output, &format!("{args:?}"));
+        }
         assert!(temp.path().join(&out).join(member).is_file());
     }
 }

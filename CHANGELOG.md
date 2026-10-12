@@ -81,6 +81,11 @@ documented in each crate's own changelog so those notes ship with the crate.
 - `rar extract` accepts a header-encrypted archive or a volume set named
   without a directory (`rar extract set.part1.rar`), instead of failing with
   "No such file or directory"; `./set.part1.rar` already worked.
+- `rar test` and `rar list` read the whole volume set the named archive
+  belongs to, as `rar extract` does. `rar test` failed every multi-volume set
+  ("unexpected EOF while copying member data", or "encrypted data not aligned
+  to AES block size" for an encrypted member split across volumes), and
+  `rar list` named only the members that start in the named volume.
 
 ### Library versions
 

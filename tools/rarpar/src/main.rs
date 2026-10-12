@@ -322,7 +322,7 @@ fn run_rar_command(cli: &Cli, command: RarCommand) -> Result<u8, RarparError> {
     match command {
         RarCommand::List { archive } => {
             let mut passwords = PasswordResolver::from_cli(cli)?;
-            rar::list_archive(&archive, &mut passwords)
+            rar::list_archive(cli, &archive, &mut passwords)
         }
         RarCommand::Test { archive } => {
             let mut passwords = PasswordResolver::from_cli(cli)?;
