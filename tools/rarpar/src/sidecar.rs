@@ -459,12 +459,13 @@ pub(crate) fn preflight_set(
     Ok(paths)
 }
 
-/// Refuse a planned output that is a link, or that exists without
-/// `--overwrite`, before any byte is read.
+/// Refuse a planned output that is a link, that exists as anything but a
+/// regular file, or that exists without `--overwrite`, before any byte is
+/// read.
 pub(crate) fn preflight(paths: &[PathBuf], overwrite: bool) -> Result<(), RarparError> {
     for path in paths {
         crate::par3::reject_symlinks(path)?;
-        if !overwrite && std::fs::symlink_metadata(path).is_ok() {
+        if output_exists(path)? && !overwrite {
             return Err(RarparError::Unsafe(format!(
                 "output exists; pass --overwrite to replace: {}",
                 path.display()
@@ -472,6 +473,48 @@ pub(crate) fn preflight(paths: &[PathBuf], overwrite: bool) -> Result<(), Rarpar
         }
     }
     Ok(())
+}
+
+/// Whether a planned output exists, refusing one that exists as anything but
+/// a regular file. `--overwrite` replaces files: a directory, FIFO, socket or
+/// device at a planned path would fail only when the set is installed, after
+/// the archive it protects had already been replaced.
+pub(crate) fn output_exists(path: &Path) -> Result<bool, RarparError> {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return Ok(false);
+    };
+    if !meta.is_file() {
+        return Err(RarparError::Unsafe(format!(
+            "output is a {}, not a regular file: {}",
+            file_kind(meta.file_type()),
+            path.display()
+        )));
+    }
+    Ok(true)
+}
+
+/// What a path that is not a regular file is, for the refusal to name.
+fn file_kind(file_type: std::fs::FileType) -> &'static str {
+    if file_type.is_dir() {
+        return "directory";
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if file_type.is_fifo() {
+            return "FIFO";
+        }
+        if file_type.is_socket() {
+            return "socket";
+        }
+        if file_type.is_block_device() {
+            return "block device";
+        }
+        if file_type.is_char_device() {
+            return "character device";
+        }
+    }
+    "special file"
 }
 
 #[cfg(test)]

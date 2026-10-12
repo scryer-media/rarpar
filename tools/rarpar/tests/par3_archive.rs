@@ -507,6 +507,61 @@ fn taken_or_linked_volume_names_stop_the_archive_first() {
     }
 }
 
+/// `--overwrite` replaces files: a directory at the index or a volume name
+/// stops the run before the previous archive or any of its set is replaced.
+#[test]
+fn a_directory_at_a_set_name_stops_an_overwrite_before_anything_is_replaced() {
+    for taken in ["set.par3", "set.vol0+1.par3"] {
+        let dir = fixture(1000);
+        let root = dir.path();
+        archive(root, &with_args(&["set.7z"], &MEMBERS));
+        std::fs::remove_file(root.join(taken)).unwrap();
+        std::fs::create_dir(root.join(taken)).unwrap();
+        let snapshot = || {
+            let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(root)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .filter(|entry| entry.file_type().unwrap().is_file())
+                .map(|entry| {
+                    (
+                        entry.file_name().into_string().unwrap(),
+                        std::fs::read(entry.path()).unwrap(),
+                    )
+                })
+                .collect();
+            files.sort();
+            files
+        };
+        let before = snapshot();
+        std::fs::write(root.join("in/static.bin"), bytes(1000, 4)).unwrap();
+        let output = rarpar(
+            root,
+            &with_args(
+                &[
+                    "par3",
+                    "archive",
+                    "--overwrite",
+                    "--base-path",
+                    "in",
+                    "set.7z",
+                ],
+                &MEMBERS,
+            ),
+        );
+        let message = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(3), "{taken}: {message}");
+        assert!(
+            message.contains("directory") && message.contains(taken),
+            "{message}"
+        );
+        assert!(
+            snapshot() == before,
+            "{taken}: the previous archive or set changed"
+        );
+        assert!(root.join(taken).is_dir());
+    }
+}
+
 /// The sets match par3cmdline's `c` and `i` over the finished archive, byte
 /// for byte, once both write the same Creator text.
 #[test]
