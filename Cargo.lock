@@ -1692,9 +1692,9 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "lzma-turbo"
-version = "0.6.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9062c1b910139b10dc12eb1a78aa90919aafed4124012fc7828dd29a7fdcce40"
+checksum = "9b9ccc3065ff5558e94314fcf941f2508a6ace67da9b2cdc85a6f4e436ab2f0b"
 dependencies = [
  "aws-lc-rs",
  "crc-fast",
@@ -2151,12 +2151,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ppmd-rust"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "196a7c80b9a7652aba7cc070827516c2abe4ccdf53d128e1944003cf5726cff1"
-
-[[package]]
 name = "ppmd-turbo"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2590,9 +2584,9 @@ dependencies = [
 
 [[package]]
 name = "sevenz-turbo"
-version = "0.26.1"
+version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef0b63767205ca00089473573d7172b94878631874f5f22183b9a411b436aedf"
+checksum = "4abe071a8b7d5f393996f6f7e1c210510ac014de56db49e0228a3a2ce8523a06"
 dependencies = [
  "aes",
  "aws-lc-rs",
@@ -2602,7 +2596,7 @@ dependencies = [
  "getrandom 0.4.3",
  "js-sys",
  "lzma-turbo",
- "ppmd-rust",
+ "ppmd-turbo",
  "wasm-bindgen",
  "zeroize",
 ]
