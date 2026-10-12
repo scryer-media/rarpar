@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use crate::cleanup::{CleanupManifest, CleanupResult};
 use crate::error::RarparError;
+use crate::par3_inside::same_stem;
 use rarpar::cli::Cli;
 
 const PAR2_MAGIC: &[u8] = b"PAR2\0PKT";
@@ -361,8 +362,7 @@ fn discover_named_rar_family(
 
         let path = entry.path();
         let is_archive = archive_identity.is(&path);
-        let is_family_candidate = set_hint(&path).as_deref() == Some(label)
-            && (looks_rarish_by_name(&path) || is_ext(&path, "rev"));
+        let is_family_candidate = in_named_family(&path, label);
         if !is_archive && !is_family_candidate {
             continue;
         }
@@ -376,10 +376,23 @@ fn discover_named_rar_family(
         if is_archive {
             files.push(archive_file.clone());
         } else {
-            files.push(classify_path(&path));
+            // Under the archive's spelling of the label, so a volume whose
+            // name spells it in another case groups into the archive's set.
+            let mut file = classify_path(&path);
+            file.set_hint = Some(label.to_owned());
+            files.push(file);
         }
     }
     Ok(files)
+}
+
+/// Whether `path` names a volume of the family labelled `label`: a RAR
+/// volume or `.rev` recovery volume by name whose label is `label` as the
+/// platform's file names compare ([`same_stem`]), so where they ignore case
+/// `set.part2.rar` is a volume of the family `SET.part1.rar` names.
+fn in_named_family(path: &Path, label: &str) -> bool {
+    set_hint(path).is_some_and(|hint| same_stem(&hint, label))
+        && (looks_rarish_by_name(path) || is_ext(path, "rev"))
 }
 
 /// [`Path::canonicalize`], counted per thread under test so RAR set
@@ -1188,6 +1201,27 @@ mod tests {
                 names(&files),
                 ["alias.part1.rar", "glade.part2.rar", "glade.part3.rar"]
             );
+        }
+    }
+
+    /// A volume joins the family the caller named when its label is the
+    /// caller's as the platform compares file names: exactly everywhere, and
+    /// in any case on macOS and Windows, so `rar list SET.part1.rar` there
+    /// reaches `set.part2.rar`.
+    #[test]
+    fn a_named_family_compares_labels_as_the_platform_compares_names() {
+        let folds = cfg!(any(windows, target_os = "macos"));
+        for (name, label, member) in [
+            ("set.part2.rar", "set", true),
+            ("set.part2.rar", "SET", folds),
+            ("Set.R00", "sET", folds),
+            ("SET.part1.rev", "set", folds),
+            ("\u{e9}t\u{e9}.part2.rar", "\u{c9}T\u{c9}", folds),
+            ("sets.part2.rar", "set", false),
+            ("set.par2", "set", false),
+        ] {
+            let path = Path::new("dir").join(name);
+            assert_eq!(in_named_family(&path, label), member, "{name} in {label}");
         }
     }
 
