@@ -1,5 +1,369 @@
 # Native PAR3 performance
 
+## FFT decode and transform experiments, 2026-10
+
+Seven experimental FFT-codec lanes were measured against the 0.5.0 default
+on three AWS hosts. Two shipped in 0.5.1; the others were dropped, and their
+code is gone. This section is their record.
+
+### What shipped
+
+- **Capacity decode with a pipelined fill** (`decode-capacity`,
+  `decode-pipeline`) is the only FFT decoder. It keeps two banks of
+  `capacity` rows instead of a full-domain work area, and with workers on a
+  direct lane over a domain wider than twice the capacity it adds a third
+  bank so the next fill overlaps the current transform. If the budget refuses
+  the third bank, it runs on two. Repair output is byte-identical.
+- **The four-step transform** (`fft-four-step`, leaf 2^6) runs only where it
+  measured faster. A codec takes it when the CPU reports `AuthenticAMD` and
+  the linear-map kernel resolves to AVX2. On top of that CPU gate, each
+  transform of `n` points over rows of `row_bytes` takes it when
+  `n > 1` and either:
+  - it runs in the worker pool and `n > 64`, or
+  - it runs on the calling thread and `row_bytes >= 16 KiB`.
+
+  The first rule excludes the 128 × 64 KiB-class encode at 4 or more
+  workers. The second excludes the one-worker 30000 × 1 KiB decode. Output
+  is the same with four-step on or off.
+- **Dropped:** `fft-hash-feed`, `cauchy-shared`, `encode-pruned` and
+  `fft-recursive`, along with the four-step leaf and split knobs and the
+  `RARPAR_PAR3_EXPERIMENTS` environment read.
+
+### Method
+
+- **Hosts:** c7a.2xlarge (AMD EPYC 9R14, Zen 4), c7i.2xlarge (Intel Xeon
+  Platinum 8488C, Sapphire Rapids) and c8g.2xlarge (AWS Graviton4), each with
+  8 vCPUs. The 30000 × 1 KiB decode was rerun at n = 8 on c7a and c8g.
+- **Builds:** the baseline is the unmodified 0.5.0 engine. Every other arm
+  is one experimental build with the lanes selected per process by
+  environment, so `control` (the experimental build with nothing selected)
+  measures build-to-build noise.
+- **Runs:** each arm runs in a fresh process. Arms rotate order on every
+  repeat, after one discarded warm-up. Workers are 1, 4 and 8, and n = 3
+  unless a table says otherwise. Every created set is compared with the
+  baseline's carrier SHA-256s and every repair with the input's SHA-256.
+  There were no mismatches.
+- **Whole operations** go through the `engine_perf` example with a 512 MiB
+  budget:
+
+  | workload | codec | inputs × block | recovery | losses |
+  |---|---|---|---:|---:|
+  | cauchy-S | Cauchy | 1024 × 1 KiB | 16 | 4 |
+  | cauchy-M | Cauchy | 512 × 8 KiB | 16 | 4 |
+  | cauchy-L | Cauchy | 256 × 64 KiB | 16 | 4 |
+  | fft-S | FFT | 30000 × 1 KiB | 256 | 10 |
+  | fft-L | FFT | 4096 × 16 KiB | 192 | 4 |
+  | fft-1.5G | FFT | 49152 × 32 KiB | 4916 | 2000 |
+
+  fft-1.5G ran with a 2 GiB budget and a 256 MiB retained-source cap, so
+  sources are re-read. The cold row drops the page cache before each run.
+- **Codec-only rows** time the encoder or decoder alone through an A/B
+  example over generated rows.
+
+### Scale
+
+Every figure is **default ÷ experiment** on median wall time, so a figure
+above 1 means the experiment was faster. Memory figures are default ÷
+experiment on the engine's charged peak, so a figure above 1 means the
+experiment used less. A dash means that arm was not run at that worker count.
+
+Two rows carry noise that the control arm exposes, so read them with care:
+- On c7a, fft-1.5G create at w1: every arm reads 1.5–1.8, control included,
+  because the baseline's w1 runs were slow.
+- On c7a, the codec-only 128 × 64 KiB encode at w4: the control spread is
+  0.77–1.27, and arms that cannot touch encode read about 0.6.
+
+On c7i and c8g, the four-step loss on that encode is clear (0.64).
+
+### Per-host results
+
+#### c7a: AMD EPYC 9R14 (Zen 4), AVX2 kernels with GFNI
+
+Whole operations through `engine_perf`, each cell w1 / w4 / w8. The last column is the pipeline decode with four-step, the closest measured arm to what landed.
+
+| workload | capacity | pipeline | four-step | hash-feed | cauchy-shared | encode-pruned | recursive | pipeline + four-step |
+|---|---|---|---|---|---|---|---|---|
+| cauchy-L create | 1.00 / 1.00 / 1.01 | 1.01 / 1.00 / 1.02 | 1.01 / 0.99 / 1.01 | 1.00 / 0.99 / 1.00 | 0.03 / 0.10 / 0.10 | 1.01 / 1.00 / – | 1.01 / 0.99 / – | 1.00 / 1.00 / 1.01 |
+| cauchy-L repair | 1.00 / 0.99 / 1.00 | 1.04 / 1.00 / 1.00 | 1.03 / 0.99 / 1.00 | 1.01 / 0.99 / 1.00 | 1.01 / 1.00 / 1.00 | 1.01 / 1.01 / – | 0.99 / 1.00 / – | 1.00 / 1.00 / 1.01 |
+| cauchy-M create | 1.00 / 1.01 / 1.03 | 1.01 / 1.02 / 1.05 | 1.01 / 1.01 / 1.04 | 1.01 / 1.01 / 1.03 | 0.01 / 0.02 / 0.02 | 0.98 / 1.00 / – | 0.99 / 1.01 / – | 1.01 / 1.02 / 1.01 |
+| cauchy-M repair | 1.02 / 1.01 / 1.00 | 1.01 / 1.02 / 1.00 | 1.01 / 1.00 / 1.00 | 1.03 / 1.02 / 1.02 | 1.01 / 1.01 / 1.01 | 1.02 / 1.02 / – | 1.01 / 1.00 / – | 1.02 / 1.03 / 1.01 |
+| cauchy-S create | 1.02 / 1.01 / 0.97 | 1.02 / 1.00 / 0.96 | 1.02 / 1.02 / 0.97 | 1.02 / 1.01 / 0.98 | 0.01 / 0.01 / 0.01 | 1.00 / 1.01 / – | 1.02 / 1.02 / – | 1.00 / 1.01 / 0.95 |
+| cauchy-S repair | 1.03 / 1.00 / 1.00 | 1.03 / 1.00 / 0.99 | 1.02 / 1.00 / 1.01 | 1.04 / 0.98 / 0.99 | 1.01 / 0.98 / 1.00 | 1.04 / 0.95 / – | 1.03 / 1.01 / – | 1.05 / 1.02 / 1.00 |
+| fft-L create | 0.99 / 1.01 / 1.01 | 1.00 / 1.01 / 1.01 | 1.01 / 1.09 / 1.11 | 1.07 / 1.07 / 1.09 | 0.99 / 1.00 / 1.02 | 0.99 / 1.00 / – | 1.01 / 1.00 / – | 1.00 / 1.08 / 1.11 |
+| fft-L repair | 1.70 / 1.31 / 1.21 | 1.72 / 1.49 / 1.39 | 0.99 / 1.00 / 1.00 | 1.00 / 1.00 / 0.99 | 0.99 / 1.00 / 1.00 | 1.00 / 1.00 / – | 1.00 / 1.00 / – | 1.77 / 1.62 / 1.46 |
+| fft-S create | 1.03 / 1.00 / 1.01 | 1.05 / 1.00 / 1.01 | 1.06 / 1.00 / 1.20 | 1.10 / 1.00 / 1.19 | 1.03 / 1.00 / 1.00 | 0.94 / 1.00 / – | 1.10 / 1.00 / – | 0.96 / 1.00 / 0.89 |
+| fft-S repair | 1.28 / 1.16 / 1.11 | 1.29 / 1.24 / 1.19 | 1.01 / 1.01 / 0.99 | 1.00 / 1.00 / 0.99 | 1.00 / 1.01 / 0.98 | 1.00 / 1.02 / – | 0.99 / 1.03 / – | 1.25 / 1.24 / 1.19 |
+| fft-1.5G create | – | – | 1.76 / 1.01 / 0.98 | 1.54 / 0.92 / 1.01 | – | 1.75 / 1.00 / 1.00 | – | – |
+| fft-1.5G repair | 1.91 / 1.58 / 1.36 | 1.92 / 1.66 / 1.41 | – | – | – | – | – | 1.99 / 1.68 / 1.33 |
+| fft-1.5G create (cold cache, w8) | – | – | 1.02 | 1.02 | – | – | – | – |
+
+Codec only (`fft_ab`), each cell w1 / w4 / w8. A case is the operation, input blocks × block size, the cohort capacity, the recovery rows encoded or the losses decoded, and the first recovery index.
+
+| case | capacity | pipeline | encode-pruned | recursive | four-step | capacity + four-step | pipeline + four-step |
+|---|---|---|---|---|---|---|---|
+| decode 128×64K, 2^5, 4 losses, first 0 | 2.50 / 1.55 / 1.42 | 2.51 / 1.57 / 1.46 | 0.98 / 1.01 / 0.96 | 0.98 / 0.97 / 1.07 | 0.98 / 0.97 / 0.95 | 2.57 / 1.43 / 1.36 | 2.61 / 1.56 / 1.38 |
+| decode 30000×1K, 2^11, 10 losses, first 23 | 1.90 / 1.45 / 1.42 | 1.85 / 1.48 / 1.63 | 1.01 / 0.99 / 1.00 | 1.01 / 1.01 / 0.98 | 1.00 / 1.00 / 1.01 | 1.42 / 2.35 / 2.47 | 1.43 / 2.66 / 2.87 |
+| decode 4096×16K, 2^8, 128 losses, first 0 | 2.84 / 1.86 / 1.60 | 2.85 / 2.25 / 2.00 | 0.99 / 1.00 / 1.01 | 0.98 / 1.00 / 1.00 | 0.98 / 1.00 / 1.00 | 3.17 / 3.56 / 2.87 | 3.16 / 4.54 / 3.58 |
+| decode 4096×16K, 2^8, 4 losses, first 5 | 3.24 / 2.24 / 1.91 | 3.36 / 2.88 / 2.61 | 1.00 / 0.99 / 1.01 | 0.99 / 0.99 / 1.00 | 1.00 / 1.00 / 0.95 | 3.59 / 3.69 / 3.28 | 3.67 / 5.00 / 4.29 |
+| encode 128×64K, 2^5, 16 rows, first 0 | 1.01 / 0.98 / 1.05 | 1.02 / 0.64 / 1.03 | 1.01 / 0.65 / 1.00 | 1.06 / 0.62 / 1.05 | 1.04 / 0.56 / 0.97 | 1.04 / 0.90 / 0.91 | 1.05 / 0.58 / 0.92 |
+| encode 4096×16K, 2^8, 128 rows, first 0 | 1.01 / 0.96 / 1.03 | 1.00 / 0.99 / 1.15 | 1.02 / 1.00 / 1.08 | 1.01 / 0.98 / 1.02 | 1.03 / 1.63 / 1.69 | 1.00 / 1.51 / 1.69 | 0.99 / 1.50 / 1.70 |
+| encode 4096×16K, 2^8, 32 rows, first 64 | 0.99 / 0.99 / 0.96 | 0.95 / 1.01 / 1.00 | 1.02 / 1.00 / 0.98 | 0.96 / 0.99 / 1.00 | 1.05 / 1.51 / 1.60 | 1.03 / 1.54 / 1.74 | 1.06 / 1.57 / 1.57 |
+
+Four-step leaf and split variants, codec only, w1 / w4 / w8 (alone, over the old decode). Leaf 6 is what landed.
+
+| case | leaf 2 | leaf 4 | leaf 6 | leaf 8 | leaf 6, split 2 | leaf 6, split 4 |
+|---|---|---|---|---|---|---|
+| decode 128×64K, 2^5, 4 losses, first 0 | 0.98 / 0.96 / 0.99 | 0.98 / 1.21 / 0.96 | 0.98 / 0.97 / 0.95 | 0.99 / 0.98 / 1.19 | 0.98 / 1.17 / 0.97 | 0.98 / 1.21 / 1.06 |
+| decode 30000×1K, 2^11, 10 losses, first 23 | 0.99 / 1.01 / 1.00 | 1.00 / 0.99 / 1.00 | 1.00 / 1.00 / 1.01 | 1.00 / 1.00 / 1.00 | 1.00 / 1.00 / 1.00 | 1.00 / 0.99 / 1.00 |
+| decode 4096×16K, 2^8, 128 losses, first 0 | 0.99 / 1.01 / 1.00 | 1.00 / 1.00 / 1.00 | 0.98 / 1.00 / 1.00 | 0.99 / 1.00 / 0.99 | 0.99 / 1.00 / 1.01 | 0.97 / 1.00 / 1.00 |
+| decode 4096×16K, 2^8, 4 losses, first 5 | 0.99 / 1.00 / 1.01 | 0.98 / 1.00 / 1.01 | 1.00 / 1.00 / 0.95 | 1.00 / 1.00 / 1.00 | 1.00 / 0.99 / 1.01 | 0.99 / 1.00 / 1.00 |
+| encode 128×64K, 2^5, 16 rows, first 0 | 1.08 / 0.62 / 1.04 | 1.07 / 1.01 / 1.01 | 1.04 / 0.56 / 0.97 | 1.04 / 0.55 / 0.99 | 1.05 / 0.59 / 0.89 | 1.06 / 0.89 / 0.91 |
+| encode 4096×16K, 2^8, 128 rows, first 0 | 0.99 / 1.47 / 1.63 | 1.03 / 1.50 / 1.67 | 1.03 / 1.63 / 1.69 | 1.09 / 0.95 / 0.97 | 1.04 / 1.40 / 1.48 | 1.06 / 1.50 / 1.71 |
+| encode 4096×16K, 2^8, 32 rows, first 64 | 0.97 / 1.49 / 1.57 | 1.03 / 1.57 / 1.58 | 1.05 / 1.51 / 1.60 | 1.09 / 0.95 / 0.92 | 1.01 / 1.41 / 1.38 | 1.00 / 1.58 / 1.60 |
+
+The one-worker small-block decode, 30000×1K, 2^11, 10 losses, first 23 rerun at n = 8, w1 / w4:
+
+| arm | w1 / w4 |
+|---|---|
+| decode-capacity | 1.90 / 1.44 |
+| decode-pipeline | 1.89 / 1.51 |
+| fft-four-step[leaf6] | 1.00 / 1.01 |
+| decode-capacity+fft-four-step[leaf6] | 1.44 / 2.46 |
+| decode-pipeline+fft-four-step[leaf6] | 1.46 / 2.59 |
+| decode-capacity+fft-four-step[leaf4] | 1.07 / 2.04 |
+| decode-pipeline+fft-four-step[leaf4] | 1.08 / 2.14 |
+
+#### c7i: Intel Xeon Platinum 8488C (Sapphire Rapids), AVX2 kernels with GFNI
+
+Whole operations through `engine_perf`, each cell w1 / w4 / w8. The last column is the pipeline decode with four-step, the closest measured arm to what landed.
+
+| workload | capacity | pipeline | four-step | hash-feed | cauchy-shared | encode-pruned | recursive | pipeline + four-step |
+|---|---|---|---|---|---|---|---|---|
+| cauchy-L create | 1.01 / 1.04 / 1.00 | 1.02 / 1.02 / 1.01 | 1.00 / 1.02 / 1.01 | 1.03 / 1.04 / 0.98 | 0.03 / 0.09 / 0.06 | 1.01 / 1.04 / – | 1.00 / 1.01 / – | 1.01 / 1.02 / 1.01 |
+| cauchy-L repair | 1.00 / 0.96 / 0.94 | 1.02 / 0.98 / 0.95 | 1.03 / 1.02 / 1.00 | 1.02 / 0.95 / 0.97 | 0.98 / 1.00 / 0.92 | 0.98 / 0.96 / – | 1.00 / 1.02 / – | 0.99 / 0.98 / 0.97 |
+| cauchy-M create | 1.00 / 1.03 / 1.03 | 1.01 / 1.01 / 1.02 | 1.03 / 1.03 / 1.05 | 1.02 / 1.08 / 1.03 | 0.01 / 0.02 / 0.02 | 1.01 / 1.04 / – | 1.03 / 1.03 / – | 1.04 / 1.04 / 0.99 |
+| cauchy-M repair | 1.06 / 0.98 / 1.02 | 1.00 / 1.05 / 1.03 | 1.02 / 1.02 / 0.99 | 1.04 / 1.03 / 1.00 | 1.01 / 1.03 / 1.00 | 1.06 / 1.04 / – | 0.99 / 1.05 / – | 0.97 / 1.04 / 0.98 |
+| cauchy-S create | 0.96 / 1.01 / 1.00 | 1.01 / 1.00 / 0.95 | 0.98 / 1.00 / 0.97 | 1.02 / 0.99 / 0.96 | 0.01 / 0.01 / 0.01 | 0.98 / 1.00 / – | 1.00 / 1.00 / – | 1.03 / 1.00 / 0.97 |
+| cauchy-S repair | 0.99 / 1.03 / 0.95 | 1.12 / 1.05 / 1.07 | 1.10 / 1.03 / 0.92 | 1.09 / 1.02 / 1.04 | 1.06 / 1.02 / 1.02 | 1.09 / 1.03 / – | 1.08 / 1.00 / – | 1.05 / 1.05 / 1.03 |
+| fft-L create | 0.98 / 1.01 / 1.02 | 0.99 / 0.97 / 1.01 | 0.97 / 0.99 / 0.99 | 1.06 / 1.03 / 1.03 | 1.02 / 0.96 / 0.99 | 0.99 / 0.97 / – | 0.98 / 0.99 / – | 0.97 / 0.98 / 1.00 |
+| fft-L repair | 1.69 / 1.28 / 1.22 | 1.70 / 1.45 / 1.34 | 1.00 / 0.99 / 0.99 | 1.01 / 0.98 / 0.99 | 1.00 / 1.00 / 0.99 | 0.99 / 1.02 / – | 0.99 / 1.01 / – | 1.70 / 1.45 / 1.37 |
+| fft-S create | 1.00 / 1.00 / 1.00 | 1.00 / 1.00 / 1.00 | 1.00 / 1.00 / 1.15 | 0.99 / 1.00 / 1.00 | 1.00 / 1.00 / 1.01 | 1.00 / 1.00 / – | 1.00 / 1.00 / – | 1.08 / 1.00 / 1.00 |
+| fft-S repair | 1.37 / 1.16 / 1.15 | 1.37 / 1.26 / 1.25 | 1.00 / 1.01 / 1.00 | 1.00 / 1.00 / 1.00 | 1.00 / 1.00 / 1.00 | 1.02 / 0.99 / – | 1.00 / 1.00 / – | 1.31 / 1.28 / 1.25 |
+| fft-1.5G create | – | – | 0.95 / 0.97 / 0.86 | 1.02 / 0.83 / 1.01 | – | 0.72 / 1.00 / 0.98 | – | – |
+| fft-1.5G repair | 1.89 / 1.67 / 1.46 | 1.84 / 1.74 / 1.42 | – | – | – | – | – | 1.79 / 1.71 / 1.46 |
+| fft-1.5G create (cold cache, w8) | – | – | 1.00 | 1.00 | – | – | – | – |
+
+Codec only (`fft_ab`), each cell w1 / w4 / w8. A case is the operation, input blocks × block size, the cohort capacity, the recovery rows encoded or the losses decoded, and the first recovery index.
+
+| case | capacity | pipeline | encode-pruned | recursive | four-step | capacity + four-step | pipeline + four-step |
+|---|---|---|---|---|---|---|---|
+| decode 128×64K, 2^5, 4 losses, first 0 | 2.08 / 1.03 / 0.91 | 2.16 / 1.10 / 1.01 | 1.01 / 1.18 / 0.91 | 0.99 / 1.00 / 0.90 | 1.04 / 1.00 / 0.82 | 2.06 / 0.68 / 0.58 | 2.08 / 0.81 / 0.69 |
+| decode 30000×1K, 2^11, 10 losses, first 23 | 1.71 / 1.12 / 1.10 | 1.75 / 1.21 / 1.30 | 1.01 / 0.99 / 1.02 | 0.99 / 1.00 / 1.00 | 1.00 / 1.00 / 1.01 | 1.38 / 1.37 / 1.35 | 1.39 / 1.48 / 1.53 |
+| decode 4096×16K, 2^8, 128 losses, first 0 | 2.68 / 1.58 / 1.49 | 2.69 / 1.92 / 1.78 | 1.00 / 1.02 / 1.02 | 1.00 / 1.02 / 1.02 | 1.00 / 1.02 / 1.02 | 2.62 / 1.68 / 1.56 | 2.62 / 1.92 / 1.74 |
+| decode 4096×16K, 2^8, 4 losses, first 5 | 2.92 / 1.92 / 1.76 | 2.92 / 2.63 / 2.35 | 0.99 / 1.00 / 0.99 | 0.99 / 1.01 / 0.98 | 0.99 / 0.97 / 0.99 | 2.94 / 1.92 / 1.80 | 2.92 / 2.36 / 1.91 |
+| encode 128×64K, 2^5, 16 rows, first 0 | 0.99 / 1.03 / 0.94 | 0.97 / 1.03 / 0.87 | 0.97 / 0.99 / 0.96 | 0.97 / 1.07 / 1.00 | 0.99 / 0.64 / 0.71 | 1.05 / 0.66 / 0.67 | 0.97 / 0.65 / 0.73 |
+| encode 4096×16K, 2^8, 128 rows, first 0 | 1.02 / 1.00 / 1.00 | 0.99 / 1.00 / 1.00 | 1.02 / 0.97 / 1.03 | 0.99 / 1.01 / 1.03 | 0.96 / 0.95 / 0.91 | 0.97 / 0.93 / 0.96 | 0.96 / 0.93 / 0.93 |
+| encode 4096×16K, 2^8, 32 rows, first 64 | 1.00 / 0.95 / 0.96 | 1.01 / 0.98 / 0.99 | 1.03 / 0.98 / 0.94 | 1.00 / 0.95 / 0.97 | 0.96 / 0.92 / 0.90 | 0.94 / 0.90 / 0.91 | 0.95 / 0.91 / 0.92 |
+
+Four-step leaf and split variants, codec only, w1 / w4 / w8 (alone, over the old decode). Leaf 6 is what landed.
+
+| case | leaf 2 | leaf 4 | leaf 6 | leaf 8 | leaf 6, split 2 | leaf 6, split 4 |
+|---|---|---|---|---|---|---|
+| decode 128×64K, 2^5, 4 losses, first 0 | 1.01 / 1.04 / 0.91 | 0.99 / 0.91 / 0.79 | 1.04 / 1.00 / 0.82 | 1.02 / 0.95 / 0.87 | 1.01 / 1.03 / 0.89 | 1.00 / 1.05 / 0.99 |
+| decode 30000×1K, 2^11, 10 losses, first 23 | 0.98 / 1.01 / 1.01 | 0.98 / 1.01 / 1.02 | 1.00 / 1.00 / 1.01 | 0.99 / 0.99 / 1.04 | 1.04 / 1.00 / 1.05 | 1.00 / 1.02 / 1.02 |
+| decode 4096×16K, 2^8, 128 losses, first 0 | 1.00 / 1.04 / 1.03 | 1.00 / 1.01 / 1.02 | 1.00 / 1.02 / 1.02 | 1.02 / 1.01 / 1.02 | 1.02 / 1.00 / 1.02 | 1.01 / 1.02 / 1.02 |
+| decode 4096×16K, 2^8, 4 losses, first 5 | 1.00 / 1.00 / 0.98 | 0.98 / 1.02 / 1.00 | 0.99 / 0.97 / 0.99 | 1.00 / 1.02 / 1.00 | 1.00 / 1.02 / 0.99 | 1.00 / 1.02 / 0.98 |
+| encode 128×64K, 2^5, 16 rows, first 0 | 0.92 / 0.85 / 0.84 | 0.98 / 0.89 / 0.85 | 0.99 / 0.64 / 0.71 | 0.95 / 0.67 / 0.69 | 1.00 / 0.65 / 0.68 | 0.97 / 0.68 / 0.72 |
+| encode 4096×16K, 2^8, 128 rows, first 0 | 0.94 / 0.91 / 0.89 | 0.97 / 0.91 / 0.93 | 0.96 / 0.95 / 0.91 | 0.95 / 0.76 / 0.68 | 0.94 / 0.88 / 0.83 | 0.98 / 0.98 / 0.94 |
+| encode 4096×16K, 2^8, 32 rows, first 64 | 0.92 / 0.90 / 0.89 | 0.97 / 0.87 / 0.90 | 0.96 / 0.92 / 0.90 | 0.95 / 0.74 / 0.65 | 0.94 / 0.91 / 0.81 | 0.94 / 0.93 / 0.93 |
+
+The one-worker small-block decode, 30000×1K, 2^11, 10 losses, first 23 rerun at n = 8, w1 / w4:
+
+| arm | w1 / w4 |
+|---|---|
+| decode-capacity | 1.71 / 1.13 |
+| decode-pipeline | 1.71 / 1.23 |
+| fft-four-step[leaf6] | 1.01 / 1.02 |
+| decode-capacity+fft-four-step[leaf6] | 1.37 / 1.33 |
+| decode-pipeline+fft-four-step[leaf6] | 1.37 / 1.52 |
+| decode-capacity+fft-four-step[leaf4] | 1.06 / 1.17 |
+| decode-pipeline+fft-four-step[leaf4] | 1.06 / 1.36 |
+
+#### c8g: AWS Graviton4 (Neoverse V2), NEON kernels
+
+Whole operations through `engine_perf`, each cell w1 / w4 / w8. The last column is the pipeline decode with four-step, the closest measured arm to what landed.
+
+| workload | capacity | pipeline | four-step | hash-feed | cauchy-shared | encode-pruned | recursive | pipeline + four-step |
+|---|---|---|---|---|---|---|---|---|
+| cauchy-L create | 1.00 / 0.99 / 1.00 | 1.00 / 1.00 / 0.98 | 0.99 / 1.00 / 0.99 | 0.99 / 1.01 / 0.99 | 0.04 / 0.09 / 0.08 | 0.98 / 0.99 / – | 0.96 / 0.99 / – | 1.00 / 1.00 / 1.00 |
+| cauchy-L repair | 1.00 / 1.06 / 1.03 | 0.99 / 1.05 / 1.03 | 1.00 / 1.03 / 1.00 | 0.97 / 1.11 / 1.02 | 1.00 / 1.05 / 1.03 | 0.98 / 1.10 / – | 0.99 / 1.09 / – | 1.00 / 1.05 / 1.01 |
+| cauchy-M create | 0.99 / 1.01 / 0.99 | 0.97 / 1.00 / 1.00 | 1.01 / 1.00 / 0.99 | 0.99 / 1.01 / 1.00 | 0.01 / 0.02 / 0.02 | 1.01 / 1.00 / – | 1.00 / 1.00 / – | 0.98 / 1.01 / 0.99 |
+| cauchy-M repair | 0.98 / 1.00 / 1.01 | 1.00 / 1.01 / 1.00 | 1.01 / 1.01 / 1.01 | 1.00 / 1.01 / 1.01 | 0.98 / 1.01 / 1.01 | 0.99 / 1.02 / – | 1.00 / 1.01 / – | 1.00 / 1.00 / 1.00 |
+| cauchy-S create | 0.99 / 1.00 / 1.01 | 1.00 / 1.01 / 1.00 | 1.01 / 1.00 / 1.00 | 1.00 / 1.00 / 1.01 | 0.01 / 0.01 / 0.01 | 1.00 / 1.01 / – | 0.99 / 1.01 / – | 1.00 / 1.00 / 0.98 |
+| cauchy-S repair | 1.01 / 1.00 / 1.00 | 1.01 / 1.03 / 1.00 | 1.02 / 1.02 / 1.00 | 1.02 / 1.01 / 0.98 | 1.03 / 1.03 / 1.00 | 1.03 / 1.02 / – | 1.04 / 1.02 / – | 1.03 / 1.00 / 1.00 |
+| fft-L create | 0.99 / 1.00 / 0.99 | 1.00 / 1.00 / 0.99 | 1.02 / 1.00 / 1.01 | 1.01 / 0.87 / 1.02 | 1.00 / 1.00 / 1.01 | 1.00 / 1.00 / – | 1.00 / 1.02 / – | 1.01 / 1.00 / 1.01 |
+| fft-L repair | 1.67 / 1.45 / 1.38 | 1.67 / 1.51 / 1.44 | 1.00 / 0.96 / 0.97 | 1.01 / 0.99 / 0.97 | 0.97 / 0.99 / 0.98 | 0.98 / 1.01 / – | 0.96 / 0.99 / – | 1.67 / 1.53 / 1.41 |
+| fft-S create | 0.96 / 1.00 / 1.00 | 0.94 / 1.00 / 1.00 | 0.95 / 1.00 / 1.00 | 0.92 / 1.00 / 1.01 | 0.94 / 1.00 / 1.00 | 0.95 / 1.01 / – | 0.98 / 1.01 / – | 0.96 / 1.00 / 1.00 |
+| fft-S repair | 1.29 / 1.12 / 1.12 | 1.30 / 1.21 / 1.19 | 0.99 / 0.99 / 1.00 | 0.99 / 0.97 / 1.01 | 1.00 / 0.99 / 1.01 | 1.00 / 0.99 / – | 1.00 / 0.98 / – | 1.27 / 1.21 / 1.19 |
+| fft-1.5G create | – | – | 1.01 / 0.99 / 0.99 | 1.00 / 0.73 / 0.97 | – | 1.01 / 1.00 / 1.00 | – | – |
+| fft-1.5G repair | 1.83 / 1.47 / 1.34 | 1.83 / 1.50 / 1.33 | – | – | – | – | – | 1.84 / 1.48 / 1.35 |
+| fft-1.5G create (cold cache, w8) | – | – | 0.98 | 0.97 | – | – | – | – |
+
+Codec only (`fft_ab`), each cell w1 / w4 / w8. A case is the operation, input blocks × block size, the cohort capacity, the recovery rows encoded or the losses decoded, and the first recovery index.
+
+| case | capacity | pipeline | encode-pruned | recursive | four-step | capacity + four-step | pipeline + four-step |
+|---|---|---|---|---|---|---|---|
+| decode 128×64K, 2^5, 4 losses, first 0 | 2.15 / 2.45 / 1.99 | 2.34 / 2.21 / 1.79 | 0.98 / 1.05 / 0.98 | 1.00 / 0.97 / 1.00 | 0.99 / 1.02 / 1.00 | 2.47 / 1.37 / 1.15 | 2.43 / 1.33 / 1.20 |
+| decode 30000×1K, 2^11, 10 losses, first 23 | 1.48 / 1.55 / 1.52 | 1.50 / 1.65 / 1.69 | 1.02 / 0.98 / 1.00 | 1.02 / 0.94 / 0.98 | 1.00 / 0.99 / 0.96 | 1.41 / 1.83 / 2.03 | 1.42 / 2.01 / 2.18 |
+| decode 4096×16K, 2^8, 128 losses, first 0 | 2.71 / 3.23 / 2.48 | 2.74 / 3.43 / 2.65 | 1.00 / 1.02 / 1.03 | 1.00 / 1.01 / 1.01 | 1.00 / 1.03 / 1.03 | 2.84 / 3.23 / 3.16 | 2.90 / 3.49 / 3.20 |
+| decode 4096×16K, 2^8, 4 losses, first 5 | 3.13 / 3.64 / 2.73 | 3.07 / 3.96 / 3.35 | 0.99 / 1.01 / 0.96 | 1.00 / 0.97 / 0.94 | 0.98 / 1.02 / 0.99 | 3.34 / 3.65 / 3.59 | 3.41 / 3.94 / 3.84 |
+| encode 128×64K, 2^5, 16 rows, first 0 | 1.00 / 0.99 / 1.02 | 1.03 / 0.99 / 0.94 | 1.04 / 1.00 / 0.98 | 1.03 / 0.99 / 0.97 | 1.06 / 0.64 / 0.65 | 1.06 / 0.62 / 0.67 | 1.06 / 0.64 / 0.67 |
+| encode 4096×16K, 2^8, 128 rows, first 0 | 1.05 / 1.05 / 0.88 | 1.05 / 1.05 / 0.91 | 1.08 / 1.00 / 0.99 | 1.01 / 1.03 / 0.95 | 1.10 / 1.00 / 1.03 | 1.13 / 0.96 / 1.02 | 1.15 / 0.98 / 0.96 |
+| encode 4096×16K, 2^8, 32 rows, first 64 | 0.97 / 1.09 / 0.94 | 1.01 / 1.09 / 0.94 | 1.05 / 1.14 / 1.00 | 1.01 / 1.02 / 1.02 | 1.08 / 1.09 / 1.06 | 1.08 / 1.07 / 1.05 | 1.09 / 1.09 / 1.05 |
+
+Four-step leaf and split variants, codec only, w1 / w4 / w8 (alone, over the old decode). Leaf 6 is what landed.
+
+| case | leaf 2 | leaf 4 | leaf 6 | leaf 8 | leaf 6, split 2 | leaf 6, split 4 |
+|---|---|---|---|---|---|---|
+| decode 128×64K, 2^5, 4 losses, first 0 | 0.97 / 1.03 / 0.92 | 0.95 / 1.02 / 0.95 | 0.99 / 1.02 / 1.00 | 1.00 / 1.01 / 0.98 | 1.00 / 1.04 / 1.05 | 1.01 / 1.04 / 0.95 |
+| decode 30000×1K, 2^11, 10 losses, first 23 | 0.99 / 0.97 / 0.97 | 1.00 / 0.98 / 0.98 | 1.00 / 0.99 / 0.96 | 1.00 / 0.98 / 1.00 | 0.99 / 1.00 / 1.01 | 1.01 / 0.97 / 0.95 |
+| decode 4096×16K, 2^8, 128 losses, first 0 | 1.00 / 1.05 / 1.02 | 0.99 / 1.01 / 1.01 | 1.00 / 1.03 / 1.03 | 1.00 / 1.03 / 0.92 | 1.00 / 1.01 / 1.04 | 1.01 / 1.02 / 0.96 |
+| decode 4096×16K, 2^8, 4 losses, first 5 | 1.00 / 1.01 / 0.92 | 0.99 / 1.01 / 0.96 | 0.98 / 1.02 / 0.99 | 0.98 / 1.01 / 0.96 | 0.99 / 0.99 / 1.03 | 0.99 / 1.00 / 1.03 |
+| encode 128×64K, 2^5, 16 rows, first 0 | 1.03 / 0.85 / 0.91 | 1.04 / 0.86 / 0.84 | 1.06 / 0.64 / 0.65 | 1.04 / 0.65 / 0.69 | 1.03 / 0.67 / 0.69 | 1.06 / 0.63 / 0.69 |
+| encode 4096×16K, 2^8, 128 rows, first 0 | 1.13 / 1.02 / 1.01 | 1.09 / 0.98 / 1.03 | 1.10 / 1.00 / 1.03 | 1.14 / 0.45 / 0.38 | 1.15 / 0.95 / 0.90 | 1.10 / 0.99 / 1.00 |
+| encode 4096×16K, 2^8, 32 rows, first 64 | 1.06 / 1.09 / 1.03 | 1.09 / 1.03 / 1.07 | 1.08 / 1.09 / 1.06 | 1.09 / 0.45 / 0.39 | 1.07 / 1.04 / 0.92 | 1.05 / 1.08 / 1.01 |
+
+The one-worker small-block decode, 30000×1K, 2^11, 10 losses, first 23 rerun at n = 8, w1 / w4:
+
+| arm | w1 / w4 |
+|---|---|
+| decode-capacity | 1.55 / 1.54 |
+| decode-pipeline | 1.55 / 1.67 |
+| fft-four-step[leaf6] | 1.00 / 0.99 |
+| decode-capacity+fft-four-step[leaf6] | 1.44 / 1.87 |
+| decode-pipeline+fft-four-step[leaf6] | 1.44 / 1.82 |
+| decode-capacity+fft-four-step[leaf4] | 1.25 / 1.69 |
+| decode-pipeline+fft-four-step[leaf4] | 1.25 / 1.72 |
+
+#### Charged peak memory
+
+The engine's charged peak (`reserved_peak`) at w8 in MB: the default, the capacity decode, the pipeline decode, and default ÷ pipeline. The charge is deterministic, so the c7a rows stand for all three hosts: c7i matches c7a to the decimal, and c8g's default is up to 6% lower on the 1 KiB-block rows, with the same arms. Every other lane matched the default within 1%, except `cauchy-shared`.
+
+| host | workload | default | capacity | pipeline | default ÷ pipeline |
+|---|---|---:|---:|---:|---:|
+| c7a | cauchy-L repair | 4.9 | 4.9 | 4.9 | 1.00 |
+| c7a | cauchy-M repair | 2.6 | 2.6 | 2.6 | 1.00 |
+| c7a | cauchy-S repair | 2.3 | 2.3 | 2.3 | 1.00 |
+| c7a | fft-L repair | 137.9 | 11.8 | 15.8 | 8.71 |
+| c7a | fft-S repair | 56.3 | 6.7 | 6.4 | 8.76 |
+| c7a | fft-1.5G repair | 1899.9 | 527.3 | 783.9 | 2.42 |
+| c7a | decode 128×64K, 2^5, 4 losses, first 0 | 20.9 | 6.6 | 8.6 | 2.43 |
+| c7a | decode 30000×1K, 2^11, 10 losses, first 23 | 54.7 | 9.1 | 11.3 | 4.84 |
+| c7a | decode 4096×16K, 2^8, 128 losses, first 0 | 139.5 | 11.4 | 15.4 | 9.04 |
+| c7a | decode 4096×16K, 2^8, 4 losses, first 5 | 137.5 | 11.4 | 15.4 | 8.91 |
+
+`cauchy-shared` on Cauchy create at w8, MB default / arm, the same on every host:
+
+| host | workload | default / cauchy-shared | default ÷ arm |
+|---|---|---|---:|
+| c7a | cauchy-L create | 21.6 / 23.6 | 0.92 |
+| c7a | cauchy-M create | 6.3 / 7.3 | 0.86 |
+| c7a | cauchy-S create | 2.9 / 3.4 | 0.85 |
+
+`fft-hash-feed` source reads at w8 in MB, the same on every host:
+
+| host | workload | default | hash-feed |
+|---|---|---:|---:|
+| c7a | fft-L create | 128.0 | 64.0 |
+| c7a | fft-S create | 29.3 | 29.3 |
+| c7a | fft-1.5G create | 3072.0 | 1536.0 |
+
+### Defects found and their disposition
+
+1. **The hash feed left most workers idle.** `fft-hash-feed` gave the hash
+   feed one thread out of `workers - hash_workers`. At w4 it measured
+   0.73–1.07 on fft-L and fft-1.5G create, and about 1.0 at w1 and w8.
+   Dropped with the lane.
+2. **No check of the layout against the plan** before the hash feed used
+   planned parity. Unreachable: the feed and its planned-recovery path are
+   deleted.
+3. **Four-step had no ISA or geometry gate.** Its sign changed with host and
+   shape:
+   - it won on c7a;
+   - it lost on c7i encode and on c7i's small-block decode together with
+     the capacity decode;
+   - it lost on the 128 × 64 KiB encode at w4 and w8 on c7i and c8g;
+   - it lost on the one-worker 30000 × 1 KiB decode against the capacity
+     decode alone, on every host;
+   - leaf 8 lost on c8g (0.38–0.45 on encode).
+
+   Fixed by the CPU gate and the per-transform rule above.
+4. **`cauchy-shared` was 25–100 times slower** on every Cauchy create, and
+   its charged peak was higher (0.85–0.92 on the memory scale). Dropped.
+5. **`encode-pruned` and `fft-recursive` had no measurable effect** anywhere.
+   Dropped.
+6. **Halving source reads bought no time.** The hash feed halved reads on
+   fft-L and fft-1.5G and left fft-S unchanged, but saved no time, cached or
+   cold, on these hosts. Dropped with the lane.
+7. **The library read an environment variable on every codec
+   construction,** and an invalid value failed every operation. Fixed: the
+   variable and the module that read it are deleted.
+8. **The grid's data generator overflowed on CPython before 3.12** at 1.5
+   GiB. This was in the measurement tooling, not in this crate, and was
+   worked around with chunked generation (the same byte stream).
+
+### Not yet measured, and what is uncertain
+
+- **Four-step at 2 workers, and on serial rows of 2 to 8 KiB.** Neither was
+  a grid row. The gate applies the pooled rule at two workers and the 16 KiB
+  serial threshold to those rows without a measurement behind either.
+- **AMD hosts with AVX-512 GF kernels (Zen 5).** The gate requires the AVX2
+  kernel, so four-step stays off there until it is measured.
+- **The 128 × 64 KiB encode at 4 or more workers.** On c7a this row is noisy:
+  the control spread is 0.77 to 1.27, and arms that cannot touch encode read
+  about 0.6. On c7i and c8g, four-step loses on it with no such noise (0.64
+  at w4). That loss is why the pooled rule excludes transforms of 64 points or
+  fewer.
+- **Thread counts in the PAR2 against PAR3 rows.** `rarpar par` has no
+  thread flag, so every arm runs at its default thread count and the arms are
+  not thread-matched.
+
+### PAR2 against PAR3
+
+This comparison has not been run yet; the fleet benchmark will run it once
+this release is published.
+
+The `rarpar-bench` harness has a `par3 versus` profile for it. Every arm
+uses the same generated inputs, block size, recovery count and damage. The
+arms are:
+- PAR2 through `rarpar par`;
+- par2cmdline-turbo, where the host has it;
+- PAR3 Cauchy through `rarpar par3`;
+- PAR3 FFT through `rarpar par3`.
+
+Each arm creates its own set and repairs it over the same damaged copy of
+the inputs. Every repair is checked against the inputs' SHA-256. The scale is
+**par2 ÷ par3** median wall time, so a figure above 1 means the PAR3 arm was
+faster. Peak RSS is reported raw for every arm.
+
+The rows are:
+- every arm at one recovery count on the Cauchy-class sets A (1 GiB, 1 MiB
+  blocks) and B (10 × 30 MiB, 1 MiB blocks), at 10% recovery;
+- FFT-only rows against both PAR2 arms on set A at 64 KiB blocks, at 10% and
+  30% recovery.
+
+### Open
+
+1. Measure four-step at 2 workers and on serial rows of 2 to 8 KiB, and move
+   the pooled and serial thresholds if the result says so.
+2. Measure four-step on Zen 5 with the AVX-512 GF kernels; the gate keeps it
+   off there until then.
+3. Rerun the 128 × 64 KiB encode at 4 and 8 workers on c7a with more repeats,
+   to confirm the loss seen on c7i and c8g, or show the exclusion is wider
+   than it needs to be there.
+4. Give `rarpar par` a thread flag, or record each arm's thread count, so the
+   PAR2 against PAR3 rows can be thread-matched.
+
 ## Tuned verification and repair, 2026-09-08
 
 The Weaver-facing tuning pass closes the measured small-file verification and

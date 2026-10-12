@@ -96,6 +96,7 @@ pub fn decompress_with_limits(
                 expected_crc,
                 &mut output,
                 limits.max_dict_size,
+                limits.max_ppmd_arena_size,
             )?;
             Ok(output)
         }
@@ -216,6 +217,7 @@ pub fn decompress_to_writer<W: Write>(
         expected_crc,
         writer,
         Limits::default().max_dict_size,
+        Limits::default().max_ppmd_arena_size,
     )
 }
 
@@ -226,6 +228,7 @@ fn decompress_to_writer_with_max_dict_size<W: Write>(
     expected_crc: Option<u32>,
     writer: &mut W,
     max_dict_size: u64,
+    max_ppmd_arena_size: u64,
 ) -> RarResult<u64> {
     enforce_supported_compression(info)?;
 
@@ -246,6 +249,7 @@ fn decompress_to_writer_with_max_dict_size<W: Write>(
                 info.method.code(),
                 info.dict_size,
                 writer,
+                max_ppmd_arena_size,
             ),
             ArchiveFormat::Rar5 => lz::decompress_lz_to_writer_with_max_dict_size(
                 input,
@@ -302,6 +306,7 @@ where
                     first_volume_index,
                     boundaries,
                     writer_factory,
+                    Limits::default().max_ppmd_arena_size,
                 )
             }
             ArchiveFormat::Rar5 => lz::decompress_lz_to_writer_chunked_with_max_dict_size(

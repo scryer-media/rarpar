@@ -7,6 +7,12 @@ pub const RAR_MIN_LZ_WINDOW_SIZE: u64 = 0x40000;
 /// Maximum dictionary size accepted for RAR extraction.
 pub const RAR_UNPACK_MAX_DICT_SIZE: u64 = 0x1000000000;
 
+/// Largest PPMd model arena a RAR3 block header can declare.
+///
+/// The header stores the arena size as one byte `mem`, and the model is
+/// started over `(mem + 1)` MiB, so 256 MiB is the format's ceiling.
+pub const RAR_PPMD_MAX_ARENA_SIZE: u64 = 256 << 20;
+
 /// Maximum RAR5 header body size accepted by the parser.
 pub const RAR5_MAX_HEADER_BODY: u64 = 0x200000;
 
@@ -61,6 +67,16 @@ pub struct Limits {
     pub max_unpacked_size: u64,
     /// Maximum dictionary size in bytes (default 256 MB).
     pub max_dict_size: u64,
+    /// Maximum PPMd model arena, in bytes, a RAR3 PPMd block header may ask
+    /// for (default [`RAR_PPMD_MAX_ARENA_SIZE`], the format's 256 MiB
+    /// ceiling, so the default admits every valid archive).
+    ///
+    /// The header's memory-size byte `mem` declares an arena of
+    /// `(mem + 1) << 20` bytes. A block that declares more than this limit
+    /// fails with [`RarError::ResourceLimit`](crate::RarError::ResourceLimit)
+    /// before the arena is allocated. The model's fixed tables come on top of
+    /// the arena and are not counted here.
+    pub max_ppmd_arena_size: u64,
 }
 
 impl Default for Limits {
@@ -70,6 +86,7 @@ impl Default for Limits {
             max_data_segment: MAX_MEMBER_DATA_SIZE,
             max_unpacked_size: MAX_MEMBER_DATA_SIZE,
             max_dict_size: 256 * 1024 * 1024, // 256 MB
+            max_ppmd_arena_size: RAR_PPMD_MAX_ARENA_SIZE,
         }
     }
 }
@@ -85,6 +102,8 @@ mod tests {
         assert_eq!(limits.max_data_segment, MAX_MEMBER_DATA_SIZE);
         assert_eq!(limits.max_unpacked_size, MAX_MEMBER_DATA_SIZE);
         assert_eq!(limits.max_dict_size, 256 * 1024 * 1024);
+        assert_eq!(limits.max_ppmd_arena_size, RAR_PPMD_MAX_ARENA_SIZE);
+        assert_eq!(RAR_PPMD_MAX_ARENA_SIZE, 256 << 20);
     }
 
     #[test]
@@ -101,11 +120,13 @@ mod tests {
             max_data_segment: 2048,
             max_unpacked_size: 4096,
             max_dict_size: 8192,
+            max_ppmd_arena_size: 1 << 20,
         };
         assert_eq!(limits.max_header_size, 1024);
         assert_eq!(limits.max_data_segment, 2048);
         assert_eq!(limits.max_unpacked_size, 4096);
         assert_eq!(limits.max_dict_size, 8192);
+        assert_eq!(limits.max_ppmd_arena_size, 1 << 20);
     }
 
     #[test]

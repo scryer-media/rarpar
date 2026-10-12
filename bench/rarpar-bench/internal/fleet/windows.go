@@ -156,6 +156,17 @@ func WindowsRunScript(machine Machine, defaults RunDefaults, runID string, layou
 		write("  & $Bench @p3Args *> (Join-Path $R 'par3-run.log')")
 		write("  Check 'macro-par3'")
 		write("} else { Fail 'par3-reference-missing' }")
+		if versus := par3VersusArgs(machine); versus != nil {
+			quotedVersus := make([]string, 0, len(versus))
+			for _, arg := range versus {
+				quotedVersus = append(quotedVersus, q(arg))
+			}
+			write("Gate 'macro-par3-versus'")
+			write("$vsArgs = @('par3','versus','--candidate',$Candidate,'--work',(Join-Path $p3Work 'vs'),'--out',(Join-Path $R 'par3-versus'),'--machine',$Machine,%s)", strings.Join(quotedVersus, ","))
+			write("if ($OraclePar2) { $vsArgs += @('--par2', $OraclePar2) }")
+			write("& $Bench @vsArgs *> (Join-Path $R 'par3-versus.log')")
+			write("Check 'macro-par3-versus'")
+		}
 		write("if (Test-Path -LiteralPath $p3Work) { Remove-Item -LiteralPath $p3Work -Recurse -Force -ErrorAction SilentlyContinue }")
 	}
 	write("[IO.File]::WriteAllText((Join-Path $R 'perf-NO-COLLECTOR.txt'), \"capabilities.perf = none on Windows hosts; phase timings only`r`n\", $Utf8NoBom)")

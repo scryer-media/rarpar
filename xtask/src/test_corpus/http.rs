@@ -24,6 +24,7 @@
 //! a subprocess: the bundle format is the interop contract.
 
 use std::fs;
+use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -161,18 +162,35 @@ pub(crate) struct Download {
     pub(crate) destination: PathBuf,
 }
 
-/// GET one URL, retried a bounded number of times on a transient failure. The
-/// response is returned whatever its status; the caller decides what a status
-/// means.
-fn get(agent: &Agent, url: &str) -> Result<ureq::http::Response<ureq::Body>> {
+/// A response body the connection gave out on partway through, with the
+/// reason: worth a fresh request, unlike a failure the response itself caused.
+struct Dropped(String);
+
+/// What one attempt at a transfer made of its response: the result, or a body
+/// the connection dropped.
+type Taken<T> = Result<std::result::Result<T, Dropped>>;
+
+/// GET one URL and hand the response to `take`, retried a bounded number of
+/// times on a transient failure: a refused or dropped connection, a transient
+/// status, or a body `take` reports [`Dropped`], which a fresh request reads
+/// again from the start. Every other response reaches `take` whatever its
+/// status; the caller decides what a status means.
+fn get_with<T>(
+    agent: &Agent,
+    url: &str,
+    mut take: impl FnMut(&mut ureq::http::Response<ureq::Body>) -> Taken<T>,
+) -> Result<T> {
     checked_uri(url)?;
     let mut last = format!("GET {url}: no attempt was made");
     for attempt in 1..=ATTEMPTS {
         match agent.get(url).call() {
-            Ok(response) if !transient(response.status().as_u16()) => return Ok(response),
-            Ok(response) => {
+            Ok(response) if transient(response.status().as_u16()) => {
                 last = format!("GET {url}: HTTP {} (attempt {attempt})", response.status());
             }
+            Ok(mut response) => match take(&mut response)? {
+                Ok(taken) => return Ok(taken),
+                Err(Dropped(reason)) => last = format!("GET {url}: {reason} (attempt {attempt})"),
+            },
             Err(source) => last = format!("GET {url}: {source} (attempt {attempt})"),
         }
         if attempt < ATTEMPTS {
@@ -182,9 +200,18 @@ fn get(agent: &Agent, url: &str) -> Result<ureq::http::Response<ureq::Body>> {
     fail(last)
 }
 
+/// Whether a failure partway through a response body is the connection's (a
+/// reset, a cut-off, a timeout) and so worth a fresh request. A body over the
+/// size limit is the same body the next time.
+fn dropped(source: &ureq::Error) -> bool {
+    !matches!(source, ureq::Error::BodyExceedsLimit(_))
+}
+
 /// Stream a response body to a file. A body that fails midway leaves no file:
-/// a partial fixture that looks present is worse than an absent one.
-fn write_body(response: &mut ureq::http::Response<ureq::Body>, destination: &Path) -> Result<()> {
+/// a partial fixture that looks present is worse than an absent one. A
+/// connection that gives out partway through is [`Dropped`]; a file that
+/// cannot be written is an error.
+fn write_body(response: &mut ureq::http::Response<ureq::Body>, destination: &Path) -> Taken<()> {
     let mut file = fs::File::create(destination)
         .map_err(|source| error(format!("create {}: {source}", destination.display())))?;
     let mut reader = response
@@ -192,15 +219,35 @@ fn write_body(response: &mut ureq::http::Response<ureq::Body>, destination: &Pat
         .with_config()
         .limit(MAX_BODY_BYTES)
         .reader();
-    let copied = std::io::copy(&mut reader, &mut file);
-    drop(file);
-    match copied {
-        Ok(_) => Ok(()),
-        Err(source) => {
-            let _ = fs::remove_file(destination);
-            fail(format!("write {}: {source}", destination.display()))
+    // The read and the write fail for different reasons, so they are told
+    // apart here rather than inside `io::copy`.
+    let mut buffer = vec![0; 64 << 10];
+    let written = loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(0) => break Ok(Ok(())),
+            Ok(read) => read,
+            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(source) => {
+                let reason = format!("write {}: {source}", destination.display());
+                let inner = source
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<ureq::Error>());
+                break if inner.is_none_or(dropped) {
+                    Ok(Err(Dropped(reason)))
+                } else {
+                    fail(reason)
+                };
+            }
+        };
+        if let Err(source) = file.write_all(&buffer[..read]) {
+            break fail(format!("write {}: {source}", destination.display()));
         }
+    };
+    drop(file);
+    if !matches!(written, Ok(Ok(()))) {
+        let _ = fs::remove_file(destination);
     }
+    written
 }
 
 /// GET one URL to a file. Fails on any non-2xx status; the caller verifies the
@@ -210,28 +257,34 @@ pub(crate) fn get_to_file(url: &str, destination: &Path) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let agent = agent();
-    let mut response = get(&agent, url)?;
-    let status = response.status().as_u16();
-    if !(200..300).contains(&status) {
-        return fail(format!("GET {url} failed (HTTP {status})"));
-    }
-    write_body(&mut response, destination)
+    get_with(&agent, url, |response| {
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            return fail(format!("GET {url} failed (HTTP {status})"));
+        }
+        write_body(response, destination)
+    })
 }
 
 /// GET one URL into memory (small documents: manifest, bundle, provenance).
 pub(crate) fn get_to_vec(url: &str) -> Result<Vec<u8>> {
     let agent = agent();
-    let mut response = get(&agent, url)?;
-    let status = response.status().as_u16();
-    if !(200..300).contains(&status) {
-        return fail(format!("GET {url} failed (HTTP {status})"));
-    }
-    response
-        .body_mut()
-        .with_config()
-        .limit(MAX_BODY_BYTES)
-        .read_to_vec()
-        .map_err(|source| error(format!("GET {url}: {source}")))
+    get_with(&agent, url, |response| {
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            return fail(format!("GET {url} failed (HTTP {status})"));
+        }
+        match response
+            .body_mut()
+            .with_config()
+            .limit(MAX_BODY_BYTES)
+            .read_to_vec()
+        {
+            Ok(bytes) => Ok(Ok(bytes)),
+            Err(source) if dropped(&source) => Ok(Err(Dropped(source.to_string()))),
+            Err(source) => fail(format!("GET {url}: {source}")),
+        }
+    })
 }
 
 /// GET many URLs with bounded parallelism, over one connection pool. Returns
@@ -298,12 +351,13 @@ pub(crate) fn get_many(downloads: &[Download], parallel: usize) -> Result<Vec<Tr
 /// One download: the body lands on disk only when the status says there is
 /// one, so a 404's error page never sits where a fixture belongs.
 fn fetch_one(agent: &Agent, download: &Download) -> Result<u16> {
-    let mut response = get(agent, &download.url)?;
-    let status = response.status().as_u16();
-    if (200..300).contains(&status) {
-        write_body(&mut response, &download.destination)?;
-    }
-    Ok(status)
+    get_with(agent, &download.url, |response| {
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Ok(Ok(status));
+        }
+        Ok(write_body(response, &download.destination)?.map(|()| status))
+    })
 }
 
 /// The headers a conditional SigV4 PUT carries, computed without touching the
@@ -412,6 +466,10 @@ pub(crate) mod tests {
         /// existed, which is what a publication reading its own writes has to
         /// survive. A request carrying a query string still reaches the store.
         absent_on_bare_url: Arc<Mutex<bool>>,
+        /// Paths whose next GET is cut off, one entry per GET: answered with
+        /// the whole `Content-Length` but half the body before the connection
+        /// closes, the way a reset connection ends a transfer.
+        cut_off: Arc<Mutex<Vec<String>>>,
         handle: Option<std::thread::JoinHandle<()>>,
         stop: Arc<Mutex<bool>>,
     }
@@ -421,6 +479,12 @@ pub(crate) mod tests {
         /// before this run stored anything.
         pub(crate) fn cache_every_absence(&self) {
             *self.absent_on_bare_url.lock().unwrap() = true;
+        }
+
+        /// Cut off the next GET of `path` partway through its body; the GET
+        /// after it is answered whole. Each call cuts off one more.
+        pub(crate) fn cut_off_next_get(&self, path: &str) {
+            self.cut_off.lock().unwrap().push(path.to_owned());
         }
     }
 
@@ -444,6 +508,9 @@ pub(crate) mod tests {
             // See FakeServer::cache_every_absence.
             let absent_on_bare_url = Arc::new(Mutex::new(false));
             let absent_flag = absent_on_bare_url.clone();
+            // See FakeServer::cut_off_next_get.
+            let cut_off: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let cut_list = cut_off.clone();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -563,8 +630,18 @@ pub(crate) mod tests {
                         "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         response_body.len()
                     );
+                    let cut = method == "GET" && {
+                        let mut cut_off = cut_list.lock().unwrap();
+                        let at = cut_off.iter().position(|cut| *cut == path);
+                        at.map(|at| cut_off.remove(at)).is_some()
+                    };
+                    let sent = if cut {
+                        response_body.len() / 2
+                    } else {
+                        response_body.len()
+                    };
                     let _ = stream.write_all(head.as_bytes());
-                    let _ = stream.write_all(&response_body);
+                    let _ = stream.write_all(&response_body[..sent]);
                     let _ = stream.flush();
                 }
             });
@@ -572,6 +649,7 @@ pub(crate) mod tests {
                 base_url: format!("http://127.0.0.1:{port}"),
                 requests,
                 absent_on_bare_url,
+                cut_off,
                 handle: Some(handle),
                 stop,
             }
@@ -863,6 +941,82 @@ pub(crate) mod tests {
             "the browser user agent reaches the far end: {:?}",
             get.2
         );
+        drop(requests);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A connection can give out partway through a body; a CI shard once lost
+    /// a fixture to "Peer disconnected" while the other shards fetched the
+    /// same object whole. The transfer is made again from a fresh request, a
+    /// bounded number of times, a body that never arrives whole leaves no
+    /// file, and a 404 is still an answer, asked for once.
+    #[test]
+    fn a_body_cut_off_midway_is_fetched_again_whole() {
+        let dir = std::env::temp_dir().join(format!("xtask-corpus-cut-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let whole = |seed: u8| -> Vec<u8> { (0..100_000u32).map(|i| i as u8 ^ seed).collect() };
+        let server = FakeServer::start(vec![
+            (("GET", "/objects/once"), (200, whole(1))),
+            (("GET", "/objects/always"), (200, whole(2))),
+            (("GET", "/objects/file"), (200, whole(3))),
+            (("GET", "/objects/doc"), (200, whole(4))),
+        ]);
+        server.cut_off_next_get("/objects/once");
+        for _ in 0..ATTEMPTS {
+            server.cut_off_next_get("/objects/always");
+        }
+        server.cut_off_next_get("/objects/file");
+        server.cut_off_next_get("/objects/doc");
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var(ALLOW_PLAIN_HTTP_ENV, "1") };
+
+        let batch: Vec<Download> = ["once", "always", "nope"]
+            .iter()
+            .map(|name| Download {
+                url: format!("{}/objects/{name}", server.base_url),
+                destination: dir.join(format!("batch/{name}.part")),
+            })
+            .collect();
+        let transfers = get_many(&batch, 4).unwrap();
+        let status = |suffix: &str| {
+            transfers
+                .iter()
+                .find(|t| t.url.ends_with(suffix))
+                .map(|t| t.status)
+        };
+        assert_eq!(status("/objects/once"), Some(200));
+        assert_eq!(fs::read(dir.join("batch/once.part")).unwrap(), whole(1));
+        assert_eq!(status("/objects/always"), None, "cut off every time");
+        assert!(
+            !dir.join("batch/always.part").exists(),
+            "a body that never arrived whole leaves no file"
+        );
+        assert_eq!(status("/objects/nope"), Some(404));
+
+        let file = dir.join("file");
+        get_to_file(&format!("{}/objects/file", server.base_url), &file).unwrap();
+        assert_eq!(fs::read(&file).unwrap(), whole(3));
+        assert_eq!(
+            get_to_vec(&format!("{}/objects/doc", server.base_url)).unwrap(),
+            whole(4)
+        );
+        unsafe { std::env::remove_var(ALLOW_PLAIN_HTTP_ENV) };
+
+        // Every retry was a fresh request, the attempts stop at ATTEMPTS, and
+        // a 404 is not asked again.
+        let requests = server.requests.lock().unwrap();
+        let gets = |path: &str| {
+            requests
+                .iter()
+                .filter(|(m, p, _)| m == "GET" && p == path)
+                .count()
+        };
+        assert_eq!(gets("/objects/once"), 2);
+        assert_eq!(gets("/objects/always"), ATTEMPTS as usize);
+        assert_eq!(gets("/objects/nope"), 1);
+        assert_eq!(gets("/objects/file"), 2);
+        assert_eq!(gets("/objects/doc"), 2);
         drop(requests);
         let _ = fs::remove_dir_all(&dir);
     }

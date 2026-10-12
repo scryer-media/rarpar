@@ -565,10 +565,14 @@ fn emit(cli: &Cli, report: &Value) -> Result<(), RarparError> {
                     report["protected_bytes"]
                 );
                 println!(
-                    "  {} block(s) of {} bytes, {} recovery block(s), PAR3 set {}",
+                    "  {} block(s) of {} bytes, {} recovery block(s), {} set {}",
                     report["blocks"],
                     report["block_size"],
                     report["recovery_blocks"],
+                    report["set_format"]
+                        .as_str()
+                        .unwrap_or("par3")
+                        .to_uppercase(),
                     report["mode"].as_str().unwrap_or_default()
                 );
             }
@@ -824,6 +828,25 @@ fn verify_repair_loaded(
     })
 }
 
+/// The `par3 create` overwrite rule for a set written outside the planned
+/// creator: under `--overwrite`, refuse when a set already named by `stem`
+/// has authenticated carriers that `outputs` would not replace.
+pub(crate) fn reject_obsolete_sibling_carriers(
+    cli: &Cli,
+    stem: &Path,
+    outputs: &[PathBuf],
+) -> Result<(), RarparError> {
+    if !cli.overwrite {
+        return Ok(());
+    }
+    let name = stem.file_name().unwrap_or_default().to_string_lossy();
+    let stem = match name.strip_suffix(".par3") {
+        Some(base) => stem.with_file_name(base),
+        None => stem.to_path_buf(),
+    };
+    reject_obsolete_carriers(cli, &stem, outputs, &options(cli)?)
+}
+
 fn reject_obsolete_carriers(
     cli: &Cli,
     stem: &Path,
@@ -882,6 +905,30 @@ fn reject_obsolete_carriers(
 }
 
 fn create(cli: &Cli, args: &Par3CreateArgs) -> Result<(bool, Value), RarparError> {
+    // One file from standard input, `-`, or no file at all when it is piped.
+    let stream = match args.files.as_slice() {
+        [] => Some(crate::streams::input_or_stdin(None).map_err(|_| {
+            RarparError::Usage(
+                "no input files given and standard input is a terminal; give FILES or `-`".into(),
+            )
+        })?),
+        [only] if crate::streams::is_stdio(only) => Some(only.clone()),
+        files if files.iter().any(|file| crate::streams::is_stdio(file)) => {
+            return Err(RarparError::Usage(
+                "`-` reads one file from standard input and cannot be mixed with other inputs"
+                    .into(),
+            ));
+        }
+        _ => None,
+    };
+    if let Some(input) = stream {
+        return crate::par3_pipe::create(cli, &input, args);
+    }
+    if args.name.is_some() {
+        return Err(RarparError::Usage(
+            "--name names a file read from standard input; give `-` as the input".into(),
+        ));
+    }
     let execution = options(cli)?;
     if args.files.len() > cli.max_files {
         return Err(RarparError::Resource(
@@ -942,7 +989,7 @@ fn create(cli: &Cli, args: &Par3CreateArgs) -> Result<(bool, Value), RarparError
     }
     let mut config = CreationOptions {
         execution: execution.clone(),
-        block_size: args.block_size,
+        block_size: args.block_size.unwrap_or(1_048_576),
         codec: match args.codec {
             Par3Codec::Cauchy => {
                 if args.capacity_log2.is_some() || args.interleave != 0 {
@@ -994,10 +1041,11 @@ fn create(cli: &Cli, args: &Par3CreateArgs) -> Result<(bool, Value), RarparError
         drop(plan);
         plan = CreationPlan::build(access, &sources, config)?;
     }
-    let stem = if is_carrier(&args.output) {
-        args.output.with_extension("")
+    let output = cli.place_output(&args.output);
+    let stem = if is_carrier(&output) {
+        output.with_extension("")
     } else {
-        args.output.clone()
+        output
     };
     reject_symlinks(&stem)?;
     let outputs: Vec<_> = plan.output_paths(&stem).collect();

@@ -42,8 +42,12 @@ impl RarRestoreOutcome {
     }
 }
 
-pub fn list_archive(archive: &Path, passwords: &mut PasswordResolver) -> Result<u8, RarparError> {
-    let set = single_archive_set(archive)?;
+pub fn list_archive(
+    cli: &Cli,
+    archive: &Path,
+    passwords: &mut PasswordResolver,
+) -> Result<u8, RarparError> {
+    let set = archive_set(cli, archive)?;
     let names = with_password_retry(&set, passwords, |archive| {
         Ok(archive
             .member_names()
@@ -58,11 +62,11 @@ pub fn list_archive(archive: &Path, passwords: &mut PasswordResolver) -> Result<
 }
 
 pub fn test_archive(
-    _cli: &Cli,
+    cli: &Cli,
     archive: &Path,
     passwords: &mut PasswordResolver,
 ) -> Result<u8, RarparError> {
-    let set = single_archive_set(archive)?;
+    let set = archive_set(cli, archive)?;
     let outcome = test_set(&set, passwords)?;
     Ok(if outcome.success {
         EXIT_SUCCESS
@@ -333,29 +337,15 @@ fn preflight_outputs(
     Ok(())
 }
 
-fn single_archive_set(archive: &Path) -> Result<RarSet, RarparError> {
-    if !archive.exists() {
-        return Err(RarparError::MissingInput(archive.to_path_buf()));
-    }
-    Ok(RarSet {
-        id: format!("rar:{}", archive.display()),
-        label: archive
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("archive")
-            .to_string(),
-        base_dir: archive
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf(),
-        volumes: vec![crate::discovery::RarVolume {
-            path: archive.to_path_buf(),
-            volume_number: Some(0),
-            sort_index: 0,
-            is_first_volume: true,
-        }],
-        recovery_volumes: Vec::new(),
-    })
+/// The whole volume set `archive` belongs to, found the way `rar extract`
+/// finds it, so `list` and `test` read every member a later volume carries
+/// and every member split across volumes in full instead of stopping at the
+/// end of the volume named on the command line.
+fn archive_set(cli: &Cli, archive: &Path) -> Result<RarSet, RarparError> {
+    crate::discovery::discover_rar_set_for_archive(
+        archive,
+        &crate::discovery::DiscoveryOptions::from_cli(cli),
+    )
 }
 
 /// Resource limits the CLI applies to every archive it opens.

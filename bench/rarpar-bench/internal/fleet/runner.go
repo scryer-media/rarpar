@@ -442,6 +442,16 @@ func (orch *orchestrator) build(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// The turbo checkouts are part of the bundle content too: two runs with
+	// different lzma-turbo or sevenz-turbo candidates must not share a build
+	// directory any more than two rarpar candidates may.
+	turboID, err := turboTreeID(ctx, bundler.Settings, orch.options.Machines)
+	if err != nil {
+		return err
+	}
+	if turboID != "" {
+		treeID += "|" + turboID
+	}
 	byKey := map[string]*buildGroup{}
 	groups := []*buildGroup{}
 	for _, machine := range orch.options.Machines {

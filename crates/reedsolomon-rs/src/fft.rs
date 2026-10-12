@@ -31,6 +31,30 @@ pub struct TransformField {
     bits: u32,
     log: Vec<u16>,
     exp: Vec<u16>,
+    four_step: bool,
+}
+
+/// Rows at or below which a four-step transform runs the butterfly kernels
+/// directly: `2^FOUR_STEP_LEAF`.
+const FOUR_STEP_LEAF: u32 = 6;
+
+/// Narrowest row, in bytes, a four-step transform takes on one thread.
+/// Narrower rows keep the tiled sweeps, which on 1 KiB rows measured faster
+/// than four-step on one thread; 16 KiB rows measured faster four-step.
+pub const FOUR_STEP_SERIAL_MIN_ROW_BYTES: usize = 16 << 10;
+
+/// Whether a CPU takes four-step transforms: an AMD CPU running the AVX2
+/// kernels (including their GFNI and 512-bit shuffle forms). Four-step
+/// measured faster there only; on Intel and Graviton it was a wash or slower.
+#[must_use]
+pub fn four_step_admits(amd: bool, kernel: crate::gf_simd::LinearKernel) -> bool {
+    amd && kernel == crate::gf_simd::LinearKernel::Avx2
+}
+
+/// [`four_step_admits`] on the executing CPU with `backend`.
+#[must_use]
+pub fn four_step_preferred(backend: crate::gf_simd::LinearBackend) -> bool {
+    four_step_admits(crate::gf_simd::cpu_is_amd(), backend.kernel())
 }
 
 impl TransformField {
@@ -79,7 +103,245 @@ impl TransformField {
             exp[exponent as usize] = cantor as u16;
             exp[exponent as usize + order - 1] = cantor as u16;
         }
-        Ok(Self { bits, log, exp })
+        Ok(Self {
+            bits,
+            log,
+            exp,
+            four_step: false,
+        })
+    }
+
+    /// Run transforms through the four-step LCH factorization where it
+    /// applies; see [`Self::four_step_runs`]. Off by default. Output is
+    /// identical either way; [`four_step_preferred`] says where it is faster.
+    pub fn set_four_step(&mut self, enabled: bool) {
+        self.four_step = enabled;
+    }
+
+    /// Whether [`Self::set_four_step`] enabled the four-step factorization.
+    #[must_use]
+    pub fn four_step(&self) -> bool {
+        self.four_step
+    }
+
+    /// Whether a transform of `n` rows of `row_bytes` takes the four-step
+    /// factorization: enabled, and on a pool more than `2^6` rows (smaller
+    /// transforms run their leaf serially, losing the pool's column tiles),
+    /// on one thread rows of at least [`FOUR_STEP_SERIAL_MIN_ROW_BYTES`].
+    #[must_use]
+    pub fn four_step_runs(&self, n: usize, row_bytes: usize, pooled: bool) -> bool {
+        self.four_step
+            && n > 1
+            && if pooled {
+                n > 1 << FOUR_STEP_LEAF
+            } else {
+                row_bytes >= FOUR_STEP_SERIAL_MIN_ROW_BYTES
+            }
+    }
+
+    /// Bytes beside the rows a four-step transform of `n` rows keeps: the
+    /// row views, the transpose bitmaps and the flags its leaves carry.
+    fn four_step_bytes(n: usize) -> usize {
+        n.saturating_mul(size_of::<FourRow<'_, u16>>() + 2)
+            .saturating_add(256)
+    }
+
+    /// `rows` as four-step views, transformed by `run`; then, with `sum`,
+    /// each row not known zero after it added into the same row of `sum`.
+    fn four_step_rows<S: Lane, R: AsMut<[S]>, T: AsMut<[S]>>(
+        rows: &mut [R],
+        zero: Option<&[bool]>,
+        sum: Option<&mut [T]>,
+        run: impl FnOnce(&mut [FourRow<'_, S>]) -> Result<(), TransformError>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError> {
+        let mut views: Vec<_> = rows
+            .iter_mut()
+            .enumerate()
+            .map(|(i, row)| FourRow {
+                row: row.as_mut(),
+                zero: zero.is_some_and(|flags| flags[i]),
+            })
+            .collect();
+        run(&mut views)?;
+        if let Some(sum) = sum {
+            for (to, from) in sum.iter_mut().zip(&views) {
+                if cancelled() {
+                    return Err(TransformError::Cancelled);
+                }
+                if !from.zero {
+                    xor_into(to.as_mut(), from.row);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The balanced split of an `n`-row four-step transform.
+    fn four_step_split(n: usize) -> u32 {
+        let levels = n.trailing_zeros();
+        (levels / 2).clamp(1, levels - 1)
+    }
+
+    /// LCH-basis form of the row/column factorization of Samanta, Badakhshan
+    /// and Gong, "On the Additive FFT Techniques over Binary Extension
+    /// Fields", 2026, arXiv:2608.20855, section V (see ATTRIBUTION.md at the
+    /// repository root). Projection by the low subspace polynomial shifts a Cantor
+    /// coordinate right by the split. Inverse reverses the two passes.
+    fn four_step_serial<S: Lane>(
+        &self,
+        rows: &mut [FourRow<'_, S>],
+        origin: usize,
+        inverse: bool,
+        backend: crate::gf_simd::LinearBackend,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError> {
+        if cancelled() {
+            return Err(TransformError::Cancelled);
+        }
+        let n = rows.len();
+        if n <= 1 || rows.iter().all(|row| row.zero) {
+            return Ok(());
+        }
+        if n <= 1 << FOUR_STEP_LEAF {
+            return self.four_step_leaf(rows, origin, inverse, backend, cancelled);
+        }
+        let split = Self::four_step_split(n);
+        let low = 1 << split;
+        let high = n / low;
+        if inverse {
+            for (index, row) in rows.chunks_mut(low).enumerate() {
+                self.four_step_serial(row, origin ^ (index * low), inverse, backend, cancelled)?;
+            }
+        }
+        four_transpose(rows, high, low);
+        for column in rows.chunks_mut(high) {
+            self.four_step_serial(column, origin >> split, inverse, backend, cancelled)?;
+        }
+        four_transpose(rows, low, high);
+        if !inverse {
+            for (index, row) in rows.chunks_mut(low).enumerate() {
+                self.four_step_serial(row, origin ^ (index * low), inverse, backend, cancelled)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::four_step_serial`] with each pass's independent transforms
+    /// spread over the current pool.
+    fn four_step_parallel<S: Lane>(
+        &self,
+        rows: &mut [FourRow<'_, S>],
+        origin: usize,
+        inverse: bool,
+        backend: crate::gf_simd::LinearBackend,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), TransformError> {
+        use rayon::prelude::*;
+        if cancelled() {
+            return Err(TransformError::Cancelled);
+        }
+        let n = rows.len();
+        if n <= 1 << FOUR_STEP_LEAF {
+            return self.four_step_serial(rows, origin, inverse, backend, cancelled);
+        }
+        let split = Self::four_step_split(n);
+        let low = 1 << split;
+        let high = n / low;
+        if inverse {
+            rows.par_chunks_mut(low)
+                .enumerate()
+                .try_for_each(|(index, row)| {
+                    self.four_step_serial(row, origin ^ (index * low), inverse, backend, cancelled)
+                })?;
+        }
+        four_transpose(rows, high, low);
+        rows.par_chunks_mut(high).try_for_each(|column| {
+            self.four_step_serial(column, origin >> split, inverse, backend, cancelled)
+        })?;
+        four_transpose(rows, low, high);
+        if !inverse {
+            rows.par_chunks_mut(low)
+                .enumerate()
+                .try_for_each(|(index, row)| {
+                    self.four_step_serial(row, origin ^ (index * low), inverse, backend, cancelled)
+                })?;
+        }
+        Ok(())
+    }
+
+    /// A four-step leaf: the transform's sweeps over whole rows.
+    fn four_step_leaf<S: Lane>(
+        &self,
+        rows: &mut [FourRow<'_, S>],
+        origin: usize,
+        inverse: bool,
+        backend: crate::gf_simd::LinearBackend,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), TransformError> {
+        let width = rows[0].row.len();
+        let schedule = Schedule {
+            origin,
+            inverse,
+            backend,
+            radix4: Self::fused(width, backend),
+        };
+        for sweep in sweeps(rows.len().trailing_zeros(), inverse, schedule.radix4) {
+            match sweep {
+                Sweep::Radix2(level) => {
+                    let half = 1 << level;
+                    for (group, chunk) in rows.chunks_mut(2 * half).enumerate() {
+                        let base = group * 2 * half;
+                        let pair = self.pair(&schedule, level, base, width);
+                        let factor_zero = (origin ^ base) >> level == 0;
+                        let (left, right) = chunk.split_at_mut(half);
+                        for (left, right) in left.iter_mut().zip(right) {
+                            if cancelled() {
+                                return Err(TransformError::Cancelled);
+                            }
+                            let flags = [left.zero, right.zero];
+                            pair(left.row, right.row, flags);
+                            [left.zero, right.zero] = Step::of(flags, factor_zero, inverse).1;
+                        }
+                    }
+                }
+                Sweep::Radix4(level) => {
+                    let quarter = 1 << level;
+                    for (group, chunk) in rows.chunks_mut(4 * quarter).enumerate() {
+                        let base = group * 4 * quarter;
+                        let quad = self.quad(&schedule, base, level);
+                        let factors = [
+                            (origin ^ base) >> (level + 1),
+                            (origin ^ base) >> level,
+                            (origin ^ (base + 2 * quarter)) >> level,
+                        ];
+                        let [a, b, c, d] = quarters(chunk);
+                        for (((a, b), c), d) in a.iter_mut().zip(b).zip(c).zip(d) {
+                            if cancelled() {
+                                return Err(TransformError::Cancelled);
+                            }
+                            let mut flags = [a.zero, b.zero, c.zero, d.zero];
+                            quad([a.row, b.row, c.row, d.row], flags);
+                            let order = if inverse {
+                                [(0, 1, 1), (2, 3, 2), (0, 2, 0), (1, 3, 0)]
+                            } else {
+                                [(0, 2, 0), (1, 3, 0), (0, 1, 1), (2, 3, 2)]
+                            };
+                            for (left, right, factor) in order {
+                                [flags[left], flags[right]] = Step::of(
+                                    [flags[left], flags[right]],
+                                    factors[factor] == 0,
+                                    inverse,
+                                )
+                                .1;
+                            }
+                            [a.zero, b.zero, c.zero, d.zero] = flags;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Number of distinct field elements.
@@ -400,6 +662,15 @@ impl TransformField {
             backend,
             radix4: Self::fused(width, backend),
         };
+        if self.four_step_runs(n, width * size_of::<S>(), false) {
+            return Self::four_step_rows(
+                rows,
+                zero,
+                sum,
+                |views| self.four_step_serial(views, origin, inverse, backend, cancelled),
+                cancelled,
+            );
+        }
         // A bank beyond a tile, on a target that tiles, runs tile by tile
         // in place: every sweep of a pass over one tile while it stays in
         // the cache; see `Walk`.
@@ -480,6 +751,10 @@ impl TransformField {
         backend: crate::gf_simd::LinearBackend,
         threads: usize,
     ) -> usize {
+        let pooled = threads > 1 && width.saturating_mul(size).saturating_mul(n) >= 65536;
+        if self.four_step_runs(n, width.saturating_mul(size), pooled) {
+            return Self::four_step_bytes(n);
+        }
         let schedule = Schedule {
             origin: 0,
             inverse,
@@ -1434,6 +1709,19 @@ impl TransformField {
             radix4: Self::fused(width, backend),
         };
         let threads = pool.current_num_threads();
+        if self.four_step_runs(n, width * size_of::<S>(), true) {
+            return Self::four_step_rows(
+                rows,
+                zero,
+                sum,
+                |views| {
+                    pool.install(|| {
+                        self.four_step_parallel(views, origin, inverse, backend, cancelled)
+                    })
+                },
+                cancelled,
+            );
+        }
         if let Some(walk) = Walk::engaged(n, width, size_of::<S>(), &schedule, threads) {
             let flags = sweep_flags(n, zero, &schedule);
             return self.transform_tiles(
@@ -2006,6 +2294,44 @@ impl Lane for u8 {
     }
     fn admits(_: &TransformField, _: &[Self]) -> bool {
         true
+    }
+}
+
+/// One row of a four-step transform and whether it is known zero.
+struct FourRow<'a, S> {
+    row: &'a mut [S],
+    zero: bool,
+}
+
+impl<S> Default for FourRow<'_, S> {
+    fn default() -> Self {
+        Self {
+            row: &mut [],
+            zero: true,
+        }
+    }
+}
+
+/// Permute disjoint views, including their zero flags, from `rows` by
+/// `columns` to `columns` by `rows`. The data stays in its bank; the second
+/// transpose of a pass returns the caller's row order.
+fn four_transpose<S>(views: &mut [FourRow<'_, S>], rows: usize, columns: usize) {
+    let mut seen = vec![0u64; views.len().div_ceil(64)];
+    for first in 0..views.len() {
+        if seen[first / 64] >> (first % 64) & 1 != 0 {
+            continue;
+        }
+        let mut at = first;
+        let mut carry = std::mem::take(&mut views[at]);
+        loop {
+            seen[at / 64] |= 1 << (at % 64);
+            let next = (at % columns) * rows + at / columns;
+            carry = std::mem::replace(&mut views[next], carry);
+            if next == first {
+                break;
+            }
+            at = next;
+        }
     }
 }
 
@@ -3116,6 +3442,123 @@ impl<S: Symbol + std::fmt::Debug> std::fmt::Debug for RowBank<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn four_step_is_admitted_on_amd_with_the_avx2_kernels_only() {
+        use crate::gf_simd::LinearKernel;
+        for kernel in [
+            LinearKernel::Scalar,
+            LinearKernel::Neon,
+            LinearKernel::Ssse3,
+            LinearKernel::Avx2,
+        ] {
+            assert!(!four_step_admits(false, kernel), "{kernel:?}");
+            assert_eq!(
+                four_step_admits(true, kernel),
+                kernel == LinearKernel::Avx2,
+                "{kernel:?}"
+            );
+        }
+        assert!(!four_step_preferred(crate::gf_simd::LinearBackend::Scalar));
+    }
+    #[test]
+    fn four_step_runs_only_where_it_measured_faster() {
+        let mut field = TransformField::new(16).unwrap();
+        assert!(!field.four_step_runs(1 << 12, 64 << 10, true));
+        field.set_four_step(true);
+        // On a pool: more than 2^6 rows, at any width.
+        assert!(!field.four_step_runs(64, 64 << 10, true));
+        assert!(field.four_step_runs(128, 1 << 10, true));
+        // On one thread: rows of 16 KiB or more, at any count.
+        assert!(!field.four_step_runs(1 << 15, 1 << 10, false));
+        assert!(!field.four_step_runs(1 << 15, (16 << 10) - 2, false));
+        assert!(field.four_step_runs(16, 16 << 10, false));
+        assert!(!field.four_step_runs(1, 64 << 10, false));
+    }
+    #[test]
+    fn four_step_matches_existing_transform_across_sizes_and_cosets() {
+        use crate::gf_simd::LinearBackend;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for bits in [8, 16] {
+            let baseline = TransformField::new(bits).unwrap();
+            let mut field = TransformField::new(bits).unwrap();
+            field.set_four_step(true);
+            for count in [8, 32, 128, 512, 8192] {
+                if count > baseline.order() {
+                    continue;
+                }
+                // Wide enough that the serial path takes four-step too.
+                let width = if count <= 512 { 8 << 10 } else { 8 };
+                let zero: Vec<_> = (0..count).map(|i| i % 5 < 2).collect();
+                let original: Vec<Vec<u16>> = (0..count)
+                    .map(|r| {
+                        (0..width)
+                            .map(|c| {
+                                if zero[r] {
+                                    0
+                                } else {
+                                    ((r * 7919 + c * 103) % baseline.order()) as u16
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect();
+                for origin in [0, baseline.order() - count] {
+                    for inverse in [false, true] {
+                        let mut expected = original.clone();
+                        baseline
+                            .transform(&mut expected, origin, inverse, &|| false)
+                            .unwrap();
+                        let mut actual = original.clone();
+                        field
+                            .transform_known_zero_with_backend(
+                                &mut actual,
+                                &zero,
+                                origin,
+                                inverse,
+                                LinearBackend::Auto,
+                                &|| false,
+                            )
+                            .unwrap();
+                        assert_eq!(actual, expected, "{bits} {count} {origin} {inverse}");
+                        let mut actual = original.clone();
+                        field
+                            .transform_known_zero_in_pool(
+                                &mut actual,
+                                &zero,
+                                origin,
+                                inverse,
+                                LinearBackend::Auto,
+                                &pool,
+                                &|| false,
+                            )
+                            .unwrap();
+                        assert_eq!(actual, expected, "{bits} {count} {origin} {inverse} pool");
+                        if bits == 8 {
+                            let mut bytes: Vec<Vec<u8>> = original
+                                .iter()
+                                .map(|r| r.iter().map(|&v| v as u8).collect())
+                                .collect();
+                            field
+                                .transform_u8_known_zero_in_pool(
+                                    &mut bytes,
+                                    &zero,
+                                    origin,
+                                    inverse,
+                                    LinearBackend::Auto,
+                                    &pool,
+                                    &|| false,
+                                )
+                                .unwrap();
+                            assert_eq!(widen(&bytes), expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
     #[test]
     fn transforms_match_direct_polynomial_evaluation_and_round_trip() {
         for bits in [8, 16] {

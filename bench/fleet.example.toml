@@ -36,6 +36,11 @@ bundle_cache = "/Users/example/bench/fleet-bundles"
 rarpar_path = "/Users/example/dev/rarpar"
 weaver_path = "/Users/example/dev/weaver"
 rapidyenc_path = "/Users/example/dev/rapidyenc"
+# lzma_turbo_path and sevenz_turbo_path are only needed for the lzma-turbo and
+# sevenz-turbo suites; each checkout ships to the host as a git bundle of its
+# clean HEAD and is built there.
+lzma_turbo_path = "/Users/example/dev/lzma-turbo"
+sevenz_turbo_path = "/Users/example/dev/sevenz-turbo"
 docker = "docker"
 # How often a host is asked whether it has written its DONE sentinel.
 poll_seconds = 20
@@ -91,8 +96,9 @@ public_ip_lookup = ["dig +short -4 txt ch whoami.cloudflare @1.0.0.1", "dig +sho
 # Deliberately not 22: fleet boxes are internet-facing for their whole lives
 # and 22 attracts scanner noise and provider interference.
 ssh_ingress_port = 22022
-# Ceiling for any single machine's ec2.max_hours.
-max_session_hours = 3
+# Ceiling for any single machine's ec2.max_hours. The turbo machine's sevenz
+# fleet profile alone runs for hours, hence 7 rather than 3.
+max_session_hours = 7
 # SSM access (ec2.access = "ssm"): every file an SSM machine sends or returns
 # moves through this bucket as a short-lived tar object under
 # <resource_prefix>/<run id>/<machine>/, and the instance profile below (role
@@ -213,6 +219,10 @@ warmups = 1
 repeats = 5
 pin_cpus = "0-7"                         # P-cores on a hybrid part; empty = unpinned
 iocount = false                          # untimed strace -f -c pass (Linux)
+# PAR2 against PAR3 after the suite: rarpar par (plus the par2 oracle when the
+# machine has one) vs PAR3 Cauchy and FFT, par2 ÷ par3. versus | versus-smoke;
+# omit to skip.
+versus = "versus"
 # The reference keeps its volume paths in a 1 KiB buffer and fails on longer
 # lists, so keep the work path short (set C writes 13 volumes: about 40
 # characters at most). The plan warns about a longer path but runs anyway; the
@@ -438,6 +448,67 @@ hourly_usd = 0.4106
 access = "ssm"                           # ssh (default) | ssm
 spot = true                              # one-time spot, terminated on interruption
 # instance_profile = "..."               # default: fleet.aws.instance_profile
+
+# ---------------------------------------- machine: EC2 turbo suites (SSM) ----
+# lzma-turbo and sevenz-turbo on one spot host. No rarpar candidate is built:
+# the bundle carries a git bundle of each checkout plus its Go harness, and
+# the run script installs a pinned rustup, builds the candidates with each
+# checkout's rust-toolchain.toml, fetches the official 7-Zip release and
+# builds xz from its pinned tarball as the oracles. The sevenz fleet profile
+# alone is several hours on a 16-thread host, so the session caps are raised.
+[[machines]]
+name = "ec2-zen4-turbo"
+kind = "aws-ec2"
+platform_label = "linux-x86_64-zen4-turbo"
+build_target = "x86_64-unknown-linux-gnu"
+enabled = true
+wave = 1
+suites = ["lzma-turbo", "sevenz-turbo"]
+
+[machines.connection]
+user = "ubuntu"
+shell = "sh"
+
+[machines.capabilities]
+perf = "none"
+
+[machines.paths]
+staging = "/home/ubuntu/fs"
+cleanup = false
+
+[machines.bundle]
+# Only the Go harnesses are cross-compiled here; the Rust candidates are built
+# on the host, so the image is unused and the glibc target is fine.
+source = "docker"
+image = "docker.io/library/rust:1.97-alpine"
+build_host = "local"
+rust_target = "x86_64-unknown-linux-gnu"
+go_os = "linux"
+go_arch = "amd64"
+goamd64 = "v2"
+crt_static = false
+
+[machines.turbo]
+lzma_profile = "fleet"                   # quick | full | fleet
+sevenz_profile = "fleet"                 # quick | full | fleet
+# lzma_only = ["decode"]                 # harness --only selectors
+# sevenz_only = ["lzma2"]
+# lzma_repeats = 0                       # 0 = the profile's
+# sevenz_repeats = 0
+# pin_cpus = "0-7"                       # sevenz --pin-cpus (taskset list)
+timeout_minutes = 60                     # per-case harness timeout
+
+[machines.ec2]
+instance_type = "c7a.4xlarge"
+region = "us-east-1"
+ami = "ami-00000000000000000"
+vcpus = 16
+volume_gb = 60
+deadman_minutes = 480
+max_hours = 7.0
+hourly_usd = 0.8212
+access = "ssm"
+spot = true
 
 # ------------------------------------------------- machine: Windows (dGPU) ----
 # UNVALIDATED PATH. The runner uploads and executes a .ps1 file (never an inline

@@ -281,6 +281,29 @@ func machineSteps(machine Machine, layout RemoteLayout) []string {
 		steps = append(steps, fmt.Sprintf("on host: macro-par3, profile %s, workers %v, rarpar create/repair %s (verify runs once), warmups=%d repeats=%d, %s, reference failures are DNF, work %s",
 			machine.PAR3.Profile, machine.PAR3.Workers, strings.Join(par3Durabilities(machine), "+"), machine.PAR3.Warmups, machine.PAR3.Repeats,
 			timeout, PAR3Work(machine, layout)))
+		if machine.PAR3.Versus != "" {
+			steps = append(steps, fmt.Sprintf("on host: par3 versus, profile %s: PAR2 (rarpar par, plus the par2 oracle when present) against PAR3 Cauchy and FFT, par2 ÷ par3, every repair SHA-256 checked",
+				machine.PAR3.Versus))
+		}
+	}
+	if machine.hasTurbo() {
+		steps = append(steps,
+			fmt.Sprintf("on host: install rustup %s (pinned digest) with no default toolchain; each checkout's rust-toolchain.toml installs its own", rustupVersion),
+			fmt.Sprintf("on host: fetch the official 7-Zip %s release (pinned digest) as the 7zz oracle", sevenZipVersion))
+	}
+	if machine.hasSuite(SuiteLzmaTurbo) {
+		steps = append(steps,
+			"on host: clone lzma-turbo from the shipped git bundle, verify the commit, cargo build --locked lzma-bench",
+			fmt.Sprintf("on host: build xz %s (pinned digest, static) as the xz oracle, generate the lzma fixtures", xzVersion),
+			fmt.Sprintf("on host: lzma-turbo run, profile %s%s, %dm per-case timeout, results under results/lzma-turbo",
+				machine.Turbo.LzmaProfile, turboOnlyNote(machine.Turbo.LzmaOnly, machine.Turbo.LzmaRepeats), machine.Turbo.TimeoutMinutes))
+	}
+	if machine.hasSuite(SuiteSevenzTurbo) {
+		steps = append(steps,
+			"on host: clone sevenz-turbo from the shipped git bundle, verify the commit, cargo build --locked decode-bench (aws-lc-rs and native-crypto)",
+			fmt.Sprintf("on host: generate the %s sevenz fixture corpus with the official 7zz", turboCorpus(machine.Turbo.SevenzProfile)),
+			fmt.Sprintf("on host: sevenz-turbo run, profile %s%s, %dm per-case timeout, results under results/sevenz-turbo",
+				machine.Turbo.SevenzProfile, turboOnlyNote(machine.Turbo.SevenzOnly, machine.Turbo.SevenzRepeats), machine.Turbo.TimeoutMinutes))
 	}
 	switch machine.Capabilities.Perf {
 	case PerfLinux:
@@ -500,4 +523,17 @@ func joinLocal(parts ...string) string {
 		}
 	}
 	return strings.Join(cleaned, "/")
+}
+
+// turboOnlyNote renders a turbo suite's scenario filter and repeat override
+// for the plan.
+func turboOnlyNote(only []string, repeats int) string {
+	note := ""
+	if len(only) > 0 {
+		note += ", only " + strings.Join(only, "+")
+	}
+	if repeats > 0 {
+		note += fmt.Sprintf(", repeats=%d", repeats)
+	}
+	return note
 }

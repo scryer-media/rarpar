@@ -302,6 +302,67 @@ fn par_create_json_reports_real_outcome_and_writes_outputs() {
 }
 
 #[test]
+fn par_create_places_the_set_under_the_global_output_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::write(root.join("input.bin"), b"0123456789abcdef").unwrap();
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    std::fs::write(root.join("data/other.bin"), b"fedcba9876543210").unwrap();
+    std::fs::create_dir_all(root.join("sets")).unwrap();
+    let create = |extra: &[&str]| {
+        let mut args: Vec<&OsStr> = ["-o", "sets", "par", "create"]
+            .iter()
+            .chain(extra)
+            .map(OsStr::new)
+            .collect();
+        args.extend(
+            ["--block-size", "4", "--recovery-count", "1"]
+                .iter()
+                .map(OsStr::new),
+        );
+        run_in_dir(root, &args)
+    };
+    let succeeded = |output: &Output| {
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    // The set lands under -o; the input is still found beside OUTPUT as typed.
+    succeeded(&create(&["set.par2", "input.bin"]));
+    assert!(root.join("sets/set.par2").is_file());
+    assert!(!root.join("set.par2").exists());
+    let verify = run_in_dir(
+        root,
+        &[
+            OsStr::new("par"),
+            OsStr::new("verify"),
+            OsStr::new("sets/set.par2"),
+            OsStr::new("."),
+        ],
+    );
+    succeeded(&verify);
+
+    // An explicit --base-path is used as given, not moved under -o.
+    succeeded(&create(&["--base-path", "data", "named.par2", "other.bin"]));
+    assert!(root.join("sets/named.par2").is_file());
+    assert!(!root.join("sets/data").exists());
+    let verify = run_in_dir(
+        root,
+        &[
+            OsStr::new("par"),
+            OsStr::new("verify"),
+            OsStr::new("sets/named.par2"),
+            OsStr::new("data"),
+        ],
+    );
+    succeeded(&verify);
+}
+
+#[test]
 fn par_create_progress_reports_true_scan_totals_without_flooding() {
     let temp = tempfile::tempdir().unwrap();
     let sizes = [100_000usize, 50_000, 25_000];
@@ -1324,6 +1385,118 @@ fn rar_list_and_test_validate_a_real_archive() {
         String::from_utf8_lossy(&test.stdout),
         String::from_utf8_lossy(&test.stderr)
     );
+}
+
+/// Run `rarpar` from `dir` with `--password-file pass_file`.
+fn run_in_dir_with_password_file(dir: &Path, pass_file: &Path, args: &[&OsStr]) -> Output {
+    Command::new(bin())
+        .current_dir(dir)
+        .arg("--password-file")
+        .arg(pass_file)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn assert_success(output: &Output, what: &str) {
+    assert!(
+        output.status.success(),
+        "{what} failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn rar_list_and_test_follow_the_volume_chain() {
+    // Two members over nine volumes, the second starting in volume 5: naming
+    // the first volume has to reach the second member and every volume of
+    // both.
+    let first = fixture(&[
+        "crates",
+        "unrar-rs",
+        "tests",
+        "fixtures",
+        "rar5",
+        "rar5_mv_store_pair.part01.rar",
+    ]);
+    let list = run(&[OsStr::new("rar"), OsStr::new("list"), first.as_os_str()]);
+    assert_success(&list, "rar list");
+    assert_eq!(
+        String::from_utf8_lossy(&list.stdout),
+        "Silver.Horizon.S02E01.mkv\nSilver.Horizon.S02E02.mkv\n"
+    );
+    let test = run(&[OsStr::new("rar"), OsStr::new("test"), first.as_os_str()]);
+    assert_success(&test, "rar test of a RAR5 volume set");
+
+    let first = fixture(&[
+        "crates",
+        "unrar-rs",
+        "tests",
+        "fixtures",
+        "rar4",
+        "rar4_tiny_volumes.part1.rar",
+    ]);
+    let test = run(&[OsStr::new("rar"), OsStr::new("test"), first.as_os_str()]);
+    assert_success(&test, "rar test of a RAR4 volume set");
+}
+
+#[test]
+fn rar_test_decrypts_a_member_split_across_volumes() {
+    // One encrypted member over five volumes: tested from the first volume
+    // alone, its packed data stops at a size that is not a whole number of
+    // AES blocks.
+    let temp = tempfile::tempdir().unwrap();
+    let pass_file = temp.path().join("passwords.txt");
+    std::fs::write(&pass_file, "testpass123\n").unwrap();
+    let fixture_dir = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar4"]);
+    let test = run_in_dir_with_password_file(
+        &fixture_dir,
+        &pass_file,
+        &[
+            OsStr::new("rar"),
+            OsStr::new("test"),
+            OsStr::new("rar4_enc_mv_store.part1.rar"),
+        ],
+    );
+    assert_success(&test, "rar test of an encrypted RAR4 volume set");
+}
+
+#[test]
+fn rar_commands_accept_a_bare_archive_name() {
+    let temp = tempfile::tempdir().unwrap();
+    let rar4 = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar4"]);
+    let rar5 = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar5"]);
+    for volume in 1..=5 {
+        let name = format!("rar4_tiny_volumes.part{volume}.rar");
+        std::fs::copy(rar4.join(&name), temp.path().join(name)).unwrap();
+    }
+    std::fs::copy(
+        rar5.join("rar5_hp_store.rar"),
+        temp.path().join("rar5_hp_store.rar"),
+    )
+    .unwrap();
+    let pass_file = temp.path().join("passwords.txt");
+    std::fs::write(&pass_file, "secretpass\n").unwrap();
+
+    // A header-encrypted archive and a volume set both make discovery list
+    // the archive's directory, which a bare name's empty parent is not.
+    for (archive, member) in [
+        ("rar4_tiny_volumes.part1.rar", "random_4k.bin"),
+        ("rar5_hp_store.rar", "small.txt"),
+    ] {
+        let out = format!("out-{archive}");
+        for args in [
+            vec!["rar", "list", archive],
+            vec!["rar", "test", archive],
+            vec!["rar", "extract", archive, out.as_str()],
+        ] {
+            let args = args.iter().map(OsStr::new).collect::<Vec<_>>();
+            let output = run_in_dir_with_password_file(temp.path(), &pass_file, &args);
+            assert_success(&output, &format!("{args:?}"));
+        }
+        assert!(temp.path().join(&out).join(member).is_file());
+    }
 }
 
 #[test]

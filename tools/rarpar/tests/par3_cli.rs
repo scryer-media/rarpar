@@ -582,6 +582,45 @@ fn creation_dry_run_overwrite_and_resource_limits() {
 }
 
 #[test]
+fn creation_places_a_relative_output_under_the_global_output_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    input(root, "data.bin");
+    let created = run(
+        root,
+        &[
+            "-o", "sets", "par3", "create", "set.par3", "data.bin", "-s", "256", "-r", "50",
+        ],
+        0,
+    );
+    assert!(root.join("sets/set.par3").is_file(), "{created}");
+    assert!(!root.join("set.par3").exists());
+    let verify = run(root, &["par3", "verify", "sets/set.par3", "-C", "."], 0);
+    assert_eq!(verify["status"], "Complete");
+
+    // An absolute OUTPUT wins over -o.
+    let absolute = root.join("abs/set.par3");
+    run(
+        root,
+        &[
+            "-o",
+            "sets",
+            "par3",
+            "create",
+            absolute.to_str().unwrap(),
+            "data.bin",
+            "-s",
+            "256",
+            "-r",
+            "50",
+        ],
+        0,
+    );
+    assert!(absolute.is_file());
+    assert!(!root.join("sets/abs").exists());
+}
+
+#[test]
 fn directory_requires_set_selection_and_invalid_carrier_fails_auto() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();

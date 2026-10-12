@@ -262,6 +262,68 @@ Public write-ups name hosts by core type only, for example "Zen 4" or
 "Graviton 4", never by machine name. `platform_label` should follow the same
 rule.
 
+## Turbo suites on the fleet
+
+`lzma-turbo` and `sevenz-turbo` run the lzma-turbo and sevenz-turbo Go
+harnesses (`bench/lzma-turbo-bench`, `bench/sevenz-turbo-bench` in their own
+repositories) against their own oracles. Name the checkouts in `[fleet]` and
+add the suites to a machine:
+
+```toml
+[fleet]
+lzma_turbo_path = "/path/to/lzma-turbo"
+sevenz_turbo_path = "/path/to/sevenz-turbo"
+
+[[machines]]
+suites = ["lzma-turbo", "sevenz-turbo"]
+
+[machines.turbo]
+lzma_profile = "fleet"            # quick | full | fleet
+sevenz_profile = "fleet"
+# lzma_only = ["decode"]          # the harness's --only selectors
+# sevenz_only = ["lzma2"]
+# lzma_repeats = 0                # 0 = the profile's
+# sevenz_repeats = 0
+# pin_cpus = "0-7"                # sevenz --pin-cpus
+timeout_minutes = 60              # per case
+```
+
+Unlike the rarpar suites, the candidates are built **on the host**. Both
+harnesses record the checkout's rustc and lockfile as provenance, the lzma
+harness refuses a binary whose embedded commit is not the checkout's clean
+HEAD, and lzma's fixtures come from `cargo xtask` in that checkout. So the
+bundle carries, per suite, a `git bundle` of the checkout's HEAD commit, a
+`.commit` sidecar, and the harness cross-compiled with CGO off. The build
+refuses a dirty checkout. A machine that runs only turbo suites skips the
+container build entirely; its `[machines.bundle]` still sets the Go target.
+
+On the host, the run script:
+
+1. installs rustup 1.29.1 from its pinned, digest-checked installer under the
+   run root with no default toolchain, so each checkout's `rust-toolchain.toml`
+   installs exactly its own compiler;
+2. fetches the official 7-Zip 26.03 Linux release (digest-checked) as the
+   `7zz` oracle, with the same pin lzma-turbo's `xtask` carries;
+3. for `lzma-turbo`: clones the bundle, verifies the commit, builds XZ Utils
+   5.8.3 from its pinned tarball (static), runs `toolchain --build`,
+   `fixtures`, then `run --profile <lzma_profile>` into `results/lzma-turbo/`;
+4. for `sevenz-turbo`: clones the bundle, verifies the commit, builds
+   `decode-bench` twice (`aws-lc-rs` and `native-crypto`), generates the
+   fixture corpus with the official `7zz`, records the toolchain, then
+   `run --profile <sevenz_profile>` into `results/sevenz-turbo/`.
+
+Setup logs live under `results/turbo/`. Each stage that fails records a
+`fail` marker and skips the rest of that suite; the other suite and the
+manifest still run. The host needs `build-essential`, `cmake`, `pkg-config`,
+`git`, `curl`, `xz-utils` and `perl`; EC2 user-data installs them.
+
+Budget the session for the profile. The sevenz `fleet` profile is the full
+corpus at three repeats and runs for hours on a 16-thread host; set
+`ec2.max_hours`, `ec2.deadman_minutes`, `fleet.aws.max_session_hours` and
+`fleet.host_timeout_minutes` accordingly, or narrow with `sevenz_only`.
+Only Linux hosts run these suites: a Windows host, or one whose
+`bundle.go_os` is not `linux` (a macOS host's is `darwin`), is refused.
+
 ## Network-mount rig
 
 Remote-filesystem rows do not run on the fleet. They come from the local
@@ -313,6 +375,9 @@ spot = true                                    # optional, SSM only
   against a live account yet. Treat its first run as bring-up.
 - The Windows transport is implemented and unit-tested but has not run against
   a live host (see below).
+- The turbo suites' host-side flow (rustup, checkout build, oracle fetch and
+  build, harness run) is unit-tested from the generated script but has not run
+  on a live host yet. Treat the first run as bring-up.
 
 ## Windows hosts
 

@@ -26,6 +26,8 @@ writing, compression, or modification APIs.
 - Creates PAR2 recovery sets with validated, atomically committed output
   (`par create`).
 - Restores missing RAR volumes from `.rev` recovery volumes when available.
+- Compresses, decompresses, tests and lists `.xz` files on several threads
+  (`xz compress`, `xz decompress`, `xz test`, `xz list`).
 - Extracts RAR archives with integrity checks enabled.
 - Handles encrypted archives through secure password sources or a hidden
   interactive prompt.
@@ -213,6 +215,13 @@ variable scheme by default and can be selected as `uniform` with
 `--volume-scheme`, then split with `--volume-count`. `--memory-mib` sets the
 creator's bounded planning/working budget.
 
+With the global `-o DIR`, a relative OUTPUT is written under DIR (an absolute
+OUTPUT wins), but `--base-path` still defaults to the parent of OUTPUT as typed,
+so the inputs are found where they were and an explicit `--base-path` is used
+as given. `rarpar -o sets par create set.par2 input.bin` writes
+`sets/set.par2` protecting `./input.bin`; verify it with the data's directory
+as a search directory (`rarpar par verify sets/set.par2 .`).
+
 Creation honors the global safety/reporting flags:
 
 ```bash
@@ -238,6 +247,22 @@ rarpar r -B ./release ./release/release.par2 "*.rar"
 
 The explicit `rarpar par ...` commands remain the general-purpose interface.
 
+`par verify` can check one protected file as it streams in, without saving it
+first: give the set as a path and name the file the stream is with `--name`.
+
+```bash
+curl -s "$URL" | rarpar par verify release.par2 --name part01.rar
+```
+
+The stream is hashed one slice at a time in memory that does not depend on its
+length. That slice must fit `--par3-memory-mib` (default 256 MiB) and the file
+may have at most 32768 slices; a set that declares more exits 1 before any
+slice is allocated. The report names the damaged slices, how many are missing from a short
+stream or trail a long one, and whether the set's recovery blocks could repair
+it; an intact stream exits 0 and a damaged one 1. An unknown `--name` exits 2
+and lists the names the set protects. `par repair` works on files on disk only
+and exits 2 when given `-` or `--name`.
+
 PAR3 operations:
 
 ```bash
@@ -260,6 +285,25 @@ one recovery index in each cohort — so `--first-recovery` takes a multiple of
 the cohort count and a recovery count or percentage is completed to the whole
 rows that hold it. Percentage sizing uses the block count after deduplication
 and requires a second planning pass over sources.
+
+`par3 create OUTPUT -` (or an absent FILE when standard input is not a terminal)
+makes a set for one file read from standard input:
+
+```bash
+tar -c ./release | rarpar par3 create release.tar.par3 - \
+  --name release.tar -s 1048576 -c 16
+```
+
+The stream's length is unknown until it ends, so `--name` (the file name the set
+records), `-s/--block-size` and `-c/--recovery-count` are required, and options
+that depend on the length or on seeing the data twice (`-r`, FFT, interleave,
+`--first-recovery`, deduplication, data packets, volume sizing, `--base-path`,
+`--scratch-dir`) are refused. The data is read once as it arrives and never
+buffered or staged to a temporary file; memory is the recovery blocks plus a few
+dozen bytes per input block (twice the recovery blocks until the stream passes
+128 blocks, while the set's field is still open). OUTPUT is a stem or `.par3`
+path, or an existing directory that takes `--name` inside it. The set is laid out
+as `par3 archive` lays out its sibling sets; verify it against the saved file.
 
 Use `--dry-run --json par3 create ...` to obtain output paths, sizes, block counts,
 and scratch requirements without writing. Existing carriers require `--overwrite`;
@@ -301,6 +345,98 @@ budget covers engine allocations; CLI path/report storage is bounded separately
 by `--max-files` and metadata limits. `auto` repairs before rediscovering and
 extracting RAR inputs. Container insertion/self-repair and recovery-carrier
 reconstruction remain explicit library APIs rather than CLI commands.
+
+xz operations:
+
+```bash
+rarpar xz compress data.tar                    # writes data.tar.xz
+rarpar xz compress --level 9 --extreme --threads 8 data.tar
+rarpar xz decompress data.tar.xz ./out         # writes ./out/data.tar
+rarpar xz test data.tar.xz
+rarpar --json xz list data.tar.xz
+tar -c ./release | rarpar xz compress > release.tar.xz
+curl -s "$URL" | rarpar xz decompress --threads 4 | tar -x
+```
+
+`xz compress [INPUT] [OUTPUT]` and `xz decompress [INPUT] [OUTPUT]` take a file,
+or `-` for standard input or output; an absent INPUT is standard input when that
+is not a terminal. Pipes are read and written as the data flows, never staged
+to a temporary file, in memory that does not depend on the stream's length, and
+a slow reader holds rarpar back rather than growing a buffer. OUTPUT defaults to INPUT with `.xz` added
+(compress) or removed (decompress, where `.txz` becomes `.tar`), beside INPUT or
+in the global `--output` directory; an existing directory as OUTPUT takes that
+name inside it, and standard input defaults to standard output. When both
+`-o DIR` and OUTPUT are given, a relative OUTPUT is placed under DIR keeping its
+own subdirectories (`-o out ... sub/a.xz` writes `out/sub/a.xz`), an absolute
+OUTPUT wins and ignores `-o`, and `-` is always standard output; `par3 create`
+and `par3 archive` place their OUTPUT the same way. Inputs are
+always kept, so `--delete-sources` is refused. An existing output requires
+`--overwrite`; the output is staged beside its destination, installed only once
+complete, and keeps the input's permissions and modification time. Compressed
+data is not written to a terminal.
+
+`--level` 0-9 and `--extreme` select the xz preset of that number; the default
+is 6 with a CRC-64 check, and `--check` selects `crc32`, `crc64`, `sha256` or
+`none`. The stream is cut into blocks of `--block-size` bytes, by default three
+times the preset's dictionary (at least 1 MiB) as xz's threaded mode does, and
+up to `--threads` blocks (default: available CPUs) are compressed at once. The
+output bytes do not depend on `--threads`. A dictionary larger than the largest
+block is shrunk to fit it. `--memory-mib` caps the estimated encoder memory by
+running fewer threads; there is no cap by default.
+
+Decompression and `xz test` verify every block's check. A file with more than
+one block is decoded on up to `--threads` threads within `--memory-mib` (default
+1024), with fewer threads when the largest block needs it; single-block files
+and files the parallel decoder cannot map are decoded in one pass, whose
+dictionary must fit the same limit. A pipe is decoded as it arrives: on several
+threads, blocks whose headers record their sizes (as rarpar's and xz's threaded
+output do) go to workers, and other blocks are decoded in order.
+Concatenated streams and stream padding decode as one output. `xz list` reads
+the index of every stream from the end of a file and reports each stream's
+offset, sizes, check, padding and blocks. A pipe has no end to seek to, so
+`xz list -` decodes it once and reports the sizes, the stream and block counts,
+each block's uncompressed size and the first stream's check, with `unknown`
+naming what a single forward pass cannot give. With `--json`, every action prints one
+report; when the data itself goes to standard output, reports go to standard
+error. A damaged stream exits 1, an exceeded memory limit 4, and a refused
+output 3.
+
+Sidecar recovery sets in the same pass:
+
+```bash
+rarpar xz compress --sidecar par2 --sidecar-block-size 1048576 \
+  --sidecar-recovery-count 16 data.tar         # data.tar.xz + data.tar.xz.par2 + volumes
+tar -c ./release | rarpar xz compress --sidecar par3 --sidecar-block-size 1048576 \
+  --sidecar-recovery-count 16 --sidecar-name release.tar.xz > release.tar.xz
+rarpar par3 archive --format zip --sidecar par2 -s 1048576 -c 16 set.zip ./release
+```
+
+`xz compress --sidecar par2|par3` and `par3 archive --sidecar par2|par3` feed
+the archive's bytes, as they are written, to a PAR2 or PAR3 creator and write a
+conventional one-file set (an index plus power-of-two recovery volumes) beside
+the archive. The archive is never read back and nothing is staged to a temporary
+file; memory is the recovery blocks, one block, and a few dozen bytes per input
+block, within `--par3-memory-mib` for either format. The archive's length is
+unknown until its last byte, so the block size and recovery count are fixed up
+front: `--sidecar-block-size` and `--sidecar-recovery-count` (both required for
+`xz compress`; on `par3 archive` they are aliases of `-s` and `-c`, and `-c`
+defaults to 1). A PAR2 sidecar records the same packets in the same layout as
+`par create` over the finished archive with the same block size and recovery
+count, byte for byte. Verify and repair with `par verify|repair` or
+`par3 verify|repair` against the archive.
+
+An xz file names its set after itself (`data.tar.xz.par2`); `par3 archive`
+names it after the archive's stem (`set.par2`, as its PAR3 sibling sets are
+named). The set follows the archive's placement under `-o`, is staged beside
+its names and installed after the archive, and every name it will take is
+checked, with the same `--overwrite` and symlink rules, before a byte is
+read. An archive written to standard output has no name to record, so
+`--sidecar` there needs `--sidecar-name NAME`, the name the output will be
+saved under (placed under `-o` like an OUTPUT); otherwise it exits 2. Neither
+command writes multi-volume archives, so one set covers the one archive.
+`par3 archive --format 7z --sidecar par2` is refused (exit 2): the 7z writer
+writes its start header last, over bytes PAR2's whole-file MD5 has already
+taken, so use `--sidecar par3` or run `par create` over the finished 7z.
 
 PAR2 placement defaults to `smart`, which can locate renamed or moved data by
 content. For a conventional expected-path-only verification or repair, use:
@@ -456,7 +592,8 @@ Status: **Landed** ships; **Building** has an owner now; **Exploring** is a meas
 |---|---|---|---|
 | GFNI affine tiers on AVX2 for GF(2^8), GF(2^16) and the FFT linear maps | PAR2, PAR3 | Landed | |
 | Native 8-bit FFT lane, fused butterflies and radix-4, zero truncation, in-place scaling | PAR3 FFT | Landed | |
-| Fused FFT decode (`derivative_at`), pass-count admission, proof frontiers before decode | PAR3 repair | Landed | |
+| FFT repair through capacity-sized windows (Algorithm 5 of Chen, Lin, Tang, Han and others, 2026): two banks of `capacity` rows plus a third that overlaps the next fill when workers can use it; pass-count admission, proof frontiers before decode; 1.2–1.9x faster repair on c7a, c7i and c8g, and a 4096 × 16 KiB repair's charged peak down from 137.9 MB to 15.8 MB | PAR3 repair | Landed | |
+| Four-step FFT transform (leaf 2^6), gated to AMD CPUs with the AVX2 linear kernels, on pooled transforms over more than 64 points and serial ones over rows of at least 16 KiB | PAR3 FFT on AMD | Landed | Zen 5 with AVX-512 kernels, two workers and 2–8 KiB serial rows are unmeasured, so gated off |
 | Grouped multi-source Cauchy kernels, resident recovery rows, clone-based staging, no read-back, spool never fsynced | PAR3 create and repair | Landed | |
 | Reference comparison fleet and PAR3 bench suite (`rarpar-bench par3`) | measurement | Landed | live Windows and SSM runs |
 | GF(2^8) AVX-512 tiers (GFNI on zmm, VBMI nibble form), cached multiply plans, factor 0 and 1 short-circuits | PAR2, PAR3 | Building | Zen 4 and Sapphire Rapids via the fleet |
@@ -466,9 +603,8 @@ Status: **Landed** ships; **Building** has an owner now; **Exploring** is a meas
 | Planning hashes fused with the encode read; redundant zero-fills and coverage scans removed; repair validation fused into the codec read | PAR3 disk work | Building | |
 | par3cmdline-compatible command-line facade | rarpar CLI | Building | |
 | PAR3 inside RAR5 volume sets (experimental `par3 inside`): trailing region by default, `PAR3` service header as the alternative; trailing reads clean in unrar and unrar-rs with a 7-Zip "data after end" warning, the service header reads clean in all three; 1 GiB inserts in 0.7 to 1.5 s at 2 to 15% and repairs in 1.6 to 2.6 s | PAR3, rarpar CLI | Building | layout agreed with the PAR3 maintainers |
-| FFT repair with main-step transforms sized by the smaller side of the code, O(N log min(K, N-K)) in place of the O(N log N) decoder shipped today; for a low-rate code, N/K length-K transforms replace one length-N transform (Chen, Lin, Tang, Han and others, 2023 and 2026) | PAR3 FFT repair | Exploring | decode only, so recovery bytes cannot change; the locator step stays O(N log N); published timings are GF(2^8) at N = 256 on SSE and AVX2, none at GF(2^16) or at 10,000 to 60,000 blocks; repaired bytes equal the current decoder's on every fixture, interleaved cohorts above 65,536 blocks included |
 | Frobenius additive FFT: evaluations at conjugate points follow from one another under the Frobenius map, so one point per orbit is transformed (Li, Chen, Kuo, Cheng, Yang 2018) | PAR3 FFT | Exploring | the published saving is for polynomials whose coefficients lie in a subfield, and block data fills the whole field, so the spike first has to show that any of it carries over; on create the byte-exact par3cmdline differential is the gate |
-| Recursive four-step stage order for the additive FFT, built for memory locality, n/2 · log2 n multiplications (Samanta, Badakhshan, Gong 2026) | PAR3 FFT | Exploring | measured against column tiling, which goes after the same cache misses; published timings are GF(2^128), faster than the Lin-Chung-Han transform in 37 of 42 configurations, none at GF(2^16) or GF(2^8); it takes monomial-basis input where the PAR3 codeword is defined on the Lin-Chung-Han basis, so the stage order has to carry over to that basis without a conversion pass |
+| Recursive stage order for the additive FFT (Samanta, Badakhshan, Gong 2026) and the `encode-pruned`, `fft-hash-feed` and `cauchy-shared` lanes | PAR3 FFT and Cauchy | Dropped | measured on c7a, c7i and c8g: the recursive order and `encode-pruned` about 1.0x everywhere; `fft-hash-feed` halved source reads but saved no time and was 0.73–0.92x at 4 workers on the 1.5 GiB create; `cauchy-shared` 10–100x slower on Cauchy create with a higher charged peak; see `crates/par3-rs/PERFORMANCE.md` |
 | SME2 GF(2) outer-product GEMM (`BMOPA`) for Cauchy and Vandermonde encode and solve | PAR2, PAR3 | Watch | spike measured: slower than NEON at the 12–16 source groups the engines issue and at 8–18 workers (SME unit shared per cluster); wins 2–3x only at 64 or more sources per product; kept as an opt-in `kernel_ceiling` lane |
 | Wide-K engine restructure: stage 64 or more source stripes per matrix product instead of 16 | PAR2, PAR3 Cauchy, matrix-unit ISAs | Dropped | breakpoint spike measured on Apple silicon at 8 workers: repair of 1–10 lost blocks never crosses on realistic sets (N 256–51,200 blocks, 64 KiB stripe: SME2 saves 8–14 ms of compute per pass against at least 130 ms of streamed read, and holding K stripes resident forfeits NEON's read-ahead overlap, a net loss cold); PAR2 shows no crossover up to N=32,000 for 1–4 lost blocks or 5–10% recovery; full-recovery create is 1.2–1.5x on the kernel but per-pass plan rebuilds erase it and cached plans cost 32·R·N bytes (1.6 GB at N=32,000); the apparent 1.9x on one lost block was the PAR3 repair nest running row-parallel on one thread, fixed by a column split instead (see PAR3 repair row); revisit only if large-set create with page-cached sources and a 256 KiB or larger stripe becomes a hot path |
 | PAR3 repair nest column split when fewer blocks are lost than there are workers | PAR3 | Dropped | measured on Sapphire Rapids and Apple silicon against the merged column-tiled FFT: at 8 workers it was 1.06–1.11x slower on wall and 1.26–1.64x on CPU for 1–4 lost blocks at a 64 KiB stripe, flat at 10 lost, and 1.02–1.16x CPU with +16 MiB at a 1 MiB stripe; repair is bounded by disk reads the existing nest already overlaps, so the idle threads the wide-K spike saw were waiting on I/O, not on the kernel; the patch is kept in the campaign handoff folder |
@@ -476,7 +612,7 @@ Status: **Landed** ships; **Building** has an owner now; **Exploring** is a meas
 | AVX10.2 and APX | every x86 kernel | Watch | Diamond Rapids and Nova Lake; EVEX kernels carry over |
 | AVX-512 FFT linear map tier | PAR3 FFT | Watch | depends on the GF(2^8) AVX-512 result |
 
-The PAR3 FFT lane shipped today is the additive transform and formal-derivative erasure decoder of Lin, Al-Naffouri, Han and Chung (2016). The Exploring rows come from later work:
+The PAR3 FFT lane shipped today is the additive transform of Lin, Al-Naffouri, Han and Chung (2016) with the capacity-window erasure decoder of Chen, Lin, Tang, Han and others (2026). The other rows come from later work:
 
 - Baseline: S.-J. Lin, T. Y. Al-Naffouri, Y. S. Han, W.-H. Chung, "Novel Polynomial Basis With Fast Fourier Transform and Its Application to Reed-Solomon Erasure Codes", IEEE Trans. Inf. Theory 62(11), 2016, [doi:10.1109/TIT.2016.2608892](https://doi.org/10.1109/TIT.2016.2608892).
 - C. Chen, S.-J. Lin, Z. Li, S. Cai, Y. S. Han, B. Bai, "Reduced-Complexity Erasure Decoding of Low-Rate Reed-Solomon Codes Based on LCH-FFT", IEEE ISIT 2023, pp. 1015-1019; extended by C. Chen, S.-J. Lin, N. Tang, Y. S. Han, S. Cai, L. Yu, Z. Li, B. Bai, B. Bai, "Two Fast Erasure Decoding Algorithms for Reed-Solomon Codes Based on LCH-FFT", IEEE Trans. Inf. Theory, 2026 (authors' version).
@@ -484,6 +620,9 @@ The PAR3 FFT lane shipped today is the additive transform and formal-derivative 
 - S. Samanta, M. Badakhshan, G. Gong, "On the Additive FFT Techniques over Binary Extension Fields", 2026, [arXiv:2608.20855](https://arxiv.org/abs/2608.20855).
 
 Error-correcting decoders (the Welch-Berlekamp line, Tang and Han 2022) are not on the radar: PAR3 repair knows which blocks are lost from their checksums, so it only ever decodes erasures.
+
+What each shipped paper contributed, and where it is used, is recorded in
+[ATTRIBUTION.md](ATTRIBUTION.md).
 
 
 ## License
