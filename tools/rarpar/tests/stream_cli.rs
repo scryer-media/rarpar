@@ -782,6 +782,55 @@ fn par_verify_from_a_pipe_refuses_a_slice_size_it_cannot_hold() {
 }
 
 #[test]
+fn par_verify_from_a_pipe_ending_inside_a_slice_leaves_it_unverified_within_the_limit() {
+    // One 1 MiB slice takes the whole of a 1 MiB limit, so the verifier has
+    // nothing left to hold a slice the stream ended inside: that slice is
+    // reported missing, not buffered beside the slice being read.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let data = sample(2 << 20, 29);
+    std::fs::write(root.join("big.bin"), &data).unwrap();
+    ok(&rarpar(
+        root,
+        &[
+            "par",
+            "create",
+            "set.par2",
+            "big.bin",
+            "-s",
+            "1048576",
+            "--recovery-count",
+            "1",
+        ],
+    ));
+    let short = through_pipes(
+        root,
+        &[
+            "--json",
+            "--par3-memory-mib",
+            "1",
+            "par",
+            "verify",
+            "set.par2",
+            "--name",
+            "big.bin",
+        ],
+        data[..data.len() - 1].to_vec(),
+    );
+    assert_eq!(
+        short.status.code(),
+        Some(1),
+        "stderr={}",
+        String::from_utf8_lossy(&short.stderr)
+    );
+    let report = json(&short);
+    assert_eq!(report["success"], false);
+    assert_eq!(report["stream"]["bytes"], data.len() as u64 - 1);
+    assert_eq!(report["stream"]["damaged_slices"], serde_json::json!([]));
+    assert_eq!(report["stream"]["missing_slices"], 1);
+}
+
+#[test]
 fn par_verify_from_a_pipe_refuses_what_it_cannot_do() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
