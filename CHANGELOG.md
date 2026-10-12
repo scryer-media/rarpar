@@ -78,6 +78,9 @@ documented in each crate's own changelog so those notes ship with the crate.
 - `par verify --name` checks a file the set has no slice checksums for by its
   length and whole-file MD5, as `par verify` does on disk, instead of failing;
   the `--json` report's `stream.slice_checksums` says which check ran.
+- `rar extract` accepts a header-encrypted archive or a volume set named
+  without a directory (`rar extract set.part1.rar`), instead of failing with
+  "No such file or directory"; `./set.part1.rar` already worked.
 
 ### Library versions
 

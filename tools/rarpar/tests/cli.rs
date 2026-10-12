@@ -1387,6 +1387,57 @@ fn rar_list_and_test_validate_a_real_archive() {
     );
 }
 
+/// Run `rarpar` from `dir` with `RARPAR_TEST_PASSWORD` set to `password`.
+fn run_in_dir_with_password(dir: &Path, password: &str, args: &[&OsStr]) -> Output {
+    Command::new(bin())
+        .current_dir(dir)
+        .env("RARPAR_TEST_PASSWORD", password)
+        .arg("--password-env")
+        .arg("RARPAR_TEST_PASSWORD")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn assert_success(output: &Output, what: &str) {
+    assert!(
+        output.status.success(),
+        "{what} failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn rar_extract_accepts_a_bare_archive_name() {
+    let temp = tempfile::tempdir().unwrap();
+    let rar4 = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar4"]);
+    let rar5 = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar5"]);
+    for volume in 1..=5 {
+        let name = format!("rar4_tiny_volumes.part{volume}.rar");
+        std::fs::copy(rar4.join(&name), temp.path().join(name)).unwrap();
+    }
+    std::fs::copy(
+        rar5.join("rar5_hp_store.rar"),
+        temp.path().join("rar5_hp_store.rar"),
+    )
+    .unwrap();
+
+    // A header-encrypted archive and a volume set both make discovery list
+    // the archive's directory, which a bare name's empty parent is not.
+    for (archive, member) in [
+        ("rar4_tiny_volumes.part1.rar", "random_4k.bin"),
+        ("rar5_hp_store.rar", "small.txt"),
+    ] {
+        let out = format!("out-{archive}");
+        let args = ["rar", "extract", archive, out.as_str()];
+        let args = args.iter().map(OsStr::new).collect::<Vec<_>>();
+        let output = run_in_dir_with_password(temp.path(), "secretpass", &args);
+        assert_success(&output, &format!("{args:?}"));
+        assert!(temp.path().join(&out).join(member).is_file());
+    }
+}
+
 #[test]
 fn rar_restore_volumes_restores_a_missing_volume_explicitly() {
     let temp = tempfile::tempdir().unwrap();

@@ -324,12 +324,21 @@ pub fn discover_rar_set_for_archive(
         }
     }
 
-    let root = archive
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf();
+    let root = parent_directory(archive).to_path_buf();
     let report = discover(vec![root], options)?;
     selected_rar_set_from_sets(report.rar_sets, archive)
+}
+
+/// The directory a file lives in.
+///
+/// A bare file name's parent is the empty path, which no filesystem call
+/// accepts and which would key the file apart from the `./`-prefixed
+/// siblings a listing of the current directory yields, so it stands for the
+/// current directory instead.
+fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
 }
 
 fn discover_named_rar_family(
@@ -338,7 +347,7 @@ fn discover_named_rar_family(
     label: &str,
     options: &DiscoveryOptions,
 ) -> Result<Vec<DiscoveredFile>, RarparError> {
-    let root = archive.parent().unwrap_or_else(|| Path::new("."));
+    let root = parent_directory(archive);
     let mut entries = std::fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.path());
 
@@ -766,11 +775,7 @@ impl RarSetBuilder {
         Self {
             id: id.to_string(),
             label: file.set_hint.clone(),
-            base_dir: file
-                .path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf(),
+            base_dir: parent_directory(&file.path).to_path_buf(),
             volumes: Vec::new(),
             recovery_volumes: Vec::new(),
         }
@@ -1037,17 +1042,13 @@ fn fallback_set_key(path: &Path) -> String {
 }
 
 fn parent_key(path: &Path) -> String {
-    path.parent()
-        .unwrap_or_else(|| Path::new("."))
-        .display()
-        .to_string()
+    parent_directory(path).display().to_string()
 }
 
 fn common_base_dir(paths: &[PathBuf]) -> PathBuf {
     paths
         .first()
-        .and_then(|path| path.parent())
-        .unwrap_or_else(|| Path::new("."))
+        .map_or(Path::new("."), |path| parent_directory(path))
         .to_path_buf()
 }
 
