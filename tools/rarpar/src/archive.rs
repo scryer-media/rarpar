@@ -1009,7 +1009,7 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
         Guard::Sidecar(sidecar) => {
             file.sync_all()?;
             drop(file);
-            let finished = sidecar.finish(&name, &stem, cli.overwrite, Durability::Sync)?;
+            let finished = sidecar.finish(cli, &name, &stem, Durability::Sync)?;
             let mut set = finished.report.clone();
             // The set is staged beside its names before the archive is
             // installed, and installed after it, as a PAR3 sibling is.

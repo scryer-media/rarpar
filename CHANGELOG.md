@@ -65,6 +65,8 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ### Fixes
 
+- `par3 create -` and `--sidecar par3` under `--overwrite` refuse (exit 3) a
+  stream too short for a block when the previous set's volumes would remain.
 - `par3 create -` and `--sidecar par3` stop at the first input block
   GF(2^16) cannot hold, instead of first taking in the rest of the read.
 

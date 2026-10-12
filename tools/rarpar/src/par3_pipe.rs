@@ -149,7 +149,7 @@ pub fn create(
     {
         std::fs::create_dir_all(directory)?;
     }
-    let finished = sidecar.finish(&name, &stem, cli.overwrite, durability)?;
+    let finished = sidecar.finish(cli, &name, &stem, durability)?;
     let set = finished.report.clone();
     let (outputs, sizes) = finished.install()?;
     for key in [

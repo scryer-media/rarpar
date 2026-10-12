@@ -353,12 +353,7 @@ fn compress(cli: &Cli, input: &Path, args: &XzCompressArgs) -> Result<Value, Rar
             {
                 std::fs::create_dir_all(directory)?;
             }
-            Some(set.finish(
-                name,
-                stem,
-                cli.overwrite,
-                crate::par3_stream::Durability::Sync,
-            )?)
+            Some(set.finish(cli, name, stem, crate::par3_stream::Durability::Sync)?)
         }
         _ => None,
     };

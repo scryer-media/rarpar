@@ -259,13 +259,15 @@ impl Sidecar {
 
     /// Finish the set for a file recorded as `name`, and write it beside the
     /// paths `stem` names, synced first unless `durability` is buffered.
+    /// `cli` decides whether existing files there may be replaced.
     pub(crate) fn finish(
         self,
+        cli: &rarpar::cli::Cli,
         name: &str,
         stem: &Path,
-        overwrite: bool,
         durability: Durability,
     ) -> Result<FinishedSidecar, RarparError> {
+        let overwrite = cli.overwrite;
         let creator = par3_stream::creator_text();
         let block_size = self.plan.block_size;
         let (staged, report) = match self.lane {
@@ -332,6 +334,18 @@ impl Sidecar {
                     ));
                 };
                 coding.truncate(geometry.recovery);
+                // A file too short for one block has no recovery rows, so the
+                // set is its index alone, not the volumes `preflight_set`
+                // cleared for replacing: a previous set's volumes at those
+                // names would outlive it. Check what is written instead.
+                if geometry.recovery != self.plan.rows {
+                    let written = SidecarPlan {
+                        rows: geometry.recovery,
+                        ..self.plan
+                    }
+                    .paths(stem);
+                    crate::par3::reject_obsolete_sibling_carriers(cli, stem, &written)?;
+                }
                 let runs = lane.checksum_runs();
                 let spec = SetSpec {
                     id_name: name,

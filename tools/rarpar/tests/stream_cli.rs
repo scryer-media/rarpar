@@ -400,6 +400,64 @@ fn par3_create_from_a_pipe_refuses_to_leave_obsolete_volumes_behind() {
 }
 
 #[test]
+fn par3_create_from_a_pipe_too_short_for_a_block_leaves_no_volumes_behind() {
+    // 32 bytes hold no 4096-byte block and are too short for a tail block,
+    // so the set is its index alone, not the volumes -c names: replacing a
+    // set that has those volumes would leave them authenticated beside an
+    // index they no longer belong to.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    for directory in ["sets", "short"] {
+        std::fs::create_dir_all(root.join(directory)).unwrap();
+    }
+    let create = |output: &str, data: Vec<u8>, overwrite: bool| {
+        let mut args = Vec::new();
+        if overwrite {
+            args.push("--overwrite");
+        }
+        args.extend_from_slice(&[
+            "par3",
+            "create",
+            output,
+            "-",
+            "--name",
+            "piece.bin",
+            "-s",
+            "4096",
+            "-c",
+            "2",
+        ]);
+        through_pipes(root, &args, data)
+    };
+    ok(&create("sets/set.par3", sample(200_000, 3), false));
+    let before = listing(&root.join("sets"));
+    assert!(before.len() > 1, "{before:?}");
+    let contents: Vec<Vec<u8>> = before
+        .iter()
+        .map(|name| std::fs::read(root.join("sets").join(name)).unwrap())
+        .collect();
+
+    let short = create("sets/set.par3", sample(32, 5), true);
+    code_of(&short, 3);
+    assert!(String::from_utf8_lossy(&short.stderr).contains("obsolete"));
+    assert_eq!(listing(&root.join("sets")), before);
+    for (name, content) in before.iter().zip(&contents) {
+        assert_eq!(
+            &std::fs::read(root.join("sets").join(name)).unwrap(),
+            content
+        );
+    }
+
+    // A previous set that is an index alone is replaced as before.
+    ok(&create("short/set.par3", sample(32, 5), false));
+    let data = sample(32, 7);
+    ok(&create("short/set.par3", data.clone(), true));
+    assert_eq!(listing(&root.join("short")), ["set.par3"]);
+    std::fs::write(root.join("short/piece.bin"), &data).unwrap();
+    assert_eq!(par3_verdicts(&root.join("short"), "set.par3").0, Some(0));
+}
+
+#[test]
 fn par3_create_from_a_pipe_needs_what_the_length_would_choose() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
