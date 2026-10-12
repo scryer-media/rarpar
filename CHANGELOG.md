@@ -7,7 +7,20 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ### Fixes
 
-- Follow-ups to the 0.6.1 review on the CLI only; no library crate changes.
+- `xz compress --sidecar`, `par3 archive` and `par3 create -` refuse (exit 3)
+  a planned set file that exists as a directory or other non-regular file,
+  `--overwrite` or not, before replacing anything; `xz compress` and
+  `par3 archive` replaced the archive and then failed to install the set.
+- `par3 create OUTPUT -` takes a `.par3` suffix in any case as the set's
+  suffix, as `par3 create` over files does: `SET.PAR3` writes `SET.par3` and
+  `SET.vol0+1.par3`, not `SET.PAR3.par3` and `SET.PAR3.vol0+1.par3`.
+- `par verify --name` from standard input keeps its verification buffers
+  within `--par3-memory-mib` instead of up to 64 MiB beyond it; a stream
+  ending inside a slice still reports that slice missing.
+- `rar list`, `rar test` and `rar extract` read the whole volume set when the
+  archive is named in another case than its volumes on a filesystem that
+  ignores case (macOS and Windows by default): `rar list SET.part01.rar` over
+  `set.partNN.rar` read the named volume alone.
 
 ## rarpar 0.6.1
 
