@@ -35,6 +35,11 @@ const (
 	// SuiteMacroPAR3 runs `rarpar-bench par3 run`: the shipped CLI against the
 	// pinned par3cmdline reference on generated inputs. It needs no corpus.
 	SuiteMacroPAR3 = "macro-par3"
+	// SuiteLzmaTurbo and SuiteSevenzTurbo run the lzma-turbo and sevenz-turbo
+	// Go harnesses against their own oracles (xz, the official 7-Zip). The
+	// candidates are built on the host from shipped git bundles; see turbo.go.
+	SuiteLzmaTurbo   = "lzma-turbo"
+	SuiteSevenzTurbo = "sevenz-turbo"
 )
 
 // EC2 access modes. SSH is the original path (session key pair + security
@@ -79,7 +84,7 @@ const (
 )
 
 var (
-	knownSuites   = []string{SuiteCRCProbe, SuiteYencMicro, SuiteMacroRAR, SuiteMacroPAR2, SuiteMacroPAR3}
+	knownSuites   = []string{SuiteCRCProbe, SuiteYencMicro, SuiteMacroRAR, SuiteMacroPAR2, SuiteMacroPAR3, SuiteLzmaTurbo, SuiteSevenzTurbo}
 	knownShells   = []string{"sh", "bash", "powershell"}
 	suiteFamilies = map[string]string{SuiteMacroRAR: "rar", SuiteMacroPAR2: "par2"}
 	// suiteOracles names the oracle role each suite compares against.
@@ -97,12 +102,16 @@ type Config struct {
 }
 
 type Settings struct {
-	ResultsRoot        string      `json:"results_root"`
-	RunIDPrefix        string      `json:"run_id_prefix"`
-	BundleCache        string      `json:"bundle_cache"`
-	RarparPath         string      `json:"rarpar_path,omitempty"`
-	WeaverPath         string      `json:"weaver_path,omitempty"`
-	RapidyencPath      string      `json:"rapidyenc_path,omitempty"`
+	ResultsRoot   string `json:"results_root"`
+	RunIDPrefix   string `json:"run_id_prefix"`
+	BundleCache   string `json:"bundle_cache"`
+	RarparPath    string `json:"rarpar_path,omitempty"`
+	WeaverPath    string `json:"weaver_path,omitempty"`
+	RapidyencPath string `json:"rapidyenc_path,omitempty"`
+	// LzmaTurboPath and SevenzTurboPath are the checkouts the turbo suites
+	// ship as git bundles and build on the host.
+	LzmaTurboPath      string      `json:"lzma_turbo_path,omitempty"`
+	SevenzTurboPath    string      `json:"sevenz_turbo_path,omitempty"`
 	Docker             string      `json:"docker"`
 	PollSeconds        int         `json:"poll_seconds"`
 	HostTimeoutMinutes int         `json:"host_timeout_minutes"`
@@ -164,6 +173,7 @@ type Machine struct {
 	Run          RunOverrides      `json:"run"`
 	Perf         PerfPlan          `json:"perf"`
 	PAR3         PAR3Plan          `json:"par3"`
+	Turbo        TurboPlan         `json:"turbo"`
 	EC2          *EC2              `json:"ec2,omitempty"`
 }
 
@@ -355,6 +365,8 @@ func decodeSettings(item *section) Settings {
 		RarparPath:         item.str("rarpar_path", ""),
 		WeaverPath:         item.str("weaver_path", ""),
 		RapidyencPath:      item.str("rapidyenc_path", ""),
+		LzmaTurboPath:      item.str("lzma_turbo_path", ""),
+		SevenzTurboPath:    item.str("sevenz_turbo_path", ""),
 		Docker:             item.str("docker", "docker"),
 		PollSeconds:        item.integer("poll_seconds", 20),
 		HostTimeoutMinutes: item.integer("host_timeout_minutes", 240),
@@ -372,6 +384,7 @@ func decodeSettings(item *section) Settings {
 		QuietLoadPollSeconds:    defaults.integer("quiet_load_poll_seconds", 30),
 		QuietLoadProcessNames: defaults.strings("quiet_load_process_names", []string{
 			"rarpar-bench", "rarpar", "par2", "unrar", "decode_timing", "searchend_timing", "crc_probe",
+			"lzma-bench", "decode-bench", "7zz",
 		}),
 		PerfStatRepeats:     defaults.integer("perf_stat_repeats", 3),
 		PerfRecordFrequency: defaults.integer("perf_record_frequency", 499),
@@ -542,6 +555,19 @@ func decodeMachine(item *section, settings Settings) Machine {
 		ReferenceTimeoutMinutes: par3.integer("reference_timeout_minutes", 0),
 	}
 	par3.finish()
+
+	turbo := item.child("turbo")
+	machine.Turbo = TurboPlan{
+		LzmaProfile:    turbo.str("lzma_profile", "fleet"),
+		SevenzProfile:  turbo.str("sevenz_profile", "fleet"),
+		LzmaOnly:       turbo.strings("lzma_only", nil),
+		SevenzOnly:     turbo.strings("sevenz_only", nil),
+		LzmaRepeats:    turbo.integer("lzma_repeats", 0),
+		SevenzRepeats:  turbo.integer("sevenz_repeats", 0),
+		PinCPUs:        turbo.str("pin_cpus", ""),
+		TimeoutMinutes: turbo.integer("timeout_minutes", 60),
+	}
+	turbo.finish()
 
 	if ec2 := item.child("ec2"); ec2.present {
 		machine.EC2 = &EC2{
@@ -735,6 +761,9 @@ func validate(state *decodeState, config *Config) {
 		validateOracles(state, prefix, machine)
 		if machine.hasSuite(SuiteMacroPAR3) {
 			validatePAR3(state, prefix, machine)
+		}
+		if machine.hasTurbo() {
+			validateTurbo(state, prefix, machine, settings)
 		}
 
 		if machine.Run.Warmups < 0 || machine.Run.Repeats < 1 {
@@ -983,6 +1012,46 @@ func validatePAR3(state *decodeState, prefix string, machine *Machine) {
 	}
 }
 
+// validateTurbo checks the turbo suites' plan and their source checkouts,
+// which must be named in [fleet] so the bundle can ship them.
+func validateTurbo(state *decodeState, prefix string, machine *Machine, settings *Settings) {
+	plan := machine.Turbo
+	if machine.isWindows() {
+		state.fail("%s: the lzma-turbo and sevenz-turbo suites build on the host with a POSIX run script; Windows hosts are not supported", prefix)
+	}
+	for _, source := range turboSources(*settings, *machine) {
+		suite, name, path := source[0], source[1], source[2]
+		key := "fleet." + strings.ReplaceAll(name, "-", "_") + "_path"
+		if path == "" {
+			state.fail("%s: suite %q needs %s, the checkout shipped to the host as a git bundle", prefix, suite, key)
+		} else if !filepath.IsAbs(path) {
+			state.fail("%s must be an absolute path: %s", key, path)
+		}
+	}
+	if machine.hasSuite(SuiteLzmaTurbo) && !contains(turboProfiles, plan.LzmaProfile) {
+		state.fail("%s: turbo.lzma_profile must be one of %s", prefix, strings.Join(turboProfiles, ", "))
+	}
+	if machine.hasSuite(SuiteSevenzTurbo) && !contains(turboProfiles, plan.SevenzProfile) {
+		state.fail("%s: turbo.sevenz_profile must be one of %s", prefix, strings.Join(turboProfiles, ", "))
+	}
+	if plan.LzmaRepeats < 0 || plan.SevenzRepeats < 0 {
+		state.fail("%s: turbo repeats must not be negative (0 = the profile's)", prefix)
+	}
+	if plan.TimeoutMinutes < 1 {
+		state.fail("%s: turbo.timeout_minutes must be positive", prefix)
+	}
+	if err := par3bench.ValidatePinCPUs(plan.PinCPUs); err != nil {
+		state.fail("%s: turbo.pin_cpus: %v", prefix, err)
+	}
+	for _, list := range [][]string{plan.LzmaOnly, plan.SevenzOnly} {
+		for _, entry := range list {
+			if strings.TrimSpace(entry) == "" || strings.Contains(entry, ",") {
+				state.fail("%s: turbo.*_only entries must be non-empty scenario selectors without commas", prefix)
+			}
+		}
+	}
+}
+
 func validateEC2(state *decodeState, prefix string, machine *Machine, settings *Settings) {
 	if machine.EC2 == nil {
 		state.fail("%s: [machines.ec2] is required for kind = %q", prefix, KindAWSEC2)
@@ -1133,6 +1202,14 @@ func (machine Machine) needsCorpus() bool {
 // needsCandidate reports whether the bundle must carry the rarpar CLI.
 func (machine Machine) needsCandidate() bool {
 	return machine.needsCorpus() || machine.hasSuite(SuiteMacroPAR3)
+}
+
+// needsContainerBuild reports whether the bundle needs the container build
+// at all: the rarpar CLI or weaver's examples. A machine running only the
+// turbo suites ships git bundles and a cross-compiled harness and builds its
+// candidates on the host.
+func (machine Machine) needsContainerBuild() bool {
+	return machine.needsCandidate() || machine.hasSuite(SuiteYencMicro) || machine.hasSuite(SuiteCRCProbe)
 }
 
 // usesSSM reports whether this cloud machine is reached through SSM.
