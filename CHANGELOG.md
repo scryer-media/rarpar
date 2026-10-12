@@ -75,6 +75,9 @@ documented in each crate's own changelog so those notes ship with the crate.
   its one JSON failure document, not a plain-text error.
 - `par verify --name` refuses (exit 2) a NAME that more than one file in the
   set answers to, instead of verifying the stream against the first.
+- `par verify --name` checks a file the set has no slice checksums for by its
+  length and whole-file MD5, as `par verify` does on disk, instead of failing;
+  the `--json` report's `stream.slice_checksums` says which check ran.
 
 ### Library versions
 

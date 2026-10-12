@@ -599,6 +599,7 @@ fn par_verify_reads_one_protected_file_from_a_pipe() {
         ok(&verified);
         let report = json(&verified);
         assert_eq!(report["success"], true);
+        assert_eq!(report["stream"]["slice_checksums"], true);
         assert_eq!(report["stream"]["bytes"], data.len() as u64);
         assert_eq!(report["stream"]["damaged_slices"], serde_json::json!([]));
         assert_eq!(report["stream"]["missing_slices"], 0);
@@ -841,4 +842,81 @@ fn par_verify_from_a_pipe_refuses_a_name_two_files_answer_to() {
         &["par", "verify", "set.par2", "--name", "dir\\a.bin"],
         b,
     ));
+}
+
+#[test]
+fn par_verify_from_a_pipe_checks_a_file_without_slice_checksums_by_its_md5() {
+    // A set may describe a file but carry no IFSC packet with its slice
+    // checksums. The disk verifier then checks the file by its length and
+    // whole-file MD5, and the stream is checked the same way.
+    const IFSC: &[u8; 16] = b"PAR 2.0\0IFSC\0\0\0\0";
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let (first, second) = par2_set(root);
+    let mut dropped = 0;
+    rewrite_set(root, |packet| {
+        let keep = packet[48..64] != IFSC[..];
+        dropped += usize::from(!keep);
+        keep
+    });
+    assert!(dropped > 0);
+    ok(&rarpar(root, &["par", "verify", "set.par2"]));
+    std::fs::remove_file(root.join("first.bin")).unwrap();
+
+    for (name, data) in [("first.bin", &first), ("second.bin", &second)] {
+        let verified = through_pipes(
+            root,
+            &["--json", "par", "verify", "set.par2", "--name", name],
+            data.clone(),
+        );
+        ok(&verified);
+        let report = json(&verified);
+        assert_eq!(report["success"], true);
+        assert_eq!(report["stream"]["slice_checksums"], false);
+        assert_eq!(report["stream"]["bytes"], data.len() as u64);
+        assert_eq!(report["stream"]["trailing_bytes"], 0);
+    }
+    let text = through_pipes(
+        root,
+        &["par", "verify", "set.par2", "--name", "first.bin"],
+        first.clone(),
+    );
+    ok(&text);
+    assert!(String::from_utf8_lossy(&text.stdout).contains("whole-file MD5"));
+
+    // One flipped byte fails the MD5. With no slice checksums to narrow it,
+    // all 23 slices count as damaged, more than the 4 recovery blocks.
+    let mut damaged = first.clone();
+    damaged[700_000] ^= 1;
+    let verified = through_pipes(
+        root,
+        &["--json", "par", "verify", "set.par2", "--name", "first.bin"],
+        damaged,
+    );
+    assert_eq!(verified.status.code(), Some(1));
+    let report = json(&verified);
+    assert_eq!(report["success"], false);
+    assert_eq!(report["stream"]["slices"], 23);
+    assert_eq!(report["stream"]["recovery_blocks_available"], 4);
+    assert_eq!(report["stream"]["repairable"], false);
+
+    // A short stream and a long one do not match either.
+    let short = through_pipes(
+        root,
+        &["--json", "par", "verify", "set.par2", "--name", "first.bin"],
+        first[..1_000_000].to_vec(),
+    );
+    assert_eq!(short.status.code(), Some(1));
+    assert_eq!(json(&short)["success"], false);
+    let mut long = first.clone();
+    long.extend_from_slice(b"extra");
+    let long = through_pipes(
+        root,
+        &["--json", "par", "verify", "set.par2", "--name", "first.bin"],
+        long,
+    );
+    assert_eq!(long.status.code(), Some(1));
+    let report = json(&long);
+    assert_eq!(report["success"], false);
+    assert_eq!(report["stream"]["trailing_bytes"], 5);
 }

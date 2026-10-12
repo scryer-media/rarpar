@@ -848,6 +848,15 @@ fn verify_stream(cli: &Cli, args: &ParArgs, name: &str) -> Result<u8, RarparErro
         session.add_par2_data(&packets);
     }
 
+    // A set may describe the file without slice checksums (no IFSC packet,
+    // as in a truncated set). The disk verifier then checks the file by its
+    // length and whole-file MD5, and so does the stream.
+    let mut whole_file = session
+        .par2_set()
+        .is_none_or(|par2| par2.file_checksums(&file_id).is_none())
+        .then(par2_rs::FileHashState::new);
+    let by_md5 = whole_file.is_some();
+
     let mut source = Input::open(&input)?.into_reader();
     let mut buffer = Vec::new();
     buffer.try_reserve_exact(slice).map_err(|_| {
@@ -875,15 +884,19 @@ fn verify_stream(cli: &Cli, args: &ParArgs, name: &str) -> Result<u8, RarparErro
         let within = expected.saturating_sub(received).min(filled as u64) as usize;
         trailing += (filled - within) as u64;
         if within > 0 {
-            let outcome = session.feed_range(&file_id, received, &buffer[..within]);
-            match outcome.disposition() {
-                par2_rs::FeedDisposition::Verified | par2_rs::FeedDisposition::Duplicate => {}
-                // The stream ended inside a slice: it stays unverified.
-                par2_rs::FeedDisposition::Buffered if filled < buffer.len() => {}
-                other => {
-                    return Err(RarparError::Data(format!(
-                        "the verifier did not settle the slice at offset {received}: {other:?}"
-                    )));
+            if let Some(hash) = whole_file.as_mut() {
+                hash.update(&buffer[..within]);
+            } else {
+                let outcome = session.feed_range(&file_id, received, &buffer[..within]);
+                match outcome.disposition() {
+                    par2_rs::FeedDisposition::Verified | par2_rs::FeedDisposition::Duplicate => {}
+                    // The stream ended inside a slice: it stays unverified.
+                    par2_rs::FeedDisposition::Buffered if filled < buffer.len() => {}
+                    other => {
+                        return Err(RarparError::Data(format!(
+                            "the verifier did not settle the slice at offset {received}: {other:?}"
+                        )));
+                    }
                 }
             }
             received += within as u64;
@@ -893,36 +906,63 @@ fn verify_stream(cli: &Cli, args: &ParArgs, name: &str) -> Result<u8, RarparErro
         }
     }
 
-    let verification = session
-        .verification_result()
-        .ok_or_else(|| RarparError::Data("the PAR2 set has no usable metadata".into()))?;
-    let file = verification
-        .files
-        .iter()
-        .find(|file| file.file_id == file_id)
-        .ok_or_else(|| RarparError::Data(format!("the set has no slices for {name}")))?;
-    // Slices the stream delivered whole; one it ended inside counts as missing.
-    let fed_slices = if received >= expected {
-        file.valid_slices.len()
-    } else {
-        (received / slice_size.max(1)) as usize
+    let available = session
+        .par2_set()
+        .map_or(0, |par2| par2.recovery_block_count() as usize);
+    // The slices a repair would rebuild: the damaged and missing ones, or,
+    // with no slice checksums to narrow a mismatch, all of them.
+    let (slices, damaged, missing, verified, needed) = match whole_file {
+        Some(hash) => {
+            let digest = hash.finalize();
+            let matched = received == expected
+                && set
+                    .file_description(&file_id)
+                    .is_some_and(|desc| desc.hash_full == digest);
+            let slices = set.slice_count_for_file(expected) as usize;
+            let needed = if matched { 0 } else { slices };
+            (slices, Vec::new(), 0, matched, needed)
+        }
+        None => {
+            let verification = session
+                .verification_result()
+                .ok_or_else(|| RarparError::Data("the PAR2 set has no usable metadata".into()))?;
+            let file = verification
+                .files
+                .iter()
+                .find(|file| file.file_id == file_id)
+                .ok_or_else(|| RarparError::Data(format!("the set has no slices for {name}")))?;
+            // Slices the stream delivered whole; one it ended inside counts
+            // as missing.
+            let fed_slices = if received >= expected {
+                file.valid_slices.len()
+            } else {
+                (received / slice_size.max(1)) as usize
+            };
+            let damaged: Vec<usize> = file
+                .valid_slices
+                .iter()
+                .enumerate()
+                .take(fed_slices)
+                .filter(|(_, valid)| !**valid)
+                .map(|(index, _)| index)
+                .collect();
+            let missing = file.valid_slices.len().saturating_sub(fed_slices);
+            let bad = damaged.len() + missing;
+            (file.valid_slices.len(), damaged, missing, bad == 0, bad)
+        }
     };
-    let damaged: Vec<usize> = file
-        .valid_slices
-        .iter()
-        .enumerate()
-        .take(fed_slices)
-        .filter(|(_, valid)| !**valid)
-        .map(|(index, _)| index)
-        .collect();
-    let missing = file.valid_slices.len().saturating_sub(fed_slices);
-    let bad = damaged.len() + missing;
-    let success = bad == 0 && trailing == 0;
-    let available = verification.recovery_blocks_available as usize;
-    let message = if success {
+    let success = verified && trailing == 0;
+    let message = if success && by_md5 {
         format!(
-            "{name}: all {} slice(s) verified from standard input",
-            file.valid_slices.len()
+            "{name}: verified from standard input by its whole-file MD5 (the set has no slice checksums)"
+        )
+    } else if success {
+        format!("{name}: all {slices} slice(s) verified from standard input")
+    } else if by_md5 && verified {
+        format!("{name}: matches its whole-file MD5 but runs {trailing} byte(s) past its length")
+    } else if by_md5 {
+        format!(
+            "{name}: does not match its whole-file MD5 ({received} of {expected} bytes, {trailing} byte(s) past its length); with no slice checksums in the set, all {slices} slice(s) count as damaged; {available} recovery block(s) available"
         )
     } else {
         format!(
@@ -934,18 +974,24 @@ fn verify_stream(cli: &Cli, args: &ParArgs, name: &str) -> Result<u8, RarparErro
         let report = serde_json::json!({"schema_version":1,"command":"verify","success":success,
             "repaired":false,"recovery_blocks_needed":serde_json::Value::Null,"message":message,
             "stream":{"name":name,"bytes":received + trailing,"expected_bytes":expected,
-                "slice_size":slice_size,"slices":file.valid_slices.len(),
+                "slice_size":slice_size,"slices":slices,"slice_checksums":!by_md5,
                 "damaged_slices":damaged,"missing_slices":missing,"trailing_bytes":trailing,
                 "recovery_blocks_available":available,
-                "repairable":bad <= available && trailing == 0}});
+                "repairable":needed <= available && trailing == 0}});
         println!("{}", serde_json::to_string(&report)?);
     } else if !cli.quiet {
         println!("rarpar par verify (standard input as {name})");
-        println!(
-            "  {} of {expected} bytes, {} slice(s) of {slice_size} bytes",
-            received + trailing,
-            file.valid_slices.len()
-        );
+        if by_md5 {
+            println!(
+                "  {} of {expected} bytes, checked by the whole-file MD5",
+                received + trailing
+            );
+        } else {
+            println!(
+                "  {} of {expected} bytes, {slices} slice(s) of {slice_size} bytes",
+                received + trailing
+            );
+        }
         if !damaged.is_empty() {
             let list: Vec<String> = damaged.iter().map(usize::to_string).collect();
             println!("  damaged slices: {}", list.join(", "));
