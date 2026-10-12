@@ -537,6 +537,32 @@ fn delete_sources_is_refused_rather_than_ignored() {
     assert_eq!(output.status.code(), Some(2));
     assert!(root.join("data.bin").is_file());
     assert!(!root.join("data.bin.xz").exists());
+
+    // With --json the refusal is one failure report where the command
+    // reports, standard output here, and nothing else.
+    let commands: [&[&str]; 3] = [
+        &["--json", "--delete-sources", "xz", "compress", "data.bin"],
+        &["--json", "--delete-sources", "xz", "test", "x.xz"],
+        &["--json", "--delete-sources", "xz", "list", "x.xz"],
+    ];
+    for args in commands {
+        let output = rarpar(root, args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(
+            output.stderr.is_empty(),
+            "{args:?}: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "{args:?}: {error}: stdout={}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+        assert_eq!(report["success"], false, "{args:?}");
+        assert_eq!(report["exit_code"], 2, "{args:?}");
+    }
+    assert!(!root.join("data.bin.xz").exists());
 }
 
 /// The system `xz`, when there is one on PATH.
@@ -880,9 +906,15 @@ fn a_json_failure_with_data_on_stdout_is_one_json_document_on_stderr() {
     let mut damaged = compressed.stdout;
     let middle = damaged.len() / 2;
     damaged[middle] ^= 0x55;
-    let cases: [(&[&str], Vec<u8>, i32); 2] = [
+    let cases: [(&[&str], Vec<u8>, i32); 3] = [
         // A damaged stream decoded to standard output: a data failure.
         (&["--json", "xz", "decompress"], damaged, 1),
+        // A refusal before the command starts: a usage error.
+        (
+            &["--json", "--delete-sources", "xz", "compress"],
+            sample(10_000, 3),
+            2,
+        ),
         // A sidecar with no name for standard output: a usage error.
         (
             &[
@@ -913,5 +945,9 @@ fn a_json_failure_with_data_on_stdout_is_one_json_document_on_stderr() {
         });
         assert_eq!(report["success"], false);
         assert_eq!(report["exit_code"], code);
+        if code == 2 {
+            // A usage error comes before any data.
+            assert!(output.stdout.is_empty(), "{args:?}");
+        }
     }
 }

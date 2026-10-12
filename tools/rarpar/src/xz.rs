@@ -12,7 +12,7 @@ use lzma_turbo::xz::{
 use lzma_turbo::{Checksum, ChecksumPlan, LzmaEncProps, MatchFinderKind, XzErrorKind, XzWriter};
 use rarpar::cli::{
     Cli, SidecarArgs, XzCheck, XzCommand, XzCompressArgs, XzDecodeArgs, XzDecompressArgs,
-    XzListArgs, XzTestArgs,
+    XzListArgs,
 };
 use serde_json::{Value, json};
 
@@ -28,30 +28,18 @@ const MIB: u64 = 1 << 20;
 const STREAM_HEADER_SIZE: usize = 12;
 
 pub fn run_command(cli: &Cli, command: XzCommand) -> Result<u8, RarparError> {
-    if cli.delete_sources {
-        return Err(RarparError::Usage(
-            "--delete-sources does not apply to xz commands; their input is always kept".into(),
-        ));
-    }
-    // A report never shares standard output with the data written there.
-    let (input, data_on_stdout) = match &command {
+    // A report never shares standard output with the data written there:
+    // OUTPUT `-`, or no OUTPUT with standard input as INPUT. That is decided
+    // from the arguments alone, so a command that fails to start reports
+    // where it would have reported.
+    let data_on_stdout = match &command {
         XzCommand::Compress(XzCompressArgs { input, output, .. })
-        | XzCommand::Decompress(XzDecompressArgs { input, output, .. }) => {
-            let input = input_or_stdin(input.as_deref())?;
-            let on_stdout = output.as_deref().map_or_else(|| is_stdio(&input), is_stdio);
-            (input, on_stdout)
-        }
-        XzCommand::Test(XzTestArgs { input, .. }) | XzCommand::List(XzListArgs { input, .. }) => {
-            (input_or_stdin(input.as_deref())?, false)
-        }
+        | XzCommand::Decompress(XzDecompressArgs { input, output, .. }) => output
+            .as_deref()
+            .map_or_else(|| input.as_deref().is_none_or(is_stdio), is_stdio),
+        XzCommand::Test(_) | XzCommand::List(_) => false,
     };
-    let result = match command {
-        XzCommand::Compress(args) => compress(cli, &input, &args),
-        XzCommand::Decompress(args) => decompress(cli, &input, &args),
-        XzCommand::Test(args) => test(&input, &args.decode),
-        XzCommand::List(args) => list(&input, &args),
-    };
-    match result {
+    match run(cli, command) {
         Ok(report) => {
             emit(cli, &report, data_on_stdout)?;
             Ok(if report["success"] == true {
@@ -70,6 +58,24 @@ pub fn run_command(cli: &Cli, command: XzCommand) -> Result<u8, RarparError> {
             Ok(error.exit_code())
         }
         Err(error) => Err(error),
+    }
+}
+
+/// The command's report, or the error that ended it, whether it ended
+/// before starting or partway.
+fn run(cli: &Cli, command: XzCommand) -> Result<Value, RarparError> {
+    if cli.delete_sources {
+        return Err(RarparError::Usage(
+            "--delete-sources does not apply to xz commands; their input is always kept".into(),
+        ));
+    }
+    match command {
+        XzCommand::Compress(args) => compress(cli, &input_or_stdin(args.input.as_deref())?, &args),
+        XzCommand::Decompress(args) => {
+            decompress(cli, &input_or_stdin(args.input.as_deref())?, &args)
+        }
+        XzCommand::Test(args) => test(&input_or_stdin(args.input.as_deref())?, &args.decode),
+        XzCommand::List(args) => list(&input_or_stdin(args.input.as_deref())?, &args),
     }
 }
 
