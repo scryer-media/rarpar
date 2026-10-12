@@ -286,6 +286,25 @@ func machineSteps(machine Machine, layout RemoteLayout) []string {
 				machine.PAR3.Versus))
 		}
 	}
+	if machine.hasTurbo() {
+		steps = append(steps,
+			fmt.Sprintf("on host: install rustup %s (pinned digest) with no default toolchain; each checkout's rust-toolchain.toml installs its own", rustupVersion),
+			fmt.Sprintf("on host: fetch the official 7-Zip %s release (pinned digest) as the 7zz oracle", sevenZipVersion))
+	}
+	if machine.hasSuite(SuiteLzmaTurbo) {
+		steps = append(steps,
+			"on host: clone lzma-turbo from the shipped git bundle, verify the commit, cargo build --locked lzma-bench",
+			fmt.Sprintf("on host: build xz %s (pinned digest, static) as the xz oracle, generate the lzma fixtures", xzVersion),
+			fmt.Sprintf("on host: lzma-turbo run, profile %s%s, %dm per-case timeout, results under results/lzma-turbo",
+				machine.Turbo.LzmaProfile, turboOnlyNote(machine.Turbo.LzmaOnly, machine.Turbo.LzmaRepeats), machine.Turbo.TimeoutMinutes))
+	}
+	if machine.hasSuite(SuiteSevenzTurbo) {
+		steps = append(steps,
+			"on host: clone sevenz-turbo from the shipped git bundle, verify the commit, cargo build --locked decode-bench (aws-lc-rs and native-crypto)",
+			fmt.Sprintf("on host: generate the %s sevenz fixture corpus with the official 7zz", turboCorpus(machine.Turbo.SevenzProfile)),
+			fmt.Sprintf("on host: sevenz-turbo run, profile %s%s, %dm per-case timeout, results under results/sevenz-turbo",
+				machine.Turbo.SevenzProfile, turboOnlyNote(machine.Turbo.SevenzOnly, machine.Turbo.SevenzRepeats), machine.Turbo.TimeoutMinutes))
+	}
 	switch machine.Capabilities.Perf {
 	case PerfLinux:
 		steps = append(steps, "on host: perf diagnostic pass (harness --perf counters for both subjects, plus perf record/script/folded on the designated cases)")
@@ -504,4 +523,17 @@ func joinLocal(parts ...string) string {
 		}
 	}
 	return strings.Join(cleaned, "/")
+}
+
+// turboOnlyNote renders a turbo suite's scenario filter and repeat override
+// for the plan.
+func turboOnlyNote(only []string, repeats int) string {
+	note := ""
+	if len(only) > 0 {
+		note += ", only " + strings.Join(only, "+")
+	}
+	if repeats > 0 {
+		note += fmt.Sprintf(", repeats=%d", repeats)
+	}
+	return note
 }

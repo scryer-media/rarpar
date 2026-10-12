@@ -26,8 +26,8 @@ func TestExampleConfigLoads(t *testing.T) {
 	if config.SchemaVersion != ConfigSchemaVersion {
 		t.Fatalf("schema version = %d, want %d", config.SchemaVersion, ConfigSchemaVersion)
 	}
-	if len(config.Machines) != 5 {
-		t.Fatalf("machines = %d, want 5 (one of each kind, an SSM cloud machine, and the Windows example)", len(config.Machines))
+	if len(config.Machines) != 6 {
+		t.Fatalf("machines = %d, want 6 (one of each kind, an SSM cloud machine, the turbo machine, and the Windows example)", len(config.Machines))
 	}
 	if config.SHA256 == "" {
 		t.Fatal("config digest must be recorded so a run can name the config it used")
@@ -36,7 +36,7 @@ func TestExampleConfigLoads(t *testing.T) {
 	for _, machine := range config.Machines {
 		kinds[machine.Kind]++
 	}
-	if kinds[KindAWSEC2] != 2 || kinds[KindLocalSSH] != 3 {
+	if kinds[KindAWSEC2] != 3 || kinds[KindLocalSSH] != 3 {
 		t.Fatalf("unexpected machine kinds: %v", kinds)
 	}
 }
@@ -455,7 +455,7 @@ func TestBuildPlan(t *testing.T) {
 			}
 		}
 	}
-	if plan.Quota.Requested != 12 || !plan.Quota.Fits {
+	if plan.Quota.Requested != 28 || !plan.Quota.Fits {
 		t.Fatalf("unexpected quota check: %+v", plan.Quota)
 	}
 	var text strings.Builder
@@ -1040,6 +1040,144 @@ func TestValidateRunID(t *testing.T) {
 	for _, bad := range []string{"", ".", "..", "../shared", "a/b", `a\b`, "with space", "/abs"} {
 		if err := ValidateRunID(bad); err == nil {
 			t.Errorf("run id %q must be rejected", bad)
+		}
+	}
+}
+
+// loadMutatedExample loads the example config with one textual substitution
+// applied, for exercising validation of a single field.
+func loadMutatedExample(t *testing.T, old, new string) (Config, error) {
+	t.Helper()
+	data, err := os.ReadFile(examplePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), old) {
+		t.Fatalf("example config does not contain %q", old)
+	}
+	path := filepath.Join(t.TempDir(), "fleet.toml")
+	if err := os.WriteFile(path, []byte(strings.Replace(string(data), old, new, 1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return LoadConfig(path)
+}
+
+func TestExampleTurboMachine(t *testing.T) {
+	config := loadExample(t)
+	var turbo Machine
+	for _, machine := range config.Machines {
+		if machine.Name == "ec2-zen4-turbo" {
+			turbo = machine
+		}
+	}
+	if turbo.Name == "" || turbo.EC2 == nil {
+		t.Fatal("expected the EC2 turbo example machine")
+	}
+	if !turbo.hasTurbo() || !turbo.hasSuite(SuiteLzmaTurbo) || !turbo.hasSuite(SuiteSevenzTurbo) {
+		t.Fatal("the turbo machine runs both turbo suites")
+	}
+	if turbo.needsContainerBuild() {
+		t.Fatal("a turbo-only machine builds its candidates on the host and needs no container build")
+	}
+	if turbo.Turbo.LzmaProfile != "fleet" || turbo.Turbo.SevenzProfile != "fleet" || turbo.Turbo.TimeoutMinutes != 60 {
+		t.Fatalf("unexpected turbo plan: %+v", turbo.Turbo)
+	}
+	if !turbo.usesSSM() || !turbo.EC2.Spot {
+		t.Fatal("the turbo example rides spot over SSM")
+	}
+	if float64(turbo.EC2.DeadmanMinutes) < turbo.EC2.MaxHours*60 {
+		t.Fatal("the deadman must outlast the cost cap")
+	}
+	if config.Fleet.LzmaTurboPath == "" || config.Fleet.SevenzTurboPath == "" {
+		t.Fatal("the example names both turbo checkouts")
+	}
+	packages := bootstrapPackages(turbo)
+	for _, name := range []string{"build-essential", "cmake", "git", "curl", "xz-utils", "perl"} {
+		if !contains(packages, name) {
+			t.Fatalf("turbo hosts need %s; got %v", name, packages)
+		}
+	}
+	if len(packages) != len(turboPackages) {
+		t.Fatalf("turbo packages must not repeat: %v", packages)
+	}
+	key := buildKey(turbo)
+	lzmaOnly := turbo
+	lzmaOnly.Suites = []string{SuiteLzmaTurbo}
+	if buildKey(lzmaOnly) == key {
+		t.Fatal("bundles with different turbo suites carry different content and must not share a build")
+	}
+}
+
+func TestTurboSectionIsPinnedAndComplete(t *testing.T) {
+	config := loadExample(t)
+	var turbo Machine
+	for _, machine := range config.Machines {
+		if machine.Name == "ec2-zen4-turbo" {
+			turbo = machine
+		}
+	}
+	layout := LayoutFor(turbo, "fleet-testrun")
+	script := RunScript(turbo, config.Fleet.Defaults, "fleet-testrun", layout, nil)
+	for _, expected := range []string{
+		"https://static.rust-lang.org/rustup/archive/" + rustupVersion + "/$RUSTUP_TRIPLE/rustup-init",
+		"RUSTUP_TRIPLE=x86_64-unknown-linux-gnu", "RUSTUP_TRIPLE=aarch64-unknown-linux-gnu",
+		rustupSHA256X86, rustupSHA256ARM,
+		sevenZipURL(sevenZipAssetX86), sevenZipURL(sevenZipAssetARM), sevenZipSHA256X86, sevenZipSHA256ARM,
+		xzURL(), xzSHA256,
+		"--profile minimal --default-toolchain none",
+		"$BIN/$name.bundle", "$BIN/$name.commit", "turbo_checkout lzma-turbo", "turbo_checkout sevenz-turbo",
+		"lzma-turbo-bench\" toolchain --repo \"$LZ\" --build",
+		"cargo build --locked --release -p decode-bench",
+		"--features native-crypto",
+		"SEVENZ_BENCH_ORACLE_OFFICIAL=1",
+		"LZMA_TURBO_XZ=", "LZMA_TURBO_7ZZ=",
+		quoteAll([]string{"--profile", "fleet", "--timeout", "60m"}),
+		"SEVENZ_BENCH_INSTANCE_TYPE=",
+	} {
+		if !strings.Contains(script, expected) {
+			t.Fatalf("turbo script is missing %q", expected)
+		}
+	}
+	for _, forbidden := range []string{"rustup-init.sh", "sh.rustup.rs", "curl | sh", "apt-get install -y 7zip", "p7zip"} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("turbo script must not contain %q (unpinned install path)", forbidden)
+		}
+	}
+	// The results land where the collector expects suite evidence.
+	for _, dir := range []string{"$R/lzma-turbo", "$R/sevenz-turbo", "$R/turbo"} {
+		if !strings.Contains(script, dir) {
+			t.Fatalf("turbo script does not write to %s", dir)
+		}
+	}
+}
+
+func TestTurboPlanSteps(t *testing.T) {
+	config := loadExample(t)
+	machines, err := Select(config, []string{"ec2-zen4-turbo"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := BuildPlan(config, machines, "fleet-testrun")
+	steps := strings.Join(plan.Machines[0].Steps, "\n")
+	for _, expected := range []string{"rustup " + rustupVersion, "7-Zip " + sevenZipVersion, "xz " + xzVersion,
+		"lzma-turbo run, profile fleet", "sevenz-turbo run, profile fleet", "results/lzma-turbo", "results/sevenz-turbo"} {
+		if !strings.Contains(steps, expected) {
+			t.Fatalf("turbo plan steps are missing %q:\n%s", expected, steps)
+		}
+	}
+}
+
+func TestTurboConfigValidation(t *testing.T) {
+	cases := []struct{ name, old, new, want string }{
+		{"profile", `lzma_profile = "fleet"`, `lzma_profile = "huge"`, "turbo.lzma_profile must be one of"},
+		{"timeout", "timeout_minutes = 60                     # per-case", "timeout_minutes = 0                     # per-case", "turbo.timeout_minutes must be positive"},
+		{"path", `lzma_turbo_path = "/Users/example/dev/lzma-turbo"`, ``, "needs fleet.lzma_turbo_path"},
+		{"relative", `lzma_turbo_path = "/Users/example/dev/lzma-turbo"`, `lzma_turbo_path = "dev/lzma-turbo"`, "must be an absolute path"},
+	}
+	for _, tc := range cases {
+		_, err := loadMutatedExample(t, tc.old, tc.new)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("%s: expected an error containing %q, got %v", tc.name, tc.want, err)
 		}
 	}
 }

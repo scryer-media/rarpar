@@ -328,6 +328,11 @@ func RunScript(machine Machine, defaults RunDefaults, runID string, layout Remot
 		script.WriteString(par3Section(machine, layout, oracles["par3"]))
 	}
 
+	// ---- lzma-turbo / sevenz-turbo ---------------------------------------
+	if machine.hasTurbo() {
+		script.WriteString(turboSection(machine, layout))
+	}
+
 	// ---- perf diagnostic pass -------------------------------------------
 	script.WriteString(perfSection(machine, families))
 

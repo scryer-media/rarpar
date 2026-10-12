@@ -339,10 +339,20 @@ func packageInstall(packages []string) string {
 // bootstrapPackages are the distro packages a machine's suites need on host:
 // the par3cmdline-onhost recipe builds the reference with CMake.
 func bootstrapPackages(machine Machine) []string {
+	var packages []string
 	if oracle, ok := machine.Oracles["par3"]; ok && oracle.Policy == OracleSourceBuild && oracle.Recipe == RecipePAR3CmdlineHost {
-		return []string{"build-essential", "cmake"}
+		packages = append(packages, "build-essential", "cmake")
 	}
-	return nil
+	if machine.hasTurbo() {
+		// The turbo suites build Rust candidates and xz on the host and
+		// fetch rustup and 7-Zip over https.
+		for _, name := range turboPackages {
+			if !contains(packages, name) {
+				packages = append(packages, name)
+			}
+		}
+	}
+	return packages
 }
 
 func (aws *AWS) Launch(ctx context.Context, machine Machine, session SessionResources, userDataPath string) (*CloudState, error) {

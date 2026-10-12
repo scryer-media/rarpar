@@ -95,8 +95,22 @@ func (bundler *Bundler) SharedBuild(ctx context.Context, sharedName string, rep 
 		info.Notes = append(info.Notes,
 			"prebuilt bundle staged from "+rep.Bundle.Path+"; its own BUILDINFO (if any) records the codegen policy")
 	case BundleDocker:
-		if err := bundler.dockerBuild(ctx, sharedName, rep, target, &info); err != nil {
-			return "", info, err
+		if rep.needsContainerBuild() {
+			if err := bundler.dockerBuild(ctx, sharedName, rep, target, &info); err != nil {
+				return "", info, err
+			}
+		} else {
+			// Turbo-only machines build their candidates on the host from
+			// git bundles; the orchestrator only cross-compiles the harness.
+			info.CodegenPolicy["candidates"] = "built on host with the checkout's pinned toolchain (rust-toolchain.toml); see turbo.go"
+			if err := bundler.buildHarness(ctx, sharedName, rep.Bundle, target); err != nil {
+				return "", info, err
+			}
+		}
+	}
+	if rep.hasTurbo() {
+		if err := bundler.stageTurbo(ctx, rep, target, &info); err != nil {
+			return "", info, fmt.Errorf("bundle %s: %w", sharedName, err)
 		}
 	}
 
@@ -106,6 +120,9 @@ func (bundler *Bundler) SharedBuild(ctx context.Context, sharedName string, rep 
 	}
 	if rep.hasSuite(SuiteCRCProbe) {
 		required = append(required, "crc_probe")
+	}
+	for _, source := range turboSources(bundler.Settings, rep) {
+		required = append(required, source[1]+"-bench", source[1]+".bundle", source[1]+".commit")
 	}
 	for index, name := range required {
 		// Windows bundles are prebuilt PE binaries; the names carry .exe.
@@ -206,6 +223,12 @@ func buildKey(machine Machine) string {
 	}
 	if machine.hasSuite(SuiteCRCProbe) {
 		features = append(features, "crc-probe")
+	}
+	if machine.hasSuite(SuiteLzmaTurbo) {
+		features = append(features, "lzma-turbo")
+	}
+	if machine.hasSuite(SuiteSevenzTurbo) {
+		features = append(features, "sevenz-turbo")
 	}
 	return strings.Join([]string{
 		bundle.Source, bundle.Path, bundle.Image, bundle.BuildHost,
