@@ -3,6 +3,12 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.6.2
+
+### Fixes
+
+- Follow-ups to the 0.6.1 review on the CLI only; no library crate changes.
+
 ## rarpar 0.6.1
 
 ### CLI Changes
