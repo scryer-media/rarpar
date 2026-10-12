@@ -46,7 +46,8 @@
 //! precisely so that one worker's destination is the contiguous, row-major
 //! buffer the plan wants; nothing is transposed afterwards.
 //!
-//! Stripes are deliberately small (8 KiB, 4 KiB when memory is tight). The
+//! Stripes are deliberately small (8 KiB, 4 KiB when memory is tight, and 2 KiB
+//! only when nothing wider fits at all). The
 //! plan's working set is `rows * stripe`, and the fold count does not depend on
 //! the stripe at all, so a small stripe keeps the intermediate rows in cache
 //! and buys more stripes per band — which is the parallel width.
@@ -87,9 +88,20 @@ use super::encode::{
 };
 
 /// Smallest band the arm will run. Below this the per-pass read of every slice
-/// degenerates into a seek per few kilobytes and the pass count explodes; the
+/// degenerates into a seek per kilobyte or so and the pass count explodes; the
 /// create takes the dense path instead.
-const MIN_BAND_BYTES: usize = 4 * 1024;
+///
+/// The band a budget buys is `budget / (sources + outputs)`, and the budget is
+/// the dense arm's own reservation, which for a narrow slice or a modest
+/// recovery count is little more than `outputs * slice`. Two shapes measured
+/// on an x86-64 performance core (GFNI, page-cached inputs, 1 thread) sit
+/// below a 4 KiB floor by that arithmetic: 10 x 100 MiB at 32,008-byte slices
+/// with 3,277 recovery blocks buys a ~2.9 KiB band, and 32,768 slices of 5,552
+/// bytes with 32,768 recovery blocks buys ~3.0 KiB. At a 4 KiB floor both took
+/// the dense arm (60.3 s and 112.5 s); at 2 KiB they run the transform in
+/// 16 and 3 passes and take 4.9 s and 4.4 s, at a lower peak RSS than the
+/// dense arm (86 MiB against 123 MiB, 151 MiB against 214 MiB).
+const MIN_BAND_BYTES: usize = 2 * 1024;
 
 /// Largest number of passes the arm will run. Each pass re-opens the strided
 /// read of the whole payload, so the bound is what keeps a tiny budget from
@@ -122,9 +134,23 @@ const FOLD_MARGIN: u64 = 2;
 const MIN_SOURCE_SLICES: usize = 512;
 
 /// Stripe lengths tried, widest first. See the module docs for why these are
-/// small; 4 KiB is the floor because the plan's rows must still be worth a
-/// kernel call.
+/// small; 4 KiB is the floor of the ordinary search because the plan's rows
+/// must still be worth a kernel call.
 const STRIPE_CANDIDATES: [usize; 3] = [16 * 1024, 8 * 1024, 4 * 1024];
+
+/// The stripe tried only when no [`STRIPE_CANDIDATES`] entry fits the budget.
+///
+/// The accumulation stage makes `256 * outputs / batch` kernel calls per
+/// stripe whatever its length, so a shorter stripe only adds calls. Measured on
+/// an x86-64 performance core (GFNI, 1 thread) at 32,760 sources and 32,768
+/// recovery blocks, a 2 KiB stripe costs the same as a 4 KiB one (21.7 s
+/// against 21.8 s) and a 1 KiB stripe costs 1.6x (34.0 s). In the ordinary
+/// search a 2 KiB stripe would still win shapes the wider stripes already
+/// admit — it buys more stripes per band, which [`better`] prefers — and on
+/// 4,096 recovery blocks of 44,436 bytes at 8 threads that traded 12% of wall
+/// time for 70% more CPU. It is therefore a fallback that opens shapes the
+/// arm could not run at all, never a competitor for the ones it could.
+const NARROW_STRIPE: usize = 2 * 1024;
 
 /// Bucket batches tried, widest first. A wider batch divides the accumulation
 /// stage's destination traffic and multiplies the plan's scratch; when memory
@@ -351,6 +377,32 @@ pub(crate) fn admit(
 
     let workers = configured_create_threads().max(1);
     let mut best: Option<(usize, TransformShape)> = None;
+    // Every worker count from the configured one down to 1, halving: the
+    // widest that fits is not always the best (see [`better`]).
+    let search_widths = |plan: &DftPlan,
+                         bucket_batch: usize,
+                         stripe: usize,
+                         best: &mut Option<(usize, TransformShape)>| {
+        let mut width = workers;
+        loop {
+            if let Some(shape) = fit(
+                plan,
+                slice_size,
+                source_count,
+                exponents.len(),
+                budget,
+                stripe,
+                width,
+            ) && best.is_none_or(|(_, incumbent)| better(shape, incumbent))
+            {
+                *best = Some((bucket_batch, shape));
+            }
+            if width == 1 {
+                break;
+            }
+            width /= 2;
+        }
+    };
     for &bucket_batch in &BATCH_CANDIDATES {
         let Ok(plan) = DftPlan::build_tuned(&slots, outputs.clone(), bucket_batch) else {
             return None;
@@ -361,25 +413,15 @@ pub(crate) fn admit(
             return None;
         }
         for &stripe in &STRIPE_CANDIDATES {
-            let mut width = workers;
-            loop {
-                if let Some(shape) = fit(
-                    &plan,
-                    slice_size,
-                    source_count,
-                    exponents.len(),
-                    budget,
-                    stripe,
-                    width,
-                ) && best.is_none_or(|(_, incumbent)| better(shape, incumbent))
-                {
-                    best = Some((bucket_batch, shape));
-                }
-                if width == 1 {
-                    break;
-                }
-                width /= 2;
-            }
+            search_widths(&plan, bucket_batch, stripe, &mut best);
+        }
+    }
+    if best.is_none() {
+        for &bucket_batch in &BATCH_CANDIDATES {
+            let Ok(plan) = DftPlan::build_tuned(&slots, outputs.clone(), bucket_batch) else {
+                return None;
+            };
+            search_widths(&plan, bucket_batch, NARROW_STRIPE, &mut best);
         }
     }
     let (bucket_batch, shape) = best?;
@@ -1039,6 +1081,21 @@ mod tests {
     }
 
     #[test]
+    fn a_two_kilobyte_band_is_byte_identical() {
+        // The narrowest band the arm admits: four passes over an 8 KiB slice,
+        // one 2 KiB stripe each.
+        let shape = Shape {
+            lengths: vec![300 * 8_192, 300 * 8_192 + 77],
+            slice_size: 8_192,
+            recovery: 256,
+            first_exponent: 3,
+            memory_limit: Some(4 * 1024 * 1024),
+        };
+        let passes = compare_arms(&shape, "2 KiB band");
+        assert_eq!(passes, 4, "expected four 2 KiB passes, ran {passes}");
+    }
+
+    #[test]
     fn a_limit_too_small_for_a_band_falls_back_to_dense() {
         let shape = Shape {
             lengths: vec![40 * 65_536, 40 * 65_536 + 3],
@@ -1221,7 +1278,7 @@ mod tests {
 
     #[test]
     fn a_budget_too_small_for_one_band_is_refused() {
-        // 4000 sources cannot hold even a 4 KiB band in 8 MiB.
+        // 4000 sources cannot hold even a 2 KiB band in 8 MiB.
         assert!(
             admit(
                 768_000,
