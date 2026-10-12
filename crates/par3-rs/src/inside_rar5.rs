@@ -740,7 +740,7 @@ pub fn insert_set(
 
 /// Link each finished `staged[k]` to the absent `outputs[k]`. On a failure,
 /// remove the outputs this call already linked, so none is left behind.
-fn link_all(staged: &[PathBuf], outputs: &[PathBuf]) -> EngineResult<()> {
+pub(crate) fn link_all(staged: &[PathBuf], outputs: &[PathBuf]) -> EngineResult<()> {
     for (position, (temporary, output)) in staged.iter().zip(outputs).enumerate() {
         let linked =
             injected_install_failure(position).and_then(|()| std::fs::hard_link(temporary, output));
@@ -772,7 +772,7 @@ fn injected_install_failure(position: usize) -> io::Result<()> {
     Ok(())
 }
 
-fn copy(
+pub(crate) fn copy(
     access: &dyn SourceAccess,
     source: SourceId,
     range: Range<u64>,
@@ -803,7 +803,7 @@ fn copy(
 
 /// Stage `destination` as a clone of the source where the filesystem allows,
 /// otherwise as an empty file. Records the staging path in `staged`.
-fn stage(
+pub(crate) fn stage(
     access: &dyn SourceAccess,
     source: SourceId,
     destination: &Path,
@@ -895,9 +895,9 @@ fn install_by_copy(
     result
 }
 
-struct HostViews {
-    access: Arc<dyn SourceAccess>,
-    views: BTreeMap<SourceId, (SourceId, SourceSnapshot, Range<u64>)>,
+pub(crate) struct HostViews {
+    pub(crate) access: Arc<dyn SourceAccess>,
+    pub(crate) views: BTreeMap<SourceId, (SourceId, SourceSnapshot, Range<u64>)>,
 }
 
 impl HostViews {
@@ -943,7 +943,7 @@ impl SourceAccess for HostViews {
 }
 
 /// Every authenticated packet of any set in `source`, scanning from `from`.
-fn scan(
+pub(crate) fn scan(
     access: Arc<dyn SourceAccess>,
     source: SourceId,
     from: u64,
@@ -1015,7 +1015,7 @@ pub struct Rar5Set {
     access: Arc<dyn SourceAccess>,
 }
 
-fn disk_access(paths: &[PathBuf], options: &ExecutionOptions) -> DiskSourceAccess {
+pub(crate) fn disk_access(paths: &[PathBuf], options: &ExecutionOptions) -> DiskSourceAccess {
     let mut disk = DiskSourceAccess::with_options(options.clone());
     for (index, path) in paths.iter().enumerate() {
         disk.insert(SourceId(index as u64), path.clone());
@@ -1023,18 +1023,18 @@ fn disk_access(paths: &[PathBuf], options: &ExecutionOptions) -> DiskSourceAcces
     disk
 }
 
-struct Candidate {
-    path: PathBuf,
-    source: SourceId,
-    volume: Option<u64>,
-    packets: Vec<IngestedPacket>,
+pub(crate) struct Candidate {
+    pub(crate) path: PathBuf,
+    pub(crate) source: SourceId,
+    pub(crate) volume: Option<u64>,
+    pub(crate) packets: Vec<IngestedPacket>,
     /// Indices into `packets` per input set, so opening one set walks its own
     /// packets rather than every packet of every set the file carries.
     by_set: HashMap<InputSetId, Vec<usize>>,
 }
 
 impl Candidate {
-    fn new(
+    pub(crate) fn new(
         path: PathBuf,
         source: SourceId,
         volume: Option<u64>,
@@ -1054,7 +1054,7 @@ impl Candidate {
     }
 
     /// This file's packets of set `id`, in scan order.
-    fn packets_of(&self, id: InputSetId) -> impl Iterator<Item = &IngestedPacket> {
+    pub(crate) fn packets_of(&self, id: InputSetId) -> impl Iterator<Item = &IngestedPacket> {
         self.by_set
             .get(&id)
             .into_iter()
@@ -1062,16 +1062,16 @@ impl Candidate {
             .map(|&index| &self.packets[index])
     }
 
-    fn carries(&self, id: InputSetId) -> bool {
+    pub(crate) fn carries(&self, id: InputSetId) -> bool {
         self.by_set.contains_key(&id)
     }
 
-    fn carries_other_than(&self, id: InputSetId) -> bool {
+    pub(crate) fn carries_other_than(&self, id: InputSetId) -> bool {
         self.by_set.keys().any(|other| *other != id)
     }
 }
 
-fn file_name(path: &Path) -> Option<&str> {
+pub(crate) fn file_name(path: &Path) -> Option<&str> {
     path.file_name().and_then(|name| name.to_str())
 }
 
@@ -1317,7 +1317,7 @@ fn stem_change(recorded: &str, actual: &str) -> Option<(String, String)> {
 /// the first starting at `first`. `first` comes from an authenticated packet,
 /// which may still carry any index: a range past `u64::MAX` is refused, never
 /// wrapped.
-fn recovery_ranges(first: u64, counts: &[u64]) -> EngineResult<Vec<Range<u64>>> {
+pub(crate) fn recovery_ranges(first: u64, counts: &[u64]) -> EngineResult<Vec<Range<u64>>> {
     let mut base = first;
     counts
         .iter()
@@ -1672,7 +1672,7 @@ fn open_set(
 
 /// The length of one Recovery Data packet for `block_size`, refused when the
 /// Start packet records a block size too large for that length to exist.
-fn packet_len(block_size: u64) -> EngineResult<u64> {
+pub(crate) fn packet_len(block_size: u64) -> EngineResult<u64> {
     block_size
         .checked_add(RECOVERY_OVERHEAD)
         .ok_or(EngineError::Unsupported(
