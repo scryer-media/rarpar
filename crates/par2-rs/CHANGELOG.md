@@ -35,6 +35,33 @@ workers idle, at the same peak memory.
   whose bands were already fully parallel. Peak RSS at 8 threads can rise by
   under 1 MiB for the pool threads' stacks; a single-threaded create keeps
   the writes on its own thread.
+- A multi-pass transform create reads its sources once fewer. The whole-file
+  MD5 still needs one read of every source in file order, but that read now
+  also fills the first pass's band, so the strided reads cover only the
+  remaining passes. Before, the first band was read strided as well as by the
+  separate hashing read. Output is byte-identical. The hashing read, the
+  16 KiB head and the encoder's band reads use positional reads instead of
+  seek plus read, and the hashing read stages at least 1 MiB of whole slices
+  per read (it read once per slice before). That raises its per-task
+  staging, which the plan accounts, from 256 KiB to about 1 MiB for slices
+  under 256 KiB.
+- Staged volume validation keeps one sequential read of each staged volume:
+  the packet scan, which already checks every packet against the MD5 in its
+  header, recovery payloads included. It no longer re-opens the volume to
+  re-read each packet header or re-opens it again to re-hash each recovery
+  payload. A planted change to a staged recovery byte after hashing is still
+  rejected.
+- Together, measured on Apple silicon performance cores (page-cached inputs,
+  medians of three, 1 thread / 6 threads, read calls counted at the libc
+  boundary). 10 x 100 MiB at 32,008-byte slices with 3,277 recovery blocks
+  (16 passes): 4.83 s / 2.39 s becomes 4.58 s / 2.34 s; system time drops
+  from 0.60 s to 0.44 s single-threaded; reads fall from 2.36 GB in 565,751
+  read and 543,834 seek calls to 2.19 GB in 493,056 read and 13,107 seek
+  calls; opens fall from 3,349 to 49. 32,768 recovery blocks (3 passes):
+  17.46 s / 6.49 s becomes 15.65 s / 5.72 s; reads fall from 4.28 GB in
+  203,505 read and 267,261 seek calls to 2.83 GB in 70,900 read and 103,428
+  seek calls; opens fall from 32,852 to 57. Peak RSS is unchanged (94 MiB
+  and 837 MiB single-threaded).
 
 ## 0.10.8
 

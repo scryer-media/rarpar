@@ -9,7 +9,7 @@ use bytes::Bytes;
 use crate::checksum::Md5State;
 use crate::error::{Par2Error, Result};
 use crate::evidence::FileStatFingerprint;
-use crate::types::{CancellationToken, RecoveryExponent};
+use crate::types::RecoveryExponent;
 
 #[derive(Debug, Clone)]
 pub enum RecoverySliceData {
@@ -239,7 +239,7 @@ impl RecoverySliceData {
         recovery_set_id: &[u8; 16],
         exponent: RecoveryExponent,
     ) -> io::Result<bool> {
-        self.validate_packet_hash_inner(recovery_set_id, exponent, None)
+        self.validate_packet_hash_inner(recovery_set_id, exponent)
             .map_err(|error| match error {
                 Par2Error::Io(error) => error,
                 Par2Error::Cancelled => io::Error::new(
@@ -250,20 +250,10 @@ impl RecoverySliceData {
             })
     }
 
-    pub(crate) fn validate_packet_hash_cancellable(
-        &self,
-        recovery_set_id: &[u8; 16],
-        exponent: RecoveryExponent,
-        cancellation: &CancellationToken,
-    ) -> Result<bool> {
-        self.validate_packet_hash_inner(recovery_set_id, exponent, Some(cancellation))
-    }
-
     fn validate_packet_hash_inner(
         &self,
         recovery_set_id: &[u8; 16],
         exponent: RecoveryExponent,
-        cancellation: Option<&CancellationToken>,
     ) -> Result<bool> {
         let Self::FileBacked {
             path,
@@ -291,9 +281,6 @@ impl RecoverySliceData {
         let mut remaining = *len;
         let mut buf = vec![0u8; remaining.clamp(1, 256 * 1024)];
         while remaining > 0 {
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return Err(Par2Error::Cancelled);
-            }
             let take = remaining.min(buf.len());
             file.read_exact(&mut buf[..take]).map_err(Par2Error::Io)?;
             hasher.update(&buf[..take]);
@@ -459,24 +446,5 @@ mod tests {
         let body = [0u8; 2];
         let err = RecoverySlicePacket::parse(&body).unwrap_err();
         assert!(matches!(err, Par2Error::InvalidRecoveryPacket { .. }));
-    }
-
-    #[test]
-    fn file_backed_hash_validation_honors_cancellation() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(file.path(), vec![0xA5; 512 * 1024]).unwrap();
-        let data = RecoverySliceData::file_backed_with_hash(
-            file.path().to_path_buf(),
-            0,
-            512 * 1024,
-            [0; 16],
-        );
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-
-        let error = data
-            .validate_packet_hash_cancellable(&[0; 16], 0, &cancellation)
-            .unwrap_err();
-        assert!(matches!(error, Par2Error::Cancelled));
     }
 }

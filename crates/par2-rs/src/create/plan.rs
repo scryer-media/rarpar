@@ -503,7 +503,6 @@ fn estimate_source_metadata_bytes(sources: &[CreationSource], capacity: usize) -
 }
 
 fn estimate_source_hash_workspace(input_count: usize, block_size: u64) -> Result<usize> {
-    const READ_BUFFER_BYTES: usize = 256 * 1024;
     const HASH_SET_ENTRY_RESERVE_BYTES: usize = 128;
     let input_lengths = checked_memory_mul(
         input_count,
@@ -528,27 +527,15 @@ fn estimate_source_hash_workspace(input_count: usize, block_size: u64) -> Result
     } else {
         input_count.min(threads.saturating_add(1))
     };
-    // A task either stages a batch of slices for the multi-buffer slice-hash
-    // kernel or streams one slice through a single read buffer, whichever
-    // `create_md5_batch_lanes` selected for this block size. Mirrors the split
-    // in `source.rs` exactly; the two must move together or the plan's
+    // A task stages one read window: whole slices for the multi-buffer
+    // slice-hash kernel, or one chunk of a slice for the streaming scan,
+    // whichever `create_md5_batch_lanes` selected for this block size. The
+    // same window serves the first-band sweep of a multi-pass transform, which
+    // runs inside the create phase below. Mirrors `source.rs` exactly through
+    // `create_hash_window_bytes`; the two must move together or the plan's
     // self-consistency check in `Par2CreatePlan` fails.
-    // `READ_BUFFER_BYTES` stays a floor rather than the exact figure: the
-    // streaming arm allocates only `min(READ_BUFFER_BYTES, block_size)`, so
-    // this estimate has always been an upper bound for small blocks, and
-    // tightening it here would move a reported number for no benefit.
     let block_size_usize = usize::try_from(block_size).unwrap_or(usize::MAX);
-    let lanes = super::source::create_md5_batch_lanes(block_size_usize);
-    let per_task_bytes = if lanes >= 2 {
-        checked_memory_mul(
-            lanes,
-            block_size_usize,
-            "source hash batch estimate overflows",
-        )?
-        .max(READ_BUFFER_BYTES)
-    } else {
-        READ_BUFFER_BYTES
-    };
+    let per_task_bytes = super::source::create_hash_window_bytes(block_size_usize);
     let read_buffers = checked_memory_mul(
         per_task_bytes,
         concurrent_reads,

@@ -60,9 +60,12 @@
 //! are single serial messages over a file's bytes in file order, so they cannot
 //! be driven from a multi-pass feed — exactly the rule the dense arm already
 //! follows when its own stripe count exceeds one. A single-pass transform *is*
-//! in file order and fuses the digests as before; a multi-pass one leaves them
-//! to the separate hashing read `write_outputs` already performs for every
-//! multi-stripe create. No per-slice digest state is carried across passes.
+//! in file order and fuses the digests as before. A multi-pass one still needs
+//! one file-order read of every source for them, so `write_outputs` makes that
+//! read the first pass's feed: the provider's
+//! [`fill_band`](super::encode::ForwardSourceProvider::fill_band) serves band
+//! zero from the sequential hashing sweep, and only the remaining passes read
+//! strided. No per-slice digest state is carried across passes.
 //!
 //! # The safety row
 //!
@@ -623,8 +626,7 @@ pub(crate) fn encode<P: ForwardSourceProvider + ?Sized, S: ForwardRecoverySink>(
         let band_len = (slice_size - band_offset).min(shape.band);
         let live_chunks = band_len.div_ceil(shape.stripe);
 
-        fill_band(
-            provider,
+        provider.fill_band(
             sources.as_bytes_mut(),
             &mut band_lens,
             shape.band,
@@ -698,25 +700,6 @@ pub(crate) fn encode<P: ForwardSourceProvider + ?Sized, S: ForwardRecoverySink>(
 
     check_cancel(options)?;
     Ok(EncodeAttempt::Complete)
-}
-
-/// Read `[offset, offset + band_len)` of every slice into the source arena,
-/// zeroing each slice's padding out to the full band so every stripe view is a
-/// whole, defined region.
-fn fill_band<P: ForwardSourceProvider + ?Sized>(
-    provider: &mut P,
-    arena: &mut [u8],
-    band_lens: &mut [usize],
-    band: usize,
-    offset: usize,
-    band_len: usize,
-) -> Result<()> {
-    for (source_index, slot) in arena.chunks_mut(band).enumerate() {
-        let read = provider.read_source_chunk(source_index, offset, &mut slot[..band_len])?;
-        slot[read..].fill(0);
-        band_lens[source_index] = read;
-    }
-    Ok(())
 }
 
 /// Hand a single-pass band's real source bytes to the fused hasher, in source
@@ -1499,6 +1482,70 @@ mod tests {
         let passes =
             test_probe::with_budget(4 * 1024 * 1024, || compare_arms(&shape, "2 KiB band"));
         assert_eq!(passes, 4, "expected four 2 KiB passes, ran {passes}");
+    }
+
+    #[test]
+    fn a_multi_pass_create_hashes_its_sources_while_filling_the_first_band() {
+        // The 2 KiB-band shape: four passes. The sources' content hashes come
+        // from the sequential sweep that fills band zero, not from a separate
+        // hashing read, and the set is byte-identical to the dense arm's
+        // (`a_two_kilobyte_band_is_byte_identical`).
+        let shape = Shape {
+            lengths: vec![300 * 8_192, 300 * 8_192 + 77, 5],
+            slice_size: 8_192,
+            recovery: 256,
+            first_exponent: 3,
+            memory_limit: Some(4 * 1024 * 1024),
+        };
+        let root = tempfile::tempdir().unwrap();
+        let sources = root.path().join("sources");
+        let inputs = write_sources(&sources, &shape.lengths);
+        let ((_, passes), sweeps, hydrates) = crate::create::source::test_probe::counted(|| {
+            test_probe::with_budget(4 * 1024 * 1024, || {
+                create(
+                    &shape,
+                    &inputs,
+                    &sources,
+                    &root.path().join("transform"),
+                    TransformPolicy::Force,
+                )
+            })
+        });
+        assert_eq!(passes, 4, "expected four 2 KiB passes, ran {passes}");
+        assert_eq!(
+            sweeps, 1,
+            "the first band was not served by the hashing sweep"
+        );
+        assert_eq!(
+            hydrates, 0,
+            "the sources were read a second time to hash them"
+        );
+    }
+
+    #[test]
+    fn a_multi_pass_band_over_slices_larger_than_a_read_window_is_byte_identical() {
+        // Slices above the multi-buffer staging budget take the streaming
+        // hashing scan, which hands the sweep each slice in 1 MiB read-window
+        // chunks. An 11 MiB budget over seven rows buys a band of about
+        // 1.5 MiB, so band zero takes one whole chunk and part of the next.
+        let slice = 3 * 1024 * 1024 + 4;
+        let shape = Shape {
+            lengths: vec![2 * slice + 1_000, slice - 9],
+            slice_size: slice as u64,
+            recovery: 3,
+            first_exponent: 0,
+            memory_limit: None,
+        };
+        let (passes, sweeps, _) = crate::create::source::test_probe::counted(|| {
+            test_probe::with_budget(11 * 1024 * 1024, || {
+                compare_arms(&shape, "streaming first band")
+            })
+        });
+        assert!(passes > 1, "expected a multi-pass arm, ran {passes}");
+        assert_eq!(
+            sweeps, 1,
+            "the first band was not served by the hashing sweep"
+        );
     }
 
     #[test]

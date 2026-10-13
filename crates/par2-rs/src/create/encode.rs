@@ -369,6 +369,39 @@ pub(crate) trait ForwardSourceProvider {
         offset: usize,
         destination: &mut [u8],
     ) -> Result<usize>;
+
+    /// Fill one transform band: `[offset, offset + band_len)` of every slice
+    /// into consecutive `band`-byte slots of `arena`, each zero-padded to the
+    /// full slot, with each slice's real byte count in `band_lens`. The
+    /// default reads the slices one chunk at a time.
+    fn fill_band(
+        &mut self,
+        arena: &mut [u8],
+        band_lens: &mut [usize],
+        band: usize,
+        offset: usize,
+        band_len: usize,
+    ) -> Result<()> {
+        fill_band_by_chunks(self, arena, band_lens, band, offset, band_len)
+    }
+}
+
+/// [`ForwardSourceProvider::fill_band`]'s default: one
+/// [`ForwardSourceProvider::read_source_chunk`] per slice.
+pub(crate) fn fill_band_by_chunks<P: ForwardSourceProvider + ?Sized>(
+    provider: &mut P,
+    arena: &mut [u8],
+    band_lens: &mut [usize],
+    band: usize,
+    offset: usize,
+    band_len: usize,
+) -> Result<()> {
+    for (source_index, slot) in arena.chunks_mut(band).enumerate() {
+        let read = provider.read_source_chunk(source_index, offset, &mut slot[..band_len])?;
+        slot[read..].fill(0);
+        band_lens[source_index] = read;
+    }
+    Ok(())
 }
 
 /// Observer of the exact source bytes the encode feed reads, in feed order.
@@ -2217,25 +2250,38 @@ impl RowFactors {
     }
 }
 
-/// Stripes one forward pass will walk under the same budget the pass itself
+/// How one forward pass will read its sources: how many times it walks each
+/// slice, and whether the walks are transform bands (every slice's band
+/// resident at once) or dense stripes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForwardFeedShape {
+    pub(crate) passes: usize,
+    pub(crate) transform: bool,
+}
+
+/// The feed one forward pass will take under the same budget the pass itself
 /// resolves.
 ///
-/// Creation asks this to decide whether a whole-file digest can be driven from
-/// the encode feed: one stripe means the feed visits each file's bytes in file
-/// order, more than one means it is stripe-major and cannot. Funnels through
-/// `select_kernel_for_memory` exactly as `estimate_forward_memory` does, so
-/// the answer is the shape the pass will actually take.
-pub(crate) fn forward_stripe_count(
+/// Creation asks this to decide where the whole-file digests come from: one
+/// pass means the feed visits each file's bytes in file order and can drive
+/// them; a multi-pass transform can serve its first band from the hashing
+/// read; a multi-stripe dense pass is stripe-major and can do neither. Funnels
+/// through `select_kernel_for_memory` exactly as `estimate_forward_memory`
+/// does, so the answer is the shape the pass will actually take.
+pub(crate) fn forward_feed_shape(
     slice_size: u64,
     source_count: usize,
     exponents: &[RecoveryExponent],
     memory_limit: usize,
     requested_kernel: ForwardKernel,
     transform_policy: TransformPolicy,
-) -> Result<usize> {
+) -> Result<ForwardFeedShape> {
     let output_count = exponents.len();
     if output_count == 0 {
-        return Ok(0);
+        return Ok(ForwardFeedShape {
+            passes: 0,
+            transform: false,
+        });
     }
     let slice_size = usize::try_from(slice_size)
         .map_err(|_| resource_limit("slice size exceeds addressable memory"))?;
@@ -2257,9 +2303,15 @@ pub(crate) fn forward_stripe_count(
         &buffers,
         transform_policy,
     ) {
-        return Ok(arm.shape().passes);
+        return Ok(ForwardFeedShape {
+            passes: arm.shape().passes,
+            transform: true,
+        });
     }
-    Ok(slice_size.div_ceil(buffers.chunk_len))
+    Ok(ForwardFeedShape {
+        passes: slice_size.div_ceil(buffers.chunk_len),
+        transform: false,
+    })
 }
 
 /// The one place the transform arm's admission is resolved, for the pass and

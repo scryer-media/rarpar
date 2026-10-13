@@ -30,6 +30,12 @@ documented in each crate's own changelog so those notes ship with the crate.
   recovery blocks takes 4.9 s instead of 61.8 s single-threaded, and 1 GiB
   with 32,768 recovery blocks 9.7 s instead of 13.2 s at 8 threads. A create
   issues about half the seeks it did.
+- `par create` (PAR2) reads less on the same shapes: a multi-pass create
+  reads its sources once fewer, and staged volumes are checked with one read
+  each instead of a re-read of every recovery packet. With 32,768 recovery
+  blocks over 10 x 100 MiB it reads 2.83 GB instead of 4.28 GB and takes
+  15.7 s instead of 17.5 s single-threaded on Apple silicon performance cores.
+  Output is unchanged.
 
 ## rarpar 0.6.1
 
