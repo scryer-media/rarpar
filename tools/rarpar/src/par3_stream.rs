@@ -1240,19 +1240,20 @@ pub(crate) fn write_sibling(
 /// Whether a written set waits for durable storage before it is installed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Durability {
-    /// Each file is synced before it is installed (the default).
+    /// Each file is synced before it is installed (`par3 create --fsync`
+    /// from a pipe, and the writers outside `par3 create`).
     Sync,
-    /// Buffers are flushed but no storage barrier is requested
-    /// (`--buffered`).
+    /// Buffers are flushed but no storage barrier is requested (`par3
+    /// create` from a pipe without `--fsync`).
     Buffered,
 }
 
 impl Durability {
-    pub(crate) fn from_buffered(buffered: bool) -> Self {
-        if buffered {
-            Durability::Buffered
-        } else {
+    pub(crate) fn from_fsync(fsync: bool) -> Self {
+        if fsync {
             Durability::Sync
+        } else {
+            Durability::Buffered
         }
     }
 }

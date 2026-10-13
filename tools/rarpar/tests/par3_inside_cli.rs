@@ -108,11 +108,13 @@ fn inside_lifecycle_repairs_lost_and_damaged_volumes_and_removes_exactly() {
             "56",
             "--layout",
             "service",
+            "--fsync",
         ],
         0,
     );
     assert_eq!(inserted["outputs"].as_array().unwrap().len(), 7);
     assert_eq!(inserted["experimental"], true);
+    assert_eq!(inserted["fsync"], true);
     let protected = root.join("protected");
     let pristine: Vec<Vec<u8>> = (1..=7)
         .map(|part| std::fs::read(protected.join(name(part))).unwrap())
@@ -135,8 +137,9 @@ fn inside_lifecycle_repairs_lost_and_damaged_volumes_and_removes_exactly() {
     let entry = entry.to_str().unwrap();
     let verified = run(root, &["par3", "inside", "verify", entry], 1);
     assert_eq!(verified["repairable"], true);
-    let repaired = run(root, &["par3", "inside", "repair", entry], 0);
+    let repaired = run(root, &["par3", "inside", "repair", entry, "--fsync"], 0);
     assert_eq!(repaired["status"], "repaired");
+    assert_eq!(repaired["fsync"], true);
     for part in 1..=7 {
         assert_eq!(
             std::fs::read(protected.join(name(part))).unwrap(),
@@ -146,11 +149,14 @@ fn inside_lifecycle_repairs_lost_and_damaged_volumes_and_removes_exactly() {
     }
     run(root, &["par3", "inside", "verify", entry], 0);
 
-    run(
+    let removed = run(
         root,
-        &["par3", "inside", "remove", entry, "-d", "stripped"],
+        &[
+            "par3", "inside", "remove", entry, "-d", "stripped", "--fsync",
+        ],
         0,
     );
+    assert_eq!(removed["fsync"], true);
     for (part, source) in sources.iter().enumerate() {
         assert_eq!(
             std::fs::read(root.join("stripped").join(name(part + 1))).unwrap(),

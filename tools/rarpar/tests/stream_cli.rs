@@ -302,11 +302,11 @@ fn code_of(output: &Output, expected: i32) {
 }
 
 #[test]
-fn par3_create_from_a_pipe_honours_buffered() {
+fn par3_create_from_a_pipe_honours_fsync() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let data = sample(100_000, 7);
-    for (buffered, flag) in [(false, None), (true, Some("--buffered"))] {
+    for (fsync, flag) in [(false, None), (true, Some("--fsync"))] {
         let mut args = vec![
             "--json",
             "par3",
@@ -320,15 +320,15 @@ fn par3_create_from_a_pipe_honours_buffered() {
             "-c",
             "2",
         ];
-        if buffered {
+        if fsync {
             args.insert(0, "--overwrite");
         }
         args.extend(flag);
         let created = through_pipes(root, &args, data.clone());
         ok(&created);
-        // As `par3 create` over a file reports it: --buffered skips the
-        // storage barriers.
-        assert_eq!(json(&created)["buffered"], buffered);
+        // As `par3 create` over a file reports it: only --fsync syncs the
+        // files written.
+        assert_eq!(json(&created)["fsync"], fsync);
     }
     std::fs::write(root.join("piece.bin"), &data).unwrap();
     let (code, _) = par3_verdicts(root, "set.par3");

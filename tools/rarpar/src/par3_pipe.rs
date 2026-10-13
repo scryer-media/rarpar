@@ -124,8 +124,8 @@ pub fn create(
     let mut report = json!({"operation":"par3_create","success":true,"dry_run":cli.dry_run,
         "input":"-","name":name,"block_size":block_size,"recovery_blocks":rows,
         "memory_estimate_bytes":memory_estimate,"cohorts":1,"scratch_bytes":0,
-        "buffered":args.buffered});
-    let durability = Durability::from_buffered(args.buffered);
+        "fsync":args.fsync});
+    let durability = Durability::from_fsync(args.fsync);
     if cli.dry_run {
         report["outputs"] = json!(planned);
         return Ok((true, report));

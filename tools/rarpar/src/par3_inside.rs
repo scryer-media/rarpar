@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use par3_rs::creation::{CreationDurability, CreationOptions};
+use par3_rs::creation::CreationOptions;
 use par3_rs::inside::rar5::{self, Rar5Layout, Rar5Placement, Rar5Set};
 use par3_rs::session::RepairStatus;
 use rarpar::cli::{
@@ -262,7 +262,7 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
         }
         return Ok((
             true,
-            json!({"operation":"par3_inside_insert","status":"planned","dry_run":true,"hosts":hosts.iter().map(|h| &h.name).collect::<Vec<_>>(),"block_size":block_size}),
+            json!({"operation":"par3_inside_insert","status":"planned","dry_run":true,"hosts":hosts.iter().map(|h| &h.name).collect::<Vec<_>>(),"block_size":block_size,"fsync":args.fsync}),
         ));
     }
     // In place, each output is staged in its own volume's directory, so the
@@ -293,11 +293,6 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
             scratch_holder.path().to_owned()
         }
     };
-    let durability = if args.buffered {
-        CreationDurability::Buffered
-    } else {
-        CreationDurability::SyncFiles
-    };
     let creation = |count: u64| CreationOptions {
         execution: execution.clone(),
         block_size,
@@ -315,7 +310,6 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
                 region_layout,
                 creation(count),
                 &scratch,
-                durability,
             ) {
                 Ok(entries) => inserted.extend(entries),
                 Err(error) => {
@@ -343,10 +337,10 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
             region_layout,
             creation(count),
             &scratch,
-            durability,
         )?;
     }
     let mut written = Vec::new();
+    let mut destinations = Vec::new();
     for (entry, path) in inserted.iter().zip(&paths) {
         let destination = if args.in_place {
             std::fs::rename(&entry.path, path)?;
@@ -355,11 +349,15 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
             entry.path.clone()
         };
         written.push(json!({"path":destination,"region_bytes":entry.region_bytes,"recovery_packets":entry.recovery_packets,"set_id":entry.set.to_string()}));
+        destinations.push(destination);
     }
     drop(staging);
+    if args.fsync {
+        crate::par3::fsync_outputs(&destinations)?;
+    }
     Ok((
         true,
-        json!({"operation":"par3_inside_insert","status":"inserted","block_size":block_size,"layout":layout_name(region_layout),"outputs":written}),
+        json!({"operation":"par3_inside_insert","status":"inserted","block_size":block_size,"layout":layout_name(region_layout),"outputs":written,"fsync":args.fsync}),
     ))
 }
 
@@ -595,6 +593,7 @@ fn verify(cli: &Cli, args: &Par3InsideArgs) -> Result<(bool, Value), RarparError
 fn repair(cli: &Cli, args: &Par3InsideRepairArgs) -> Result<(bool, Value), RarparError> {
     let mut sets = open(cli, &args.inputs)?;
     let mut outputs = Vec::new();
+    let mut destinations = Vec::new();
     let mut planned = false;
     let uncovered = uncovered_volumes(cli, &args.inputs, &sets);
     let mut success = uncovered.is_empty();
@@ -662,7 +661,11 @@ fn repair(cli: &Cli, args: &Par3InsideRepairArgs) -> Result<(bool, Value), Rarpa
             }
             std::fs::rename(&entry.path, destination)?;
             outputs.push(json!({"path":destination,"data_rebuilt":entry.data_rebuilt,"regenerated_packets":entry.regenerated,"restoration":format!("{:?}", entry.restoration)}));
+            destinations.push(destination.clone());
         }
+    }
+    if args.fsync {
+        crate::par3::fsync_outputs(&destinations)?;
     }
     let status = if !success {
         "some damage is not repairable"
@@ -673,7 +676,7 @@ fn repair(cli: &Cli, args: &Par3InsideRepairArgs) -> Result<(bool, Value), Rarpa
     } else {
         "repaired"
     };
-    let mut report = json!({"operation":"par3_inside_repair","status":status,"unprotected_missing_volumes":uncovered,"sets":sets.iter().map(set_report).collect::<Vec<_>>(),"outputs":outputs});
+    let mut report = json!({"operation":"par3_inside_repair","status":status,"unprotected_missing_volumes":uncovered,"sets":sets.iter().map(set_report).collect::<Vec<_>>(),"outputs":outputs,"fsync":args.fsync});
     if cli.dry_run {
         report["dry_run"] = json!(true);
     }
@@ -694,6 +697,7 @@ fn numbered_backup(path: &Path) -> PathBuf {
 fn remove(cli: &Cli, args: &Par3InsideRemoveArgs) -> Result<(bool, Value), RarparError> {
     let mut sets = open(cli, &args.inputs)?;
     let mut outputs = Vec::new();
+    let mut removed = Vec::new();
     for set in &mut sets {
         // A dry run makes the checks a removal would, and writes nothing.
         set.removable()?;
@@ -731,18 +735,22 @@ fn remove(cli: &Cli, args: &Par3InsideRemoveArgs) -> Result<(bool, Value), Rarpa
                 path.clone()
             };
             outputs.push(json!(destination));
+            removed.push(destination);
         }
         drop(stage);
     }
     if cli.dry_run {
         return Ok((
             true,
-            json!({"operation":"par3_inside_remove","status":"planned","dry_run":true,"outputs":outputs}),
+            json!({"operation":"par3_inside_remove","status":"planned","dry_run":true,"outputs":outputs,"fsync":args.fsync}),
         ));
+    }
+    if args.fsync {
+        crate::par3::fsync_outputs(&removed)?;
     }
     Ok((
         true,
-        json!({"operation":"par3_inside_remove","status":"removed","outputs":outputs}),
+        json!({"operation":"par3_inside_remove","status":"removed","outputs":outputs,"fsync":args.fsync}),
     ))
 }
 
