@@ -20,7 +20,10 @@ documented in each crate's own changelog so those notes ship with the crate.
 - `rar list`, `rar test` and `rar extract` read the whole volume set when the
   archive is named in another case than its volumes on a filesystem that
   ignores case (macOS and Windows by default): `rar list SET.part01.rar` over
-  `set.partNN.rar` read the named volume alone.
+  `set.partNN.rar` read the named volume alone. The match follows the
+  filesystem rather than the platform: a volume in another case joins when
+  its name respelled in the archive's case opens the same file, so a
+  case-sensitive volume keeps `SET.*` and `set.*` apart on any platform.
 
 ### Changed
 

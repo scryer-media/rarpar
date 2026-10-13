@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::cleanup::{CleanupManifest, CleanupResult};
 use crate::error::RarparError;
-use crate::par3_inside::same_stem;
+use crate::par3_inside::fold_case;
 use rarpar::cli::Cli;
 
 const PAR2_MAGIC: &[u8] = b"PAR2\0PKT";
@@ -536,11 +536,64 @@ fn discover_named_rar_family(
 
 /// Whether `path` names a volume of the family labelled `label`: a RAR
 /// volume or `.rev` recovery volume by name whose label is `label` as the
-/// platform's file names compare ([`same_stem`]), so where they ignore case
-/// `set.part2.rar` is a volume of the family `SET.part1.rar` names.
+/// filesystem holding it compares names. A label spelled in another case
+/// joins when the name respelled with `label` opens the same file, so on a
+/// volume that ignores case (macOS and Windows by default) `set.part2.rar`
+/// is a volume of the family `SET.part1.rar` names, and on one that does not
+/// `SET.*` and `set.*` stay two families.
 fn in_named_family(path: &Path, label: &str) -> bool {
-    set_hint(path).is_some_and(|hint| same_stem(&hint, label))
-        && (looks_rarish_by_name(path) || is_ext(path, "rev"))
+    in_named_family_with(path, label, same_file_on_disk)
+}
+
+/// [`in_named_family`] with `same_file` deciding whether two names open one
+/// file, so tests can stand in for either kind of filesystem.
+fn in_named_family_with(
+    path: &Path,
+    label: &str,
+    same_file: impl Fn(&Path, &Path) -> bool,
+) -> bool {
+    if !(looks_rarish_by_name(path) || is_ext(path, "rev")) {
+        return false;
+    }
+    let Some(hint) = set_hint(path) else {
+        return false;
+    };
+    if hint == label {
+        return true;
+    }
+    if fold_case(&hint) != fold_case(label) {
+        return false;
+    }
+    // The hint is a prefix of the file name, so the respelling keeps the
+    // rest of the name exactly.
+    let Some(rest) = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .and_then(|name| name.get(hint.len()..))
+    else {
+        return false;
+    };
+    same_file(path, &path.with_file_name(format!("{label}{rest}")))
+}
+
+/// Whether both names exist and open one file: the same device and inode on
+/// Unix, the same final path elsewhere (which on Windows reports the name as
+/// stored, whatever case it was opened in).
+#[cfg(unix)]
+fn same_file_on_disk(left: &Path, right: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(left), std::fs::metadata(right)) {
+        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_file_on_disk(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 /// [`Path::canonicalize`], counted per thread under test so RAR set
@@ -1390,24 +1443,70 @@ mod tests {
     }
 
     /// A volume joins the family the caller named when its label is the
-    /// caller's as the platform compares file names: exactly everywhere, and
-    /// in any case on macOS and Windows, so `rar list SET.part1.rar` there
-    /// reaches `set.part2.rar`.
+    /// caller's exactly, or in another case when the filesystem opens the
+    /// respelled name as the same file: `rar list SET.part1.rar` reaches
+    /// `set.part2.rar` where names ignore case, and where they do not, a
+    /// `set.*` family stays apart from `SET.*`. The probe stands in for
+    /// both kinds of filesystem.
     #[test]
-    fn a_named_family_compares_labels_as_the_platform_compares_names() {
-        let folds = cfg!(any(windows, target_os = "macos"));
-        for (name, label, member) in [
-            ("set.part2.rar", "set", true),
-            ("set.part2.rar", "SET", folds),
-            ("Set.R00", "sET", folds),
-            ("SET.part1.rev", "set", folds),
-            ("\u{e9}t\u{e9}.part2.rar", "\u{c9}T\u{c9}", folds),
-            ("sets.part2.rar", "set", false),
-            ("set.par2", "set", false),
-        ] {
-            let path = Path::new("dir").join(name);
-            assert_eq!(in_named_family(&path, label), member, "{name} in {label}");
+    fn a_named_family_compares_labels_as_the_filesystem_compares_names() {
+        let probed = std::cell::RefCell::new(Vec::new());
+        for folds in [true, false] {
+            let probe = |left: &Path, right: &Path| {
+                probed
+                    .borrow_mut()
+                    .push((left.to_path_buf(), right.to_path_buf()));
+                folds
+            };
+            for (name, label, member) in [
+                ("set.part2.rar", "set", true),
+                ("set.part2.rar", "SET", folds),
+                ("Set.R00", "sET", folds),
+                ("SET.part1.rev", "set", folds),
+                ("\u{e9}t\u{e9}.part2.rar", "\u{c9}T\u{c9}", folds),
+                ("sets.part2.rar", "set", false),
+                ("set.par2", "set", false),
+            ] {
+                let path = Path::new("dir").join(name);
+                assert_eq!(
+                    in_named_family_with(&path, label, probe),
+                    member,
+                    "{name} in {label}, folding {folds}"
+                );
+            }
         }
+        // Only a name differing from the label by case is probed, under the
+        // label's spelling.
+        let probed = probed.into_inner();
+        assert_eq!(probed.len(), 8);
+        assert_eq!(
+            probed[0],
+            (
+                Path::new("dir").join("set.part2.rar"),
+                Path::new("dir").join("SET.part2.rar")
+            )
+        );
+        assert_eq!(probed[1].1, Path::new("dir").join("sET.R00"));
+    }
+
+    /// The real probe on this machine's temporary directory: a sibling in
+    /// another case joins exactly when the filesystem opens its respelling
+    /// as the same file, and two files whose names differ only by case,
+    /// possible only where names keep case apart, never merge.
+    #[test]
+    fn the_family_probe_follows_the_temporary_filesystem() {
+        let temp = tempfile::tempdir().unwrap();
+        let lower = temp.path().join("set.part2.rar");
+        std::fs::write(&lower, b"lower").unwrap();
+        let upper = temp.path().join("SET.part2.rar");
+        let folds = std::fs::metadata(&upper).is_ok();
+        assert_eq!(in_named_family(&lower, "SET"), folds);
+        if !folds {
+            std::fs::write(&upper, b"upper").unwrap();
+            assert!(!in_named_family(&lower, "SET"));
+            assert!(!in_named_family(&upper, "set"));
+        }
+        assert!(!in_named_family(&temp.path().join("set.part3.rar"), "SET"));
     }
 
     #[test]

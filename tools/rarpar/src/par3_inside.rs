@@ -149,6 +149,12 @@ pub(crate) fn name_key(stem: &str) -> String {
     if !cfg!(any(windows, target_os = "macos")) {
         return stem.to_owned();
     }
+    fold_case(stem)
+}
+
+/// `stem` under the simple case folding [`name_key`] applies, on every
+/// platform: each character to its one-character uppercase.
+pub(crate) fn fold_case(stem: &str) -> String {
     stem.chars()
         .map(|c| {
             let mut upper = c.to_uppercase();
