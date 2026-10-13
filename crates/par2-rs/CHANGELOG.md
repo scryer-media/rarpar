@@ -76,6 +76,14 @@ workers idle, at the same peak memory.
 - A multi-threaded create checks for cancellation before every recovery
   chunk it writes, as a single-threaded create does, instead of once per
   recovery slot of a band.
+- The passes that hash whole source files (the identity scan, the first
+  band's sweep and the source-hash hydrate) hold at most the configured
+  create width of read windows in flight, never more than there are files.
+  Before, they ran on the unbounded global rayon pool, so on a host with
+  more cores than the configured width they could stage more windows than
+  the plan's memory estimate accounted for. The plan now accounts exactly
+  that bound, one window fewer than before. Output is byte-identical; wall
+  time and peak RSS are unchanged within noise at 1 and 6 threads.
 
 ### Added
 

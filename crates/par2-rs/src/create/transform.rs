@@ -1527,6 +1527,52 @@ mod tests {
     }
 
     #[test]
+    fn hashing_passes_stage_no_more_read_windows_than_the_plan_accounts() {
+        // Twelve sources under a width of two: the identity scan and the
+        // first-band sweep may each stage only the two windows the plan
+        // accounts, however wide rayon's global pool is.
+        let shape = Shape {
+            lengths: (0..12).map(|at| 40 * 8_192 + at * 311).collect(),
+            slice_size: 8_192,
+            recovery: 256,
+            first_exponent: 0,
+            memory_limit: Some(4 * 1024 * 1024),
+        };
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let sources = root.join("sources");
+        let inputs = write_sources(&sources, &shape.lengths);
+        for width in [2, 3] {
+            let accounted = crate::create::source::test_probe::with_width(width, || {
+                crate::create::source::concurrent_hash_reads(inputs.len())
+            });
+            assert_eq!(accounted, width);
+            let (((_, passes), sweeps, hydrates), peak) =
+                crate::create::source::test_probe::peak_windows_under(&sources, || {
+                    crate::create::source::test_probe::counted(|| {
+                        crate::create::source::test_probe::with_width(width, || {
+                            test_probe::with_budget(4 * 1024 * 1024, || {
+                                create(
+                                    &shape,
+                                    &inputs,
+                                    &sources,
+                                    &root.join(format!("transform-{width}")),
+                                    TransformPolicy::Force,
+                                )
+                            })
+                        })
+                    })
+                });
+            assert!(passes > 1, "expected a multi-pass arm, ran {passes}");
+            assert_eq!((sweeps, hydrates), (1, 0));
+            assert!(
+                (1..=accounted).contains(&peak),
+                "{peak} read windows staged at once under an accounted {accounted}"
+            );
+        }
+    }
+
+    #[test]
     fn a_multi_pass_band_over_slices_larger_than_a_read_window_is_byte_identical() {
         // Slices above the multi-buffer staging budget take the streaming
         // hashing scan, which hands the sweep each slice in 1 MiB read-window

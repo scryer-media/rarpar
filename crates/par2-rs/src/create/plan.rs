@@ -606,15 +606,11 @@ fn estimate_source_hash_workspace(input_count: usize, block_size: u64) -> Result
         2,
         "source index estimate overflows",
     )?;
-    // Source hashing runs one file per rayon task, each with its own read
-    // buffer; the gate mirrors the parallel scan's split in source.rs and
-    // the +1 covers the calling thread. Process-stable thread count only.
-    let threads = super::encode::configured_create_threads();
-    let concurrent_reads = if threads == 1 || input_count <= 1 {
-        1
-    } else {
-        input_count.min(threads.saturating_add(1))
-    };
+    // Source hashing runs one file per task, each with its own read window,
+    // and every parallel hashing pass in source.rs holds at most
+    // `concurrent_hash_reads` of them in flight: the configured create width,
+    // never more than there are files. Process-stable thread count only.
+    let concurrent_reads = super::source::concurrent_hash_reads(input_count);
     // A task stages one read window: whole slices for the multi-buffer
     // slice-hash kernel, or one chunk of a slice for the streaming scan,
     // whichever `create_md5_batch_lanes` selected for this block size. The

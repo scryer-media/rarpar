@@ -4,8 +4,6 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rayon::prelude::*;
-
 use crate::checksum::{self, FileHashState, Md5State, SliceChecksumState};
 use crate::error::{Par2Error, Result};
 use crate::md5_simd;
@@ -334,21 +332,16 @@ pub(crate) fn collect_sources(
     // other guards; `wasm32-wasip1-threads` probes `true` and hashes in
     // parallel like native)
     // and the WEAVER_PAR2_CREATE_THREADS=1 pre-banding escape hatch.
-    let scan_parallel = reedsolomon_rs::threading::parallel_enabled()
-        && active_inputs.len() > 1
-        && super::encode::configured_create_threads() != 1;
-    let scanned: Vec<CreationSource> = if scan_parallel {
+    let width = concurrent_hash_reads(active_inputs.len());
+    let scanned: Vec<CreationSource> = if reedsolomon_rs::threading::parallel_enabled() && width > 1
+    {
         // Collect every per-file Result, then surface the FIRST error by
         // input order: rayon's Result collection reports an arbitrary
         // racer's error, which would let a concurrent I/O error mask
         // `Cancelled` (or make the reported path vary run to run). The
         // deliberate cost is losing error short-circuiting — in-flight
         // files hash to completion before the error surfaces.
-        active_inputs
-            .par_iter()
-            .enumerate()
-            .map(hash_one)
-            .collect::<Vec<Result<_>>>()
+        map_bounded(active_inputs.iter().enumerate().collect(), width, hash_one)
             .into_iter()
             .collect::<Result<Vec<_>>>()?
     } else {
@@ -612,14 +605,13 @@ impl<'a> DiskSourceProvider<'a> {
         };
         // Same split, and the same first-error-by-input-order rule, as
         // `hydrate_source_hashes`.
-        let parallel = reedsolomon_rs::threading::parallel_enabled()
-            && sources.len() > 1
-            && super::encode::configured_create_threads() != 1;
-        let results: Vec<Result<SourceContentHashes>> = if parallel {
-            tasks.into_par_iter().map(sweep_one).collect()
-        } else {
-            tasks.into_iter().map(sweep_one).collect()
-        };
+        let width = concurrent_hash_reads(sources.len());
+        let results: Vec<Result<SourceContentHashes>> =
+            if reedsolomon_rs::threading::parallel_enabled() && width > 1 {
+                map_bounded(tasks, width, sweep_one)
+            } else {
+                tasks.into_iter().map(sweep_one).collect()
+            };
         let mut hash_full = Vec::with_capacity(sources.len());
         let mut slice_checksums = Vec::with_capacity(sources.len());
         for result in results {
@@ -1002,6 +994,9 @@ fn hash_source_contents(
         usize::try_from(block_size).map_err(|_| Par2Error::ResourceLimitExceeded {
             reason: format!("source block size {block_size} exceeds addressable memory"),
         })?;
+    // One read window is staged for the whole scan, whichever arm runs.
+    #[cfg(test)]
+    let _window = test_probe::window_staged(input);
     let mut full_hash = FileHashState::new();
     let mut first_hash = Md5State::new();
     let mut first_bytes = 0u64;
@@ -1142,6 +1137,82 @@ fn hash_source_contents(
 /// [`CreationSource`]. Every file is re-validated against the identity the
 /// plan was built on, so a file that changed between planning and creation is
 /// rejected here rather than silently written into a packet.
+/// How many per-file hashing tasks run at once, each staging one read window
+/// of [`create_hash_window_bytes`]: the configured create width, never more
+/// than there are files. The plan accounts exactly this many windows
+/// (`estimate_source_hash_workspace`), and every parallel hashing pass —
+/// the identity scan, the hydrating read and the first-band sweep — runs at
+/// most this many through [`map_bounded`].
+pub(crate) fn concurrent_hash_reads(input_count: usize) -> usize {
+    let threads = hashing_threads();
+    if threads <= 1 || input_count <= 1 {
+        1
+    } else {
+        input_count.min(threads)
+    }
+}
+
+fn hashing_threads() -> usize {
+    #[cfg(test)]
+    if let Some(width) = test_probe::width() {
+        return width;
+    }
+    super::encode::configured_create_threads()
+}
+
+/// `task` over every item, results in item order, with at most `width` items
+/// in flight. The work runs on rayon's global pool, which this neither
+/// resizes nor replaces: `width` tasks (the caller's share included) pull
+/// the next item until none is left, so a pool wider than `width` cannot
+/// stage more than `width` read windows.
+fn map_bounded<T: Send, R: Send>(
+    items: Vec<T>,
+    width: usize,
+    task: impl Fn(T) -> R + Sync,
+) -> Vec<R> {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Mutex, PoisonError};
+
+    let len = items.len();
+    let width = width.clamp(1, len.max(1));
+    let queue: Vec<Mutex<Option<T>>> = items
+        .into_iter()
+        .map(|item| Mutex::new(Some(item)))
+        .collect();
+    let results: Vec<Mutex<Option<R>>> = (0..len).map(|_| Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+    let work = || {
+        loop {
+            let at = next.fetch_add(1, Ordering::Relaxed);
+            if at >= len {
+                break;
+            }
+            let item = queue[at]
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(item) = item {
+                let produced = task(item);
+                *results[at].lock().unwrap_or_else(PoisonError::into_inner) = Some(produced);
+            }
+        }
+    };
+    rayon::scope(|scope| {
+        for _ in 1..width {
+            scope.spawn(|_| work());
+        }
+        work();
+    });
+    results
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(PoisonError::into_inner)
+                .expect("every item is taken by exactly one task")
+        })
+        .collect()
+}
+
 pub(crate) fn hydrate_source_hashes(
     sources: &mut [CreationSource],
     block_size: u64,
@@ -1180,14 +1251,9 @@ pub(crate) fn hydrate_source_hashes(
     };
     // Same split, and the same first-error-by-input-order rule, as the
     // identity scan above.
-    let scan_parallel = reedsolomon_rs::threading::parallel_enabled()
-        && sources.len() > 1
-        && super::encode::configured_create_threads() != 1;
-    if scan_parallel {
-        sources
-            .par_iter_mut()
-            .map(hash_one)
-            .collect::<Vec<Result<()>>>()
+    let width = concurrent_hash_reads(sources.len());
+    if reedsolomon_rs::threading::parallel_enabled() && width > 1 {
+        map_bounded(sources.iter_mut().collect(), width, hash_one)
             .into_iter()
             .collect::<Result<Vec<()>>>()?;
     } else {
@@ -1224,6 +1290,69 @@ pub(crate) mod test_probe {
 
     pub(super) fn record_sweep() {
         SWEEPS.with(|count| count.set(count.get() + 1));
+    }
+
+    thread_local! {
+        static WIDTH: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Run `body` with the hashing width (`concurrent_hash_reads`) pinned to
+    /// `width` on this thread, where the plan and the passes read it.
+    pub(crate) fn with_width<T>(width: usize, body: impl FnOnce() -> T) -> T {
+        let previous = WIDTH.with(|cell| cell.replace(Some(width)));
+        let produced = body();
+        WIDTH.with(|cell| cell.set(previous));
+        produced
+    }
+
+    pub(super) fn width() -> Option<usize> {
+        WIDTH.with(Cell::get)
+    }
+
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, PoisonError};
+
+    /// Windows are counted only for sources under this directory, so tests
+    /// running beside the probe do not disturb its counts.
+    static PROBED: Mutex<Option<PathBuf>> = Mutex::new(None);
+    static PROBE_LOCK: Mutex<()> = Mutex::new(());
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+    /// Run `body` and hand back the most read windows that sources under
+    /// `dir` ever had staged at once.
+    pub(crate) fn peak_windows_under<T>(dir: &Path, body: impl FnOnce() -> T) -> (T, usize) {
+        let _serial = PROBE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        LIVE.store(0, Ordering::SeqCst);
+        PEAK.store(0, Ordering::SeqCst);
+        *PROBED.lock().unwrap_or_else(PoisonError::into_inner) = Some(dir.to_path_buf());
+        let produced = body();
+        *PROBED.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        (produced, PEAK.load(Ordering::SeqCst))
+    }
+
+    pub(super) struct WindowGuard(bool);
+
+    pub(super) fn window_staged(input: &Path) -> WindowGuard {
+        let probed = PROBED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|dir| input.starts_with(dir));
+        if probed {
+            let live = LIVE.fetch_add(1, Ordering::SeqCst) + 1;
+            PEAK.fetch_max(live, Ordering::SeqCst);
+        }
+        WindowGuard(probed)
+    }
+
+    impl Drop for WindowGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                LIVE.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
     }
 }
 
@@ -1560,5 +1689,26 @@ mod tests {
             validate_main_file_count(MAX_FILES_PER_SET + 1),
             Err(Par2Error::ResourceLimitExceeded { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::map_bounded;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn map_bounded_keeps_order_and_never_exceeds_its_width() {
+        let live = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let produced = map_bounded((0..64).collect(), 3, |item: usize| {
+            let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            live.fetch_sub(1, Ordering::SeqCst);
+            item * 2
+        });
+        assert_eq!(produced, (0..64).map(|item| item * 2).collect::<Vec<_>>());
+        assert!((1..=3).contains(&peak.load(Ordering::SeqCst)));
     }
 }
