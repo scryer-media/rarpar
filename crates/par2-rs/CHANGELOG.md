@@ -70,8 +70,12 @@ workers idle, at the same peak memory.
   least 256 MiB) now takes host memory as the smaller of physical memory and
   the process's cgroup memory limit: cgroup v2 `memory.max` or v1
   `memory.limit_in_bytes`, the tightest of the process's cgroup and its
-  ancestors. Before, a container limited to 2 GiB on a 64 GiB host defaulted
-  to 8 GiB. An explicit memory limit is unchanged, as are the repair and
+  ancestors. The hierarchies are found through `/proc/self/mountinfo` (the
+  `cgroup2` mount, and the v1 mount whose options name the memory
+  controller, including a co-mounted one such as `cpu,memory` and the
+  `unified` mount of a hybrid host), falling back to `/sys/fs/cgroup` and
+  `/sys/fs/cgroup/memory` when mountinfo cannot be read. Before, a container
+  limited to 2 GiB on a 64 GiB host defaulted to 8 GiB. An explicit memory limit is unchanged, as are the repair and
   verify defaults, which are fixed sizes.
 - A multi-threaded create checks for cancellation before every recovery
   chunk it writes, as a single-threaded create does, instead of once per
