@@ -74,6 +74,13 @@ workers idle, at the same peak memory.
   to 8 GiB. An explicit memory limit is unchanged, as are the repair and
   verify defaults, which are fixed sizes.
 
+### Added
+
+- `VerificationSession::with_par2_set` starts a session over a set the
+  caller already loaded (for example with `Par2FileSet::from_paths`), so a
+  caller holding the set does not scan every volume again to hand the
+  session its packets.
+
 ## 0.10.8
 
 Fewer redundant reads on the verify and repair paths.

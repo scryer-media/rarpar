@@ -48,6 +48,11 @@ documented in each crate's own changelog so those notes ship with the crate.
   damaged slice of 10 x 100 MiB with a 156 MB PAR2 set reads 2.51 GB instead
   of 2.98 GB and takes 1.04 s instead of 1.62 s on Apple silicon
   performance cores, at the same peak RSS.
+- `par verify --name` from standard input verifies against the PAR2 set it
+  already loaded instead of scanning every volume a second time: checking a
+  100 MiB file against a 156 MB set reads 262 MB instead of 418 MB, takes
+  0.33 s instead of 0.53 s and peaks at 7.6 MB RSS instead of 32.7 MB on
+  Apple silicon performance cores. Its output is unchanged.
 
 ## rarpar 0.6.1
 

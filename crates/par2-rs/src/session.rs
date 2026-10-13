@@ -786,6 +786,16 @@ impl VerificationSession {
         Self::with_options(VerificationSessionOptions::new().with_memory_budget(memory_budget))
     }
 
+    /// Create a session over a PAR2 set the caller already loaded, such as
+    /// one from [`Par2FileSet::from_paths`], instead of handing the session
+    /// the packets of every volume again through [`Self::add_par2_data`].
+    pub fn with_par2_set(par2_set: Par2FileSet, options: VerificationSessionOptions) -> Self {
+        let mut session = Self::with_options(options);
+        session.par2_set = Some(Arc::new(par2_set));
+        session.initialize_file_states();
+        session
+    }
+
     /// The budget used for incomplete slice data in this session.
     pub fn memory_budget(&self) -> &VerificationMemoryBudget {
         &self.memory_budget

@@ -778,15 +778,18 @@ fn stream_slice_bytes(
         .map_err(|_| RarparError::Data(format!("{slice_size}-byte slices are too large")))
 }
 
-/// The session a stream is verified with. The slice buffer is charged
+/// The budget of the session a stream is verified with. The slice buffer is charged
 /// against `--par3-memory-mib` first ([`stream_slice_bytes`]); the session
 /// may hold boundary bytes only in what that leaves, so the two together
 /// stay within the limit. Whole slices take nothing from its budget.
-fn stream_session(budget_mib: usize, slice: usize) -> par2_rs::VerificationSession {
+fn stream_budget(budget_mib: usize, slice: usize) -> par2_rs::VerificationMemoryBudget {
     let limit = budget_mib.saturating_mul(1 << 20);
-    par2_rs::VerificationSession::with_memory_budget(par2_rs::VerificationMemoryBudget::new(
-        limit.saturating_sub(slice),
-    ))
+    par2_rs::VerificationMemoryBudget::new(limit.saturating_sub(slice))
+}
+
+#[cfg(test)]
+fn stream_session(budget_mib: usize, slice: usize) -> par2_rs::VerificationSession {
+    par2_rs::VerificationSession::with_memory_budget(stream_budget(budget_mib, slice))
 }
 
 /// Hands the session `data`, the stream's bytes of the file from `offset`,
@@ -873,15 +876,18 @@ fn verify_stream(cli: &Cli, args: &ParArgs, name: &str) -> Result<u8, RarparErro
     let slice_size = set.slice_size;
     let slice = stream_slice_bytes(slice_size, expected, cli.par3_memory_mib)?;
 
-    let mut session = stream_session(cli.par3_memory_mib, slice);
-    for path in &resolved.par2_paths {
-        let packets: Vec<_> = par2_rs::scan_packets_from_path_with_set_ids(path)?
-            .into_iter()
-            .filter(|scanned| scanned.recovery_set_id == set.recovery_set_id)
-            .map(|scanned| scanned.packet)
-            .collect();
-        session.add_par2_data(&packets);
-    }
+    // The session verifies against the set already loaded above rather than
+    // a second scan of every volume.
+    let mut session = par2_rs::VerificationSession::with_par2_set(
+        set,
+        par2_rs::VerificationSessionOptions::new()
+            .with_memory_budget(stream_budget(cli.par3_memory_mib, slice)),
+    );
+    let set = std::sync::Arc::clone(
+        session
+            .par2_set()
+            .expect("a session built over a set holds that set"),
+    );
 
     // A set may describe the file without slice checksums (no IFSC packet,
     // as in a truncated set). The disk verifier then checks the file by its
