@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.11
+
+- `gf16_dft::DftPlan` can split one stripe across several workers. Output is
+  unchanged.
+  - `bucket_count` reports the live 257-buckets, the unit of the split.
+  - `scratch_parts` splits a `DftScratch` into its `bucket_batch` result
+    slots and its stage; `result_bytes` and `stage_bytes` give their sizes.
+  - `transform_bucket` runs one bucket's sub-transform into a result slot.
+  - `accumulate_buckets` folds any set of finished buckets into a range of
+    output rows. Folding every bucket once into every row, in any order and
+    over any number of calls, equals `transform_stripe`.
+  - `bucket_batch` reports the batch the plan was built with.
+
 ## 0.4.10
 
 - Relicensed from GPL-3.0-or-later to Apache-2.0. Releases up to 0.4.9 stay

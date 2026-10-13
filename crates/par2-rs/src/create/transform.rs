@@ -98,9 +98,9 @@ use super::encode::{
 /// below a 4 KiB floor by that arithmetic: 10 x 100 MiB at 32,008-byte slices
 /// with 3,277 recovery blocks buys a ~2.9 KiB band, and 32,768 slices of 5,552
 /// bytes with 32,768 recovery blocks buys ~3.0 KiB. At a 4 KiB floor both took
-/// the dense arm (60.3 s and 112.5 s); at 2 KiB they run the transform in
-/// 16 and 3 passes and take 4.9 s and 4.4 s, at a lower peak RSS than the
-/// dense arm (86 MiB against 123 MiB, 151 MiB against 214 MiB).
+/// the dense arm (61.8 s and 115.4 s, medians of three); at 2 KiB they run the
+/// transform in 16 and 3 passes and take 4.9 s and 4.4 s, at a lower peak RSS
+/// than the dense arm (85 MiB against 119 MiB, 147 MiB against 209 MiB).
 const MIN_BAND_BYTES: usize = 2 * 1024;
 
 /// Largest number of passes the arm will run. Each pass re-opens the strided

@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.10.9
+
+Faster PAR2 creation where the transform arm used to be refused or left
+workers idle, at the same peak memory.
+
+### Changed
+
+- The create transform arm admits a 2 KiB band, and a 2 KiB stripe, when no
+  4 KiB band fits in the dense arm's own memory reservation. Narrow slices
+  with many recovery blocks now take the transform instead of the dense
+  encoder. Measured on an x86-64 Alder Lake host (GFNI, page-cached inputs,
+  medians of three, 1 thread / 8 threads on its 4 SMT performance cores):
+  10 x 100 MiB at 32,008-byte slices with 3,277 recovery blocks drops from
+  61.8 s / 20.8 s to 4.9 s / 3.0 s, and 32,768 slices of 5,552 bytes with
+  32,768 recovery blocks from 115.4 s / 39.0 s to 4.4 s / 2.3 s. Peak RSS
+  falls from 119 to 84 MiB and from 209 to 148 MiB. Shapes the fold margin
+  rules out stay dense, and the arm's memory still comes out of the dense
+  reservation the plan reports.
+- A transform band of fewer stripes than workers is now shared by every
+  worker: one fills a scratch's bucket slots and all of them fold the slots
+  into disjoint ranges of output rows. Before, such a band ran on as many
+  workers as it had stripes, often one. It touches no memory the old runner
+  did not, so peak RSS is unchanged or lower. At 8 threads, 1 GiB of
+  32,008-byte slices with 32,768 recovery blocks takes 9.7 s instead of
+  13.2 s (peak RSS 794 MiB instead of 804), and 16,384 slices of 11,104
+  bytes with 16,384 recovery blocks 2.3 s instead of 4.0 s. CPU time rises
+  with the wall-time gain (7.4 s instead of 4.0 s in the second case),
+  mostly because the extra workers share SMT cores.
+- Recovery data is written with positional writes, and at more than one
+  thread a finished band's slots are hashed and written in parallel. A
+  create issues about half the seeks it did (238,590 instead of 504,830 for
+  the 1 GiB set above) and, at 8 threads, 4-11% less wall time on shapes
+  whose bands were already fully parallel. Peak RSS at 8 threads can rise by
+  under 1 MiB for the pool threads' stacks; a single-threaded create keeps
+  the writes on its own thread.
+
 ## 0.10.8
 
 Fewer redundant reads on the verify and repair paths.
