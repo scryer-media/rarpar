@@ -505,6 +505,8 @@ enum ExpectedPacket {
 }
 
 struct RecoverySlot {
+    /// The encoder's output index this slot stores.
+    output_index: usize,
     exponent: RecoveryExponent,
     header_offset: u64,
     data_offset: u64,
@@ -1927,6 +1929,7 @@ fn append_recovery_slot(
     volume.expected.push(ExpectedPacket::Recovery(exponent));
     let slot_index = volume.recovery_slots.len();
     volume.recovery_slots.push(RecoverySlot {
+        output_index: global_index,
         exponent,
         header_offset,
         data_offset,
@@ -2160,17 +2163,7 @@ impl ForwardRecoverySink for RecoveryWriter<'_> {
         if data.is_empty() {
             return Ok(());
         }
-        if data.len() > self.slice_size
-            || usize::try_from(offset)
-                .ok()
-                .and_then(|start| start.checked_add(data.len()))
-                .is_none_or(|end| end > self.slice_size)
-        {
-            return Err(Par2Error::CreationValidation {
-                path: "recovery output".to_string(),
-                reason: "encoder supplied a chunk outside the slice".to_string(),
-            });
-        }
+        check_chunk_bounds(self.slice_size, offset, data)?;
         let location = *self.outputs.locations.get(output_index).ok_or_else(|| {
             Par2Error::CreationValidation {
                 path: "recovery output".to_string(),
@@ -2192,28 +2185,120 @@ impl ForwardRecoverySink for RecoveryWriter<'_> {
                 path: volume.stage_path.display().to_string(),
                 reason: "recovery slot index is out of range".to_string(),
             })?;
-        if slot.exponent != exponent || slot.bytes_written != offset {
+        store_recovery_chunk(
+            slot,
+            &volume.file,
+            &volume.stage_path,
+            exponent,
+            offset,
+            data,
+        )
+    }
+
+    /// Every slot's chunks of the band, slots in parallel: the packet MD5 and
+    /// the copy into the page cache are the serial tail of each transform
+    /// pass, and slots share nothing but their volume's handle, which a
+    /// positional write does not move.
+    fn write_recovery_band<'d>(
+        &mut self,
+        rows: usize,
+        chunks: usize,
+        chunk: &(dyn Fn(usize, usize) -> (RecoveryExponent, u64, &'d [u8]) + Sync),
+    ) -> Result<()> {
+        if !reedsolomon_rs::threading::parallel_enabled() {
+            for row in 0..rows {
+                for at in 0..chunks {
+                    let (exponent, offset, data) = chunk(row, at);
+                    self.write_recovery_chunk(row, exponent, offset, data)?;
+                }
+            }
+            return Ok(());
+        }
+        if self.outputs.locations.len() != rows {
             return Err(Par2Error::CreationValidation {
-                path: volume.stage_path.display().to_string(),
-                reason: "encoder recovery chunks are out of order".to_string(),
+                path: "recovery output".to_string(),
+                reason: "encoder band does not cover every recovery output".to_string(),
             });
         }
-        let write_offset = slot.data_offset.checked_add(offset).ok_or_else(|| {
-            Par2Error::ResourceLimitExceeded {
-                reason: "recovery write offset overflows".to_string(),
-            }
-        })?;
-        volume.file.seek(SeekFrom::Start(write_offset))?;
-        volume.file.write_all(data)?;
-        slot.hasher.update(data);
-        slot.bytes_written = slot
-            .bytes_written
-            .checked_add(data.len() as u64)
-            .ok_or_else(|| Par2Error::ResourceLimitExceeded {
-                reason: "recovery byte count overflows".to_string(),
-            })?;
-        Ok(())
+        let slice_size = self.slice_size;
+        let cancellation = self.cancellation;
+        use rayon::prelude::*;
+        // Any one failure stops the band; nothing here is collected, so the
+        // pool's threads allocate nothing.
+        self.outputs.volumes.par_iter_mut().try_for_each(|volume| {
+            let VolumeState {
+                file,
+                stage_path,
+                recovery_slots,
+                ..
+            } = volume;
+            let (file, stage_path) = (&*file, &*stage_path);
+            recovery_slots
+                .par_iter_mut()
+                .with_min_len(16)
+                .try_for_each(|slot| {
+                    if cancellation.is_cancelled() {
+                        return Err(Par2Error::Cancelled);
+                    }
+                    for at in 0..chunks {
+                        let (exponent, offset, data) = chunk(slot.output_index, at);
+                        check_chunk_bounds(slice_size, offset, data)?;
+                        store_recovery_chunk(slot, file, stage_path, exponent, offset, data)?;
+                    }
+                    Ok(())
+                })
+        })
     }
+}
+
+fn check_chunk_bounds(slice_size: usize, offset: u64, data: &[u8]) -> Result<()> {
+    if data.len() > slice_size
+        || usize::try_from(offset)
+            .ok()
+            .and_then(|start| start.checked_add(data.len()))
+            .is_none_or(|end| end > slice_size)
+    {
+        return Err(Par2Error::CreationValidation {
+            path: "recovery output".to_string(),
+            reason: "encoder supplied a chunk outside the slice".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Append one in-order chunk to a recovery slot: write it in place and fold it
+/// into the packet digest.
+fn store_recovery_chunk(
+    slot: &mut RecoverySlot,
+    file: &File,
+    stage_path: &Path,
+    exponent: RecoveryExponent,
+    offset: u64,
+    data: &[u8],
+) -> Result<()> {
+    if slot.exponent != exponent || slot.bytes_written != offset {
+        return Err(Par2Error::CreationValidation {
+            path: stage_path.display().to_string(),
+            reason: "encoder recovery chunks are out of order".to_string(),
+        });
+    }
+    let write_offset =
+        slot.data_offset
+            .checked_add(offset)
+            .ok_or_else(|| Par2Error::ResourceLimitExceeded {
+                reason: "recovery write offset overflows".to_string(),
+            })?;
+    // Positional: one syscall per chunk instead of a seek and a write, and
+    // every later write to this handle seeks explicitly first.
+    crate::repairer::write_all_file_at(file, data, write_offset)?;
+    slot.hasher.update(data);
+    slot.bytes_written = slot
+        .bytes_written
+        .checked_add(data.len() as u64)
+        .ok_or_else(|| Par2Error::ResourceLimitExceeded {
+            reason: "recovery byte count overflows".to_string(),
+        })?;
+    Ok(())
 }
 
 fn sync_parent_directories(paths: &[PathBuf]) -> Result<()> {

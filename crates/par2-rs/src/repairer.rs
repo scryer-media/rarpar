@@ -2741,7 +2741,7 @@ fn write_file_at(file: &File, src: &[u8], offset: u64) -> io::Result<usize> {
     cloned.write(src)
 }
 
-fn write_all_file_at(file: &File, mut src: &[u8], mut offset: u64) -> io::Result<()> {
+pub(crate) fn write_all_file_at(file: &File, mut src: &[u8], mut offset: u64) -> io::Result<()> {
     while !src.is_empty() {
         let written = write_file_at(file, src, offset)?;
         if written == 0 {

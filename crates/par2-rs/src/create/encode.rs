@@ -332,6 +332,26 @@ pub trait ForwardRecoverySink {
         offset: u64,
         data: &[u8],
     ) -> Result<()>;
+
+    /// Store a whole band: `rows` outputs, each `chunks` consecutive stripes
+    /// long, `chunk(row, at)` naming stripe `at` of output `row` as its
+    /// exponent, offset and bytes. Rows are independent, so an implementation
+    /// may store them concurrently; within a row the stripes are in ascending
+    /// offset order. The default stores them one at a time.
+    fn write_recovery_band<'d>(
+        &mut self,
+        rows: usize,
+        chunks: usize,
+        chunk: &(dyn Fn(usize, usize) -> (RecoveryExponent, u64, &'d [u8]) + Sync),
+    ) -> Result<()> {
+        for row in 0..rows {
+            for at in 0..chunks {
+                let (exponent, offset, data) = chunk(row, at);
+                self.write_recovery_chunk(row, exponent, offset, data)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Source-slice access used by the forward stripe controller.
@@ -2257,13 +2277,12 @@ fn admit_transform(
     dense: &BufferPlan,
     policy: TransformPolicy,
 ) -> Option<transform::TransformArm> {
-    transform::admit(
-        slice_size,
-        source_count,
-        exponents,
-        memory_limit.min(dense.memory_bytes),
-        policy,
-    )
+    let budget = memory_limit.min(dense.memory_bytes);
+    // The dense reservation differs by architecture (its kernel and stripe
+    // choice do), so tests that pin a transform geometry pin its budget.
+    #[cfg(test)]
+    let budget = transform::test_probe::budget_override().unwrap_or(budget);
+    transform::admit(slice_size, source_count, exponents, budget, policy)
 }
 
 pub(crate) fn estimate_forward_memory(
