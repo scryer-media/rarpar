@@ -2256,18 +2256,41 @@ impl ForwardRecoverySink for RecoveryWriter<'_> {
                 .par_iter_mut()
                 .with_min_len(16)
                 .try_for_each(|slot| {
-                    if cancellation.is_cancelled() {
-                        return Err(Par2Error::Cancelled);
-                    }
-                    for at in 0..chunks {
-                        let (exponent, offset, data) = chunk(slot.output_index, at);
-                        check_chunk_bounds(slice_size, offset, data)?;
-                        store_recovery_chunk(slot, file, stage_path, exponent, offset, data)?;
-                    }
-                    Ok(())
+                    store_slot_chunks(
+                        slot,
+                        file,
+                        stage_path,
+                        slice_size,
+                        cancellation,
+                        chunks,
+                        chunk,
+                    )
                 })
         })
     }
+}
+
+/// Every chunk of one slot's band, in order. Cancellation is polled before
+/// each chunk, as the sequential arm's `write_recovery_chunk` polls it, so
+/// both arms stop within one chunk of a cancel.
+fn store_slot_chunks<'d>(
+    slot: &mut RecoverySlot,
+    file: &File,
+    stage_path: &Path,
+    slice_size: usize,
+    cancellation: &CancellationToken,
+    chunks: usize,
+    chunk: &(dyn Fn(usize, usize) -> (RecoveryExponent, u64, &'d [u8]) + Sync),
+) -> Result<()> {
+    for at in 0..chunks {
+        if cancellation.is_cancelled() {
+            return Err(Par2Error::Cancelled);
+        }
+        let (exponent, offset, data) = chunk(slot.output_index, at);
+        check_chunk_bounds(slice_size, offset, data)?;
+        store_recovery_chunk(slot, file, stage_path, exponent, offset, data)?;
+    }
+    Ok(())
 }
 
 fn check_chunk_bounds(slice_size: usize, offset: u64, data: &[u8]) -> Result<()> {
@@ -2883,6 +2906,54 @@ fn validation_error(path: &Path, reason: String) -> Par2Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The parallel band arm polls cancellation before every chunk of a slot,
+    /// as the sequential arm does through `write_recovery_chunk`: a cancel
+    /// raised while chunk 3 is produced stops the slot before chunk 4.
+    #[test]
+    fn a_parallel_band_slot_stops_within_one_chunk_of_a_cancel() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let directory = tempfile::tempdir().unwrap();
+        let stage_path = directory.path().join("stage.par2");
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&stage_path)
+            .unwrap();
+        let mut slot = RecoverySlot {
+            output_index: 0,
+            exponent: 7,
+            header_offset: 0,
+            data_offset: 0,
+            bytes_written: 0,
+            hasher: Md5State::new(),
+        };
+        let cancellation = CancellationToken::new();
+        let data = [0xa5u8; 16];
+        let calls = AtomicUsize::new(0);
+        let chunk = |_: usize, at: usize| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            if at == 3 {
+                cancellation.cancel();
+            }
+            (7, (at * data.len()) as u64, &data[..])
+        };
+        let error = store_slot_chunks(
+            &mut slot,
+            &file,
+            &stage_path,
+            8 * data.len(),
+            &cancellation,
+            8,
+            &chunk,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Par2Error::Cancelled));
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
+        assert_eq!(slot.bytes_written, 4 * data.len() as u64);
+    }
 
     #[test]
     fn the_staged_read_back_rejects_a_recovery_payload_that_changed_after_hashing() {

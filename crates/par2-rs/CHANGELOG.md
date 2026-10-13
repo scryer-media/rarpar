@@ -73,6 +73,9 @@ workers idle, at the same peak memory.
   ancestors. Before, a container limited to 2 GiB on a 64 GiB host defaulted
   to 8 GiB. An explicit memory limit is unchanged, as are the repair and
   verify defaults, which are fixed sizes.
+- A multi-threaded create checks for cancellation before every recovery
+  chunk it writes, as a single-threaded create does, instead of once per
+  recovery slot of a band.
 
 ### Added
 
