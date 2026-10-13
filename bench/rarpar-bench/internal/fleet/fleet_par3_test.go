@@ -44,7 +44,7 @@ func TestPAR3ConfigValidation(t *testing.T) {
 	cases := []struct {
 		name, old, new, want string
 	}{
-		{"unknown profile", `profile = "full"                         # full | smoke`, `profile = "huge"`, "par3.profile"},
+		{"unknown profile", `profile = "full"                         # full | smoke | fleet`, `profile = "huge"`, "par3.profile"},
 		{"unknown set", `# sets = ["a-gf16", "c-gf16"]            # default: every set in the profile`, `sets = ["z-gf99"]`, "par3.sets"},
 		{"unknown op", `# ops = ["create", "verify", "repair"]   # default; verify-damaged is opt-in`, `ops = ["explode"]`, "unknown op"},
 		{"duplicate op", `# ops = ["create", "verify", "repair"]   # default; verify-damaged is opt-in`, `ops = ["create", "create"]`, `op "create" is listed more than once`},
@@ -293,5 +293,29 @@ func TestVerifyManifestRefusesEscapingPaths(t *testing.T) {
 	}
 	if _, err := verifyManifest(root); err == nil || !strings.Contains(err.Error(), "unsafe path") {
 		t.Fatalf("want an unsafe-path refusal, got %v", err)
+	}
+}
+
+// An SSH-access EC2 host answers on the bench port while user-data is still
+// installing cmake, so the run script waits for the user-data sentinel before
+// it builds the on-host reference; a local host has no user-data to wait for.
+func TestRunScriptWaitsForEC2UserData(t *testing.T) {
+	config, cloud := exampleMachine(t, "ec2-zen4-ssm")
+	layout := LayoutFor(cloud, "fleet-testrun")
+	resolution := sourceBuildResolution(cloud, "par3", cloud.Oracles["par3"], layout)
+	script := RunScript(cloud, config.Fleet.Defaults, "fleet-testrun", layout, map[string]string{"par3": resolution.RemotePath})
+	wait := strings.Index(script, `while [ ! -f "$USERDATA_DONE" ]`)
+	build := strings.Index(script, "par3 build-reference")
+	if wait < 0 || build < 0 || wait > build {
+		t.Fatalf("user-data wait at %d must precede the reference build at %d", wait, build)
+	}
+	for _, expected := range []string{"USERDATA_DONE=/var/lib/cloud/instance/BENCH_USERDATA_DONE", "fail userdata-timeout"} {
+		if !strings.Contains(script, expected) {
+			t.Fatalf("EC2 run script is missing %q", expected)
+		}
+	}
+	config, local := exampleMachine(t, "linux-avx2")
+	if script := RunScript(local, config.Fleet.Defaults, "fleet-testrun", LayoutFor(local, "fleet-testrun"), map[string]string{}); strings.Contains(script, "USERDATA_DONE") {
+		t.Fatal("a local host must not wait for EC2 user-data")
 	}
 }
