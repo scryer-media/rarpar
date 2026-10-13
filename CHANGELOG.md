@@ -3,6 +3,28 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.6.3
+
+### Changed
+
+- On par3-rs 0.6.0, which issues no storage barriers, `par3 create`,
+  `par3 repair` and `par3 inside insert|repair|remove` no longer fsync what
+  they write by default. Outputs are still flushed and authenticated before
+  installation, but a crash can lose them. `par3 create -` from standard
+  input follows the same default.
+- `par3 create --buffered` and `par3 inside insert --buffered` are removed;
+  buffered output is the default, and passing `--buffered` is a usage error
+  (exit 2). The `"buffered"` field of the `par3 create` JSON report is gone.
+
+### Added
+
+- `--fsync` on `par3 create`, `par3 repair` and
+  `par3 inside insert|repair|remove`: once the run has succeeded, every file
+  it wrote (the installed carriers, repaired files or archive volumes) is
+  opened and synced. Parent directories are not synced. These reports carry
+  `"fsync": true|false`. `auto` mode repair has no `--fsync` and does not
+  sync.
+
 ## rarpar 0.6.2
 
 ### Fixes
