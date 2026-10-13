@@ -36,6 +36,10 @@ documented in each crate's own changelog so those notes ship with the crate.
   blocks over 10 x 100 MiB it reads 2.83 GB instead of 4.28 GB and takes
   15.7 s instead of 17.5 s single-threaded on Apple silicon performance cores.
   Output is unchanged.
+- `par create` (PAR2) on Linux sizes its default memory limit from the
+  container's cgroup memory limit when that is below physical memory, so a
+  create in a memory-limited container no longer plans for an eighth of the
+  host's memory.
 
 ## rarpar 0.6.1
 

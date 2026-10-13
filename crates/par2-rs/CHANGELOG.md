@@ -62,6 +62,17 @@ workers idle, at the same peak memory.
   203,505 read and 267,261 seek calls to 2.83 GB in 70,900 read and 103,428
   seek calls; opens fall from 32,852 to 57. Peak RSS is unchanged (94 MiB
   and 837 MiB single-threaded).
+- Streaming repair reads each source chunk without a seek when the chunk
+  starts where the previous read of that source ended. Repairing one damaged
+  slice of a 10 x 100 MiB set (32,008-byte slices) issues 39 seek calls
+  instead of 32,787, with the same reads and output.
+- On Linux the default create memory limit (an eighth of host memory, at
+  least 256 MiB) now takes host memory as the smaller of physical memory and
+  the process's cgroup memory limit: cgroup v2 `memory.max` or v1
+  `memory.limit_in_bytes`, the tightest of the process's cgroup and its
+  ancestors. Before, a container limited to 2 GiB on a 64 GiB host defaulted
+  to 8 GiB. An explicit memory limit is unchanged, as are the repair and
+  verify defaults, which are fixed sizes.
 
 ## 0.10.8
 

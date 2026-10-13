@@ -22,7 +22,95 @@ const MAX_RECOVERY_EXPONENT: u32 = 65_535;
 const MEMORY_FLOOR_BYTES: usize = 256 * 1024 * 1024;
 const MEMORY_32_BIT_CAP_BYTES: usize = 1024 * 1024 * 1024;
 pub(crate) fn default_memory_limit() -> usize {
-    memory_limit_for(physical_memory_bytes(), usize::BITS)
+    memory_limit_for(
+        host_memory_bytes(physical_memory_bytes(), cgroup_memory_limit_bytes()),
+        usize::BITS,
+    )
+}
+
+/// The memory this process may use: physical memory, narrowed by the
+/// cgroup limit when the process runs under one.
+fn host_memory_bytes(physical: Option<u64>, cgroup: Option<u64>) -> Option<u64> {
+    match (physical, cgroup) {
+        (Some(physical), Some(cgroup)) => Some(physical.min(cgroup)),
+        (physical, cgroup) => physical.or(cgroup),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_memory_limit_bytes() -> Option<u64> {
+    let membership = fs::read_to_string("/proc/self/cgroup").ok()?;
+    cgroup_memory_limit_from(&membership, |path| fs::read_to_string(path).ok())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cgroup_memory_limit_bytes() -> Option<u64> {
+    None
+}
+
+/// The tightest memory limit on the cgroup named in `membership` (the text of
+/// `/proc/self/cgroup`) or any of its ancestors. cgroup v2 limits come from
+/// `memory.max` under `/sys/fs/cgroup`, v1 limits from
+/// `memory.limit_in_bytes` under `/sys/fs/cgroup/memory`. When the named
+/// directory is not visible (a container whose cgroup namespace shows the
+/// host path), the mount root's own file is used. `read` returns a file's
+/// text, so tests supply values without touching the host's cgroups.
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_memory_limit_from(
+    membership: &str,
+    read: impl Fn(&Path) -> Option<String>,
+) -> Option<u64> {
+    let mut tightest: Option<u64> = None;
+    for line in membership.lines() {
+        let mut fields = line.splitn(3, ':');
+        let (Some(_), Some(controllers), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let (root, file) = if controllers.is_empty() {
+            ("/sys/fs/cgroup", "memory.max")
+        } else if controllers.split(',').any(|name| name == "memory") {
+            ("/sys/fs/cgroup/memory", "memory.limit_in_bytes")
+        } else {
+            continue;
+        };
+        let limit = cgroup_limit_along(Path::new(root), path, file, &read);
+        tightest = match (tightest, limit) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+    }
+    tightest
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_limit_along(
+    root: &Path,
+    cgroup: &str,
+    file: &str,
+    read: &impl Fn(&Path) -> Option<String>,
+) -> Option<u64> {
+    let mut tightest: Option<u64> = None;
+    let mut found = false;
+    let mut dir = PathBuf::from(cgroup.trim_start_matches('/'));
+    loop {
+        if let Some(text) = read(&root.join(&dir).join(file)) {
+            found = true;
+            // `max` (v2) is no limit; v1 reports "no limit" as a huge number,
+            // which the physical-memory minimum absorbs.
+            if let Ok(bytes) = text.trim().parse::<u64>() {
+                tightest = Some(tightest.map_or(bytes, |current| current.min(bytes)));
+            }
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    if !found {
+        return read(&root.join(file)).and_then(|text| text.trim().parse::<u64>().ok());
+    }
+    tightest
 }
 
 fn memory_limit_for(physical_memory: Option<u64>, address_bits: u32) -> usize {
@@ -1036,6 +1124,85 @@ mod tests {
             memory_limit_for(Some(u64::MAX), 32),
             MEMORY_32_BIT_CAP_BYTES,
         );
+    }
+
+    fn files<'a>(entries: &'a [(&'a str, &'a str)]) -> impl Fn(&Path) -> Option<String> + 'a {
+        move |path| {
+            entries
+                .iter()
+                .find(|(name, _)| Path::new(name) == path)
+                .map(|(_, text)| (*text).to_owned())
+        }
+    }
+
+    #[test]
+    fn a_cgroup_v2_limit_narrows_the_memory_default() {
+        let read = files(&[
+            (
+                "/sys/fs/cgroup/system.slice/app.service/memory.max",
+                "2147483648\n",
+            ),
+            ("/sys/fs/cgroup/system.slice/memory.max", "max\n"),
+        ]);
+        let cgroup = cgroup_memory_limit_from("0::/system.slice/app.service\n", read);
+        assert_eq!(cgroup, Some(2 << 30));
+        let host = host_memory_bytes(Some(64 << 30), cgroup);
+        assert_eq!(memory_limit_for(host, 64), MEMORY_FLOOR_BYTES);
+        let host = host_memory_bytes(Some(64 << 30), Some(16 << 30));
+        assert_eq!(memory_limit_for(host, 64), 2 << 30);
+    }
+
+    #[test]
+    fn a_cgroup_v2_ancestor_limit_applies_to_its_descendants() {
+        let read = files(&[
+            ("/sys/fs/cgroup/a/b/memory.max", "max"),
+            ("/sys/fs/cgroup/a/memory.max", "4294967296"),
+        ]);
+        assert_eq!(cgroup_memory_limit_from("0::/a/b", read), Some(4 << 30));
+    }
+
+    #[test]
+    fn an_unlimited_cgroup_leaves_physical_memory_in_charge() {
+        let read = files(&[("/sys/fs/cgroup/memory.max", "max\n")]);
+        assert_eq!(cgroup_memory_limit_from("0::/\n", read), None);
+        assert_eq!(host_memory_bytes(Some(32 << 30), None), Some(32 << 30));
+        assert_eq!(host_memory_bytes(None, None), None);
+        assert_eq!(host_memory_bytes(None, Some(1 << 30)), Some(1 << 30));
+    }
+
+    #[test]
+    fn a_cgroup_v1_memory_controller_limit_is_read() {
+        let membership = "12:cpu,cpuacct:/docker/abc\n4:memory:/docker/abc\n";
+        let read = files(&[(
+            "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes",
+            "1073741824\n",
+        )]);
+        assert_eq!(cgroup_memory_limit_from(membership, read), Some(1 << 30));
+    }
+
+    #[test]
+    fn a_namespaced_cgroup_path_falls_back_to_the_mount_root() {
+        let read = files(&[("/sys/fs/cgroup/memory/memory.limit_in_bytes", "536870912")]);
+        assert_eq!(
+            cgroup_memory_limit_from("4:memory:/docker/abc", &read),
+            Some(512 << 20)
+        );
+        let read = files(&[("/sys/fs/cgroup/memory.max", "805306368")]);
+        assert_eq!(
+            cgroup_memory_limit_from("0::/kubepods/pod1/ctr", read),
+            Some(768 << 20)
+        );
+    }
+
+    #[test]
+    fn a_v1_unlimited_sentinel_does_not_raise_the_default() {
+        let read = files(&[(
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+            "9223372036854771712",
+        )]);
+        let cgroup = cgroup_memory_limit_from("4:memory:/", read);
+        let host = host_memory_bytes(Some(8 << 30), cgroup);
+        assert_eq!(memory_limit_for(host, 64), 1 << 30);
     }
 
     #[cfg(target_os = "windows")]
