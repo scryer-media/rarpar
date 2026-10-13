@@ -444,10 +444,139 @@ fn validate_main_file_count(file_count: usize) -> Result<()> {
     Ok(())
 }
 
+/// SPIKE (spike/par2-mmap-input): how creation reads its source files.
+///
+/// Opt-in only. Unset, or any unrecognised value of `WEAVER_PAR2_CREATE_INPUT`,
+/// is [`InputReadMode::Seek`], the shipped behaviour (one `lseek` plus one
+/// `read` per requested range). `pread` reads one large window at a time and
+/// serves later ranges from it; `mmap` maps every source and copies ranges out
+/// of the mapping. Not for merging: this exists so one binary can run all three
+/// arms of the spike's comparison.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InputReadMode {
+    /// `lseek` + `read` per requested range (shipped behaviour).
+    Seek,
+    /// One positioned read of up to `window` bytes, ranges served from it.
+    Pread { window: usize },
+    /// Whole-file read-only mapping per source.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    Mmap { advice: MapAdvice },
+}
+
+/// `madvise` hint applied to each mapping in [`InputReadMode::Mmap`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
+pub(crate) enum MapAdvice {
+    None,
+    WillNeed,
+    Sequential,
+}
+
+const SPIKE_DEFAULT_WINDOW_BYTES: usize = 4 * 1024 * 1024;
+
+pub(crate) fn input_read_mode() -> InputReadMode {
+    static MODE: std::sync::OnceLock<InputReadMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let window = std::env::var("WEAVER_PAR2_CREATE_INPUT_WINDOW")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&value| value >= 64 * 1024)
+            .unwrap_or(SPIKE_DEFAULT_WINDOW_BYTES);
+        let advice = match std::env::var("WEAVER_PAR2_CREATE_INPUT_ADVISE").as_deref() {
+            Ok("willneed") => MapAdvice::WillNeed,
+            Ok("sequential") => MapAdvice::Sequential,
+            _ => MapAdvice::None,
+        };
+        match std::env::var("WEAVER_PAR2_CREATE_INPUT").as_deref() {
+            Ok("pread") => InputReadMode::Pread { window },
+            #[cfg(not(target_family = "wasm"))]
+            Ok("mmap") => InputReadMode::Mmap { advice },
+            _ => {
+                let _ = advice;
+                InputReadMode::Seek
+            }
+        }
+    })
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn map_source(file: &File, length: u64, advice: MapAdvice) -> io::Result<memmap2::Mmap> {
+    let length = usize::try_from(length)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source too large to map"))?;
+    // SAFETY: the mapping is read-only and private to this provider. If the
+    // file is truncated while mapped, touching a page past the new end raises
+    // SIGBUS and the process dies; the spike report covers that exposure. The
+    // length is pinned to the size the caller already validated, so a file
+    // that grew is not read past that size.
+    let map = unsafe { memmap2::MmapOptions::new().len(length).map(file)? };
+    #[cfg(unix)]
+    {
+        let advice = match advice {
+            MapAdvice::None => None,
+            MapAdvice::WillNeed => Some(memmap2::Advice::WillNeed),
+            MapAdvice::Sequential => Some(memmap2::Advice::Sequential),
+        };
+        if let Some(advice) = advice {
+            let _ = map.advise(advice);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = advice;
+    Ok(map)
+}
+
+/// Positioned read that does not move a shared cursor, looping on short reads.
+/// Returns the bytes read; fewer than `buffer.len()` only at end of file.
+fn read_full_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+    let mut filled = 0usize;
+    while filled < buffer.len() {
+        #[cfg(unix)]
+        let read = {
+            use std::os::unix::fs::FileExt;
+            file.read_at(&mut buffer[filled..], offset + filled as u64)
+        };
+        #[cfg(windows)]
+        let read = {
+            use std::os::windows::fs::FileExt;
+            file.seek_read(&mut buffer[filled..], offset + filled as u64)
+        };
+        #[cfg(not(any(unix, windows)))]
+        let read = {
+            let mut handle = file;
+            handle
+                .seek(SeekFrom::Start(offset + filled as u64))
+                .and_then(|_| handle.read(&mut buffer[filled..]))
+        };
+        match read {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(filled)
+}
+
+/// The shared read window of [`InputReadMode::Pread`]: one buffer for every
+/// file, because both encoder arms walk sources in increasing index.
+struct ReadWindow {
+    buffer: Vec<u8>,
+    file_index: usize,
+    start: u64,
+    len: usize,
+}
+
+enum SourceBacking {
+    File(File),
+    #[cfg(not(target_family = "wasm"))]
+    Mapped(memmap2::Mmap),
+}
+
 /// Seek/read source slices for one forward-encoding pass.
 pub(crate) struct DiskSourceProvider<'a> {
     sources: &'a [CreationSource],
-    files: Vec<File>,
+    files: Vec<SourceBacking>,
+    window: Option<ReadWindow>,
     fingerprints: Vec<SourceFingerprint>,
     slice_starts: Vec<usize>,
     slice_size: usize,
@@ -459,6 +588,15 @@ impl<'a> DiskSourceProvider<'a> {
         sources: &'a [CreationSource],
         slice_size: usize,
         cancellation: &'a CancellationToken,
+    ) -> Result<Self> {
+        Self::open_with_mode(sources, slice_size, cancellation, input_read_mode())
+    }
+
+    pub(crate) fn open_with_mode(
+        sources: &'a [CreationSource],
+        slice_size: usize,
+        cancellation: &'a CancellationToken,
+        mode: InputReadMode,
     ) -> Result<Self> {
         if slice_size == 0 {
             return Err(Par2Error::ResourceLimitExceeded {
@@ -487,11 +625,29 @@ impl<'a> DiskSourceProvider<'a> {
                 }
             })?;
             fingerprints.push(SourceFingerprint::from_metadata(&metadata));
-            files.push(File::open(&source.path).map_err(Par2Error::Io)?);
+            let file = File::open(&source.path).map_err(Par2Error::Io)?;
+            let backing = match mode {
+                #[cfg(not(target_family = "wasm"))]
+                InputReadMode::Mmap { advice } if source.file_length > 0 => SourceBacking::Mapped(
+                    map_source(&file, source.file_length, advice).map_err(Par2Error::Io)?,
+                ),
+                _ => SourceBacking::File(file),
+            };
+            files.push(backing);
         }
+        let window = match mode {
+            InputReadMode::Pread { window } => Some(ReadWindow {
+                buffer: vec![0u8; window],
+                file_index: usize::MAX,
+                start: 0,
+                len: 0,
+            }),
+            _ => None,
+        };
         Ok(Self {
             sources,
             files,
+            window,
             fingerprints,
             slice_starts,
             slice_size,
@@ -581,20 +737,52 @@ impl ForwardSourceProvider for DiskSourceProvider<'_> {
             .ok_or_else(|| Par2Error::ResourceLimitExceeded {
                 reason: "source read offset overflows".to_string(),
             })?;
-        self.files[file_index]
-            .seek(SeekFrom::Start(slice_offset))
-            .map_err(Par2Error::Io)?;
-        self.files[file_index]
-            .read_exact(&mut destination[..take])
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::UnexpectedEof {
-                    Par2Error::CreationSourceChanged {
-                        path: self.sources[file_index].path.display().to_string(),
-                    }
-                } else {
-                    Par2Error::Io(error)
+        let changed = || Par2Error::CreationSourceChanged {
+            path: self.sources[file_index].path.display().to_string(),
+        };
+        let file = match &mut self.files[file_index] {
+            #[cfg(not(target_family = "wasm"))]
+            SourceBacking::Mapped(map) => {
+                let start = usize::try_from(slice_offset).map_err(|_| changed())?;
+                let end = start.checked_add(take).ok_or_else(changed)?;
+                let bytes = map.get(start..end).ok_or_else(changed)?;
+                destination[..take].copy_from_slice(bytes);
+                return Ok(take);
+            }
+            SourceBacking::File(file) => file,
+        };
+        if let Some(window) = self.window.as_mut() {
+            let end = slice_offset + take as u64;
+            let hit = window.file_index == file_index
+                && slice_offset >= window.start
+                && end <= window.start + window.len as u64;
+            if !hit {
+                let remaining = self.sources[file_index]
+                    .file_length
+                    .saturating_sub(slice_offset);
+                let want = (window.buffer.len() as u64).min(remaining) as usize;
+                let read = read_full_at(file, &mut window.buffer[..want], slice_offset)
+                    .map_err(Par2Error::Io)?;
+                if read < take {
+                    return Err(changed());
                 }
-            })?;
+                window.file_index = file_index;
+                window.start = slice_offset;
+                window.len = read;
+            }
+            let at = (slice_offset - window.start) as usize;
+            destination[..take].copy_from_slice(&window.buffer[at..at + take]);
+            return Ok(take);
+        }
+        file.seek(SeekFrom::Start(slice_offset))
+            .map_err(Par2Error::Io)?;
+        file.read_exact(&mut destination[..take]).map_err(|error| {
+            if error.kind() == io::ErrorKind::UnexpectedEof {
+                changed()
+            } else {
+                Par2Error::Io(error)
+            }
+        })?;
         Ok(take)
     }
 }
@@ -852,7 +1040,7 @@ fn hash_source_contents(
         usize::try_from(block_size).map_err(|_| Par2Error::ResourceLimitExceeded {
             reason: format!("source block size {block_size} exceeds addressable memory"),
         })?;
-    let mut file = File::open(path).map_err(Par2Error::Io)?;
+    let mut file = SpikeHashReader::open(path, file_length, input_read_mode())?;
     let mut full_hash = FileHashState::new();
     let mut first_hash = Md5State::new();
     let mut first_bytes = 0u64;
@@ -1231,7 +1419,54 @@ fn absorb_file_stream(
     }
 }
 
-fn read_exact_or_changed(file: &mut File, buffer: &mut [u8], input: &Path) -> Result<()> {
+/// SPIKE: the hashing fallback's reader under each [`InputReadMode`].
+enum SpikeHashReader {
+    File(File),
+    Buffered(io::BufReader<File>),
+    #[cfg(not(target_family = "wasm"))]
+    Mapped {
+        map: memmap2::Mmap,
+        position: usize,
+    },
+}
+
+impl SpikeHashReader {
+    fn open(path: &Path, file_length: u64, mode: InputReadMode) -> Result<Self> {
+        let file = File::open(path).map_err(Par2Error::Io)?;
+        Ok(match mode {
+            InputReadMode::Seek => Self::File(file),
+            InputReadMode::Pread { window } => {
+                Self::Buffered(io::BufReader::with_capacity(window, file))
+            }
+            #[cfg(not(target_family = "wasm"))]
+            InputReadMode::Mmap { advice } if file_length > 0 => Self::Mapped {
+                map: map_source(&file, file_length, advice).map_err(Par2Error::Io)?,
+                position: 0,
+            },
+            #[allow(unreachable_patterns)]
+            _ => Self::File(file),
+        })
+    }
+}
+
+impl Read for SpikeHashReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::File(file) => file.read(buf),
+            Self::Buffered(reader) => reader.read(buf),
+            #[cfg(not(target_family = "wasm"))]
+            Self::Mapped { map, position } => {
+                let rest = &map[(*position).min(map.len())..];
+                let take = rest.len().min(buf.len());
+                buf[..take].copy_from_slice(&rest[..take]);
+                *position += take;
+                Ok(take)
+            }
+        }
+    }
+}
+
+fn read_exact_or_changed(file: &mut impl Read, buffer: &mut [u8], input: &Path) -> Result<()> {
     file.read_exact(buffer).map_err(|error| {
         if error.kind() == io::ErrorKind::UnexpectedEof {
             Par2Error::CreationSourceChanged {
@@ -1353,5 +1588,80 @@ mod tests {
             validate_main_file_count(MAX_FILES_PER_SET + 1),
             Err(Par2Error::ResourceLimitExceeded { .. })
         ));
+    }
+
+    /// SPIKE: every input read mode hands the encoder the same bytes, for a
+    /// strided multi-pass walk (the transform arm's pattern) and a sequential
+    /// hashing read, including short tails and window refills.
+    #[test]
+    fn spike_input_read_modes_deliver_identical_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let block = 4096u64;
+        let lengths = [10_000usize, 70_001, 1, 4096];
+        let mut sources = Vec::new();
+        let mut contents = Vec::new();
+        for (index, &length) in lengths.iter().enumerate() {
+            let bytes: Vec<u8> = (0..length)
+                .map(|at| {
+                    (at as u32)
+                        .wrapping_mul(2_654_435_761)
+                        .wrapping_add(index as u32) as u8
+                })
+                .collect();
+            let path = dir.path().join(format!("f{index}"));
+            fs::write(&path, &bytes).unwrap();
+            let mut source = planned_source(
+                &format!("f{index}"),
+                length as u64,
+                block,
+                &bytes[..bytes.len().min(16 * 1024)],
+            );
+            source.path = path;
+            sources.push(source);
+            contents.push(bytes);
+        }
+        let cancel = CancellationToken::new();
+        let mut modes = vec![
+            InputReadMode::Seek,
+            InputReadMode::Pread { window: 8192 },
+            InputReadMode::Pread { window: 1 << 20 },
+        ];
+        #[cfg(not(target_family = "wasm"))]
+        modes.extend([
+            InputReadMode::Mmap {
+                advice: MapAdvice::None,
+            },
+            InputReadMode::Mmap {
+                advice: MapAdvice::WillNeed,
+            },
+        ]);
+        let mut reference: Option<Vec<u8>> = None;
+        for mode in modes {
+            let mut provider =
+                DiskSourceProvider::open_with_mode(&sources, block as usize, &cancel, mode)
+                    .unwrap();
+            let mut got = Vec::new();
+            let band = 1000usize;
+            for pass in 0..(block as usize).div_ceil(band) {
+                for index in 0..provider.source_count() {
+                    let mut buffer = vec![0u8; band];
+                    let read = provider
+                        .read_source_chunk(index, pass * band, &mut buffer)
+                        .unwrap();
+                    got.extend_from_slice(&buffer[..read]);
+                }
+            }
+            match &reference {
+                None => reference = Some(got),
+                Some(reference) => assert_eq!(&got, reference, "{mode:?} differs from seek"),
+            }
+            for (source, bytes) in sources.iter().zip(&contents) {
+                let mut reader =
+                    SpikeHashReader::open(&source.path, source.file_length, mode).unwrap();
+                let mut all = vec![0u8; bytes.len()];
+                read_exact_or_changed(&mut reader, &mut all, &source.path).unwrap();
+                assert_eq!(&all, bytes, "{mode:?} hashing read differs");
+            }
+        }
     }
 }
