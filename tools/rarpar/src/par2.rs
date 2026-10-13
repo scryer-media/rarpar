@@ -497,7 +497,7 @@ pub fn repair_set(cli: &Cli, set: &Par2Set) -> Result<ParOutcome, RarparError> {
             .unwrap_or_else(|| set.base_dir.clone()),
         search_dirs: cli.search_dir.clone(),
         placement: cli.par_placement,
-        scanned: None,
+        scanned: set.reusable_packets(),
     };
     run_flow(&mut resolved, true, false, cli.quiet || cli.json)
 }

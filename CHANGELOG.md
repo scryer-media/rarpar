@@ -40,6 +40,14 @@ documented in each crate's own changelog so those notes ship with the crate.
   container's cgroup memory limit when that is below physical memory, so a
   create in a memory-limited container no longer plans for an eighth of the
   host's memory.
+- `rarpar auto` reads each PAR2 volume through a full packet scan twice per
+  run instead of five times: the repair takes the packet set discovery
+  loaded, and the rediscovery after a repair keeps the classification and
+  set of every volume whose length, mtime and inode are unchanged and were
+  last written at least 2 s before discovery read them. Repairing one
+  damaged slice of 10 x 100 MiB with a 156 MB PAR2 set reads 2.51 GB instead
+  of 2.98 GB and takes 1.04 s instead of 1.62 s on Apple silicon
+  performance cores, at the same peak RSS.
 
 ## rarpar 0.6.1
 
