@@ -82,7 +82,8 @@ fn build(directory: &Path) -> (PathBuf, PathBuf, PathBuf) {
         reader.fill(&mut chunk);
         file.write_all(&chunk).unwrap();
     }
-    file.into_inner().unwrap().sync_all().unwrap();
+    file.flush().unwrap();
+    drop(file);
     let mut options = CreationOptions {
         block_size: BLOCK_SIZE,
         recovery_count: RECOVERY,

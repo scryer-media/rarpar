@@ -143,9 +143,6 @@ impl EngineFile {
     pub(crate) fn set_len(&self, len: u64) -> io::Result<()> {
         self.file.set_len(len)
     }
-    pub(crate) fn sync_all(&self) -> io::Result<()> {
-        self.diagnostics.sync(|| self.file.sync_all())
-    }
 
     /// Read at `offset` without a separate seek. Unix and Windows leave the
     /// shared file position alone, so concurrent readers need no lock; other

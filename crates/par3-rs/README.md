@@ -158,12 +158,15 @@ File and chunk hashes share one planning pass; sliding deduplication can read
 additional candidate windows. Encoding reads sources again. Destinations must
 be absent; execution uses a caller-selected scratch directory.
 
-`execute` preserves file synchronization before installation. Standalone
-creators can explicitly use `execute_with_durability` with
-`CreationDurability::Buffered` to omit storage barriers. Both modes flush
-application buffers and authenticate staged carriers; buffered output can be
-lost after a crash. Neither mode promises atomic set installation across a
-crash. Verification and repair retain their existing behavior.
+par3-rs flushes its application buffers but never fsyncs: no creation,
+insertion or repair path issues a storage barrier (`fsync`, `sync_all`,
+`sync_data` or `F_FULLFSYNC`). Staged outputs are still authenticated before
+installation, but acknowledged output can be lost after a crash, and no API
+promises atomic set installation across one. A caller that needs durability
+synchronizes the output paths the call returns (the paths from
+`CreationPlan::execute`, the installed files in a repair report, and so on),
+and their parent directories as well if it wants the installation renames
+themselves to survive a crash.
 
 ## Streaming and resource limits
 
@@ -348,6 +351,8 @@ Still outside scope:
 - Automatic source-directory discovery and arbitrary unprotected creation
   layouts beyond supported container insertion.
 - Inferring an unknown carrier's original byte order or missing set metadata.
+- Storage barriers: outputs are flushed, never fsynced. Durability is the
+  caller's, by synchronizing the returned output paths.
 
 The workspace's `rarpar` CLI provides `par3 create`, `par3 verify`, `par3 repair`,
 `par3 archive` (a 7z or ZIP archive protected in the same pass), the

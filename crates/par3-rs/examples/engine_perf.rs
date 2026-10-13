@@ -7,9 +7,8 @@
 //! `inside` embeds PAR3 in the one `.zip`/`.7z` archive in DATA, with CARRIERS
 //! as its scratch directory and the result written into OUTPUT.
 //! Timing excludes directory discovery. Each invocation is one fresh process.
-//! PAR3_BENCH_CREATE_DURABILITY=buffered opts creation into buffered output;
-//! the default is sync-files. The selected policy is recorded in metrics.
-//! PAR3_BENCH_REPAIR_DURABILITY=buffered does the same for repair.
+//! The engine issues no storage barriers, so there is no durability policy
+//! to select.
 //! PAR3_BENCH_CREATOR replaces the Creator packet text of `create`.
 //! PAR3_BENCH_WHOLE_FILE_FIRST=0 makes disk verification hash extents and the
 //! whole file in one pass instead of the whole file first; `1` or unset keeps
@@ -228,15 +227,7 @@ fn main() -> Result<()> {
         );
         let before = options.diagnostics.source_io();
         let start = Instant::now();
-        let durability = match std::env::var("PAR3_BENCH_CREATE_DURABILITY").as_deref() {
-            Ok("buffered") => par3_rs::creation::CreationDurability::Buffered,
-            Err(std::env::VarError::NotPresent) | Ok("sync-files") => {
-                par3_rs::creation::CreationDurability::SyncFiles
-            }
-            _ => return Err("invalid PAR3_BENCH_CREATE_DURABILITY".into()),
-        };
-        println!("{{\"creation_durability\":\"{durability:?}\"}}");
-        let paths = plan.execute_with_durability(&carriers.join("set"), output, durability)?;
+        let paths = plan.execute(&carriers.join("set"), output)?;
         metric("create", start, before, &options);
         println!("{{\"carriers\":{}}}", paths.len());
     } else {
@@ -347,18 +338,7 @@ fn main() -> Result<()> {
                 "repair" if status == RepairStatus::Ready => {
                     let before = options.diagnostics.source_io();
                     let start = Instant::now();
-                    let report = match std::env::var("PAR3_BENCH_REPAIR_DURABILITY").as_deref() {
-                        Ok("buffered") => session.repair_with_durability(
-                            output,
-                            false,
-                            par3_rs::session_repair::RepairDurability::Buffered,
-                        ),
-                        Err(std::env::VarError::NotPresent) | Ok("sync-files") => {
-                            session.repair(output, false)
-                        }
-                        _ => return Err("invalid PAR3_BENCH_REPAIR_DURABILITY".into()),
-                    }
-                    .inspect_err(|_| {
+                    let report = session.repair(output, false).inspect_err(|_| {
                         let io = options.diagnostics.file_io();
                         eprintln!(
                             "{{\"failed_repair_seconds\":{:.3},\"file_read_bytes\":{},\"file_read_calls\":{},\"file_write_bytes\":{},\"file_opens\":{},\"snapshots\":{},\"scan_work_used\":{}}}",
@@ -401,21 +381,14 @@ fn main() -> Result<()> {
             snapshot.calls
         );
     }
-    let sync = options.diagnostics.file_sync();
-    println!(
-        "{{\"internal_stage\":\"Sync\",\"seconds\":{:.9},\"calls\":{}}}",
-        sync.elapsed.as_secs_f64(),
-        sync.calls
-    );
     let io = options.diagnostics.file_io();
     println!(
-        "{{\"file_read_bytes\":{},\"file_read_calls\":{},\"file_write_bytes\":{},\"file_write_calls\":{},\"file_opens\":{},\"file_syncs\":{},\"file_clones\":{},\"file_in_place\":{},\"snapshots\":{},\"scan_work_used\":{},\"memory_limit\":{},\"workers\":{}}}",
+        "{{\"file_read_bytes\":{},\"file_read_calls\":{},\"file_write_bytes\":{},\"file_write_calls\":{},\"file_opens\":{},\"file_clones\":{},\"file_in_place\":{},\"snapshots\":{},\"scan_work_used\":{},\"memory_limit\":{},\"workers\":{}}}",
         io.read_bytes,
         io.read_calls,
         io.write_bytes,
         io.write_calls,
         options.diagnostics.file_opens(),
-        sync.completed,
         options.diagnostics.file_clones(),
         options.diagnostics.file_in_place_repairs(),
         SNAPSHOTS.load(Ordering::Relaxed),

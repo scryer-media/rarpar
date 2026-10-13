@@ -51,9 +51,7 @@ use super::rar5::{
     recovery_ranges, scan, stage,
 };
 use crate::carrier::{CarrierPlan, CarrierRestoration};
-use crate::creation::{
-    CreationCodec, CreationDurability, CreationOptions, CreationPlan, CreationSource,
-};
+use crate::creation::{CreationCodec, CreationOptions, CreationPlan, CreationSource};
 use crate::ingest::{AuthenticatingWriter, IngestedPacket, PayloadKind};
 use crate::runtime::{EngineError, EngineResult, ExecutionOptions, OpenBudgeted};
 use crate::session::{Par3RepairSession, RepairStatus};
@@ -1426,7 +1424,6 @@ pub fn insert_set(
     spec: Spec,
     options: CreationOptions,
     scratch_directory: &Path,
-    durability: CreationDurability,
     crypto: Option<&Crypto>,
 ) -> EngineResult<Vec<Inserted>> {
     if options.codec != CreationCodec::Cauchy || options.store_data || options.first_recovery != 0 {
@@ -1575,9 +1572,7 @@ pub fn insert_set(
                     "embedded output failed verification",
                 ));
             }
-            if durability == CreationDurability::SyncFiles {
-                file.sync_all()?;
-            }
+            file.flush()?;
             drop(file);
             reports.push(Inserted {
                 path: output.clone(),
@@ -2208,11 +2203,7 @@ impl Set {
             )?);
         }
         let temporaries: Vec<PathBuf> = scratch.iter().map(|file| file.path().to_owned()).collect();
-        crate::session_repair::stage_embedded_files(
-            &mut self.session,
-            &temporaries,
-            crate::session_repair::RepairDurability::Buffered,
-        )?;
+        crate::session_repair::stage_embedded_files(&mut self.session, &temporaries)?;
         let mut disk = DiskSourceAccess::with_options(options.clone());
         for (index, path) in temporaries.iter().enumerate() {
             disk.insert(SourceId(index as u64), path.clone());
@@ -2288,7 +2279,7 @@ impl Set {
                     .write(true)
                     .open_budgeted(&temporaries[host.file], &options)?;
                 output.write_all_at(host.gap.start, &region)?;
-                output.sync_all()?;
+                // Positional writes leave nothing buffered to flush.
                 drop(output);
                 let proof = crate::evidence::verify_source(
                     layout.clone(),
@@ -2394,7 +2385,7 @@ impl Set {
                         "stripped host differs from the original",
                     ));
                 }
-                output.sync_all()?;
+                output.flush()?;
                 drop(output);
                 std::fs::hard_link(&temporary, destination)?;
                 written.push(destination.clone());

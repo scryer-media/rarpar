@@ -6,7 +6,7 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use par3_rs::carrier::CarrierRestoration;
-use par3_rs::creation::{CreationDurability, CreationOptions};
+use par3_rs::creation::CreationOptions;
 use par3_rs::inside::rar5::{self, Rar5Layout, Rar5Placement};
 use par3_rs::runtime::{EngineError, ExecutionOptions};
 use par3_rs::session::RepairStatus;
@@ -72,7 +72,6 @@ fn insert(
                 layout,
                 creation(recovery),
                 &scratch,
-                CreationDurability::Buffered,
             )
             .unwrap();
         }
@@ -85,7 +84,6 @@ fn insert(
             layout,
             creation(recovery),
             &scratch,
-            CreationDurability::Buffered,
         )
         .unwrap();
     }
@@ -654,7 +652,6 @@ fn insertion_refuses_a_recovery_base_and_a_changed_host() {
                 ..CreationOptions::default()
             },
             tree.path(),
-            CreationDurability::Buffered,
         )
     };
     assert!(matches!(

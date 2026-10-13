@@ -457,28 +457,16 @@ fn advanced_cauchy_and_fft_sets_repair_and_report_exact_volume_sizes() {
         let paths = plan
             .execute(&carriers.path().join("set"), carriers.path())
             .unwrap();
-        // Six 256-byte rows are held resident, so there is no spool file to
-        // synchronize: one barrier per carrier and nothing else.
-        let synced = options.execution.diagnostics.file_sync();
-        assert_eq!(synced.calls, paths.len() as u64);
-        assert_eq!(synced.completed, synced.calls);
-        let buffered = common::TempTree::new(&format!("advanced-buffered-{number}"));
-        let buffered_paths = plan
-            .execute_with_durability(
-                &buffered.path().join("set"),
-                buffered.path(),
-                par3_rs::creation::CreationDurability::Buffered,
-            )
+        // Executing the same plan again writes the same bytes.
+        let again = common::TempTree::new(&format!("advanced-again-{number}"));
+        let again_paths = plan
+            .execute(&again.path().join("set"), again.path())
             .unwrap();
-        assert_eq!(
-            options.execution.diagnostics.file_sync().calls,
-            synced.calls
-        );
-        assert_eq!(buffered_paths.len(), paths.len());
-        for (durable, buffered) in paths.iter().zip(&buffered_paths) {
+        assert_eq!(again_paths.len(), paths.len());
+        for (first, second) in paths.iter().zip(&again_paths) {
             assert_eq!(
-                std::fs::read(durable).unwrap(),
-                std::fs::read(buffered).unwrap()
+                std::fs::read(first).unwrap(),
+                std::fs::read(second).unwrap()
             );
         }
         for (path, size) in paths.iter().zip(&plan.requirements().output_sizes) {
@@ -566,13 +554,7 @@ fn cauchy_carriers(
     .unwrap();
     let reads = diagnostics.source_io().read_calls;
     let tree = common::TempTree::new(&format!("cauchy-workers-{name}-{workers}"));
-    let paths = plan
-        .execute_with_durability(
-            &tree.path().join("set"),
-            tree.path(),
-            par3_rs::creation::CreationDurability::Buffered,
-        )
-        .unwrap();
+    let paths = plan.execute(&tree.path().join("set"), tree.path()).unwrap();
     (
         plan.requirements().field.size,
         paths
@@ -658,13 +640,7 @@ fn grouped_carriers(
     .ok()?;
     let reads = execution.diagnostics.source_io().read_calls;
     let tree = common::TempTree::new(&format!("cauchy-groups-{block_size}-{memory}-{workers}"));
-    let paths = plan
-        .execute_with_durability(
-            &tree.path().join("set"),
-            tree.path(),
-            par3_rs::creation::CreationDurability::Buffered,
-        )
-        .ok()?;
+    let paths = plan.execute(&tree.path().join("set"), tree.path()).ok()?;
     assert!(execution.memory.peak() <= execution.memory.limit());
     let scratch = execution
         .diagnostics
@@ -1014,7 +990,6 @@ struct Created {
     output_bytes: u64,
     scratch_bytes: u64,
     file_io: par3_rs::runtime::IoSnapshot,
-    syncs: u64,
     resident_peak: u64,
     field: u8,
 }
@@ -1058,7 +1033,6 @@ fn create_under(
         scratch_bytes: plan.requirements().scratch_bytes,
         field: plan.requirements().field.size,
         file_io: execution.diagnostics.file_io(),
-        syncs: execution.diagnostics.file_sync().calls,
         resident_peak: ledger
             .category(par3_rs::runtime::MemoryCategory::OutputStaging)
             .peak,
@@ -1137,7 +1111,7 @@ fn resident_and_spooled_recovery_rows_write_the_same_carriers() {
                 resident.file_io.read_bytes, 0,
                 "{case}: a carrier was read back"
             );
-            assert_eq!(resident.syncs, carriers, "{case}: a spool was synchronized");
+
             assert!(resident.resident_peak >= scratch, "{case}");
 
             // Spooled rows: each is written once and read back once, where
@@ -1152,11 +1126,7 @@ fn resident_and_spooled_recovery_rows_write_the_same_carriers() {
                 scratch,
                 "{case}: spooled payloads were not read exactly once"
             );
-            // The spool is scratch: only the staged carriers are synchronized.
-            assert_eq!(
-                spooled.syncs, carriers,
-                "{case}: the spool was synchronized"
-            );
+
             assert!(spooled.resident_peak < scratch, "{case}");
         }
     }

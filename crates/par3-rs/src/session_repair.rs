@@ -41,23 +41,6 @@ pub struct SessionRepairReport {
     pub reconstructed_blocks: u64,
 }
 
-/// File synchronization policy for retained-session repair.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum RepairDurability {
-    /// Preserve the default: synchronize each staged output file once before
-    /// installation, and a destination-local copy once before it is renamed
-    /// into place. This does not synchronize parent directories or promise
-    /// atomic installation of the complete set across a crash.
-    #[default]
-    SyncFiles,
-    /// Flush application buffers without requesting durable storage barriers.
-    /// Every staged output is still checked against the authenticated layout
-    /// before installation, but a crash after installation can leave a
-    /// partial or stale file under the destination name. The host must own
-    /// the barrier, for example by synchronizing the outputs it was given.
-    Buffered,
-}
-
 struct StagedFile {
     index: usize,
     destination: Option<Destination>,
@@ -257,18 +240,10 @@ pub(crate) fn repair(
     session: &mut Par3RepairSession,
     output: &Path,
     backup: bool,
-    durability: RepairDurability,
 ) -> EngineResult<SessionRepairReport> {
     let mut installed = Vec::new();
     let mut temporary = Vec::new();
-    match repair_inner(
-        session,
-        output,
-        backup,
-        durability,
-        &mut installed,
-        &mut temporary,
-    ) {
+    match repair_inner(session, output, backup, &mut installed, &mut temporary) {
         Ok(reconstructed_blocks) => Ok(SessionRepairReport {
             installed,
             reconstructed_blocks,
@@ -288,7 +263,6 @@ fn repair_inner(
     session: &mut Par3RepairSession,
     output: &Path,
     backup: bool,
-    durability: RepairDurability,
     installed: &mut Vec<InstalledFile>,
     temporary_outputs: &mut Vec<PathBuf>,
 ) -> EngineResult<u64> {
@@ -498,7 +472,7 @@ fn repair_inner(
             }
         }
         checks.finish()?;
-        finish_staged(session, layout, Some(&tree), &staged, &proof, durability)?;
+        finish_staged(session, layout, Some(&tree), &staged, &proof)?;
         drop(proof);
         for evidence in session.evidence.values() {
             if patched_in_place(&staged, evidence.source) {
@@ -512,7 +486,7 @@ fn repair_inner(
         }
         for target in staged {
             session.options.cancel.check()?;
-            // Patched, synchronized and read back where it stands.
+            // Patched and read back where it stands.
             if target.in_place.is_some() {
                 installed.push(InstalledFile {
                     path: target.destination.expect("tree destination").display,
@@ -524,7 +498,6 @@ fn repair_inner(
                 target.stage_name.as_deref().expect("tree staging name"),
                 target.destination.as_ref().expect("tree destination"),
                 backup,
-                durability,
             )?;
             temporary_outputs.retain(|path| path != &target.temporary);
             installed.push(InstalledFile {
@@ -552,7 +525,6 @@ fn repair_inner(
 pub(crate) fn stage_embedded(
     session: &mut Par3RepairSession,
     temporary: &Path,
-    durability: RepairDurability,
 ) -> EngineResult<u64> {
     if session
         .layout()?
@@ -562,7 +534,7 @@ pub(crate) fn stage_embedded(
             "embedded repair requires one file",
         ));
     }
-    stage_embedded_files(session, &[temporary.to_owned()], durability)
+    stage_embedded_files(session, &[temporary.to_owned()])
 }
 
 /// Stage every file of an embedded set, file `k` to `temporaries[k]`, which
@@ -570,7 +542,6 @@ pub(crate) fn stage_embedded(
 pub(crate) fn stage_embedded_files(
     session: &mut Par3RepairSession,
     temporaries: &[std::path::PathBuf],
-    durability: RepairDurability,
 ) -> EngineResult<u64> {
     session.options.validate()?;
     if !matches!(
@@ -637,7 +608,7 @@ pub(crate) fn stage_embedded_files(
         }
     }
     checks.finish()?;
-    finish_staged(session, layout, None, &targets, &proof, durability)?;
+    finish_staged(session, layout, None, &targets, &proof)?;
     drop(proof);
     for evidence in session.evidence.values() {
         crate::source::ensure_snapshot(
@@ -2119,8 +2090,8 @@ fn read_back(
     Ok(())
 }
 
-/// Write the inline tails, synchronize under [`RepairDurability::SyncFiles`],
-/// and check every staged output before anything is installed.
+/// Write the inline tails and check every staged output before anything is
+/// installed. Staged outputs are flushed, never synchronized to storage.
 ///
 /// Which check is exact. Every protected extent of an output has an
 /// authenticated fingerprint: the set's block checksum for a whole block, the
@@ -2168,18 +2139,15 @@ fn finish_staged(
     tree: Option<&RepairTree>,
     staged: &[StagedFile],
     proof: &StagedProof,
-    durability: RepairDurability,
 ) -> EngineResult<()> {
     for (slot, target) in staged.iter().enumerate() {
         let extents = &layout.files[target.index].extents;
         let inline = (0..extents.len()).any(|index| extents.inline_bytes(index).is_some());
-        if !inline && durability == RepairDurability::Buffered {
+        if !inline {
             continue;
         }
         // Inline tails need no source and no recovery equation.
-        if inline {
-            before_in_place_write(session.access.as_ref(), target)?;
-        }
+        before_in_place_write(session.access.as_ref(), target)?;
         let mut file = open_staged(tree, target, false, true, &session.options)?;
         for index in 0..extents.len() {
             if let Some(bytes) = extents.inline_bytes(index) {
@@ -2189,9 +2157,7 @@ fn finish_staged(
                 proof.record(slot, index, 0, bytes);
             }
         }
-        if durability == RepairDurability::SyncFiles {
-            file.sync_all()?;
-        }
+        file.flush()?;
     }
     for (slot, target) in staged.iter().enumerate() {
         if !proof.proves(slot) {
@@ -2889,9 +2855,7 @@ mod tests {
             .unwrap();
         std::fs::write(&temporary, b"verified repaired bytes").unwrap();
 
-        let saved = tree
-            .install(&stage_name, &resolved, backup, RepairDurability::SyncFiles)
-            .unwrap();
+        let saved = tree.install(&stage_name, &resolved, backup).unwrap();
 
         assert_eq!(
             std::fs::read(&destination).unwrap(),

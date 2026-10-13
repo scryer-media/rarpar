@@ -70,7 +70,9 @@ func ParseEngineOutput(stdout string) (EngineCounters, bool) {
 			value, err := strconv.ParseInt(string(raw), 10, 64)
 			return value, err == nil
 		}
-		if _, ok := fields["file_syncs"]; ok {
+		// par3-rs 0.6.0 dropped file_syncs (it issues no storage barrier),
+		// so the counter line is recognised by a field every version prints.
+		if _, ok := fields["file_read_bytes"]; ok {
 			found = true
 			for key, target := range map[string]*int64{
 				"file_read_bytes": &counters.ReadBytes, "file_read_calls": &counters.ReadCalls,

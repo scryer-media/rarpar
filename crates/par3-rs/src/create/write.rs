@@ -289,17 +289,7 @@ fn write_file(
     out.flush().map_err(|source| Par3Error::FileIo {
         path: name(),
         source,
-    })?;
-    out.into_inner()
-        .map_err(|error| Par3Error::FileIo {
-            path: name(),
-            source: error.into_error(),
-        })?
-        .sync_all()
-        .map_err(|source| Par3Error::FileIo {
-            path: name(),
-            source,
-        })
+    })
 }
 
 #[cfg(test)]

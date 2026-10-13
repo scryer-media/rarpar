@@ -345,7 +345,6 @@ struct State {
     clones: AtomicU64,
     in_place: AtomicU64,
     stages: [StageCounters; STAGES],
-    sync: StageCounters,
     next: AtomicU64,
     admission: AdmissionCounters,
     /// Local, remote and unknown mounts, then whole-first and single-pass files.
@@ -424,29 +423,6 @@ impl ExecutionDiagnostics {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn note_in_place(&self) {
         add(&self.0.in_place, 1);
-    }
-    /// File synchronization barriers, including time waiting for storage.
-    /// `calls` counts attempts and `completed` counts successes. Durations are
-    /// already included in enclosing operation stages; do not add them again.
-    pub fn file_sync(&self) -> StageSnapshot {
-        StageSnapshot {
-            calls: self.0.sync.calls.load(Ordering::Relaxed),
-            elapsed: Duration::from_nanos(self.0.sync.nanos.load(Ordering::Relaxed)),
-            completed: self.0.sync.completed.load(Ordering::Relaxed),
-        }
-    }
-    pub(crate) fn sync(&self, sync: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
-        let started = Instant::now();
-        let result = sync();
-        add(&self.0.sync.calls, 1);
-        add(
-            &self.0.sync.nanos,
-            started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-        );
-        if result.is_ok() {
-            add(&self.0.sync.completed, 1);
-        }
-        result
     }
     /// Cumulative measurements for one stage.
     pub fn stage(&self, stage: Stage) -> StageSnapshot {

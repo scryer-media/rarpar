@@ -8,9 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::{ContainerLayout, ContainerLimits};
-use crate::creation::{
-    CreationCodec, CreationDurability, CreationOptions, CreationPlan, CreationSource,
-};
+use crate::creation::{CreationCodec, CreationOptions, CreationPlan, CreationSource};
 use crate::runtime::{EngineError, EngineResult};
 use crate::source::{SourceAccess, SourceId, SourceSnapshot, ensure_snapshot, read_exact_at};
 
@@ -114,18 +112,9 @@ impl InsertionPlan {
 
     /// Stage insertion to a separate, absent output. The caller supplies a
     /// dedicated existing scratch directory. The original archive is read-only.
-    /// The staged output is proven before exclusive output installation.
-    pub fn execute(&self, destination: &Path, scratch_directory: &Path) -> EngineResult<PathBuf> {
-        self.execute_with_durability(
-            destination,
-            scratch_directory,
-            CreationDurability::SyncFiles,
-        )
-    }
-
-    /// Execute with an explicit file synchronization policy: `SyncFiles`
-    /// synchronizes the staged output once before it is linked into place,
-    /// `Buffered` leaves that to the host. Both build and prove the same bytes.
+    /// The staged output is proven before exclusive output installation. It
+    /// is flushed but never synchronized to storage; a caller that needs
+    /// durability synchronizes the returned path itself.
     ///
     /// The output is the original archive, the embedded carrier and, for ZIP,
     /// a copy of the footer. Where the filesystem shares extents (APFS, and
@@ -137,12 +126,7 @@ impl InsertionPlan {
     /// fingerprint the plan recorded; cloned ones are the snapshot's own,
     /// checked again after the last source read. The carrier is written
     /// straight into the output and authenticated packet by packet as it is.
-    pub fn execute_with_durability(
-        &self,
-        destination: &Path,
-        scratch_directory: &Path,
-        durability: CreationDurability,
-    ) -> EngineResult<PathBuf> {
+    pub fn execute(&self, destination: &Path, scratch_directory: &Path) -> EngineResult<PathBuf> {
         let options = &self.options.execution;
         let _progress = options.stage(crate::runtime::Stage::Container)?;
         ensure_snapshot(
@@ -230,9 +214,7 @@ impl InsertionPlan {
                     "embedded output failed verification",
                 ));
             }
-            if durability == CreationDurability::SyncFiles {
-                output.sync_all()?;
-            }
+            output.flush()?;
             drop(output);
             let temporary = staging
                 .as_ref()
@@ -440,13 +422,12 @@ mod tests {
         bytes
     }
 
-    /// What one disk insertion did: engine file I/O, opens, syncs, clones.
+    /// What one disk insertion did: engine file I/O, opens, clones.
     #[derive(Debug, PartialEq)]
     struct Run {
         read_bytes: u64,
         write_bytes: u64,
         opens: u64,
-        syncs: u64,
         clones: u64,
     }
 
@@ -457,7 +438,6 @@ mod tests {
         name: &str,
         block_size: u64,
         refuse: bool,
-        durability: CreationDurability,
     ) -> (Vec<u8>, Run, u64) {
         let tree = TempTree::new("inside-disk");
         let options = options(block_size);
@@ -470,10 +450,9 @@ mod tests {
         let output = tree.path().join("output").join(name);
         let diagnostics = &execution.diagnostics;
         let (files, sources) = (diagnostics.file_io(), diagnostics.source_io());
-        let (opens, syncs) = (diagnostics.file_opens(), diagnostics.file_sync().calls);
+        let opens = diagnostics.file_opens();
         crate::repair_tree::REFUSE_CLONES.with(|refused| refused.set(refuse));
-        let installed =
-            plan.execute_with_durability(&output, &tree.path().join("scratch"), durability);
+        let installed = plan.execute(&output, &tree.path().join("scratch"));
         crate::repair_tree::REFUSE_CLONES.with(|refused| refused.set(false));
         assert_eq!(installed.unwrap(), output);
         let (files_after, sources_after) = (diagnostics.file_io(), diagnostics.source_io());
@@ -486,7 +465,6 @@ mod tests {
             read_bytes: files_after.read_bytes - files.read_bytes,
             write_bytes: files_after.write_bytes - files.write_bytes,
             opens: diagnostics.file_opens() - opens,
-            syncs: diagnostics.file_sync().calls - syncs,
             clones: diagnostics.file_clones(),
         };
         let protection = plan.requirements().protection_bytes;
@@ -532,30 +510,10 @@ mod tests {
             memory.execute(&output, tree.path()).unwrap();
             assert_eq!(std::fs::read(&output).unwrap(), expected, "{fixture}");
 
-            let (cloned, clone, protection) = insert_from_disk(
-                &original,
-                name,
-                block_size,
-                false,
-                CreationDurability::SyncFiles,
-            );
-            let (copied, copy, _) = insert_from_disk(
-                &original,
-                name,
-                block_size,
-                true,
-                CreationDurability::SyncFiles,
-            );
-            let (buffered, unsynced, _) = insert_from_disk(
-                &original,
-                name,
-                block_size,
-                false,
-                CreationDurability::Buffered,
-            );
+            let (cloned, clone, protection) = insert_from_disk(&original, name, block_size, false);
+            let (copied, copy, _) = insert_from_disk(&original, name, block_size, true);
             assert_eq!(cloned, expected, "{fixture}");
             assert_eq!(copied, expected, "{fixture}");
-            assert_eq!(buffered, expected, "{fixture}");
             let len = original.len() as u64;
             assert_eq!(len + protection + footer, expected.len() as u64);
 
@@ -569,7 +527,6 @@ mod tests {
                 read_bytes: encoding + len,
                 write_bytes: len + protection + footer,
                 opens: 2,
-                syncs: 1,
                 clones: 0,
             };
             assert_eq!(copy, copy_expected, "{fixture}");
@@ -580,7 +537,6 @@ mod tests {
                 read_bytes: encoding,
                 write_bytes: protection + footer,
                 opens,
-                syncs: 1,
                 clones: 1,
             };
             let clone_expected = if cfg!(target_os = "macos") {
@@ -591,14 +547,6 @@ mod tests {
                 copy_expected
             };
             assert_eq!(clone, clone_expected, "{fixture}");
-            assert_eq!(
-                unsynced,
-                Run {
-                    syncs: 0,
-                    ..clone_expected
-                },
-                "{fixture}"
-            );
         }
     }
 

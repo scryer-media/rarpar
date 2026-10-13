@@ -1264,10 +1264,9 @@ fn a_copy_that_walks_a_block_in_windows_counts_one_pass_per_window() {
 
 /// A repair proves each staged output from the bytes it writes, whether a
 /// stripe covers a whole block or a block is written over several passes, so
-/// no staged byte is read back. Only `SyncFiles`, the default, synchronizes it.
+/// no staged byte is read back.
 #[test]
-fn repair_proves_staged_outputs_and_syncs_only_when_asked() {
-    use par3_rs::session_repair::RepairDurability;
+fn repair_proves_staged_outputs_without_reading_them_back() {
     let tree = common::TempTree::new("staged-proof");
     let set = common::cauchy_block_set(64, 4096, 8, b"PAR3 staged proof", &tree);
     let (name, bytes) = set.contents[0].clone();
@@ -1275,13 +1274,8 @@ fn repair_proves_staged_outputs_and_syncs_only_when_asked() {
     for block in [2usize, 5, 9] {
         damaged[block * 4096 + 17] ^= 0x80;
     }
-    for (stripe, durability, syncs) in [
-        (4096, RepairDurability::SyncFiles, 1),
-        (1024, RepairDurability::SyncFiles, 1),
-        (4096, RepairDurability::Buffered, 0),
-        (1024, RepairDurability::Buffered, 0),
-    ] {
-        let case = format!("{stripe}-byte stripes, {durability:?}");
+    for stripe in [4096, 1024] {
+        let case = format!("{stripe}-byte stripes");
         let mut access = MemorySourceAccess::default();
         access.insert(SourceId(1), 1, damaged.clone().into());
         let mut options = ExecutionOptions::default();
@@ -1297,9 +1291,7 @@ fn repair_proves_staged_outputs_and_syncs_only_when_asked() {
         }
         assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
         let output = common::TempTree::new("staged-proof-out");
-        let report = session
-            .repair_with_durability(output.path(), false, durability)
-            .unwrap();
+        let report = session.repair(output.path(), false).unwrap();
         assert_eq!(report.reconstructed_blocks, 3, "{case}");
         assert_eq!(
             std::fs::read(output.path().join(&name)).unwrap(),
@@ -1309,7 +1301,6 @@ fn repair_proves_staged_outputs_and_syncs_only_when_asked() {
         let io = options.diagnostics.file_io();
         assert_eq!(io.read_bytes, 0, "{case}: a staged output was read back");
         assert_eq!(io.write_bytes, bytes.len() as u64, "{case}");
-        assert_eq!(options.diagnostics.file_sync().calls, syncs, "{case}");
         drop(session);
         assert_eq!(options.memory.used(), 0, "{case}: the session leaked");
     }
@@ -1389,7 +1380,7 @@ impl SourceAccess for Trickle {
 /// buffers may differ. A small source beside it keeps the serial walk.
 #[test]
 fn a_planning_pool_changes_scratch_and_nothing_else() {
-    use par3_rs::creation::{CreationDurability, CreationOptions, CreationPlan, CreationSource};
+    use par3_rs::creation::{CreationOptions, CreationPlan, CreationSource};
     // The smallest source that may start a planning pool.
     let large = 8usize << 20;
     let small: Vec<u8> = (0..70_000usize).map(|i| (i * 7 + i / 251) as u8).collect();
@@ -1442,11 +1433,7 @@ fn a_planning_pool_changes_scratch_and_nothing_else() {
             let tree =
                 common::TempTree::new(&format!("planning-pool-{block_size}-{tail}-{workers}"));
             let carriers: Vec<Vec<u8>> = plan
-                .execute_with_durability(
-                    &tree.path().join("set"),
-                    tree.path(),
-                    CreationDurability::Buffered,
-                )
+                .execute(&tree.path().join("set"), tree.path())
                 .unwrap()
                 .iter()
                 .map(|path| std::fs::read(path).unwrap())
@@ -1578,7 +1565,6 @@ struct DiskRepair {
     write_bytes: u64,
     clones: u64,
     in_place: u64,
-    syncs: u64,
 }
 
 /// Write every file of `set` into `inputs`, file `damaged` holding `on_disk`
@@ -1630,7 +1616,6 @@ fn repair_disk_files(
         write_bytes: after.write_bytes - before.write_bytes,
         clones: options.diagnostics.file_clones(),
         in_place: options.diagnostics.file_in_place_repairs(),
-        syncs: options.diagnostics.file_sync().calls,
     };
     drop(session);
     assert_eq!(options.memory.used(), 0, "the session leaked");
@@ -1673,7 +1658,6 @@ fn a_file_repaired_in_place_from_its_clone_writes_only_its_lost_block() {
             backup,
         );
         let len = bytes.len() as u64;
-        assert_eq!(run.syncs, 1);
         if expect_clone(&run) {
             // The surviving blocks, read once for the syndromes; no read-back.
             assert_eq!(run.read_bytes, len - block, "backup {backup}");

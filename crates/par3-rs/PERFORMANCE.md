@@ -455,6 +455,11 @@ Default creation and all repair synchronization remain unchanged. See the
 [Rust filesystem implementation](https://raw.githubusercontent.com/rust-lang/rust/1.97.0/library/std/src/sys/fs/unix.rs)
 for the platform barrier semantics.
 
+> Superseded in 0.6.0: par3-rs no longer issues any storage barrier, so the
+> buffered behaviour measured below is the only mode, and `CreationDurability`
+> and `execute_with_durability` are gone. The measurements in this section
+> are kept as recorded.
+
 A separate buffered-creation matrix passed all **240 invocations** across the
 four FFT cases, both worker limits, and three repetitions. Its FFT creation
 geometric means were **1.32× / 1.38×** the adapted reference. Every creation

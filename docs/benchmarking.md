@@ -168,7 +168,9 @@ If you pass `--engine-perf PATH`, it also runs the `par3-rs` `engine_perf`
 example once per set and durability as an untimed stage breakdown, selecting
 the durability with `PAR3_BENCH_CREATE_DURABILITY` and
 `PAR3_BENCH_REPAIR_DURABILITY` (`durable` or `buffered`; older builds ignore
-the repair variable). Nothing from that pass goes into the timing tables.
+the repair variable). From par3-rs 0.6.0 the engine issues no storage barrier
+and ignores both variables, so its durable and buffered passes are the same
+work. Nothing from that pass goes into the timing tables.
 
 ```sh
 cd bench/rarpar-bench
@@ -218,6 +220,10 @@ NAME:VAR=value[,VAR=value]` adds a `rarpar` row with extra environment
 variables. The env-gated kernel pins on main are currently no-ops for PAR3;
 the flag is plumbing for when they exist.
 
+From rarpar 0.6.3, `par3 create` has no `--buffered` flag (buffered output is
+its default and `--fsync` opts into syncing), so the probe below finds no
+`--buffered` and the suite keeps only the default row for that candidate;
+for 0.6.3 that row is buffered, not durable. Before 0.6.3:
 Every `rarpar` create and repair row runs twice: once durable, which is the
 default (no flag, one fsync per output), and once buffered (`--buffered`, no
 fsync). The durable row is listed first and labelled `durable (default)`; the
