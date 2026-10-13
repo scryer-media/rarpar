@@ -868,9 +868,16 @@ fn run_band(
     Ok(false)
 }
 
-/// Result slots one shared stripe can fold per round; the largest bucket batch
-/// [`admit`] tries.
+/// Result slots one shared stripe can fold per round; at least the largest
+/// bucket batch [`admit`] tries, so a shared band never fails on geometry.
 const SHARED_MAX_SLOTS: usize = 4;
+const _: () = {
+    let mut at = 0;
+    while at < BATCH_CANDIDATES.len() {
+        assert!(BATCH_CANDIDATES[at] <= SHARED_MAX_SLOTS);
+        at += 1;
+    }
+};
 
 /// Transform every live stripe of one band with all workers sharing each
 /// stripe, checking each against the dense definition. Returns `true` when the

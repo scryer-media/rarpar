@@ -207,9 +207,13 @@ jobs:
           PY
       - name: Hydrate the test corpus (release-tests)
         # The rarpar CLI tests open the rar5_mv_store_pair and rar4_enc_mv_store
-        # volume sets. The published `release-tests` profile predates them, so
-        # the `unrar` profile rides along until a corpus revision carrying the
-        # widened `release-tests` profile is pinned.
+        # volume sets, which the published `release-tests` profile predates, so
+        # the `unrar` profile rides along. Widening `release-tests` in
+        # test-corpus/profiles.json has to wait for the next corpus publication:
+        # the profile table is part of the pinned manifest, and a published
+        # profile that gains patterns over already-published paths fails
+        # `test-corpus verify` in CI until a revision carrying it is pinned.
+        # Drop the extra profile once that revision lands.
         run: cargo run --locked -p xtask -- test-corpus hydrate --profile release-tests --profile unrar
       - name: Run release preflight checks
         run: |

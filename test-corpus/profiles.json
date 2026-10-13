@@ -95,11 +95,9 @@
         "crates/unrar-rs/tests/fixtures/rar5/rar5_dirs.rar",
         "crates/unrar-rs/tests/fixtures/rar5/rar5_multifile_store.rar",
         "crates/unrar-rs/tests/fixtures/rar5/rar5_enc_mv_store.part*.rar",
-        "crates/unrar-rs/tests/fixtures/rar5/rar5_mv_store_pair.part*.rar",
         "crates/unrar-rs/tests/fixtures/rar5/rar5_recovery_volumes.part*",
         "crates/unrar-rs/tests/fixtures/rar4/rar4_store.rar",
         "crates/unrar-rs/tests/fixtures/rar4/rar4_tiny_volumes.part*.rar",
-        "crates/unrar-rs/tests/fixtures/rar4/rar4_enc_mv_store.part*.rar",
         "crates/unrar-rs/tests/fixtures/rar4/rar4_ppm_oldmv*",
         "crates/par2-rs/tests/fixtures/rar5_lz_plain/**"
       ]
