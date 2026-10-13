@@ -340,3 +340,11 @@ const svgStyle = `  <style>
     @media (prefers-color-scheme: dark) { .bg { fill: #0d1117; } text { fill: #e6edf3; } .subtitle, .column, .timing, .tick { fill: #9ca7b5; } .grid { stroke: #30363d; } .parity { stroke: #e6edf3; } .rule { stroke: #21262d; } .cpu { fill: #58a6ff; } .gpu { fill: #bc8cff; } .slower { fill: #f2a65a; } }
   </style>
 `
+
+// SVGStyle, EscapeXML and RatioX expose the chart style and scale so the
+// PAR3 suite's charts render in the same visual language as these.
+func SVGStyle() string { return svgStyle }
+
+func EscapeXML(value string) string { return escapeXML(value) }
+
+func RatioX(ratio, start, parity, end float64) float64 { return ratioX(ratio, start, parity, end) }

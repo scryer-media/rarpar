@@ -440,6 +440,42 @@ type ConfigSummary struct {
 	// verify and repair read: "reference" normally, "rarpar" when the
 	// reference's seed create did not finish.
 	CanonicalSource string `json:"canonical_source,omitempty"`
+	// The shape, recorded so rows can be joined with other suites' rows of
+	// the same payload bytes, block size and lost blocks: LostBlocks is the
+	// damage's block count, PAR2SourceBlocks the blocks PAR2 would need at
+	// this block size (it packs no tails), and PAR2Equivalent whether PAR2
+	// can express the shape at all (at most 32768 source and recovery
+	// blocks, and no carrier: PAR2 has no PAR-inside).
+	LostBlocks       int   `json:"lost_blocks"`
+	PAR2SourceBlocks int64 `json:"par2_source_blocks,omitempty"`
+	PAR2Equivalent   bool  `json:"par2_equivalent"`
+	// MeasuredRepeats is the measured runs per row after MaxRepeats.
+	MeasuredRepeats int `json:"measured_repeats"`
+	// CarrierBytes and CarrierSHA256 describe the protected carrier after
+	// the reference's insert (carrier sets only).
+	CarrierBytes  int64  `json:"carrier_bytes,omitempty"`
+	CarrierSHA256 string `json:"carrier_sha256,omitempty"`
+}
+
+// fillShape records the join keys for a configuration whose block size and
+// recovery count are known.
+func (s *ConfigSummary) fillShape(dataset Dataset) {
+	s.LostBlocks = s.Damage.LostBlocks()
+	if s.Carrier != "" {
+		s.PAR2Equivalent = false
+		return
+	}
+	s.InputBlocks = InputBlocks(dataset, s.BlockSize)
+	s.PAR2SourceBlocks = par2SourceBlocks(dataset, s.BlockSize)
+	s.PAR2Equivalent = s.PAR2SourceBlocks <= par2MaxSourceBlocks && s.Recovery <= par2MaxRecoveryBlocks
+}
+
+// measuredRepeats is the run's repeats, capped by the set's MaxRepeats.
+func measuredRepeats(config Config, repeats int) int {
+	if config.MaxRepeats > 0 && config.MaxRepeats < repeats {
+		return config.MaxRepeats
+	}
+	return repeats
 }
 
 // Results is the evidence document a run writes.
@@ -618,9 +654,13 @@ func RunSuite(ctx context.Context, options Options) (*Results, error) {
 			return results, err
 		}
 		dataset, _ := options.Profile.Dataset(config.Dataset)
-		summary := ConfigSummary{Config: config, DatasetBytes: dataset.TotalBytes(), InputBlocks: InputBlocks(dataset, config.BlockSize)}
+		summary := ConfigSummary{Config: config, DatasetBytes: dataset.TotalBytes(), MeasuredRepeats: measuredRepeats(config, options.Repeats)}
+		summary.fillShape(dataset)
 		if config.Codec == "fft" {
 			summary.CapacityLog2 = config.CapacityLog2()
+		}
+		if summary.MeasuredRepeats < options.Repeats {
+			results.Notes = append(results.Notes, fmt.Sprintf("%s: measured runs capped at %d (of %d) by the profile, to keep a slow host inside its session cap", config.ID, summary.MeasuredRepeats, options.Repeats))
 		}
 		results.Configs = append(results.Configs, summary)
 		if err := r.runConfig(ctx, config, dataset, &results.Configs[len(results.Configs)-1]); err != nil {
@@ -1040,9 +1080,17 @@ func (r *runner) runConfig(ctx context.Context, config Config, dataset Dataset, 
 	// The canonical carriers: one untimed reference create on the first
 	// target, copied to the others. Every identity check compares against it,
 	// and every verify and repair, ours included, reads it, so both tools
-	// always work from the same recovery set on every target.
-	canonicalSet, source, err := r.seedCanonical(ctx, config, dataset, first.dataDir, first.canonical)
-	if err != nil {
+	// always work from the same recovery set on every target. A PAR-inside
+	// set's canonical carrier is the reference's insert into the ZIP.
+	var canonicalSet CarrierSet
+	var source string
+	var err error
+	if config.Carrier != "" {
+		if config, manifest, err = r.seedCarrier(ctx, config, dataset, first, summary); err != nil {
+			return err
+		}
+		source = ToolReference
+	} else if canonicalSet, source, err = r.seedCanonical(ctx, config, dataset, first.dataDir, first.canonical); err != nil {
 		return err
 	}
 	summary.CanonicalSource = source
@@ -1054,7 +1102,7 @@ func (r *runner) runConfig(ctx context.Context, config Config, dataset Dataset, 
 			return fmt.Errorf("copying the canonical carriers: %w", err)
 		}
 	}
-	if contains(r.options.Ops, OpVerifyDamaged) {
+	if contains(r.options.Ops, OpVerifyDamaged) && config.Carrier == "" {
 		for _, state := range states {
 			state.damaged = filepath.Join(filepath.Dir(filepath.Dir(state.canonical)), "x", config.ID)
 			if err := resetDir(state.damaged); err != nil {
@@ -1073,17 +1121,25 @@ func (r *runner) runConfig(ctx context.Context, config Config, dataset Dataset, 
 	}
 
 	var failed []string
+	runs := r.options.Warmups + measuredRepeats(config, r.options.Repeats)
 	for _, op := range r.options.Ops {
 		if err := r.checkBinaries(ctx); err != nil {
 			return err
 		}
+		if config.Carrier != "" && (op == OpCreate || op == OpVerifyDamaged) {
+			// The reference's insert writes into the carrier and rarpar has
+			// no insert, so there is no create pair to time. A damaged
+			// verify is skipped too: both tools answer through par3cmdline's
+			// exit codes there, which do not report damage.
+			continue
+		}
 		var variants []Variant
 		for _, variant := range r.results.Variants {
-			if r.runsOp(variant, op) {
+			if r.runsOp(variant, op) && r.carrierRuns(config, variant) {
 				variants = append(variants, variant)
 			}
 		}
-		for run := 0; run < r.options.Warmups+r.options.Repeats; run++ {
+		for run := 0; run < runs; run++ {
 			order := orderFor(variants, run)
 			for position, variant := range order {
 				key := rowKey(config.ID, op, variant.Name)
@@ -1106,21 +1162,21 @@ func (r *runner) runConfig(ctx context.Context, config Config, dataset Dataset, 
 				r.record(record)
 				switch record.Status {
 				case StatusDNF:
-					r.noteDNF(record, r.options.Warmups+r.options.Repeats-run-1)
+					r.noteDNF(record, runs-run-1)
 				case StatusFailed:
 					failed = append(failed, fmt.Sprintf("%s/%s/%s: %s", config.ID, op, variant.Name, record.Status))
 				}
 			}
 		}
 		// The untimed passes run once, on the first target.
-		if r.options.IOCount {
+		if r.options.IOCount && config.Carrier == "" {
 			for _, variant := range variants {
 				if variant.Tool != ToolEngine && variant.Target == r.options.Targets[0].Name {
 					r.countIO(ctx, op, config, dataset, manifest, first.dataDir, first.canonical, first.stageRoot, variant)
 				}
 			}
 		}
-		if r.options.EnginePerf != "" && !contains(r.options.Rows, ToolEngine) {
+		if r.options.EnginePerf != "" && !contains(r.options.Rows, ToolEngine) && config.Carrier == "" {
 			for _, workers := range r.options.Workers {
 				for _, durability := range r.enginePerfDurabilities(op) {
 					r.enginePerf(ctx, op, config, dataset, first.dataDir, first.canonical, first.stageRoot, workers, durability)
@@ -1402,7 +1458,22 @@ func (r *runner) pin() string {
 	return ""
 }
 
-func (r *runner) checkCommand(op string, stage string, variant Variant) Command {
+func (r *runner) checkCommand(op string, stage string, variant Variant, config Config) Command {
+	if config.Carrier != "" {
+		// PAR-inside: par3cmdline's verify-itself and repair-itself on the
+		// carrier. rarpar runs the same command line through its shipped
+		// par3cmdline-compatible front end, which has no worker or
+		// durability switch (its self-repair syncs the carrier).
+		letters := "vs"
+		if op == OpRepair {
+			letters = "rs"
+		}
+		args := []string{letters, "-q", carrierZIPName}
+		if variant.Tool == ToolReference {
+			return Command{Path: r.options.Reference, Args: args, Dir: stage, PinCPUs: r.pin(), Timeout: r.timeoutFor(ToolReference)}
+		}
+		return Command{Path: r.options.Candidate, Args: args, Dir: stage, Env: variant.Env, PinCPUs: r.pin(), Timeout: r.timeoutFor(ToolCandidate)}
+	}
 	if variant.Tool == ToolReference {
 		letter := "v"
 		if op == OpRepair {
@@ -1437,6 +1508,9 @@ func stageFrom(dir string, dataset Dataset, dataDir, canonical string, config Co
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
+	}
+	if config.Carrier != "" {
+		return stageCarrier(dir, canonical, config, op)
 	}
 	inputs := dataDir
 	if op == OpVerifyDamaged && damaged != "" {
@@ -1508,7 +1582,7 @@ func (r *runner) runOne(ctx context.Context, op string, config Config, dataset D
 		if variant.Tool == ToolEngine {
 			command = r.engineCommand(op, config, state.dataDir, dir, variant)
 		} else {
-			command = r.checkCommand(op, dir, variant)
+			command = r.checkCommand(op, dir, variant, config)
 		}
 	}
 	record.Command = command.Describe()
@@ -1694,7 +1768,7 @@ func (r *runner) countIO(ctx context.Context, op string, config Config, dataset 
 		if err := stage(dir, dataset, dataDir, canonical, config, op); err != nil {
 			record.Error = err.Error()
 		}
-		command = r.checkCommand(op, dir, variant)
+		command = r.checkCommand(op, dir, variant, config)
 	}
 	if record.Error == "" {
 		counts, err := CountIO(ctx, command, stageRoot, func(exitCode int) bool {
@@ -1862,4 +1936,102 @@ func CollectMachine(ctx context.Context, label string) bench.Machine {
 		machine.Kernel = runtime.GOOS
 	}
 	return machine
+}
+
+// carrierRuns reports whether a variant runs on a configuration. Every
+// variant runs on a plain set. On a PAR-inside carrier rarpar runs through
+// its par3cmdline-compatible front end, which takes no worker count and no
+// durability switch, so only one rarpar row runs there: the durable default
+// at the most workers, with no kernel override. Engine rows do not run.
+func (r *runner) carrierRuns(config Config, variant Variant) bool {
+	if config.Carrier == "" || variant.Tool == ToolReference {
+		return true
+	}
+	if variant.Tool != ToolCandidate || variant.Kernel != "" || variant.EffectiveDurability() != DurabilityDurable {
+		return false
+	}
+	most := 0
+	for _, workers := range r.options.Workers {
+		if workers > most {
+			most = workers
+		}
+	}
+	return variant.Workers == most
+}
+
+// seedCarrier builds the original ZIP from the dataset, has the reference
+// insert its PAR3 region into a copy (untimed), and reads the block size and
+// recovery count the reference chose. The canonical carrier is that inserted
+// ZIP; every verify and repair, ours included, starts from a copy of it, and
+// a repair passes only when the carrier hashes back to it. A reference that
+// cannot insert fails the set: rarpar has no ZIP insert to fall back on.
+func (r *runner) seedCarrier(ctx context.Context, config Config, dataset Dataset, first *targetState, summary *ConfigSummary) (Config, DatasetManifest, error) {
+	if err := resetDir(first.canonical); err != nil {
+		return config, DatasetManifest{}, err
+	}
+	carrier := filepath.Join(first.canonical, carrierZIPName)
+	original, err := BuildCarrierZIP(carrier, first.dataDir, dataset)
+	if err != nil {
+		return config, DatasetManifest{}, fmt.Errorf("%s: building the original ZIP: %w", config.ID, err)
+	}
+	originalDigest, _, err := hashFile(carrier)
+	if err != nil {
+		return config, DatasetManifest{}, err
+	}
+	command := Command{Path: r.options.Reference, Args: []string{"i", "-q", "-r" + strconv.Itoa(config.InsertRedundancy), carrierZIPName},
+		Dir: first.canonical, PinCPUs: r.pin(), Timeout: r.timeoutFor(ToolReference)}
+	result := Run(ctx, command)
+	if result.Failure == "binary-quarantined" {
+		return config, DatasetManifest{}, r.quarantined(ctx, r.options.Reference, "refused to start")
+	}
+	if result.Failure != "" || result.ExitCode != 0 {
+		return config, DatasetManifest{}, fmt.Errorf("%s: the reference's PAR-inside insert failed (exit %d %s): %s", config.ID, result.ExitCode, result.Failure, lastLine(result))
+	}
+	embedded, err := scanEmbedded(carrier)
+	if err != nil {
+		return config, DatasetManifest{}, fmt.Errorf("%s: after the reference's insert: %w", config.ID, err)
+	}
+	if embedded.FirstPacket < original {
+		return config, DatasetManifest{}, fmt.Errorf("%s: the inserted PAR3 region starts at %d, inside the %d original ZIP bytes", config.ID, embedded.FirstPacket, original)
+	}
+	digest, size, err := hashFile(carrier)
+	if err != nil {
+		return config, DatasetManifest{}, err
+	}
+	config.BlockSize = embedded.BlockSize
+	config.Recovery = embedded.Recovery
+	config.CarrierOriginalBytes = original
+	if lost := int64(config.Damage.LostBlocks()); lost > config.Recovery {
+		return config, DatasetManifest{}, fmt.Errorf("%s: damage loses %d blocks but the reference's insert wrote only %d recovery blocks", config.ID, lost, config.Recovery)
+	}
+	damage := carrierDamageDataset(original)
+	if blocks := (damage.Files[0].Size) / config.BlockSize; int64(config.Damage.LostBlocks()) > blocks {
+		return config, DatasetManifest{}, fmt.Errorf("%s: damage wants %d blocks of the %d-block original ZIP", config.ID, config.Damage.LostBlocks(), blocks)
+	}
+	summary.Config = config
+	summary.InputBlocks = (original + config.BlockSize - 1) / config.BlockSize
+	summary.CarrierBytes = size
+	summary.CarrierSHA256 = digest
+	summary.ExpectedField = embedded.Field
+	summary.fillShape(dataset)
+	summary.CanonicalSource = ToolReference
+	r.results.Notes = append(r.results.Notes, fmt.Sprintf("%s: original ZIP %d bytes (sha256 %s); the reference's insert (-r%d, untimed, %.3fs) chose %d-byte blocks, %d input and %d recovery blocks (%s), carrier %d bytes; create is not timed for a carrier, and rarpar runs one row through its par3cmdline-compatible front end (vs/rs)",
+		config.ID, original, short(originalDigest), config.InsertRedundancy, result.WallSeconds, config.BlockSize, summary.InputBlocks, config.Recovery, embedded.Field, size))
+	manifest := DatasetManifest{Generator: generatorVersion, Dataset: Dataset{ID: config.ID, Files: []FileSpec{{Name: carrierZIPName, Size: size}}},
+		SHA256: []FileDigest{{Name: carrierZIPName, Size: size, SHA256: digest}}}
+	return config, manifest, nil
+}
+
+// stageCarrier lays out a PAR-inside stage: a private copy of the canonical
+// carrier for anything that writes or is damaged, a link otherwise, with the
+// damage confined to the original ZIP bytes.
+func stageCarrier(dir, canonical string, config Config, op string) error {
+	source, destination := filepath.Join(canonical, carrierZIPName), filepath.Join(dir, carrierZIPName)
+	if op == OpVerify {
+		return linkOrCopy(source, destination)
+	}
+	if err := copyFile(source, destination); err != nil {
+		return err
+	}
+	return ApplyDamage(dir, carrierDamageDataset(config.CarrierOriginalBytes), config.BlockSize, config.Damage)
 }

@@ -82,7 +82,34 @@ type Config struct {
 	ExpectedField string `json:"expected_field"`
 	Damage        Damage `json:"damage"`
 	Note          string `json:"note,omitempty"`
+	// Carrier is empty for a recovery set beside its inputs, or CarrierZIP:
+	// the dataset stored in a ZIP that the reference protects in place with
+	// its PAR-inside insert (`par3 i -r<InsertRedundancy>`), and that both
+	// tools then verify and self-repair (`vs`, `rs`). The reference picks the
+	// block size and recovery count for an insert, so BlockSize and Recovery
+	// are zero in the profile and are read from the inserted carrier at run
+	// time. The damage names file 0, the carrier, and lands only in the
+	// original ZIP bytes, never in the appended PAR3 region.
+	Carrier          string `json:"carrier,omitempty"`
+	InsertRedundancy int    `json:"insert_redundancy_percent,omitempty"`
+	// MaxRepeats caps the measured runs of this set (0: the run's repeats).
+	// The largest reference shapes use it so a slow host stays inside its
+	// session cap; the report states the cap.
+	MaxRepeats int `json:"max_repeats,omitempty"`
+	// CarrierOriginalBytes is the original ZIP's size, before the
+	// reference's insert; set at run time.
+	CarrierOriginalBytes int64 `json:"carrier_original_bytes,omitempty"`
 }
+
+// CarrierZIP is the PAR-inside ZIP carrier kind.
+const CarrierZIP = "zip"
+
+// carrierZIPName is the protected ZIP's name in every carrier stage.
+const carrierZIPName = "inside.zip"
+
+// carrierDamageGuard keeps carrier damage clear of the ZIP's central
+// directory and end records at the tail of the original bytes.
+const carrierDamageGuard = 64 * KiB
 
 // CapacityLog2 is the FFT cohort capacity both tools derive from the recovery
 // count with one cohort: log2(next_power_of_two(recovery)). The reference
@@ -250,9 +277,74 @@ func fullProfile() Profile {
 	return profile
 }
 
+// fleetProfile is the cross-machine PAR3 round: create, verify and repair at
+// three sizes with Cauchy and FFT side by side, a shape over PAR2's 32768
+// input-block limit, and a PAR-inside ZIP. Sets A, B and C are the full
+// profile's datasets and shapes, so the numbers compare with earlier rounds.
+// Every FFT row is forced on both sides: the reference's explicit -e8 codec
+// switch and rarpar's --codec fft with the same one-cohort capacity; neither
+// tool picks FFT by size. The order keeps each size's Cauchy and FFT rows
+// together.
+func fleetProfile() Profile {
+	full := fullProfile()
+	a, _ := full.Dataset("a")
+	b, _ := full.Dataset("b")
+	c, _ := full.Dataset("c")
+	mFiles := make([]FileSpec, 4)
+	for i := range mFiles {
+		mFiles[i] = FileSpec{Name: fmt.Sprintf("m%d.bin", i), Size: 128 * MiB}
+	}
+	m := Dataset{ID: "m", Files: mFiles}
+	zFiles := make([]FileSpec, 4)
+	for i := range zFiles {
+		zFiles[i] = FileSpec{Name: fmt.Sprintf("z%d.bin", i), Size: 64 * MiB}
+	}
+	z := Dataset{ID: "z", Files: zFiles}
+	byID := map[string]Config{}
+	for _, config := range full.Configs {
+		byID[config.ID] = config
+	}
+	bFFT := byID["b-gf16"]
+	bFFT.ID, bFFT.Codec, bFFT.ExpectedField = "b-fft", "fft", "fft-gf16"
+	bFFT.Note = "set B with the FFT codec on both sides (reference -e8, one cohort, capacity 32): the small FFT shape"
+	aGF16 := byID["a-gf16"]
+	aGF16.MaxRepeats = 3
+	cFFT := byID["c-fft"]
+	cFFT.MaxRepeats = 3
+	cFFT.Note = "set C, over PAR2's cap: 49152 input blocks where PAR2 allows 32768, so there is no PAR2 equivalent; FFT on both sides (reference -e8, one cohort, capacity 8192); the reference's Cauchy is quadratic here"
+	return Profile{
+		Name:     "fleet",
+		Datasets: []Dataset{b, m, a, c, z},
+		Configs: []Config{
+			byID["b-gf16"],
+			bFFT,
+			{
+				ID: "m-gf16", Dataset: "m", BlockSize: 1 * MiB, Recovery: 52,
+				Codec: "cauchy", ExpectedField: "gf16",
+				Damage: spread("lost-24x1m-4files", []int{0, 1, 2, 3}, 6),
+				Note:   "set M: 4 x 128 MiB, 1 MiB blocks, 10% (512 + 52 blocks): the medium Cauchy shape",
+			},
+			{
+				ID: "m-fft", Dataset: "m", BlockSize: 1 * MiB, Recovery: 52,
+				Codec: "fft", ExpectedField: "fft-gf16",
+				Damage: spread("lost-24x1m-4files", []int{0, 1, 2, 3}, 6),
+				Note:   "set M with the FFT codec on both sides (reference -e8, one cohort, capacity 64): the medium FFT shape",
+			},
+			aGF16,
+			cFFT,
+			{
+				ID: "zip-inside", Dataset: "z", Codec: "cauchy", ExpectedField: "gf16",
+				Carrier: CarrierZIP, InsertRedundancy: 10,
+				Damage: spread("lost-40-blocks-in-zip", []int{0}, 40),
+				Note:   "PAR-inside ZIP: 4 x 64 MiB stored in one ZIP, protected in place by the reference's insert (-r10, Cauchy; the reference picks the block size), self-repaired by both sides",
+			},
+		},
+	}
+}
+
 // Profiles lists every built-in profile by name.
 func Profiles() map[string]Profile {
-	return map[string]Profile{"smoke": smokeProfile(), "full": fullProfile()}
+	return map[string]Profile{"smoke": smokeProfile(), "full": fullProfile(), "fleet": fleetProfile()}
 }
 
 // LookupProfile returns a built-in profile.
@@ -322,6 +414,15 @@ func (p Profile) Validate() error {
 		if !ok {
 			return fmt.Errorf("set %s: unknown dataset %q", config.ID, config.Dataset)
 		}
+		if config.MaxRepeats < 0 {
+			return fmt.Errorf("set %s: max_repeats must not be negative", config.ID)
+		}
+		if config.Carrier != "" {
+			if err := validateCarrier(config, dataset); err != nil {
+				return err
+			}
+			continue
+		}
 		if config.BlockSize <= 0 || config.Recovery <= 0 {
 			return fmt.Errorf("set %s: block size and recovery count must be positive", config.ID)
 		}
@@ -350,6 +451,34 @@ func (p Profile) Validate() error {
 			if int64(target.Blocks) > fileBlocks {
 				return fmt.Errorf("set %s: damage wants %d blocks of a %d-block file", config.ID, target.Blocks, fileBlocks)
 			}
+		}
+	}
+	return nil
+}
+
+// validateCarrier checks a PAR-inside set: a known carrier, an insert
+// redundancy the reference accepts (it refuses above 250), no block size or
+// recovery count of its own (the reference picks them), the Cauchy codec
+// (the reference's insert is Cauchy only), and damage aimed at the carrier.
+func validateCarrier(config Config, dataset Dataset) error {
+	if config.Carrier != CarrierZIP {
+		return fmt.Errorf("set %s: unknown carrier %q (known: %s)", config.ID, config.Carrier, CarrierZIP)
+	}
+	if config.InsertRedundancy < 1 || config.InsertRedundancy > 250 {
+		return fmt.Errorf("set %s: insert redundancy %d%% is outside the reference's 1-250", config.ID, config.InsertRedundancy)
+	}
+	if config.BlockSize != 0 || config.Recovery != 0 {
+		return fmt.Errorf("set %s: a carrier set takes its block size and recovery count from the reference's insert; leave them 0", config.ID)
+	}
+	if config.Codec != "cauchy" {
+		return fmt.Errorf("set %s: the reference's PAR-inside insert writes Cauchy only", config.ID)
+	}
+	if len(dataset.Files) == 0 {
+		return fmt.Errorf("set %s: a carrier needs at least one member", config.ID)
+	}
+	for _, target := range config.Damage.Targets {
+		if target.File != 0 || target.Blocks <= 0 {
+			return fmt.Errorf("set %s: carrier damage must name file 0 (the carrier) with a positive block count", config.ID)
 		}
 	}
 	return nil
