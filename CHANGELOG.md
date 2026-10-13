@@ -57,6 +57,16 @@ documented in each crate's own changelog so those notes ship with the crate.
   0.33 s instead of 0.53 s and peaks at 7.6 MB RSS instead of 32.7 MB on
   Apple silicon performance cores. Its output is unchanged.
 
+### Library versions
+
+- par2-rs 0.10.9 (pinned exactly): the faster and leaner create above, the
+  cgroup-aware memory default, `VerificationSession::with_par2_set`, and
+  repair reads without a seek per slice.
+- par3-rs 0.5.2 (pinned exactly, was 0.5.1): adds the experimental
+  `inside::rar4` module, which no `rarpar` command uses. PAR3 behavior is
+  unchanged.
+- unrar-rs 0.11.0: unchanged.
+
 ## rarpar 0.6.1
 
 ### CLI Changes
