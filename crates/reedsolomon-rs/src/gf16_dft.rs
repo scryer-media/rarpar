@@ -409,6 +409,12 @@ impl DftPlan {
         self.output_count
     }
 
+    /// Buckets one [`DftScratch`] can hold results for at once: the batch the
+    /// plan was built with.
+    pub fn bucket_batch(&self) -> usize {
+        self.bucket_batch
+    }
+
     /// The exponent range this plan was built for.
     pub fn outputs(&self) -> Range<u32> {
         self.first_exponent..self.first_exponent + self.output_count as u32
@@ -510,6 +516,155 @@ impl DftPlan {
                 self.bucket_transform(at, sources, result, stage, stripe_len);
             }
             self.accumulate(from..upto, results, outputs, stripe_len);
+        }
+        Ok(())
+    }
+
+    /// Live 257-buckets: the unit [`DftPlan::transform_bucket`] works in.
+    ///
+    /// [`DftPlan::transform_stripe`] is one worker's whole stripe. When there
+    /// are fewer stripes than workers — a narrow slice, or a memory budget that
+    /// buys only a stripe or two at a time — several workers can share one
+    /// stripe instead, inside one scratch's worth of result rows: split a
+    /// [`DftScratch`] with [`DftPlan::scratch_parts`], let each of up to
+    /// `bucket_batch` workers run the sub-transform of one bucket into one
+    /// result slot ([`DftPlan::transform_bucket`]), each with a stage of its
+    /// own, and once a round's slots are full let every worker fold them into
+    /// a disjoint range of output rows ([`DftPlan::accumulate_buckets`]). The
+    /// fold count and the result are those of `transform_stripe`; only the
+    /// order of the XORs into each output row differs, and XOR is associative.
+    pub fn bucket_count(&self) -> usize {
+        self.live_buckets.len()
+    }
+
+    /// Bytes of one bucket's result rows at this stripe length: one slot of
+    /// [`DftPlan::scratch_parts`].
+    pub fn result_bytes(&self, stripe_len: usize) -> usize {
+        self.result_rows * stripe_len
+    }
+
+    /// Bytes of the stage one running sub-transform needs at this stripe
+    /// length. A scratch holds one; a further worker sharing a stripe needs
+    /// another.
+    pub fn stage_bytes(&self, stripe_len: usize) -> usize {
+        self.stage_rows * stripe_len
+    }
+
+    /// Split `scratch` into its `bucket_batch` result slots and its stage.
+    ///
+    /// # Errors
+    ///
+    /// [`TransformError::Geometry`] if the scratch was not built for this
+    /// plan.
+    pub fn scratch_parts<'s>(
+        &self,
+        scratch: &'s mut DftScratch,
+    ) -> Result<(std::slice::ChunksExactMut<'s, u8>, &'s mut [u8]), TransformError> {
+        let stripe_len = scratch.stripe_len;
+        if stripe_len == 0 || scratch.buf.len() != self.scratch_bytes(stripe_len) {
+            return Err(TransformError::Geometry);
+        }
+        let (results, stage) = scratch
+            .buf
+            .split_at_mut(self.bucket_batch * self.result_bytes(stripe_len));
+        Ok((
+            results.chunks_exact_mut(self.result_bytes(stripe_len)),
+            stage,
+        ))
+    }
+
+    /// Run live bucket `bucket`'s 255-point sub-transform over `sources` into
+    /// `result`, one slot of [`DftPlan::scratch_parts`], using `stage`, which
+    /// is at least [`DftPlan::stage_bytes`] long. The stripe length is the
+    /// sources' and must be even.
+    ///
+    /// # Errors
+    ///
+    /// [`TransformError::Geometry`] if the slice count, a stripe length, the
+    /// bucket, the result or the stage does not match the plan.
+    pub fn transform_bucket(
+        &self,
+        bucket: usize,
+        sources: &[&[u8]],
+        result: &mut [u8],
+        stage: &mut [u8],
+    ) -> Result<(), TransformError> {
+        let stripe_len = sources.first().map_or(0, |s| s.len());
+        if sources.len() != self.source_count
+            || bucket >= self.live_buckets.len()
+            || !stripe_len.is_multiple_of(2)
+            || sources.iter().any(|s| s.len() != stripe_len)
+            || result.len() != self.result_bytes(stripe_len)
+            || stage.len() < self.stage_bytes(stripe_len)
+        {
+            return Err(TransformError::Geometry);
+        }
+        if stripe_len == 0 {
+            return Ok(());
+        }
+        let stage = &mut stage[..self.stage_bytes(stripe_len)];
+        self.bucket_transform(bucket, sources, result, stage, stripe_len);
+        Ok(())
+    }
+
+    /// XOR-accumulate finished buckets into output rows `rows`.
+    ///
+    /// `buckets` pairs each live bucket index with the result rows
+    /// [`DftPlan::transform_bucket`] wrote for it; `outputs` holds exactly the
+    /// rows `rows` covers, row-major, `outputs[(o - rows.start) * stripe_len..]`
+    /// for output `o`. Folding every live bucket exactly once into every row,
+    /// over any number of calls and in any order, produces what
+    /// [`DftPlan::transform_stripe`] produces.
+    ///
+    /// # Errors
+    ///
+    /// [`TransformError::Geometry`] if a bucket index, a result length, the
+    /// row range or the output length does not match the plan.
+    pub fn accumulate_buckets(
+        &self,
+        buckets: &[(usize, &[u8])],
+        rows: Range<usize>,
+        outputs: &mut [u8],
+    ) -> Result<(), TransformError> {
+        if rows.end > self.output_count || rows.start > rows.end {
+            return Err(TransformError::Geometry);
+        }
+        if rows.is_empty() || buckets.is_empty() {
+            return Ok(());
+        }
+        if !outputs.len().is_multiple_of(rows.len()) {
+            return Err(TransformError::Geometry);
+        }
+        let stripe_len = outputs.len() / rows.len();
+        let result_span = self.result_rows * stripe_len;
+        if !stripe_len.is_multiple_of(2)
+            || buckets
+                .iter()
+                .any(|&(at, result)| at >= self.live_buckets.len() || result.len() != result_span)
+        {
+            return Err(TransformError::Geometry);
+        }
+        if stripe_len == 0 {
+            return Ok(());
+        }
+        const ACCUMULATE_BATCH: usize = 16;
+        let mut batch: [FactorSrc<'_>; ACCUMULATE_BATCH] = std::array::from_fn(|_| FactorSrc {
+            factor: 0,
+            src: &[],
+        });
+        for group in buckets.chunks(ACCUMULATE_BATCH) {
+            for (dst, out) in outputs.chunks_mut(stripe_len).zip(rows.clone()) {
+                let row = self.out_row[out] as usize * stripe_len;
+                let q = self.out_q[out] as u32;
+                for (slot, &(at, result)) in group.iter().enumerate() {
+                    let v = self.live_buckets[at] as u32;
+                    batch[slot] = FactorSrc {
+                        factor: gf::pow_from_log(LOG_W257, q * v),
+                        src: &result[row..][..stripe_len],
+                    };
+                }
+                mul_acc_input_batch(dst, &batch[..group.len()]);
+            }
         }
         Ok(())
     }
@@ -919,6 +1074,106 @@ mod tests {
                 .unwrap();
             assert_eq!(got, expect, "batch={batch}");
         }
+    }
+
+    #[test]
+    fn a_stripe_shared_by_bucket_and_row_matches_transform_stripe() {
+        // Several workers sharing one stripe: each round fills one scratch's
+        // result slots, every slot's sub-transform with a stage of its own,
+        // and the round is folded into disjoint row ranges.
+        let slots = par2_slots(1500);
+        let outputs = 7..700u32;
+        let stripe = 96;
+        let sources: Vec<Vec<u8>> = (0..slots.len())
+            .map(|i| noise(i as u64 + 0x77, stripe))
+            .collect();
+        let refs: Vec<&[u8]> = sources.iter().map(|s| s.as_slice()).collect();
+        let rows = outputs.len();
+        for (workers, batch) in [(1usize, 4usize), (3, 2), (8, 4), (5, 1)] {
+            let plan = DftPlan::build_tuned(&slots, outputs.clone(), batch).unwrap();
+            let mut expect = vec![0u8; rows * stripe];
+            let mut scratch = DftScratch::new(&plan, stripe);
+            plan.transform_stripe(&refs, &mut expect, &mut scratch, &|| false)
+                .unwrap();
+
+            let mut shared = DftScratch::new(&plan, stripe);
+            let (slots_iter, stage) = plan.scratch_parts(&mut shared).unwrap();
+            let mut result_slots: Vec<&mut [u8]> = slots_iter.collect();
+            assert_eq!(result_slots.len(), batch);
+            let mut spare = vec![0u8; plan.stage_bytes(stripe)];
+            let mut got = vec![0u8; rows * stripe];
+            let bounds: Vec<usize> = (0..=workers).map(|w| w * rows / workers).collect();
+            for round in (0..plan.bucket_count()).step_by(batch) {
+                let live = batch.min(plan.bucket_count() - round);
+                for (slot, result) in result_slots.iter_mut().take(live).enumerate() {
+                    // Alternate the two stages, as two workers would.
+                    let stage: &mut [u8] = if slot % 2 == 0 { stage } else { &mut spare };
+                    plan.transform_bucket(round + slot, &refs, result, stage)
+                        .unwrap();
+                }
+                let finished: Vec<(usize, &[u8])> = result_slots
+                    .iter()
+                    .take(live)
+                    .enumerate()
+                    .map(|(slot, result)| (round + slot, &result[..]))
+                    .collect();
+                for worker in 0..workers {
+                    let range = bounds[worker]..bounds[worker + 1];
+                    plan.accumulate_buckets(
+                        &finished,
+                        range.clone(),
+                        &mut got[range.start * stripe..range.end * stripe],
+                    )
+                    .unwrap();
+                }
+            }
+            assert_eq!(got, expect, "workers={workers} batch={batch}");
+        }
+    }
+
+    #[test]
+    fn the_shared_stripe_api_validates_its_geometry() {
+        let slots = par2_slots(300);
+        let plan = DftPlan::build_tuned(&slots, 0..40, 2).unwrap();
+        let sources: Vec<Vec<u8>> = (0..300).map(|i| noise(i as u64, 64)).collect();
+        let refs: Vec<&[u8]> = sources.iter().map(|s| s.as_slice()).collect();
+        let mut wrong = DftScratch::new(&plan, 0);
+        assert!(plan.scratch_parts(&mut wrong).is_err());
+        let mut scratch = DftScratch::new(&plan, 64);
+        let (mut result_slots, stage) = plan.scratch_parts(&mut scratch).unwrap();
+        let result = result_slots.next().unwrap();
+        let buckets = plan.bucket_count();
+        assert!(
+            plan.transform_bucket(buckets, &refs, result, stage)
+                .is_err()
+        );
+        assert!(plan.transform_bucket(0, &refs[1..], result, stage).is_err());
+        assert!(
+            plan.transform_bucket(0, &refs, &mut result[1..], stage)
+                .is_err()
+        );
+        let short = plan.stage_bytes(64) - 1;
+        assert!(
+            plan.transform_bucket(0, &refs, result, &mut stage[..short])
+                .is_err()
+        );
+        plan.transform_bucket(0, &refs, result, stage).unwrap();
+        let result = result.to_vec();
+        let mut out = vec![0u8; 4 * 64];
+        assert!(
+            plan.accumulate_buckets(&[(buckets, &result)], 0..4, &mut out)
+                .is_err()
+        );
+        assert!(
+            plan.accumulate_buckets(&[(0, &result[1..])], 0..4, &mut out)
+                .is_err()
+        );
+        assert!(
+            plan.accumulate_buckets(&[(0, &result)], 38..42, &mut out)
+                .is_err()
+        );
+        plan.accumulate_buckets(&[(0, &result)], 0..4, &mut out)
+            .unwrap();
     }
 
     #[test]
