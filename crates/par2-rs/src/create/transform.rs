@@ -1033,9 +1033,9 @@ fn run_band_shared(
                         let live = batch.min(buckets - first);
                         if let Some(stage) = stage.as_deref_mut() {
                             phase(&mut || {
-                                for slot in 0..live {
+                                for (slot, lock) in slots[..live].iter().enumerate() {
                                     let mut result =
-                                        slots[slot].write().unwrap_or_else(PoisonError::into_inner);
+                                        lock.write().unwrap_or_else(PoisonError::into_inner);
                                     plan.transform_bucket(first + slot, views, &mut result, stage)
                                         .map_err(transform_error)?;
                                 }
