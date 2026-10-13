@@ -3,11 +3,15 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
+use par2_rs::FileStatFingerprint;
 use serde::Serialize;
 
 use crate::cleanup::{CleanupManifest, CleanupResult};
 use crate::error::RarparError;
+use crate::par3_inside::fold_case;
 use rarpar::cli::Cli;
 
 const PAR2_MAGIC: &[u8] = b"PAR2\0PKT";
@@ -73,6 +77,11 @@ pub struct DiscoveredFile {
     pub kind: DiscoveredKind,
     pub set_hint: Option<String>,
     pub diagnostics: Vec<String>,
+    /// For a PAR2 file, the stat of the bytes its packet scan read, when that
+    /// stat can vouch for them (see [`settled_scan`]). A later discovery in
+    /// the same run reuses this classification while the stat still matches.
+    #[serde(skip)]
+    pub(crate) settled: Option<FileStatFingerprint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -147,6 +156,115 @@ pub struct Par2Set {
     pub base_dir: PathBuf,
     pub paths: Vec<PathBuf>,
     pub protected_files: Vec<String>,
+    /// The packet set discovery loaded from `paths`, kept so the repair and a
+    /// later discovery in the same run do not read the volumes again.
+    #[serde(skip)]
+    pub(crate) loaded: Option<Arc<LoadedPar2Set>>,
+}
+
+/// A PAR2 packet set and the stat of each volume it was read from.
+#[derive(Debug)]
+pub(crate) struct LoadedPar2Set {
+    set: par2_rs::Par2FileSet,
+    fingerprints: Vec<FileStatFingerprint>,
+}
+
+impl Par2Set {
+    /// The loaded packet set, while every volume still has the stat it had
+    /// when it was read. `None` sends the caller back to the volumes.
+    pub(crate) fn reusable_packets(&self) -> Option<par2_rs::Par2FileSet> {
+        let loaded = self.loaded.as_ref()?;
+        unchanged(&self.paths, &loaded.fingerprints).then(|| loaded.set.clone())
+    }
+}
+
+/// How long before a scan a file's mtime must lie for its stat to vouch for
+/// the bytes the scan read. A write inside the filesystem's timestamp
+/// granularity can leave length, mtime and inode as they were; a file last
+/// written at least this long before the scan started cannot have been.
+const SCAN_SETTLE: Duration = Duration::from_secs(2);
+
+/// Run `scan` over `path` and report the file's stat if it vouches for the
+/// bytes the scan read: the same before and after, and last modified at
+/// least [`SCAN_SETTLE`] before the scan started.
+fn settled_scan<T>(path: &Path, scan: impl FnOnce() -> T) -> (T, Option<FileStatFingerprint>) {
+    let (value, settled) = settled_scan_all(std::slice::from_ref(&path.to_path_buf()), scan);
+    (value, settled.and_then(|mut all| all.pop()))
+}
+
+/// [`settled_scan`] over several files: their stats, in order, if every one
+/// of them vouches for the bytes the scan read.
+fn settled_scan_all<T>(
+    paths: &[PathBuf],
+    scan: impl FnOnce() -> T,
+) -> (T, Option<Vec<FileStatFingerprint>>) {
+    let started = SystemTime::now();
+    let before: Option<Vec<_>> = paths
+        .iter()
+        .map(FileStatFingerprint::capture_path)
+        .collect();
+    let value = scan();
+    let settled = before.filter(|before| {
+        unchanged(paths, before)
+            && before.iter().all(|fingerprint| {
+                fingerprint
+                    .modified()
+                    .and_then(|modified| started.duration_since(modified).ok())
+                    .is_some_and(|age| age >= SCAN_SETTLE)
+            })
+    });
+    (value, settled)
+}
+
+fn unchanged(paths: &[PathBuf], fingerprints: &[FileStatFingerprint]) -> bool {
+    paths.len() == fingerprints.len()
+        && paths.iter().zip(fingerprints).all(|(path, fingerprint)| {
+            FileStatFingerprint::capture_path(path).as_ref() == Some(fingerprint)
+        })
+}
+
+/// PAR2 work an earlier discovery in the same run already did.
+#[derive(Default)]
+struct Par2Reuse {
+    files: BTreeMap<PathBuf, DiscoveredFile>,
+    sets: Vec<Par2Set>,
+}
+
+impl Par2Reuse {
+    fn from_report(report: &DiscoveryReport) -> Self {
+        Self {
+            files: report
+                .files
+                .iter()
+                .filter(|file| file.settled.is_some())
+                .map(|file| (file.path.clone(), file.clone()))
+                .collect(),
+            sets: report
+                .par2_sets
+                .iter()
+                .filter(|set| set.loaded.is_some())
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// The earlier classification of `path`, if its stat has not changed.
+    fn file(&self, path: &Path) -> Option<DiscoveredFile> {
+        let file = self.files.get(path)?;
+        let settled = file.settled.as_ref()?;
+        (FileStatFingerprint::capture_path(path).as_ref() == Some(settled)).then(|| file.clone())
+    }
+
+    /// The earlier set over exactly `paths`, if no volume's stat has changed.
+    fn set(&self, paths: &[PathBuf]) -> Option<&Par2Set> {
+        self.sets.iter().find(|set| {
+            set.paths == paths
+                && set
+                    .loaded
+                    .as_ref()
+                    .is_some_and(|loaded| unchanged(paths, &loaded.fingerprints))
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -184,6 +302,28 @@ pub(crate) fn discover_reusing_par3(
     options: &DiscoveryOptions,
     cached: Option<Vec<crate::par3::Par3Set>>,
 ) -> Result<DiscoveryReport, RarparError> {
+    discover_with(paths, options, cached, &Par2Reuse::default())
+}
+
+/// Discover again after an action changed the tree. The PAR3 collection is
+/// taken from `previous`, and PAR2 volumes whose stat has not changed since
+/// `previous` read them are not read again.
+pub(crate) fn rediscover(
+    paths: Vec<PathBuf>,
+    options: &DiscoveryOptions,
+    previous: &mut DiscoveryReport,
+) -> Result<DiscoveryReport, RarparError> {
+    let reuse = Par2Reuse::from_report(previous);
+    let par3_sets = std::mem::take(&mut previous.par3_sets);
+    discover_with(paths, options, Some(par3_sets), &reuse)
+}
+
+fn discover_with(
+    paths: Vec<PathBuf>,
+    options: &DiscoveryOptions,
+    cached: Option<Vec<crate::par3::Par3Set>>,
+    reuse: &Par2Reuse,
+) -> Result<DiscoveryReport, RarparError> {
     let roots = paths.clone();
     let mut sibling_directories = BTreeSet::new();
     let mut files = Vec::new();
@@ -193,7 +333,15 @@ pub(crate) fn discover_reusing_par3(
         if !path.exists() {
             return Err(RarparError::MissingInput(path));
         }
-        collect_path(&path, options, 0, &mut scan_count, &mut files, &mut visited)?;
+        collect_path(
+            &path,
+            options,
+            0,
+            &mut scan_count,
+            &mut files,
+            &mut visited,
+            reuse,
+        )?;
         if path.is_file() && crate::par3::is_carrier_candidate(&path) {
             let directory = path
                 .parent()
@@ -215,6 +363,7 @@ pub(crate) fn discover_reusing_par3(
                         &mut scan_count,
                         &mut files,
                         &mut visited,
+                        reuse,
                     )?;
                 }
             }
@@ -251,7 +400,7 @@ pub(crate) fn discover_reusing_par3(
                 .push("no authenticated PAR3 packets found".into());
         }
     }
-    let par2_sets = build_par2_sets(&files);
+    let par2_sets = build_par2_sets(&files, reuse);
     let rar_sets = build_rar_sets(&files);
     let sets = summarize_sets(&rar_sets, &par2_sets);
     let mut planned_actions: Vec<_> = par3_sets.iter().filter(|set| selected_par3_set(set, &roots)).map(|set| PlannedAction { set_id: set.id.clone(), action: "par3_verify_repair".into(), reason: "verify protected data and repair with authenticated PAR3 recovery before extraction".into() }).collect();
@@ -361,8 +510,7 @@ fn discover_named_rar_family(
 
         let path = entry.path();
         let is_archive = archive_identity.is(&path);
-        let is_family_candidate = set_hint(&path).as_deref() == Some(label)
-            && (looks_rarish_by_name(&path) || is_ext(&path, "rev"));
+        let is_family_candidate = in_named_family(&path, label);
         if !is_archive && !is_family_candidate {
             continue;
         }
@@ -376,10 +524,76 @@ fn discover_named_rar_family(
         if is_archive {
             files.push(archive_file.clone());
         } else {
-            files.push(classify_path(&path));
+            // Under the archive's spelling of the label, so a volume whose
+            // name spells it in another case groups into the archive's set.
+            let mut file = classify_path(&path);
+            file.set_hint = Some(label.to_owned());
+            files.push(file);
         }
     }
     Ok(files)
+}
+
+/// Whether `path` names a volume of the family labelled `label`: a RAR
+/// volume or `.rev` recovery volume by name whose label is `label` as the
+/// filesystem holding it compares names. A label spelled in another case
+/// joins when the name respelled with `label` opens the same file, so on a
+/// volume that ignores case (macOS and Windows by default) `set.part2.rar`
+/// is a volume of the family `SET.part1.rar` names, and on one that does not
+/// `SET.*` and `set.*` stay two families.
+fn in_named_family(path: &Path, label: &str) -> bool {
+    in_named_family_with(path, label, same_file_on_disk)
+}
+
+/// [`in_named_family`] with `same_file` deciding whether two names open one
+/// file, so tests can stand in for either kind of filesystem.
+fn in_named_family_with(
+    path: &Path,
+    label: &str,
+    same_file: impl Fn(&Path, &Path) -> bool,
+) -> bool {
+    if !(looks_rarish_by_name(path) || is_ext(path, "rev")) {
+        return false;
+    }
+    let Some(hint) = set_hint(path) else {
+        return false;
+    };
+    if hint == label {
+        return true;
+    }
+    if fold_case(&hint) != fold_case(label) {
+        return false;
+    }
+    // The hint is a prefix of the file name, so the respelling keeps the
+    // rest of the name exactly.
+    let Some(rest) = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .and_then(|name| name.get(hint.len()..))
+    else {
+        return false;
+    };
+    same_file(path, &path.with_file_name(format!("{label}{rest}")))
+}
+
+/// Whether both names exist and open one file: the same device and inode on
+/// Unix, the same final path elsewhere (which on Windows reports the name as
+/// stored, whatever case it was opened in).
+#[cfg(unix)]
+fn same_file_on_disk(left: &Path, right: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(left), std::fs::metadata(right)) {
+        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_file_on_disk(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 /// [`Path::canonicalize`], counted per thread under test so RAR set
@@ -497,6 +711,7 @@ fn collect_path(
     scan_count: &mut usize,
     files: &mut Vec<DiscoveredFile>,
     visited: &mut BTreeSet<PathBuf>,
+    reuse: &Par2Reuse,
 ) -> Result<(), RarparError> {
     if !visited.insert(path.canonicalize()?) {
         return Ok(());
@@ -511,7 +726,7 @@ fn collect_path(
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.is_file() {
         *scan_count += 1;
-        files.push(classify_path(path));
+        files.push(reuse.file(path).unwrap_or_else(|| classify_path(path)));
         return Ok(());
     }
 
@@ -545,9 +760,21 @@ fn collect_path(
                     options.max_files
                 )));
             }
-            files.push(classify_path(&entry_path));
+            files.push(
+                reuse
+                    .file(&entry_path)
+                    .unwrap_or_else(|| classify_path(&entry_path)),
+            );
         } else if options.recursive && file_type.is_dir() {
-            collect_path(&entry_path, options, depth + 1, scan_count, files, visited)?;
+            collect_path(
+                &entry_path,
+                options,
+                depth + 1,
+                scan_count,
+                files,
+                visited,
+                reuse,
+            )?;
         }
     }
     Ok(())
@@ -563,11 +790,14 @@ fn classify_path(path: &Path) -> DiscoveredFile {
             kind: DiscoveredKind::Par3,
             set_hint: set_hint(path),
             diagnostics,
+            settled: None,
         };
     }
 
     if looks_like_par2(path, &prefix) {
-        match par2_rs::scan_packets_from_path_with_set_ids(path) {
+        let (scanned, settled) =
+            settled_scan(path, || par2_rs::scan_packets_from_path_with_set_ids(path));
+        match scanned {
             Ok(packets) if !packets.is_empty() => {
                 let set_id = packets
                     .first()
@@ -580,6 +810,7 @@ fn classify_path(path: &Path) -> DiscoveredFile {
                     }),
                     set_hint: set_hint(path),
                     diagnostics,
+                    settled,
                 };
             }
             Ok(_) if is_ext(path, "par2") => {
@@ -592,6 +823,7 @@ fn classify_path(path: &Path) -> DiscoveredFile {
                     }),
                     set_hint: set_hint(path),
                     diagnostics,
+                    settled: None,
                 };
             }
             Ok(_) => {}
@@ -605,6 +837,7 @@ fn classify_path(path: &Path) -> DiscoveredFile {
                     }),
                     set_hint: set_hint(path),
                     diagnostics,
+                    settled: None,
                 };
             }
             Err(_) => {}
@@ -617,6 +850,7 @@ fn classify_path(path: &Path) -> DiscoveredFile {
             kind: DiscoveredKind::RarRecoveryVolume,
             set_hint: set_hint(path),
             diagnostics,
+            settled: None,
         };
     }
 
@@ -646,6 +880,7 @@ fn classify_path(path: &Path) -> DiscoveredFile {
                     }),
                     set_hint: set_hint(path),
                     diagnostics,
+                    settled: None,
                 };
             }
             Err(error) if looks_rarish_by_name(path) => {
@@ -660,10 +895,11 @@ fn classify_path(path: &Path) -> DiscoveredFile {
         kind: DiscoveredKind::Other,
         set_hint: None,
         diagnostics,
+        settled: None,
     }
 }
 
-fn build_par2_sets(files: &[DiscoveredFile]) -> Vec<Par2Set> {
+fn build_par2_sets(files: &[DiscoveredFile], reuse: &Par2Reuse) -> Vec<Par2Set> {
     let mut groups: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
     for file in files {
         let DiscoveredKind::Par2(info) = &file.kind else {
@@ -682,8 +918,19 @@ fn build_par2_sets(files: &[DiscoveredFile]) -> Vec<Par2Set> {
             paths.sort();
             paths.dedup();
             let base_dir = common_base_dir(&paths);
-            let protected_files = par2_rs::Par2FileSet::from_paths(&paths)
-                .ok()
+            if let Some(previous) = reuse.set(&paths) {
+                return Par2Set {
+                    id,
+                    base_dir,
+                    paths,
+                    protected_files: previous.protected_files.clone(),
+                    loaded: previous.loaded.clone(),
+                };
+            }
+            let (set, settled) =
+                settled_scan_all(&paths, || par2_rs::Par2FileSet::from_paths(&paths).ok());
+            let protected_files = set
+                .as_ref()
                 .map(|set| {
                     set.files
                         .values()
@@ -691,11 +938,15 @@ fn build_par2_sets(files: &[DiscoveredFile]) -> Vec<Par2Set> {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
+            let loaded = set
+                .zip(settled)
+                .map(|(set, fingerprints)| Arc::new(LoadedPar2Set { set, fingerprints }));
             Par2Set {
                 id,
                 base_dir,
                 paths,
                 protected_files,
+                loaded,
             }
         })
         .collect()
@@ -1191,6 +1442,73 @@ mod tests {
         }
     }
 
+    /// A volume joins the family the caller named when its label is the
+    /// caller's exactly, or in another case when the filesystem opens the
+    /// respelled name as the same file: `rar list SET.part1.rar` reaches
+    /// `set.part2.rar` where names ignore case, and where they do not, a
+    /// `set.*` family stays apart from `SET.*`. The probe stands in for
+    /// both kinds of filesystem.
+    #[test]
+    fn a_named_family_compares_labels_as_the_filesystem_compares_names() {
+        let probed = std::cell::RefCell::new(Vec::new());
+        for folds in [true, false] {
+            let probe = |left: &Path, right: &Path| {
+                probed
+                    .borrow_mut()
+                    .push((left.to_path_buf(), right.to_path_buf()));
+                folds
+            };
+            for (name, label, member) in [
+                ("set.part2.rar", "set", true),
+                ("set.part2.rar", "SET", folds),
+                ("Set.R00", "sET", folds),
+                ("SET.part1.rev", "set", folds),
+                ("\u{e9}t\u{e9}.part2.rar", "\u{c9}T\u{c9}", folds),
+                ("sets.part2.rar", "set", false),
+                ("set.par2", "set", false),
+            ] {
+                let path = Path::new("dir").join(name);
+                assert_eq!(
+                    in_named_family_with(&path, label, probe),
+                    member,
+                    "{name} in {label}, folding {folds}"
+                );
+            }
+        }
+        // Only a name differing from the label by case is probed, under the
+        // label's spelling.
+        let probed = probed.into_inner();
+        assert_eq!(probed.len(), 8);
+        assert_eq!(
+            probed[0],
+            (
+                Path::new("dir").join("set.part2.rar"),
+                Path::new("dir").join("SET.part2.rar")
+            )
+        );
+        assert_eq!(probed[1].1, Path::new("dir").join("sET.R00"));
+    }
+
+    /// The real probe on this machine's temporary directory: a sibling in
+    /// another case joins exactly when the filesystem opens its respelling
+    /// as the same file, and two files whose names differ only by case,
+    /// possible only where names keep case apart, never merge.
+    #[test]
+    fn the_family_probe_follows_the_temporary_filesystem() {
+        let temp = tempfile::tempdir().unwrap();
+        let lower = temp.path().join("set.part2.rar");
+        std::fs::write(&lower, b"lower").unwrap();
+        let upper = temp.path().join("SET.part2.rar");
+        let folds = std::fs::metadata(&upper).is_ok();
+        assert_eq!(in_named_family(&lower, "SET"), folds);
+        if !folds {
+            std::fs::write(&upper, b"upper").unwrap();
+            assert!(!in_named_family(&lower, "SET"));
+            assert!(!in_named_family(&upper, "set"));
+        }
+        assert!(!in_named_family(&temp.path().join("set.part3.rar"), "SET"));
+    }
+
     #[test]
     fn fixture_hydration_guard_separates_archives_from_lfs_pointers() {
         let temp = tempfile::tempdir().unwrap();
@@ -1309,5 +1627,140 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("rar4_tiny_volumes.part")
         }));
+    }
+
+    /// A small PAR2 set in `dir`, every file last modified `age` ago.
+    fn par2_set_aged(dir: &Path, age: Duration) -> Vec<PathBuf> {
+        let mut sources = Vec::new();
+        for (index, name) in ["ledger.a.bin", "ledger.b.bin"].into_iter().enumerate() {
+            let path = dir.join(name);
+            std::fs::write(&path, vec![0x41 + index as u8; 3_000]).unwrap();
+            sources.push(path);
+        }
+        let mut options = par2_rs::Par2CreatorOptions::with_output(
+            dir.join("ledger.par2"),
+            Some(dir.to_path_buf()),
+            sources.clone(),
+        );
+        options.block_sizing = par2_rs::BlockSizing::Bytes(512);
+        options.recovery_amount = par2_rs::RecoveryAmount::Count(4);
+        let creator = par2_rs::Par2Creator::new(options);
+        let plan = creator.plan().unwrap();
+        let outcome = creator.create(&plan).unwrap();
+        let mut volumes = vec![outcome.main_path.clone()];
+        volumes.extend(outcome.volume_paths.iter().cloned());
+        for path in sources.iter().chain(&volumes) {
+            age_file(path, age);
+        }
+        volumes.sort();
+        volumes
+    }
+
+    fn age_file(path: &Path, age: Duration) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+    }
+
+    fn flat_options() -> DiscoveryOptions {
+        DiscoveryOptions {
+            working_dir: None,
+            recursive: false,
+            max_depth: 1,
+            max_files: 100,
+            par3_memory_mib: 256,
+            par3_workers: None,
+            par3_max_lost_blocks: 4096,
+        }
+    }
+
+    /// Rediscovery after an action took every PAR2 volume through a full
+    /// packet scan twice more: once to classify it, once to load its set.
+    /// Volumes whose stat is unchanged now keep the earlier classification and
+    /// set, so a rediscovery reads none of them: here they are unreadable by
+    /// then, and it still reports the same set.
+    #[cfg(unix)]
+    #[test]
+    fn rediscovery_does_not_read_unchanged_par2_volumes_again() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let volumes = par2_set_aged(&root, Duration::from_secs(60));
+        let options = flat_options();
+        let mut first = discover(vec![root.clone()], &options).unwrap();
+        assert_eq!(first.par2_sets.len(), 1);
+        assert_eq!(first.par2_sets[0].paths, volumes);
+        let loaded = first.par2_sets[0]
+            .loaded
+            .clone()
+            .expect("a settled set is kept");
+        assert!(first.par2_sets[0].reusable_packets().is_some());
+        let classified: Vec<_> = first.files.iter().map(|file| file.kind.clone()).collect();
+
+        for volume in &volumes {
+            std::fs::set_permissions(volume, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        if std::fs::File::open(&volumes[0]).is_ok() {
+            return;
+        }
+        let second = rediscover(vec![root.clone()], &options, &mut first).unwrap();
+        for volume in &volumes {
+            std::fs::set_permissions(volume, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        assert_eq!(
+            second
+                .files
+                .iter()
+                .map(|file| file.kind.clone())
+                .collect::<Vec<_>>(),
+            classified
+        );
+        assert_eq!(second.par2_sets.len(), 1);
+        assert!(Arc::ptr_eq(
+            second.par2_sets[0].loaded.as_ref().unwrap(),
+            &loaded
+        ));
+        assert_eq!(
+            second.par2_sets[0].protected_files,
+            first.par2_sets[0].protected_files
+        );
+    }
+
+    /// A volume whose stat changed is read again, and a volume written too
+    /// recently for its stat to vouch for its bytes is never reused.
+    #[test]
+    fn rediscovery_reads_a_changed_or_fresh_par2_volume_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let volumes = par2_set_aged(&root, Duration::from_secs(60));
+        let options = flat_options();
+        let mut first = discover(vec![root.clone()], &options).unwrap();
+        let loaded = first.par2_sets[0]
+            .loaded
+            .clone()
+            .expect("a settled set is kept");
+
+        age_file(&volumes[1], Duration::from_secs(30));
+        assert!(first.par2_sets[0].reusable_packets().is_none());
+        let mut second = rediscover(vec![root.clone()], &options, &mut first).unwrap();
+        let reloaded = second.par2_sets[0].loaded.clone().expect("still settled");
+        assert!(!Arc::ptr_eq(&reloaded, &loaded));
+        assert!(second.par2_sets[0].reusable_packets().is_some());
+
+        age_file(&volumes[1], Duration::ZERO);
+        let third = rediscover(vec![root.clone()], &options, &mut second).unwrap();
+        assert_eq!(third.par2_sets.len(), 1);
+        assert!(third.par2_sets[0].loaded.is_none());
+        assert!(third.par2_sets[0].reusable_packets().is_none());
+        assert!(!third.par2_sets[0].protected_files.is_empty());
+        let fresh = third
+            .files
+            .iter()
+            .find(|file| file.path == volumes[1])
+            .unwrap();
+        assert!(fresh.settled.is_none());
     }
 }

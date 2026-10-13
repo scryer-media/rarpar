@@ -22,7 +22,213 @@ const MAX_RECOVERY_EXPONENT: u32 = 65_535;
 const MEMORY_FLOOR_BYTES: usize = 256 * 1024 * 1024;
 const MEMORY_32_BIT_CAP_BYTES: usize = 1024 * 1024 * 1024;
 pub(crate) fn default_memory_limit() -> usize {
-    memory_limit_for(physical_memory_bytes(), usize::BITS)
+    memory_limit_for(
+        host_memory_bytes(physical_memory_bytes(), cgroup_memory_limit_bytes()),
+        usize::BITS,
+    )
+}
+
+/// The memory this process may use: physical memory, narrowed by the
+/// cgroup limit when the process runs under one.
+fn host_memory_bytes(physical: Option<u64>, cgroup: Option<u64>) -> Option<u64> {
+    match (physical, cgroup) {
+        (Some(physical), Some(cgroup)) => Some(physical.min(cgroup)),
+        (physical, cgroup) => physical.or(cgroup),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_memory_limit_bytes() -> Option<u64> {
+    let membership = fs::read_to_string("/proc/self/cgroup").ok()?;
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo").ok();
+    cgroup_memory_limit_from(&membership, mountinfo.as_deref(), |path| {
+        fs::read_to_string(path).ok()
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cgroup_memory_limit_bytes() -> Option<u64> {
+    None
+}
+
+/// Where a cgroup hierarchy is mounted: the directory, and the cgroup path
+/// that directory shows (`/` unless only part of the hierarchy is mounted).
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CgroupMount {
+    point: PathBuf,
+    root: String,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl CgroupMount {
+    fn fixed(point: &str) -> Self {
+        Self {
+            point: PathBuf::from(point),
+            root: "/".to_owned(),
+        }
+    }
+
+    /// `cgroup` (a path from `/proc/self/cgroup`) relative to this mount, or
+    /// `None` when the mount does not show it.
+    fn relative<'a>(&self, cgroup: &'a str) -> Option<&'a str> {
+        let root = self.root.trim_end_matches('/');
+        if root.is_empty() {
+            return Some(cgroup);
+        }
+        let rest = cgroup.strip_prefix(root)?;
+        (rest.is_empty() || rest.starts_with('/')).then_some(rest)
+    }
+}
+
+/// The cgroup v2 mount and the cgroup v1 mount carrying the memory
+/// controller, from the text of `/proc/self/mountinfo`. A v1 controller can
+/// be co-mounted with others (`/sys/fs/cgroup/cpu,memory`), and a hybrid
+/// host mounts v2 at `/sys/fs/cgroup/unified`, so neither sits at a fixed
+/// path. Each line is `id parent dev root point options [tags] - fstype
+/// source superoptions`.
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_mounts(mountinfo: &str) -> (Vec<CgroupMount>, Vec<CgroupMount>) {
+    let mut v2 = Vec::new();
+    let mut v1_memory = Vec::new();
+    for line in mountinfo.lines() {
+        let Some((head, tail)) = line.split_once(" - ") else {
+            continue;
+        };
+        let mut head = head.split(' ');
+        let (Some(root), Some(point)) = (head.nth(3), head.next()) else {
+            continue;
+        };
+        let mut tail = tail.split(' ');
+        let (Some(fstype), Some(_source), Some(options)) = (tail.next(), tail.next(), tail.next())
+        else {
+            continue;
+        };
+        let mount = CgroupMount {
+            point: PathBuf::from(unescape_mount_field(point)),
+            root: unescape_mount_field(root),
+        };
+        match fstype {
+            "cgroup2" => v2.push(mount),
+            "cgroup" if options.split(',').any(|option| option == "memory") => {
+                v1_memory.push(mount);
+            }
+            _ => {}
+        }
+    }
+    (v2, v1_memory)
+}
+
+/// mountinfo writes space, tab, newline and backslash as `\ooo` octal.
+#[cfg(any(target_os = "linux", test))]
+fn unescape_mount_field(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let octal = bytes.get(at + 1..at + 4).filter(|digits| {
+            bytes[at] == b'\\' && digits.iter().all(|digit| (b'0'..=b'7').contains(digit))
+        });
+        match octal {
+            Some(digits) => {
+                let value = digits
+                    .iter()
+                    .fold(0u32, |value, digit| value * 8 + u32::from(digit - b'0'));
+                out.push(value as u8);
+                at += 4;
+            }
+            None => {
+                out.push(bytes[at]);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The tightest memory limit on the cgroup named in `membership` (the text of
+/// `/proc/self/cgroup`) or any of its ancestors. cgroup v2 limits come from
+/// `memory.max` under the `cgroup2` mount, v1 limits from
+/// `memory.limit_in_bytes` under the `cgroup` mount whose super options name
+/// the memory controller, both found in `mountinfo` (the text of
+/// `/proc/self/mountinfo`). Without mountinfo the conventional
+/// `/sys/fs/cgroup` and `/sys/fs/cgroup/memory` are tried. When the named
+/// directory is not visible (a container whose cgroup namespace shows the
+/// host path), the mount's own file is used. `read` returns a file's text,
+/// so tests supply values without touching the host's cgroups.
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_memory_limit_from(
+    membership: &str,
+    mountinfo: Option<&str>,
+    read: impl Fn(&Path) -> Option<String>,
+) -> Option<u64> {
+    let (v2, v1_memory) = match mountinfo {
+        Some(text) => cgroup_mounts(text),
+        None => (
+            vec![CgroupMount::fixed("/sys/fs/cgroup")],
+            vec![CgroupMount::fixed("/sys/fs/cgroup/memory")],
+        ),
+    };
+    let mut tightest: Option<u64> = None;
+    for line in membership.lines() {
+        let mut fields = line.splitn(3, ':');
+        let (Some(_), Some(controllers), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let (mounts, file) = if controllers.is_empty() {
+            (&v2, "memory.max")
+        } else if controllers.split(',').any(|name| name == "memory") {
+            (&v1_memory, "memory.limit_in_bytes")
+        } else {
+            continue;
+        };
+        // Prefer a mount that shows this cgroup; otherwise the first one,
+        // read at its own root.
+        let Some((mount, relative)) = mounts
+            .iter()
+            .find_map(|mount| mount.relative(path).map(|relative| (mount, relative)))
+            .or_else(|| mounts.first().map(|mount| (mount, path)))
+        else {
+            continue;
+        };
+        let limit = cgroup_limit_along(&mount.point, relative, file, &read);
+        tightest = match (tightest, limit) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+    }
+    tightest
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_limit_along(
+    root: &Path,
+    cgroup: &str,
+    file: &str,
+    read: &impl Fn(&Path) -> Option<String>,
+) -> Option<u64> {
+    let mut tightest: Option<u64> = None;
+    let mut found = false;
+    let mut dir = PathBuf::from(cgroup.trim_start_matches('/'));
+    loop {
+        if let Some(text) = read(&root.join(&dir).join(file)) {
+            found = true;
+            // `max` (v2) is no limit; v1 reports "no limit" as a huge number,
+            // which the physical-memory minimum absorbs.
+            if let Ok(bytes) = text.trim().parse::<u64>() {
+                tightest = Some(tightest.map_or(bytes, |current| current.min(bytes)));
+            }
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    if !found {
+        return read(&root.join(file)).and_then(|text| text.trim().parse::<u64>().ok());
+    }
+    tightest
 }
 
 fn memory_limit_for(physical_memory: Option<u64>, address_bits: u32) -> usize {
@@ -503,7 +709,6 @@ fn estimate_source_metadata_bytes(sources: &[CreationSource], capacity: usize) -
 }
 
 fn estimate_source_hash_workspace(input_count: usize, block_size: u64) -> Result<usize> {
-    const READ_BUFFER_BYTES: usize = 256 * 1024;
     const HASH_SET_ENTRY_RESERVE_BYTES: usize = 128;
     let input_lengths = checked_memory_mul(
         input_count,
@@ -519,36 +724,20 @@ fn estimate_source_hash_workspace(input_count: usize, block_size: u64) -> Result
         2,
         "source index estimate overflows",
     )?;
-    // Source hashing runs one file per rayon task, each with its own read
-    // buffer; the gate mirrors the parallel scan's split in source.rs and
-    // the +1 covers the calling thread. Process-stable thread count only.
-    let threads = super::encode::configured_create_threads();
-    let concurrent_reads = if threads == 1 || input_count <= 1 {
-        1
-    } else {
-        input_count.min(threads.saturating_add(1))
-    };
-    // A task either stages a batch of slices for the multi-buffer slice-hash
-    // kernel or streams one slice through a single read buffer, whichever
-    // `create_md5_batch_lanes` selected for this block size. Mirrors the split
-    // in `source.rs` exactly; the two must move together or the plan's
+    // Source hashing runs one file per task, each with its own read window,
+    // and every parallel hashing pass in source.rs holds at most
+    // `concurrent_hash_reads` of them in flight: the configured create width,
+    // never more than there are files. Process-stable thread count only.
+    let concurrent_reads = super::source::concurrent_hash_reads(input_count);
+    // A task stages one read window: whole slices for the multi-buffer
+    // slice-hash kernel, or one chunk of a slice for the streaming scan,
+    // whichever `create_md5_batch_lanes` selected for this block size. The
+    // same window serves the first-band sweep of a multi-pass transform, which
+    // runs inside the create phase below. Mirrors `source.rs` exactly through
+    // `create_hash_window_bytes`; the two must move together or the plan's
     // self-consistency check in `Par2CreatePlan` fails.
-    // `READ_BUFFER_BYTES` stays a floor rather than the exact figure: the
-    // streaming arm allocates only `min(READ_BUFFER_BYTES, block_size)`, so
-    // this estimate has always been an upper bound for small blocks, and
-    // tightening it here would move a reported number for no benefit.
     let block_size_usize = usize::try_from(block_size).unwrap_or(usize::MAX);
-    let lanes = super::source::create_md5_batch_lanes(block_size_usize);
-    let per_task_bytes = if lanes >= 2 {
-        checked_memory_mul(
-            lanes,
-            block_size_usize,
-            "source hash batch estimate overflows",
-        )?
-        .max(READ_BUFFER_BYTES)
-    } else {
-        READ_BUFFER_BYTES
-    };
+    let per_task_bytes = super::source::create_hash_window_bytes(block_size_usize);
     let read_buffers = checked_memory_mul(
         per_task_bytes,
         concurrent_reads,
@@ -1048,6 +1237,210 @@ mod tests {
         assert_eq!(
             memory_limit_for(Some(u64::MAX), 32),
             MEMORY_32_BIT_CAP_BYTES,
+        );
+    }
+
+    fn files<'a>(entries: &'a [(&'a str, &'a str)]) -> impl Fn(&Path) -> Option<String> + 'a {
+        move |path| {
+            entries
+                .iter()
+                .find(|(name, _)| Path::new(name) == path)
+                .map(|(_, text)| (*text).to_owned())
+        }
+    }
+
+    #[test]
+    fn a_cgroup_v2_limit_narrows_the_memory_default() {
+        let read = files(&[
+            (
+                "/sys/fs/cgroup/system.slice/app.service/memory.max",
+                "2147483648\n",
+            ),
+            ("/sys/fs/cgroup/system.slice/memory.max", "max\n"),
+        ]);
+        let cgroup = cgroup_memory_limit_from("0::/system.slice/app.service\n", None, read);
+        assert_eq!(cgroup, Some(2 << 30));
+        let host = host_memory_bytes(Some(64 << 30), cgroup);
+        assert_eq!(memory_limit_for(host, 64), MEMORY_FLOOR_BYTES);
+        let host = host_memory_bytes(Some(64 << 30), Some(16 << 30));
+        assert_eq!(memory_limit_for(host, 64), 2 << 30);
+    }
+
+    #[test]
+    fn a_cgroup_v2_ancestor_limit_applies_to_its_descendants() {
+        let read = files(&[
+            ("/sys/fs/cgroup/a/b/memory.max", "max"),
+            ("/sys/fs/cgroup/a/memory.max", "4294967296"),
+        ]);
+        assert_eq!(
+            cgroup_memory_limit_from("0::/a/b", None, read),
+            Some(4 << 30)
+        );
+    }
+
+    #[test]
+    fn an_unlimited_cgroup_leaves_physical_memory_in_charge() {
+        let read = files(&[("/sys/fs/cgroup/memory.max", "max\n")]);
+        assert_eq!(cgroup_memory_limit_from("0::/\n", None, read), None);
+        assert_eq!(host_memory_bytes(Some(32 << 30), None), Some(32 << 30));
+        assert_eq!(host_memory_bytes(None, None), None);
+        assert_eq!(host_memory_bytes(None, Some(1 << 30)), Some(1 << 30));
+    }
+
+    #[test]
+    fn a_cgroup_v1_memory_controller_limit_is_read() {
+        let membership = "12:cpu,cpuacct:/docker/abc\n4:memory:/docker/abc\n";
+        let read = files(&[(
+            "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes",
+            "1073741824\n",
+        )]);
+        assert_eq!(
+            cgroup_memory_limit_from(membership, None, read),
+            Some(1 << 30)
+        );
+    }
+
+    #[test]
+    fn a_namespaced_cgroup_path_falls_back_to_the_mount_root() {
+        let read = files(&[("/sys/fs/cgroup/memory/memory.limit_in_bytes", "536870912")]);
+        assert_eq!(
+            cgroup_memory_limit_from("4:memory:/docker/abc", None, &read),
+            Some(512 << 20)
+        );
+        let read = files(&[("/sys/fs/cgroup/memory.max", "805306368")]);
+        assert_eq!(
+            cgroup_memory_limit_from("0::/kubepods/pod1/ctr", None, read),
+            Some(768 << 20)
+        );
+    }
+
+    #[test]
+    fn a_v1_unlimited_sentinel_does_not_raise_the_default() {
+        let read = files(&[(
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+            "9223372036854771712",
+        )]);
+        let cgroup = cgroup_memory_limit_from("4:memory:/", None, read);
+        let host = host_memory_bytes(Some(8 << 30), cgroup);
+        assert_eq!(memory_limit_for(host, 64), 1 << 30);
+    }
+
+    const V2_ONLY_MOUNTINFO: &str = "\
+22 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw
+24 22 0:22 / /sys rw,nosuid,nodev,noexec,relatime shared:2 - sysfs sysfs rw
+30 24 0:26 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:4 - cgroup2 cgroup2 rw,nsdelegate,memory_recursiveprot
+";
+
+    #[test]
+    fn mountinfo_locates_a_cgroup_v2_only_hierarchy() {
+        let (v2, v1_memory) = cgroup_mounts(V2_ONLY_MOUNTINFO);
+        assert_eq!(v2, vec![CgroupMount::fixed("/sys/fs/cgroup")]);
+        assert!(v1_memory.is_empty());
+        let read = files(&[
+            ("/sys/fs/cgroup/user.slice/app.scope/memory.max", "max\n"),
+            ("/sys/fs/cgroup/user.slice/memory.max", "3221225472\n"),
+        ]);
+        assert_eq!(
+            cgroup_memory_limit_from("0::/user.slice/app.scope\n", Some(V2_ONLY_MOUNTINFO), read),
+            Some(3 << 30)
+        );
+    }
+
+    #[test]
+    fn mountinfo_locates_a_v1_memory_controller_co_mounted_with_cpu() {
+        let mountinfo = "\
+24 22 0:22 / /sys rw,nosuid,nodev,noexec,relatime shared:2 - sysfs sysfs rw
+25 24 0:23 / /sys/fs/cgroup ro,nosuid,nodev,noexec shared:3 - tmpfs tmpfs ro,mode=755
+31 25 0:27 / /sys/fs/cgroup/cpu,memory rw,nosuid,nodev,noexec,relatime shared:5 - cgroup cgroup rw,cpu,memory
+32 25 0:28 / /sys/fs/cgroup/blkio rw,nosuid,nodev,noexec,relatime shared:6 - cgroup cgroup rw,blkio
+";
+        let (v2, v1_memory) = cgroup_mounts(mountinfo);
+        assert!(v2.is_empty());
+        assert_eq!(
+            v1_memory,
+            vec![CgroupMount::fixed("/sys/fs/cgroup/cpu,memory")]
+        );
+        let membership = "5:blkio:/docker/abc\n4:cpu,memory:/docker/abc\n";
+        let read = files(&[
+            (
+                "/sys/fs/cgroup/cpu,memory/docker/abc/memory.limit_in_bytes",
+                "1073741824\n",
+            ),
+            // The conventional path is not where this host mounts the controller.
+            (
+                "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes",
+                "4096\n",
+            ),
+        ]);
+        assert_eq!(
+            cgroup_memory_limit_from(membership, Some(mountinfo), read),
+            Some(1 << 30)
+        );
+    }
+
+    #[test]
+    fn mountinfo_locates_both_hierarchies_on_a_hybrid_host() {
+        let mountinfo = "\
+25 24 0:23 / /sys/fs/cgroup ro,nosuid,nodev,noexec shared:3 - tmpfs tmpfs ro,mode=755
+26 25 0:24 / /sys/fs/cgroup/unified rw,nosuid,nodev,noexec,relatime shared:4 - cgroup2 cgroup2 rw,nsdelegate
+33 25 0:29 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime shared:7 - cgroup cgroup rw,memory
+";
+        let (v2, v1_memory) = cgroup_mounts(mountinfo);
+        assert_eq!(v2, vec![CgroupMount::fixed("/sys/fs/cgroup/unified")]);
+        assert_eq!(v1_memory, vec![CgroupMount::fixed("/sys/fs/cgroup/memory")]);
+        let membership = "0::/system.slice/app.service\n7:memory:/system.slice/app.service\n";
+        let read = files(&[
+            (
+                "/sys/fs/cgroup/unified/system.slice/app.service/memory.max",
+                "1073741824\n",
+            ),
+            (
+                "/sys/fs/cgroup/memory/system.slice/app.service/memory.limit_in_bytes",
+                "2147483648\n",
+            ),
+        ]);
+        assert_eq!(
+            cgroup_memory_limit_from(membership, Some(mountinfo), &read),
+            Some(1 << 30)
+        );
+        // A v2 hierarchy without the memory controller leaves the v1 limit.
+        let read = files(&[(
+            "/sys/fs/cgroup/memory/system.slice/app.service/memory.limit_in_bytes",
+            "2147483648\n",
+        )]);
+        assert_eq!(
+            cgroup_memory_limit_from(membership, Some(mountinfo), read),
+            Some(2 << 30)
+        );
+    }
+
+    #[test]
+    fn a_mount_of_part_of_the_hierarchy_is_read_relative_to_its_root() {
+        let mountinfo = "\
+40 39 0:26 /docker/abc /sys/fs/cgroup\\040x rw,nosuid shared:4 - cgroup2 cgroup2 rw
+";
+        let (v2, _) = cgroup_mounts(mountinfo);
+        assert_eq!(
+            v2,
+            vec![CgroupMount {
+                point: PathBuf::from("/sys/fs/cgroup x"),
+                root: "/docker/abc".to_owned(),
+            }]
+        );
+        let read = files(&[("/sys/fs/cgroup x/inner/memory.max", "536870912")]);
+        assert_eq!(
+            cgroup_memory_limit_from("0::/docker/abc/inner", Some(mountinfo), read),
+            Some(512 << 20)
+        );
+        // No cgroup mount at all: nothing to read, even at the usual paths.
+        let read = files(&[("/sys/fs/cgroup/memory.max", "4096")]);
+        assert_eq!(
+            cgroup_memory_limit_from(
+                "0::/",
+                Some("24 22 0:22 / /sys rw - sysfs sysfs rw\n"),
+                read
+            ),
+            None
         );
     }
 

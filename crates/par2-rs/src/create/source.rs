@@ -1,10 +1,8 @@
 use std::collections::HashSet;
 use std::fs::{self, File, Metadata};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-
-use rayon::prelude::*;
 
 use crate::checksum::{self, FileHashState, Md5State, SliceChecksumState};
 use crate::error::{Par2Error, Result};
@@ -18,7 +16,6 @@ use crate::types::{
 use super::encode::{ForwardSourceObserver, ForwardSourceProvider};
 
 const FIRST_HASH_BYTES: u64 = 16 * 1024;
-const READ_BUFFER_BYTES: usize = 256 * 1024;
 const MAX_PAR2_NAME_BYTES: usize = 100_000;
 /// Staging budget for one file's multi-buffer slice-hash batch.
 ///
@@ -27,13 +24,34 @@ const MAX_PAR2_NAME_BYTES: usize = 100_000;
 /// this exact number, so the two must move together.
 pub(crate) const CREATE_MD5_BATCH_MEMORY_BYTES: usize = 4 * 1024 * 1024;
 
+/// Smallest positional read a sequential source-hashing sweep issues while
+/// whole slices remain, so a sweep over many small slices is a few large reads
+/// rather than one read per slice.
+pub(crate) const CREATE_READ_WINDOW_BYTES: usize = 1024 * 1024;
+
+/// Bytes one sequential source-hashing task stages per read: whole slices, at
+/// least one multi-buffer lane batch and at least [`CREATE_READ_WINDOW_BYTES`]
+/// when the block allows lanes; one `CREATE_READ_WINDOW_BYTES` chunk (or one
+/// block, when smaller) for the streaming scan. `plan.rs` accounts this exact
+/// number per hashing task.
+pub(crate) fn create_hash_window_bytes(block_size: usize) -> usize {
+    if block_size == 0 {
+        return CREATE_READ_WINDOW_BYTES;
+    }
+    if create_md5_batch_lanes(block_size) >= 2 {
+        (CREATE_READ_WINDOW_BYTES / block_size).max(create_md5_batch_lanes(block_size)) * block_size
+    } else {
+        block_size.min(CREATE_READ_WINDOW_BYTES)
+    }
+}
+
 /// How many consecutive slices of one file to hash per multi-buffer MD5 call.
 ///
 /// Consecutive slices are independent messages, so they lane directly. The
 /// width is the narrower of what the kernel offers ([`md5_simd::max_lanes`]:
 /// 8 on AVX2, 4 on NEON/SSE2/simd128, 1 scalar) and what the staging budget
 /// affords. A block size large enough to leave only one lane falls back to the
-/// streaming scan, which needs just one `READ_BUFFER_BYTES` chunk.
+/// streaming scan, which needs just one [`create_hash_window_bytes`] chunk.
 pub(crate) fn create_md5_batch_lanes(block_size: usize) -> usize {
     if block_size == 0 {
         return 1;
@@ -314,21 +332,16 @@ pub(crate) fn collect_sources(
     // other guards; `wasm32-wasip1-threads` probes `true` and hashes in
     // parallel like native)
     // and the WEAVER_PAR2_CREATE_THREADS=1 pre-banding escape hatch.
-    let scan_parallel = reedsolomon_rs::threading::parallel_enabled()
-        && active_inputs.len() > 1
-        && super::encode::configured_create_threads() != 1;
-    let scanned: Vec<CreationSource> = if scan_parallel {
+    let width = concurrent_hash_reads(active_inputs.len());
+    let scanned: Vec<CreationSource> = if reedsolomon_rs::threading::parallel_enabled() && width > 1
+    {
         // Collect every per-file Result, then surface the FIRST error by
         // input order: rayon's Result collection reports an arbitrary
         // racer's error, which would let a concurrent I/O error mask
         // `Cancelled` (or make the reported path vary run to run). The
         // deliberate cost is losing error short-circuiting — in-flight
         // files hash to completion before the error surfaces.
-        active_inputs
-            .par_iter()
-            .enumerate()
-            .map(hash_one)
-            .collect::<Vec<Result<_>>>()
+        map_bounded(active_inputs.iter().enumerate().collect(), width, hash_one)
             .into_iter()
             .collect::<Result<Vec<_>>>()?
     } else {
@@ -444,7 +457,7 @@ fn validate_main_file_count(file_count: usize) -> Result<()> {
     Ok(())
 }
 
-/// Seek/read source slices for one forward-encoding pass.
+/// Positional reads of source slices for one forward-encoding pass.
 pub(crate) struct DiskSourceProvider<'a> {
     sources: &'a [CreationSource],
     files: Vec<File>,
@@ -452,6 +465,11 @@ pub(crate) struct DiskSourceProvider<'a> {
     slice_starts: Vec<usize>,
     slice_size: usize,
     cancellation: &'a CancellationToken,
+    /// Whether the first transform band should come from a sequential
+    /// hashing sweep of every file; see [`Self::hash_during_first_band`].
+    hash_first_band: bool,
+    /// What that sweep produced, once it has run.
+    content_hashes: Option<FusedSourceHashes>,
 }
 
 impl<'a> DiskSourceProvider<'a> {
@@ -496,7 +514,116 @@ impl<'a> DiskSourceProvider<'a> {
             slice_starts,
             slice_size,
             cancellation,
+            hash_first_band: false,
+            content_hashes: None,
         })
+    }
+
+    /// Serve the first band of a multi-pass transform from one sequential,
+    /// file-order read of every source that also produces the deferred content
+    /// hashes, instead of a strided band read followed by a separate hashing
+    /// read of every file.
+    ///
+    /// A multi-pass feed cannot drive the whole-file MD5 itself: that digest
+    /// is one serial message over a file's bytes in file order, and the
+    /// passes deliver each slice in `passes` pieces. So the bytes are read in
+    /// file order once regardless; this makes that read also the first pass's
+    /// source feed, so the strided reads cover the remaining passes only. The
+    /// sweep keeps the hashing fallback's own per-task staging (see
+    /// [`create_hash_window_bytes`]) and its per-file parallel split.
+    pub(crate) fn hash_during_first_band(&mut self) {
+        self.hash_first_band = true;
+    }
+
+    /// The content hashes the first-band sweep produced, when it ran.
+    pub(crate) fn take_content_hashes(&mut self) -> Option<FusedSourceHashes> {
+        self.content_hashes.take()
+    }
+
+    fn sweep_first_band(
+        &mut self,
+        arena: &mut [u8],
+        band_lens: &mut [usize],
+        band: usize,
+        band_len: usize,
+    ) -> Result<()> {
+        #[cfg(test)]
+        test_probe::record_sweep();
+        let sources = self.sources;
+        let files = &self.files;
+        let cancellation = self.cancellation;
+        let block_size = self.slice_size;
+        let mut tasks = Vec::with_capacity(sources.len());
+        let mut arena_rest = arena;
+        let mut lens_rest = band_lens;
+        for (file_index, source) in sources.iter().enumerate() {
+            let count = source.slice_checksums.len();
+            let slot_bytes = count
+                .checked_mul(band)
+                .filter(|&bytes| bytes <= arena_rest.len() && count <= lens_rest.len())
+                .ok_or_else(|| Par2Error::ResourceLimitExceeded {
+                    reason: "transform band does not cover the source set".to_string(),
+                })?;
+            let (slots, rest) = std::mem::take(&mut arena_rest).split_at_mut(slot_bytes);
+            arena_rest = rest;
+            let (lens, rest) = std::mem::take(&mut lens_rest).split_at_mut(count);
+            lens_rest = rest;
+            tasks.push((file_index, slots, lens));
+        }
+        let sweep_one = |(file_index, slots, lens): (usize, &mut [u8], &mut [usize])| {
+            let source = &sources[file_index];
+            let mut remaining = source.file_length;
+            for len in lens.iter_mut() {
+                let slice = remaining.min(block_size as u64);
+                remaining -= slice;
+                *len = (slice as usize).min(band_len);
+            }
+            let hashes = hash_source_contents(
+                &files[file_index],
+                &source.path,
+                source.file_length,
+                block_size as u64,
+                lens.len(),
+                cancellation,
+                |slice, at, bytes| {
+                    if at < band_len {
+                        let take = bytes.len().min(band_len - at);
+                        let start = slice * band + at;
+                        slots[start..start + take].copy_from_slice(&bytes[..take]);
+                    }
+                },
+            )?;
+            for (slot, &len) in slots.chunks_mut(band).zip(lens.iter()) {
+                slot[len..].fill(0);
+            }
+            if hashes.hash_16k != source.hash_16k {
+                return Err(Par2Error::CreationSourceChanged {
+                    path: source.path.display().to_string(),
+                });
+            }
+            Ok(hashes)
+        };
+        // Same split, and the same first-error-by-input-order rule, as
+        // `hydrate_source_hashes`.
+        let width = concurrent_hash_reads(sources.len());
+        let results: Vec<Result<SourceContentHashes>> =
+            if reedsolomon_rs::threading::parallel_enabled() && width > 1 {
+                map_bounded(tasks, width, sweep_one)
+            } else {
+                tasks.into_iter().map(sweep_one).collect()
+            };
+        let mut hash_full = Vec::with_capacity(sources.len());
+        let mut slice_checksums = Vec::with_capacity(sources.len());
+        for result in results {
+            let hashes = result?;
+            hash_full.push(hashes.hash_full);
+            slice_checksums.push(hashes.slice_checksums);
+        }
+        self.content_hashes = Some(FusedSourceHashes {
+            hash_full,
+            slice_checksums,
+        });
+        Ok(())
     }
 
     pub(crate) fn verify_unchanged(&self) -> Result<()> {
@@ -581,21 +708,30 @@ impl ForwardSourceProvider for DiskSourceProvider<'_> {
             .ok_or_else(|| Par2Error::ResourceLimitExceeded {
                 reason: "source read offset overflows".to_string(),
             })?;
-        self.files[file_index]
-            .seek(SeekFrom::Start(slice_offset))
-            .map_err(Par2Error::Io)?;
-        self.files[file_index]
-            .read_exact(&mut destination[..take])
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::UnexpectedEof {
-                    Par2Error::CreationSourceChanged {
-                        path: self.sources[file_index].path.display().to_string(),
-                    }
-                } else {
-                    Par2Error::Io(error)
-                }
-            })?;
+        read_exact_at_or_changed(
+            &self.files[file_index],
+            &mut destination[..take],
+            slice_offset,
+            &self.sources[file_index].path,
+        )?;
         Ok(take)
+    }
+
+    fn fill_band(
+        &mut self,
+        arena: &mut [u8],
+        band_lens: &mut [usize],
+        band: usize,
+        offset: usize,
+        band_len: usize,
+    ) -> Result<()> {
+        if offset == 0 && self.hash_first_band && self.content_hashes.is_none() {
+            if self.cancellation.is_cancelled() {
+                return Err(Par2Error::Cancelled);
+            }
+            return self.sweep_first_band(arena, band_lens, band, band_len);
+        }
+        super::encode::fill_band_by_chunks(self, arena, band_lens, band, offset, band_len)
     }
 }
 
@@ -680,7 +816,7 @@ fn resolve_source_identity(
         return Ok(source);
     }
 
-    let mut file = File::open(&path).map_err(Par2Error::Io)?;
+    let file = File::open(&path).map_err(Par2Error::Io)?;
     let slice_count = if fingerprint.length == 0 {
         0
     } else {
@@ -712,7 +848,7 @@ fn resolve_source_identity(
         }
     })?;
     let mut head = vec![0u8; head_len];
-    read_exact_or_changed(&mut file, &mut head, input)?;
+    read_exact_at_or_changed(&file, &mut head, 0, input)?;
     let mut first_hash = Md5State::new();
     first_hash.update(&head);
     drop(head);
@@ -834,25 +970,33 @@ pub(crate) struct SourceContentHashes {
     pub(crate) slice_checksums: Vec<SliceChecksum>,
 }
 
-/// Read one source file end to end and produce its content hashes.
+/// Read one source file end to end, in file order, and produce its content
+/// hashes, handing every byte range read to `on_bytes(slice, offset_in_slice,
+/// bytes)` as it goes.
 ///
-/// This is the fallback: it runs only when the encoder's feed cannot serve the
-/// hashes (a non-CPU backend, a pass with no recovery blocks, or a stripe
-/// schedule that visits a file's bytes out of file order). The fast path is
-/// [`FusedSourceHasher`], which sees the same bytes for free.
+/// Two callers: [`hydrate_source_hashes`], the fallback for a feed that cannot
+/// serve the hashes at all (a non-CPU backend, a pass with no recovery blocks,
+/// or a dense stripe schedule that visits a file's bytes out of file order),
+/// and the first pass of a multi-pass transform, where [`DiskSourceProvider`]
+/// uses `on_bytes` to fill the pass's band from this same read. The
+/// single-pass fast path is [`FusedSourceHasher`], which sees the encoder's
+/// bytes for free.
 fn hash_source_contents(
-    path: &Path,
+    file: &File,
     input: &Path,
     file_length: u64,
     block_size: u64,
     slice_count: usize,
     cancellation: &CancellationToken,
+    mut on_bytes: impl FnMut(usize, usize, &[u8]),
 ) -> Result<SourceContentHashes> {
     let block_size_usize =
         usize::try_from(block_size).map_err(|_| Par2Error::ResourceLimitExceeded {
             reason: format!("source block size {block_size} exceeds addressable memory"),
         })?;
-    let mut file = File::open(path).map_err(Par2Error::Io)?;
+    // One read window is staged for the whole scan, whichever arm runs.
+    #[cfg(test)]
+    let _window = test_probe::window_staged(input);
     let mut full_hash = FileHashState::new();
     let mut first_hash = Md5State::new();
     let mut first_bytes = 0u64;
@@ -874,81 +1018,99 @@ fn hash_source_contents(
     };
 
     let lanes = create_md5_batch_lanes(block_size_usize);
+    let window_bytes = create_hash_window_bytes(block_size_usize);
     if lanes >= 2 {
-        // Batched scan. Consecutive slices are independent MD5 messages, so a
-        // batch of them goes through the multi-buffer kernel in one pass. The
-        // whole-file MD5 stays a single serial stream over the same bytes: it
-        // is a different message and cannot be laned within one file (see the
-        // module note on why it is also not laned *across* files).
-        let mut batch = vec![0u8; lanes * block_size_usize];
+        // Batched scan. One positional read fills a window of whole slices
+        // (at least `CREATE_READ_WINDOW_BYTES`, at least one lane batch), and
+        // the window is hashed one lane batch at a time: consecutive slices are
+        // independent MD5 messages, so a batch of them goes through the
+        // multi-buffer kernel in one pass. The whole-file MD5 stays a single
+        // serial stream over the same bytes: it is a different message and
+        // cannot be laned within one file (see the module note on why it is
+        // also not laned *across* files).
+        let window_slices = window_bytes / block_size_usize;
+        let mut window = vec![0u8; window_slices * block_size_usize];
         let mut digests = vec![[0u8; 16]; lanes];
         let mut lens = vec![0usize; lanes];
         let mut crcs = vec![0u32; lanes];
         let mut slice_index = 0usize;
+        let mut file_offset = 0u64;
 
         while slice_index < slice_count {
-            let batch_slices = lanes.min(slice_count - slice_index);
-
-            for lane in 0..batch_slices {
-                if cancellation.is_cancelled() {
-                    return Err(Par2Error::Cancelled);
-                }
-                let actual_len = slice_len(slice_index + lane)?;
-                let start = lane * block_size_usize;
-                let slice = &mut batch[start..start + actual_len];
-                read_exact_or_changed(&mut file, slice, input)?;
-                lens[lane] = actual_len;
-
-                // Both single-stream digests run here, while this slice is
-                // still in the cache the read just filled, instead of after a
-                // second whole-batch walk. Only the file's final slice can be
-                // short, so lane order within a batch is file order and the
-                // serial stream sees exactly the bytes -- and the byte order --
-                // that one `batch[..batch_bytes]` absorb produced.
-                let slice = &batch[start..start + actual_len];
-                absorb_file_stream(&mut full_hash, &mut first_hash, &mut first_bytes, slice);
-                crcs[lane] = checksum::crc32_padded(slice, block_size);
-            }
-
-            let inputs = (0..batch_slices)
-                .map(|lane| {
-                    let start = lane * block_size_usize;
-                    &batch[start..start + lens[lane]]
-                })
-                .collect::<Vec<_>>();
-            md5_simd::md5_multi_into(&inputs, Some(block_size), &mut digests[..batch_slices]);
-
-            for lane in 0..batch_slices {
-                checksums.push(SliceChecksum {
-                    crc32: crcs[lane],
-                    md5: digests[lane],
-                });
-            }
-
-            slice_index += batch_slices;
-        }
-    } else {
-        // Streaming scan: one slice at a time through a single read buffer.
-        // Selected when one block already fills the staging budget, so there
-        // is no second lane to fill anyway.
-        let mut buffer = vec![0u8; READ_BUFFER_BYTES.min(block_size_usize.max(1))];
-        for slice_index in 0..slice_count {
             if cancellation.is_cancelled() {
                 return Err(Par2Error::Cancelled);
             }
+            let window_count = window_slices.min(slice_count - slice_index);
+            let window_len = usize::try_from(
+                file_length
+                    .saturating_sub(file_offset)
+                    .min((window_count * block_size_usize) as u64),
+            )
+            .map_err(|_| Par2Error::ResourceLimitExceeded {
+                reason: "source read window exceeds addressable memory".to_string(),
+            })?;
+            read_exact_at_or_changed(file, &mut window[..window_len], file_offset, input)?;
+
+            let mut batch_first = 0usize;
+            while batch_first < window_count {
+                let batch_slices = lanes.min(window_count - batch_first);
+                for lane in 0..batch_slices {
+                    let at = batch_first + lane;
+                    let actual_len = slice_len(slice_index + at)?;
+                    let start = at * block_size_usize;
+                    // Both single-stream digests run here, while this slice
+                    // is still in the cache, instead of after a second walk.
+                    // Only the file's final slice can be short, so slice order
+                    // within a window is file order.
+                    let slice = &window[start..start + actual_len];
+                    absorb_file_stream(&mut full_hash, &mut first_hash, &mut first_bytes, slice);
+                    crcs[lane] = checksum::crc32_padded(slice, block_size);
+                    lens[lane] = actual_len;
+                    on_bytes(slice_index + at, 0, slice);
+                }
+
+                let inputs = (0..batch_slices)
+                    .map(|lane| {
+                        let start = (batch_first + lane) * block_size_usize;
+                        &window[start..start + lens[lane]]
+                    })
+                    .collect::<Vec<_>>();
+                md5_simd::md5_multi_into(&inputs, Some(block_size), &mut digests[..batch_slices]);
+
+                for lane in 0..batch_slices {
+                    checksums.push(SliceChecksum {
+                        crc32: crcs[lane],
+                        md5: digests[lane],
+                    });
+                }
+                batch_first += batch_slices;
+            }
+
+            slice_index += window_count;
+            file_offset += window_len as u64;
+        }
+    } else {
+        // Streaming scan: one slice at a time through a single read window.
+        // Selected when one block already fills the staging budget, so there
+        // is no second lane to fill anyway.
+        let mut buffer = vec![0u8; window_bytes.max(1)];
+        let mut file_offset = 0u64;
+        for slice_index in 0..slice_count {
             let actual_len = slice_len(slice_index)?;
-            let mut remaining = actual_len;
+            let mut done = 0usize;
             let mut slice_hash = SliceChecksumState::new();
-            while remaining > 0 {
+            while done < actual_len {
                 if cancellation.is_cancelled() {
                     return Err(Par2Error::Cancelled);
                 }
-                let take = remaining.min(buffer.len());
-                read_exact_or_changed(&mut file, &mut buffer[..take], input)?;
+                let take = (actual_len - done).min(buffer.len());
+                read_exact_at_or_changed(file, &mut buffer[..take], file_offset, input)?;
                 let chunk = &buffer[..take];
                 slice_hash.update(chunk);
                 absorb_file_stream(&mut full_hash, &mut first_hash, &mut first_bytes, chunk);
-                remaining -= take;
+                on_bytes(slice_index, done, chunk);
+                done += take;
+                file_offset += take as u64;
             }
             let pad_to = ((actual_len as u64) < block_size).then_some(block_size);
             let (crc32, md5) = slice_hash.finalize(pad_to);
@@ -975,28 +1137,108 @@ fn hash_source_contents(
 /// [`CreationSource`]. Every file is re-validated against the identity the
 /// plan was built on, so a file that changed between planning and creation is
 /// rejected here rather than silently written into a packet.
+/// How many per-file hashing tasks run at once, each staging one read window
+/// of [`create_hash_window_bytes`]: the configured create width, never more
+/// than there are files. The plan accounts exactly this many windows
+/// (`estimate_source_hash_workspace`), and every parallel hashing pass —
+/// the identity scan, the hydrating read and the first-band sweep — runs at
+/// most this many through [`map_bounded`].
+pub(crate) fn concurrent_hash_reads(input_count: usize) -> usize {
+    let threads = hashing_threads();
+    if threads <= 1 || input_count <= 1 {
+        1
+    } else {
+        input_count.min(threads)
+    }
+}
+
+fn hashing_threads() -> usize {
+    #[cfg(test)]
+    if let Some(width) = test_probe::width() {
+        return width;
+    }
+    super::encode::configured_create_threads()
+}
+
+/// `task` over every item, results in item order, with at most `width` items
+/// in flight. The work runs on rayon's global pool, which this neither
+/// resizes nor replaces: `width` tasks (the caller's share included) pull
+/// the next item until none is left, so a pool wider than `width` cannot
+/// stage more than `width` read windows.
+fn map_bounded<T: Send, R: Send>(
+    items: Vec<T>,
+    width: usize,
+    task: impl Fn(T) -> R + Sync,
+) -> Vec<R> {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Mutex, PoisonError};
+
+    let len = items.len();
+    let width = width.clamp(1, len.max(1));
+    let queue: Vec<Mutex<Option<T>>> = items
+        .into_iter()
+        .map(|item| Mutex::new(Some(item)))
+        .collect();
+    let results: Vec<Mutex<Option<R>>> = (0..len).map(|_| Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+    let work = || {
+        loop {
+            let at = next.fetch_add(1, Ordering::Relaxed);
+            if at >= len {
+                break;
+            }
+            let item = queue[at]
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(item) = item {
+                let produced = task(item);
+                *results[at].lock().unwrap_or_else(PoisonError::into_inner) = Some(produced);
+            }
+        }
+    };
+    rayon::scope(|scope| {
+        for _ in 1..width {
+            scope.spawn(|_| work());
+        }
+        work();
+    });
+    results
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(PoisonError::into_inner)
+                .expect("every item is taken by exactly one task")
+        })
+        .collect()
+}
+
 pub(crate) fn hydrate_source_hashes(
     sources: &mut [CreationSource],
     block_size: u64,
     cancellation: &CancellationToken,
 ) -> Result<()> {
+    #[cfg(test)]
+    test_probe::record_hydrate();
     let hash_one = |source: &mut CreationSource| -> Result<()> {
         if cancellation.is_cancelled() {
             return Err(Par2Error::Cancelled);
         }
-        let metadata = fs::metadata(&source.path).map_err(Par2Error::Io)?;
+        let file = File::open(&source.path).map_err(Par2Error::Io)?;
+        let metadata = file.metadata().map_err(Par2Error::Io)?;
         if !metadata.is_file() || metadata.len() != source.file_length {
             return Err(Par2Error::CreationSourceChanged {
                 path: source.path.display().to_string(),
             });
         }
         let hashes = hash_source_contents(
-            &source.path,
+            &file,
             &source.path,
             source.file_length,
             block_size,
             source.slice_checksums.len(),
             cancellation,
+            |_, _, _| {},
         )?;
         if hashes.hash_16k != source.hash_16k {
             return Err(Par2Error::CreationSourceChanged {
@@ -1009,14 +1251,9 @@ pub(crate) fn hydrate_source_hashes(
     };
     // Same split, and the same first-error-by-input-order rule, as the
     // identity scan above.
-    let scan_parallel = reedsolomon_rs::threading::parallel_enabled()
-        && sources.len() > 1
-        && super::encode::configured_create_threads() != 1;
-    if scan_parallel {
-        sources
-            .par_iter_mut()
-            .map(hash_one)
-            .collect::<Vec<Result<()>>>()
+    let width = concurrent_hash_reads(sources.len());
+    if reedsolomon_rs::threading::parallel_enabled() && width > 1 {
+        map_bounded(sources.iter_mut().collect(), width, hash_one)
             .into_iter()
             .collect::<Result<Vec<()>>>()?;
     } else {
@@ -1025,6 +1262,98 @@ pub(crate) fn hydrate_source_hashes(
         }
     }
     Ok(())
+}
+
+/// Counts of the two source-reading hashing paths creation can take, so tests
+/// can pin which one served a create.
+#[cfg(test)]
+pub(crate) mod test_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static HYDRATES: Cell<usize> = const { Cell::new(0) };
+        static SWEEPS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Run `body` with both counters reset and hand back what it produced,
+    /// the number of first-band sweeps, and the number of hydrating reads.
+    pub(crate) fn counted<T>(body: impl FnOnce() -> T) -> (T, usize, usize) {
+        HYDRATES.with(|count| count.set(0));
+        SWEEPS.with(|count| count.set(0));
+        let produced = body();
+        (produced, SWEEPS.with(Cell::get), HYDRATES.with(Cell::get))
+    }
+
+    pub(super) fn record_hydrate() {
+        HYDRATES.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(super) fn record_sweep() {
+        SWEEPS.with(|count| count.set(count.get() + 1));
+    }
+
+    thread_local! {
+        static WIDTH: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Run `body` with the hashing width (`concurrent_hash_reads`) pinned to
+    /// `width` on this thread, where the plan and the passes read it.
+    pub(crate) fn with_width<T>(width: usize, body: impl FnOnce() -> T) -> T {
+        let previous = WIDTH.with(|cell| cell.replace(Some(width)));
+        let produced = body();
+        WIDTH.with(|cell| cell.set(previous));
+        produced
+    }
+
+    pub(super) fn width() -> Option<usize> {
+        WIDTH.with(Cell::get)
+    }
+
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, PoisonError};
+
+    /// Windows are counted only for sources under this directory, so tests
+    /// running beside the probe do not disturb its counts.
+    static PROBED: Mutex<Option<PathBuf>> = Mutex::new(None);
+    static PROBE_LOCK: Mutex<()> = Mutex::new(());
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+    /// Run `body` and hand back the most read windows that sources under
+    /// `dir` ever had staged at once.
+    pub(crate) fn peak_windows_under<T>(dir: &Path, body: impl FnOnce() -> T) -> (T, usize) {
+        let _serial = PROBE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        LIVE.store(0, Ordering::SeqCst);
+        PEAK.store(0, Ordering::SeqCst);
+        *PROBED.lock().unwrap_or_else(PoisonError::into_inner) = Some(dir.to_path_buf());
+        let produced = body();
+        *PROBED.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        (produced, PEAK.load(Ordering::SeqCst))
+    }
+
+    pub(super) struct WindowGuard(bool);
+
+    pub(super) fn window_staged(input: &Path) -> WindowGuard {
+        let probed = PROBED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|dir| input.starts_with(dir));
+        if probed {
+            let live = LIVE.fetch_add(1, Ordering::SeqCst) + 1;
+            PEAK.fetch_max(live, Ordering::SeqCst);
+        }
+        WindowGuard(probed)
+    }
+
+    impl Drop for WindowGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                LIVE.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
 }
 
 /// The deferred content hashes of a whole recovery set, ready to be applied.
@@ -1231,8 +1560,15 @@ fn absorb_file_stream(
     }
 }
 
-fn read_exact_or_changed(file: &mut File, buffer: &mut [u8], input: &Path) -> Result<()> {
-    file.read_exact(buffer).map_err(|error| {
+/// Positional `read_exact` of one source range; a short file means the source
+/// changed under the create.
+fn read_exact_at_or_changed(
+    file: &File,
+    buffer: &mut [u8],
+    offset: u64,
+    input: &Path,
+) -> Result<()> {
+    crate::repairer::read_exact_file_at(file, buffer, offset).map_err(|error| {
         if error.kind() == io::ErrorKind::UnexpectedEof {
             Par2Error::CreationSourceChanged {
                 path: input.display().to_string(),
@@ -1353,5 +1689,26 @@ mod tests {
             validate_main_file_count(MAX_FILES_PER_SET + 1),
             Err(Par2Error::ResourceLimitExceeded { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::map_bounded;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn map_bounded_keeps_order_and_never_exceeds_its_width() {
+        let live = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let produced = map_bounded((0..64).collect(), 3, |item: usize| {
+            let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            live.fetch_sub(1, Ordering::SeqCst);
+            item * 2
+        });
+        assert_eq!(produced, (0..64).map(|item| item * 2).collect::<Vec<_>>());
+        assert!((1..=3).contains(&peak.load(Ordering::SeqCst)));
     }
 }

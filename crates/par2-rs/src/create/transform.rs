@@ -46,7 +46,8 @@
 //! precisely so that one worker's destination is the contiguous, row-major
 //! buffer the plan wants; nothing is transposed afterwards.
 //!
-//! Stripes are deliberately small (8 KiB, 4 KiB when memory is tight). The
+//! Stripes are deliberately small (8 KiB, 4 KiB when memory is tight, and 2 KiB
+//! only when nothing wider fits at all). The
 //! plan's working set is `rows * stripe`, and the fold count does not depend on
 //! the stripe at all, so a small stripe keeps the intermediate rows in cache
 //! and buys more stripes per band — which is the parallel width.
@@ -59,9 +60,12 @@
 //! are single serial messages over a file's bytes in file order, so they cannot
 //! be driven from a multi-pass feed — exactly the rule the dense arm already
 //! follows when its own stripe count exceeds one. A single-pass transform *is*
-//! in file order and fuses the digests as before; a multi-pass one leaves them
-//! to the separate hashing read `write_outputs` already performs for every
-//! multi-stripe create. No per-slice digest state is carried across passes.
+//! in file order and fuses the digests as before. A multi-pass one still needs
+//! one file-order read of every source for them, so `write_outputs` makes that
+//! read the first pass's feed: the provider's
+//! [`fill_band`](super::encode::ForwardSourceProvider::fill_band) serves band
+//! zero from the sequential hashing sweep, and only the remaining passes read
+//! strided. No per-slice digest state is carried across passes.
 //!
 //! # The safety row
 //!
@@ -87,9 +91,20 @@ use super::encode::{
 };
 
 /// Smallest band the arm will run. Below this the per-pass read of every slice
-/// degenerates into a seek per few kilobytes and the pass count explodes; the
+/// degenerates into a seek per kilobyte or so and the pass count explodes; the
 /// create takes the dense path instead.
-const MIN_BAND_BYTES: usize = 4 * 1024;
+///
+/// The band a budget buys is `budget / (sources + outputs)`, and the budget is
+/// the dense arm's own reservation, which for a narrow slice or a modest
+/// recovery count is little more than `outputs * slice`. Two shapes measured
+/// on an x86-64 performance core (GFNI, page-cached inputs, 1 thread) sit
+/// below a 4 KiB floor by that arithmetic: 10 x 100 MiB at 32,008-byte slices
+/// with 3,277 recovery blocks buys a ~2.9 KiB band, and 32,768 slices of 5,552
+/// bytes with 32,768 recovery blocks buys ~3.0 KiB. At a 4 KiB floor both took
+/// the dense arm (61.8 s and 115.4 s, medians of three); at 2 KiB they run the
+/// transform in 16 and 3 passes and take 4.9 s and 4.4 s, at a lower peak RSS
+/// than the dense arm (85 MiB against 119 MiB, 147 MiB against 209 MiB).
+const MIN_BAND_BYTES: usize = 2 * 1024;
 
 /// Largest number of passes the arm will run. Each pass re-opens the strided
 /// read of the whole payload, so the bound is what keeps a tiny budget from
@@ -122,9 +137,23 @@ const FOLD_MARGIN: u64 = 2;
 const MIN_SOURCE_SLICES: usize = 512;
 
 /// Stripe lengths tried, widest first. See the module docs for why these are
-/// small; 4 KiB is the floor because the plan's rows must still be worth a
-/// kernel call.
+/// small; 4 KiB is the floor of the ordinary search because the plan's rows
+/// must still be worth a kernel call.
 const STRIPE_CANDIDATES: [usize; 3] = [16 * 1024, 8 * 1024, 4 * 1024];
+
+/// The stripe tried only when no [`STRIPE_CANDIDATES`] entry fits the budget.
+///
+/// The accumulation stage makes `256 * outputs / batch` kernel calls per
+/// stripe whatever its length, so a shorter stripe only adds calls. Measured on
+/// an x86-64 performance core (GFNI, 1 thread) at 32,760 sources and 32,768
+/// recovery blocks, a 2 KiB stripe costs the same as a 4 KiB one (21.7 s
+/// against 21.8 s) and a 1 KiB stripe costs 1.6x (34.0 s). In the ordinary
+/// search a 2 KiB stripe would still win shapes the wider stripes already
+/// admit — it buys more stripes per band, which [`better`] prefers — and on
+/// 4,096 recovery blocks of 44,436 bytes at 8 threads that traded 12% of wall
+/// time for 70% more CPU. It is therefore a fallback that opens shapes the
+/// arm could not run at all, never a competitor for the ones it could.
+const NARROW_STRIPE: usize = 2 * 1024;
 
 /// Bucket batches tried, widest first. A wider batch divides the accumulation
 /// stage's destination traffic and multiplies the plan's scratch; when memory
@@ -244,6 +273,49 @@ pub(crate) mod test_probe {
     thread_local! {
         static PASSES: Cell<usize> = const { Cell::new(0) };
         static FAULT: Cell<bool> = const { Cell::new(false) };
+        static SHARED_BANDS: Cell<usize> = const { Cell::new(0) };
+        static FORCE_SHARED: Cell<bool> = const { Cell::new(false) };
+        static BUDGET: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Run `body` with the transform arm's budget pinned to `bytes` instead of
+    /// the dense reservation, which differs by architecture.
+    pub(crate) fn with_budget<T>(bytes: usize, body: impl FnOnce() -> T) -> T {
+        struct Restore(Option<usize>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                BUDGET.with(|budget| budget.set(self.0));
+            }
+        }
+        let _restore = Restore(BUDGET.with(|budget| budget.replace(Some(bytes))));
+        body()
+    }
+
+    pub(crate) fn budget_override() -> Option<usize> {
+        BUDGET.with(Cell::get)
+    }
+
+    /// Run `body` with every band on the shared-stripe runner, whatever the
+    /// host's worker count, and hand back how many bands took it.
+    pub(crate) fn with_shared_bands<T>(body: impl FnOnce() -> T) -> (T, usize) {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FORCE_SHARED.with(|force| force.set(self.0));
+            }
+        }
+        let _restore = Restore(FORCE_SHARED.with(|force| force.replace(true)));
+        SHARED_BANDS.with(|bands| bands.set(0));
+        let produced = body();
+        (produced, SHARED_BANDS.with(Cell::get))
+    }
+
+    pub(crate) fn shared_forced() -> bool {
+        FORCE_SHARED.with(Cell::get)
+    }
+
+    pub(crate) fn record_shared_band() {
+        SHARED_BANDS.with(|bands| bands.set(bands.get() + 1));
     }
 
     /// Run `body` with the pass counter reset, and hand back what it produced
@@ -351,6 +423,32 @@ pub(crate) fn admit(
 
     let workers = configured_create_threads().max(1);
     let mut best: Option<(usize, TransformShape)> = None;
+    // Every worker count from the configured one down to 1, halving: the
+    // widest that fits is not always the best (see [`better`]).
+    let search_widths = |plan: &DftPlan,
+                         bucket_batch: usize,
+                         stripe: usize,
+                         best: &mut Option<(usize, TransformShape)>| {
+        let mut width = workers;
+        loop {
+            if let Some(shape) = fit(
+                plan,
+                slice_size,
+                source_count,
+                exponents.len(),
+                budget,
+                stripe,
+                width,
+            ) && best.is_none_or(|(_, incumbent)| better(shape, incumbent))
+            {
+                *best = Some((bucket_batch, shape));
+            }
+            if width == 1 {
+                break;
+            }
+            width /= 2;
+        }
+    };
     for &bucket_batch in &BATCH_CANDIDATES {
         let Ok(plan) = DftPlan::build_tuned(&slots, outputs.clone(), bucket_batch) else {
             return None;
@@ -361,25 +459,15 @@ pub(crate) fn admit(
             return None;
         }
         for &stripe in &STRIPE_CANDIDATES {
-            let mut width = workers;
-            loop {
-                if let Some(shape) = fit(
-                    &plan,
-                    slice_size,
-                    source_count,
-                    exponents.len(),
-                    budget,
-                    stripe,
-                    width,
-                ) && best.is_none_or(|(_, incumbent)| better(shape, incumbent))
-                {
-                    best = Some((bucket_batch, shape));
-                }
-                if width == 1 {
-                    break;
-                }
-                width /= 2;
-            }
+            search_widths(&plan, bucket_batch, stripe, &mut best);
+        }
+    }
+    if best.is_none() {
+        for &bucket_batch in &BATCH_CANDIDATES {
+            let Ok(plan) = DftPlan::build_tuned(&slots, outputs.clone(), bucket_batch) else {
+                return None;
+            };
+            search_widths(&plan, bucket_batch, NARROW_STRIPE, &mut best);
         }
     }
     let (bucket_batch, shape) = best?;
@@ -538,8 +626,7 @@ pub(crate) fn encode<P: ForwardSourceProvider + ?Sized, S: ForwardRecoverySink>(
         let band_len = (slice_size - band_offset).min(shape.band);
         let live_chunks = band_len.div_ceil(shape.stripe);
 
-        fill_band(
-            provider,
+        provider.fill_band(
             sources.as_bytes_mut(),
             &mut band_lens,
             shape.band,
@@ -557,7 +644,17 @@ pub(crate) fn encode<P: ForwardSourceProvider + ?Sized, S: ForwardRecoverySink>(
 
         #[cfg(test)]
         test_probe::record_pass();
-        let mismatch = run_band(
+        // Fewer stripes than workers: the workers share each stripe instead of
+        // leaving all but `live_chunks` of them idle (see `run_band_shared`).
+        let shared = live_chunks < shape.workers;
+        #[cfg(test)]
+        let shared = shared || test_probe::shared_forced();
+        #[cfg(test)]
+        if shared {
+            test_probe::record_shared_band();
+        }
+        let runner = if shared { run_band_shared } else { run_band };
+        let mismatch = runner(
             &arm.plan,
             sources.as_bytes(),
             outputs.as_bytes_mut(),
@@ -603,25 +700,6 @@ pub(crate) fn encode<P: ForwardSourceProvider + ?Sized, S: ForwardRecoverySink>(
 
     check_cancel(options)?;
     Ok(EncodeAttempt::Complete)
-}
-
-/// Read `[offset, offset + band_len)` of every slice into the source arena,
-/// zeroing each slice's padding out to the full band so every stripe view is a
-/// whole, defined region.
-fn fill_band<P: ForwardSourceProvider + ?Sized>(
-    provider: &mut P,
-    arena: &mut [u8],
-    band_lens: &mut [usize],
-    band: usize,
-    offset: usize,
-    band_len: usize,
-) -> Result<()> {
-    for (source_index, slot) in arena.chunks_mut(band).enumerate() {
-        let read = provider.read_source_chunk(source_index, offset, &mut slot[..band_len])?;
-        slot[read..].fill(0);
-        band_lens[source_index] = read;
-    }
-    Ok(())
 }
 
 /// Hand a single-pass band's real source bytes to the fused hasher, in source
@@ -773,6 +851,364 @@ fn run_band(
     Ok(false)
 }
 
+/// Result slots one shared stripe can fold per round; at least the largest
+/// bucket batch [`admit`] tries, so a shared band never fails on geometry.
+const SHARED_MAX_SLOTS: usize = 4;
+const _: () = {
+    let mut at = 0;
+    while at < BATCH_CANDIDATES.len() {
+        assert!(BATCH_CANDIDATES[at] <= SHARED_MAX_SLOTS);
+        at += 1;
+    }
+};
+
+/// Transform every live stripe of one band with all workers sharing each
+/// stripe, checking each against the dense definition. Returns `true` when the
+/// safety row disagreed anywhere.
+///
+/// [`run_band`] gives each worker whole stripes, so a band of fewer stripes
+/// than workers — a narrow slice, or a budget that buys a stripe or two per
+/// pass — leaves workers idle: at 32,768 slices of 5,552 bytes the band is one
+/// 2 KiB stripe and seven of eight workers would wait. Here the workers share
+/// each stripe, in rounds of one scratch's `bucket_batch` result slots. The
+/// first worker fills the slots ([`DftPlan::transform_bucket`]); once they are
+/// full (a barrier) every worker folds them into its own disjoint range of
+/// output rows; a second barrier frees the slots for the next round. The safety row is split the
+/// same way, by source, into each worker's probe buffer, and summed by the
+/// worker that owns the row.
+///
+/// Memory stays what [`run_band`] touches for the same band, by construction:
+/// the first scratch's result slots and stage, the probes, and one
+/// slice-descriptor table per live stripe; the workers allocate nothing. That
+/// is why one worker runs every sub-transform. A second needs a stage of its
+/// own, which `run_band` never touches for a one-stripe band, and on an x86
+/// host with 4 SMT performance cores (8 threads) four slot workers bought only 4-8%
+/// more wall time than one at 32,768 slices of 5,552 or 16,384 of 11,104
+/// bytes, for 1-3 MiB more peak RSS: the fold into the output rows is the cost
+/// that needs sharing, and every worker shares it. Every worker
+/// walks the same fixed sequence of barriers whatever happens — a
+/// cancellation, an error or a caught panic only makes the remaining phases
+/// no-ops — so no worker can be left waiting on one that stopped.
+#[allow(clippy::too_many_arguments)]
+fn run_band_shared(
+    plan: &DftPlan,
+    sources: &[u8],
+    outputs: &mut [u8],
+    scratches: &mut [DftScratch],
+    probes: &mut [Vec<u8>],
+    probe_factors: &[u16],
+    probe_row: usize,
+    source_count: usize,
+    output_count: usize,
+    shape: TransformShape,
+    live_chunks: usize,
+    cancel: Option<&CancellationToken>,
+    #[cfg(test)] inject_fault: bool,
+) -> Result<bool> {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::{Mutex, PoisonError, RwLock};
+
+    let stripe = shape.stripe;
+    let chunk_bytes = output_count * stripe;
+    let batch = plan.bucket_batch();
+    let buckets = plan.bucket_count();
+    let workers = shape.workers.min(probes.len());
+    if workers == 0 || batch > SHARED_MAX_SLOTS || live_chunks == 0 {
+        return Err(resource_limit(
+            "shared transform band has no usable geometry",
+        ));
+    }
+    let Some(first) = scratches.first_mut() else {
+        return Err(resource_limit("shared transform band has no scratch"));
+    };
+    let (slot_parts, stage) = plan.scratch_parts(first).map_err(transform_error)?;
+    let slots: Vec<RwLock<&mut [u8]>> = slot_parts.map(RwLock::new).collect();
+    let mut stage = Some(stage);
+
+    let row_bounds: Vec<usize> = (0..=workers).map(|w| w * output_count / workers).collect();
+    let source_bounds: Vec<usize> = (0..=workers).map(|w| w * source_count / workers).collect();
+    let owner = (0..workers)
+        .find(|&w| probe_row < row_bounds[w + 1])
+        .unwrap_or(workers - 1);
+
+    // Each live stripe's slice descriptors, shared read-only by every worker.
+    let views: Vec<Vec<&[u8]>> = (0..live_chunks)
+        .map(|chunk_index| {
+            let start = chunk_index * stripe;
+            sources
+                .chunks(shape.band)
+                .map(|slot| &slot[start..start + stripe])
+                .collect()
+        })
+        .collect();
+
+    // Each worker's rows of every live stripe, as disjoint mutable slices.
+    let mut lanes: Vec<Vec<&mut [u8]>> = (0..workers)
+        .map(|_| Vec::with_capacity(live_chunks))
+        .collect();
+    for chunk in outputs[..live_chunks * chunk_bytes].chunks_mut(chunk_bytes) {
+        let mut rest = chunk;
+        for (worker, lane) in lanes.iter_mut().enumerate() {
+            let rows = row_bounds[worker + 1] - row_bounds[worker];
+            let (head, tail) = rest.split_at_mut(rows * stripe);
+            lane.push(head);
+            rest = tail;
+        }
+    }
+
+    let probes: Vec<RwLock<&mut Vec<u8>>> = probes[..workers].iter_mut().map(RwLock::new).collect();
+    let barrier = Rendezvous::new(workers);
+    let stopped = AtomicBool::new(false);
+    let mismatched = AtomicBool::new(false);
+    let failure: Mutex<Option<Par2Error>> = Mutex::new(None);
+    let panicked: Mutex<Option<Box<dyn std::any::Any + Send>>> = Mutex::new(None);
+    let mut spawn_failure: Option<Par2Error> = None;
+
+    let (slots, probes, views, barrier, stopped, mismatched, failure, panicked) = (
+        &slots,
+        &probes,
+        &views,
+        &barrier,
+        &stopped,
+        &mismatched,
+        &failure,
+        &panicked,
+    );
+    // Run one phase's work unless the band has already stopped, turning an
+    // error or a panic into "stopped" so the barrier sequence carries on.
+    let phase = move |work: &mut dyn FnMut() -> Result<()>| {
+        if stopped.load(Ordering::Relaxed) {
+            return;
+        }
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            stopped.store(true, Ordering::Relaxed);
+            return;
+        }
+        match catch_unwind(AssertUnwindSafe(work)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                stopped.store(true, Ordering::Relaxed);
+                failure
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get_or_insert(error);
+            }
+            Err(payload) => {
+                stopped.store(true, Ordering::Relaxed);
+                panicked
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get_or_insert(payload);
+            }
+        }
+    };
+
+    std::thread::scope(|scope| {
+        let mut spawned_workers = 0;
+        for (worker, lane) in lanes.into_iter().enumerate() {
+            let phase = &phase;
+            let row_bounds = &row_bounds;
+            let source_bounds = &source_bounds;
+            let mut stage = stage.take();
+            let builder = std::thread::Builder::new()
+                .name("par2-transform".to_string())
+                .stack_size(WORKER_STACK_BYTES);
+            let spawned = builder.spawn_scoped(scope, move || {
+                let rows = row_bounds[worker]..row_bounds[worker + 1];
+                let mine = source_bounds[worker]..source_bounds[worker + 1];
+                for (views, out) in views.iter().zip(lane) {
+                    out.fill(0);
+                    for round in 0..buckets.div_ceil(batch) {
+                        let first = round * batch;
+                        let live = batch.min(buckets - first);
+                        if let Some(stage) = stage.as_deref_mut() {
+                            phase(&mut || {
+                                for (slot, lock) in slots[..live].iter().enumerate() {
+                                    let mut result =
+                                        lock.write().unwrap_or_else(PoisonError::into_inner);
+                                    plan.transform_bucket(first + slot, views, &mut result, stage)
+                                        .map_err(transform_error)?;
+                                }
+                                Ok(())
+                            });
+                        }
+                        barrier.wait();
+                        phase(&mut || {
+                            // A worker past the last output row owns none.
+                            if rows.is_empty() {
+                                return Ok(());
+                            }
+                            let guards: [Option<_>; SHARED_MAX_SLOTS] =
+                                std::array::from_fn(|slot| {
+                                    (slot < live).then(|| {
+                                        slots[slot].read().unwrap_or_else(PoisonError::into_inner)
+                                    })
+                                });
+                            let finished: [(usize, &[u8]); SHARED_MAX_SLOTS] =
+                                std::array::from_fn(|slot| {
+                                    (
+                                        first + slot,
+                                        guards[slot].as_deref().map_or(&[][..], |r| &r[..]),
+                                    )
+                                });
+                            plan.accumulate_buckets(&finished[..live], rows.clone(), out)
+                                .map_err(transform_error)
+                        });
+                        barrier.wait();
+                    }
+                    // The safety row, split by source across the workers.
+                    phase(&mut || {
+                        let mut probe = probes[worker]
+                            .write()
+                            .unwrap_or_else(PoisonError::into_inner);
+                        dense_probe_row(
+                            &mut probe[..],
+                            &views[mine.clone()],
+                            &probe_factors[mine.clone()],
+                        );
+                        Ok(())
+                    });
+                    barrier.wait();
+                    if worker == owner {
+                        phase(&mut || {
+                            let mut sum = probes[worker]
+                                .write()
+                                .unwrap_or_else(PoisonError::into_inner);
+                            for (other, lock) in probes.iter().enumerate() {
+                                if other == worker {
+                                    continue;
+                                }
+                                let part = lock.read().unwrap_or_else(PoisonError::into_inner);
+                                for (byte, &add) in sum.iter_mut().zip(part.iter()) {
+                                    *byte ^= add;
+                                }
+                            }
+                            #[cfg(test)]
+                            if inject_fault {
+                                sum[0] ^= 0xff;
+                            }
+                            let at = (probe_row - rows.start) * stripe;
+                            if sum[..] != out[at..at + stripe] {
+                                mismatched.store(true, Ordering::Relaxed);
+                                stopped.store(true, Ordering::Relaxed);
+                            }
+                            Ok(())
+                        });
+                    }
+                    // The probes are rewritten for the next stripe.
+                    barrier.wait();
+                }
+            });
+            match spawned {
+                Ok(_) => spawned_workers += 1,
+                Err(error) => {
+                    // The workers already running would wait at the first
+                    // barrier for this one forever: stop the band and take the
+                    // missing workers out of the barrier's count.
+                    stopped.store(true, Ordering::Relaxed);
+                    spawn_failure = Some(Par2Error::Io(error));
+                    break;
+                }
+            }
+        }
+        for _ in spawned_workers..workers {
+            barrier.leave();
+        }
+    });
+    if let Some(payload) = panicked
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+    {
+        std::panic::resume_unwind(payload);
+    }
+    if let Some(error) = spawn_failure {
+        return Err(error);
+    }
+    if mismatched.load(Ordering::Relaxed) {
+        return Ok(true);
+    }
+    if let Some(error) = failure
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+    {
+        return Err(error);
+    }
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Err(Par2Error::Cancelled);
+    }
+    Ok(false)
+}
+
+/// A reusable barrier whose party count can shrink: [`std::sync::Barrier`]
+/// cannot release workers that are waiting for a thread that never started.
+struct Rendezvous {
+    state: std::sync::Mutex<RendezvousState>,
+    turned: std::sync::Condvar,
+}
+
+struct RendezvousState {
+    parties: usize,
+    arrived: usize,
+    generation: u64,
+}
+
+impl Rendezvous {
+    fn new(parties: usize) -> Self {
+        Self {
+            state: std::sync::Mutex::new(RendezvousState {
+                parties,
+                arrived: 0,
+                generation: 0,
+            }),
+            turned: std::sync::Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RendezvousState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Release everyone waiting when the last expected party has arrived.
+    fn turn_if_full(&self, state: &mut RendezvousState) -> bool {
+        if state.arrived >= state.parties {
+            state.arrived = 0;
+            state.generation = state.generation.wrapping_add(1);
+            self.turned.notify_all();
+            return true;
+        }
+        false
+    }
+
+    fn wait(&self) {
+        let mut state = self.lock();
+        state.arrived += 1;
+        if self.turn_if_full(&mut state) {
+            return;
+        }
+        let generation = state.generation;
+        while state.generation == generation {
+            state = self
+                .turned
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// Remove one party for good, releasing the current round if it was the
+    /// only one missing.
+    fn leave(&self) {
+        let mut state = self.lock();
+        state.parties = state.parties.saturating_sub(1);
+        if state.arrived > 0 {
+            self.turn_if_full(&mut state);
+        }
+    }
+}
+
 /// One recovery row, straight from the PAR2 definition: `n` region folds over
 /// the same staged stripe the transform just consumed.
 fn dense_probe_row(probe: &mut [u8], views: &[&[u8]], factors: &[u16]) {
@@ -805,20 +1241,16 @@ fn emit_band<S: ForwardRecoverySink>(
     slice_size: usize,
 ) -> Result<()> {
     let output_count = exponents.len();
-    for (output_index, &exponent) in exponents.iter().enumerate() {
-        for chunk_index in 0..live_chunks {
-            let offset = band_offset + chunk_index * stripe;
-            let len = stripe.min(slice_size - offset);
-            let start = (chunk_index * output_count + output_index) * stripe;
-            sink.write_recovery_chunk(
-                output_index,
-                exponent,
-                offset as u64,
-                &outputs[start..start + len],
-            )?;
-        }
-    }
-    Ok(())
+    sink.write_recovery_band(output_count, live_chunks, &|output_index, chunk_index| {
+        let offset = band_offset + chunk_index * stripe;
+        let len = stripe.min(slice_size - offset);
+        let start = (chunk_index * output_count + output_index) * stripe;
+        (
+            exponents[output_index],
+            offset as u64,
+            &outputs[start..start + len],
+        )
+    })
 }
 
 fn transform_error(error: reedsolomon_rs::fft::TransformError) -> Par2Error {
@@ -1039,6 +1471,134 @@ mod tests {
     }
 
     #[test]
+    fn a_two_kilobyte_band_is_byte_identical() {
+        // The narrowest band the arm admits: four passes over an 8 KiB slice,
+        // one 2 KiB stripe each.
+        let shape = Shape {
+            lengths: vec![300 * 8_192, 300 * 8_192 + 77],
+            slice_size: 8_192,
+            recovery: 256,
+            first_exponent: 3,
+            memory_limit: Some(4 * 1024 * 1024),
+        };
+        // The budget is pinned: the dense reservation it otherwise follows
+        // depends on the architecture's dense kernel.
+        let passes =
+            test_probe::with_budget(4 * 1024 * 1024, || compare_arms(&shape, "2 KiB band"));
+        assert_eq!(passes, 4, "expected four 2 KiB passes, ran {passes}");
+    }
+
+    #[test]
+    fn a_multi_pass_create_hashes_its_sources_while_filling_the_first_band() {
+        // The 2 KiB-band shape: four passes. The sources' content hashes come
+        // from the sequential sweep that fills band zero, not from a separate
+        // hashing read, and the set is byte-identical to the dense arm's
+        // (`a_two_kilobyte_band_is_byte_identical`).
+        let shape = Shape {
+            lengths: vec![300 * 8_192, 300 * 8_192 + 77, 5],
+            slice_size: 8_192,
+            recovery: 256,
+            first_exponent: 3,
+            memory_limit: Some(4 * 1024 * 1024),
+        };
+        let root = tempfile::tempdir().unwrap();
+        let sources = root.path().join("sources");
+        let inputs = write_sources(&sources, &shape.lengths);
+        let ((_, passes), sweeps, hydrates) = crate::create::source::test_probe::counted(|| {
+            test_probe::with_budget(4 * 1024 * 1024, || {
+                create(
+                    &shape,
+                    &inputs,
+                    &sources,
+                    &root.path().join("transform"),
+                    TransformPolicy::Force,
+                )
+            })
+        });
+        assert_eq!(passes, 4, "expected four 2 KiB passes, ran {passes}");
+        assert_eq!(
+            sweeps, 1,
+            "the first band was not served by the hashing sweep"
+        );
+        assert_eq!(
+            hydrates, 0,
+            "the sources were read a second time to hash them"
+        );
+    }
+
+    #[test]
+    fn hashing_passes_stage_no_more_read_windows_than_the_plan_accounts() {
+        // Twelve sources under a width of two: the identity scan and the
+        // first-band sweep may each stage only the two windows the plan
+        // accounts, however wide rayon's global pool is.
+        let shape = Shape {
+            lengths: (0..12).map(|at| 40 * 8_192 + at * 311).collect(),
+            slice_size: 8_192,
+            recovery: 256,
+            first_exponent: 0,
+            memory_limit: Some(4 * 1024 * 1024),
+        };
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let sources = root.join("sources");
+        let inputs = write_sources(&sources, &shape.lengths);
+        for width in [2, 3] {
+            let accounted = crate::create::source::test_probe::with_width(width, || {
+                crate::create::source::concurrent_hash_reads(inputs.len())
+            });
+            assert_eq!(accounted, width);
+            let (((_, passes), sweeps, hydrates), peak) =
+                crate::create::source::test_probe::peak_windows_under(&sources, || {
+                    crate::create::source::test_probe::counted(|| {
+                        crate::create::source::test_probe::with_width(width, || {
+                            test_probe::with_budget(4 * 1024 * 1024, || {
+                                create(
+                                    &shape,
+                                    &inputs,
+                                    &sources,
+                                    &root.join(format!("transform-{width}")),
+                                    TransformPolicy::Force,
+                                )
+                            })
+                        })
+                    })
+                });
+            assert!(passes > 1, "expected a multi-pass arm, ran {passes}");
+            assert_eq!((sweeps, hydrates), (1, 0));
+            assert!(
+                (1..=accounted).contains(&peak),
+                "{peak} read windows staged at once under an accounted {accounted}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_multi_pass_band_over_slices_larger_than_a_read_window_is_byte_identical() {
+        // Slices above the multi-buffer staging budget take the streaming
+        // hashing scan, which hands the sweep each slice in 1 MiB read-window
+        // chunks. An 11 MiB budget over seven rows buys a band of about
+        // 1.5 MiB, so band zero takes one whole chunk and part of the next.
+        let slice = 3 * 1024 * 1024 + 4;
+        let shape = Shape {
+            lengths: vec![2 * slice + 1_000, slice - 9],
+            slice_size: slice as u64,
+            recovery: 3,
+            first_exponent: 0,
+            memory_limit: None,
+        };
+        let (passes, sweeps, _) = crate::create::source::test_probe::counted(|| {
+            test_probe::with_budget(11 * 1024 * 1024, || {
+                compare_arms(&shape, "streaming first band")
+            })
+        });
+        assert!(passes > 1, "expected a multi-pass arm, ran {passes}");
+        assert_eq!(
+            sweeps, 1,
+            "the first band was not served by the hashing sweep"
+        );
+    }
+
+    #[test]
     fn a_limit_too_small_for_a_band_falls_back_to_dense() {
         let shape = Shape {
             lengths: vec![40 * 65_536, 40 * 65_536 + 3],
@@ -1148,6 +1708,107 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bands_shared_by_every_worker_are_byte_identical() {
+        // Several stripes per band and several passes, every band forced onto
+        // the shared-stripe runner, plus the one-stripe 2 KiB band that takes
+        // it on its own wherever more than one worker is configured.
+        for (label, shape) in [
+            (
+                "shared, several stripes",
+                Shape {
+                    lengths: vec![40 * 65_536 + 5, 23 * 65_536],
+                    slice_size: 65_536,
+                    recovery: 300,
+                    first_exponent: 1,
+                    memory_limit: None,
+                },
+            ),
+            (
+                "shared, 2 KiB band",
+                Shape {
+                    lengths: vec![300 * 8_192, 300 * 8_192 + 77],
+                    slice_size: 8_192,
+                    recovery: 256,
+                    first_exponent: 3,
+                    memory_limit: Some(4 * 1024 * 1024),
+                },
+            ),
+        ] {
+            // Pinned budgets: several stripes and several workers per band
+            // wherever more than one thread is configured, and the one-stripe
+            // 2 KiB band.
+            let budget = if shape.slice_size == 65_536 { 16 } else { 4 } * 1024 * 1024;
+            let (passes, shared) = test_probe::with_shared_bands(|| {
+                test_probe::with_budget(budget, || compare_arms(&shape, label))
+            });
+            assert!(passes > 1, "{label}: expected several passes, ran {passes}");
+            assert_eq!(shared, passes, "{label}: a band skipped the shared runner");
+        }
+    }
+
+    #[test]
+    fn a_shared_band_safety_row_mismatch_recreates_every_volume_densely() {
+        let shape = Shape {
+            lengths: vec![4 * 32_768 + 137, 60 * 32_768],
+            slice_size: 32_768,
+            recovery: 32,
+            first_exponent: 0,
+            memory_limit: None,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let sources = root.path().join("sources");
+        let inputs = write_sources(&sources, &shape.lengths);
+
+        let (dense, _) = create(
+            &shape,
+            &inputs,
+            &sources,
+            &root.path().join("dense"),
+            TransformPolicy::Never,
+        );
+        let ((recovered, passes), shared) = test_probe::with_shared_bands(|| {
+            test_probe::with_fault(|| {
+                create(
+                    &shape,
+                    &inputs,
+                    &sources,
+                    &root.path().join("faulted"),
+                    TransformPolicy::Force,
+                )
+            })
+        });
+        assert_eq!(passes, 1, "the arm should abandon at its first band");
+        assert_eq!(shared, 1, "the band should have run shared");
+        assert_eq!(
+            dense.keys().collect::<Vec<_>>(),
+            recovered.keys().collect::<Vec<_>>()
+        );
+        for (name, expected) in &dense {
+            assert!(
+                &recovered[name] == expected,
+                "{name} differs after the dense recreation"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rendezvous_releases_waiters_when_a_party_leaves() {
+        let rendezvous = Rendezvous::new(3);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    for _ in 0..4 {
+                        rendezvous.wait();
+                    }
+                });
+            }
+            // The third party never arrives; leaving lets the other two finish
+            // all four rounds between themselves.
+            rendezvous.leave();
+        });
+    }
+
     fn exponents(first: u32, count: usize) -> Vec<RecoveryExponent> {
         (0..count as u32).map(|at| first + at).collect()
     }
@@ -1221,7 +1882,7 @@ mod tests {
 
     #[test]
     fn a_budget_too_small_for_one_band_is_refused() {
-        // 4000 sources cannot hold even a 4 KiB band in 8 MiB.
+        // 4000 sources cannot hold even a 2 KiB band in 8 MiB.
         assert!(
             admit(
                 768_000,

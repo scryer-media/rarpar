@@ -800,6 +800,60 @@ fn an_overwrite_spelled_in_another_case_refuses_to_leave_obsolete_volumes_behind
     }
 }
 
+#[test]
+fn an_xz_sidecar_over_a_directory_is_refused_before_the_archive_is_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("old"), noise(50_000, 15)).unwrap();
+    ok(&rarpar(root, &["xz", "compress", "old", "out.xz"]));
+    std::fs::remove_file(root.join("old")).unwrap();
+    let archive = std::fs::read(root.join("out.xz")).unwrap();
+    // A directory where the set's index goes: `--overwrite` replaces a file,
+    // and nothing can replace the directory once the archive is installed.
+    std::fs::create_dir(root.join("out.xz.par3")).unwrap();
+    let listing = || {
+        let mut names: Vec<String> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    };
+    let output = through_pipes(
+        root,
+        &[
+            "--overwrite",
+            "xz",
+            "compress",
+            "--sidecar",
+            "par3",
+            "--sidecar-block-size",
+            "4096",
+            "--sidecar-recovery-count",
+            "1",
+            "-",
+            "out.xz",
+        ],
+        noise(200_000, 16),
+    );
+    code(&output, 3);
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        message.contains("directory") && message.contains("out.xz.par3"),
+        "{message}"
+    );
+    assert!(
+        std::fs::read(root.join("out.xz")).unwrap() == archive,
+        "the previous archive was replaced"
+    );
+    // Nothing was staged beside the outputs.
+    assert_eq!(listing(), ["out.xz", "out.xz.par3"]);
+    assert_eq!(
+        std::fs::read_dir(root.join("out.xz.par3")).unwrap().count(),
+        0
+    );
+}
+
 #[cfg(feature = "sevenz")]
 mod archives {
     use super::*;

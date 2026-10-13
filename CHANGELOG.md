@@ -3,6 +3,70 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.6.2
+
+### Fixes
+
+- `xz compress --sidecar`, `par3 archive` and `par3 create -` refuse (exit 3)
+  a planned set file that exists as a directory or other non-regular file,
+  `--overwrite` or not, before replacing anything; `xz compress` and
+  `par3 archive` replaced the archive and then failed to install the set.
+- `par3 create OUTPUT -` takes a `.par3` suffix in any case as the set's
+  suffix, as `par3 create` over files does: `SET.PAR3` writes `SET.par3` and
+  `SET.vol0+1.par3`, not `SET.PAR3.par3` and `SET.PAR3.vol0+1.par3`.
+- `par verify --name` from standard input keeps its verification buffers
+  within `--par3-memory-mib` instead of up to 64 MiB beyond it; a stream
+  ending inside a slice still reports that slice missing.
+- `rar list`, `rar test` and `rar extract` read the whole volume set when the
+  archive is named in another case than its volumes on a filesystem that
+  ignores case (macOS and Windows by default): `rar list SET.part01.rar` over
+  `set.partNN.rar` read the named volume alone. The match follows the
+  filesystem rather than the platform: a volume in another case joins when
+  its name respelled in the archive's case opens the same file, so a
+  case-sensitive volume keeps `SET.*` and `set.*` apart on any platform.
+
+### Changed
+
+- `par create` (PAR2) is faster on narrow slices with many recovery blocks,
+  and at more than one thread, on par2-rs 0.10.9, without raising peak
+  memory by more than 1 MiB: 10 x 100 MiB at 32,008-byte slices with 3,277
+  recovery blocks takes 4.9 s instead of 61.8 s single-threaded, and 1 GiB
+  with 32,768 recovery blocks 9.7 s instead of 13.2 s at 8 threads. A create
+  issues about half the seeks it did.
+- `par create` (PAR2) reads less on the same shapes: a multi-pass create
+  reads its sources once fewer, and staged volumes are checked with one read
+  each instead of a re-read of every recovery packet. With 32,768 recovery
+  blocks over 10 x 100 MiB it reads 2.83 GB instead of 4.28 GB and takes
+  15.7 s instead of 17.5 s single-threaded on Apple silicon performance cores.
+  Output is unchanged.
+- `par create` (PAR2) on Linux sizes its default memory limit from the
+  container's cgroup memory limit when that is below physical memory, so a
+  create in a memory-limited container no longer plans for an eighth of the
+  host's memory.
+- `rarpar auto` reads each PAR2 volume through a full packet scan twice per
+  run instead of five times: the repair takes the packet set discovery
+  loaded, and the rediscovery after a repair keeps the classification and
+  set of every volume whose length, mtime and inode are unchanged and were
+  last written at least 2 s before discovery read them. Repairing one
+  damaged slice of 10 x 100 MiB with a 156 MB PAR2 set reads 2.51 GB instead
+  of 2.98 GB and takes 1.04 s instead of 1.62 s on Apple silicon
+  performance cores, at the same peak RSS.
+- `par verify --name` from standard input verifies against the PAR2 set it
+  already loaded instead of scanning every volume a second time: checking a
+  100 MiB file against a 156 MB set reads 262 MB instead of 418 MB, takes
+  0.33 s instead of 0.53 s and peaks at 7.6 MB RSS instead of 32.7 MB on
+  Apple silicon performance cores. Its output is unchanged.
+
+### Library versions
+
+- par2-rs 0.10.9 (pinned exactly): the faster and leaner create above, the
+  cgroup-aware memory default, `VerificationSession::with_par2_set`, and
+  repair reads without a seek per slice.
+- par3-rs 0.5.2 (pinned exactly, was 0.5.1): adds the experimental
+  `inside::rar4` module, which no `rarpar` command uses. PAR3 behavior is
+  unchanged.
+- unrar-rs 0.11.0: unchanged.
+
 ## rarpar 0.6.1
 
 ### CLI Changes

@@ -149,6 +149,12 @@ pub(crate) fn name_key(stem: &str) -> String {
     if !cfg!(any(windows, target_os = "macos")) {
         return stem.to_owned();
     }
+    fold_case(stem)
+}
+
+/// `stem` under the simple case folding [`name_key`] applies, on every
+/// platform: each character to its one-character uppercase.
+pub(crate) fn fold_case(stem: &str) -> String {
     stem.chars()
         .map(|c| {
             let mut upper = c.to_uppercase();
@@ -160,8 +166,9 @@ pub(crate) fn name_key(stem: &str) -> String {
         .collect()
 }
 
-/// Whether two `.partN.rar` stems name one family, by [`name_key`].
-fn same_stem(a: &str, b: &str) -> bool {
+/// Whether two volume family stems, such as `set` in `set.partN.rar`, name
+/// one family, by [`name_key`].
+pub(crate) fn same_stem(a: &str, b: &str) -> bool {
     a == b || name_key(a) == name_key(b)
 }
 

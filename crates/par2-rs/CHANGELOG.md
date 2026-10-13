@@ -1,5 +1,101 @@
 # Changelog
 
+## 0.10.9
+
+Faster PAR2 creation where the transform arm used to be refused or left
+workers idle, at the same peak memory.
+
+### Changed
+
+- The create transform arm admits a 2 KiB band, and a 2 KiB stripe, when no
+  4 KiB band fits in the dense arm's own memory reservation. Narrow slices
+  with many recovery blocks now take the transform instead of the dense
+  encoder. Measured on an x86-64 Alder Lake host (GFNI, page-cached inputs,
+  medians of three, 1 thread / 8 threads on its 4 SMT performance cores):
+  10 x 100 MiB at 32,008-byte slices with 3,277 recovery blocks drops from
+  61.8 s / 20.8 s to 4.9 s / 3.0 s, and 32,768 slices of 5,552 bytes with
+  32,768 recovery blocks from 115.4 s / 39.0 s to 4.4 s / 2.3 s. Peak RSS
+  falls from 119 to 84 MiB and from 209 to 148 MiB. Shapes the fold margin
+  rules out stay dense, and the arm's memory still comes out of the dense
+  reservation the plan reports.
+- A transform band of fewer stripes than workers is now shared by every
+  worker: one fills a scratch's bucket slots and all of them fold the slots
+  into disjoint ranges of output rows. Before, such a band ran on as many
+  workers as it had stripes, often one. It touches no memory the old runner
+  did not, so peak RSS is unchanged or lower. At 8 threads, 1 GiB of
+  32,008-byte slices with 32,768 recovery blocks takes 9.7 s instead of
+  13.2 s (peak RSS 794 MiB instead of 804), and 16,384 slices of 11,104
+  bytes with 16,384 recovery blocks 2.3 s instead of 4.0 s. CPU time rises
+  with the wall-time gain (7.4 s instead of 4.0 s in the second case),
+  mostly because the extra workers share SMT cores.
+- Recovery data is written with positional writes, and at more than one
+  thread a finished band's slots are hashed and written in parallel. A
+  create issues about half the seeks it did (238,590 instead of 504,830 for
+  the 1 GiB set above) and, at 8 threads, 4-11% less wall time on shapes
+  whose bands were already fully parallel. Peak RSS at 8 threads can rise by
+  under 1 MiB for the pool threads' stacks; a single-threaded create keeps
+  the writes on its own thread.
+- A multi-pass transform create reads its sources once fewer. The whole-file
+  MD5 still needs one read of every source in file order, but that read now
+  also fills the first pass's band, so the strided reads cover only the
+  remaining passes. Before, the first band was read strided as well as by the
+  separate hashing read. Output is byte-identical. The hashing read, the
+  16 KiB head and the encoder's band reads use positional reads instead of
+  seek plus read, and the hashing read stages at least 1 MiB of whole slices
+  per read (it read once per slice before). That raises its per-task
+  staging, which the plan accounts, from 256 KiB to about 1 MiB for slices
+  under 256 KiB.
+- Staged volume validation keeps one sequential read of each staged volume:
+  the packet scan, which already checks every packet against the MD5 in its
+  header, recovery payloads included. It no longer re-opens the volume to
+  re-read each packet header or re-opens it again to re-hash each recovery
+  payload. A planted change to a staged recovery byte after hashing is still
+  rejected.
+- Together, measured on Apple silicon performance cores (page-cached inputs,
+  medians of three, 1 thread / 6 threads, read calls counted at the libc
+  boundary). 10 x 100 MiB at 32,008-byte slices with 3,277 recovery blocks
+  (16 passes): 4.83 s / 2.39 s becomes 4.58 s / 2.34 s; system time drops
+  from 0.60 s to 0.44 s single-threaded; reads fall from 2.36 GB in 565,751
+  read and 543,834 seek calls to 2.19 GB in 493,056 read and 13,107 seek
+  calls; opens fall from 3,349 to 49. 32,768 recovery blocks (3 passes):
+  17.46 s / 6.49 s becomes 15.65 s / 5.72 s; reads fall from 4.28 GB in
+  203,505 read and 267,261 seek calls to 2.83 GB in 70,900 read and 103,428
+  seek calls; opens fall from 32,852 to 57. Peak RSS is unchanged (94 MiB
+  and 837 MiB single-threaded).
+- Streaming repair reads each source chunk without a seek when the chunk
+  starts where the previous read of that source ended. Repairing one damaged
+  slice of a 10 x 100 MiB set (32,008-byte slices) issues 39 seek calls
+  instead of 32,787, with the same reads and output.
+- On Linux the default create memory limit (an eighth of host memory, at
+  least 256 MiB) now takes host memory as the smaller of physical memory and
+  the process's cgroup memory limit: cgroup v2 `memory.max` or v1
+  `memory.limit_in_bytes`, the tightest of the process's cgroup and its
+  ancestors. The hierarchies are found through `/proc/self/mountinfo` (the
+  `cgroup2` mount, and the v1 mount whose options name the memory
+  controller, including a co-mounted one such as `cpu,memory` and the
+  `unified` mount of a hybrid host), falling back to `/sys/fs/cgroup` and
+  `/sys/fs/cgroup/memory` when mountinfo cannot be read. Before, a container
+  limited to 2 GiB on a 64 GiB host defaulted to 8 GiB. An explicit memory limit is unchanged, as are the repair and
+  verify defaults, which are fixed sizes.
+- A multi-threaded create checks for cancellation before every recovery
+  chunk it writes, as a single-threaded create does, instead of once per
+  recovery slot of a band.
+- The passes that hash whole source files (the identity scan, the first
+  band's sweep and the source-hash hydrate) hold at most the configured
+  create width of read windows in flight, never more than there are files.
+  Before, they ran on the unbounded global rayon pool, so on a host with
+  more cores than the configured width they could stage more windows than
+  the plan's memory estimate accounted for. The plan now accounts exactly
+  that bound, one window fewer than before. Output is byte-identical; wall
+  time and peak RSS are unchanged within noise at 1 and 6 threads.
+
+### Added
+
+- `VerificationSession::with_par2_set` starts a session over a set the
+  caller already loaded (for example with `Par2FileSet::from_paths`), so a
+  caller holding the set does not scan every volume again to hand the
+  session its packets.
+
 ## 0.10.8
 
 Fewer redundant reads on the verify and repair paths.

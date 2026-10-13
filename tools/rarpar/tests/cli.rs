@@ -1442,6 +1442,81 @@ fn rar_list_and_test_follow_the_volume_chain() {
 }
 
 #[test]
+fn rar_list_and_test_refuse_a_missing_archive_as_missing_input() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = temp.path().join("absent.rar");
+    for command in ["list", "test"] {
+        let output = run(&[OsStr::new("rar"), OsStr::new(command), missing.as_os_str()]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "rar {command}: {stderr}");
+        assert!(
+            stderr.contains(&format!("input path does not exist: {}", missing.display())),
+            "rar {command}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn rar_list_and_test_take_the_volume_set_under_another_case_of_its_name() {
+    // Named `SET.part01.rar` over volumes stored as `set.partNN.rar`, the set
+    // is all nine volumes where the filesystem ignores case. Where it does
+    // not, no file has the uppercase name.
+    let temp = tempfile::tempdir().unwrap();
+    let rar5 = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar5"]);
+    for volume in 1..=9 {
+        std::fs::copy(
+            rar5.join(format!("rar5_mv_store_pair.part{volume:02}.rar")),
+            temp.path().join(format!("set.part{volume:02}.rar")),
+        )
+        .unwrap();
+    }
+    let named = temp.path().join("SET.part01.rar");
+    if std::fs::File::open(&named).is_err() {
+        eprintln!("skipping test: this filesystem tells SET.part01.rar from set.part01.rar");
+        return;
+    }
+
+    let list = run(&[OsStr::new("rar"), OsStr::new("list"), named.as_os_str()]);
+    assert_success(&list, "rar list");
+    assert_eq!(
+        String::from_utf8_lossy(&list.stdout),
+        "Silver.Horizon.S02E01.mkv\nSilver.Horizon.S02E02.mkv\n"
+    );
+    let test = run(&[OsStr::new("rar"), OsStr::new("test"), named.as_os_str()]);
+    assert_success(&test, "rar test");
+}
+
+/// On APFS as macOS formats it by default, which ignores case, volumes stored
+/// under three spellings of the set's name are one set, as the filesystem
+/// itself treats them.
+#[cfg(target_os = "macos")]
+#[test]
+fn rar_list_on_apfs_joins_volumes_stored_under_mixed_case_names() {
+    let temp = tempfile::tempdir().unwrap();
+    let rar5 = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar5"]);
+    let spellings = ["set", "Set", "SET"];
+    for volume in 1..=9 {
+        std::fs::copy(
+            rar5.join(format!("rar5_mv_store_pair.part{volume:02}.rar")),
+            temp.path()
+                .join(format!("{}.part{volume:02}.rar", spellings[volume % 3])),
+        )
+        .unwrap();
+    }
+    if std::fs::File::open(temp.path().join("sEt.part01.rar")).is_err() {
+        eprintln!("skipping test: this APFS volume is case-sensitive");
+        return;
+    }
+    let named = temp.path().join("sEt.part01.rar");
+    let list = run(&[OsStr::new("rar"), OsStr::new("list"), named.as_os_str()]);
+    assert_success(&list, "rar list");
+    assert_eq!(
+        String::from_utf8_lossy(&list.stdout),
+        "Silver.Horizon.S02E01.mkv\nSilver.Horizon.S02E02.mkv\n"
+    );
+}
+
+#[test]
 fn rar_test_decrypts_a_member_split_across_volumes() {
     // One encrypted member over five volumes: tested from the first volume
     // alone, its packed data stops at a size that is not a whole number of

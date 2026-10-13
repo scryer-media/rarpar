@@ -332,6 +332,26 @@ pub trait ForwardRecoverySink {
         offset: u64,
         data: &[u8],
     ) -> Result<()>;
+
+    /// Store a whole band: `rows` outputs, each `chunks` consecutive stripes
+    /// long, `chunk(row, at)` naming stripe `at` of output `row` as its
+    /// exponent, offset and bytes. Rows are independent, so an implementation
+    /// may store them concurrently; within a row the stripes are in ascending
+    /// offset order. The default stores them one at a time.
+    fn write_recovery_band<'d>(
+        &mut self,
+        rows: usize,
+        chunks: usize,
+        chunk: &(dyn Fn(usize, usize) -> (RecoveryExponent, u64, &'d [u8]) + Sync),
+    ) -> Result<()> {
+        for row in 0..rows {
+            for at in 0..chunks {
+                let (exponent, offset, data) = chunk(row, at);
+                self.write_recovery_chunk(row, exponent, offset, data)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Source-slice access used by the forward stripe controller.
@@ -349,6 +369,39 @@ pub(crate) trait ForwardSourceProvider {
         offset: usize,
         destination: &mut [u8],
     ) -> Result<usize>;
+
+    /// Fill one transform band: `[offset, offset + band_len)` of every slice
+    /// into consecutive `band`-byte slots of `arena`, each zero-padded to the
+    /// full slot, with each slice's real byte count in `band_lens`. The
+    /// default reads the slices one chunk at a time.
+    fn fill_band(
+        &mut self,
+        arena: &mut [u8],
+        band_lens: &mut [usize],
+        band: usize,
+        offset: usize,
+        band_len: usize,
+    ) -> Result<()> {
+        fill_band_by_chunks(self, arena, band_lens, band, offset, band_len)
+    }
+}
+
+/// [`ForwardSourceProvider::fill_band`]'s default: one
+/// [`ForwardSourceProvider::read_source_chunk`] per slice.
+pub(crate) fn fill_band_by_chunks<P: ForwardSourceProvider + ?Sized>(
+    provider: &mut P,
+    arena: &mut [u8],
+    band_lens: &mut [usize],
+    band: usize,
+    offset: usize,
+    band_len: usize,
+) -> Result<()> {
+    for (source_index, slot) in arena.chunks_mut(band).enumerate() {
+        let read = provider.read_source_chunk(source_index, offset, &mut slot[..band_len])?;
+        slot[read..].fill(0);
+        band_lens[source_index] = read;
+    }
+    Ok(())
 }
 
 /// Observer of the exact source bytes the encode feed reads, in feed order.
@@ -546,14 +599,12 @@ impl ForwardEncoder {
             options.kernel,
         )?;
 
-        // The transform arm is admitted against the smaller of the caller's
-        // budget and what the dense arm just reserved, so taking it can only
-        // lower this pass's residency, never raise it.
-        if let Some(arm) = transform::admit(
+        if let Some(arm) = admit_transform(
             self.slice_size,
             provider.source_count(),
             &self.recovery_exponents,
-            memory_limit.min(buffers.memory_bytes),
+            memory_limit,
+            &buffers,
             options.transform,
         ) && (observer.is_none() || arm.shape().passes == 1)
         {
@@ -2199,25 +2250,38 @@ impl RowFactors {
     }
 }
 
-/// Stripes one forward pass will walk under the same budget the pass itself
+/// How one forward pass will read its sources: how many times it walks each
+/// slice, and whether the walks are transform bands (every slice's band
+/// resident at once) or dense stripes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForwardFeedShape {
+    pub(crate) passes: usize,
+    pub(crate) transform: bool,
+}
+
+/// The feed one forward pass will take under the same budget the pass itself
 /// resolves.
 ///
-/// Creation asks this to decide whether a whole-file digest can be driven from
-/// the encode feed: one stripe means the feed visits each file's bytes in file
-/// order, more than one means it is stripe-major and cannot. Funnels through
-/// `select_kernel_for_memory` exactly as `estimate_forward_memory` does, so
-/// the answer is the shape the pass will actually take.
-pub(crate) fn forward_stripe_count(
+/// Creation asks this to decide where the whole-file digests come from: one
+/// pass means the feed visits each file's bytes in file order and can drive
+/// them; a multi-pass transform can serve its first band from the hashing
+/// read; a multi-stripe dense pass is stripe-major and can do neither. Funnels
+/// through `select_kernel_for_memory` exactly as `estimate_forward_memory`
+/// does, so the answer is the shape the pass will actually take.
+pub(crate) fn forward_feed_shape(
     slice_size: u64,
     source_count: usize,
     exponents: &[RecoveryExponent],
     memory_limit: usize,
     requested_kernel: ForwardKernel,
     transform_policy: TransformPolicy,
-) -> Result<usize> {
+) -> Result<ForwardFeedShape> {
     let output_count = exponents.len();
     if output_count == 0 {
-        return Ok(0);
+        return Ok(ForwardFeedShape {
+            passes: 0,
+            transform: false,
+        });
     }
     let slice_size = usize::try_from(slice_size)
         .map_err(|_| resource_limit("slice size exceeds addressable memory"))?;
@@ -2231,16 +2295,46 @@ pub(crate) fn forward_stripe_count(
     // The arm that will run is the one whose pass count decides whether the
     // feed is in file order, so the transform's admission is resolved with the
     // same inputs the pass itself will use.
-    if let Some(arm) = transform::admit(
+    if let Some(arm) = admit_transform(
         slice_size,
         source_count,
         exponents,
-        memory_limit.min(buffers.memory_bytes),
+        memory_limit,
+        &buffers,
         transform_policy,
     ) {
-        return Ok(arm.shape().passes);
+        return Ok(ForwardFeedShape {
+            passes: arm.shape().passes,
+            transform: true,
+        });
     }
-    Ok(slice_size.div_ceil(buffers.chunk_len))
+    Ok(ForwardFeedShape {
+        passes: slice_size.div_ceil(buffers.chunk_len),
+        transform: false,
+    })
+}
+
+/// The one place the transform arm's admission is resolved, for the pass and
+/// for the planning question that must agree with it.
+///
+/// The arm is admitted against the smaller of the caller's budget and what the
+/// dense arm reserves for the same shape, so taking it can only lower a pass's
+/// residency, never raise it — and the dense reservation the plan reports as
+/// the create's processing peak stays a true bound whichever arm runs.
+fn admit_transform(
+    slice_size: usize,
+    source_count: usize,
+    exponents: &[RecoveryExponent],
+    memory_limit: usize,
+    dense: &BufferPlan,
+    policy: TransformPolicy,
+) -> Option<transform::TransformArm> {
+    let budget = memory_limit.min(dense.memory_bytes);
+    // The dense reservation differs by architecture (its kernel and stripe
+    // choice do), so tests that pin a transform geometry pin its budget.
+    #[cfg(test)]
+    let budget = transform::test_probe::budget_override().unwrap_or(budget);
+    transform::admit(slice_size, source_count, exponents, budget, policy)
 }
 
 pub(crate) fn estimate_forward_memory(
@@ -3093,6 +3187,74 @@ fn jit_build_error(reason: String) -> Par2Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The transform arm the automatic policy admits for one create shape,
+    /// resolved exactly as a pass resolves it: the dense arm's reservation at
+    /// `memory_limit` first, then the transform against it.
+    fn auto_transform_for(
+        slice_size: usize,
+        source_count: usize,
+        recovery_count: u32,
+        memory_limit: usize,
+    ) -> (Option<transform::TransformShape>, usize) {
+        let exponents: Vec<RecoveryExponent> = (0..recovery_count).collect();
+        let (_, dense) = select_kernel_for_memory(
+            slice_size,
+            exponents.len(),
+            source_count,
+            memory_limit,
+            ForwardKernel::Auto,
+        )
+        .unwrap();
+        let arm = admit_transform(
+            slice_size,
+            source_count,
+            &exponents,
+            memory_limit,
+            &dense,
+            TransformPolicy::Auto,
+        );
+        (arm.map(|arm| arm.shape()), dense.memory_bytes)
+    }
+
+    /// Default limit on a 64 GiB host, the machine the shapes below were
+    /// measured on; a fixed figure keeps the pins independent of the test host.
+    const MEASURED_HOST_LIMIT: usize = 8 * 1024 * 1024 * 1024;
+
+    #[test]
+    fn narrow_band_shapes_take_the_transform_inside_the_dense_reservation() {
+        // 10 x 100 MiB at 32,008-byte slices: 32,760 sources and 3,277
+        // recovery blocks (10%), whose dense reservation buys a ~2.9 KiB band.
+        // 32,768 slices of 5,552 bytes with 32,768 recovery blocks buys
+        // ~3.0 KiB. Both measured 12x-25x faster on the transform; both were
+        // refused by the 4 KiB band floor this test pins against.
+        for (label, slice_size, sources, recovery) in [
+            ("10x100MiB/32008/3277", 32_008, 32_760, 3_277),
+            ("1x173MiB/5552/32768", 5_552, 32_768, 32_768),
+        ] {
+            let (arm, dense_bytes) =
+                auto_transform_for(slice_size, sources, recovery, MEASURED_HOST_LIMIT);
+            let shape = arm.unwrap_or_else(|| panic!("{label}: the transform was refused"));
+            assert!(
+                shape.total_bytes <= dense_bytes,
+                "{label}: {shape:?} exceeds the dense reservation {dense_bytes}"
+            );
+            assert!(shape.band >= 2 * 1024, "{label}: {shape:?}");
+            assert!(shape.passes > 1, "{label}: expected a multi-pass arm");
+        }
+    }
+
+    #[test]
+    fn shapes_the_fold_margin_rules_out_stay_dense() {
+        // The measured losing shape: n = 5600 at 768,000-byte slices with 32
+        // recovery blocks, where the plan performs MORE folds than the dense
+        // arm (ratio 0.97). Memory is no constraint here; the margin is.
+        let (arm, _) = auto_transform_for(768_000, 5_600, 32, MEASURED_HOST_LIMIT);
+        assert_eq!(arm, None);
+        // Too few sources for the 257-dimension to pay off.
+        let (arm, _) = auto_transform_for(32_008, 400, 400, MEASURED_HOST_LIMIT);
+        assert_eq!(arm, None);
+    }
 
     fn test_sources() -> Vec<Vec<u8>> {
         (0..19usize)

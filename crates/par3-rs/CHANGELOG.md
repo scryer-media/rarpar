@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.2
+
+- **Experimental**, outside the supported scope and absent from the README and
+  crate docs: `inside::rar4` inserts, verifies, repairs and removes a PAR3
+  carrier in RAR4 archives as a `NEWSUB` service block named `PAR3`, and in
+  RAR5 archives whose headers are encrypted (`-hp`), given the password. The
+  RAR4 end block's data CRC is kept valid by free bytes in the new block, so
+  removal restores the original byte for byte. `rarpar`'s
+  `examples/rar_inside_exp.rs` drives it. Readers tested against the layout:
+  unrar 7.23, rar 6.24 and 4.20 output, 7-Zip 26.01, libarchive 3.8.7 and
+  rarpar 0.6.1. The module's layout and API may change or be dropped without
+  notice; it is not a RAR writer and does not touch member data.
+
 ## 0.5.1
 
 - Relicensed from GPL-3.0-or-later to Apache-2.0. Releases up to 0.5.0 stay

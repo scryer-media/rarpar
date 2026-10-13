@@ -839,10 +839,15 @@ pub(crate) fn reject_obsolete_sibling_carriers(
     if !cli.overwrite {
         return Ok(());
     }
+    // A previous set is found by the base its files are named by: the stem
+    // without a carrier suffix in any case, as `par3_stream::sibling_paths`
+    // names this set's files.
     let name = stem.file_name().unwrap_or_default().to_string_lossy();
-    let stem = match name.strip_suffix(".par3") {
-        Some(base) => stem.with_file_name(base),
-        None => stem.to_path_buf(),
+    let base = crate::par3_stream::carrier_base(&name);
+    let stem = if base.len() < name.len() {
+        stem.with_file_name(base)
+    } else {
+        stem.to_path_buf()
     };
     reject_obsolete_carriers(cli, &stem, outputs, &options(cli)?)
 }

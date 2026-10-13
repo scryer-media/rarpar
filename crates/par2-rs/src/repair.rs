@@ -1322,6 +1322,10 @@ impl StreamBatchSet {
 pub(crate) struct StreamSourceReader {
     file_id: FileId,
     reader: Box<dyn FileRangeReader>,
+    /// Where the reader's cursor is after the last whole read, so a walk over
+    /// consecutive slices of one file reads on without seeking to where it
+    /// already is.
+    position: Option<u64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1354,13 +1358,23 @@ pub(crate) fn read_stream_source_chunk(
             *source_reader = file_access
                 .open_range_reader(&file_id)
                 .map_err(Par2Error::Io)?
-                .map(|reader| StreamSourceReader { file_id, reader });
+                .map(|reader| StreamSourceReader {
+                    file_id,
+                    reader,
+                    position: None,
+                });
         }
         if let Some(open) = source_reader.as_mut() {
+            let at = open.position.take();
+            if at != Some(offset) {
+                open.reader
+                    .seek(SeekFrom::Start(offset))
+                    .map_err(Par2Error::Io)?;
+            }
             open.reader
-                .seek(SeekFrom::Start(offset))
-                .and_then(|_| open.reader.read_exact(&mut dst[..expected_len]))
+                .read_exact(&mut dst[..expected_len])
                 .map_err(Par2Error::Io)?;
+            open.position = Some(offset + expected_len as u64);
         } else {
             let mut read_len = 0usize;
             while read_len < expected_len {

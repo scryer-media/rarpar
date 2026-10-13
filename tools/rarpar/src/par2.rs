@@ -497,7 +497,7 @@ pub fn repair_set(cli: &Cli, set: &Par2Set) -> Result<ParOutcome, RarparError> {
             .unwrap_or_else(|| set.base_dir.clone()),
         search_dirs: cli.search_dir.clone(),
         placement: cli.par_placement,
-        scanned: None,
+        scanned: set.reusable_packets(),
     };
     run_flow(&mut resolved, true, false, cli.quiet || cli.json)
 }
@@ -778,6 +778,44 @@ fn stream_slice_bytes(
         .map_err(|_| RarparError::Data(format!("{slice_size}-byte slices are too large")))
 }
 
+/// The budget of the session a stream is verified with. The slice buffer is charged
+/// against `--par3-memory-mib` first ([`stream_slice_bytes`]); the session
+/// may hold boundary bytes only in what that leaves, so the two together
+/// stay within the limit. Whole slices take nothing from its budget.
+fn stream_budget(budget_mib: usize, slice: usize) -> par2_rs::VerificationMemoryBudget {
+    let limit = budget_mib.saturating_mul(1 << 20);
+    par2_rs::VerificationMemoryBudget::new(limit.saturating_sub(slice))
+}
+
+#[cfg(test)]
+fn stream_session(budget_mib: usize, slice: usize) -> par2_rs::VerificationSession {
+    par2_rs::VerificationSession::with_memory_budget(stream_budget(budget_mib, slice))
+}
+
+/// Hands the session `data`, the stream's bytes of the file from `offset`,
+/// read into a buffer of one `slice`. A whole slice, or the file's shorter
+/// last one, is checked at once. Bytes that end inside a slice mean the
+/// stream ended there: that slice stays unverified, and the session is not
+/// given its bytes to hold for a rest that will not arrive.
+fn feed_slice(
+    session: &mut par2_rs::VerificationSession,
+    file_id: &par2_rs::FileId,
+    offset: u64,
+    expected: u64,
+    data: &[u8],
+    slice: usize,
+) -> Result<(), RarparError> {
+    if data.len() < slice && offset.saturating_add(data.len() as u64) < expected {
+        return Ok(());
+    }
+    match session.feed_range(file_id, offset, data).disposition() {
+        par2_rs::FeedDisposition::Verified | par2_rs::FeedDisposition::Duplicate => Ok(()),
+        other => Err(RarparError::Data(format!(
+            "the verifier did not settle the slice at offset {offset}: {other:?}"
+        ))),
+    }
+}
+
 /// Verifies the protected file `name` from standard input in one forward
 /// pass: each slice is checked as soon as its bytes have arrived, and only
 /// one slice is held at a time.
@@ -838,15 +876,18 @@ fn verify_stream(cli: &Cli, args: &ParArgs, name: &str) -> Result<u8, RarparErro
     let slice_size = set.slice_size;
     let slice = stream_slice_bytes(slice_size, expected, cli.par3_memory_mib)?;
 
-    let mut session = par2_rs::VerificationSession::new();
-    for path in &resolved.par2_paths {
-        let packets: Vec<_> = par2_rs::scan_packets_from_path_with_set_ids(path)?
-            .into_iter()
-            .filter(|scanned| scanned.recovery_set_id == set.recovery_set_id)
-            .map(|scanned| scanned.packet)
-            .collect();
-        session.add_par2_data(&packets);
-    }
+    // The session verifies against the set already loaded above rather than
+    // a second scan of every volume.
+    let mut session = par2_rs::VerificationSession::with_par2_set(
+        set,
+        par2_rs::VerificationSessionOptions::new()
+            .with_memory_budget(stream_budget(cli.par3_memory_mib, slice)),
+    );
+    let set = std::sync::Arc::clone(
+        session
+            .par2_set()
+            .expect("a session built over a set holds that set"),
+    );
 
     // A set may describe the file without slice checksums (no IFSC packet,
     // as in a truncated set). The disk verifier then checks the file by its
@@ -887,17 +928,14 @@ fn verify_stream(cli: &Cli, args: &ParArgs, name: &str) -> Result<u8, RarparErro
             if let Some(hash) = whole_file.as_mut() {
                 hash.update(&buffer[..within]);
             } else {
-                let outcome = session.feed_range(&file_id, received, &buffer[..within]);
-                match outcome.disposition() {
-                    par2_rs::FeedDisposition::Verified | par2_rs::FeedDisposition::Duplicate => {}
-                    // The stream ended inside a slice: it stays unverified.
-                    par2_rs::FeedDisposition::Buffered if filled < buffer.len() => {}
-                    other => {
-                        return Err(RarparError::Data(format!(
-                            "the verifier did not settle the slice at offset {received}: {other:?}"
-                        )));
-                    }
-                }
+                feed_slice(
+                    &mut session,
+                    &file_id,
+                    received,
+                    expected,
+                    &buffer[..within],
+                    buffer.len(),
+                )?;
             }
             received += within as u64;
         }
@@ -1680,5 +1718,65 @@ mod tests {
             par2_rs::Par2FileSet::from_paths(std::slice::from_ref(&outcome.main_path)).unwrap();
         let found = identify_set_volumes(temp.path(), &seed).unwrap();
         assert!(found.contains(renamed), "{found:?}");
+    }
+
+    /// A stream that ends inside a slice leaves that slice unverified and
+    /// hands the session none of its bytes. The session's budget is only what
+    /// the slice buffer leaves of `--par3-memory-mib`: a 1 MiB slice under a
+    /// 1 MiB limit leaves it nothing, where a default session would hold the
+    /// partial slice in a 64 MiB budget of its own, beside the buffer.
+    #[test]
+    fn a_stream_ending_inside_a_slice_holds_nothing_past_the_memory_limit() {
+        const MIB: usize = 1 << 20;
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("pebble.bin");
+        let data: Vec<u8> = (0..2 * MIB).map(|at| (at % 251) as u8).collect();
+        std::fs::write(&source, &data).unwrap();
+        let mut options = Par2CreatorOptions::with_output(
+            temp.path().join("pebble.par2"),
+            Some(temp.path().to_path_buf()),
+            vec![source],
+        );
+        options.block_sizing = BlockSizing::Bytes(1 << 20);
+        options.recovery_amount = RecoveryAmount::Count(1);
+        let creator = Par2Creator::new(options);
+        let outcome = creator.create(&creator.plan().unwrap()).unwrap();
+        let set =
+            par2_rs::Par2FileSet::from_paths(std::slice::from_ref(&outcome.main_path)).unwrap();
+        let file_id = set.recovery_file_ids[0];
+        let expected = data.len() as u64;
+        let slice = stream_slice_bytes(set.slice_size, expected, 1).unwrap();
+        assert_eq!(slice, MIB);
+
+        let mut session = stream_session(1, slice);
+        for path in &outcome.output_paths {
+            let packets: Vec<_> = par2_rs::scan_packets_from_path_with_set_ids(path)
+                .unwrap()
+                .into_iter()
+                .map(|scanned| scanned.packet)
+                .collect();
+            session.add_par2_data(&packets);
+        }
+        // The stream ends one byte short of the file.
+        for (index, piece) in data[..data.len() - 1].chunks(slice).enumerate() {
+            let offset = (index * slice) as u64;
+            feed_slice(&mut session, &file_id, offset, expected, piece, slice).unwrap();
+        }
+        assert_eq!(session.memory_budget().buffered_bytes(), 0);
+        assert_eq!(session.memory_budget().max_buffered_bytes(), 0);
+        let result = session.verification_result().unwrap();
+        let file = result
+            .files
+            .iter()
+            .find(|file| file.file_id == file_id)
+            .unwrap();
+        assert_eq!(file.valid_slices, [true, false]);
+        // With room to spare, the session's budget is that room.
+        assert_eq!(
+            stream_session(4, slice)
+                .memory_budget()
+                .max_buffered_bytes(),
+            3 * MIB
+        );
     }
 }

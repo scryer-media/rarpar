@@ -17,6 +17,10 @@ pub use repair::{SelfRepairPlan, SelfRepairReport};
 #[path = "inside_rar5.rs"]
 pub mod rar5;
 
+// EXPERIMENTAL: RAR4 (and RAR5 -hp) PAR-inside; not part of the supported scope.
+#[path = "inside_rar4.rs"]
+pub mod rar4;
+
 use crc_fast::{CrcAlgorithm, Digest};
 
 use crate::runtime::{EngineError, EngineResult, ExecutionOptions, MemoryCategory};

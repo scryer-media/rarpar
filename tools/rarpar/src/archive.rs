@@ -46,7 +46,7 @@ use crate::par3_stream::{
     block_count, build_set, inside_geometry, inside_size, reference_field, sibling_geometry,
     write_inside, write_sibling,
 };
-use crate::sidecar::{Sidecar, SidecarPlan, preflight_set};
+use crate::sidecar::{Sidecar, SidecarPlan, output_exists, preflight_set};
 
 const MIB: u64 = 1 << 20;
 
@@ -895,7 +895,7 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
     }
     for path in &outputs {
         reject_symlinks(path)?;
-        if !cli.overwrite && path.try_exists()? {
+        if output_exists(path)? && !cli.overwrite {
             return Err(RarparError::Unsafe(format!(
                 "output exists: {}",
                 path.display()
@@ -1190,7 +1190,7 @@ pub fn run(cli: &Cli, args: &Par3ArchiveArgs) -> Result<(bool, Value), RarparErr
         refuse_aliases(&planned)?;
         for (_, _, path) in &volumes {
             reject_symlinks(path)?;
-            if !cli.overwrite && std::fs::symlink_metadata(path).is_ok() {
+            if output_exists(path)? && !cli.overwrite {
                 return Err(RarparError::Unsafe(format!(
                     "output exists: {}",
                     path.display()

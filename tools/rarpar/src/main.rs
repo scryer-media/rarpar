@@ -259,8 +259,7 @@ fn run_cleanup(cli: &Cli, mut paths: Vec<std::path::PathBuf>) -> Result<u8, Rarp
     }
     if !members.is_empty() {
         paths.extend(members);
-        let cached = std::mem::take(&mut report.par3_sets);
-        report = discovery::discover_reusing_par3(paths, &options, Some(cached))?;
+        report = discovery::rediscover(paths, &options, &mut report)?;
     }
     for set in &mut report.par3_sets {
         set.release_carriers();
@@ -311,8 +310,7 @@ fn rediscover_preserving_history(
 ) -> Result<(), RarparError> {
     let executed_actions = std::mem::take(&mut report.executed_actions);
     let cleanup_results = std::mem::take(&mut report.cleanup_results);
-    let par3_sets = std::mem::take(&mut report.par3_sets);
-    *report = discovery::discover_reusing_par3(paths.to_vec(), options, Some(par3_sets))?;
+    *report = discovery::rediscover(paths.to_vec(), options, report)?;
     report.executed_actions = executed_actions;
     report.cleanup_results = cleanup_results;
     emit_progress(cli, report)

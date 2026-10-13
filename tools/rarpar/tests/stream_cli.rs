@@ -408,6 +408,50 @@ fn par3_create_from_a_pipe_refuses_to_leave_obsolete_volumes_behind() {
 }
 
 #[test]
+fn par3_create_from_a_pipe_takes_a_par3_suffix_in_any_case_as_the_carrier() {
+    let temp = tempfile::tempdir().unwrap();
+    let (piped, from_file) = (temp.path().join("piped"), temp.path().join("from_file"));
+    std::fs::create_dir_all(&piped).unwrap();
+    std::fs::create_dir_all(&from_file).unwrap();
+    let data = sample(5000, 23);
+    let args = [
+        "par3", "create", "SET.PAR3", "-", "--name", "data", "-s", "1024", "-c", "1",
+    ];
+    // The set is named off `SET`, as `par3 create` over the file names it,
+    // not `SET.PAR3.par3`.
+    ok(&through_pipes(&piped, &args, data.clone()));
+    assert_eq!(listing(&piped), ["SET.par3", "SET.vol0+1.par3"]);
+    std::fs::write(from_file.join("data"), &data).unwrap();
+    ok(&rarpar(
+        &from_file,
+        &[
+            "par3", "create", "SET.PAR3", "data", "-s", "1024", "-c", "1",
+        ],
+    ));
+    assert_eq!(listing(&from_file), ["SET.par3", "SET.vol0+1.par3", "data"]);
+    std::fs::write(piped.join("data"), &data).unwrap();
+    assert_eq!(par3_verdicts(&piped, "SET.par3").0, Some(0));
+    std::fs::remove_file(piped.join("data")).unwrap();
+    // The set is not replaced without --overwrite.
+    code_of(&through_pipes(&piped, &args, data.clone()), 3);
+
+    // Where names fold case, an existing `SET.PAR3` is the set's index, so
+    // it is refused without --overwrite as well.
+    for name in listing(&piped) {
+        std::fs::remove_file(piped.join(name)).unwrap();
+    }
+    std::fs::write(piped.join("SET.PAR3"), b"someone else's").unwrap();
+    if piped.join("SET.par3").exists() {
+        code_of(&through_pipes(&piped, &args, data.clone()), 3);
+        assert_eq!(listing(&piped), ["SET.PAR3"]);
+        assert_eq!(
+            std::fs::read(piped.join("SET.PAR3")).unwrap(),
+            b"someone else's"
+        );
+    }
+}
+
+#[test]
 fn par3_create_from_a_pipe_too_short_for_a_block_leaves_no_volumes_behind() {
     // 32 bytes hold no 4096-byte block and are too short for a tail block,
     // so the set is its index alone, not the volumes -c names: replacing a
@@ -735,6 +779,55 @@ fn par_verify_from_a_pipe_refuses_a_slice_size_it_cannot_hold() {
         first,
     );
     assert_eq!(over.status.code(), Some(1));
+}
+
+#[test]
+fn par_verify_from_a_pipe_ending_inside_a_slice_leaves_it_unverified_within_the_limit() {
+    // One 1 MiB slice takes the whole of a 1 MiB limit, so the verifier has
+    // nothing left to hold a slice the stream ended inside: that slice is
+    // reported missing, not buffered beside the slice being read.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let data = sample(2 << 20, 29);
+    std::fs::write(root.join("big.bin"), &data).unwrap();
+    ok(&rarpar(
+        root,
+        &[
+            "par",
+            "create",
+            "set.par2",
+            "big.bin",
+            "-s",
+            "1048576",
+            "--recovery-count",
+            "1",
+        ],
+    ));
+    let short = through_pipes(
+        root,
+        &[
+            "--json",
+            "--par3-memory-mib",
+            "1",
+            "par",
+            "verify",
+            "set.par2",
+            "--name",
+            "big.bin",
+        ],
+        data[..data.len() - 1].to_vec(),
+    );
+    assert_eq!(
+        short.status.code(),
+        Some(1),
+        "stderr={}",
+        String::from_utf8_lossy(&short.stderr)
+    );
+    let report = json(&short);
+    assert_eq!(report["success"], false);
+    assert_eq!(report["stream"]["bytes"], data.len() as u64 - 1);
+    assert_eq!(report["stream"]["damaged_slices"], serde_json::json!([]));
+    assert_eq!(report["stream"]["missing_slices"], 1);
 }
 
 #[test]

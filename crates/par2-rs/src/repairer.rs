@@ -2741,7 +2741,7 @@ fn write_file_at(file: &File, src: &[u8], offset: u64) -> io::Result<usize> {
     cloned.write(src)
 }
 
-fn write_all_file_at(file: &File, mut src: &[u8], mut offset: u64) -> io::Result<()> {
+pub(crate) fn write_all_file_at(file: &File, mut src: &[u8], mut offset: u64) -> io::Result<()> {
     while !src.is_empty() {
         let written = write_file_at(file, src, offset)?;
         if written == 0 {
@@ -2792,7 +2792,11 @@ fn read_file_at(file: &File, dst: &mut [u8], offset: u64) -> io::Result<usize> {
 
 /// Positional `read_exact`: fills `dst` from `offset` without relying on the
 /// handle's seek cursor, so parallel scan segments can share one handle.
-fn read_exact_file_at(file: &File, mut dst: &mut [u8], mut offset: u64) -> io::Result<()> {
+pub(crate) fn read_exact_file_at(
+    file: &File,
+    mut dst: &mut [u8],
+    mut offset: u64,
+) -> io::Result<()> {
     while !dst.is_empty() {
         match read_file_at(file, dst, offset) {
             Ok(0) => {

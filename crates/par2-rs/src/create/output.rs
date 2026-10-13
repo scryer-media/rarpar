@@ -1,7 +1,7 @@
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 #[cfg(windows)]
 use std::mem::MaybeUninit;
 use std::mem::size_of;
@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::checksum::Md5State;
 use crate::error::{Par2Error, Result};
 use crate::packet::encode::{encode_header, encode_packet, start_streamed_hash};
-use crate::packet::header::{HEADER_SIZE, PacketHeader, TYPE_CREATOR};
+use crate::packet::header::{HEADER_SIZE, TYPE_CREATOR};
 use crate::packet::{Packet, scan_packets_from_path_with_set_ids_cancellable};
 use crate::types::{CancellationToken, FileId, RecoveryExponent, RecoverySetId};
 
@@ -505,6 +505,8 @@ enum ExpectedPacket {
 }
 
 struct RecoverySlot {
+    /// The encoder's output index this slot stores.
+    output_index: usize,
     exponent: RecoveryExponent,
     header_offset: u64,
     data_offset: u64,
@@ -516,7 +518,8 @@ struct VolumeState {
     stage_path: PathBuf,
     target_path: PathBuf,
     file: File,
-    expected: Vec<ExpectedPacket>,
+    /// Every packet staged into this volume, in file order, with its length.
+    expected: Vec<(ExpectedPacket, u64)>,
     recovery_slots: Vec<RecoverySlot>,
 }
 
@@ -1652,10 +1655,12 @@ pub(crate) fn write_outputs(
         // the CPU encoder, only when there are recovery blocks for it to
         // compute, and only when the pass is single-stripe, because a
         // stripe-major feed does not deliver a file's bytes in file order.
-        // Anything else reads them here.
-        let fuse_source_hashing = plan.recovery_count > 0
-            && matches!(backend, SelectedBackend::Cpu)
-            && super::encode::forward_stripe_count(
+        // A multi-pass transform still needs that one file-order read, but
+        // takes its first band from it instead of reading the band strided
+        // (see `DiskSourceProvider::hash_during_first_band`). Anything else
+        // reads them here.
+        let feed = if plan.recovery_count > 0 && matches!(backend, SelectedBackend::Cpu) {
+            Some(super::encode::forward_feed_shape(
                 plan.slice_size,
                 plan.source_slice_count as usize,
                 &plan.recovery_exponents,
@@ -1664,8 +1669,14 @@ pub(crate) fn write_outputs(
                     .unwrap_or_else(super::plan::default_memory_limit),
                 options.forward_kernel,
                 transform_policy,
-            )? == 1;
-        if !fuse_source_hashing && !hydrated {
+            )?)
+        } else {
+            None
+        };
+        let fuse_source_hashing = feed.is_some_and(|feed| feed.passes == 1);
+        let hash_during_first_band =
+            !hydrated && feed.is_some_and(|feed| feed.transform && feed.passes > 1);
+        if !fuse_source_hashing && !hash_during_first_band && !hydrated {
             super::source::hydrate_source_hashes(
                 &mut sources,
                 plan.slice_size,
@@ -1684,6 +1695,9 @@ pub(crate) fn write_outputs(
                 })?;
             let mut provider =
                 DiskSourceProvider::open(&sources, slice_size, &options.cancellation)?;
+            if hash_during_first_band {
+                provider.hash_during_first_band();
+            }
             let attempt = {
                 let mut sink = RecoveryWriter {
                     outputs: &mut staged,
@@ -1750,6 +1764,24 @@ pub(crate) fn write_outputs(
                 continue;
             }
             provider.verify_unchanged()?;
+            let fused = match fused.or_else(|| provider.take_content_hashes()) {
+                Some(fused) => Some(fused),
+                // The first-band sweep was asked for but the encode did not
+                // take the transform arm it was planned against; read the
+                // hashes now rather than write placeholder packets.
+                None if hash_during_first_band => {
+                    drop(provider);
+                    super::source::hydrate_source_hashes(
+                        &mut sources,
+                        plan.slice_size,
+                        &options.cancellation,
+                    )?;
+                    let critical = build_critical_packets(plan, &sources)?;
+                    staged.rewrite_critical_packets(&critical, &options.cancellation)?;
+                    None
+                }
+                None => None,
+            };
             if let Some(fused) = fused {
                 fused.apply(&mut sources)?;
                 // Same packets at the same offsets, now with the hashes the
@@ -1767,6 +1799,10 @@ pub(crate) fn write_outputs(
         break staged;
     };
 
+    #[cfg(test)]
+    if validation_fault::armed() {
+        staged.corrupt_first_recovery_payload_byte()?;
+    }
     staged.validate(plan, &sources, &options.cancellation)?;
     let bytes_written = staged.bytes_written()?;
     staged.commit(options.overwrite, &options.cancellation)?;
@@ -1875,7 +1911,7 @@ fn append_critical_packet(
 
 fn append_packet(volume: &mut VolumeState, expected: ExpectedPacket, packet: &[u8]) -> Result<()> {
     volume.file.write_all(packet).map_err(Par2Error::Io)?;
-    volume.expected.push(expected);
+    volume.expected.push((expected, packet.len() as u64));
     Ok(())
 }
 
@@ -1924,9 +1960,12 @@ fn append_recovery_slot(
     let data_offset = volume.file.stream_position().map_err(Par2Error::Io)?;
     write_zeroes(&mut volume.file, slice_size, cancellation)?;
     check_cancel(cancellation)?;
-    volume.expected.push(ExpectedPacket::Recovery(exponent));
+    volume
+        .expected
+        .push((ExpectedPacket::Recovery(exponent), packet_length));
     let slot_index = volume.recovery_slots.len();
     volume.recovery_slots.push(RecoverySlot {
+        output_index: global_index,
         exponent,
         header_offset,
         data_offset,
@@ -1994,9 +2033,15 @@ fn validate_staged_volume(
             ),
         ));
     }
-    let mut file = File::open(&volume.stage_path).map_err(Par2Error::Io)?;
+    // The scan above is the read-back: one sequential pass over the staged
+    // file that authenticated every packet it returned against the MD5 in its
+    // header, including every recovery payload, whose header digest
+    // `finish_recovery_headers` took from the bytes as they were handed to the
+    // writer. What is left to check is that the packets sit exactly where they
+    // were staged, back to back, and say what the plan says; none of that
+    // needs the file again.
     let mut offset = 0u64;
-    for (scanned, expected) in scanned.iter().zip(&volume.expected) {
+    for (scanned, (expected, length)) in scanned.iter().zip(&volume.expected) {
         check_cancel(cancellation)?;
         if scanned.offset != offset || scanned.recovery_set_id != plan.recovery_set_id {
             return Err(validation_error(
@@ -2004,22 +2049,10 @@ fn validate_staged_volume(
                 "packet offsets or recovery-set identifiers are inconsistent".to_string(),
             ));
         }
-        let mut header_bytes = [0u8; HEADER_SIZE];
-        file.seek(SeekFrom::Start(offset)).map_err(Par2Error::Io)?;
-        file.read_exact(&mut header_bytes).map_err(Par2Error::Io)?;
-        let header = PacketHeader::parse(&header_bytes, offset)
-            .map_err(|error| validation_error(&volume.stage_path, error.to_string()))?;
-        offset = offset.checked_add(header.length).ok_or_else(|| {
+        offset = offset.checked_add(*length).ok_or_else(|| {
             validation_error(&volume.stage_path, "packet offsets overflow".to_string())
         })?;
-        validate_expected_packet(
-            scanned,
-            expected,
-            plan,
-            sources,
-            &volume.stage_path,
-            cancellation,
-        )?;
+        validate_expected_packet(scanned, expected, plan, sources, &volume.stage_path)?;
     }
     check_cancel(cancellation)?;
     if offset != file_length {
@@ -2037,9 +2070,7 @@ fn validate_expected_packet(
     plan: &Par2CreatePlan,
     sources: &[CreationSource],
     path: &Path,
-    cancellation: &CancellationToken,
 ) -> Result<()> {
-    check_cancel(cancellation)?;
     if scanned.recovery_set_id != plan.recovery_set_id {
         return Err(validation_error(
             path,
@@ -2096,25 +2127,11 @@ fn validate_expected_packet(
             }
         }
         (ExpectedPacket::Recovery(exponent), Packet::RecoverySlice(packet)) => {
+            // The payload's hash was checked by the scan that produced it.
             if packet.exponent != *exponent || packet.data.len() != plan.slice_size as usize {
                 return Err(validation_error(
                     path,
                     "recovery packet length or exponent differs from plan".to_string(),
-                ));
-            }
-            let valid = match packet.data.validate_packet_hash_cancellable(
-                plan.recovery_set_id.as_bytes(),
-                *exponent,
-                cancellation,
-            ) {
-                Ok(valid) => valid,
-                Err(Par2Error::Cancelled) => return Err(Par2Error::Cancelled),
-                Err(error) => return Err(validation_error(path, error.to_string())),
-            };
-            if !valid {
-                return Err(validation_error(
-                    path,
-                    "recovery packet hash is invalid".to_string(),
                 ));
             }
         }
@@ -2160,17 +2177,7 @@ impl ForwardRecoverySink for RecoveryWriter<'_> {
         if data.is_empty() {
             return Ok(());
         }
-        if data.len() > self.slice_size
-            || usize::try_from(offset)
-                .ok()
-                .and_then(|start| start.checked_add(data.len()))
-                .is_none_or(|end| end > self.slice_size)
-        {
-            return Err(Par2Error::CreationValidation {
-                path: "recovery output".to_string(),
-                reason: "encoder supplied a chunk outside the slice".to_string(),
-            });
-        }
+        check_chunk_bounds(self.slice_size, offset, data)?;
         let location = *self.outputs.locations.get(output_index).ok_or_else(|| {
             Par2Error::CreationValidation {
                 path: "recovery output".to_string(),
@@ -2192,28 +2199,148 @@ impl ForwardRecoverySink for RecoveryWriter<'_> {
                 path: volume.stage_path.display().to_string(),
                 reason: "recovery slot index is out of range".to_string(),
             })?;
-        if slot.exponent != exponent || slot.bytes_written != offset {
+        store_recovery_chunk(
+            slot,
+            &volume.file,
+            &volume.stage_path,
+            exponent,
+            offset,
+            data,
+        )
+    }
+
+    /// Every slot's chunks of the band, slots in parallel: the packet MD5 and
+    /// the copy into the page cache are the serial tail of each transform
+    /// pass, and slots share nothing but their volume's handle, which a
+    /// positional write does not move.
+    fn write_recovery_band<'d>(
+        &mut self,
+        rows: usize,
+        chunks: usize,
+        chunk: &(dyn Fn(usize, usize) -> (RecoveryExponent, u64, &'d [u8]) + Sync),
+    ) -> Result<()> {
+        // A pinned single thread keeps the caller's own thread, as `validate`
+        // does: handing the band to a pool worker would only add that worker's
+        // stack and allocator arena to the peak.
+        if !reedsolomon_rs::threading::parallel_enabled()
+            || super::encode::configured_create_threads() == 1
+        {
+            for row in 0..rows {
+                for at in 0..chunks {
+                    let (exponent, offset, data) = chunk(row, at);
+                    self.write_recovery_chunk(row, exponent, offset, data)?;
+                }
+            }
+            return Ok(());
+        }
+        if self.outputs.locations.len() != rows {
             return Err(Par2Error::CreationValidation {
-                path: volume.stage_path.display().to_string(),
-                reason: "encoder recovery chunks are out of order".to_string(),
+                path: "recovery output".to_string(),
+                reason: "encoder band does not cover every recovery output".to_string(),
             });
         }
-        let write_offset = slot.data_offset.checked_add(offset).ok_or_else(|| {
-            Par2Error::ResourceLimitExceeded {
-                reason: "recovery write offset overflows".to_string(),
-            }
-        })?;
-        volume.file.seek(SeekFrom::Start(write_offset))?;
-        volume.file.write_all(data)?;
-        slot.hasher.update(data);
-        slot.bytes_written = slot
-            .bytes_written
-            .checked_add(data.len() as u64)
-            .ok_or_else(|| Par2Error::ResourceLimitExceeded {
-                reason: "recovery byte count overflows".to_string(),
-            })?;
-        Ok(())
+        let slice_size = self.slice_size;
+        let cancellation = self.cancellation;
+        use rayon::prelude::*;
+        // Any one failure stops the band; nothing here is collected, so the
+        // pool's threads allocate nothing.
+        self.outputs.volumes.par_iter_mut().try_for_each(|volume| {
+            let VolumeState {
+                file,
+                stage_path,
+                recovery_slots,
+                ..
+            } = volume;
+            let (file, stage_path) = (&*file, &*stage_path);
+            recovery_slots
+                .par_iter_mut()
+                .with_min_len(16)
+                .try_for_each(|slot| {
+                    store_slot_chunks(
+                        slot,
+                        file,
+                        stage_path,
+                        slice_size,
+                        cancellation,
+                        chunks,
+                        chunk,
+                    )
+                })
+        })
     }
+}
+
+/// Every chunk of one slot's band, in order. Cancellation is polled before
+/// each chunk, as the sequential arm's `write_recovery_chunk` polls it, so
+/// both arms stop within one chunk of a cancel.
+fn store_slot_chunks<'d>(
+    slot: &mut RecoverySlot,
+    file: &File,
+    stage_path: &Path,
+    slice_size: usize,
+    cancellation: &CancellationToken,
+    chunks: usize,
+    chunk: &(dyn Fn(usize, usize) -> (RecoveryExponent, u64, &'d [u8]) + Sync),
+) -> Result<()> {
+    for at in 0..chunks {
+        if cancellation.is_cancelled() {
+            return Err(Par2Error::Cancelled);
+        }
+        let (exponent, offset, data) = chunk(slot.output_index, at);
+        check_chunk_bounds(slice_size, offset, data)?;
+        store_recovery_chunk(slot, file, stage_path, exponent, offset, data)?;
+    }
+    Ok(())
+}
+
+fn check_chunk_bounds(slice_size: usize, offset: u64, data: &[u8]) -> Result<()> {
+    if data.len() > slice_size
+        || usize::try_from(offset)
+            .ok()
+            .and_then(|start| start.checked_add(data.len()))
+            .is_none_or(|end| end > slice_size)
+    {
+        return Err(Par2Error::CreationValidation {
+            path: "recovery output".to_string(),
+            reason: "encoder supplied a chunk outside the slice".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Append one in-order chunk to a recovery slot: write it in place and fold it
+/// into the packet digest.
+fn store_recovery_chunk(
+    slot: &mut RecoverySlot,
+    file: &File,
+    stage_path: &Path,
+    exponent: RecoveryExponent,
+    offset: u64,
+    data: &[u8],
+) -> Result<()> {
+    if slot.exponent != exponent || slot.bytes_written != offset {
+        return Err(Par2Error::CreationValidation {
+            path: stage_path.display().to_string(),
+            reason: "encoder recovery chunks are out of order".to_string(),
+        });
+    }
+    let write_offset =
+        slot.data_offset
+            .checked_add(offset)
+            .ok_or_else(|| Par2Error::ResourceLimitExceeded {
+                reason: "recovery write offset overflows".to_string(),
+            })?;
+    // Positional: one syscall per chunk instead of a seek and a write, and
+    // every later write to this handle seeks explicitly first.
+    crate::repairer::write_all_file_at(file, data, write_offset)?;
+    slot.hasher.update(data);
+    slot.bytes_written = slot
+        .bytes_written
+        .checked_add(data.len() as u64)
+        .ok_or_else(|| Par2Error::ResourceLimitExceeded {
+            reason: "recovery byte count overflows".to_string(),
+        })?;
+    Ok(())
 }
 
 fn sync_parent_directories(paths: &[PathBuf]) -> Result<()> {
@@ -2726,6 +2853,49 @@ fn bit_length(value: u32) -> u32 {
     u32::BITS - value.leading_zeros()
 }
 
+/// Flip one staged recovery byte between the write and the read-back, to pin
+/// that the read-back still sees a payload that differs from what was hashed.
+#[cfg(test)]
+pub(crate) mod validation_fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn with<T>(body: impl FnOnce() -> T) -> T {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                ARMED.with(|armed| armed.set(self.0));
+            }
+        }
+        let _restore = Restore(ARMED.with(|armed| armed.replace(true)));
+        body()
+    }
+
+    pub(super) fn armed() -> bool {
+        ARMED.with(Cell::get)
+    }
+}
+
+#[cfg(test)]
+impl StagedOutputs {
+    fn corrupt_first_recovery_payload_byte(&mut self) -> Result<()> {
+        let volume = self
+            .volumes
+            .iter_mut()
+            .find(|volume| !volume.recovery_slots.is_empty())
+            .expect("a staged recovery slot");
+        let offset = volume.recovery_slots[0].data_offset;
+        let mut byte = [0u8; 1];
+        crate::repairer::read_exact_file_at(&volume.file, &mut byte, offset)?;
+        byte[0] ^= 0x01;
+        crate::repairer::write_all_file_at(&volume.file, &byte, offset)?;
+        Ok(())
+    }
+}
+
 fn validation_error(path: &Path, reason: String) -> Par2Error {
     Par2Error::CreationValidation {
         path: path.display().to_string(),
@@ -2736,6 +2906,89 @@ fn validation_error(path: &Path, reason: String) -> Par2Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The parallel band arm polls cancellation before every chunk of a slot,
+    /// as the sequential arm does through `write_recovery_chunk`: a cancel
+    /// raised while chunk 3 is produced stops the slot before chunk 4.
+    #[test]
+    fn a_parallel_band_slot_stops_within_one_chunk_of_a_cancel() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let directory = tempfile::tempdir().unwrap();
+        let stage_path = directory.path().join("stage.par2");
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&stage_path)
+            .unwrap();
+        let mut slot = RecoverySlot {
+            output_index: 0,
+            exponent: 7,
+            header_offset: 0,
+            data_offset: 0,
+            bytes_written: 0,
+            hasher: Md5State::new(),
+        };
+        let cancellation = CancellationToken::new();
+        let data = [0xa5u8; 16];
+        let calls = AtomicUsize::new(0);
+        let chunk = |_: usize, at: usize| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            if at == 3 {
+                cancellation.cancel();
+            }
+            (7, (at * data.len()) as u64, &data[..])
+        };
+        let error = store_slot_chunks(
+            &mut slot,
+            &file,
+            &stage_path,
+            8 * data.len(),
+            &cancellation,
+            8,
+            &chunk,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Par2Error::Cancelled));
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
+        assert_eq!(slot.bytes_written, 4 * data.len() as u64);
+    }
+
+    #[test]
+    fn the_staged_read_back_rejects_a_recovery_payload_that_changed_after_hashing() {
+        use crate::create::{BlockSizing, Par2Creator, Par2CreatorOptions, RecoveryAmount};
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.bin");
+        fs::write(
+            &source,
+            (0..40_000u32)
+                .map(|value| value.wrapping_mul(2_654_435_761) as u8)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let mut options =
+            Par2CreatorOptions::new(Some(directory.path().to_path_buf()), vec![source]);
+        options.output = Some(directory.path().join("set.par2"));
+        options.block_sizing = BlockSizing::Bytes(4_096);
+        options.recovery_amount = RecoveryAmount::Count(4);
+        let creator = Par2Creator::new(options);
+        let plan = creator.plan().unwrap();
+
+        let error = validation_fault::with(|| creator.create(&plan)).unwrap_err();
+
+        assert!(
+            matches!(error, Par2Error::CreationValidation { .. }),
+            "unexpected error: {error:?}"
+        );
+        let leftovers = fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "source.bin")
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "outputs left behind: {leftovers:?}");
+    }
 
     #[test]
     fn zero_fill_honors_cancellation_before_writing() {

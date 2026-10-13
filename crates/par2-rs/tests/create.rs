@@ -974,3 +974,59 @@ fn native_metal_disabled_policy_reports_unavailable_before_staging() {
             .starts_with(".par2-create-")
     }));
 }
+
+/// A session started from a set loaded with `Par2FileSet::from_paths` reaches
+/// the same verdicts as one handed every volume's packets, for intact and for
+/// damaged slices, without reading the volumes again.
+#[test]
+fn a_session_over_a_loaded_set_verifies_like_one_fed_the_packets() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("payload.bin");
+    let data: Vec<u8> = (0..20_000u32).map(|i| (i * 31 % 251) as u8).collect();
+    fs::write(&source, &data).unwrap();
+    let mut options = Par2CreatorOptions::with_output(
+        dir.path().join("payload.par2"),
+        Some(dir.path().to_path_buf()),
+        vec![source],
+    );
+    options.block_sizing = BlockSizing::Bytes(1024);
+    options.recovery_amount = RecoveryAmount::Count(3);
+    let creator = Par2Creator::new(options);
+    let outcome = creator.create(&creator.plan().unwrap()).unwrap();
+    let mut volumes = vec![outcome.main_path.clone()];
+    volumes.extend(outcome.volume_paths.iter().cloned());
+
+    let set = Par2FileSet::from_paths(&volumes).unwrap();
+    let file_id = set.recovery_file_ids[0];
+    let mut damaged = data.clone();
+    damaged[5_000] ^= 0x5a;
+
+    for bytes in [&data, &damaged] {
+        let mut loaded = par2_rs::VerificationSession::with_par2_set(
+            set.clone(),
+            par2_rs::VerificationSessionOptions::new(),
+        );
+        let mut fed = par2_rs::VerificationSession::new();
+        for path in &volumes {
+            let packets: Vec<_> = par2_rs::scan_packets_from_path_with_set_ids(path)
+                .unwrap()
+                .into_iter()
+                .map(|scanned| scanned.packet)
+                .collect();
+            fed.add_par2_data(&packets);
+        }
+        for session in [&mut loaded, &mut fed] {
+            for (index, chunk) in bytes.chunks(1024).enumerate() {
+                session.feed_data(&file_id, index as u64 * 1024, chunk);
+            }
+        }
+        assert_eq!(
+            format!("{:?}", loaded.verification_result().unwrap()),
+            format!("{:?}", fed.verification_result().unwrap()),
+        );
+        assert_eq!(
+            loaded.verification_result().unwrap().total_missing_blocks,
+            u32::from(!std::ptr::eq(bytes, &data)),
+        );
+    }
+}
