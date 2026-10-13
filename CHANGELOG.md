@@ -22,6 +22,15 @@ documented in each crate's own changelog so those notes ship with the crate.
   ignores case (macOS and Windows by default): `rar list SET.part01.rar` over
   `set.partNN.rar` read the named volume alone.
 
+### Changed
+
+- `par create` (PAR2) is faster on narrow slices with many recovery blocks,
+  and at more than one thread, on par2-rs 0.10.9, without raising peak
+  memory by more than 1 MiB: 10 x 100 MiB at 32,008-byte slices with 3,277
+  recovery blocks takes 4.9 s instead of 61.8 s single-threaded, and 1 GiB
+  with 32,768 recovery blocks 9.7 s instead of 13.2 s at 8 threads. A create
+  issues about half the seeks it did.
+
 ## rarpar 0.6.1
 
 ### CLI Changes
