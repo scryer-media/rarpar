@@ -206,7 +206,11 @@ jobs:
               print(f"packaged dependency: {name} {dependency['req']}")
           PY
       - name: Hydrate the test corpus (release-tests)
-        run: cargo run --locked -p xtask -- test-corpus hydrate --profile release-tests
+        # The rarpar CLI tests open the rar5_mv_store_pair and rar4_enc_mv_store
+        # volume sets. The published `release-tests` profile predates them, so
+        # the `unrar` profile rides along until a corpus revision carrying the
+        # widened `release-tests` profile is pinned.
+        run: cargo run --locked -p xtask -- test-corpus hydrate --profile release-tests --profile unrar
       - name: Run release preflight checks
         run: |
           cargo fmt --check --all
