@@ -555,13 +555,17 @@ impl DftPlan {
     /// # Errors
     ///
     /// [`TransformError::Geometry`] if the scratch was not built for this
-    /// plan.
+    /// plan, or if the plan has no output rows (its result slots would be
+    /// empty).
     pub fn scratch_parts<'s>(
         &self,
         scratch: &'s mut DftScratch,
     ) -> Result<(std::slice::ChunksExactMut<'s, u8>, &'s mut [u8]), TransformError> {
         let stripe_len = scratch.stripe_len;
-        if stripe_len == 0 || scratch.buf.len() != self.scratch_bytes(stripe_len) {
+        if stripe_len == 0
+            || self.result_rows == 0
+            || scratch.buf.len() != self.scratch_bytes(stripe_len)
+        {
             return Err(TransformError::Geometry);
         }
         let (results, stage) = scratch
@@ -619,7 +623,9 @@ impl DftPlan {
     /// # Errors
     ///
     /// [`TransformError::Geometry`] if a bucket index, a result length, the
-    /// row range or the output length does not match the plan.
+    /// row range or the output length does not match the plan. An empty row
+    /// range takes no output bytes and no buckets: with no row there is no
+    /// stripe length to check a bucket's result against.
     pub fn accumulate_buckets(
         &self,
         buckets: &[(usize, &[u8])],
@@ -629,8 +635,12 @@ impl DftPlan {
         if rows.end > self.output_count || rows.start > rows.end {
             return Err(TransformError::Geometry);
         }
-        if rows.is_empty() || buckets.is_empty() {
-            return Ok(());
+        if rows.is_empty() {
+            return if outputs.is_empty() && buckets.is_empty() {
+                Ok(())
+            } else {
+                Err(TransformError::Geometry)
+            };
         }
         if !outputs.len().is_multiple_of(rows.len()) {
             return Err(TransformError::Geometry);
@@ -644,7 +654,7 @@ impl DftPlan {
         {
             return Err(TransformError::Geometry);
         }
-        if stripe_len == 0 {
+        if stripe_len == 0 || buckets.is_empty() {
             return Ok(());
         }
         const ACCUMULATE_BATCH: usize = 16;
@@ -1174,6 +1184,29 @@ mod tests {
         );
         plan.accumulate_buckets(&[(0, &result)], 0..4, &mut out)
             .unwrap();
+        // An empty row range holds no output bytes and no buckets, and an
+        // empty bucket list still needs outputs that fit the rows.
+        assert!(plan.accumulate_buckets(&[], 0..0, &mut [0u8; 8]).is_err());
+        assert!(
+            plan.accumulate_buckets(&[(0, &result)], 0..0, &mut [])
+                .is_err()
+        );
+        assert!(plan.accumulate_buckets(&[], 0..2, &mut [0u8; 3]).is_err());
+        plan.accumulate_buckets(&[], 0..0, &mut []).unwrap();
+        plan.accumulate_buckets(&[], 0..2, &mut [0u8; 4]).unwrap();
+    }
+
+    /// A plan with no output rows has empty result slots, which cannot be
+    /// split into chunks; the split is refused instead of panicking.
+    #[test]
+    fn scratch_parts_refuses_a_plan_without_output_rows() {
+        let slots = par2_slots(10);
+        let plan = DftPlan::build(&slots, 0..0).unwrap();
+        let mut scratch = DftScratch::new(&plan, 64);
+        assert!(matches!(
+            plan.scratch_parts(&mut scratch),
+            Err(TransformError::Geometry)
+        ));
     }
 
     #[test]

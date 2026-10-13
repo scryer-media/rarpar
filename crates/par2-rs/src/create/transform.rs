@@ -1034,6 +1034,10 @@ fn run_band_shared(
                         }
                         barrier.wait();
                         phase(&mut || {
+                            // A worker past the last output row owns none.
+                            if rows.is_empty() {
+                                return Ok(());
+                            }
                             let guards: [Option<_>; SHARED_MAX_SLOTS] =
                                 std::array::from_fn(|slot| {
                                     (slot < live).then(|| {
