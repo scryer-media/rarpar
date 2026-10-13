@@ -2205,7 +2205,12 @@ impl ForwardRecoverySink for RecoveryWriter<'_> {
         chunks: usize,
         chunk: &(dyn Fn(usize, usize) -> (RecoveryExponent, u64, &'d [u8]) + Sync),
     ) -> Result<()> {
-        if !reedsolomon_rs::threading::parallel_enabled() {
+        // A pinned single thread keeps the caller's own thread, as `validate`
+        // does: handing the band to a pool worker would only add that worker's
+        // stack and allocator arena to the peak.
+        if !reedsolomon_rs::threading::parallel_enabled()
+            || super::encode::configured_create_threads() == 1
+        {
             for row in 0..rows {
                 for at in 0..chunks {
                     let (exponent, offset, data) = chunk(row, at);
