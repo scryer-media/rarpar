@@ -321,7 +321,8 @@ class NativeCodeTests(unittest.TestCase):
     JITTER = ("base", "gcd", "health", "noise", "sha3", "timer")
 
     def build_output(self, compiler="cc", ordinary=("-O3",), jitter=("-O3", "-O0"), tail=(),
-                     header=("Building with: CC",), link=True, windows=False, extra=()):
+                     header=("Building with: CC",), link=True, windows=False, extra=(),
+                     crate=CRATE):
         def debug(text):
             # How Rust's {:?} prints an argument.
             return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
@@ -331,7 +332,7 @@ class NativeCodeTests(unittest.TestCase):
 
         def running(flags, source):
             words = [debug(compiler), *(debug(flag) for flag in (*flags, *extra, *tail)),
-                     '"-o"', quote("/out/x.o"), '"-c"', quote(f"{self.CRATE}/aws-lc/{source}")]
+                     '"-o"', quote("/out/x.o"), '"-c"', quote(f"{crate}/aws-lc/{source}")]
             return "running: " + " ".join(words)
 
         lines = [f"cargo:warning={line}" for line in header]
@@ -358,6 +359,14 @@ class NativeCodeTests(unittest.TestCase):
         output = self.build_output(compiler="C:\\Program Files\\LLVM\\bin\\clang-cl.exe",
                                    ordinary=("-O2", "/O2"), jitter=("-O2", "-Od", "-Od"), windows=True)
         errors, summary = native.check_aws_lc_build(output, "x86_64-pc-windows-msvc")
+        self.assertEqual(errors, [])
+        self.assertIn("120 C sources at O2", summary)
+        self.assertIn("jitterentropy at Od", summary)
+        # aws-lc-sys passes its crate directory to clang-cl in 8.3 short form.
+        output = self.build_output(compiler="clang-cl", ordinary=("-O2", "/O2"),
+                                   jitter=("-O2", "-Od", "-Od"), windows=True,
+                                   crate="/Users/RUNNER~1/.cargo/registry/src/INDEXC~1.IO-/AWS-LC~1.0")
+        errors, summary = native.check_aws_lc_build(output, "aarch64-pc-windows-msvc")
         self.assertEqual(errors, [])
         self.assertIn("120 C sources at O2", summary)
         self.assertIn("jitterentropy at Od", summary)

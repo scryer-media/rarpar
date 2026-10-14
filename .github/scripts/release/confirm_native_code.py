@@ -56,8 +56,12 @@ SIMPLE_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\0"}
 # tune a level rather than set one.
 LEVEL = re.compile(r"(?:-O(?:[0-3sz]|fast|g)?|[-/]O[12dx])")
 NO_ASM_OR_SMALL = re.compile(r"[-/]DOPENSSL_(?:NO_ASM|SMALL)(?:=.*)?")
-LIBRARY_SOURCE = re.compile(r"/aws-lc-sys-[^/]+/aws-lc/(?!tests/)")
-JITTER_SOURCE = re.compile(r"/aws-lc-sys-[^/]+/aws-lc/third_party/jitterentropy/")
+# AWS-LC's sources sit under aws-lc/ in the aws-lc-sys crate directory. On
+# Windows aws-lc-sys names that directory by its 8.3 short name (AWS-LC~1.0,
+# say) to keep cl command lines under MAX_PATH; the part below it is as written.
+CRATE_DIR = r"/(?:aws-lc-sys-[^/]+|[^/]*~[0-9][^/]*)/aws-lc/"
+LIBRARY_SOURCE = re.compile(CRATE_DIR + r"(?!tests/)")
+JITTER_SOURCE = re.compile(CRATE_DIR + r"third_party/jitterentropy/")
 MINIMUM_C_SOURCES = 100
 
 
