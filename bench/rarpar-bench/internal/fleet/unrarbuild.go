@@ -28,10 +28,23 @@ const (
 )
 
 // unrarMakeArgs is the whole recipe: the stock makefile with its stock
-// CXXFLAGS, and only CXX and a static link set. Nothing in the build adds a
+// CXXFLAGS and LDFLAGS, and only CXX set. Nothing in the build adds a
 // -march/-mcpu/-mtune: an oracle tuned for the host it runs on would not be
 // the oracle anyone else can reproduce.
-var unrarMakeArgs = []string{"CXX=g++", "LDFLAGS=-pthread -static"}
+//
+// The oracle links dynamically against the host's glibc, the one it is built
+// on and the only one it runs on. A static glibc link cannot work: UnRAR
+// prints through glibc's wide-character stdio, which a static glibc cannot
+// back (its character-set conversion is loaded at run time), and the static
+// binary crashes on a null function pointer inside fputws the first time it
+// prints its banner.
+var unrarMakeArgs = []string{"CXX=g++"}
+
+// unrarBanner is how UnRAR's no-argument output starts ("UNRAR 7.20 ...").
+const unrarBanner = "UNRAR"
+
+// unrarSmokeTimeout bounds the no-argument start check.
+const unrarSmokeTimeout = 30 * time.Second
 
 // unrarTargetCPUFlag is what the makefile audit refuses outside comments.
 var unrarTargetCPUFlag = regexp.MustCompile(`-march|-mcpu|-mtune|native`)
@@ -69,7 +82,8 @@ type UnrarBuild struct {
 	BinarySHA256    string   `json:"binary_sha256"`
 	BinaryPinned    bool     `json:"binary_pinned"`
 	ELFMachine      string   `json:"elf_machine"`
-	StaticLink      bool     `json:"static_link"`
+	SharedLibraries []string `json:"shared_libraries"`
+	Banner          string   `json:"banner"`
 	BuiltUTC        string   `json:"built_utc"`
 	GOOS            string   `json:"goos"`
 	GOARCH          string   `json:"goarch"`
@@ -77,9 +91,11 @@ type UnrarBuild struct {
 
 // BuildUnrar builds the UnRAR oracle from the shipped source tarball with the
 // audited portable recipe. It fails closed: a source digest that does not
-// match its pin, a makefile that carries a target-cpu flag, a dynamically
-// linked result, or a binary that does not match its pin stops the build
-// with no oracle where the suites look for one, not even an earlier build's.
+// match its pin, a makefile that carries a target-cpu flag, a result that is
+// not an executable for this host's architecture, a binary that does not
+// start and print UnRAR's banner, or a binary that does not match its pin
+// stops the build with no oracle where the suites look for one, not even an
+// earlier build's.
 func BuildUnrar(ctx context.Context, options UnrarBuildOptions) (UnrarBuild, error) {
 	switch {
 	case options.Source == "":
@@ -163,10 +179,15 @@ func BuildUnrar(ctx context.Context, options UnrarBuildOptions) (UnrarBuild, err
 		return UnrarBuild{}, fmt.Errorf("make: %w", err)
 	}
 	built := filepath.Join(dir, unrarBinaryName)
-	machine, err := checkStaticELF(built)
+	machine, libraries, err := checkHostELF(built, runtime.GOARCH)
 	if err != nil {
 		return UnrarBuild{}, err
 	}
+	banner, err := unrarSmoke(ctx, built)
+	if err != nil {
+		return UnrarBuild{}, err
+	}
+	logf("start check: %q", banner)
 	digest, err := fileSHA256(built)
 	if err != nil {
 		return UnrarBuild{}, err
@@ -178,7 +199,7 @@ func BuildUnrar(ctx context.Context, options UnrarBuildOptions) (UnrarBuild, err
 	if err := copyFileMode(built, binary, 0o755); err != nil {
 		return UnrarBuild{}, err
 	}
-	logf("installed %s (%s, statically linked, sha256 %s)", binary, machine, digest)
+	logf("installed %s (%s, linked against %s, sha256 %s)", binary, machine, strings.Join(libraries, ", "), digest)
 	makefileSum := sha256.Sum256(makefile)
 	build := UnrarBuild{
 		Recipe: RecipeUnrarHost, SourceURL: options.SourceURL, SourceSHA256: sourceDigest,
@@ -186,7 +207,7 @@ func BuildUnrar(ctx context.Context, options UnrarBuildOptions) (UnrarBuild, err
 		MakeArgs: append([]string(nil), unrarMakeArgs...), ScrubbedEnv: append([]string(nil), unrarScrubbedEnv...),
 		MakeVersion: makeVersion, CompilerVersion: compilerVersion,
 		Binary: binary, BinarySHA256: digest, BinaryPinned: options.BinarySHA256 != "",
-		ELFMachine: machine, StaticLink: true,
+		ELFMachine: machine, SharedLibraries: libraries, Banner: banner,
 		BuiltUTC: time.Now().UTC().Format(time.RFC3339), GOOS: runtime.GOOS, GOARCH: runtime.GOARCH,
 	}
 	if err := writeJSONFile(record, build); err != nil {
@@ -239,27 +260,66 @@ func unrarBuildEnv(environ []string) []string {
 	return kept
 }
 
-// checkStaticELF proves the build produced a statically linked ELF
-// executable: no program interpreter and no shared-library dependency.
-func checkStaticELF(path string) (string, error) {
+// unrarELFMachine is the ELF machine an oracle built on each supported host
+// architecture must carry.
+var unrarELFMachine = map[string]elf.Machine{"arm64": elf.EM_AARCH64, "amd64": elf.EM_X86_64}
+
+// checkHostELF proves the build produced an executable for this host's
+// architecture and returns its machine and the shared libraries it names.
+func checkHostELF(path, goarch string) (string, []string, error) {
 	file, err := elf.Open(path)
 	if err != nil {
-		return "", fmt.Errorf("%s is not an ELF executable: %w", path, err)
+		return "", nil, fmt.Errorf("%s is not an ELF executable: %w", path, err)
 	}
 	defer file.Close()
-	for _, program := range file.Progs {
-		if program.Type == elf.PT_INTERP {
-			return "", fmt.Errorf("%s is dynamically linked (it names a program interpreter); the recipe links statically, so nothing was installed", path)
-		}
+	if file.Type != elf.ET_EXEC && file.Type != elf.ET_DYN {
+		return "", nil, fmt.Errorf("%s is an ELF %s, not an executable; nothing was installed", path, file.Type)
+	}
+	if want, ok := unrarELFMachine[goarch]; ok && file.Machine != want {
+		return "", nil, fmt.Errorf("%s is built for %s, but this host is %s (%s); nothing was installed", path, file.Machine, goarch, want)
 	}
 	libraries, err := file.ImportedLibraries()
 	if err != nil {
-		return "", fmt.Errorf("%s: reading its dynamic section: %w", path, err)
+		return "", nil, fmt.Errorf("%s: reading its dynamic section: %w", path, err)
 	}
-	if len(libraries) > 0 {
-		return "", fmt.Errorf("%s needs shared libraries (%s); the recipe links statically, so nothing was installed", path, strings.Join(libraries, ", "))
+	if libraries == nil {
+		libraries = []string{}
 	}
-	return file.Machine.String(), nil
+	return file.Machine.String(), libraries, nil
+}
+
+// unrarSmoke runs the built binary with no arguments, as the suites' identity
+// probe falls back to doing, before it is installed. UnRAR then prints its
+// banner and usage; any exit status is fine, but a binary killed by a signal,
+// or one whose first line is not the banner, is refused. A variable so tests
+// can stand in for a binary they cannot run.
+var unrarSmoke = func(ctx context.Context, path string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, unrarSmokeTimeout)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, path).CombinedOutput()
+	return checkUnrarSmoke(path, output, err)
+}
+
+// checkUnrarSmoke judges one no-argument run of the built binary.
+func checkUnrarSmoke(path string, output []byte, runErr error) (string, error) {
+	var exit *exec.ExitError
+	if runErr != nil && !errors.As(runErr, &exit) {
+		return "", fmt.Errorf("start check: %s did not run: %w; nothing was installed", path, runErr)
+	}
+	if exit != nil && !exit.Exited() {
+		return "", fmt.Errorf("start check: %s was killed (%v) when run with no arguments; nothing was installed", path, runErr)
+	}
+	banner := ""
+	for _, line := range strings.Split(string(output), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			banner = line
+			break
+		}
+	}
+	if !strings.HasPrefix(banner, unrarBanner) {
+		return "", fmt.Errorf("start check: %s printed %q, not UnRAR's banner, when run with no arguments; nothing was installed", path, banner)
+	}
+	return banner, nil
 }
 
 // runBuildStep runs one build step with its output in the build log, so the

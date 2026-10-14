@@ -337,13 +337,18 @@ version = "unrar 7.2.3 (portable on-host build)"
   `rarpar-bench fleet build-unrar`. That checks the shipped tarball against
   the pin again and unpacks it. It refuses to build if the stock makefile
   carries `-march`, `-mcpu`, `-mtune` or `native` outside a comment line. It
-  runs the stock makefile with its stock `CXXFLAGS`, setting only `CXX=g++`
-  and `LDFLAGS=-pthread -static`, and removes `CPPFLAGS`, `CFLAGS`,
+  runs the stock makefile with its stock `CXXFLAGS` and `LDFLAGS`, setting
+  only `CXX=g++`, and removes `CPPFLAGS`, `CFLAGS`,
   `CXXFLAGS`, `LDFLAGS`, `LIBS`, `MAKEFLAGS`, `MFLAGS`, `GNUMAKEFLAGS` and
   `MAKEFILES` from make's environment, so none of them can carry a flag from
-  the host into the build. It refuses a result that names an ELF interpreter
-  or needs a shared library, and one whose sha256 differs from
-  `binary_sha256` when that is set. Only then does it install
+  the host into the build. The result links dynamically against the host's
+  glibc, the one it was built on: a static glibc link cannot back UnRAR's
+  wide-character console output, and such a binary crashes on a null pointer
+  inside `fputws` the first time it prints. It refuses a result that is not
+  an ELF executable for the host's architecture, one that is killed by a
+  signal or does not print UnRAR's banner when run with no arguments (the
+  suites' identity probe), and one whose sha256 differs from `binary_sha256`
+  when that is set. Only then does it install
   `unrar-reference/unrar` in the run's staging directory, the path every
   suite uses. It first deletes any binary an earlier build left there, so a
   refused build leaves none. The quiet-load gate before the first suite waits
@@ -351,12 +356,13 @@ version = "unrar 7.2.3 (portable on-host build)"
 - **Evidence.** `results/unrar-build.json` records the source URL and
   digest, the makefile digest, the flag audit, the make arguments, the
   removed variables, the make and compiler versions, the binary digest and
-  whether a pin held it, the ELF machine and the static-link check.
+  whether a pin held it, the ELF machine, the shared libraries it names and
+  the banner from the start check.
   `results/unrar-build.log` holds the full build output.
 - **A failed build fails the host** as `unrar-build`. Every run that needs
   the oracle then stops at its missing-binary check before it runs a case.
-- **Host requirements.** make, g++, and the static libc and libstdc++
-  archives. EC2 user-data installs `build-essential` when this recipe is
+- **Host requirements.** make, g++, and the libc and libstdc++ development
+  files. EC2 user-data installs `build-essential` when this recipe is
   selected; a local host must already have them.
 - **Pinning the binary.** The digest depends on the host's compiler, so a run
   without `binary_sha256` records the digest and does not check it. Review

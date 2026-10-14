@@ -241,7 +241,7 @@ func RunScript(machine Machine, defaults RunDefaults, runID string, layout Remot
 	if oracle, ok := machine.Oracles["rar"]; ok && oracle.Policy == OracleSourceBuild && oracle.Recipe == RecipeUnrarHost {
 		write("# RARLAB publishes no Linux arm64 UnRAR: build the shipped, sha256-pinned source")
 		write("# here with the audited portable recipe (stock makefile and CXXFLAGS, CXX=g++,")
-		write("# static link, no -march/-mcpu/-mtune; refused if the makefile carries one).")
+		write("# stock LDFLAGS, no -march/-mcpu/-mtune; refused if the makefile carries one).")
 		write("log 'building the UnRAR oracle on this host'")
 		args := []string{"--source", "\"$BIN/" + unrarSourceName + "\"", "--sha256", shellQuote(oracle.SHA256),
 			"--url", shellQuote(oracle.URL), "--out", shellQuote(unrarReferenceDir(machine, layout))}

@@ -54,8 +54,9 @@ verifies and stages every bundle without contacting a fleet host.
 build-unrar runs on a fleet host, from the generated run script: on Linux
 arm64, where RARLAB publishes no UnRAR, it builds the unrar-portable-onhost
 oracle from the shipped, sha256-pinned source with the audited portable recipe
-(stock makefile and CXXFLAGS, CXX=g++, static link, no -march/-mcpu/-mtune)
-and prints the build record.
+(stock makefile, CXXFLAGS and LDFLAGS, CXX=g++, no -march/-mcpu/-mtune),
+checks that the binary starts and prints UnRAR's banner, and prints the build
+record.
 
 The configuration is operator-private and gitignored; start from
 bench/fleet.example.toml. See docs/fleet.md.

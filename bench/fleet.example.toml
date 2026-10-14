@@ -365,9 +365,11 @@ version = "par2cmdline-turbo 1.4.0"
 # The one UnRAR source build, because RARLAB publishes no Linux arm64 UnRAR
 # (see reason). The orchestrator ships the sha256-pinned source tarball; the
 # host builds it natively at run start (`rarpar-bench fleet build-unrar`) with
-# the audited portable recipe: stock makefile, stock CXXFLAGS, only CXX=g++ and
-# a static link set, and NO -march/-mcpu/-mtune anywhere. The build refuses to
-# proceed if the stock makefile has acquired a target-cpu flag. Nothing is
+# the audited portable recipe: stock makefile, stock CXXFLAGS and LDFLAGS, only
+# CXX=g++ set, and NO -march/-mcpu/-mtune anywhere. The binary links against
+# the host's own glibc and must start and print UnRAR's banner before it is
+# installed. The build refuses to proceed if the stock makefile has acquired a
+# target-cpu flag. Nothing is
 # built on the orchestrator and nothing runs in a container.
 policy = "source-build"
 reason = "RARLAB publishes no Linux arm64 UnRAR: rarlab.com/download.htm lists none, and the only Linux ARM entries on rarlab.com/rar_add.htm are unrar-4.1.3-armv4l.tar.gz and unrar-5.5.0-arm.gz, an UnRAR 5.5.0 (2017) ELF 32-bit ARM EABI5 binary dynamically linked against /lib/ld-linux-armhf.so.3, which an AArch64-only server core cannot execute and which predates RAR 7"

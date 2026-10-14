@@ -10,10 +10,12 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -55,13 +57,30 @@ func TestUnrarBuildEnvScrubsMakeFlags(t *testing.T) {
 	}
 }
 
+// hostMachine is the ELF machine checkHostELF expects on the host running the
+// tests; an unlisted architecture gets EM_AARCH64, which it does not check.
+func hostMachine() elf.Machine {
+	if machine, ok := unrarELFMachine[runtime.GOARCH]; ok {
+		return machine
+	}
+	return elf.EM_AARCH64
+}
+
+// foreignMachine is a supported machine that is not the host's.
+func foreignMachine() elf.Machine {
+	if hostMachine() == elf.EM_X86_64 {
+		return elf.EM_AARCH64
+	}
+	return elf.EM_X86_64
+}
+
 // testELF is a minimal ELF64 header and program table: enough for debug/elf,
 // and nothing that could run.
-func testELF(dynamic bool) []byte {
+func testELF(machine elf.Machine, dynamic bool) []byte {
 	var buffer bytes.Buffer
 	put := func(value any) { _ = binary.Write(&buffer, binary.LittleEndian, value) }
 	header := elf.Header64{
-		Type: uint16(elf.ET_EXEC), Machine: uint16(elf.EM_AARCH64), Version: uint32(elf.EV_CURRENT),
+		Type: uint16(elf.ET_EXEC), Machine: uint16(machine), Version: uint32(elf.EV_CURRENT),
 		Entry: 0x400000, Phoff: 64, Ehsize: 64, Phentsize: 56, Phnum: 1, Shentsize: 64,
 	}
 	if dynamic {
@@ -78,7 +97,7 @@ func testELF(dynamic bool) []byte {
 	return buffer.Bytes()
 }
 
-func TestCheckStaticELF(t *testing.T) {
+func TestCheckHostELF(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name string, data []byte) string {
 		path := filepath.Join(dir, name)
@@ -87,14 +106,46 @@ func TestCheckStaticELF(t *testing.T) {
 		}
 		return path
 	}
-	if machine, err := checkStaticELF(write("static", testELF(false))); err != nil || machine != "EM_AARCH64" {
-		t.Fatalf("a static ELF must pass and name its machine: %q, %v", machine, err)
+	for _, dynamic := range []bool{false, true} {
+		machine, libraries, err := checkHostELF(write("host", testELF(elf.EM_AARCH64, dynamic)), "arm64")
+		if err != nil || machine != "EM_AARCH64" || libraries == nil {
+			t.Fatalf("an arm64 ELF (dynamic %v) must pass on arm64 and name its machine: %q, %q, %v", dynamic, machine, libraries, err)
+		}
 	}
-	if _, err := checkStaticELF(write("dynamic", testELF(true))); err == nil || !strings.Contains(err.Error(), "dynamically linked") {
-		t.Fatalf("an ELF with a program interpreter must be refused, got %v", err)
+	if _, _, err := checkHostELF(write("x86", testELF(elf.EM_X86_64, true)), "arm64"); err == nil || !strings.Contains(err.Error(), "but this host is arm64") {
+		t.Fatalf("an x86-64 ELF must be refused on arm64, got %v", err)
 	}
-	if _, err := checkStaticELF(write("script", []byte("#!/bin/sh\n"))); err == nil || !strings.Contains(err.Error(), "not an ELF executable") {
+	if _, _, err := checkHostELF(write("script", []byte("#!/bin/sh\n")), "arm64"); err == nil || !strings.Contains(err.Error(), "not an ELF executable") {
 		t.Fatalf("a non-ELF result must be refused, got %v", err)
+	}
+}
+
+func TestCheckUnrarSmoke(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in binaries are POSIX shell commands")
+	}
+	run := func(script string) (string, error) {
+		output, err := exec.Command("sh", "-c", script).CombinedOutput()
+		return checkUnrarSmoke("unrar", output, err)
+	}
+	// UnRAR run with no arguments prints its banner and usage, then exits
+	// non-zero: that is a pass.
+	if banner, err := run("echo; echo 'UNRAR 7.20 beta 3 freeware      Copyright (c) 1993-2025 Alexander Roshal'; echo; echo 'Usage:'; exit 7"); err != nil ||
+		banner != "UNRAR 7.20 beta 3 freeware      Copyright (c) 1993-2025 Alexander Roshal" {
+		t.Fatalf("a banner and a non-zero exit must pass: %q, %v", banner, err)
+	}
+	// The static glibc build's failure: killed by SIGSEGV before any output.
+	if _, err := run("kill -SEGV $$"); err == nil || !strings.Contains(err.Error(), "was killed") {
+		t.Fatalf("a binary killed by a signal must be refused, got %v", err)
+	}
+	if _, err := run("echo 'something else'"); err == nil || !strings.Contains(err.Error(), "not UnRAR's banner") {
+		t.Fatalf("a binary that does not print the banner must be refused, got %v", err)
+	}
+	if _, err := run("true"); err == nil || !strings.Contains(err.Error(), "not UnRAR's banner") {
+		t.Fatalf("a binary that prints nothing must be refused, got %v", err)
+	}
+	if _, err := checkUnrarSmoke("unrar", nil, exec.ErrNotFound); err == nil || !strings.Contains(err.Error(), "did not run") {
+		t.Fatalf("a binary that cannot be started must be refused, got %v", err)
 	}
 }
 
@@ -140,8 +191,9 @@ func sha256Hex(data []byte) string {
 
 // TestBuildUnrarRecipe runs the builder with a make and a g++ test double on
 // PATH: everything around the compile (source pin, extraction, makefile audit,
-// scrubbed environment, exact make arguments, static-link check, binary pin,
-// install-last) is exercised without compiling UnRAR.
+// scrubbed environment, exact make arguments, host ELF check, start check,
+// binary pin, install-last) is exercised without compiling UnRAR. The test
+// ELFs cannot run, so the start check is stood in for.
 func TestBuildUnrarRecipe(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the make and g++ test doubles are POSIX shell scripts")
@@ -158,7 +210,17 @@ func TestBuildUnrarRecipe(t *testing.T) {
 	}
 	t.Setenv("PATH", tools+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("CPPFLAGS", "-march=native")
-	static := testELF(false)
+	const banner = "UNRAR 7.20 beta 3 freeware (test double)"
+	smokeErr := error(nil)
+	realSmoke := unrarSmoke
+	unrarSmoke = func(ctx context.Context, path string) (string, error) {
+		if smokeErr != nil {
+			return "", smokeErr
+		}
+		return banner, nil
+	}
+	t.Cleanup(func() { unrarSmoke = realSmoke })
+	static := testELF(hostMachine(), false)
 
 	build := func(t *testing.T, makefile string, output []byte, pinSource func(string) string, binaryPin string) (UnrarBuild, string, error) {
 		t.Helper()
@@ -181,7 +243,8 @@ func TestBuildUnrarRecipe(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if built.Recipe != RecipeUnrarHost || !built.StaticLink || built.ELFMachine != "EM_AARCH64" || built.BinaryPinned ||
+		if built.Recipe != RecipeUnrarHost || built.Banner != banner || built.SharedLibraries == nil ||
+			built.ELFMachine != hostMachine().String() || built.BinaryPinned ||
 			built.BinarySHA256 != sha256Hex(static) || built.MakefileSHA256 != sha256Hex([]byte(stockLikeMakefile)) ||
 			built.MakeVersion != "GNU Make 4.3 (test double)" || built.CompilerVersion != "g++ (test double) 13.2.0" {
 			t.Fatalf("unexpected build record: %+v", built)
@@ -190,8 +253,8 @@ func TestBuildUnrarRecipe(t *testing.T) {
 			t.Fatalf("installed oracle digest %s, %v", digest, err)
 		}
 		args, err := os.ReadFile(filepath.Join(out, "src", "unrar", "make-args.txt"))
-		if err != nil || string(args) != "CXX=g++\nLDFLAGS=-pthread -static\n" {
-			t.Fatalf("make ran with %q (%v); the recipe sets only CXX and a static link", args, err)
+		if err != nil || string(args) != "CXX=g++\n" {
+			t.Fatalf("make ran with %q (%v); the recipe sets only CXX", args, err)
 		}
 		environment, err := os.ReadFile(filepath.Join(out, "src", "unrar", "make-env.txt"))
 		if err != nil || !strings.Contains("\n"+string(environment), "\nPATH=") || strings.Contains("\n"+string(environment), "\nCPPFLAGS=") {
@@ -199,7 +262,8 @@ func TestBuildUnrarRecipe(t *testing.T) {
 		}
 		var record UnrarBuild
 		data, err := os.ReadFile(filepath.Join(out, "unrar-build.json"))
-		if err != nil || json.Unmarshal(data, &record) != nil || record.BinarySHA256 != built.BinarySHA256 || record.SourceURL == "" {
+		if err != nil || json.Unmarshal(data, &record) != nil || record.BinarySHA256 != built.BinarySHA256 || record.SourceURL == "" ||
+			record.Banner != banner || !strings.Contains(string(data), `"shared_libraries": []`) {
 			t.Fatalf("unrar-build.json = %s (%v)", data, err)
 		}
 	})
@@ -236,15 +300,19 @@ func TestBuildUnrarRecipe(t *testing.T) {
 		output         []byte
 		pinSource      func(string) string
 		binaryPin      string
+		smokeErr       error
 		want           string
 	}{
-		{"a source that misses its pin", stockLikeMakefile, static, func(string) string { return strings.Repeat("0", 64) }, "", "but the pin is"},
-		{"a makefile with a target-cpu flag", stockLikeMakefile + "CXXFLAGS+=-march=native\n", static, same, "", "refusing to build"},
-		{"a dynamically linked result", stockLikeMakefile, testELF(true), same, "", "dynamically linked"},
-		{"a binary that misses its pin", stockLikeMakefile, static, same, strings.Repeat("ab", 32), "does not match the pinned binary_sha256"},
+		{"a source that misses its pin", stockLikeMakefile, static, func(string) string { return strings.Repeat("0", 64) }, "", nil, "but the pin is"},
+		{"a makefile with a target-cpu flag", stockLikeMakefile + "CXXFLAGS+=-march=native\n", static, same, "", nil, "refusing to build"},
+		{"a result for another architecture", stockLikeMakefile, testELF(foreignMachine(), true), same, "", nil, "but this host is"},
+		{"a binary that crashes on start", stockLikeMakefile, static, same, "", errors.New("start check: unrar was killed (signal: segmentation fault)"), "was killed"},
+		{"a binary that misses its pin", stockLikeMakefile, static, same, strings.Repeat("ab", 32), nil, "does not match the pinned binary_sha256"},
 	}
 	for _, refusal := range refusals {
 		t.Run(refusal.name+" installs nothing", func(t *testing.T) {
+			smokeErr = refusal.smokeErr
+			defer func() { smokeErr = nil }()
 			_, out, err := build(t, refusal.makefile, refusal.output, refusal.pinSource, refusal.binaryPin)
 			if err == nil || !strings.Contains(err.Error(), refusal.want) {
 				t.Fatalf("want an error containing %q, got %v", refusal.want, err)
@@ -301,7 +369,7 @@ func TestUnrarOnHostRecipeWiring(t *testing.T) {
 
 func TestResolveOraclesShipsTheUnrarSource(t *testing.T) {
 	_, machine := exampleMachine(t, "ec2-graviton4")
-	source, digest := unrarTestTarball(t, stockLikeMakefile, testELF(false))
+	source, digest := unrarTestTarball(t, stockLikeMakefile, testELF(hostMachine(), false))
 	cache := t.TempDir()
 	// A pre-populated cache entry: nothing is fetched.
 	if err := copyFileMode(source, filepath.Join(cache, digest[:16]+"-unrarsrc-test.tar.gz"), 0o644); err != nil {

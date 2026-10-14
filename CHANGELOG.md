@@ -3,6 +3,23 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## Unreleased
+
+### Benchmark harness only
+
+- The fleet's on-host UnRAR oracle (`unrar-portable-onhost`, Linux arm64)
+  links dynamically against the host's glibc. `fleet build-unrar` runs the
+  stock makefile with only `CXX=g++` and keeps the stock `LDFLAGS`, where it
+  used to add `-static`. A static glibc link cannot back UnRAR's
+  wide-character console output: the binary jumped to a null pointer inside
+  `fputws` the first time it printed its banner, so every RAR suite on the
+  first 0.8.0 fleet round's Cortex-A72 host failed with the oracle
+  segfaulting. The build now refuses a result that is not an executable for
+  the host's architecture, or that is killed by a signal or does not print
+  UnRAR's banner when run with no arguments, before installing it.
+  `unrar-build.json` records the shared libraries and the banner in place of
+  `static_link`. No version impact of its own.
+
 ## rarpar 0.8.0
 
 A minor bump, as for 0.7.0: a command line that 0.7.0 accepted

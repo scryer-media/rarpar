@@ -337,8 +337,8 @@ func packageInstall(packages []string) string {
 }
 
 // bootstrapPackages are the distro packages a machine's suites need on host:
-// the unrar-portable-onhost recipe builds UnRAR with make and g++ and links it
-// statically against libc and libstdc++ (build-essential carries all four), and
+// the unrar-portable-onhost recipe builds UnRAR with make and g++ against the
+// libc and libstdc++ development files (build-essential carries all four), and
 // the par3cmdline-onhost recipe builds the reference with CMake.
 func bootstrapPackages(machine Machine) []string {
 	var packages []string
