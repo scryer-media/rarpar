@@ -74,6 +74,19 @@ A minor bump, as for 0.4.0 and 0.6.0: a command line that 0.6.x accepted
   `--fsync` or `--buffered` to learn which durability a plain command gives
   and which switch selects the other, so durable rows against rarpar 0.7.0
   run with `--fsync` and rows are labelled by the mode that ran.
+- `rarpar-bench fleet` benchmarks the published rarpar release, run natively
+  on each host. `[machines.bundle] source = "release"` (the default) with a
+  `tag` or `version` downloads each host platform's release asset and the
+  release's `SHA256SUMS` from GitHub, refuses an asset whose sha256 does not
+  match, and stages the unpacked `rarpar` (`rarpar.exe` from the Windows zip),
+  all before any credential check, host probe or launch; the asset, its digest
+  and the release are recorded in the run state and `BUILDINFO.json`.
+  `fleet plan --stage` runs that download, verification and staging as a dry
+  check that contacts no host. The container build is gone:
+  `bundle.source = "docker"`, the `image`, `build_host`, `rust_target` and
+  `crt_static` bundle keys, `[fleet] docker` and `capabilities.docker` are
+  config errors, and `prebuilt` remains for dev spot tests. No version impact
+  of its own.
 
 ## rarpar 0.6.2
 
