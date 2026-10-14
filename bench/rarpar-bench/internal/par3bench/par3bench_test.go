@@ -581,6 +581,20 @@ func TestRunsOpOnABufferedByDefaultCandidate(t *testing.T) {
 	if r.durabilityArgs(OpVerify, durable) != nil {
 		t.Error("a read-only op takes no durability argument")
 	}
+	// The probe only covers create and repair; rows for the other ops, and
+	// the reference everywhere, must not be dropped for lacking an entry.
+	reference := Variant{Name: "reference", Tool: ToolReference}
+	for _, op := range []string{OpCreate, OpVerify, OpVerifyDamaged, OpRepair} {
+		if !r.runsOp(reference, op) {
+			t.Errorf("reference row missing for %s", op)
+		}
+		if !r.runsOp(durable, op) {
+			t.Errorf("rarpar-w4 row missing for %s", op)
+		}
+	}
+	if r.runsOp(buffered, OpVerify) || r.runsOp(buffered, OpVerifyDamaged) {
+		t.Error("buffered rows exist only for writing ops")
+	}
 	engineDurable := Variant{Name: "engine-w4", Tool: ToolEngine, Workers: 4}
 	engineBuffered := Variant{Name: "engine-w4-buffered", Tool: ToolEngine, Workers: 4, Durability: DurabilityBuffered}
 	if r.runsOp(engineDurable, OpRepair) || !r.runsOp(engineBuffered, OpRepair) {

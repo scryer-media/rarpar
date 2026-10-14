@@ -960,6 +960,11 @@ func (r *runner) runsOp(variant Variant, op string) bool {
 		}
 		return true
 	}
+	if variant.Tool == ToolReference || (op != OpCreate && op != OpRepair) {
+		// The reference has no durability modes, and the probe covers only
+		// the writing operations; neither depends on the candidate's flags.
+		return true
+	}
 	if r.results == nil || r.results.DurabilityArgs == nil {
 		return variant.EffectiveDurability() != DurabilityBuffered
 	}
