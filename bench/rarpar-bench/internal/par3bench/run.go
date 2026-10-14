@@ -43,9 +43,13 @@ const (
 	// for either tool and is never turned into a reference DNF.
 	FailureMissingRSS = procmeasure.FailureMissingRSS
 
-	// DurabilityDurable is rarpar's default: every output file is synced
-	// before the command returns. DurabilityBuffered flushes without
-	// requesting storage barriers. The reference never syncs, so it has no
+	// DurabilityDurable syncs every output file before the command returns;
+	// DurabilityBuffered flushes without requesting storage barriers. Which
+	// one a plain `rarpar par3 create|repair` performs depends on the
+	// candidate: before rarpar 0.6.3 the CLI was durable and `--buffered`
+	// selected buffered; from 0.6.3 it is buffered and `--fsync` selects
+	// durable. The runner probes each op's --help and records the answer in
+	// Results.DefaultDurability. The reference never syncs, so it has no
 	// durability mode and gets one row.
 	DurabilityDurable  = "durable"
 	DurabilityBuffered = "buffered"
@@ -184,8 +188,10 @@ func (v Variant) dirName() string {
 }
 
 // Variants expands the reference plus every candidate worker/kernel row, each
-// rarpar row once per durability mode: the durable (default) row first, named
-// as before, then "<name>-buffered". Nil durabilities means both modes.
+// rarpar row once per durability mode: the durable row first, named as before,
+// then "<name>-buffered". Which mode a plain command gives is the candidate's
+// choice (probed from its --help); the row names only say which mode ran.
+// Nil durabilities means both modes.
 func Variants(workers []int, kernels []KernelVariant, durabilities []string) []Variant {
 	if len(durabilities) == 0 {
 		durabilities = KnownDurabilities
@@ -333,7 +339,7 @@ func ParseDurabilities(text string) ([]string, error) {
 		return append([]string(nil), KnownDurabilities...), nil
 	}
 	if !contains(modes, DurabilityDurable) {
-		return nil, fmt.Errorf("durability %q must include %q: it is rarpar's default and every ratio starts from it", text, DurabilityDurable)
+		return nil, fmt.Errorf("durability %q must include %q: every ratio starts from it", text, DurabilityDurable)
 	}
 	return modes, nil
 }
@@ -458,12 +464,16 @@ type Results struct {
 	KernelVariants []KernelVariant `json:"kernel_variants,omitempty"`
 	CandidateArgs  []string        `json:"candidate_args,omitempty"`
 	// Durabilities are the rarpar durability modes measured for create and
-	// repair, default first. BufferedArgs records, per op, the arguments that
-	// selected buffered output on this candidate; an op the candidate cannot
-	// run buffered is missing and listed in BufferedUnsupported.
-	Durabilities        []string            `json:"durabilities,omitempty"`
-	BufferedArgs        map[string][]string `json:"buffered_args,omitempty"`
-	BufferedUnsupported []string            `json:"buffered_unsupported,omitempty"`
+	// repair, durable first. DefaultDurability records, per writing op, what
+	// a plain `rarpar par3 <op>` on this candidate does (probed from its
+	// --help); DurabilityArgs records, per op and mode, the arguments that
+	// select that mode (empty for the default). A mode an op cannot select is
+	// absent from DurabilityArgs, and a buffered one is listed in
+	// BufferedUnsupported.
+	Durabilities        []string                       `json:"durabilities,omitempty"`
+	DefaultDurability   map[string]string              `json:"default_durability,omitempty"`
+	DurabilityArgs      map[string]map[string][]string `json:"durability_args,omitempty"`
+	BufferedUnsupported []string                       `json:"buffered_unsupported,omitempty"`
 	// TimeoutSeconds / ReferenceTimeoutSeconds bound each timed process.
 	TimeoutSeconds          float64   `json:"timeout_seconds,omitempty"`
 	ReferenceTimeoutSeconds float64   `json:"reference_timeout_seconds,omitempty"`
@@ -553,12 +563,13 @@ func RunSuite(ctx context.Context, options Options) (*Results, error) {
 		CandidateArgs:  options.CandidateArgs,
 		Variants: MatrixRows(options.Workers, options.KernelVariants, options.Durabilities,
 			options.EngineWorkers, options.EngineVariants, options.Rows, options.Targets),
-		Durabilities:   options.Durabilities,
-		DropCaches:     options.DropCaches,
-		Rows:           options.Rows,
-		EngineWorkers:  options.EngineWorkers,
-		EngineVariants: options.EngineVariants,
-		BufferedArgs:   map[string][]string{},
+		Durabilities:      options.Durabilities,
+		DropCaches:        options.DropCaches,
+		Rows:              options.Rows,
+		EngineWorkers:     options.EngineWorkers,
+		EngineVariants:    options.EngineVariants,
+		DefaultDurability: map[string]string{},
+		DurabilityArgs:    map[string]map[string][]string{},
 
 		TimeoutSeconds:          options.Timeout.Seconds(),
 		ReferenceTimeoutSeconds: options.ReferenceTimeout.Seconds(),
@@ -609,7 +620,7 @@ func RunSuite(ctx context.Context, options Options) (*Results, error) {
 			r.options.IOCount = false
 		}
 	}
-	if err := r.probeBuffered(ctx); err != nil {
+	if err := r.probeDurability(ctx); err != nil {
 		return nil, err
 	}
 
@@ -798,14 +809,15 @@ func validateOptions(options *Options) error {
 	return nil
 }
 
-// probeBuffered finds out how this candidate selects buffered output for each
-// writing op, from its own --help. An op whose help lists no --buffered flag
-// gets no buffered row: running the durable command twice under a buffered
-// label would be a lie.
-func (r *runner) probeBuffered(ctx context.Context) error {
-	if !contains(r.options.Durabilities, DurabilityBuffered) {
-		return nil
-	}
+// probeDurability finds out, from each writing op's own --help, what a plain
+// `rarpar par3 <op>` does on this candidate and which flag selects the other
+// mode. A help screen listing --fsync is a 0.6.3+ CLI: buffered by default,
+// durable with --fsync. One listing --buffered is older: durable by default,
+// buffered with --buffered. One listing neither is durable only; it gets no
+// buffered row, because running the durable command twice under a buffered
+// label would be a lie. The probe always runs, since the durable row's
+// arguments depend on it.
+func (r *runner) probeDurability(ctx context.Context) error {
 	for _, op := range []string{OpCreate, OpRepair} {
 		if !contains(r.options.Ops, op) {
 			continue
@@ -815,28 +827,64 @@ func (r *runner) probeBuffered(ctx context.Context) error {
 			return r.quarantined(ctx, r.options.Candidate, "refused to start: "+fmt.Sprint(result.Err))
 		}
 		if result.Failure != "" || result.ExitCode != 0 {
-			// A help screen that did not print says nothing about the flag;
-			// guessing "unsupported" would silently drop the buffered rows.
-			return fmt.Errorf("probing `%s par3 %s --help` for --buffered failed (%s, exit %d): %s",
+			// A help screen that did not print says nothing about the flags;
+			// guessing would mislabel every durability row.
+			return fmt.Errorf("probing `%s par3 %s --help` for --fsync/--buffered failed (%s, exit %d): %s",
 				r.options.Candidate, op, firstNonEmpty(result.Failure, "exit"), result.ExitCode, lastLine(result))
 		}
-		if helpListsFlag(result.Stdout+result.Stderr, "--buffered") {
-			r.results.BufferedArgs[op] = []string{"--buffered"}
+		defaultMode, args := classifyDurabilityHelp(result.Stdout + result.Stderr)
+		r.results.DefaultDurability[op] = defaultMode
+		r.results.DurabilityArgs[op] = args
+		if _, ok := args[DurabilityBuffered]; ok || !contains(r.options.Durabilities, DurabilityBuffered) {
 			continue
 		}
 		r.results.BufferedUnsupported = append(r.results.BufferedUnsupported, op)
-		note := fmt.Sprintf("buffered %s rows not run: `rarpar par3 %s --help` on this candidate lists no --buffered flag, so only its durable %s row exists", op, op, op)
-		if r.options.EnginePerf != "" {
-			note += fmt.Sprintf("; the untimed engine_perf pass still measures buffered %s (PAR3_BENCH_%s_DURABILITY=buffered)", op, strings.ToUpper(op))
-		}
+		note := fmt.Sprintf("buffered %s rows not run: `rarpar par3 %s --help` on this candidate lists neither --fsync nor --buffered, so only its durable %s row exists", op, op, op)
+		r.results.Notes = append(r.results.Notes, note)
+		r.logf("%s", note)
+	}
+	if r.options.EnginePerf != "" && !r.engineHasDurabilitySwitch() && contains(r.options.Durabilities, DurabilityDurable) {
+		note := "engine rows run buffered only: this candidate's par3-rs issues no storage barrier and its engine_perf has no durability switch, so a durable engine row would repeat the buffered one under another label"
 		r.results.Notes = append(r.results.Notes, note)
 		r.logf("%s", note)
 	}
 	return nil
 }
 
+// classifyDurabilityHelp reads a `rarpar par3 <op> --help` screen and returns
+// the mode a plain invocation performs and, per mode, the arguments that
+// select it (empty for the default; absent when the op cannot select it).
+func classifyDurabilityHelp(help string) (string, map[string][]string) {
+	switch {
+	case helpListsFlag(help, "--fsync"):
+		return DurabilityBuffered, map[string][]string{DurabilityBuffered: {}, DurabilityDurable: {"--fsync"}}
+	case helpListsFlag(help, "--buffered"):
+		return DurabilityDurable, map[string][]string{DurabilityDurable: {}, DurabilityBuffered: {"--buffered"}}
+	default:
+		return DurabilityDurable, map[string][]string{DurabilityDurable: {}}
+	}
+}
+
+// engineHasDurabilitySwitch reports whether engine_perf on this candidate can
+// run durable at all. The example and the CLI are built from the same par3-rs:
+// a CLI that is buffered by default (0.6.3+) sits on a par3-rs with no storage
+// barriers, where PAR3_BENCH_<OP>_DURABILITY is ignored. An unprobed candidate
+// is assumed to have the switch.
+func (r *runner) engineHasDurabilitySwitch() bool {
+	if r.results == nil || len(r.results.DefaultDurability) == 0 {
+		return true
+	}
+	for _, mode := range r.results.DefaultDurability {
+		if mode == DurabilityDurable {
+			return true
+		}
+	}
+	return false
+}
+
 // helpListsFlag matches flag as a whole token of a help screen, so
-// "--buffered-io" or "--no-buffered" does not count as "--buffered".
+// "--buffered-io" or "--no-buffered" does not count as "--buffered", and
+// "--fsync-dirs" would not count as "--fsync".
 func helpListsFlag(help, flag string) bool {
 	for _, token := range strings.FieldsFunc(help, func(c rune) bool {
 		return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ',' || c == '[' || c == ']' || c == '=' || c == '|' || c == '<' || c == '(' || c == ')'
@@ -862,12 +910,21 @@ func (r *runner) runsOp(variant Variant, op string) bool {
 	if !variant.RunsOp(op) {
 		return false
 	}
-	// Engine rows select buffered output through their environment
-	// (PAR3_BENCH_<OP>_DURABILITY), not the CLI flag the probe looks for.
-	if variant.EffectiveDurability() == DurabilityBuffered && variant.Tool != ToolEngine {
-		return r.results.BufferedArgs[op] != nil
+	if variant.Tool == ToolEngine {
+		// Engine rows select buffered output through their environment
+		// (PAR3_BENCH_<OP>_DURABILITY), not a CLI flag. On a par3-rs with no
+		// storage barriers that switch does nothing, so only the buffered
+		// engine row is honest there.
+		if variant.EffectiveDurability() == DurabilityDurable && (op == OpCreate || op == OpRepair) {
+			return r.engineHasDurabilitySwitch()
+		}
+		return true
 	}
-	return true
+	if r.results == nil || r.results.DurabilityArgs == nil {
+		return variant.EffectiveDurability() != DurabilityBuffered
+	}
+	_, ok := r.results.DurabilityArgs[op][variant.EffectiveDurability()]
+	return ok
 }
 
 func (r *runner) timeoutFor(tool string) time.Duration {
@@ -1381,13 +1438,15 @@ func (r *runner) createCommand(config Config, dataset Dataset, dataDir, outDir s
 	return Command{Path: r.options.Candidate, Args: args, Dir: dataDir, Env: variant.Env, PinCPUs: r.pin(), Timeout: r.timeoutFor(ToolCandidate)}
 }
 
-// durabilityArgs selects buffered output for a buffered rarpar row; the
-// durable row runs the CLI's default.
+// durabilityArgs selects the row's durability mode on this candidate: the
+// probed flag for the mode that is not the CLI's default, nothing for the
+// mode that is.
 func (r *runner) durabilityArgs(op string, variant Variant) []string {
-	if variant.EffectiveDurability() != DurabilityBuffered {
+	mode := variant.EffectiveDurability()
+	if mode == "" || r.results == nil {
 		return nil
 	}
-	return r.results.BufferedArgs[op]
+	return r.results.DurabilityArgs[op][mode]
 }
 
 func (r *runner) candidateGlobals(variant Variant) []string {
@@ -1784,11 +1843,16 @@ func (r *runner) enginePerf(ctx context.Context, op string, config Config, datas
 
 // enginePerfDurabilities is the durability modes the untimed engine_perf pass
 // covers for op: every requested mode for the writing ops, durable otherwise.
+// On a candidate whose engine has no durability switch the writing ops run
+// buffered only (see engineHasDurabilitySwitch).
 func (r *runner) enginePerfDurabilities(op string) []string {
-	if op == OpCreate || op == OpRepair {
+	if op != OpCreate && op != OpRepair {
+		return []string{DurabilityDurable}
+	}
+	if r.engineHasDurabilitySwitch() {
 		return r.options.Durabilities
 	}
-	return []string{DurabilityDurable}
+	return []string{DurabilityBuffered}
 }
 
 func writeJSONFile(path string, value any) error {

@@ -216,7 +216,20 @@ func RenderReport(results *Results) string {
 	if len(durabilities) == 0 {
 		durabilities = []string{DurabilityDurable}
 	}
-	fmt.Fprintf(&b, "- Durability: rarpar create and repair run as %s; **durable** (every output synced) is rarpar's default. The reference never syncs and has one row.", strings.Join(durabilities, " and "))
+	fmt.Fprintf(&b, "- Durability: rarpar create and repair run as %s; **durable** syncs every output before the command returns, **buffered** only flushes. The reference never syncs and has one row.", strings.Join(durabilities, " and "))
+	for _, op := range []string{OpCreate, OpRepair} {
+		mode, ok := results.DefaultDurability[op]
+		if !ok {
+			continue
+		}
+		fmt.Fprintf(&b, " A plain `rarpar par3 %s` on this candidate is %s", op, mode)
+		for _, other := range KnownDurabilities {
+			if args := results.DurabilityArgs[op][other]; other != mode && len(args) > 0 {
+				fmt.Fprintf(&b, "; `%s` selects %s", strings.Join(args, " "), other)
+			}
+		}
+		fmt.Fprint(&b, ".")
+	}
 	for _, op := range results.BufferedUnsupported {
 		fmt.Fprintf(&b, " This candidate has no buffered %s mode, so %s has only the durable row.", op, op)
 	}
@@ -403,8 +416,6 @@ func durabilityLabel(row Row) string {
 	switch row.Durability {
 	case "":
 		return "none (never syncs)"
-	case DurabilityDurable:
-		return "durable (default)"
 	default:
 		return row.Durability
 	}

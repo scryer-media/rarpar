@@ -213,13 +213,17 @@ pin_cpus = "0-7"
 work = "/bench/p3"                # keep it short, see below
 timeout_minutes = 20              # per run, rarpar rows too; a reference over it is DNF
 # reference_timeout_minutes = 60  # default 0: the reference uses timeout_minutes
-# durability = ["durable"]        # default: durable and buffered rows
+# durability = ["durable"]        # default: durable and buffered rows; the probe
+                                  # finds which one a plain `rarpar par3` gives
 ```
 
-- **Durability rows.** Every `rarpar` create and repair runs durable (the
-  default) and buffered; the reference gets one row. `durability` narrows that
-  and must include `durable`. Verify writes nothing, so it has no buffered
-  row and runs once per worker count. In the text plan, the macro-par3 step
+- **Durability rows.** Every `rarpar` create and repair runs durable and
+  buffered; the reference gets one row. The harness probes each candidate's
+  `par3 <op> --help`: a build that lists `--fsync` (0.6.3 and later) is
+  buffered when run plain and durable with `--fsync`, one that lists
+  `--buffered` is the reverse, and one that lists neither runs the durable row
+  only. `durability` narrows the rows and must include `durable`. Verify
+  writes nothing, so it has no buffered row and runs once per worker count. In the text plan, the macro-par3 step
   lists the durabilities and the per-run timeout, and the machine's `par3`
   block lists the variants and the rows each op produces; `--json` carries
   the same rows under `par3.rows`.

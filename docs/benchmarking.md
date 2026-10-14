@@ -220,23 +220,24 @@ NAME:VAR=value[,VAR=value]` adds a `rarpar` row with extra environment
 variables. The env-gated kernel pins on main are currently no-ops for PAR3;
 the flag is plumbing for when they exist.
 
-From rarpar 0.6.3, `par3 create` has no `--buffered` flag (buffered output is
-its default and `--fsync` opts into syncing), so the probe below finds no
-`--buffered` and the suite keeps only the default row for that candidate;
-for 0.6.3 that row is buffered, not durable. Before 0.6.3:
-Every `rarpar` create and repair row runs twice: once durable, which is the
-default (no flag, one fsync per output), and once buffered (`--buffered`, no
-fsync). The durable row is listed first and labelled `durable (default)`; the
-buffered row is named `rarpar-wN-buffered`. Both carry ratios against the
-single reference row, whose durability column reads `none (never syncs)`.
-Verify rows write nothing and run once. `--durability durable` drops the
-buffered rows; durable is always required. The suite probes
-`rarpar par3 <op> --help` for `--buffered` as a whole token. When the help
-prints but lacks it, which is the case for `par3 repair` today, the suite skips
-that op's buffered row and says so in the report notes. When the help itself
-fails (a timeout, a non-zero exit, a start failure, or a quarantine), the run
-stops with that error rather than guessing. `par3 matrix --profile full` prints
-the rows per op.
+Every `rarpar` create and repair row runs twice: once durable (one fsync per
+output) and once buffered (no fsync). Which of the two a plain
+`rarpar par3 <op>` gives depends on the candidate, so the suite probes
+`rarpar par3 <op> --help` once per op, for `--fsync` and `--buffered` as whole
+tokens. A help that lists `--fsync` (rarpar 0.6.3 and later) means the plain
+command is buffered and `--fsync` selects durable; one that lists `--buffered`
+(0.6.2 and earlier) means the plain command is durable and `--buffered`
+selects buffered; one that lists neither, which is the case for `par3 repair`
+before 0.6.3, runs only the durable row and says so in the report notes. The
+durable row is listed first and labelled `durable`; the buffered row is named
+`rarpar-wN-buffered`. Both carry ratios against the single reference row,
+whose durability column reads `none (never syncs)`, and the report's summary
+states per op which mode the plain command gave and which switch selected the
+other. Verify rows write nothing and run once. `--durability durable` drops
+the buffered rows; durable is always required. When the help itself fails (a
+timeout, a non-zero exit, a start failure, or a quarantine), the run stops
+with that error rather than guessing. `par3 matrix --profile full` prints the
+rows per op.
 
 Each variant gets the warmups, then the measured repeats, and the variant order
 alternates on every repeat. Each table cell is the median with the range,
@@ -303,8 +304,8 @@ bytes) and `harness-missing-rss`.
 
 Verify and repair need a canonical recovery set, normally written by an untimed
 reference create. If that create is DNF (one of the classes above; any other
-failure stops the set), `rarpar` (durable, most workers) writes
-the canonical set instead, the reference still verifies and repairs it, the
+failure stops the set), `rarpar` (durable, using whichever switch the probe
+found selects it, most workers) writes the canonical set instead, the reference still verifies and repairs it, the
 identity verdicts are skipped, and the report says where the set came from.
 
 ### Identity verdicts
