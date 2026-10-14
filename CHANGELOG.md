@@ -5,6 +5,38 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ## Unreleased
 
+### Release workflow
+
+- The musl archives now use mimalloc as their global allocator. The
+  `musl-allocator` feature has been a default feature since 0.3.2, but the
+  release jobs build with `--no-default-features` and an explicit feature
+  list that left it out, so the musl archives of 0.3.2 through 0.7.0 used
+  musl's own allocator. The musl rows now list `musl-allocator`, and the job
+  fails if a musl binary carries no mimalloc.
+- AWS-LC is built the way weaver builds it, in the release jobs and in CI:
+  from source by the aws-lc-sys cc builder, linked statically, with assembly
+  and not size-optimised (`AWS_LC_SYS_USE_SYSTEM=0`, `AWS_LC_SYS_STATIC=1`,
+  `AWS_LC_SYS_SMALL=0`, `AWS_LC_SYS_CMAKE_BUILDER=0`, `CARGO_INCREMENTAL=0`).
+  On Windows it compiles with clang-cl, where x86_64 used MSVC's `cl`
+  before, and never falls back to aws-lc-sys's prebuilt NASM objects
+  (`AWS_LC_SYS_PREBUILT_NASM=0`).
+- The release jobs pass per-target `CFLAGS_<target>`/`CXXFLAGS_<target>` to
+  every C dependency: `-DNDEBUG -ffunction-sections -fdata-sections
+  -fvisibility=hidden` on Linux and macOS (with `-mno-outline-atomics` on
+  aarch64 musl) and `/O2 /DNDEBUG /Gy /Gw` on Windows. AWS-LC's C assertions
+  are now compiled out, as in its own release builds. No flag sets `-O3`:
+  the release profile already compiles AWS-LC at `-O3` (`/O2` with clang-cl),
+  and a level in CFLAGS would override the `-O0` its jitterentropy sources
+  need.
+- The release job's AWS-LC check (`confirm-native-code.sh`/`.ps1`, replacing
+  `confirm-aws-lc.*`) now reads the aws-lc-sys build output as well as the
+  dependency graph, and the binary: it fails unless AWS-LC came from the cc
+  builder, statically, without `OPENSSL_SMALL` or `OPENSSL_NO_ASM`, with its
+  C sources at `-O3` (`/O2`) and its six jitterentropy sources at `-O0`
+  (`-Od`), and unless the stripped binary still carries AWS-LC's assembly
+  (and mimalloc on musl). CI's `target-checks` lanes now build the release
+  feature list in release mode with the same flags and run the same check.
+
 ### Benchmark harness only
 
 - `rarpar-bench par3` and the fleet `macro-par3` suite run every `rarpar`

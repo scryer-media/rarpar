@@ -25,6 +25,14 @@ env:
   # Pinned: the corpus signature is verified by the same cosign release the
   # publish workflow signs with. Bump both together.
   COSIGN_VERSION: v3.1.3
+  # Every lane that builds AWS-LC builds it the way the release jobs do: from
+  # source by the aws-lc-sys cc builder, linked statically, with assembly and
+  # not size-optimised.
+  CARGO_INCREMENTAL: "0"
+  AWS_LC_SYS_USE_SYSTEM: "0"
+  AWS_LC_SYS_STATIC: "1"
+  AWS_LC_SYS_SMALL: "0"
+  AWS_LC_SYS_CMAKE_BUILDER: "0"
 
 jobs:
   changes:
@@ -1039,6 +1047,11 @@ jobs:
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
       CMAKE_C_COMPILER_LAUNCHER: sccache
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      # As release.yml's build-windows: NASM from install-nasm.ps1, never the
+      # prebuilt objects, and AWS-LC compiled with clang-cl.
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+      CC_x86_64_pc_windows_msvc: clang-cl
+      CXX_x86_64_pc_windows_msvc: clang-cl
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1098,7 +1111,7 @@ jobs:
     needs: [changes, fmt, clippy, unit-tests]
     if: needs.changes.outputs.crates == 'true' || needs.changes.outputs.rarpar == 'true'
     runs-on: ${{ matrix.runs_on }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -1110,7 +1123,7 @@ jobs:
           - platform: linux-x86_64-musl-direct
             runs_on: ubuntu-24.04
             target: x86_64-unknown-linux-musl
-            features: runtime,crypto-aws-lc,sevenz
+            features: runtime,crypto-aws-lc,sevenz,musl-allocator
           - platform: linux-arm64-gnu-direct
             runs_on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
@@ -1118,7 +1131,7 @@ jobs:
           - platform: linux-arm64-musl-direct
             runs_on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
-            features: runtime,crypto-aws-lc,sevenz
+            features: runtime,crypto-aws-lc,sevenz,musl-allocator
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -1165,11 +1178,34 @@ jobs:
           cargo run --locked -p xtask -- feature-audit
           --manifest tools/rarpar/Cargo.toml --target ${{ matrix.target }}
           --features ${{ matrix.features }}
-      - name: Confirm the release feature list links AWS-LC
+      - name: Build the release binary
+        # The release build jobs' C flags and cc debug output (release.yml),
+        # so the next step sees what the release's own confirm step will.
+        env:
+          CC_ENABLE_DEBUG_OUTPUT: "1"
+          CFLAGS_x86_64_unknown_linux_gnu: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+          CXXFLAGS_x86_64_unknown_linux_gnu: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+          CFLAGS_x86_64_unknown_linux_musl: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+          CXXFLAGS_x86_64_unknown_linux_musl: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+          CFLAGS_aarch64_unknown_linux_gnu: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+          CXXFLAGS_aarch64_unknown_linux_gnu: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+          CFLAGS_aarch64_unknown_linux_musl: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden -mno-outline-atomics"
+          CXXFLAGS_aarch64_unknown_linux_musl: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden -mno-outline-atomics"
+          TARGET: ${{ matrix.target }}
+          FEATURES: ${{ matrix.features }}
+        run: >-
+          cargo build --locked --release -p rarpar --no-default-features
+          --features "$FEATURES" --target "$TARGET"
+      - name: Confirm AWS-LC and the allocator in the release binary
         env:
           TARGET: ${{ matrix.target }}
           FEATURES: ${{ matrix.features }}
-        run: .github/scripts/ci/target-checks-confirm-aws-lc.sh
+          PLATFORM: ${{ matrix.platform }}
+        run: >-
+          python3 .github/scripts/release/confirm_native_code.py
+          --manifest-path tools/rarpar/Cargo.toml --features "$FEATURES"
+          --target "$TARGET" --target-dir target
+          --log-prefix "target/confirm-native-code/rarpar-$PLATFORM"
       - name: Check workspace target
         run: cargo check --locked --workspace --all-targets --target ${{ matrix.target }}
       - name: Show sccache stats
@@ -1188,7 +1224,7 @@ jobs:
     needs: [changes, fmt, clippy, unit-tests]
     if: needs.changes.outputs.crates == 'true' || needs.changes.outputs.rarpar == 'true'
     runs-on: ${{ matrix.runs_on }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -1247,11 +1283,30 @@ jobs:
           cargo run --locked -p xtask -- feature-audit
           --manifest tools/rarpar/Cargo.toml --target ${{ matrix.target }}
           --features ${{ matrix.features }}
-      - name: Confirm the release feature list links AWS-LC
+      - name: Build the release binary
+        # The release build jobs' C flags and cc debug output (release.yml),
+        # so the next step sees what the release's own confirm step will.
+        env:
+          CC_ENABLE_DEBUG_OUTPUT: "1"
+          CFLAGS_aarch64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+          CXXFLAGS_aarch64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+          CFLAGS_x86_64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+          CXXFLAGS_x86_64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+          TARGET: ${{ matrix.target }}
+          FEATURES: ${{ matrix.features }}
+        run: >-
+          cargo build --locked --release -p rarpar --no-default-features
+          --features "$FEATURES" --target "$TARGET"
+      - name: Confirm AWS-LC and the allocator in the release binary
         env:
           TARGET: ${{ matrix.target }}
           FEATURES: ${{ matrix.features }}
-        run: .github/scripts/ci/target-checks-confirm-aws-lc.sh
+          PLATFORM: ${{ matrix.platform }}
+        run: >-
+          python3 .github/scripts/release/confirm_native_code.py
+          --manifest-path tools/rarpar/Cargo.toml --features "$FEATURES"
+          --target "$TARGET" --target-dir target
+          --log-prefix "target/confirm-native-code/rarpar-$PLATFORM"
       - name: Check workspace target
         run: cargo check --locked --workspace --all-targets --target ${{ matrix.target }}
       - name: Show sccache stats
@@ -1270,7 +1325,7 @@ jobs:
     needs: [changes, fmt, clippy, unit-tests]
     if: needs.changes.outputs.crates == 'true' || needs.changes.outputs.rarpar == 'true'
     runs-on: ${{ matrix.runs_on }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -1290,6 +1345,11 @@ jobs:
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
       CMAKE_C_COMPILER_LAUNCHER: sccache
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      # As release.yml's build-windows: NASM from install-nasm.ps1, never the
+      # prebuilt objects, and AWS-LC compiled with clang-cl.
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+      CC_x86_64_pc_windows_msvc: clang-cl
+      CXX_x86_64_pc_windows_msvc: clang-cl
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1335,20 +1395,32 @@ jobs:
           cargo run --locked -p xtask -- feature-audit
           --manifest tools/rarpar/Cargo.toml --target ${{ matrix.target }}
           --features ${{ matrix.features }}
-      - name: Confirm the release feature list links AWS-LC
-        # The body of .github/scripts/ci/target-checks-confirm-aws-lc.sh, kept
-        # inline: this step runs under Git Bash, and Windows runners check the
-        # repository out with CRLF line endings (no .gitattributes), which bash
-        # does not accept in a script file.
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo tree --locked -p rarpar -e normal --no-default-features \
-            --features "${{ matrix.features }}" --target "${{ matrix.target }}" > rarpar-tree.txt
-          if ! grep -q aws-lc-sys rarpar-tree.txt; then
-            echo "::error::rarpar resolved no aws-lc-sys for ${{ matrix.features }}; the crypto backend regressed to RustCrypto"
-            exit 1
-          fi
+      - name: Build the release binary
+        # The release build jobs' C flags and cc debug output (release.yml),
+        # so the next step sees what the release's own confirm step will.
+        shell: pwsh
+        env:
+          CC_ENABLE_DEBUG_OUTPUT: "1"
+          CFLAGS_x86_64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
+          CXXFLAGS_x86_64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
+          CFLAGS_aarch64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
+          CXXFLAGS_aarch64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
+          TARGET: ${{ matrix.target }}
+          FEATURES: ${{ matrix.features }}
+        run: >-
+          cargo build --locked --release -p rarpar --no-default-features
+          --features $env:FEATURES --target $env:TARGET
+      - name: Confirm AWS-LC and the allocator in the release binary
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          FEATURES: ${{ matrix.features }}
+          PLATFORM: ${{ matrix.platform }}
+        run: >-
+          python3 .github/scripts/release/confirm_native_code.py
+          --manifest-path tools/rarpar/Cargo.toml --features $env:FEATURES
+          --target $env:TARGET --target-dir target
+          --log-prefix "target/confirm-native-code/rarpar-$env:PLATFORM"
       - name: Check workspace target
         run: cargo check --locked --workspace --all-targets --target ${{ matrix.target }}
       - name: Show sccache stats

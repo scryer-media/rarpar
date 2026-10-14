@@ -238,6 +238,32 @@ jobs:
       RELEASE_TARGET: ${{ matrix.target }}
       RELEASE_FEATURES: ${{ matrix.features }}
       RELEASE_ARCHIVE_EXT: ${{ matrix.archive_ext }}
+      # AWS-LC is built from source by the aws-lc-sys cc builder, linked
+      # statically, with assembly and not size-optimised, the way weaver
+      # builds it. CC_ENABLE_DEBUG_OUTPUT makes the cc crate record every
+      # compiler command in the aws-lc-sys build-script output, which
+      # confirm_native_code.py reads.
+      CARGO_INCREMENTAL: "0"
+      AWS_LC_SYS_USE_SYSTEM: "0"
+      AWS_LC_SYS_STATIC: "1"
+      AWS_LC_SYS_SMALL: "0"
+      AWS_LC_SYS_CMAKE_BUILDER: "0"
+      CC_ENABLE_DEBUG_OUTPUT: "1"
+      # Per-target C flags for every C dependency, AWS-LC included. They carry
+      # no optimisation level: the cc crate already passes -O3 from the release
+      # profile, and it appends CFLAGS after a build script's own flags, so an
+      # -O3 here would override the -O0 aws-lc-sys compiles jitterentropy with.
+      # aarch64 musl also passes -mno-outline-atomics, as weaver does, so C
+      # code inlines its atomics instead of calling libgcc's __aarch64_*
+      # outline helpers from the static musl binary.
+      CFLAGS_x86_64_unknown_linux_gnu: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      CXXFLAGS_x86_64_unknown_linux_gnu: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      CFLAGS_x86_64_unknown_linux_musl: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      CXXFLAGS_x86_64_unknown_linux_musl: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      CFLAGS_aarch64_unknown_linux_gnu: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      CXXFLAGS_aarch64_unknown_linux_gnu: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      CFLAGS_aarch64_unknown_linux_musl: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden -mno-outline-atomics"
+      CXXFLAGS_aarch64_unknown_linux_musl: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden -mno-outline-atomics"
     defaults:
       run:
         shell: bash
@@ -255,7 +281,7 @@ jobs:
             runs_on: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             archive_ext: tar.gz
-            features: runtime,crypto-aws-lc,sevenz
+            features: runtime,crypto-aws-lc,sevenz,musl-allocator
             package_root: false
           - platform: linux-arm64-gnu-direct
             runs_on: ubuntu-22.04-arm
@@ -267,7 +293,7 @@ jobs:
             runs_on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             archive_ext: tar.gz
-            features: runtime,crypto-aws-lc,sevenz
+            features: runtime,crypto-aws-lc,sevenz,musl-allocator
             package_root: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -290,8 +316,8 @@ jobs:
         run: .github/scripts/release/build-rarpar.sh
       - name: Confirm the release binary carries no symbol table
         run: .github/scripts/release/confirm-no-symbol-table-linux.sh
-      - name: Confirm the built artifact links AWS-LC
-        run: .github/scripts/release/confirm-aws-lc.sh
+      - name: Confirm AWS-LC and the allocator in the release binary
+        run: .github/scripts/release/confirm-native-code.sh
       - name: Generate manpage and completions
         run: cargo run --locked -p xtask -- docs --out target/dist/docs
       - name: Hydrate the test corpus (cli)
@@ -333,6 +359,25 @@ jobs:
       RELEASE_FEATURES: ${{ matrix.features }}
       RELEASE_ARCHIVE_EXT: ${{ matrix.archive_ext }}
       RELEASE_NASM: ${{ matrix.nasm }}
+      # AWS-LC is built from source by the aws-lc-sys cc builder, linked
+      # statically, with assembly and not size-optimised, the way weaver
+      # builds it. CC_ENABLE_DEBUG_OUTPUT makes the cc crate record every
+      # compiler command in the aws-lc-sys build-script output, which
+      # confirm_native_code.py reads.
+      CARGO_INCREMENTAL: "0"
+      AWS_LC_SYS_USE_SYSTEM: "0"
+      AWS_LC_SYS_STATIC: "1"
+      AWS_LC_SYS_SMALL: "0"
+      AWS_LC_SYS_CMAKE_BUILDER: "0"
+      CC_ENABLE_DEBUG_OUTPUT: "1"
+      # Per-target C flags for every C dependency, AWS-LC included. They carry
+      # no optimisation level: the cc crate already passes -O3 from the release
+      # profile, and it appends CFLAGS after a build script's own flags, so an
+      # -O3 here would override the -O0 aws-lc-sys compiles jitterentropy with.
+      CFLAGS_aarch64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      CXXFLAGS_aarch64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      CFLAGS_x86_64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      CXXFLAGS_x86_64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
     defaults:
       run:
         shell: bash
@@ -373,8 +418,8 @@ jobs:
         run: .github/scripts/release/build-rarpar.sh
       - name: Confirm the release binary carries no symbol table
         run: .github/scripts/release/confirm-no-symbol-table-macos.sh
-      - name: Confirm the built artifact links AWS-LC
-        run: .github/scripts/release/confirm-aws-lc.sh
+      - name: Confirm AWS-LC and the allocator in the release binary
+        run: .github/scripts/release/confirm-native-code.sh
       - name: Generate manpage and completions
         run: cargo run --locked -p xtask -- docs --out target/dist/docs
       - name: Hydrate the test corpus (cli)
@@ -405,6 +450,34 @@ jobs:
       RELEASE_FEATURES: ${{ matrix.features }}
       RELEASE_ARCHIVE_EXT: ${{ matrix.archive_ext }}
       RELEASE_NASM: ${{ matrix.nasm }}
+      # AWS-LC is built from source by the aws-lc-sys cc builder, linked
+      # statically, with assembly and not size-optimised, the way weaver
+      # builds it. CC_ENABLE_DEBUG_OUTPUT makes the cc crate record every
+      # compiler command in the aws-lc-sys build-script output, which
+      # confirm_native_code.py reads.
+      CARGO_INCREMENTAL: "0"
+      AWS_LC_SYS_USE_SYSTEM: "0"
+      AWS_LC_SYS_STATIC: "1"
+      AWS_LC_SYS_SMALL: "0"
+      AWS_LC_SYS_CMAKE_BUILDER: "0"
+      CC_ENABLE_DEBUG_OUTPUT: "1"
+      # NASM comes from install-nasm.ps1 on x86_64; never the prebuilt
+      # objects aws-lc-sys can fall back to. AWS-LC's C compiles with clang-cl
+      # on both architectures: named here for x86_64, and aws-lc-sys selects
+      # it itself for aarch64, which it requires there.
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+      CC_x86_64_pc_windows_msvc: clang-cl
+      CXX_x86_64_pc_windows_msvc: clang-cl
+      # Per-target C flags for every C dependency, AWS-LC included. /O2 repeats
+      # the level the cc crate already passes from the release profile (the cl
+      # dialect has no -O3). The cc crate appends CFLAGS after a build
+      # script's own flags; for jitterentropy, which must compile unoptimised,
+      # aws-lc-sys takes the optimisation flags out of CFLAGS and appends -Od
+      # on this clang-cl path, and confirm_native_code.py checks the result.
+      CFLAGS_x86_64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
+      CXXFLAGS_x86_64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
+      CFLAGS_aarch64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
+      CXXFLAGS_aarch64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
     defaults:
       run:
         shell: pwsh
@@ -452,8 +525,8 @@ jobs:
       # carries a CodeView entry naming rarpar.pdb, and its symbols are in that
       # PDB, which the package does not include. No check exists without new
       # tools.
-      - name: Confirm the built artifact links AWS-LC
-        run: ./.github/scripts/release/confirm-aws-lc.ps1
+      - name: Confirm AWS-LC and the allocator in the release binary
+        run: ./.github/scripts/release/confirm-native-code.ps1
       - name: Generate manpage and completions
         shell: bash
         run: cargo run --locked -p xtask -- docs --out target/dist/docs
