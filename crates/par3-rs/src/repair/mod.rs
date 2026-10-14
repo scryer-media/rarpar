@@ -130,11 +130,11 @@ impl Default for RepairLimits {
 pub struct RepairOptions {
     /// Whether a damaged file is kept before its rebuilt copy takes its place.
     ///
-    /// On by default. The damaged file is renamed to `<name>.1`, or `.2`, and so
-    /// on up to the first free number, the way the reference implementation does
-    /// it. With this off nothing is ever deleted either: the rebuilt file is
-    /// renamed over the damaged one, which on POSIX replaces it in one step, and
-    /// the damaged bytes are simply not kept.
+    /// Off by default: the rebuilt file is renamed over the damaged one, which
+    /// on POSIX replaces it in one step, and the damaged bytes are simply not
+    /// kept; nothing else is ever deleted. On, the damaged file is kept as
+    /// `<name>.1`, or `.2`, and so on up to the first free number, the way the
+    /// reference implementation does it.
     pub backup: bool,
     /// What this repair may allocate.
     pub limits: RepairLimits,
@@ -159,7 +159,7 @@ impl RepairOptions {
 impl Default for RepairOptions {
     fn default() -> Self {
         Self {
-            backup: true,
+            backup: false,
             limits: RepairLimits::default(),
         }
     }
@@ -332,7 +332,8 @@ pub fn plan_repair(set: &Par3Set, base: &Path, limits: &RepairLimits) -> Result<
 /// carries, and writes back every file that was missing or damaged. Each is
 /// built inside a private staging directory under `base`, checked against its
 /// File packet through the staging handle, and only then moved into place — over
-/// a backup of the damaged file unless [`RepairOptions::backup`] is off. A
+/// the damaged file, which is kept as a numbered backup only when
+/// [`RepairOptions::backup`] is on. A
 /// rebuild that does not check out is left under its temporary name and
 /// reported, and the file it was to replace is left alone.
 ///
@@ -546,9 +547,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_defaults_keep_the_damaged_file() {
+    fn the_defaults_keep_no_backup_of_the_damaged_file() {
         let options = RepairOptions::default();
-        assert!(options.backup);
+        assert!(!options.backup);
         assert_eq!(
             options.limits.max_input_blocks,
             RepairLimits::DEFAULT_MAX_INPUT_BLOCKS
@@ -557,13 +558,13 @@ mod tests {
 
     #[test]
     fn options_are_built_by_setters_because_the_structs_are_non_exhaustive() {
-        let options = RepairOptions::default().with_backup(false).with_limits(
+        let options = RepairOptions::default().with_backup(true).with_limits(
             RepairLimits::default()
                 .with_codec(CodecLimits::new(4096))
                 .with_max_input_blocks(8)
                 .with_max_tail_buffer_bytes(1024),
         );
-        assert!(!options.backup);
+        assert!(options.backup);
         assert_eq!(options.limits.codec.max_buffer_bytes, 4096);
         assert_eq!(options.limits.max_input_blocks, 8);
         assert_eq!(options.limits.max_tail_buffer_bytes, 1024);

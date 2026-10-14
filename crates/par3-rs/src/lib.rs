@@ -108,8 +108,11 @@
 //! convenience-API example.
 //!
 //! Ordinary repair does not silently strip embedded protection. Use [`inside`]
-//! for those carriers. The convenience verifier reports unprotected chunks as
-//! unverifiable, and the convenience repair API executes Cauchy only.
+//! for those carriers. Repair keeps no backup of a damaged file by default:
+//! [`RepairOptions::with_backup`] keeps it as `<name>.1`, or the next free
+//! number, before the rebuilt file takes its place. The convenience verifier
+//! reports unprotected chunks as unverifiable, and the convenience repair API
+//! executes Cauchy only.
 //!
 //! # Format notes
 //!
@@ -207,8 +210,9 @@
 //! limits; use [`ingest::PacketScanner`] when that allocation must be bounded.
 //!
 //! Unsafe Rust is confined to the native Windows filesystem-security and
-//! file-identity wrapper and the macOS and Linux file-clone calls staging
-//! makes; other targets forbid it. Shared arithmetic uses CPU-specific kernels.
+//! file-identity wrapper, the macOS and Linux file-clone calls staging makes,
+//! and the Linux in-kernel copy staging makes; other targets forbid it.
+//! Shared arithmetic uses CPU-specific kernels.
 //! Set construction bounds directory expansion and rejects cycles. Parsed path
 //! components reject traversal names and separators. These are lexical checks,
 //! not a filesystem sandbox: callers must control destination links and changes

@@ -998,15 +998,18 @@ fn fft_decode_never_starves_the_proof_frontiers_into_read_back() {
     assert_eq!(diagnostics.admission().stripe_bytes, stripe as u64);
     let peak = roomy.memory.peak();
     let reads = diagnostics.source_io().read_bytes;
-    // Every budget from where the decode narrows its stripe to just above
-    // what it takes in full. Lower still, between about 0.9 and 1.5 MiB,
-    // what the session holds before the decode leaves less than the
-    // frontiers need and the repair completes by reading back; that band
-    // predates the capacity decoder, whose smaller banks only brought a
-    // window anchored on the peak down to it.
+    // Every budget from just above what the repair takes in full down to
+    // 256 KiB below the first at which the decode narrows its stripe. As the
+    // budget falls, the gathering of the rebuilt blocks gives way first, and
+    // the stripe narrows only once that is gone, so the window is anchored
+    // where the narrowing starts rather than on the peak. Lower still,
+    // between about 0.9 and 1.5 MiB, what the session holds before the
+    // decode leaves less than the frontiers need and the repair completes by
+    // reading back; that band predates the capacity decoder.
     let mut rows = Vec::new();
-    let mut budget = peak.saturating_sub(512 << 10);
-    while budget <= peak + (64 << 10) {
+    let mut budget = peak + (64 << 10);
+    let mut floor = None;
+    while budget >= floor.unwrap_or(1 << 20) {
         let run = repair(budget).map(|run| {
             let admission = run.diagnostics.admission();
             (
@@ -1015,12 +1018,14 @@ fn fft_decode_never_starves_the_proof_frontiers_into_read_back() {
                 run.diagnostics.source_io().read_bytes,
             )
         });
+        if floor.is_none() && run.is_some_and(|run| run.1 < stripe as u64) {
+            floor = Some(budget.saturating_sub(256 << 10));
+        }
         rows.push((budget, run));
-        budget += 256 << 10;
+        budget -= 128 << 10;
     }
     assert!(
-        rows.iter()
-            .any(|row| row.1.is_some_and(|run| run.1 < stripe as u64)),
+        floor.is_some(),
         "the sweep never narrowed the stripe: {rows:?}"
     );
     for (budget, run) in &rows {
@@ -1129,12 +1134,15 @@ fn a_payload_read_whole_is_authenticated_by_the_read_that_uses_it() {
         )
     };
     let lost = damage.len() as u64;
-    // Every surviving block and every selected recovery row, once each.
+    // Every surviving block and every selected recovery row, once each, and
+    // the surviving blocks once more for the copy the output is staged from,
+    // in three runs between the two lost blocks.
     let once = blocks as u64 * block_size;
+    let copied = ((blocks as u64 - lost) * block_size, 3);
     for workers in [1, 4] {
         assert_eq!(
             repair(workers, block_size as usize),
-            (once, blocks as u64),
+            (once + copied.0, blocks as u64 + copied.1),
             "{workers} workers: a whole-block stripe read a payload twice"
         );
         // A quarter-block stripe walks four passes over the surviving blocks,
@@ -1142,7 +1150,10 @@ fn a_payload_read_whole_is_authenticated_by_the_read_that_uses_it() {
         // authenticated by that read, and serves its stripes from it.
         assert_eq!(
             repair(workers, block_size as usize / 4),
-            (once, 4 * (blocks as u64 - lost) + lost),
+            (
+                once + copied.0,
+                4 * (blocks as u64 - lost) + lost + copied.1
+            ),
             "{workers} workers: a narrow stripe read a held row again"
         );
     }
@@ -1250,13 +1261,12 @@ fn a_copy_that_walks_a_block_in_windows_counts_one_pass_per_window() {
         block_size.div_ceil(stripe as u64),
         amplification.stripe_passes
     );
-    // The twin's three intact blocks are each named by two intact extents, so
-    // the copy reads each a second time and compares: the alias check, which
-    // is the only genuine reread this engine makes.
+    // The twin's three intact blocks are copied out of the twin itself, which
+    // its own evidence verified, before the walk; the walk reads only the
+    // block the twin lost, so no aliased block is read again for its check.
     assert_eq!(
-        amplification.reread_bytes,
-        (blocks - 1) * block_size,
-        "each intact aliased block is read once more for its check"
+        amplification.reread_bytes, 0,
+        "an intact block the twin holds was read for an alias check"
     );
     drop(session);
     assert_eq!(options.memory.used(), 0, "the session leaked");
@@ -1669,7 +1679,9 @@ fn a_file_repaired_in_place_from_its_clone_writes_only_its_lost_block() {
             assert_eq!(run.read_bytes, (len - block) + len, "backup {backup}");
             assert_eq!(run.write_bytes, block, "backup {backup}");
         } else {
-            assert_eq!(run.read_bytes, len - block, "backup {backup}");
+            // Staged by copying the surviving blocks in runs, which the walk
+            // reads again for the syndromes; it writes the lost block alone.
+            assert_eq!(run.read_bytes, 2 * (len - block), "backup {backup}");
             assert_eq!(run.write_bytes, len, "backup {backup}");
         }
         if backup {
@@ -1686,7 +1698,8 @@ fn a_file_repaired_in_place_from_its_clone_writes_only_its_lost_block() {
 /// copy path. Cloned and cut back, it costs no read and no write at all; one
 /// cut short inside its last block loses that block, and the clone, extended,
 /// writes that one block alone. Copied instead, where the filesystem has no
-/// clones, each reads every block it still holds.
+/// clones, each copies every block it still holds, and the short one reads
+/// them again to rebuild the block it lost.
 #[test]
 fn a_clone_cut_or_extended_to_its_length_writes_only_what_it_lacks() {
     let block = 64u64 << 10;
@@ -1699,7 +1712,7 @@ fn a_clone_cut_or_extended_to_its_length_writes_only_what_it_lacks() {
     let short = bytes[..bytes.len() - 1000].to_vec();
     for (case, on_disk, written, read, copied) in [
         ("grown", grown, 0, 0, len),
-        ("short", short, block, len - block, len - block),
+        ("short", short, block, len - block, 2 * (len - block)),
     ] {
         let inputs = common::TempTree::new("clone-length-inputs");
         let run = repair_disk_files(
@@ -1774,9 +1787,15 @@ fn a_moved_source_or_another_file_at_the_destination_clones_the_verified_source(
         inputs.path(),
         false,
     );
-    let written = if expect_clone(&run) { block } else { len };
+    // A copy reads the surviving blocks twice: to copy them, and for the
+    // syndromes. Neither reads the output back.
+    let (written, read) = if expect_clone(&run) {
+        (block, len - block)
+    } else {
+        (len, 2 * (len - block))
+    };
     assert_eq!(run.write_bytes, written, "a moved source");
-    assert_eq!(run.read_bytes, len - block, "no read-back");
+    assert_eq!(run.read_bytes, read, "no read-back");
     assert_eq!(
         std::fs::read(inputs.path().join("moved.bin")).unwrap(),
         damaged
@@ -1794,9 +1813,13 @@ fn a_moved_source_or_another_file_at_the_destination_clones_the_verified_source(
         output.path(),
         false,
     );
-    let written = if expect_clone(&run) { block } else { len };
+    let (written, read) = if expect_clone(&run) {
+        (block, len - block)
+    } else {
+        (len, 2 * (len - block))
+    };
     assert_eq!(run.write_bytes, written, "another file at the destination");
-    assert_eq!(run.read_bytes, len - block, "no read-back");
+    assert_eq!(run.read_bytes, read, "no read-back");
     assert_eq!(
         std::fs::read(inputs.path().join("input.bin")).unwrap(),
         damaged

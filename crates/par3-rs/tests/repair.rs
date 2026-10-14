@@ -493,7 +493,12 @@ fn the_damaged_file_is_kept_beside_the_repaired_one_and_numbered() {
     flip(&tree, "a.bin", 10);
     let damaged_once = tree.read("a.bin");
 
-    let report = repair_and_check(&tree, &set, &gf8_contents(), &RepairOptions::default());
+    let report = repair_and_check(
+        &tree,
+        &set,
+        &gf8_contents(),
+        &RepairOptions::default().with_backup(true),
+    );
     assert_eq!(
         report.repaired()[0].backup(),
         Some(tree.path().join("a.bin.1").as_path())
@@ -502,7 +507,12 @@ fn the_damaged_file_is_kept_beside_the_repaired_one_and_numbered() {
 
     flip(&tree, "a.bin", 20);
     let damaged_twice = tree.read("a.bin");
-    let report = repair_and_check(&tree, &set, &gf8_contents(), &RepairOptions::default());
+    let report = repair_and_check(
+        &tree,
+        &set,
+        &gf8_contents(),
+        &RepairOptions::default().with_backup(true),
+    );
     assert_eq!(
         report.repaired()[0].backup(),
         Some(tree.path().join("a.bin.2").as_path())
@@ -512,16 +522,11 @@ fn the_damaged_file_is_kept_beside_the_repaired_one_and_numbered() {
 }
 
 #[test]
-fn without_a_backup_the_damaged_bytes_are_simply_replaced() {
+fn by_default_the_damaged_bytes_are_simply_replaced() {
     let (tree, set) = gf8_tree("repair-no-backup");
     flip(&tree, "a.bin", 10);
 
-    let report = repair_and_check(
-        &tree,
-        &set,
-        &gf8_contents(),
-        &RepairOptions::default().with_backup(false),
-    );
+    let report = repair_and_check(&tree, &set, &gf8_contents(), &RepairOptions::default());
     assert!(report.repaired()[0].backup().is_none());
     assert!(!tree.path().join("a.bin.1").exists());
     assert_eq!(tree.read("a.bin"), a_bin());

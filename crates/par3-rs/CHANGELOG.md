@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.7.0
+
+Breaking: repair keeps no backup of a damaged file by default.
+
+- `RepairOptions::default()` now has `backup` off: the rebuilt file is
+  renamed over the damaged one, and the damaged bytes are not kept. Nothing
+  else is ever deleted. `RepairOptions::with_backup(true)`, or `backup: true`
+  to `Par3RepairSession::repair`, keeps the damaged file as `<name>.1`, or
+  the next free number, as before.
+- A repair output that can be neither cloned nor patched in place is now
+  staged by first copying the extents its source holds intact, front to
+  back, adjacent extents as one run: on Linux one `copy_file_range` call per
+  run where the source and the stage allow it, elsewhere a buffered read and
+  write of 1 MiB at a time. The repair then writes only the rest. Before, the
+  walk wrote every extent of the output, and a walk in stripes narrower than
+  a block wrote each one in as many pieces as it took passes. The source is
+  checked against its verified snapshot after the copy and again before
+  installation. The copy reads the intact bytes once more than before; when
+  the budget cannot spare the 1 MiB buffer the copy is skipped and the walk
+  writes everything, as before. A backup-on repair stages this way and then
+  renames the stage into place over the numbered backup.
+- Rebuilt extents that a walk in stripes narrower than a block would write
+  in pieces are gathered in memory per output and written whole once the
+  walk is over, in offset order, adjacent extents together in writes of at
+  most 1 MiB. The gathering is charged to the memory budget and takes only
+  what the walk's stripe bank leaves beyond the session's slack and the
+  proof's frontiers, so it never narrows the stripe and never forces a read
+  back; an extent that does not fit is written as it arrives. In-place
+  repair gathers the same way. Clone staging is unchanged.
+- `ExecutionDiagnostics::file_copies` counts the outputs staged by that
+  copy. On Linux one in-kernel copy counts in `file_io` as one read and one
+  write of the bytes it moved.
+- Unsafe code now also covers the Linux `copy_file_range` call, in the same
+  module as the clone calls.
+
 ## 0.6.1
 
 - On Windows, the immutable view `DiskSourceAccess::pin` opens for a packet

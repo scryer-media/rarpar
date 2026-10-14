@@ -1,7 +1,7 @@
 //! Striped repair and verified installation for retained sessions.
 
 use crate::runtime::{EngineFile as File, ExecutionOptions, MemoryCategory, OpenBudgeted};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -41,18 +41,34 @@ pub struct SessionRepairReport {
     pub reconstructed_blocks: u64,
 }
 
+/// The unit [`copy_held`] reads and writes an output's intact extents in: a
+/// run of adjacent extents shorter than this is one read and one write.
+const COPY_UNIT: usize = 1 << 20;
+
+/// The most bytes one write of adjacent assembled extents carries.
+const FLUSH_RUN: usize = 1 << 20;
+
+/// What an [`Assembly`] is charged for each extent beyond the bytes it
+/// gathers: its entry, its fill count and its share of the block map.
+const ASSEMBLY_ENTRY_BYTES: usize = 128;
+
 struct StagedFile {
     index: usize,
     destination: Option<Destination>,
     stage_name: Option<OsString>,
     temporary: PathBuf,
-    /// When the staged file is a clone of this output's verified source, or
+    /// When the staged file is a clone of this output's verified source,
+    /// holds that source's intact extents copied into it by [`copy_held`], or
     /// is that source itself patched in place, that source's verdicts: see
     /// [`Self::holds`].
     cloned: Option<Arc<crate::evidence::ExtentVerdicts>>,
     /// Set when the output is its own source, repaired in place: see
     /// [`in_place_source`].
     in_place: Option<InPlace>,
+    /// The extents gathered in memory and written whole once the walk is
+    /// over: see [`Assembly`]. Never set for a clone, which the walk writes
+    /// as it always has.
+    assembly: Option<Assembly>,
 }
 
 /// An output repaired in place: the file it is, and the source it was read
@@ -190,6 +206,153 @@ fn in_place_source(
                 .chain(session.data_payloads().values())
                 .all(|payload| !payload.reads_from(&session.access, evidence.source))
         })
+}
+
+/// The evidence output `index` may be staged from by copying the extents it
+/// holds intact out of the source that evidence verified (see [`copy_held`]),
+/// when the output is neither cloned nor patched in place. It must be this
+/// file's evidence for this layout and hold at least one such extent. Unlike
+/// a clone, a copy writes only those extents, so a file with unprotected
+/// ranges may be copied too: they stay zero, as in any fresh stage.
+fn copy_source<'a>(
+    session: &'a Par3RepairSession,
+    layout: &BlockLayout,
+    index: usize,
+) -> Option<&'a crate::evidence::FileEvidence> {
+    let file = &layout.files[index];
+    let evidence = session.evidence.get(&file.path)?;
+    if evidence.file != index || evidence.check_layout(layout).is_err() {
+        return None;
+    }
+    let extents = &file.extents;
+    (0..extents.len())
+        .any(|extent| held(&evidence.verdicts, extents, extent))
+        .then_some(evidence)
+}
+
+/// Copy every extent `evidence` holds intact (see [`held`]) out of the source
+/// it verified into the fresh stage of `target`, at the same offsets: adjacent
+/// extents as one run, front to back, each read and written [`COPY_UNIT`]
+/// bytes at a time through the source's registry, or, on Linux, copied inside
+/// the kernel from the registry's own handle once its metadata matches the
+/// evidence's snapshot. The source is checked against that snapshot once the
+/// copy is done, and again before installation; the stage then holds those
+/// extents as a clone of the source would (see [`finish_staged`]), and the
+/// repair writes only the rest.
+///
+/// Returns `false` when the copy buffer cannot be reserved. Whatever was
+/// copied by then is left for the walk to overwrite, which then writes every
+/// extent as it always has.
+fn copy_held(
+    session: &Par3RepairSession,
+    layout: &BlockLayout,
+    tree: Option<&RepairTree>,
+    target: &StagedFile,
+    evidence: &crate::evidence::FileEvidence,
+) -> EngineResult<bool> {
+    let options = &session.options;
+    let access = session.access.as_ref();
+    let extents = &layout.files[target.index].extents;
+    #[cfg(target_os = "linux")]
+    let mut kernel = access
+        .open_file(evidence.source)
+        .ok()
+        .flatten()
+        .filter(|original| {
+            original.0.metadata().is_ok_and(|metadata| {
+                crate::repair_tree::clone::is_source(&metadata, evidence.snapshot)
+            })
+        });
+    let mut buffer: Option<(crate::runtime::Reservation, Vec<u8>)> = None;
+    let file = open_staged(tree, target, false, true, options)?;
+    let mut copy = |range: std::ops::Range<u64>| -> EngineResult<bool> {
+        let mut at = range.start;
+        #[cfg(target_os = "linux")]
+        while at < range.end
+            && let Some(original) = &kernel
+        {
+            options.cancel.check()?;
+            let len = range.end - at;
+            let copied = options.diagnostics.files().copy(
+                usize::try_from(len).unwrap_or(usize::MAX).min(1 << 30),
+                || crate::repair_tree::clone::copy_range(&*original.0, at, &file, at, len),
+            );
+            match copied {
+                // The source ended early; the buffered copy reports it.
+                Ok(0) => kernel = None,
+                Ok(copied) => {
+                    #[cfg(test)]
+                    note_stage_write(at, copied);
+                    at += copied as u64;
+                }
+                Err(error) if crate::repair_tree::clone::copy_unsupported(&error) => {
+                    tracing::debug!(%error, "PAR3 repair staging copies through a buffer");
+                    kernel = None;
+                }
+                Err(error) => {
+                    crate::source::ensure_snapshot(access, evidence.source, evidence.snapshot)?;
+                    return Err(error.into());
+                }
+            }
+        }
+        while at < range.end {
+            options.cancel.check()?;
+            if buffer.is_none() {
+                match options
+                    .memory
+                    .reserve_as(MemoryCategory::SourceScratch, COPY_UNIT)
+                {
+                    Ok(reservation) => buffer = Some((reservation, vec![0; COPY_UNIT])),
+                    Err(EngineError::ResourceLimit(_)) => return Ok(false),
+                    Err(error) => return Err(error),
+                }
+            }
+            let bytes = &mut buffer.as_mut().expect("copy buffer").1;
+            let take = (range.end - at).min(COPY_UNIT as u64) as usize;
+            // A source that fails a read is reported changed if it has.
+            if let Err(error) = crate::source::read_exact_at(
+                &options.diagnostics,
+                access,
+                evidence.source,
+                at,
+                &mut bytes[..take],
+            ) {
+                crate::source::ensure_snapshot(access, evidence.source, evidence.snapshot)?;
+                return Err(error);
+            }
+            stage_write(&file, at, &bytes[..take])?;
+            at += take as u64;
+        }
+        Ok(true)
+    };
+    let mut run: Option<std::ops::Range<u64>> = None;
+    for extent in 0..extents.len() {
+        if !held(&evidence.verdicts, extents, extent) {
+            continue;
+        }
+        let range = extents.range(extent).expect("bounded extent");
+        match &mut run {
+            Some(open) if open.end == range.start => open.end = range.end,
+            _ => {
+                if let Some(done) = run.replace(range)
+                    && !copy(done)?
+                {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    if let Some(done) = run
+        && !copy(done)?
+    {
+        return Ok(false);
+    }
+    drop(file);
+    // The copy holds the bytes it read; this ties them to the bytes the
+    // evidence verified, as for a clone.
+    crate::source::ensure_snapshot(access, evidence.source, evidence.snapshot)?;
+    options.diagnostics.note_copy();
+    Ok(true)
 }
 
 /// Whether some output being staged still needs bytes of `block` written:
@@ -403,17 +566,32 @@ fn repair_inner(
                         snapshot,
                         checked: Arc::new(Mutex::new(false)),
                     }),
+                    assembly: Some(Assembly::default()),
                 });
                 continue;
             }
-            staged.push(StagedFile {
+            let clone = cloned.is_some();
+            let mut target = StagedFile {
                 index,
                 destination: Some(destination),
                 stage_name: Some(stage_name),
                 temporary,
                 cloned,
                 in_place: None,
-            });
+                // What the walk writes to an output that is not a clone may
+                // be gathered and written whole once it is over.
+                assembly: (!clone).then(Assembly::default),
+            };
+            // Otherwise the stage starts as a copy of the extents the file's
+            // evidence holds intact, made in sequential runs, and the repair
+            // writes only the rest, as it would into a clone.
+            if !clone
+                && let Some(evidence) = copy_source(session, layout, index)
+                && copy_held(session, layout, Some(&tree), &target, evidence)?
+            {
+                target.cloned = Some(Arc::clone(&evidence.verdicts));
+            }
+            staged.push(target);
         }
         let proof = StagedProof::new(layout, &staged, &session.options);
         // A whole-file fingerprint the proof cannot check already disagrees
@@ -581,6 +759,7 @@ pub(crate) fn stage_embedded_files(
             temporary: temporary.clone(),
             cloned: None,
             in_place: None,
+            assembly: None,
         })
         .collect();
     for (file, temporary) in layout.files.iter().zip(temporaries) {
@@ -1108,6 +1287,16 @@ where
     // Otherwise the bank is sized again with room held back for them; a
     // narrower stripe splits no extent the symbol width does not, so the
     // frontiers at that width bound what any stripe needs.
+    // What the bank left gathers the extents its stripes split first, and
+    // the frontiers are reserved for the rest; see `Assembly`.
+    assemble(
+        &session.options,
+        layout,
+        outputs,
+        proof,
+        admitted.0 as u64,
+        &|_| true,
+    );
     let mut reserved = proof.reserve_frontiers(admitted.0 as u64);
     if !reserved
         && let Some(stacks) = pool
@@ -1491,7 +1680,17 @@ where
         offset += take as u64;
     }
     checks.release();
-    Ok(())
+    // The banks go before what the walk gathered is written.
+    drop((
+        syndromes,
+        recovered,
+        inputs,
+        _buffers,
+        _group,
+        _read_ahead,
+        pool,
+    ));
+    writers.flush(layout, outputs)
 }
 
 fn fft_codec_with_source_stripes(
@@ -1542,9 +1741,23 @@ fn reconstruct_fft(
     // them, so taken as they open they found only what the bank left, and
     // where that was too little every staged output read back. They are
     // counted over every extent still unproven, the later cohorts' too.
+    //
+    // What the decode's banks left first gathers the extents their stripes
+    // split (see `Assembly`), of blocks in a damaged cohort: those the copy
+    // below writes are written before any decode.
+    let fresh = |block: u64| {
+        coverage.contains(&block)
+            && assessment
+                .requirements
+                .iter()
+                .any(|need| need.cohort == block % cohorts)
+    };
+    let gather = |stripe: u64| assemble(&session.options, layout, outputs, proof, stripe, &fresh);
     let frontiers = ProofFrontiers {
         proof,
         reserved: std::cell::Cell::new(false),
+        gather: &gather,
+        gathered: std::cell::Cell::new(false),
     };
     // Copy only required output ranges outside damaged cohorts. Damaged cohorts
     // copy their intact ranges as their bytes are consumed by the decoder.
@@ -1665,13 +1878,19 @@ fn reconstruct_fft(
         decoded?;
         writers.settle()?;
     }
-    Ok(())
+    // The codec and its stripes go before what the decodes gathered is
+    // written.
+    drop((codec, _scratch, covered, bytes));
+    writers.flush(layout, outputs)
 }
 
-/// The staged proof's frontiers as an FFT decode holds them; reserved once.
+/// The staged proof's frontiers as an FFT decode holds them; reserved once,
+/// after `gather` gave the outputs' assemblies what the decode's banks left.
 struct ProofFrontiers<'a, 'b> {
     proof: &'a StagedProof<'b>,
     reserved: std::cell::Cell<bool>,
+    gather: &'a dyn Fn(u64),
+    gathered: std::cell::Cell<bool>,
 }
 
 impl crate::fft::StripeHold for ProofFrontiers<'_, '_> {
@@ -1683,6 +1902,9 @@ impl crate::fft::StripeHold for ProofFrontiers<'_, '_> {
     }
 
     fn reserve(&self, stripe: usize) -> bool {
+        if !self.gathered.replace(true) {
+            (self.gather)(stripe as u64);
+        }
         if !self.reserved.get() && self.proof.reserve_frontiers(stripe as u64) {
             self.reserved.set(true);
         }
@@ -1726,7 +1948,9 @@ fn open_staged(
 ///
 /// Every successful write is also recorded in the [`StagedProof`]. The inline
 /// tails [`finish_staged`] writes bypass these writers and record themselves
-/// there directly.
+/// there directly. An extent an output's [`Assembly`] gathers is neither
+/// written nor recorded as it arrives: [`Self::flush`] does both once the
+/// walk is over, through the same handles.
 struct StageWriters<'a> {
     tree: Option<&'a RepairTree>,
     options: &'a ExecutionOptions,
@@ -1914,6 +2138,15 @@ impl<'a> StageWriters<'a> {
         offset: u64,
         bytes: &[u8],
     ) -> EngineResult<()> {
+        // An extent the output's assembly gathers is held in memory until the
+        // walk is over, and reaches the file and the proof only then.
+        if target
+            .assembly
+            .as_ref()
+            .is_some_and(|assembly| assembly.gather(extent, relative, bytes))
+        {
+            return Ok(());
+        }
         before_in_place_write(self.access, target)?;
         let mut slots = self
             .open
@@ -1921,7 +2154,7 @@ impl<'a> StageWriters<'a> {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let position = self.position(&mut slots, target, true)?;
-        slots.files[position].1.write_all_at(offset, bytes)?;
+        stage_write(&slots.files[position].1, offset, bytes)?;
         drop(slots);
         // Recorded after the handle lock is released, so the hashing of one
         // write never holds up another. The proof needs the pieces of an
@@ -1929,6 +2162,105 @@ impl<'a> StageWriters<'a> {
         // written at most once per pass, and a pass joins every write it
         // handed the workers before the next begins.
         self.proof.record(slot, extent, relative, bytes);
+        Ok(())
+    }
+
+    /// Write what each output's [`Assembly`] gathered, once the walk is over
+    /// and its last pass settled: every extent whole, in offset order,
+    /// adjacent extents together in one write of at most [`FLUSH_RUN`]
+    /// bytes, each recorded whole in the proof once written. The writes go
+    /// through these writers' handles, so an output the walk held open, or
+    /// still has cached, is not opened again. An extent that did not fill
+    /// exactly once sends its output to the read-back; what was gathered of
+    /// it is written all the same, as the walk would have written it. The
+    /// gathered bytes and their charge go as each output is done.
+    fn flush(&self, layout: &BlockLayout, outputs: &[StagedFile]) -> EngineResult<()> {
+        for (slot, target) in outputs.iter().enumerate() {
+            let Some(assembly) = target
+                .assembly
+                .as_ref()
+                .filter(|assembly| assembly.engaged.load(Ordering::Acquire))
+            else {
+                continue;
+            };
+            let gathering = std::mem::take(
+                &mut *assembly
+                    .gathering
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()),
+            );
+            let extents = &layout.files[target.index].extents;
+            // Without room for a run, each extent is written alone.
+            let charge = self
+                .options
+                .memory
+                .reserve_as(MemoryCategory::OutputStaging, FLUSH_RUN)
+                .ok();
+            let mut run = Vec::with_capacity(if charge.is_some() { FLUSH_RUN } else { 0 });
+            let write = |at: u64, bytes: &[u8]| -> EngineResult<()> {
+                before_in_place_write(self.access, target)?;
+                let mut slots = self
+                    .open
+                    .slots
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let position = self.position(&mut slots, target, true)?;
+                stage_write(&slots.files[position].1, at, bytes)?;
+                Ok(())
+            };
+            let record = |members: std::ops::Range<usize>, bytes: &[u8]| {
+                let mut from = 0;
+                for item in &gathering.extents[members] {
+                    let len = item.len as usize;
+                    self.proof
+                        .record(slot, item.extent, 0, &bytes[from..from + len]);
+                    from += len;
+                }
+            };
+            let (mut at, mut members) = (0u64, 0..0);
+            for (position, item) in gathering.extents.iter().enumerate() {
+                self.options.cancel.check()?;
+                if gathering.filled[position] != item.len {
+                    self.proof.doubt(slot);
+                }
+                let bytes = gathering
+                    .blocks
+                    .get(&item.block)
+                    .filter(|block| !block.bytes.is_empty())
+                    .and_then(|block| {
+                        let from = usize::try_from(item.at - block.start).ok()?;
+                        block
+                            .bytes
+                            .get(from..from + usize::try_from(item.len).ok()?)
+                    });
+                let Some(bytes) = bytes else {
+                    continue;
+                };
+                let offset = extents.range(item.extent).expect("bounded extent").start;
+                if run.is_empty()
+                    || at + run.len() as u64 != offset
+                    || run.len() + bytes.len() > run.capacity()
+                {
+                    if !run.is_empty() {
+                        write(at, &run)?;
+                        record(members.clone(), &run);
+                        run.clear();
+                    }
+                    (at, members) = (offset, position..position);
+                }
+                if bytes.len() > run.capacity() {
+                    write(offset, bytes)?;
+                    record(position..position + 1, bytes);
+                    continue;
+                }
+                run.extend_from_slice(bytes);
+                members.end = position + 1;
+            }
+            if !run.is_empty() {
+                write(at, &run)?;
+                record(members, &run);
+            }
+        }
         Ok(())
     }
 }
@@ -1977,6 +2309,230 @@ fn scatter(
         )?;
     }
     Ok(())
+}
+
+/// Write `bytes` at `offset` of a staged output. Every write a repair makes to
+/// its outputs, but for the inline tails, comes through here.
+fn stage_write(file: &File, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(test)]
+    note_stage_write(offset, bytes.len());
+    file.write_all_at(offset, bytes)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The writes to staged outputs this thread made, `(offset, length)`, while
+    /// a test logs them.
+    static STAGE_WRITES: std::cell::RefCell<Option<Vec<(u64, usize)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn note_stage_write(offset: u64, len: usize) {
+    STAGE_WRITES.with(|log| {
+        if let Some(log) = log.borrow_mut().as_mut() {
+            log.push((offset, len));
+        }
+    });
+}
+
+/// Writes to one staged output gathered in memory and written by
+/// [`StageWriters::flush`] once the walk is over: whole extents, in offset
+/// order, adjacent ones together in writes of at most [`FLUSH_RUN`] bytes.
+///
+/// A walk in stripes narrower than a block writes each extent in as many
+/// pieces as it takes passes, and every pass sweeps the whole output;
+/// gathered, an extent is written once, whole, and the proof opens no
+/// frontier for it. The bytes are kept per block, as the walk produces them,
+/// so extents of one output naming the same block share them.
+///
+/// The bound: [`assemble`] picks the extents once the walk's stripe bank is
+/// admitted, and charges them only what that bank left beyond
+/// [`crate::runtime::SOURCE_GROUP_SLACK`] and the proof's frontiers, so
+/// gathering never narrows the stripe and never costs the proof its
+/// frontiers. It gathers only extents the stripe splits, in offset order,
+/// until that room is spent; every other extent is written as it arrives, as
+/// before. The bytes of a block are allocated with its first piece and
+/// released, with the charge, by the flush.
+#[derive(Default)]
+struct Assembly {
+    /// Set once [`assemble`] gathered extents here; until then every write
+    /// goes to the file as it arrives.
+    engaged: AtomicBool,
+    gathering: Mutex<Gathering>,
+}
+
+struct AssembledExtent {
+    extent: usize,
+    block: u64,
+    /// Where the extent starts within its block.
+    at: u64,
+    len: u64,
+}
+
+#[derive(Default)]
+struct Gathering {
+    /// The gathered extents, in offset order.
+    extents: Vec<AssembledExtent>,
+    /// The bytes of each block the extents name, over the span they cover.
+    blocks: BTreeMap<u64, Gathered>,
+    /// Bytes gathered for each extent, by its position in `extents`.
+    filled: Vec<u64>,
+    /// What the extents and their blocks are charged.
+    _reservation: Option<crate::runtime::Reservation>,
+}
+
+struct Gathered {
+    /// The span of the block `bytes` holds, once its first piece arrived.
+    start: u64,
+    end: u64,
+    bytes: Vec<u8>,
+}
+
+impl Assembly {
+    /// Gather `bytes` written `relative` bytes into extent `extent`, or say
+    /// that extent is not gathered here. A piece that does not fit its extent
+    /// is dropped and leaves the extent unfilled; the flush then sends the
+    /// output to the read-back.
+    fn gather(&self, extent: usize, relative: u64, bytes: &[u8]) -> bool {
+        if !self.engaged.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut gathering = self
+            .gathering
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Gathering {
+            extents,
+            blocks,
+            filled,
+            ..
+        } = &mut *gathering;
+        let Ok(position) = extents.binary_search_by_key(&extent, |item| item.extent) else {
+            return false;
+        };
+        let item = &extents[position];
+        let fits = relative
+            .checked_add(bytes.len() as u64)
+            .is_some_and(|end| end <= item.len);
+        match blocks.get_mut(&item.block) {
+            Some(block) if fits => {
+                if block.bytes.is_empty() {
+                    block.bytes = vec![0; (block.end - block.start) as usize];
+                }
+                let from = (item.at + relative - block.start) as usize;
+                block.bytes[from..from + bytes.len()].copy_from_slice(bytes);
+                filled[position] = filled[position].saturating_add(bytes.len() as u64);
+            }
+            _ => filled[position] = u64::MAX,
+        }
+        true
+    }
+}
+
+/// Give the [`Assembly`] of each output the extents a walk in stripes of
+/// `stripe` bytes splits, as far as the budget the walk's bank left goes; see
+/// [`Assembly`] for the bound. Only extents of blocks `fresh` accepts are
+/// gathered: blocks the walk has written nothing of yet. Called once the
+/// walk's stripe is admitted and before the proof's frontiers are reserved,
+/// which are then reserved only for the extents left out.
+fn assemble(
+    options: &ExecutionOptions,
+    layout: &BlockLayout,
+    outputs: &[StagedFile],
+    proof: &StagedProof,
+    stripe: u64,
+    fresh: &dyn Fn(u64) -> bool,
+) {
+    // A stripe as wide as a block writes every extent whole already.
+    if stripe == 0 || stripe >= layout.block_size {
+        return;
+    }
+    let mut room = options
+        .memory
+        .available()
+        .saturating_sub(crate::runtime::SOURCE_GROUP_SLACK)
+        .saturating_sub(proof.frontier_bytes(stripe).unwrap_or(0));
+    for (slot, target) in outputs.iter().enumerate() {
+        let Some(assembly) = target
+            .assembly
+            .as_ref()
+            .filter(|assembly| !assembly.engaged.load(Ordering::Acquire))
+        else {
+            continue;
+        };
+        let extents = &layout.files[target.index].extents;
+        let mut picked = Vec::new();
+        let mut spans: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+        let mut cost = 0usize;
+        let mut spent = false;
+        for extent in 0..extents.len() {
+            if extents.is_unprotected(extent)
+                || extents.inline_bytes(extent).is_some()
+                || target.holds(extents, extent)
+            {
+                continue;
+            }
+            let (Some(range), Some((block, at))) =
+                (extents.range(extent), extents.block_at(extent))
+            else {
+                continue;
+            };
+            let len = range.end - range.start;
+            if len == 0 || at / stripe == (at + len - 1) / stripe || !fresh(block) {
+                continue;
+            }
+            let held = spans.get(&block).copied();
+            let span = held.map_or((at, at + len), |(start, end)| {
+                (start.min(at), end.max(at + len))
+            });
+            let grown = span.1 - span.0 - held.map_or(0, |(start, end)| end - start);
+            let Some(need) = usize::try_from(grown)
+                .ok()
+                .and_then(|grown| cost.checked_add(grown)?.checked_add(ASSEMBLY_ENTRY_BYTES))
+                .filter(|&need| need <= room)
+            else {
+                spent = true;
+                break;
+            };
+            cost = need;
+            spans.insert(block, span);
+            picked.push(AssembledExtent {
+                extent,
+                block,
+                at,
+                len,
+            });
+        }
+        if !picked.is_empty()
+            && let Ok(reservation) = options
+                .memory
+                .reserve_as(MemoryCategory::OutputStaging, cost)
+        {
+            room -= cost;
+            proof.assemble(slot, picked.iter().map(|item| item.extent));
+            let blocks = spans
+                .into_iter()
+                .map(|(block, (start, end))| {
+                    let bytes = Vec::new();
+                    (block, Gathered { start, end, bytes })
+                })
+                .collect();
+            *assembly
+                .gathering
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Gathering {
+                filled: vec![0; picked.len()],
+                extents: picked,
+                blocks,
+                _reservation: Some(reservation),
+            };
+            assembly.engaged.store(true, Ordering::Release);
+        }
+        if spent {
+            break;
+        }
+    }
 }
 
 fn verify_staged(
@@ -2124,6 +2680,20 @@ fn read_back(
 /// the source's end, inline, or without its own fingerprint — is written and
 /// proven as above, or the output reads back.
 ///
+/// A staged copy is proven the same way. An output neither cloned nor patched
+/// in place is staged by [`copy_held`], which copies the extents its source's
+/// evidence holds intact into the fresh stage at their own offsets, reading
+/// them through the source's registry (on Linux, from the registry's own
+/// handle once its metadata matched the snapshot), and checks that source
+/// against the snapshot once the copy is done; it is checked again before
+/// installation. On the same assumption about change times, the copied
+/// extents hold the bytes the evidence verified, so they too are proven by
+/// that metadata and never written again.
+///
+/// An extent an output's [`Assembly`] gathered reaches the file, and the
+/// proof, only when [`StageWriters::flush`] writes it whole at the end of the
+/// walk; it is then proven by its fingerprint as any whole write is.
+///
 /// The proof never checks the whole-file fingerprint, so metadata that
 /// contradicts itself — per-extent fingerprints every byte matches, under a
 /// whole-file fingerprint those same bytes do not — is routed to the read-back
@@ -2189,6 +2759,9 @@ struct OutputProof {
     /// Protected extents not yet proven.
     unproven: usize,
     proven: Vec<u64>,
+    /// Extents an [`Assembly`] gathers: each is written whole, once, when it
+    /// flushes, so no frontier is reserved for it.
+    assembled: Vec<u64>,
     /// Extents written in more than one piece, hashed up to `next`.
     partial: HashMap<usize, PartialProof>,
     /// Frontiers reserved ahead of the walk and not yet opened.
@@ -2234,8 +2807,9 @@ enum Hashed {
 impl<'a> StagedProof<'a> {
     fn new(layout: &'a BlockLayout, outputs: &[StagedFile], options: &ExecutionOptions) -> Self {
         let bits = outputs.iter().try_fold(0usize, |sum, target| {
+            // The proven and the assembled bits.
             let words = layout.files[target.index].extents.len().div_ceil(64);
-            sum.checked_add(words.checked_mul(8)?)?
+            sum.checked_add(words.checked_mul(16)?)?
                 .checked_add(std::mem::size_of::<OutputProof>())
         });
         let reservation = bits.and_then(|bytes| {
@@ -2262,8 +2836,9 @@ impl<'a> StagedProof<'a> {
                 } else {
                     vec![0; file.extents.len().div_ceil(64)]
                 };
-                // What a staged clone holds is proven by the evidence for the
-                // file it cloned; see `finish_staged`.
+                let assembled = vec![0; proven.len()];
+                // What a staged clone or a staged copy holds is proven by the
+                // evidence for its source; see `finish_staged`.
                 if !doubt && target.cloned.is_some() {
                     for index in 0..file.extents.len() {
                         if target.holds(&file.extents, index) {
@@ -2277,6 +2852,7 @@ impl<'a> StagedProof<'a> {
                     doubt,
                     unproven,
                     proven,
+                    assembled,
                     partial: HashMap::new(),
                     prepaid: 0,
                 }
@@ -2368,7 +2944,11 @@ impl<'a> StagedProof<'a> {
                 }
                 let extents = &self.layout.files[output.index].extents;
                 (0..extents.len())
-                    .filter(|&index| output.proven[index / 64] & (1u64 << (index % 64)) == 0)
+                    .filter(|&index| {
+                        (output.proven[index / 64] | output.assembled[index / 64])
+                            & (1u64 << (index % 64))
+                            == 0
+                    })
                     .filter(|&index| {
                         let (Some(range), Some((_, at))) =
                             (extents.range(index), extents.block_at(index))
@@ -2424,6 +3004,21 @@ impl<'a> StagedProof<'a> {
             output.prepaid += count;
         }
         true
+    }
+
+    /// Mark extents of the output in `slot` as gathered by its [`Assembly`]:
+    /// each is written whole, once, when the assembly flushes, so a walk opens
+    /// no frontier for it.
+    fn assemble(&self, slot: usize, extents: impl IntoIterator<Item = usize>) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(output) = state.outputs.get_mut(slot) else {
+            return;
+        };
+        for extent in extents {
+            if let Some(word) = output.assembled.get_mut(extent / 64) {
+                *word |= 1u64 << (extent % 64);
+            }
+        }
     }
 
     /// Read the output in `slot` back whatever its writes prove.
@@ -3331,6 +3926,7 @@ mod proof_tests {
                 temporary: PathBuf::new(),
                 cloned: None,
                 in_place: None,
+                assembly: None,
             });
             let mut protected = Vec::new();
             for extent in 0..file.extents.len() {
@@ -3390,6 +3986,26 @@ mod proof_tests {
             drop(proof);
             assert_eq!(options.memory.used(), 0);
         }
+    }
+
+    /// An extent an assembly gathers is written whole when it flushes, so a
+    /// walk in stripes, however narrow, reserves no frontier for it.
+    #[test]
+    fn assembled_extents_need_no_frontier() {
+        let case = case();
+        let options = options(1 << 20);
+        let proof = StagedProof::new(&case.layout, &case.staged, &options);
+        assert!(proof.frontier_bytes(1).is_some_and(|bytes| bytes > 0));
+        for (slot, extents) in case.extents.iter().enumerate() {
+            proof.assemble(slot, extents.iter().map(|(extent, _)| *extent));
+        }
+        assert_eq!(proof.frontier_bytes(1), Some(0));
+        for (slot, extents) in case.extents.iter().enumerate() {
+            for (extent, bytes) in extents {
+                proof.record(slot, *extent, 0, bytes);
+            }
+        }
+        assert!(proven(&case, &proof).iter().all(|&ok| ok));
     }
 
     #[test]
@@ -3671,6 +4287,7 @@ mod clone_tests {
     #[derive(Debug, PartialEq, Eq)]
     struct Outcome {
         clones: u64,
+        copies: u64,
         in_place: u64,
         read: u64,
         written: u64,
@@ -3680,6 +4297,17 @@ mod clone_tests {
     /// own directory, with or without a backup, while `linked` keeps a second
     /// name for it that must keep the damaged bytes.
     fn repair_in_place(refuse: bool, backup: bool, linked: bool) -> Outcome {
+        repair_with(refuse, backup, linked, 64 << 10).0
+    }
+
+    /// [`repair_in_place`] with the walk's stripe target at `stripe_bytes`,
+    /// and every write to the staged output, `(offset, length)`, in order.
+    fn repair_with(
+        refuse: bool,
+        backup: bool,
+        linked: bool,
+        stripe_bytes: usize,
+    ) -> (Outcome, Vec<(u64, usize)>) {
         let block = 64u64 << 10;
         let tree = TempTree::new("clone-refused");
         let set = cauchy_block_set(16, block, 2, b"PAR3 refused clone", &tree);
@@ -3689,6 +4317,7 @@ mod clone_tests {
         let inputs = TempTree::new("clone-refused-inputs");
         let options = ExecutionOptions {
             workers: 1,
+            stripe_bytes,
             ..ExecutionOptions::default()
         };
         let mut access = DiskSourceAccess::with_options(options.clone());
@@ -3709,7 +4338,9 @@ mod clone_tests {
         assert_eq!(session.assess().unwrap().status, RepairStatus::Ready);
         let before = options.diagnostics.file_io();
         REFUSE_CLONES.with(|refused| refused.set(refuse));
+        STAGE_WRITES.with(|log| *log.borrow_mut() = Some(Vec::new()));
         let report = session.repair(inputs.path(), backup);
+        let writes = STAGE_WRITES.with(|log| log.borrow_mut().take()).unwrap();
         REFUSE_CLONES.with(|refused| refused.set(false));
         assert_eq!(report.unwrap().installed.len(), 1);
         let after = options.diagnostics.file_io();
@@ -3724,12 +4355,14 @@ mod clone_tests {
                 "a second name for the source was changed"
             );
         }
-        Outcome {
+        let outcome = Outcome {
             clones: options.diagnostics.file_clones(),
+            copies: options.diagnostics.file_copies(),
             in_place: options.diagnostics.file_in_place_repairs(),
             read: after.read_bytes - before.read_bytes,
             written: after.write_bytes - before.write_bytes,
-        }
+        };
+        (outcome, writes)
     }
 
     /// Without a clone or a backup to keep, only the damaged block is written,
@@ -3737,40 +4370,60 @@ mod clone_tests {
     #[test]
     fn a_refused_clone_without_a_backup_patches_only_the_damaged_block() {
         let (len, block) = (16u64 * (64 << 10), 64u64 << 10);
-        let expected = if cfg!(any(target_os = "macos", target_os = "linux")) {
-            Outcome {
-                clones: 0,
-                in_place: 1,
-                read: len - block + len,
-                written: block,
-            }
-        } else {
-            Outcome {
-                clones: 0,
-                in_place: 0,
-                read: len - block,
-                written: len,
-            }
+        let expected = Outcome {
+            clones: 0,
+            copies: 0,
+            in_place: 1,
+            read: len - block + len,
+            written: block,
         };
         assert_eq!(repair_in_place(true, false, false), expected);
     }
 
     /// A backup keeps the damaged file under its own name, so a refused clone
-    /// still copies the whole file, with the same bytes.
+    /// stages a copy: the intact blocks are copied in sequential runs, and the
+    /// walk, which reads them again for the syndromes, writes only the
+    /// damaged block, with the same bytes.
     #[test]
-    fn a_refused_clone_with_a_backup_falls_back_to_a_full_copy() {
+    fn a_refused_clone_with_a_backup_copies_the_intact_blocks_in_runs() {
         let (len, block) = (16u64 * (64 << 10), 64u64 << 10);
-        let outcome = repair_in_place(true, true, false);
+        let (outcome, writes) = repair_with(true, true, false, 64 << 10);
         assert_eq!(
             outcome,
             Outcome {
                 clones: 0,
+                copies: 1,
                 in_place: 0,
-                read: len - block,
+                read: 2 * (len - block),
                 written: len,
             },
-            "the surviving blocks once, and nothing read back"
+            "the surviving blocks twice, and nothing read back"
         );
+        let block = block as usize;
+        assert_eq!(
+            writes,
+            vec![
+                (0, 5 * block),
+                (6 * block as u64, 10 * block),
+                (5 * block as u64, block)
+            ]
+        );
+    }
+
+    /// A walk in stripes narrower than a block gathers the block it rebuilds
+    /// and writes it once, whole, in place or into a copy, and the copy is
+    /// still proven without a read-back.
+    #[test]
+    fn a_block_rebuilt_in_stripes_is_written_once_whole() {
+        let (len, block) = (16u64 * (64 << 10), 64u64 << 10);
+        let (outcome, writes) = repair_with(true, true, false, 16 << 10);
+        assert_eq!((outcome.copies, outcome.written), (1, len));
+        assert_eq!(outcome.read, 2 * (len - block), "the output was read back");
+        assert_eq!(writes.last(), Some(&(5 * block, block as usize)));
+        assert_eq!(writes.len(), 3);
+        let (outcome, writes) = repair_with(true, false, false, 16 << 10);
+        assert_eq!((outcome.in_place, outcome.written), (1, block));
+        assert_eq!(writes, vec![(5 * block, block as usize)]);
     }
 
     /// A source with a second name is never patched: that name keeps the

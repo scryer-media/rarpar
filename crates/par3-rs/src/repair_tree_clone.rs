@@ -117,3 +117,50 @@ pub(crate) fn clone_into(source: &impl AsFd, target: &impl AsFd) -> io::Result<(
         Err(io::Error::last_os_error())
     }
 }
+
+/// Copy up to `len` bytes at `from` in the open file `source` to `to` in the
+/// open, writable file `target`, inside the kernel, and return how many it
+/// copied: zero only at the end of `source`.
+#[cfg(target_os = "linux")]
+pub(crate) fn copy_range(
+    source: &impl AsFd,
+    from: u64,
+    target: &impl AsFd,
+    to: u64,
+    len: u64,
+) -> io::Result<usize> {
+    let offset =
+        |at: u64| i64::try_from(at).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput));
+    let (mut from, mut to) = (offset(from)?, offset(to)?);
+    let len = usize::try_from(len).unwrap_or(usize::MAX).min(1 << 30);
+    // SAFETY: both descriptors are borrowed for the duration of the call, and
+    // the two offsets are 64-bit locals the call reads and advances.
+    let copied = unsafe {
+        libc::copy_file_range(
+            source.as_fd().as_raw_fd(),
+            (&raw mut from).cast(),
+            target.as_fd().as_raw_fd(),
+            (&raw mut to).cast(),
+            len,
+            0,
+        )
+    };
+    usize::try_from(copied).map_err(|_| io::Error::last_os_error())
+}
+
+/// Whether a refused in-kernel copy means only that these two files cannot
+/// be copied that way: an old kernel, two filesystems the kernel will not
+/// copy between, or a file that refuses it. The caller copies through a
+/// buffer instead.
+#[cfg(target_os = "linux")]
+pub(crate) fn copy_unsupported(error: &io::Error) -> bool {
+    error.raw_os_error().is_some_and(|code| {
+        code == libc::ENOSYS
+            || code == libc::EXDEV
+            || code == libc::EINVAL
+            || code == libc::EOPNOTSUPP
+            || code == libc::EBADF
+            || code == libc::EPERM
+            || code == libc::ETXTBSY
+    })
+}
