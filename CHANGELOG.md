@@ -46,7 +46,14 @@ A minor bump, as for 0.7.0: a command line that 0.7.0 accepted
   are now compiled out, as in its own release builds. No flag sets `-O3`:
   the release profile already compiles AWS-LC at `-O3` (`/O2` with clang-cl),
   and a level in CFLAGS would override the `-O0` its jitterentropy sources
-  need.
+  need. On Windows the flags are set on the build step only, not job-wide:
+  the runner's target is also its host, so job-wide flags reached the host
+  build of the release job's `xtask` steps, where `ring` (a dependency of
+  `xtask` only, never of rarpar) broke on them. On aarch64 ring switches to
+  the GNU clang driver, which rejects the cl-dialect flags; on x86_64 the
+  docs step runs under Git Bash, whose path conversion turned `/O2` into a
+  Windows path. That stopped the first 0.8.0 release run on both Windows
+  targets before anything was published.
 - The release job's AWS-LC check (`confirm-native-code.sh`/`.ps1`, replacing
   `confirm-aws-lc.*`) now reads the aws-lc-sys build output as well as the
   dependency graph, and the binary: it fails unless AWS-LC came from the cc

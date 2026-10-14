@@ -473,6 +473,18 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn("CXXFLAGS", env, job)
             rows = matrix_rows(jobs[job])
             self.assertTrue(rows, job)
+            build_step = jobs[job].split("- name: Build rarpar\n", 1)[1]
+            build_step = build_step.split("\n      - ", 1)[0] + "\n"
+            if job == "build-windows":
+                # The target is also the host on the Windows runners, so
+                # job-wide per-target flags would reach the xtask steps' host
+                # build, where ring forces GNU clang on aarch64 and rejects the
+                # cl dialect. The flags live on the build step only.
+                for key in env:
+                    self.assertFalse(key.startswith(("CFLAGS_", "CXXFLAGS_")), (job, key))
+                flag_env = env_block(build_step, "        ")
+            else:
+                flag_env = env
             for platform, row in rows.items():
                 target = row["target"]
                 features = row["features"].split(",")
@@ -481,7 +493,7 @@ class WorkflowTests(unittest.TestCase):
                 # mimalloc replaces musl's allocator; nothing else takes it.
                 self.assertEqual("musl-allocator" in features, target.endswith("-musl"), platform)
                 for name in ("CFLAGS", "CXXFLAGS"):
-                    flags = env.get(f"{name}_{cflags(target)}", "").strip('"').split()
+                    flags = flag_env.get(f"{name}_{cflags(target)}", "").strip('"').split()
                     self.assertIn("-DNDEBUG" if "-" in flags[0] else "/DNDEBUG", flags, (platform, name))
                     if job == "build-windows":
                         self.assertEqual(flags, ["/O2", "/DNDEBUG", "/Gy", "/Gw"], platform)
@@ -520,6 +532,11 @@ class WorkflowTests(unittest.TestCase):
             step = ci_jobs[checks_job].split("- name: Build the release binary\n", 1)[1]
             step_env = env_block(step.split("\n      - name:", 1)[0], "        ")
             self.assertEqual(step_env.get("CC_ENABLE_DEBUG_OUTPUT"), '"1"', checks_job)
+            if build_job == "build-windows":
+                # Windows keeps its C flags on the build step (see
+                # test_release_native_code_policy).
+                build = release_jobs[build_job].split("- name: Build rarpar\n", 1)[1]
+                release_env = env_block(build.split("\n      - ", 1)[0] + "\n", "        ")
             release_flags = {k: v for k, v in release_env.items() if "FLAGS_" in k}
             self.assertTrue(release_flags, build_job)
             self.assertEqual({k: v for k, v in step_env.items() if "FLAGS_" in k}, release_flags, checks_job)

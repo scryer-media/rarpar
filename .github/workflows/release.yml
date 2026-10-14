@@ -468,16 +468,11 @@ jobs:
       AWS_LC_SYS_PREBUILT_NASM: "0"
       CC_x86_64_pc_windows_msvc: clang-cl
       CXX_x86_64_pc_windows_msvc: clang-cl
-      # Per-target C flags for every C dependency, AWS-LC included. /O2 repeats
-      # the level the cc crate already passes from the release profile (the cl
-      # dialect has no -O3). The cc crate appends CFLAGS after a build
-      # script's own flags; for jitterentropy, which must compile unoptimised,
-      # aws-lc-sys takes the optimisation flags out of CFLAGS and appends -Od
-      # on this clang-cl path, and confirm_native_code.py checks the result.
-      CFLAGS_x86_64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
-      CXXFLAGS_x86_64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
-      CFLAGS_aarch64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
-      CXXFLAGS_aarch64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
+      # The Windows C flags are set on the "Build rarpar" step only (see
+      # there), never job-wide: the target is also the host on these runners,
+      # so job-wide per-target flags would reach the xtask steps' host build
+      # too, where ring forces the GNU clang driver on aarch64 and rejects the
+      # cl-dialect flags.
     defaults:
       run:
         shell: pwsh
@@ -517,6 +512,19 @@ jobs:
       - name: Audit release target features
         run: ./.github/scripts/release/audit-release-target-features.ps1
       - name: Build rarpar
+        # Per-target C flags for every C dependency of the shipped binary,
+        # AWS-LC included. /O2 repeats the level the cc crate already passes
+        # from the release profile (the cl dialect has no -O3). The cc crate
+        # appends CFLAGS after a build script's own flags; for jitterentropy,
+        # which must compile unoptimised, aws-lc-sys takes the optimisation
+        # flags out of CFLAGS and appends -Od on this clang-cl path, and
+        # confirm_native_code.py checks the result. Scoped to this step, as in
+        # ci.yml's target-checks-windows, so host tools never see them.
+        env:
+          CFLAGS_x86_64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
+          CXXFLAGS_x86_64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
+          CFLAGS_aarch64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
+          CXXFLAGS_aarch64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
         run: ./.github/scripts/release/build-rarpar.ps1
       - name: Confirm the 8 MiB stack reserve
         run: ./.github/scripts/release/confirm-stack-reserve.ps1
