@@ -51,11 +51,19 @@ const (
 	AccessSSM = "ssm"
 )
 
-// Oracle recipes.
+// Oracle recipes. Both build on the host itself at run start, and only for a
+// platform the vendor publishes no binary for: UnRAR on Linux arm64, and
+// par3cmdline, which publishes no release (its tree ships only
+// windows/par3.exe). Nothing is built on the orchestrator, and nothing runs in
+// a container.
 const (
-	RecipeUnrarPortable   = "unrar-portable"
+	RecipeUnrarHost       = "unrar-portable-onhost"
 	RecipePAR3CmdlineHost = "par3cmdline-onhost"
 )
+
+// removedRecipeUnrarPortable compiled UnRAR in a container on the
+// orchestrating machine. It is a config error that names RecipeUnrarHost.
+const removedRecipeUnrarPortable = "unrar-portable"
 
 // Machine kinds.
 const (
@@ -70,8 +78,9 @@ const (
 	PerfNone   = "none"
 )
 
-// Oracle policies. "Never build an oracle where an official binary exists" is a
-// standing rule: source-build is only reachable with a recorded reason.
+// Oracle policies. The benches use what the vendor provides: source-build is
+// only reachable with a recorded reason, for a platform the vendor publishes
+// no binary for.
 const (
 	OracleHostPath       = "host-path"
 	OracleOfficialBinary = "official-binary"
@@ -98,7 +107,7 @@ var (
 	// suiteOracles names the oracle role each suite compares against.
 	suiteOracles = map[string]string{SuiteMacroRAR: "rar", SuiteMacroPAR2: "par2", SuiteMacroPAR3: "par3"}
 	// recipeRoles is the audited source-build recipe set, per oracle role.
-	recipeRoles = map[string]string{RecipeUnrarPortable: "rar", RecipePAR3CmdlineHost: "par3"}
+	recipeRoles = map[string]string{RecipeUnrarHost: "rar", RecipePAR3CmdlineHost: "par3"}
 )
 
 type Config struct {
@@ -640,8 +649,10 @@ func validate(state *decodeState, config *Config) {
 	if defaults.Warmups < 0 || defaults.Repeats < 1 {
 		state.fail("fleet.defaults: warmups must be >= 0 and repeats >= 1")
 	}
-	if defaults.Lane != "cpu" && defaults.Lane != "metal" && defaults.Lane != "docker-cpu" {
-		state.fail("fleet.defaults.lane must be cpu, metal, or docker-cpu")
+	// docker-cpu labels a local harness run inside a container; a fleet host
+	// always runs natively, so that label would misdescribe its evidence.
+	if defaults.Lane != "cpu" && defaults.Lane != "metal" {
+		state.fail("fleet.defaults.lane must be cpu or metal: fleet hosts run natively, never in a container")
 	}
 	if defaults.Par2Placement != "canonical" && defaults.Par2Placement != "smart" {
 		state.fail("fleet.defaults.par2_placement must be canonical or smart")
@@ -979,15 +990,18 @@ func validateOracles(state *decodeState, prefix string, machine *Machine) {
 				state.fail("%s: oracles.%s.sha256 must be 64 hex characters", prefix, role)
 			}
 		case OracleSourceBuild:
-			// House rule: never rebuild an oracle where an official binary
-			// exists. Source builds stay reachable (linux-arm unrar has no
-			// official binary) but must record why, use an audited recipe, and
-			// pin the source tarball.
+			// House rule: use the vendor's binary. Source builds stay
+			// reachable only where the vendor publishes none for the platform
+			// (UnRAR on Linux arm64, par3cmdline outside Windows), and must
+			// record why and use an audited on-host recipe.
 			if oracle.Reason == "" {
 				state.fail("%s: oracles.%s.reason is required for policy %q; record why no official binary exists", prefix, role, OracleSourceBuild)
 			}
 			recipeRole, known := recipeRoles[oracle.Recipe]
 			switch {
+			case oracle.Recipe == removedRecipeUnrarPortable:
+				state.fail("%s: oracles.%s: recipe %q was removed: it compiled UnRAR in a container on the orchestrating machine; use recipe %q, which runs the same audited portable build natively on the host at run start",
+					prefix, role, removedRecipeUnrarPortable, RecipeUnrarHost)
 			case !known:
 				state.fail("%s: oracles.%s.recipe must be one of %s", prefix, role, strings.Join(sortedKeys(recipeRoles), ", "))
 			case recipeRole != role:
@@ -1002,8 +1016,8 @@ func validateOracles(state *decodeState, prefix string, machine *Machine) {
 				if machine.isWindows() {
 					state.fail("%s: oracles.%s: par3cmdline ships an official windows/par3.exe in the pinned archive; use policy %q with archive_member instead of building it", prefix, role, OracleOfficialBinary)
 				}
-			case oracle.URL == "" || oracle.SHA256 == "":
-				state.fail("%s: oracles.%s needs the source url and sha256 for policy %q", prefix, role, OracleSourceBuild)
+			case oracle.Recipe == RecipeUnrarHost:
+				validateUnrarHostRecipe(state, prefix, role, machine, oracle)
 			}
 		default:
 			state.fail("%s: oracles.%s.policy must be %s, %s, or %s", prefix, role,
@@ -1012,6 +1026,29 @@ func validateOracles(state *decodeState, prefix string, machine *Machine) {
 		if oracle.BinarySHA256 != "" && !isHexSHA256(oracle.BinarySHA256) {
 			state.fail("%s: oracles.%s.binary_sha256 must be 64 hex characters", prefix, role)
 		}
+	}
+}
+
+// validateUnrarHostRecipe keeps the on-host UnRAR build to Linux arm64, the
+// one fleet platform RARLAB publishes no current UnRAR for, and pins the
+// source tarball the orchestrator ships to the host.
+func validateUnrarHostRecipe(state *decodeState, prefix, role string, machine *Machine, oracle Oracle) {
+	bundle := machine.Bundle
+	switch {
+	case machine.isWindows() || bundle.GoOS != "linux" || (bundle.GoArch != "" && bundle.GoArch != "arm64"):
+		state.fail("%s: oracles.%s: recipe %q builds UnRAR only on linux/arm64, where RARLAB publishes no current binary; a %s/%s host uses RARLAB's official binary with policy %q",
+			prefix, role, RecipeUnrarHost, bundle.GoOS, bundle.GoArch, OracleOfficialBinary)
+	case bundle.GoArch == "":
+		state.fail("%s: oracles.%s: recipe %q needs bundle.go_arch = \"arm64\": it builds UnRAR only on linux/arm64, where RARLAB publishes no current binary",
+			prefix, role, RecipeUnrarHost)
+	}
+	switch {
+	case oracle.URL == "" || oracle.SHA256 == "":
+		state.fail("%s: oracles.%s: recipe %q needs url and sha256 for RARLAB's unrarsrc source tarball", prefix, role, RecipeUnrarHost)
+	case !isHexSHA256(oracle.SHA256):
+		state.fail("%s: oracles.%s.sha256 must be 64 hex characters", prefix, role)
+	case !strings.HasSuffix(oracle.URL, ".tar.gz"):
+		state.fail("%s: oracles.%s.url must name RARLAB's unrarsrc-*.tar.gz source tarball", prefix, role)
 	}
 }
 

@@ -64,10 +64,11 @@ rarpar-bench fleet run --config bench/fleet.toml --machine nas-atom --suite macr
 2. **Stages bundles.** A release bundle stages the verified `rarpar`
    (`rarpar.exe` for a Windows host) as published, and only the pure-Go harness
    is cross-compiled here, with CGO off (`rarpar-bench`, or `rarpar-bench.exe`
-   for a Windows bundle). Nothing in the fleet builds a candidate from source or
-   runs one in a container. A prebuilt bundle is copied from a local directory
-   as it is. Every bundle carries a `BUILDINFO.json` with the release it staged,
-   tree revisions, dirty-file counts, binary digests, and the codegen policy.
+   for a Windows bundle). Nothing in the fleet builds a candidate from source,
+   and nothing in it runs in a container. A prebuilt bundle is copied from a
+   local directory as it is. Every bundle carries a `BUILDINFO.json` with the
+   release it staged, tree revisions, dirty-file counts, binary digests, and
+   the codegen policy.
 3. **Spawns everything in parallel.** EC2 instances launch concurrently against a
    session security group scoped to your address and an ephemeral keypair, with
    `DeleteOnTermination`, terminate-on-shutdown, and a deadman shutdown inside
@@ -82,6 +83,12 @@ rarpar-bench fleet run --config bench/fleet.toml --machine nas-atom --suite macr
    `setsid`/`nohup` and needs no further orchestrator contact. On the host it
    does: quiet-load gate → warmup pass (discarded) → timed repeats → perf
    diagnostic pass → evidence tarball + inventory manifest + `DONE` sentinel.
+   An oracle whose vendor publishes no binary for the platform is compiled
+   here, on the host, never on the orchestrator: UnRAR on Linux arm64 before
+   the first suite (see
+   [The UnRAR oracle on Linux arm64](#the-unrar-oracle-on-linux-arm64)),
+   par3cmdline at the start of the PAR3 suite, and XZ Utils in the lzma-turbo
+   suite.
 5. **Collects as hosts finish.** Each host is polled for its sentinel; on DONE
    the tarball is pulled and verified against the manifest, then cloud hosts are
    terminated and the teardown is verified resource by resource. A slow or hung
@@ -176,7 +183,8 @@ assembles every bundle exactly as `fleet run` would, under
 `fleet teardown` cannot mistake it for a round, and it refuses a run id that
 already has a `run-state.json`. It contacts no fleet host, checks no
 credential and launches nothing. Oracles are resolved as in a round, so an
-`official-binary` oracle is downloaded unless `--no-fetch` is given.
+`official-binary` oracle, and the source tarball of an `unrar-portable-onhost`
+oracle, is downloaded unless `--no-fetch` is given.
 
 **Prebuilt, for dev spot tests.** `source = "prebuilt"` with `path` set to an
 absolute local directory stages that directory as it is: early development
@@ -249,11 +257,19 @@ oracle.
   Each machine runs its platform's release asset, verified against the
   release's `SHA256SUMS`. Nothing in the fleet builds a candidate from source
   or runs one in a container.
-- **Never rebuild an oracle where an official binary exists.** `source-build`
-  requires a recorded `reason`, a pinned source tarball digest, and one of the
-  audited recipes. `unrar-portable` uses the stock makefile and stock
-  `CXXFLAGS`, sets only `CXX` and a static link, and refuses to build if the
-  makefile has acquired a `-march`/`-mcpu`/`-mtune` of its own.
+- **Never build an oracle the vendor publishes a binary for.** `source-build`
+  requires a recorded `reason`, a pinned source, and one of two audited
+  recipes. Each is refused on every platform its vendor publishes a binary
+  for, and each compiles natively on the host during the run, never on the
+  orchestrator and never in a container. `unrar-portable-onhost` builds UnRAR
+  on Linux arm64 only (see
+  [The UnRAR oracle on Linux arm64](#the-unrar-oracle-on-linux-arm64)).
+  `par3cmdline-onhost` builds par3cmdline on Linux and macOS (see
+  [PAR3 suite on the fleet](#par3-suite-on-the-fleet)). The removed
+  `unrar-portable` recipe, which compiled UnRAR in a container on the
+  orchestrating machine, is refused with a pointer to `unrar-portable-onhost`.
+- **Hosts run natively.** `fleet.defaults.lane` must be `cpu` or `metal`;
+  `docker-cpu` is refused.
 - **Explicit `user@host:port` from the machine's own config entry.** ssh_config
   aliases are rejected; an alias that resolved to the wrong user has
   mis-authenticated a whole round.
@@ -290,6 +306,66 @@ exiting) therefore blocks that host until the orchestrator's
 it is waiting on. Clear the process, or drop that name from
 `quiet_load_process_names` for the run.
 
+## The UnRAR oracle on Linux arm64
+
+RARLAB publishes no Linux arm64 UnRAR. rarlab.com/download.htm lists none,
+and the only Linux ARM entries on rarlab.com/rar_add.htm are
+`unrar-4.1.3-armv4l.tar.gz` and `unrar-5.5.0-arm.gz`. The second is UnRAR
+5.5.0 from 2017: an ELF 32-bit ARM EABI5 binary, dynamically linked against
+`/lib/ld-linux-armhf.so.3`. An AArch64-only server core cannot execute it,
+and it predates RAR 7. So a Linux arm64 host's `rar` oracle is the one UnRAR
+the fleet builds, and the host builds it itself. Every other host runs
+RARLAB's own binary.
+
+```toml
+[machines.oracles.rar]
+policy = "source-build"
+reason = "RARLAB publishes no Linux arm64 UnRAR: rarlab.com/download.htm lists none, and the only Linux ARM entries on rarlab.com/rar_add.htm are unrar-4.1.3-armv4l.tar.gz and unrar-5.5.0-arm.gz, an UnRAR 5.5.0 (2017) ELF 32-bit ARM EABI5 binary dynamically linked against /lib/ld-linux-armhf.so.3, which an AArch64-only server core cannot execute and which predates RAR 7"
+url = "https://www.rarlab.com/rar/unrarsrc-7.2.3.tar.gz"
+sha256 = "3995af0aa32b1505a566da053725551a1f0698dc42b2fdf7ba7d65db0d004e33"
+recipe = "unrar-portable-onhost"
+# binary_sha256 = "<64 hex>"      # optional: hold later runs to one binary
+version = "unrar 7.2.3 (portable on-host build)"
+```
+
+- **The orchestrator compiles nothing.** It downloads the source tarball,
+  refuses it unless its sha256 matches the pin, and ships it in the bundle.
+  `fleet plan --stage` does the same; with `--no-fetch` the tarball must
+  already be in the cache.
+- **The host builds it at run start**, after `environment.txt` records the
+  quiet box and before `binaries.txt` hashes the binaries, by running
+  `rarpar-bench fleet build-unrar`. That checks the shipped tarball against
+  the pin again and unpacks it. It refuses to build if the stock makefile
+  carries `-march`, `-mcpu`, `-mtune` or `native` outside a comment line. It
+  runs the stock makefile with its stock `CXXFLAGS`, setting only `CXX=g++`
+  and `LDFLAGS=-pthread -static`, and removes `CPPFLAGS`, `CFLAGS`,
+  `CXXFLAGS`, `LDFLAGS`, `LIBS`, `MAKEFLAGS`, `MFLAGS`, `GNUMAKEFLAGS` and
+  `MAKEFILES` from make's environment, so none of them can carry a flag from
+  the host into the build. It refuses a result that names an ELF interpreter
+  or needs a shared library, and one whose sha256 differs from
+  `binary_sha256` when that is set. Only then does it install
+  `unrar-reference/unrar` in the run's staging directory, the path every
+  suite uses. It first deletes any binary an earlier build left there, so a
+  refused build leaves none. The quiet-load gate before the first suite waits
+  out the build's load.
+- **Evidence.** `results/unrar-build.json` records the source URL and
+  digest, the makefile digest, the flag audit, the make arguments, the
+  removed variables, the make and compiler versions, the binary digest and
+  whether a pin held it, the ELF machine and the static-link check.
+  `results/unrar-build.log` holds the full build output.
+- **A failed build fails the host** as `unrar-build`. Every run that needs
+  the oracle then stops at its missing-binary check before it runs a case.
+- **Host requirements.** make, g++, and the static libc and libstdc++
+  archives. EC2 user-data installs `build-essential` when this recipe is
+  selected; a local host must already have them.
+- **Pinning the binary.** The digest depends on the host's compiler, so a run
+  without `binary_sha256` records the digest and does not check it. Review
+  `results/unrar-build.json`, then set `binary_sha256` to hold later runs to
+  that binary.
+- **Refusals.** The recipe needs `bundle.go_arch = "arm64"` on a Linux host
+  and is refused anywhere else, since RARLAB publishes the binary there. It
+  needs the `url` and `sha256` of an `unrarsrc-*.tar.gz`.
+
 ## PAR3 suite on the fleet
 
 Add `macro-par3` to a machine's `suites` and give it a `par3` oracle. The
@@ -301,6 +377,7 @@ itself is documented in [benchmarking.md](benchmarking.md#par3-suite).
 ```toml
 [machines.oracles.par3]
 policy = "source-build"
+reason = "par3cmdline publishes no release and no Linux binary; the tree ships only windows/par3.exe"
 recipe = "par3cmdline-onhost"     # built on the host from the pinned archive
 
 [machines.par3]
@@ -338,11 +415,13 @@ timeout_minutes = 20              # per run, rarpar rows too; a reference over i
   wrongly fails the section; see
   [benchmarking.md](benchmarking.md#timeouts-and-reference-dnf).
 
-- **Linux and macOS hosts** use `recipe = "par3cmdline-onhost"`. The host runs
-  `par3 build-reference` against the shipped `toolchains.json`, so the
-  reference is compiled natively and never emulated. It needs CMake and a C
-  compiler; EC2 user-data installs `build-essential` and `cmake` when this
-  recipe is selected. This recipe takes no `url` or `sha256`.
+- **Linux and macOS hosts** use `recipe = "par3cmdline-onhost"`, because
+  par3cmdline publishes no release and no Linux binary; the tree ships only
+  windows/par3.exe. The host runs `par3 build-reference` against the shipped
+  `toolchains.json`, so the reference is compiled natively and never
+  emulated. It needs CMake and a C compiler; EC2 user-data installs
+  `build-essential` and `cmake` when this recipe is selected. This recipe
+  takes no `url` or `sha256`.
 - **Windows hosts** use `policy = "official-binary"` with the pinned archive's
   `windows/par3.exe` (`archive_member`, `binary_sha256`); see the example
   config. `par3cmdline-onhost` is refused on Windows, and so is
@@ -473,9 +552,10 @@ spot = true                                    # optional, SSM only
 
 ## Known limits
 
-- The `unrar-portable` oracle recipe (a `source-build` oracle, never a
-  candidate) still compiles UnRAR in a container on the orchestrating
-  machine. It is the one container left in the fleet.
+- The on-host UnRAR build (`unrar-portable-onhost`) has not yet compiled
+  UnRAR on a live Linux arm64 host. Its checks are unit-tested around a
+  stand-in `make`, and the builder has run on RARLAB's real 7.2.3 source
+  tarball with that stand-in. Treat its first run as bring-up.
 - The Windows runner has never been executed (see below).
 - The SSM access mode is implemented and unit-tested but has not been run
   against a live account yet. Treat its first run as bring-up.

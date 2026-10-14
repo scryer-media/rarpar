@@ -337,20 +337,28 @@ func packageInstall(packages []string) string {
 }
 
 // bootstrapPackages are the distro packages a machine's suites need on host:
+// the unrar-portable-onhost recipe builds UnRAR with make and g++ and links it
+// statically against libc and libstdc++ (build-essential carries all four), and
 // the par3cmdline-onhost recipe builds the reference with CMake.
 func bootstrapPackages(machine Machine) []string {
 	var packages []string
-	if oracle, ok := machine.Oracles["par3"]; ok && oracle.Policy == OracleSourceBuild && oracle.Recipe == RecipePAR3CmdlineHost {
-		packages = append(packages, "build-essential", "cmake")
-	}
-	if machine.hasTurbo() {
-		// The turbo suites build Rust candidates and xz on the host and
-		// fetch rustup and 7-Zip over https.
-		for _, name := range turboPackages {
+	add := func(names ...string) {
+		for _, name := range names {
 			if !contains(packages, name) {
 				packages = append(packages, name)
 			}
 		}
+	}
+	if oracle, ok := machine.Oracles["rar"]; ok && oracle.Policy == OracleSourceBuild && oracle.Recipe == RecipeUnrarHost {
+		add("build-essential")
+	}
+	if oracle, ok := machine.Oracles["par3"]; ok && oracle.Policy == OracleSourceBuild && oracle.Recipe == RecipePAR3CmdlineHost {
+		add("build-essential", "cmake")
+	}
+	if machine.hasTurbo() {
+		// The turbo suites build Rust candidates and xz on the host and
+		// fetch rustup and 7-Zip over https.
+		add(turboPackages...)
 	}
 	return packages
 }

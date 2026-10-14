@@ -58,6 +58,12 @@ func par3ReferenceDir(machine Machine, layout RemoteLayout) string {
 	return hostJoin(machine, layout.Base, "par3-reference")
 }
 
+// unrarReferenceDir is where the unrar-portable-onhost recipe extracts and
+// builds UnRAR, under the run root so cleanup removes it with everything else.
+func unrarReferenceDir(machine Machine, layout RemoteLayout) string {
+	return hostJoin(machine, layout.Base, "unrar-reference")
+}
+
 func LayoutFor(machine Machine, runID string) RemoteLayout {
 	base := joinPosix(machine.Paths.Staging, runID)
 	scratch := joinPosix(base, "work")
@@ -200,10 +206,10 @@ func RunScript(machine Machine, defaults RunDefaults, runID string, layout Remot
 
 	// ---- user-data gate ----------------------------------------------------
 	// sshd moves to the bench port early in user-data, so SSH answers while
-	// the package install (cmake for the on-host par3 reference) and the
-	// quiet-box hygiene are still running. Wait for the sentinel user-data
-	// writes last; a box that never writes it fails rather than running on a
-	// half-provisioned host.
+	// the package install (the compilers for the on-host UnRAR and par3
+	// builds) and the quiet-box hygiene are still running. Wait for the
+	// sentinel user-data writes last; a box that never writes it fails rather
+	// than running on a half-provisioned host.
 	if machine.EC2 != nil {
 		write("# Wait for user-data to finish (packages, hygiene) before anything runs.")
 		write("USERDATA_DONE=/var/lib/cloud/instance/BENCH_USERDATA_DONE")
@@ -225,6 +231,26 @@ func RunScript(machine Machine, defaults RunDefaults, runID string, layout Remot
 	write("  echo; echo '==== mounts ===='; df -h / \"$W\" 2>/dev/null")
 	write("  echo; echo '==== cpufreq ===='; for f in /sys/devices/system/cpu/cpu0/cpufreq/*; do [ -r \"$f\" ] && echo \"$f = $(cat \"$f\" 2>/dev/null)\"; done 2>/dev/null")
 	write("} > \"$R/environment.txt\" 2>&1")
+
+	// ---- on-host UnRAR build ---------------------------------------------
+	// After environment.txt records the quiet box and before binaries.txt,
+	// so the fingerprint hashes the oracle every suite then runs. Each suite's
+	// own quiet-load gate waits out the build's load.
+	if oracle, ok := machine.Oracles["rar"]; ok && oracle.Policy == OracleSourceBuild && oracle.Recipe == RecipeUnrarHost {
+		write("# RARLAB publishes no Linux arm64 UnRAR: build the shipped, sha256-pinned source")
+		write("# here with the audited portable recipe (stock makefile and CXXFLAGS, CXX=g++,")
+		write("# static link, no -march/-mcpu/-mtune; refused if the makefile carries one).")
+		write("log 'building the UnRAR oracle on this host'")
+		args := []string{"--source", "\"$BIN/" + unrarSourceName + "\"", "--sha256", shellQuote(oracle.SHA256),
+			"--url", shellQuote(oracle.URL), "--out", shellQuote(unrarReferenceDir(machine, layout))}
+		if oracle.BinarySHA256 != "" {
+			args = append(args, "--binary-sha256", shellQuote(oracle.BinarySHA256))
+		}
+		write("\"$BENCH\" fleet build-unrar %s \\", strings.Join(args, " "))
+		write("  > \"$R/unrar-build.json\" 2> \"$R/unrar-build.log\" || fail unrar-build")
+	}
+
+	// ---- shipped binaries ------------------------------------------------
 	write("{")
 	write("  echo '==== shipped binaries ===='; ls -la \"$BIN\"")
 	write("  [ -n \"$HASH\" ] && (cd \"$BIN\" && $HASH * 2>/dev/null)")

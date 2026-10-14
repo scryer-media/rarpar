@@ -98,6 +98,18 @@ A minor bump, as for 0.4.0 and 0.6.0: a command line that 0.6.x accepted
   `crt_static` bundle keys, `[fleet] docker` and `capabilities.docker` are
   config errors, and `prebuilt` remains for dev spot tests. No version impact
   of its own.
+- The fleet builds no oracle on the orchestrator and runs nothing in a
+  container. RARLAB publishes no Linux arm64 UnRAR, so a Linux arm64 host
+  builds its `rar` oracle itself at run start with the new
+  `unrar-portable-onhost` recipe. The orchestrator ships the sha256-pinned
+  `unrarsrc` tarball, and `rarpar-bench fleet build-unrar` checks it again,
+  refuses a makefile that carries `-march`, `-mcpu` or `-mtune`, runs the
+  stock makefile with only `CXX=g++` and a static link and with the flag
+  variables removed from make's environment, refuses a dynamically linked
+  result or one that misses its `binary_sha256` pin, and records
+  `results/unrar-build.json`. `recipe = "unrar-portable"`, which built UnRAR
+  in a container, and `lane = "docker-cpu"` are config errors. No version
+  impact of its own.
 
 ## rarpar 0.6.2
 

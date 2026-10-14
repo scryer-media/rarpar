@@ -13,7 +13,7 @@ import (
 func runFleet(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		fleetUsage()
-		return fmt.Errorf("fleet requires run, plan, collect, or teardown")
+		return fmt.Errorf("fleet requires run, plan, collect, teardown, or build-unrar")
 	}
 	switch args[0] {
 	case "run":
@@ -24,6 +24,8 @@ func runFleet(ctx context.Context, args []string) error {
 		return fleetCollect(ctx, args[1:])
 	case "teardown":
 		return fleetTeardown(ctx, args[1:])
+	case "build-unrar":
+		return fleetBuildUnrar(ctx, args[1:])
 	case "-h", "--help", "help":
 		fleetUsage()
 		return nil
@@ -38,6 +40,7 @@ func fleetUsage() {
   rarpar-bench fleet run      --config PATH [--machine NAME]... [--suite NAME]... [--dry-run-aws] [--no-fetch] [--no-render]
   rarpar-bench fleet collect  --config PATH --run-id ID [--machine NAME]...
   rarpar-bench fleet teardown --config PATH [--run-id ID] [--dry-run-aws]
+  rarpar-bench fleet build-unrar --source TARBALL --sha256 HEX --out DIR [--url URL] [--binary-sha256 HEX]
 
 One command spawns every configured host in parallel (local SSH and EC2), runs
 the full protocol on each, collects results as hosts finish, tears cloud hosts
@@ -48,9 +51,38 @@ verified against the release's SHA256SUMS before anything is launched; a
 prebuilt bundle is the dev spot-test path. "fleet plan --stage" downloads,
 verifies and stages every bundle without contacting a fleet host.
 
+build-unrar runs on a fleet host, from the generated run script: on Linux
+arm64, where RARLAB publishes no UnRAR, it builds the unrar-portable-onhost
+oracle from the shipped, sha256-pinned source with the audited portable recipe
+(stock makefile and CXXFLAGS, CXX=g++, static link, no -march/-mcpu/-mtune)
+and prints the build record.
+
 The configuration is operator-private and gitignored; start from
 bench/fleet.example.toml. See docs/fleet.md.
 `)
+}
+
+func fleetBuildUnrar(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("fleet build-unrar", flag.ContinueOnError)
+	source := flags.String("source", "", "the shipped UnRAR source tarball")
+	sha := flags.String("sha256", "", "the source tarball's pinned sha256")
+	sourceURL := flags.String("url", "", "where the orchestrator fetched the source (recorded)")
+	out := flags.String("out", "", "build directory: src/, the installed unrar, unrar-build.json")
+	binarySHA := flags.String("binary-sha256", "", "optional pin on the built binary")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	build, err := fleet.BuildUnrar(ctx, fleet.UnrarBuildOptions{
+		Source: *source, SourceSHA256: *sha, SourceURL: *sourceURL,
+		Out: *out, BinarySHA256: *binarySHA, Log: os.Stderr,
+	})
+	if err != nil {
+		return err
+	}
+	return writeJSONTo(os.Stdout, build)
 }
 
 type fleetFlags struct {

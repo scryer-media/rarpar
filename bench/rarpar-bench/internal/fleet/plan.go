@@ -323,6 +323,9 @@ func machineSteps(machine Machine, layout RemoteLayout) []string {
 		"upload bundle by "+channel+" to "+layout.Bin,
 		"upload the generated run script to "+layout.Script,
 		startStep(machine))
+	if oracle, ok := machine.Oracles["rar"]; ok && oracle.Policy == OracleSourceBuild && oracle.Recipe == RecipeUnrarHost {
+		steps = append(steps, "on host: build the UnRAR oracle from the shipped, sha256-pinned source (stock makefile and CXXFLAGS, CXX=g++, static link, no -march/-mcpu/-mtune; refused if the makefile carries one)")
+	}
 	steps = append(steps, "on host: quiet-load gate")
 	if len(machine.families()) > 0 {
 		if machine.Run.WarmupPass() {

@@ -82,8 +82,8 @@ func TestExampleMachineDetails(t *testing.T) {
 	if float64(cloud.EC2.DeadmanMinutes) < cloud.EC2.MaxHours*60 {
 		t.Fatal("the deadman must outlast the cost cap")
 	}
-	if cloud.Oracles["rar"].Policy != OracleSourceBuild || cloud.Oracles["rar"].Reason == "" {
-		t.Fatal("the linux-arm unrar oracle must be a source build with a recorded reason")
+	if rar := cloud.Oracles["rar"]; rar.Policy != OracleSourceBuild || rar.Recipe != RecipeUnrarHost || !strings.Contains(rar.Reason, "unrar-5.5.0-arm.gz") {
+		t.Fatal("the linux-arm64 unrar oracle must be the on-host source build, with RARLAB's missing arm64 binary as its reason")
 	}
 	if cloud.EC2.CorpusSource == "" || cloud.Paths.Corpus != "" {
 		t.Fatal("the EC2 example must provision its corpus via corpus_source, not a pre-seeded host path")
@@ -197,15 +197,45 @@ func TestConfigValidation(t *testing.T) {
 		},
 		{
 			name: "source build without a reason is refused",
-			old:  "reason = \"RARLAB publishes no official linux-arm64 UnRAR binary; recorded amendment\"",
+			old:  "reason = \"RARLAB publishes no Linux arm64 UnRAR: rarlab.com/download.htm lists none, and the only Linux ARM entries on rarlab.com/rar_add.htm are unrar-4.1.3-armv4l.tar.gz and unrar-5.5.0-arm.gz, an UnRAR 5.5.0 (2017) ELF 32-bit ARM EABI5 binary dynamically linked against /lib/ld-linux-armhf.so.3, which an AArch64-only server core cannot execute and which predates RAR 7\"",
 			new:  "",
 			want: "reason is required",
 		},
 		{
 			name: "unknown oracle recipe is refused",
-			old:  "recipe = \"unrar-portable\"",
+			old:  "recipe = \"unrar-portable-onhost\"",
 			new:  "recipe = \"unrar-native-march\"",
 			want: "recipe must be one of",
+		},
+		{
+			name: "the removed container recipe names the on-host one",
+			old:  "recipe = \"unrar-portable-onhost\"",
+			new:  "recipe = \"unrar-portable\"",
+			want: "recipe \"unrar-portable\" was removed: it compiled UnRAR in a container on the orchestrating machine; use recipe \"unrar-portable-onhost\"",
+		},
+		{
+			name: "the on-host UnRAR build is refused where RARLAB publishes a binary",
+			old:  "go_arch = \"arm64\"                        # the linux-arm64-musl-direct asset",
+			new:  "go_arch = \"amd64\"",
+			want: "builds UnRAR only on linux/arm64, where RARLAB publishes no current binary; a linux/amd64 host uses RARLAB's official binary",
+		},
+		{
+			name: "the on-host UnRAR build needs its source pin",
+			old:  "sha256 = \"3995af0aa32b1505a566da053725551a1f0698dc42b2fdf7ba7d65db0d004e33\"",
+			new:  "",
+			want: "needs url and sha256 for RARLAB's unrarsrc source tarball",
+		},
+		{
+			name: "the on-host UnRAR source is RARLAB's tarball",
+			old:  "url = \"https://www.rarlab.com/rar/unrarsrc-7.2.3.tar.gz\"",
+			new:  "url = \"https://www.rarlab.com/rar/unrarsrc-7.2.3.zip\"",
+			want: "must name RARLAB's unrarsrc-*.tar.gz source tarball",
+		},
+		{
+			name: "the container lane label is refused",
+			old:  "lane = \"cpu\"                      # cpu | metal (fleet hosts run natively)",
+			new:  "lane = \"docker-cpu\"",
+			want: "fleet.defaults.lane must be cpu or metal",
 		},
 		{
 			name: "deadman shorter than the cost cap is refused",
