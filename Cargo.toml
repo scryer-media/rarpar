@@ -90,8 +90,6 @@ opt-level = 3
 [profile.dev.package.lzma-turbo]
 opt-level = 3
 
-# RAR decoding: unrar-rs lib tests 18.5 s instead of 4.9 s. Its test binaries build optimised
-# too, in every unrar-tests shard (a cold unrar-rs test build is 587 CPU-s instead of 69);
-# the operator chose test speed over that compile cost.
-[profile.dev.package.unrar-rs]
-opt-level = 3
+# unrar-rs stays at opt-level 0: its hot dependency ppmd-turbo is optimised above, and
+# optimising unrar-rs itself would also build its test binaries optimised in every
+# unrar-tests shard (a cold unrar-rs test build is 587 CPU-s instead of 69).

@@ -66,8 +66,8 @@ A minor bump, as for 0.4.0 and 0.6.0: a command line that 0.6.x accepted
 
 - The workspace test profile drops debuginfo, split-debuginfo and incremental
   compilation, and dev/test builds optimise only the crates that dominate test
-  time (reedsolomon-rs, par2-rs, par3-rs, unrar-rs, ppmd-turbo, blake3,
-  zlib-rs, lzma-turbo at opt-level 3; debug assertions and overflow checks
+  time (reedsolomon-rs, par2-rs, par3-rs, ppmd-turbo, blake3, zlib-rs,
+  lzma-turbo at opt-level 3; debug assertions and overflow checks
   stay on). Measured locally, the test phase of every lane falls 3x to 20x
   (platform lane 107 s to 32 s, par3-rs 83 s to 12 s, reedsolomon-rs 86 s to
   5 s); test binaries at opt-level 3 cost more to compile, and sccache cannot
