@@ -253,27 +253,43 @@ func TestParseKernelVariant(t *testing.T) {
 	for _, v := range Variants([]int{1, 8}, []KernelVariant{variant}) {
 		names = append(names, v.Name+"/"+v.dirName())
 	}
-	if got := strings.Join(names, ","); got != "reference/ref,rarpar-w1/w1,rarpar-w8/w8,rarpar-w1-gfni-off/w1-gfni-off,rarpar-w8-gfni-off/w8-gfni-off" {
+	if got := strings.Join(names, ","); got != "reference/ref,rarpar-w1/w1,rarpar-w1-backup/w1-backup,rarpar-w8/w8,rarpar-w8-backup/w8-backup,rarpar-w1-gfni-off/w1-gfni-off,rarpar-w8-gfni-off/w8-gfni-off" {
 		t.Fatalf("variants %s", got)
+	}
+	// A kernel variant named "backup" would collide with the backup row.
+	err = CheckVariantNames(Variants([]int{1}, []KernelVariant{{Name: "backup", Env: []string{"A=1"}}}))
+	if err == nil || !strings.Contains(err.Error(), `may not be named "backup"`) {
+		t.Fatalf("a kernel variant named backup: %v", err)
 	}
 }
 
 // Every rarpar row runs buffered, so a matrix has one reference row and one
-// rarpar row per worker count, for every operation: no durable row and no
-// -buffered suffix.
+// rarpar row per worker count for every operation (no durable row, no
+// -buffered suffix), plus at repair one rarpar-wN-backup row per worker
+// count: rarpar-wN repairs in place with no backup, rarpar-wN-backup keeps a
+// numbered .1 as the reference does.
 func TestOneBufferedRarparRowPerWorkerCount(t *testing.T) {
 	variants := Variants([]int{1, 8}, nil)
 	var names []string
 	for _, v := range variants {
 		names = append(names, v.Name)
 	}
-	if got := strings.Join(names, ","); got != "reference,rarpar-w1,rarpar-w8" {
+	if got := strings.Join(names, ","); got != "reference,rarpar-w1,rarpar-w1-backup,rarpar-w8,rarpar-w8-backup" {
 		t.Fatalf("variants %s", got)
 	}
 	rows := RowsByOp(variants, KnownOps)
 	for _, op := range KnownOps {
-		if got := strings.Join(rows[op], ","); got != "reference,rarpar-w1,rarpar-w8" {
-			t.Fatalf("%s rows %s", op, got)
+		want := "reference,rarpar-w1,rarpar-w8"
+		if op == OpRepair {
+			want = "reference,rarpar-w1,rarpar-w1-backup,rarpar-w8,rarpar-w8-backup"
+		}
+		if got := strings.Join(rows[op], ","); got != want {
+			t.Fatalf("%s rows %s, want %s", op, got, want)
+		}
+	}
+	for _, v := range variants {
+		if v.Backup != strings.HasSuffix(v.Name, "-backup") {
+			t.Fatalf("%s: Backup %t", v.Name, v.Backup)
 		}
 	}
 }
@@ -446,15 +462,22 @@ func TestPeakRSSIsARequiredRowField(t *testing.T) {
 	if _, err := ReadResults(path); err == nil {
 		t.Fatal("ReadResults must refuse a file with an ok row lacking peak RSS")
 	}
-	// A v1 file (durable rows possible) is refused with a pointer to the
-	// harness that wrote it.
-	v1 := filepath.Join(t.TempDir(), "v1.json")
-	if err := writeJSONFile(v1, &Results{Schema: "rarpar-par3-bench-v1"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ReadResults(v1); err == nil || !strings.Contains(err.Error(), `want "rarpar-par3-bench-v2"`) ||
-		!strings.Contains(err.Error(), "read it with the harness that wrote it") {
-		t.Fatalf("a v1 results file: %v", err)
+	// A v1 file (durable rows possible) and a v2 file (its rarpar-wN repair
+	// rows kept a numbered backup) are refused with a pointer to the harness
+	// that wrote them.
+	for schema, why := range map[string]string{
+		"rarpar-par3-bench-v1": "predates buffered-only rows",
+		"rarpar-par3-bench-v2": "predates the in-place and -backup repair rows",
+	} {
+		old := filepath.Join(t.TempDir(), "old.json")
+		if err := writeJSONFile(old, &Results{Schema: schema}); err != nil {
+			t.Fatal(err)
+		}
+		_, err := ReadResults(old)
+		if err == nil || !strings.Contains(err.Error(), `want "rarpar-par3-bench-v3"`) ||
+			!strings.Contains(err.Error(), why) || !strings.Contains(err.Error(), "read it with the harness that wrote it") {
+			t.Fatalf("a %s results file: %v", schema, err)
+		}
 	}
 	// The field is serialised even when zero, so it is never silently absent.
 	if data, _ := os.ReadFile(path); strings.Count(string(data), `"max_rss_bytes"`) != len(results.Runs) {
@@ -774,5 +797,173 @@ func TestCheckOpsRefusesDuplicateAndUnknownOps(t *testing.T) {
 	options := Options{Reference: os.Args[0], Candidate: os.Args[0], Work: "/w", Out: t.TempDir(), Ops: []string{OpRepair, OpRepair}, Repeats: 1}
 	if err := validateOptions(&options); err == nil || !strings.Contains(err.Error(), `op "repair" is listed more than once`) {
 		t.Fatalf("validateOptions must refuse a repeated op, got %v", err)
+	}
+}
+
+// A repair's numbered backups are told apart from its other leftovers, and
+// each rarpar repair row must leave what its mode promises: the -backup row
+// at least one numbered backup, the in-place row none.
+func TestRepairBackupsFollowTheRowsMode(t *testing.T) {
+	dir, canonical := t.TempDir(), t.TempDir()
+	write := func(base, name, content string) {
+		if err := os.WriteFile(filepath.Join(base, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(canonical, "set.par3", "carrier")
+	write(dir, "set.par3", "carrier")
+	manifest := DatasetManifest{}
+	for _, name := range []string{"a.bin", "b.bin"} {
+		write(dir, name, "intact "+name)
+		digest, size, err := hashFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		manifest.SHA256 = append(manifest.SHA256, FileDigest{Name: name, Size: size, SHA256: digest})
+	}
+	check, err := checkRepair(dir, manifest, canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !check.Match || len(check.ExtraFiles) != 0 || len(check.Backups) != 0 {
+		t.Fatalf("an in-place repair: %+v", check)
+	}
+	if problem := backupProblem(false, check); problem != "" {
+		t.Fatalf("an in-place row that kept nothing: %q", problem)
+	}
+	if problem := backupProblem(true, check); !strings.Contains(problem, "left no numbered backup") {
+		t.Fatalf("a backup row that kept nothing: %q", problem)
+	}
+	// A temporary, a backup of an unprotected file and a non-numbered suffix
+	// are leftovers, not backups.
+	for _, name := range []string{"a.bin.1", "b.bin.12", "a.bin.tmp", "a.bin.", "c.bin.1", "set.par3.1"} {
+		write(dir, name, "left behind")
+	}
+	if check, err = checkRepair(dir, manifest, canonical); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(check.Backups, ","); got != "a.bin.1,b.bin.12" || len(check.ExtraFiles) != 6 {
+		t.Fatalf("backups %q extra %v", got, check.ExtraFiles)
+	}
+	if problem := backupProblem(true, check); problem != "" {
+		t.Fatalf("a backup row that kept backups: %q", problem)
+	}
+	if problem := backupProblem(false, check); !strings.Contains(problem, "in-place row left numbered backups: a.bin.1, b.bin.12") {
+		t.Fatalf("an in-place row that kept backups: %q", problem)
+	}
+}
+
+// On a candidate that cannot repair in place only the backup rows run a
+// plain set's repair; a PAR-inside set runs one compatible row, never a
+// backup row; create and verify never run a backup row.
+func TestRowRunsHonoursBackupAndInPlaceSupport(t *testing.T) {
+	variants := Variants([]int{1, 8}, []KernelVariant{{Name: "k", Env: []string{"A=1"}}})
+	plain, carrier := Config{ID: "p"}, Config{ID: "c", Carrier: "zip"}
+	runs := func(r *runner, config Config, op string) string {
+		var names []string
+		for _, variant := range variants {
+			if r.rowRuns(config, variant, op) {
+				names = append(names, variant.Name)
+			}
+		}
+		return strings.Join(names, ",")
+	}
+	r := &runner{options: Options{Workers: []int{1, 8}}, results: &Results{}}
+	for _, c := range []struct {
+		config   Config
+		op, want string
+	}{
+		{plain, OpCreate, "reference,rarpar-w1,rarpar-w8,rarpar-w1-k,rarpar-w8-k"},
+		{plain, OpVerify, "reference,rarpar-w1,rarpar-w8,rarpar-w1-k,rarpar-w8-k"},
+		{plain, OpRepair, "reference,rarpar-w1,rarpar-w1-backup,rarpar-w8,rarpar-w8-backup,rarpar-w1-k,rarpar-w8-k"},
+		{carrier, OpRepair, "reference,rarpar-w8"},
+		{carrier, OpVerify, "reference,rarpar-w8"},
+	} {
+		if got := runs(r, c.config, c.op); got != c.want {
+			t.Errorf("%s %s: %s, want %s", c.config.ID, c.op, got, c.want)
+		}
+	}
+	r.results.InPlaceUnsupported = true
+	if got := runs(r, plain, OpRepair); got != "reference,rarpar-w1-backup,rarpar-w8-backup" {
+		t.Errorf("no in-place mode: plain repair rows %s", got)
+	}
+	if got := runs(r, carrier, OpRepair); got != "reference,rarpar-w8" {
+		t.Errorf("no in-place mode: carrier repair rows %s", got)
+	}
+	if got := runs(r, plain, OpCreate); got != "reference,rarpar-w1,rarpar-w8,rarpar-w1-k,rarpar-w8-k" {
+		t.Errorf("no in-place mode: create rows %s", got)
+	}
+}
+
+// The report, and the repair chart, name which rarpar repair row is like for
+// like with the reference on bytes written: the -backup row on a plain set,
+// the compatible rs row on a PAR-inside set; the rarpar-wN row repairs in
+// place. The header says how each row's mode was selected on this candidate
+// and that the compatible front end on a PAR-inside set is not buffered.
+func TestReportNamesTheLikeForLikeRepairRow(t *testing.T) {
+	results := &Results{
+		Schema: ResultsSchema, Profile: "unit", Ops: []string{OpRepair}, Repeats: 1, Workers: []int{1},
+		Variants:     Variants([]int{1}, nil),
+		BufferedArgs: map[string][]string{OpRepair: {}},
+		BackupArgs:   map[string][]string{"rarpar-w1": {}, "rarpar-w1-backup": {"--backup"}},
+		Configs: []ConfigSummary{
+			{Config: Config{ID: "u", BlockSize: MiB, Recovery: 3, Codec: "cauchy"}, InputBlocks: 30},
+			{Config: Config{ID: "c", BlockSize: MiB, Recovery: 3, Codec: "cauchy", Carrier: "zip"}, InputBlocks: 30},
+		},
+		Status: StatusOK,
+	}
+	add := func(config, variant, tool string, wall float64, left ...string) {
+		check := &RepairCheck{Match: true, ExtraFiles: left}
+		for _, name := range left {
+			if strings.HasSuffix(name, ".1") {
+				check.Backups = append(check.Backups, name)
+			}
+		}
+		results.Runs = append(results.Runs, RunRecord{Config: config, Op: OpRepair, Variant: variant, Tool: tool, Status: StatusOK,
+			Measurement: Measurement{WallSeconds: wall, UserSeconds: wall, MaxRSSBytes: 10 << 20}, Repair: check})
+	}
+	add("u", "reference", ToolReference, 4, "a.bin.1")
+	add("u", "rarpar-w1", ToolCandidate, 1)
+	add("u", "rarpar-w1-backup", ToolCandidate, 2, "a.bin.1")
+	add("c", "reference", ToolReference, 4, "inside.zip.1")
+	add("c", "rarpar-w1", ToolCandidate, 2, "inside.zip.1")
+
+	report := RenderReport(results)
+	for _, want := range []string{
+		"every rarpar row on a plain set runs buffered and the bench never passes `--fsync`",
+		"On a PAR-inside set rarpar runs its par3cmdline-compatible front end (`vs`/`rs`) instead, which has no buffered mode: its repair syncs the rebuilt carrier, so those repair rows are not buffered.",
+		"- Repair rows: the reference keeps a numbered `.1` backup of every file it repairs.",
+		"the `-backup` rows are the rarpar rows that are like for like with the reference on bytes written",
+		"On this candidate the in-place rows run plain and the `-backup` rows with `--backup`.",
+		"A PAR-inside set has one rarpar row, through the compatible `rs`",
+		"Like for like with the reference on bytes written: `rarpar-w1-backup`, which keeps a numbered `.1` backup of every file it repairs, as the reference does. `rarpar-w1` repairs in place and writes no backup.",
+		"Like for like with the reference on bytes written: `rarpar-w1`, which runs the compatible `rs` and keeps the damaged carrier as a numbered backup, as the reference does.",
+		"| rarpar-w1-backup | 2.000 [2.000–2.000] |",
+	} {
+		if !strings.Contains(report, want) {
+			t.Fatalf("report lacks %q:\n%s", want, report)
+		}
+	}
+	chart, ok := renderOpSVG(results, Summarize(results), OpRepair)
+	if !ok {
+		t.Fatal("no repair chart")
+	}
+	for _, want := range []string{
+		"u / rarpar-w1 — in place, no backup",
+		"u / rarpar-w1-backup — keeps .1 like the reference: like for like",
+		"c / rarpar-w1 — compatible rs, keeps .1 like the reference: like for like",
+		"par3cmdline keeps a numbered .1 backup of every file it repairs.",
+	} {
+		if !strings.Contains(string(chart), want) {
+			t.Fatalf("repair chart lacks %q:\n%s", want, chart)
+		}
+	}
+	// A run with no PAR-inside set keeps the plain wording.
+	results.Configs = results.Configs[:1]
+	results.Runs = results.Runs[:3]
+	report = RenderReport(results)
+	if !strings.Contains(report, "every rarpar row runs buffered and the bench never passes `--fsync`") ||
+		strings.Contains(report, "PAR-inside") {
+		t.Fatalf("plain-set report:\n%s", report)
 	}
 }

@@ -154,13 +154,14 @@ func TestPAR3PlanWarnsAboutALongWorkPathButRuns(t *testing.T) {
 	if problem != "" || len(view.Warnings) != 0 {
 		t.Fatalf("the example work path must pass cleanly: %s %v", problem, view.Warnings)
 	}
-	// One buffered rarpar row per worker count, for every op.
-	if len(view.Configs) == 0 || strings.Join(view.Variants, ",") != "reference,rarpar-w1,rarpar-w8" {
+	// One buffered rarpar row per worker count for every op, plus at repair
+	// one rarpar-wN-backup row per worker count.
+	if len(view.Configs) == 0 || strings.Join(view.Variants, ",") != "reference,rarpar-w1,rarpar-w1-backup,rarpar-w8,rarpar-w8-backup" {
 		t.Fatalf("unexpected view: %+v", view)
 	}
 	if strings.Join(view.Rows["create"], ",") != "reference,rarpar-w1,rarpar-w8" ||
 		strings.Join(view.Rows["verify"], ",") != "reference,rarpar-w1,rarpar-w8" ||
-		strings.Join(view.Rows["repair"], ",") != "reference,rarpar-w1,rarpar-w8" {
+		strings.Join(view.Rows["repair"], ",") != "reference,rarpar-w1,rarpar-w1-backup,rarpar-w8,rarpar-w8-backup" {
 		t.Fatalf("unexpected rows: %v", view.Rows)
 	}
 	machine.PAR3.Work = "/home/bench/" + strings.Repeat("deep/", 20) + "p3"
@@ -182,7 +183,16 @@ func TestPAR3PlanWarnsAboutALongWorkPathButRuns(t *testing.T) {
 			step = line
 		}
 	}
-	if !strings.Contains(step, "one buffered rarpar row per worker count (never --fsync)") || strings.Contains(step, "durable") {
+	for _, want := range []string{
+		"buffered rarpar rows only (never --fsync)",
+		"rarpar-wN for every op, repairing in place with no backup",
+		"rarpar-wN-backup, which keeps a numbered .1 as the reference does (like for like on bytes written)",
+	} {
+		if !strings.Contains(step, want) {
+			t.Fatalf("macro-par3 plan step lacks %q: %q", want, step)
+		}
+	}
+	if strings.Contains(step, "durable") {
 		t.Fatalf("macro-par3 plan step = %q", step)
 	}
 }

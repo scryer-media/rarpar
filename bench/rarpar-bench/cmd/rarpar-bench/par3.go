@@ -39,9 +39,20 @@ variant; the bench never passes --fsync, because durability is the caller's
 concern, not PAR3's. A candidate whose par3 create or repair --help lists
 --buffered (0.6.x and earlier) gets --buffered; one that lists neither runs
 plain, and the results say so.
+Repair has two rarpar rows per worker count: rarpar-wN repairs in place and
+keeps no backup (the candidate's default), and rarpar-wN-backup keeps a
+numbered .1 backup of every file it repairs, as the reference always does, so
+the -backup rows are like for like with the reference on bytes written. The
+candidate's par3 repair --help picks the switches: one listing --backup gives
+the -backup rows --backup; one listing --no-backup (0.7.0 and earlier) gives
+the in-place rows --no-backup; one listing neither runs only the -backup rows,
+plain, and the results say so. A PAR-inside set keeps one compatible rs row,
+which keeps a .1 like the reference.
 par3 versus compares PAR2 (rarpar par, and par2cmdline-turbo with --par2) with
 PAR3 Cauchy and FFT at one block size, recovery count and damage pattern, on the
 scale par2 ÷ par3 (above 1 = PAR3 faster), with every repair SHA-256 checked.
+Each PAR3 arm's repair runs in place, and its -backup twin keeps a .1; the
+report says which PAR2 arm each is like for like with on bytes written.
 `
 
 func runPAR3(ctx context.Context, args []string, stdout io.Writer) error {
@@ -180,7 +191,7 @@ func runPAR3Matrix(args []string, stdout io.Writer) error {
 	if err := table.Flush(); err != nil {
 		return err
 	}
-	fmt.Fprintln(stdout, "\nrows per set (one reference row, which never syncs; one buffered rarpar row per worker count and kernel variant):")
+	fmt.Fprintln(stdout, "\nrows per set (one reference row, which never syncs and keeps a .1 backup of what it repairs; one buffered rarpar row per worker count and kernel variant, repairing in place with no backup; at repair, one rarpar-wN-backup row per worker count that keeps a .1 like the reference, like for like on bytes written):")
 	table = tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
 	for _, op := range opList {
 		fmt.Fprintf(table, "  %s\t%s\n", op, strings.Join(byOp[op], ", "))
@@ -188,7 +199,8 @@ func runPAR3Matrix(args []string, stdout io.Writer) error {
 	if err := table.Flush(); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintln(stdout, "rarpar rows never pass --fsync: a 0.7.0+ candidate is buffered when run plain, an older one whose `rarpar par3 OP --help` lists --buffered gets it, and an op listing neither runs plain (noted in the results).")
+	_, err = fmt.Fprintln(stdout, "rarpar rows never pass --fsync: a 0.7.0+ candidate is buffered when run plain, an older one whose `rarpar par3 OP --help` lists --buffered gets it, and an op listing neither runs plain (noted in the results).\n"+
+		"repair rows take their backup switch from `rarpar par3 repair --help`: --backup listed gives the -backup rows --backup; only --no-backup listed (0.7.0 and earlier) gives the in-place rows --no-backup; neither listed runs only the -backup rows, plain (noted in the results). A PAR-inside set runs one compatible rs row instead.")
 	return err
 }
 

@@ -140,10 +140,77 @@ func (r *runner) engineCommand(op string, config Config, dataDir, dir string, va
 // rarpar rows are. From par3-rs 0.6.0 the engine issues no storage barrier
 // and reads no durability variable, so this changes nothing there; an older
 // engine_perf syncs its outputs unless PAR3_BENCH_<OP>_DURABILITY is
-// "buffered".
+// "buffered", and the oldest ignore the repair variable. Every create and
+// repair's output is therefore checked afterwards (EngineSyncProblem).
 func engineBufferedEnv(op string) []string {
 	if op != OpCreate && op != OpRepair {
 		return nil
 	}
 	return []string{fmt.Sprintf("PAR3_BENCH_%s_DURABILITY=buffered", strings.ToUpper(op))}
+}
+
+// FailureEngineNotBuffered marks an engine_perf create or repair whose own
+// output shows it synced, or cannot show it did not (EngineSyncProblem).
+const FailureEngineNotBuffered = "engine-not-buffered"
+
+// EngineSyncProblem reads an engine_perf create or repair's output and says
+// why the run cannot count as buffered, or "" when it does. Builds print one
+// of four kinds of evidence. From par3-rs 0.6.0 the engine has no storage
+// barrier at all: its totals carry file_opens and no file_syncs. The builds
+// before that print file_syncs, the fsyncs the run completed. Older ones
+// print only a Sync stage line with its call count, and their repair ignores
+// PAR3_BENCH_REPAIR_DURABILITY and always syncs. The first print none of
+// these, so nothing shows that they did not sync. A create that printed its
+// creation_durability must also have run Buffered.
+func EngineSyncProblem(op, stdout string) string {
+	if op != OpCreate && op != OpRepair {
+		return ""
+	}
+	var durability string
+	var syncs, syncCalls int64
+	var haveSyncs, haveSyncLine, haveOpens bool
+	scanner := bufio.NewScanner(strings.NewReader(stdout))
+	scanner.Buffer(make([]byte, 64*1024), 1<<20)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var fields map[string]json.RawMessage
+		if json.Unmarshal([]byte(line), &fields) != nil {
+			continue
+		}
+		if raw, ok := fields["creation_durability"]; ok {
+			_ = json.Unmarshal(raw, &durability)
+		}
+		if raw, ok := fields["internal_stage"]; ok && string(raw) == `"Sync"` {
+			if json.Unmarshal(fields["calls"], &syncCalls) == nil {
+				haveSyncLine = true
+			}
+		}
+		if _, totals := fields["file_read_bytes"]; !totals {
+			continue
+		}
+		if raw, ok := fields["file_syncs"]; ok && json.Unmarshal(raw, &syncs) == nil {
+			haveSyncs = true
+		}
+		if _, ok := fields["file_opens"]; ok {
+			haveOpens = true
+		}
+	}
+	switch {
+	case durability != "" && durability != "Buffered":
+		return fmt.Sprintf("engine_perf ran its create with creation_durability %s, not Buffered", durability)
+	case haveSyncs && syncs > 0:
+		return fmt.Sprintf("engine_perf completed %d file syncs during its %s, so this build did not run it buffered", syncs, op)
+	case haveSyncs:
+		return ""
+	case haveSyncLine && syncCalls > 0 && op == OpRepair:
+		return fmt.Sprintf("engine_perf's Sync stage made %d calls: this build predates PAR3_BENCH_REPAIR_DURABILITY and its repair always syncs its outputs", syncCalls)
+	case haveSyncLine && syncCalls > 0:
+		return fmt.Sprintf("engine_perf's Sync stage made %d calls during its %s, so this build did not run it buffered", syncCalls, op)
+	case haveSyncLine, haveOpens:
+		return ""
+	}
+	return "engine_perf printed no sync evidence (no file_syncs, no Sync stage line, no file_opens), so this build cannot be confirmed to run buffered"
 }

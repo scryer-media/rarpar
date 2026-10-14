@@ -88,8 +88,11 @@ type PAR3View struct {
 	Args     []string `json:"args"`
 	Configs  []string `json:"configs"`
 	Variants []string `json:"variants"`
-	// Rows lists, per op, the rows each set produces: the reference and one
-	// buffered rarpar row per worker count and kernel variant.
+	// Rows lists, per op, the rows each set produces: the reference, one
+	// buffered rarpar row per worker count and kernel variant, and at repair
+	// one rarpar-wN-backup row per worker count. The rarpar rows repair in
+	// place with no backup; the -backup rows keep a numbered .1 as the
+	// reference does, like for like on bytes written.
 	Rows map[string][]string `json:"rows"`
 	// Warnings are reference work-path warnings: the run goes ahead and a
 	// reference that fails is recorded as DNF.
@@ -341,11 +344,11 @@ func machineSteps(machine Machine, layout RemoteLayout) []string {
 		if machine.PAR3.ReferenceTimeoutMinutes > 0 {
 			timeout += fmt.Sprintf(" (reference %dm)", machine.PAR3.ReferenceTimeoutMinutes)
 		}
-		steps = append(steps, fmt.Sprintf("on host: macro-par3, profile %s, workers %v, one buffered rarpar row per worker count (never --fsync), warmups=%d repeats=%d, %s, reference failures are DNF, work %s",
+		steps = append(steps, fmt.Sprintf("on host: macro-par3, profile %s, workers %v, buffered rarpar rows only (never --fsync): per worker count rarpar-wN for every op, repairing in place with no backup, and the repair row rarpar-wN-backup, which keeps a numbered .1 as the reference does (like for like on bytes written); warmups=%d repeats=%d, %s, reference failures are DNF, work %s",
 			machine.PAR3.Profile, machine.PAR3.Workers, machine.PAR3.Warmups, machine.PAR3.Repeats,
 			timeout, PAR3Work(machine, layout)))
 		if machine.PAR3.Versus != "" {
-			steps = append(steps, fmt.Sprintf("on host: par3 versus, profile %s: PAR2 (rarpar par, plus the par2 oracle when present) against PAR3 Cauchy and FFT, par2 ÷ par3, every repair SHA-256 checked",
+			steps = append(steps, fmt.Sprintf("on host: par3 versus, profile %s: PAR2 (rarpar par, plus the par2 oracle when present) against PAR3 Cauchy and FFT, each PAR3 repair in place and as a -backup twin that keeps a .1, par2 ÷ par3, every repair SHA-256 checked",
 				machine.PAR3.Versus))
 		}
 	}

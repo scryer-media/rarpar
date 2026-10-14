@@ -2,6 +2,7 @@ package par3bench
 
 import (
 	"math"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -106,5 +107,135 @@ func TestVersusPAR3ArmsRunBuffered(t *testing.T) {
 				t.Errorf("%s = %q carries a PAR3 switch", arm, line)
 			}
 		}
+	}
+}
+
+// Every PAR3 arm's repair runs in place, and its -backup twin repairs the
+// same set keeping a numbered .1; the backup switch each takes comes from
+// the candidate's repair --help, as the PAR3 suite reads it.
+func TestVersusPAR3RepairArmsAndTheirBackupTwins(t *testing.T) {
+	arms := []string{ArmPAR2, ArmPAR2Turbo, ArmPAR3Cauchy, ArmPAR3FFT}
+	if got := strings.Join(VersusOpArms(arms, OpCreate, false), ","); got != "par2-rs,par2cmdline-turbo,par3-cauchy,par3-fft" {
+		t.Fatalf("create arms %s", got)
+	}
+	if got := strings.Join(VersusOpArms(arms, OpRepair, false), ","); got != "par2-rs,par2cmdline-turbo,par3-cauchy,par3-cauchy-backup,par3-fft,par3-fft-backup" {
+		t.Fatalf("repair arms %s", got)
+	}
+	if got := strings.Join(VersusOpArms(arms, OpRepair, true), ","); got != "par2-rs,par2cmdline-turbo,par3-cauchy-backup,par3-fft-backup" {
+		t.Fatalf("repair arms without an in-place mode %s", got)
+	}
+	if versusSetArm(ArmPAR3FFTBackup) != ArmPAR3FFT || versusSetArm(ArmPAR2) != ArmPAR2 || isPAR3BackupArm(ArmPAR2+"-backup") {
+		t.Fatal("a twin repairs its PAR3 arm's set; no other arm has a twin")
+	}
+	help := map[string]string{
+		"--backup":    "      --fsync   fsync every file installed\n      --backup  Keep a numbered backup of every file repaired\n",
+		"--no-backup": "      --fsync      fsync every file installed\n      --no-backup  Do not keep a numbered backup\n",
+		"neither":     "      --verbose  Print progress\n",
+	}
+	want := map[string]map[string]string{
+		"--backup": {
+			ArmPAR3Cauchy: "--quiet par3 repair set.par3", ArmPAR3CauchyBackup: "--quiet par3 repair set.par3 --backup",
+			ArmPAR3FFT: "--quiet par3 repair set.par3", ArmPAR3FFTBackup: "--quiet par3 repair set.par3 --backup",
+		},
+		"--no-backup": {
+			ArmPAR3Cauchy: "--quiet par3 repair set.par3 --no-backup", ArmPAR3CauchyBackup: "--quiet par3 repair set.par3",
+			ArmPAR3FFT: "--quiet par3 repair set.par3 --no-backup", ArmPAR3FFTBackup: "--quiet par3 repair set.par3",
+		},
+		"neither": {ArmPAR3CauchyBackup: "--quiet par3 repair set.par3", ArmPAR3FFTBackup: "--quiet par3 repair set.par3"},
+	}
+	for name, screen := range help {
+		backup, inPlaceOK := versusBackupArgs(screen)
+		if inPlaceOK != (name != "neither") || len(backup) != len(want[name]) {
+			t.Fatalf("%s: args %v in place %t", name, backup, inPlaceOK)
+		}
+		options := VersusOptions{Candidate: "/bin/rarpar", buffered: map[string][]string{OpRepair: {}}, backup: backup, inPlaceUnsupported: !inPlaceOK}
+		for arm, line := range want[name] {
+			if got := strings.Join(versusRepairCommand(options, "/s", arm).Args, " "); got != line {
+				t.Errorf("%s: %s repair %q, want %q", name, arm, got, line)
+			}
+		}
+		// PAR2 arms never take a PAR3 switch.
+		if got := strings.Join(versusRepairCommand(options, "/s", ArmPAR2).Args, " "); strings.Contains(got, "backup") {
+			t.Errorf("%s: par2-rs repair %q", name, got)
+		}
+	}
+}
+
+// The report names which PAR3 repair arm is like for like with each PAR2
+// arm on bytes written, from what each repair left behind.
+func TestVersusReportSaysWhichRepairIsLikeForLike(t *testing.T) {
+	config := versusSmokeProfile().Configs[0]
+	config.Arms = []string{ArmPAR2, ArmPAR3Cauchy}
+	backupArgs, _ := versusBackupArgs("      --backup  Keep a numbered backup\n")
+	results := &VersusResults{Schema: VersusSchema, Profile: "unit", Repeats: 1, Status: StatusOK,
+		Datasets: versusSmokeProfile().Datasets, Configs: []VersusConfig{config},
+		BufferedArgs: map[string][]string{OpCreate: {}, OpRepair: {}}, BackupArgs: backupArgs}
+	add := func(op, arm string, wall float64, left ...string) {
+		run := VersusRun{Config: config.ID, Op: op, Arm: arm, Status: StatusOK,
+			Measurement: Measurement{WallSeconds: wall, UserSeconds: wall, MaxRSSBytes: 8 << 20}}
+		if op == OpRepair {
+			check := RepairCheck{Match: true, ExtraFiles: left}
+			for _, name := range left {
+				if strings.HasSuffix(name, ".1") {
+					check.Backups = append(check.Backups, name)
+				}
+			}
+			run.Repair = &check
+		}
+		results.Runs = append(results.Runs, run)
+	}
+	add(OpCreate, ArmPAR2, 4)
+	add(OpCreate, ArmPAR3Cauchy, 2)
+	add(OpRepair, ArmPAR2, 3, "v0.bin.1")
+	add(OpRepair, ArmPAR3Cauchy, 1)
+	add(OpRepair, ArmPAR3CauchyBackup, 1.5, "v0.bin.1")
+	report := RenderVersusReport(results)
+	for _, line := range []string{
+		"| op | par2 arm | par3 arm | par2 ÷ par3 | like for like on bytes written |",
+		"| repair | par2-rs | par3-cauchy | 3.00 | no |",
+		"| repair | par2-rs | par3-cauchy-backup | 2.00 | yes: both keep a numbered backup |",
+		"| create | par2-rs | par3-cauchy | 2.00 | – |",
+		"| repair | par3-cauchy-backup | 1 | 1.500 | 1.500 | 8.0 [8.0–8.0] | v0.bin.1 |",
+		"| repair | par3-cauchy | 1 | 1.000 | 1.000 | 8.0 [8.0–8.0] | none |",
+		"| create | par3-cauchy | 1 | 2.000 | 2.000 | 8.0 [8.0–8.0] | – |",
+		"On this candidate the in-place arms run plain and the `-backup` arms with `--backup`.",
+	} {
+		if !strings.Contains(report, line) {
+			t.Fatalf("report lacks %q:\n%s", line, report)
+		}
+	}
+	for _, c := range []struct {
+		par2, par3 VersusCell
+		want       string
+	}{
+		{VersusCell{Backups: "false"}, VersusCell{Backups: "false"}, "yes: neither keeps a backup"},
+		{VersusCell{Backups: "true"}, VersusCell{Backups: "true"}, "yes: both keep a numbered backup"},
+		{VersusCell{Backups: "true"}, VersusCell{Backups: "false"}, "no"},
+		{VersusCell{Backups: "false/true"}, VersusCell{Backups: "true"}, "–"},
+		{VersusCell{}, VersusCell{Backups: "true"}, "–"},
+	} {
+		if got := likeForLike(c.par2, c.par3); got != c.want {
+			t.Errorf("likeForLike(%q, %q) = %q, want %q", c.par2.Backups, c.par3.Backups, got, c.want)
+		}
+	}
+}
+
+// A v1 comparison (its PAR3 arms may have run durable and kept a backup) is
+// refused with a pointer to the harness that wrote it.
+func TestReadVersusResultsRefusesV1(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "results.json")
+	if err := writeJSONFile(path, &VersusResults{Schema: "rarpar-par3-versus-v1"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := ReadVersusResults(path)
+	if err == nil || !strings.Contains(err.Error(), `want "rarpar-par3-versus-v2"`) ||
+		!strings.Contains(err.Error(), "read it with the harness that wrote it") {
+		t.Fatalf("a v1 comparison: %v", err)
+	}
+	if err := writeJSONFile(path, &VersusResults{Schema: VersusSchema}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadVersusResults(path); err != nil {
+		t.Fatalf("a v2 comparison: %v", err)
 	}
 }
