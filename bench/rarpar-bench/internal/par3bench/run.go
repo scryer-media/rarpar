@@ -46,8 +46,8 @@ const (
 	// DurabilityDurable syncs every output file before the command returns;
 	// DurabilityBuffered flushes without requesting storage barriers. Which
 	// one a plain `rarpar par3 create|repair` performs depends on the
-	// candidate: before rarpar 0.6.3 the CLI was durable and `--buffered`
-	// selected buffered; from 0.6.3 it is buffered and `--fsync` selects
+	// candidate: before rarpar 0.7.0 the CLI was durable and `--buffered`
+	// selected buffered; from 0.7.0 it is buffered and `--fsync` selects
 	// durable. The runner probes each op's --help and records the answer in
 	// Results.DefaultDurability. The reference never syncs, so it has no
 	// durability mode and gets one row.
@@ -851,7 +851,7 @@ func validateOptions(options *Options) error {
 
 // probeDurability finds out, from each writing op's own --help, what a plain
 // `rarpar par3 <op>` does on this candidate and which flag selects the other
-// mode. A help screen listing --fsync is a 0.6.3+ CLI: buffered by default,
+// mode. A help screen listing --fsync is a 0.7.0+ CLI: buffered by default,
 // durable with --fsync. One listing --buffered is older: durable by default,
 // buffered with --buffered. One listing neither is durable only; it gets no
 // buffered row, because running the durable command twice under a buffered
@@ -907,7 +907,7 @@ func classifyDurabilityHelp(help string) (string, map[string][]string) {
 
 // engineHasDurabilitySwitch reports whether engine_perf on this candidate can
 // run durable at all. The example and the CLI are built from the same par3-rs:
-// a CLI that is buffered by default (0.6.3+) sits on a par3-rs with no storage
+// a CLI that is buffered by default (0.7.0+) sits on a par3-rs with no storage
 // barriers, where PAR3_BENCH_<OP>_DURABILITY is ignored. An unprobed candidate
 // is assumed to have the switch.
 func (r *runner) engineHasDurabilitySwitch() bool {

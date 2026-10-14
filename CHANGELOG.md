@@ -3,7 +3,10 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
-## rarpar 0.6.3
+## rarpar 0.7.0
+
+A minor bump, as for 0.4.0 and 0.6.0: a command line that 0.6.x accepted
+(`--buffered`) is now a usage error, and a JSON field is gone.
 
 ### Changed
 
@@ -35,7 +38,7 @@ documented in each crate's own changelog so those notes ship with the crate.
   version impact of their own.
 - The harness probes each candidate's `par3 create|repair --help` for
   `--fsync` or `--buffered` to learn which durability a plain command gives
-  and which switch selects the other, so durable rows against rarpar 0.6.3
+  and which switch selects the other, so durable rows against rarpar 0.7.0
   run with `--fsync` and rows are labelled by the mode that ran.
 
 ## rarpar 0.6.2

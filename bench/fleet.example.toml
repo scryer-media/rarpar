@@ -233,7 +233,7 @@ work = "/home/bench/p3"
 # kernel_variants = ["name:VAR=value"]
 # durability = ["durable", "buffered"]   # default; rarpar create/repair rows, durable first. The
 #                                        # flag selecting each mode is probed from the candidate's
-#                                        # --help (0.6.3+: buffered by default, --fsync for durable).
+#                                        # --help (0.7.0+: buffered by default, --fsync for durable).
 timeout_minutes = 20                     # per run, rarpar rows too; a reference run past it is DNF
 # reference_timeout_minutes = 60         # default 0: the reference uses timeout_minutes
 

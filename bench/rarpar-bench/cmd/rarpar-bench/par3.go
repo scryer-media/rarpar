@@ -192,7 +192,7 @@ func runPAR3Matrix(args []string, stdout io.Writer) error {
 	if err := table.Flush(); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintln(stdout, "the flag selecting each mode is probed from `rarpar par3 OP --help`: a 0.6.3+ candidate is buffered by default and takes --fsync for durable rows, an older one is durable by default and takes --buffered; an op listing neither keeps only its durable row (noted in the results).")
+	_, err = fmt.Fprintln(stdout, "the flag selecting each mode is probed from `rarpar par3 OP --help`: a 0.7.0+ candidate is buffered by default and takes --fsync for durable rows, an older one is durable by default and takes --buffered; an op listing neither keeps only its durable row (noted in the results).")
 	return err
 }
 

@@ -219,7 +219,7 @@ timeout_minutes = 20              # per run, rarpar rows too; a reference over i
 
 - **Durability rows.** Every `rarpar` create and repair runs durable and
   buffered; the reference gets one row. The harness probes each candidate's
-  `par3 <op> --help`: a build that lists `--fsync` (0.6.3 and later) is
+  `par3 <op> --help`: a build that lists `--fsync` (0.7.0 and later) is
   buffered when run plain and durable with `--fsync`, one that lists
   `--buffered` is the reverse, and one that lists neither runs the durable row
   only. `durability` narrows the rows and must include `durable`. Verify

@@ -536,13 +536,13 @@ func TestHelpListsFlagMatchesWholeTokens(t *testing.T) {
 }
 
 func TestClassifyDurabilityHelpFollowsTheCandidateGeneration(t *testing.T) {
-	// rarpar 0.6.3+: buffered by default, --fsync selects durable.
+	// rarpar 0.7.0+: buffered by default, --fsync selects durable.
 	mode, args := classifyDurabilityHelp("Usage: rarpar par3 repair [OPTIONS] <SET>\n      --fsync  After a successful repair, fsync every file installed\n")
 	if mode != DurabilityBuffered || len(args[DurabilityBuffered]) != 0 || strings.Join(args[DurabilityDurable], " ") != "--fsync" {
-		t.Errorf("0.6.3 help: mode %q args %v", mode, args)
+		t.Errorf("0.7.0 help: mode %q args %v", mode, args)
 	}
 	if _, ok := args[DurabilityBuffered]; !ok {
-		t.Error("0.6.3 help: buffered mode must be selectable with no arguments")
+		t.Error("0.7.0 help: buffered mode must be selectable with no arguments")
 	}
 	// rarpar up to 0.6.2: durable by default, --buffered selects buffered.
 	mode, args = classifyDurabilityHelp("Usage: rarpar par3 create [OPTIONS]\n      --buffered  Flush buffers without requesting durable storage barriers\n")

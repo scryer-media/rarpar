@@ -273,11 +273,11 @@ Every `rarpar` create and repair row runs twice: once durable (one fsync per
 output) and once buffered (no fsync). Which of the two a plain
 `rarpar par3 <op>` gives depends on the candidate, so the suite probes
 `rarpar par3 <op> --help` once per op, for `--fsync` and `--buffered` as whole
-tokens. A help that lists `--fsync` (rarpar 0.6.3 and later) means the plain
+tokens. A help that lists `--fsync` (rarpar 0.7.0 and later) means the plain
 command is buffered and `--fsync` selects durable; one that lists `--buffered`
-(0.6.2 and earlier) means the plain command is durable and `--buffered`
+(0.6.x and earlier) means the plain command is durable and `--buffered`
 selects buffered; one that lists neither, which is the case for `par3 repair`
-before 0.6.3, runs only the durable row and says so in the report notes. The
+before 0.7.0, runs only the durable row and says so in the report notes. The
 durable row is listed first and labelled `durable`; the buffered row is named
 `rarpar-wN-buffered`. Both carry ratios against the single reference row,
 whose durability column reads `none (never syncs)`, and the report's summary
