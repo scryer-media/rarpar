@@ -28,6 +28,15 @@ A minor bump, as for 0.4.0 and 0.6.0: a command line that 0.6.x accepted
   `"fsync": true|false`. `auto` mode repair has no `--fsync` and does not
   sync.
 
+### Fixed
+
+- On Windows, `rarpar rs` of a damaged ZIP that carries its own PAR3
+  packets (PAR-inside self-repair) failed with "The process cannot access
+  the file because it is being used by another process" when it moved the
+  damaged carrier to `.1`, and left the rebuilt `par3_<id>_0.tmp` beside it.
+  par3-rs 0.6.1 shares delete access on its view of the carrier, so the
+  rename succeeds as on other platforms.
+
 ### Benchmark harness only
 
 - The bench harness (`bench/rarpar-bench`) gains a `fleet` PAR3 profile for

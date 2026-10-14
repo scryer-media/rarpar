@@ -470,11 +470,17 @@ impl SourceAccess for DiskSourceAccess {
                 std::mem::size_of::<PinnedDiskSource>(),
             )
             .map_err(EngineError::into_io)?;
-        // FILE_SHARE_READ denies writers and deletion for the view's lifetime.
-        // An existing writer makes this fail instead of admitting unstable data.
+        // FILE_SHARE_READ | FILE_SHARE_DELETE: writers are denied for the
+        // view's lifetime, and an existing writer makes this fail instead of
+        // admitting unstable data. Renaming or deleting is allowed, since
+        // neither changes the bytes behind this handle: a caller that rebuilds
+        // a carrier in place (PAR-inside self-repair) moves the damaged file
+        // aside while the session that scanned it is still alive.
+        const FILE_SHARE_READ: u32 = 1;
+        const FILE_SHARE_DELETE: u32 = 4;
         let mut file = std::fs::OpenOptions::new()
             .read(true)
-            .share_mode(1)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
             .open_budgeted(path, options)
             .map_err(EngineError::into_io)?;
         let metadata = file.metadata()?;
@@ -1015,6 +1021,32 @@ mod tests {
             }))
         ));
         std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    }
+
+    /// PAR-inside self-repair renames the damaged carrier to `.1` and the
+    /// rebuilt file into its place while the session's view of it is alive.
+    #[cfg(windows)]
+    #[test]
+    fn a_pinned_carrier_can_be_moved_aside_but_not_written() {
+        let directory = TestDirectory::new();
+        let path = directory.path().join("carrier");
+        let aside = directory.path().join("carrier.1");
+        std::fs::write(&path, b"packets").unwrap();
+        let options = ExecutionOptions::default();
+        let mut access = DiskSourceAccess::with_options(options.clone());
+        access.insert(SourceId(1), path.clone());
+        let pinned = access.pin(SourceId(1), &options).unwrap().unwrap();
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+        std::fs::rename(&path, &aside).unwrap();
+        std::fs::write(&path, b"rebuilt").unwrap();
+        let mut out = [0u8; 7];
+        assert_eq!(pinned.read_at(SourceId(1), 0, &mut out).unwrap(), 7);
+        assert_eq!(&out, b"packets");
+        std::fs::remove_file(&aside).unwrap();
+        assert_eq!(pinned.read_at(SourceId(1), 0, &mut out).unwrap(), 7);
+        assert_eq!(&out, b"packets");
+        drop(pinned);
+        assert_eq!(options.handles.used(), 0);
     }
 
     #[test]

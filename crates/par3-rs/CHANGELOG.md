@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.1
+
+- On Windows, the immutable view `DiskSourceAccess::pin` opens for a packet
+  carrier shares delete access (`FILE_SHARE_READ | FILE_SHARE_DELETE`)
+  instead of read access alone. Writers are still refused for the view's
+  lifetime, and a rename or delete leaves the bytes the view reads unchanged;
+  what this allows is moving or replacing the carrier while a session that
+  scanned it is alive. Before, PAR-inside self-repair of a damaged ZIP
+  carrier through `rarpar rs` failed with a sharing violation (os error 32)
+  at the rename of the damaged carrier to `.1`, because the session's own
+  view of the carrier held it. Other platforms were not affected.
+
 ## 0.6.0
 
 Breaking: par3-rs no longer issues storage barriers. Buffered output is the
