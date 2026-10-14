@@ -26,6 +26,7 @@ const par3Usage = `Usage:
         [--candidate-arg ARG]... [--machine LABEL] [--timeout 20m] [--reference-timeout DURATION] [--keep-stages]
         [--target NAME=DIR]... [--target-meta NAME:KEY=V[,KEY=V]]... [--rows reference,rarpar,engine]
         [--engine-workers 8] [--engine-variant NAME:VAR=V[,VAR=V]]... [--drop-caches]
+        [--perf-stat N] [--perf-ops repair] [--perf-record SET]... [--perf-freq 499] [--perf-out DIR]
   rarpar-bench par3 report --input results.json [--out report.md]
   rarpar-bench par3 render --input results.json --out DIR
   rarpar-bench par3 versus --candidate PATH --work DIR --out DIR [--par2 PATH] [--profile versus-smoke|versus]
@@ -39,9 +40,29 @@ variant; the bench never passes --fsync, because durability is the caller's
 concern, not PAR3's. A candidate whose par3 create or repair --help lists
 --buffered (0.6.x and earlier) gets --buffered; one that lists neither runs
 plain, and the results say so.
+Repair has two rarpar rows per worker count: rarpar-wN repairs in place and
+keeps no backup (the candidate's default), and rarpar-wN-backup keeps a
+numbered .1 backup of every file it repairs, as the reference always does, so
+the -backup rows are like for like with the reference on bytes written. The
+candidate's par3 repair --help picks the switches: one listing --backup gives
+the -backup rows --backup; one listing --no-backup (0.7.0 and earlier) gives
+the in-place rows --no-backup; one listing neither runs only the -backup rows,
+plain, and the results say so. A PAR-inside set keeps one compatible rs row,
+which keeps a .1 like the reference.
+--perf-stat N and --perf-record SET add an untimed Linux perf pass after each
+--perf-ops operation's timed runs (default: repair), on the plain sets and the
+first target: N perf stat runs of every reference and rarpar row, each on a
+fresh stage, counting the corpus suites' --perf events; and on each named set
+one perf record -F 499 run (--perf-freq) of every rarpar row, kept as perf
+script text and folded stacks. Files go under --perf-out (default OUT/perf);
+a host without Linux perf skips the pass, and the results say so. A pass that
+was skipped, had a perf run fail, or ran nothing also writes INCOMPLETE.txt
+there, one problem per line.
 par3 versus compares PAR2 (rarpar par, and par2cmdline-turbo with --par2) with
 PAR3 Cauchy and FFT at one block size, recovery count and damage pattern, on the
 scale par2 ÷ par3 (above 1 = PAR3 faster), with every repair SHA-256 checked.
+Each PAR3 arm's repair runs in place, and its -backup twin keeps a .1; the
+report says which PAR2 arm each is like for like with on bytes written.
 `
 
 func runPAR3(ctx context.Context, args []string, stdout io.Writer) error {
@@ -180,7 +201,7 @@ func runPAR3Matrix(args []string, stdout io.Writer) error {
 	if err := table.Flush(); err != nil {
 		return err
 	}
-	fmt.Fprintln(stdout, "\nrows per set (one reference row, which never syncs; one buffered rarpar row per worker count and kernel variant):")
+	fmt.Fprintln(stdout, "\nrows per set (one reference row, which never syncs and keeps a .1 backup of what it repairs; one buffered rarpar row per worker count and kernel variant, repairing in place with no backup; at repair, one rarpar-wN-backup row per worker count that keeps a .1 like the reference, like for like on bytes written):")
 	table = tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
 	for _, op := range opList {
 		fmt.Fprintf(table, "  %s\t%s\n", op, strings.Join(byOp[op], ", "))
@@ -188,7 +209,8 @@ func runPAR3Matrix(args []string, stdout io.Writer) error {
 	if err := table.Flush(); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintln(stdout, "rarpar rows never pass --fsync: a 0.7.0+ candidate is buffered when run plain, an older one whose `rarpar par3 OP --help` lists --buffered gets it, and an op listing neither runs plain (noted in the results).")
+	_, err = fmt.Fprintln(stdout, "rarpar rows never pass --fsync: a 0.7.0+ candidate is buffered when run plain, an older one whose `rarpar par3 OP --help` lists --buffered gets it, and an op listing neither runs plain (noted in the results).\n"+
+		"repair rows take their backup switch from `rarpar par3 repair --help`: --backup listed gives the -backup rows --backup; only --no-backup listed (0.7.0 and earlier) gives the in-place rows --no-backup; neither listed runs only the -backup rows, plain (noted in the results). A PAR-inside set runs one compatible rs row instead.")
 	return err
 }
 
@@ -242,7 +264,12 @@ func runPAR3Suite(ctx context.Context, args []string, stdout io.Writer) error {
 	engineWorkers := flags.String("engine-workers", "", "add timed engine_perf rows at these worker counts (needs --engine-perf)")
 	rows := flags.String("rows", "", "timed row kinds: "+strings.Join(par3bench.KnownRowKinds, ",")+" (default: reference,rarpar, plus engine with --engine-workers)")
 	dropCaches := flags.Bool("drop-caches", false, "drop the page cache before every timed run (Linux, root)")
-	var sets, kernels, candidateArgs, targets, targetMeta, engineVariants stringList
+	perfStat := flags.Int("perf-stat", 0, "untimed perf stat runs of every reference and rarpar row per --perf-ops op, after its timed runs (Linux; 0 = none)")
+	perfOps := flags.String("perf-ops", strings.Join(par3bench.DefaultPerfOps, ","), "operations the perf pass covers")
+	perfFreq := flags.Int("perf-freq", par3bench.DefaultPerfFrequency, "perf record sampling frequency (-F)")
+	perfOut := flags.String("perf-out", "", "directory for perf's files (default: OUT/perf)")
+	var sets, kernels, candidateArgs, targets, targetMeta, engineVariants, perfRecord stringList
+	flags.Var(&perfRecord, "perf-record", "plain set whose rarpar rows also get one untimed perf record run per --perf-ops op (repeatable)")
 	flags.Var(&targets, "target", "storage target NAME=DIR; every row runs on every target, interleaved (repeatable; replaces --work)")
 	flags.Var(&targetMeta, "target-meta", "facts about a target the client cannot see, NAME:key=value[,key=value] (repeatable)")
 	flags.Var(&engineVariants, "engine-variant", "extra engine row NAME:VAR=value[,VAR=value] (repeatable)")
@@ -311,6 +338,8 @@ func runPAR3Suite(ctx context.Context, args []string, stdout io.Writer) error {
 		KeepStages: *keep, Timeout: *timeout, ReferenceTimeout: *referenceTimeout, Log: os.Stderr,
 		Targets: targetList, Rows: splitList(*rows), EngineWorkers: engineWorkerList, EngineVariants: engineVariantList,
 		DropCaches: *dropCaches,
+		Perf: par3bench.PerfOptions{StatRepeats: *perfStat, Ops: splitList(*perfOps), RecordSets: perfRecord,
+			Frequency: *perfFreq, Out: workspacePath(*perfOut)},
 	})
 	if err != nil {
 		return err

@@ -22,8 +22,12 @@ import (
 const (
 	// ResultsSchema names the results.json layout. v2 dropped the v1
 	// durability fields: every rarpar row runs buffered (see
-	// Results.BufferedArgs), so no row records a durability mode.
-	ResultsSchema = "rarpar-par3-bench-v2"
+	// Results.BufferedArgs), so no row records a durability mode. v3 split
+	// the rarpar repair rows in two: rarpar-wN repairs in place and keeps no
+	// backup, rarpar-wN-backup keeps a numbered `.1` backup of every file it
+	// repairs, as the reference does (see Results.BackupArgs). A v2
+	// rarpar-wN repair row kept that backup.
+	ResultsSchema = "rarpar-par3-bench-v3"
 
 	OpCreate        = "create"
 	OpVerify        = "verify"
@@ -126,7 +130,10 @@ type Options struct {
 	EngineVariants []KernelVariant
 	// DropCaches drops the page cache before every timed run (Linux, root).
 	DropCaches bool
-	Log        io.Writer
+	// Perf asks for the untimed Linux perf pass after each op's timed runs
+	// (see PerfOptions); the zero value runs none.
+	Perf PerfOptions
+	Log  io.Writer
 }
 
 // Variant is one benchmarked tool configuration.
@@ -136,9 +143,21 @@ type Variant struct {
 	Workers int      `json:"workers,omitempty"`
 	Kernel  string   `json:"kernel,omitempty"`
 	Env     []string `json:"env,omitempty"`
+	// Backup marks a rarpar repair row that keeps a numbered backup
+	// (`<file>.1`) of every file it repairs, as par3cmdline always does:
+	// the row that is like for like with the reference on bytes written. It
+	// runs repair only, and its name ends in "-backup". Every other rarpar
+	// row repairs in place and keeps no backup (see Results.BackupArgs).
+	Backup bool `json:"backup,omitempty"`
 	// Target is the storage target the row runs on; its name is the
 	// suffix after "@" in Name. Empty for a run with one unnamed target.
 	Target string `json:"target,omitempty"`
+}
+
+// RunsOp reports whether the row runs op at all: a backup row runs repair
+// only, every other row runs every op.
+func (v Variant) RunsOp(op string) bool {
+	return !v.Backup || op == OpRepair
 }
 
 // dirName is the variant's short stage-directory name. Stage paths are kept
@@ -151,14 +170,22 @@ func (v Variant) dirName() string {
 	return strings.TrimPrefix(name, "rarpar-")
 }
 
-// Variants expands the reference plus one rarpar row per worker count, then
-// one per kernel variant and worker count. Every rarpar row runs buffered:
-// durability is the caller's concern, not PAR3's, so the bench measures the
-// plain buffered command and never passes --fsync (see probeBuffered).
+// Variants expands the reference, then per worker count a rarpar row and its
+// backup row, then one row per kernel variant and worker count. The rarpar
+// row (rarpar-wN) runs every op; its repair is the candidate's in-place
+// default, which keeps no backup. The backup row (rarpar-wN-backup) runs
+// repair only and keeps a numbered `.1` backup of every file it repairs, as
+// the reference always does, so it is the row that is like for like with
+// the reference on bytes written (see probeBackup). Kernel rows repair in
+// place. Every rarpar row runs buffered: durability is the caller's concern,
+// not PAR3's, so the bench measures the plain buffered command and never
+// passes --fsync (see probeBuffered).
 func Variants(workers []int, kernels []KernelVariant) []Variant {
 	variants := []Variant{{Name: "reference", Tool: ToolReference}}
 	for _, count := range workers {
-		variants = append(variants, Variant{Name: fmt.Sprintf("rarpar-w%d", count), Tool: ToolCandidate, Workers: count})
+		variants = append(variants,
+			Variant{Name: fmt.Sprintf("rarpar-w%d", count), Tool: ToolCandidate, Workers: count},
+			Variant{Name: fmt.Sprintf("rarpar-w%d-backup", count), Tool: ToolCandidate, Workers: count, Backup: true})
 	}
 	for _, kernel := range kernels {
 		for _, count := range workers {
@@ -244,6 +271,9 @@ func CheckVariantNames(variants []Variant) error {
 	seen := map[string]bool{}
 	for _, variant := range variants {
 		if seen[variant.Name] {
+			if name, _, _ := strings.Cut(variant.Name, "@"); strings.HasSuffix(name, "-backup") {
+				return fmt.Errorf("row %q appears twice in the matrix; a kernel variant may not be named \"backup\": rarpar-wN-backup is the repair row that keeps backups", variant.Name)
+			}
 			return fmt.Errorf("row %q appears twice in the matrix; list each worker count and kernel variant once", variant.Name)
 		}
 		seen[variant.Name] = true
@@ -252,13 +282,16 @@ func CheckVariantNames(variants []Variant) error {
 }
 
 // RowsByOp lists, per operation, the row names a matrix produces. Every row
-// runs every operation; a PAR-inside set narrows them when it runs (see
-// carrierRuns).
+// runs every operation except a backup row, which runs repair only; a
+// PAR-inside set narrows them when it runs (see carrierRuns), and so does a
+// candidate that cannot repair in place (see probeBackup).
 func RowsByOp(variants []Variant, ops []string) map[string][]string {
 	rows := map[string][]string{}
 	for _, op := range ops {
 		for _, variant := range variants {
-			rows[op] = append(rows[op], variant.Name)
+			if variant.RunsOp(op) {
+				rows[op] = append(rows[op], variant.Name)
+			}
 		}
 	}
 	return rows
@@ -276,6 +309,9 @@ type RepairCheck struct {
 	Match      bool     `json:"match"`
 	Mismatched []string `json:"mismatched,omitempty"`
 	ExtraFiles []string `json:"extra_files,omitempty"`
+	// Backups lists the ExtraFiles that are numbered backups of a protected
+	// file (`<name>.<n>`): the damaged originals the repair kept.
+	Backups []string `json:"backups,omitempty"`
 }
 
 // RunRecord is one process run.
@@ -410,6 +446,19 @@ type Results struct {
 	// Notes say so. The bench never passes --fsync.
 	BufferedArgs        map[string][]string `json:"buffered_args,omitempty"`
 	BufferedUnsupported []string            `json:"buffered_unsupported,omitempty"`
+	// BackupArgs records, per rarpar row that runs repair, the arguments
+	// that select its repair mode on this candidate, probed from `par3
+	// repair --help` (see backupArgsFromHelp). A rarpar-wN row (and every
+	// kernel row) repairs in place and keeps no backup: nothing on a
+	// candidate that lists --backup, `--no-backup` on one that lists only
+	// --no-backup (0.7.0 and earlier). A rarpar-wN-backup row keeps a
+	// numbered `.1` backup of every file it repairs, as the reference does:
+	// `--backup`, or nothing on a candidate whose plain repair keeps one.
+	// InPlaceUnsupported records a candidate whose help lists neither
+	// switch: only its backup rows run repair, with the plain command, and
+	// Notes say so.
+	BackupArgs         map[string][]string `json:"backup_args,omitempty"`
+	InPlaceUnsupported bool                `json:"in_place_unsupported,omitempty"`
 	// TimeoutSeconds / ReferenceTimeoutSeconds bound each timed process.
 	TimeoutSeconds          float64   `json:"timeout_seconds,omitempty"`
 	ReferenceTimeoutSeconds float64   `json:"reference_timeout_seconds,omitempty"`
@@ -428,7 +477,11 @@ type Results struct {
 	Runs           []RunRecord        `json:"runs"`
 	IOCounts       []IOCountRecord    `json:"io_counts,omitempty"`
 	EnginePerfRuns []EnginePerfRecord `json:"engine_perf_runs,omitempty"`
-	Notes          []string           `json:"notes,omitempty"`
+	// Perf is the untimed Linux perf pass that was asked for, and PerfRuns
+	// its runs (see PerfOptions).
+	Perf     *PerfPass `json:"perf,omitempty"`
+	PerfRuns []PerfRun `json:"perf_runs,omitempty"`
+	Notes    []string  `json:"notes,omitempty"`
 	// DNF lists every reference row that did not finish. DNF rows do not
 	// change Status.
 	DNF      []string `json:"dnf,omitempty"`
@@ -554,7 +607,13 @@ func RunSuite(ctx context.Context, options Options) (*Results, error) {
 			r.options.IOCount = false
 		}
 	}
+	if err := r.startPerf(ctx); err != nil {
+		return nil, err
+	}
 	if err := r.probeBuffered(ctx); err != nil {
+		return nil, err
+	}
+	if err := r.probeBackup(ctx); err != nil {
 		return nil, err
 	}
 
@@ -580,6 +639,9 @@ func RunSuite(ctx context.Context, options Options) (*Results, error) {
 				break
 			}
 		}
+	}
+	if err := r.finishPerf(); err != nil {
+		results.Notes = append(results.Notes, "perf pass: "+err.Error())
 	}
 	results.FinishedUTC = time.Now().UTC().Format(time.RFC3339)
 	results.Failures = r.failures
@@ -739,7 +801,7 @@ func validateOptions(options *Options) error {
 			return fmt.Errorf("binary %s is not a regular file", path)
 		}
 	}
-	return nil
+	return validatePerf(options)
 }
 
 // probeBuffered finds, from each writing op's own --help, the arguments that
@@ -752,7 +814,7 @@ func (r *runner) probeBuffered(ctx context.Context) error {
 		if !contains(r.options.Ops, op) {
 			continue
 		}
-		result, err := bufferedHelp(ctx, r.options.Candidate, op)
+		result, err := opHelp(ctx, r.options.Candidate, op, "--fsync/--buffered")
 		if result.Failure == "binary-quarantined" {
 			return r.quarantined(ctx, r.options.Candidate, "refused to start: "+fmt.Sprint(result.Err))
 		}
@@ -771,16 +833,87 @@ func (r *runner) probeBuffered(ctx context.Context) error {
 	return nil
 }
 
-// bufferedHelp runs `candidate par3 <op> --help` for the buffered probe. A
-// help screen that did not print says nothing about the flags, so a failed
-// probe is an error rather than a guess that could run every row durable.
-func bufferedHelp(ctx context.Context, candidate, op string) (Result, error) {
+// opHelp runs `candidate par3 <op> --help` for a flag probe; flags names the
+// switches it looks for, for the error. A help screen that did not print
+// says nothing about the flags, so a failed probe is an error rather than a
+// guess that could run every row durable, or every repair row in the wrong
+// backup mode.
+func opHelp(ctx context.Context, candidate, op, flags string) (Result, error) {
 	result := Run(ctx, Command{Path: candidate, Args: []string{"par3", op, "--help"}, Timeout: 30 * time.Second})
 	if result.Failure != "" || result.ExitCode != 0 {
-		return result, fmt.Errorf("probing `%s par3 %s --help` for --fsync/--buffered failed (%s, exit %d): %s",
-			candidate, op, firstNonEmpty(result.Failure, "exit"), result.ExitCode, lastLine(result))
+		return result, fmt.Errorf("probing `%s par3 %s --help` for %s failed (%s, exit %d): %s",
+			candidate, op, flags, firstNonEmpty(result.Failure, "exit"), result.ExitCode, lastLine(result))
 	}
 	return result, nil
+}
+
+// probeBackup finds, from `rarpar par3 repair --help`, the arguments that
+// select each rarpar repair row's mode on this candidate (see
+// backupArgsFromHelp) and records them per row in Results.BackupArgs. A
+// candidate whose help lists neither --backup nor --no-backup cannot be told
+// to repair in place, so only its backup rows run repair, with the plain
+// command; Results.InPlaceUnsupported and a note say so. Each repair run's
+// backups are then checked against its row's mode (see backupProblem).
+func (r *runner) probeBackup(ctx context.Context) error {
+	if !contains(r.options.Ops, OpRepair) {
+		return nil
+	}
+	result, err := opHelp(ctx, r.options.Candidate, OpRepair, "--backup/--no-backup")
+	if result.Failure == "binary-quarantined" {
+		return r.quarantined(ctx, r.options.Candidate, "refused to start: "+fmt.Sprint(result.Err))
+	}
+	if err != nil {
+		return err
+	}
+	inPlace, backup, inPlaceOK := backupArgsFromHelp(result.Stdout + result.Stderr)
+	if r.results.BackupArgs == nil {
+		r.results.BackupArgs = map[string][]string{}
+	}
+	for _, variant := range r.results.Variants {
+		switch {
+		case variant.Tool != ToolCandidate:
+		case variant.Backup:
+			r.results.BackupArgs[variant.Name] = backup
+		case inPlaceOK:
+			r.results.BackupArgs[variant.Name] = inPlace
+		}
+	}
+	if !inPlaceOK {
+		r.results.InPlaceUnsupported = true
+		note := noInPlaceRepairNote()
+		r.results.Notes = append(r.results.Notes, note)
+		r.logf("%s", note)
+	}
+	return nil
+}
+
+// backupArgsFromHelp reads a `rarpar par3 repair --help` screen and returns
+// the arguments for an in-place row and for a backup row, and false for the
+// in-place row when the help lists neither switch. A screen listing
+// --backup (releases after 0.7.0, which repair in place by default) gives
+// the backup row `--backup` and the in-place row nothing. One listing
+// --no-backup instead (0.7.0 and earlier, which keep numbered backups by
+// default) gives the in-place row `--no-backup` and the backup row nothing.
+// One listing both gives each row its own switch. One listing neither can
+// only run the plain command, on the backup rows alone.
+func backupArgsFromHelp(help string) (inPlace, backup []string, inPlaceOK bool) {
+	listsBackup, listsNoBackup := helpListsFlag(help, "--backup"), helpListsFlag(help, "--no-backup")
+	switch {
+	case listsBackup && listsNoBackup:
+		return []string{"--no-backup"}, []string{"--backup"}, true
+	case listsBackup:
+		return []string{}, []string{"--backup"}, true
+	case listsNoBackup:
+		return []string{"--no-backup"}, []string{}, true
+	default:
+		return nil, []string{}, false
+	}
+}
+
+// noInPlaceRepairNote is the results note for a candidate whose repair
+// --help lists neither --backup nor --no-backup.
+func noInPlaceRepairNote() string {
+	return "`rarpar par3 repair --help` on this candidate lists neither --backup nor --no-backup, so it cannot be told to repair in place: only the rarpar-wN-backup rows ran repair, with the plain command, and each run had to leave a numbered backup; the in-place rarpar repair rows (rarpar-wN and kernel variants) did not run"
 }
 
 // bufferedArgsFromHelp reads a `rarpar par3 <op> --help` screen and returns
@@ -954,7 +1087,7 @@ func (r *runner) record(record RunRecord) {
 		extra = " carriers=" + record.Identity.Verdict()
 	}
 	if record.Repair != nil {
-		extra = fmt.Sprintf(" repaired=%t", record.Repair.Match)
+		extra = fmt.Sprintf(" repaired=%t backups=%d", record.Repair.Match, len(record.Repair.Backups))
 	}
 	if record.Canonical {
 		phase = "canonical-seed"
@@ -1055,7 +1188,7 @@ func (r *runner) runConfig(ctx context.Context, config Config, dataset Dataset, 
 		}
 		var variants []Variant
 		for _, variant := range r.results.Variants {
-			if r.carrierRuns(config, variant) {
+			if r.rowRuns(config, variant, op) {
 				variants = append(variants, variant)
 			}
 		}
@@ -1096,6 +1229,7 @@ func (r *runner) runConfig(ctx context.Context, config Config, dataset Dataset, 
 				}
 			}
 		}
+		r.perfPass(ctx, op, config, dataset, first, variants)
 		if r.options.EnginePerf != "" && !contains(r.options.Rows, ToolEngine) && config.Carrier == "" {
 			for _, workers := range r.options.Workers {
 				r.enginePerf(ctx, op, config, dataset, first.dataDir, first.canonical, first.stageRoot, workers)
@@ -1209,6 +1343,11 @@ func settleRow(record *RunRecord) bool {
 	}
 	if record.Tool == ToolReference && IsDNFFailure(record.Failure) {
 		record.Status = StatusDNF
+		return true
+	}
+	if record.Tool == ToolEngine && record.Failure == FailureEngineNotBuffered {
+		// The build decides it, so every remaining run would fail the same
+		// way.
 		return true
 	}
 	return record.Tool == ToolCandidate && record.Failure == "timeout"
@@ -1407,8 +1546,18 @@ func (r *runner) checkCommand(op string, stage string, variant Variant, config C
 	args := append(r.candidateGlobals(variant), "par3", sub, carrierName)
 	if op == OpRepair {
 		args = append(args, r.bufferedArgs(OpRepair)...)
+		args = append(args, r.backupArgs(variant)...)
 	}
 	return Command{Path: r.options.Candidate, Args: args, Dir: stage, Env: variant.Env, PinCPUs: r.pin(), Timeout: r.timeoutFor(ToolCandidate)}
+}
+
+// backupArgs selects a rarpar repair row's backup mode on this candidate
+// (see Results.BackupArgs).
+func (r *runner) backupArgs(variant Variant) []string {
+	if r.results == nil {
+		return nil
+	}
+	return r.results.BackupArgs[variant.Name]
 }
 
 // stage lays out a verify or repair directory: inputs (linked when the op
@@ -1566,6 +1715,17 @@ func (r *runner) runOne(ctx context.Context, op string, config Config, dataset D
 		record.Error = "the process exited but the harness recorded no peak RSS (expected " + procmeasure.DescribeRSSSource(procmeasure.NativeRSSSource) + ")"
 		return record, nil
 	}
+	if variant.Tool == ToolEngine {
+		// An engine row is reported as buffered, as every rarpar row is; a
+		// build whose output shows it synced, or cannot show it did not, is
+		// not the row the report names.
+		if problem := EngineSyncProblem(op, result.Stdout); problem != "" {
+			record.Status = StatusFailed
+			record.Failure = FailureEngineNotBuffered
+			record.Error = problem
+			return record, nil
+		}
+	}
 	switch op {
 	case OpCreate:
 		if variant.Tool == ToolReference {
@@ -1612,9 +1772,32 @@ func (r *runner) runOne(ctx context.Context, op string, config Config, dataset D
 			record.Failure = "repair-mismatch"
 			record.StderrTail = result.Stderr
 			record.StderrLine = lastLine(result)
+			break
+		}
+		if variant.Tool == ToolCandidate && config.Carrier == "" {
+			if problem := backupProblem(variant.Backup, check); problem != "" {
+				record.Status = StatusFailed
+				record.Failure = "backup-mismatch"
+				record.Error = problem
+			}
 		}
 	}
 	return record, nil
+}
+
+// backupProblem checks that a rarpar repair left what its row's mode
+// promises: a backup row at least one numbered backup of a file it repaired,
+// an in-place row none. It returns "" when it did. A row that broke its
+// mode is not the row the report names (like for like with the reference,
+// or in place), so it fails.
+func backupProblem(backup bool, check RepairCheck) string {
+	switch {
+	case backup && len(check.Backups) == 0:
+		return "a backup row left no numbered backup of the files it repaired"
+	case !backup && len(check.Backups) > 0:
+		return "an in-place row left numbered backups: " + strings.Join(check.Backups, ", ")
+	}
+	return ""
 }
 
 // exitAccepted reports whether a tool's run of op exited with the status of a
@@ -1670,7 +1853,29 @@ func checkRepair(dir string, manifest DatasetManifest, canonical string) (Repair
 			check.ExtraFiles = append(check.ExtraFiles, entry.Name())
 		}
 	}
+	check.Backups = numberedBackups(check.ExtraFiles, manifest)
 	return check, nil
+}
+
+// numberedBackups picks the names that are numbered backups of a protected
+// file, `<name>.<n>`, the way par3cmdline and rarpar keep the damaged
+// original of a file they repair.
+func numberedBackups(names []string, manifest DatasetManifest) []string {
+	protected := map[string]bool{}
+	for _, digest := range manifest.SHA256 {
+		protected[digest.Name] = true
+	}
+	var backups []string
+	for _, name := range names {
+		dot := strings.LastIndexByte(name, '.')
+		if dot <= 0 || dot == len(name)-1 || !protected[name[:dot]] {
+			continue
+		}
+		if _, err := strconv.ParseUint(name[dot+1:], 10, 32); err == nil {
+			backups = append(backups, name)
+		}
+	}
+	return backups
 }
 
 func (r *runner) countIO(ctx context.Context, op string, config Config, dataset Dataset, manifest DatasetManifest,
@@ -1765,6 +1970,10 @@ func (r *runner) enginePerf(ctx context.Context, op string, config Config, datas
 		}
 		if result.Failure != "" || result.ExitCode != 0 {
 			record.Error = fmt.Sprintf("exit %d %s: %s", result.ExitCode, result.Failure, firstLine(result.Stderr))
+		} else if problem := EngineSyncProblem(op, result.Stdout); problem != "" {
+			// The stage breakdown is kept, flagged: it is not the buffered
+			// run the report describes.
+			record.Error = problem
 		}
 	}
 	r.results.EnginePerfRuns = append(r.results.EnginePerfRuns, record)
@@ -1792,10 +2001,15 @@ func ReadResults(path string) (*Results, error) {
 	}
 	if results.Schema != ResultsSchema {
 		hint := ""
-		if results.Schema == "rarpar-par3-bench-v1" {
+		switch results.Schema {
+		case "rarpar-par3-bench-v1":
 			// A v1 rarpar-wN row may be a durable run; this harness would
 			// report it as buffered.
 			hint = "; a v1 file predates buffered-only rows, so read it with the harness that wrote it"
+		case "rarpar-par3-bench-v2":
+			// A v2 rarpar-wN repair row kept numbered backups; this harness
+			// would report it as the in-place row.
+			hint = "; a v2 file predates the in-place and -backup repair rows (its rarpar-wN repair rows kept a numbered backup), so read it with the harness that wrote it"
 		}
 		return nil, fmt.Errorf("%s: schema %q, want %q%s", path, results.Schema, ResultsSchema, hint)
 	}
@@ -1851,16 +2065,31 @@ func CollectMachine(ctx context.Context, label string) bench.Machine {
 	return machine
 }
 
+// rowRuns reports whether a row runs op on a configuration: a backup row
+// runs repair only (Variant.RunsOp); a PAR-inside set narrows the rows
+// (carrierRuns); and on a candidate that cannot repair in place
+// (Results.InPlaceUnsupported) only the backup rows run a plain set's
+// repair.
+func (r *runner) rowRuns(config Config, variant Variant, op string) bool {
+	if !variant.RunsOp(op) || !r.carrierRuns(config, variant) {
+		return false
+	}
+	inPlaceRepair := op == OpRepair && variant.Tool == ToolCandidate && !variant.Backup && config.Carrier == ""
+	return !(inPlaceRepair && r.results.InPlaceUnsupported)
+}
+
 // carrierRuns reports whether a variant runs on a configuration. Every
 // variant runs on a plain set. On a PAR-inside carrier rarpar runs through
-// its par3cmdline-compatible front end, which takes no worker count and has
-// no buffered mode, so only one rarpar row runs there: the row at the most
-// workers, with no kernel override. Engine rows do not run.
+// its par3cmdline-compatible front end, which takes no worker count, has no
+// buffered mode and no backup switch (its `rs` keeps the damaged carrier as
+// a numbered `.1`, as the reference does), so only one rarpar row runs
+// there: the row at the most workers, with no kernel override and not the
+// backup row. Engine rows do not run.
 func (r *runner) carrierRuns(config Config, variant Variant) bool {
 	if config.Carrier == "" || variant.Tool == ToolReference {
 		return true
 	}
-	if variant.Tool != ToolCandidate || variant.Kernel != "" {
+	if variant.Tool != ToolCandidate || variant.Kernel != "" || variant.Backup {
 		return false
 	}
 	most := 0
@@ -1928,7 +2157,7 @@ func (r *runner) seedCarrier(ctx context.Context, config Config, dataset Dataset
 	summary.ExpectedField = embedded.Field
 	summary.fillShape(dataset)
 	summary.CanonicalSource = ToolReference
-	r.results.Notes = append(r.results.Notes, fmt.Sprintf("%s: original ZIP %d bytes (sha256 %s); the reference's insert (-r%d, untimed, %.3fs) chose %d-byte blocks, %d input and %d recovery blocks (%s), carrier %d bytes; create is not timed for a carrier, and rarpar runs one row through its par3cmdline-compatible front end (vs/rs), which has no buffered mode: its repair syncs the rebuilt carrier",
+	r.results.Notes = append(r.results.Notes, fmt.Sprintf("%s: original ZIP %d bytes (sha256 %s); the reference's insert (-r%d, untimed, %.3fs) chose %d-byte blocks, %d input and %d recovery blocks (%s), carrier %d bytes; create is not timed for a carrier, and rarpar runs one row through its par3cmdline-compatible front end (vs/rs), which has no buffered mode: its repair syncs the rebuilt carrier, and it keeps the damaged carrier as a numbered .1 backup, as the reference does, so that row is like for like with the reference on bytes written (it has no -backup twin)",
 		config.ID, original, short(originalDigest), config.InsertRedundancy, result.WallSeconds, config.BlockSize, summary.InputBlocks, config.Recovery, embedded.Field, size))
 	manifest := DatasetManifest{Generator: generatorVersion, Dataset: Dataset{ID: config.ID, Files: []FileSpec{{Name: carrierZIPName, Size: size}}},
 		SHA256: []FileDigest{{Name: carrierZIPName, Size: size, SHA256: digest}}}

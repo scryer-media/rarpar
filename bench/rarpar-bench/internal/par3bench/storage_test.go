@@ -1,6 +1,7 @@
 package par3bench
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -138,8 +139,13 @@ func TestMatrixRowsExpandPerTargetAndFilterKinds(t *testing.T) {
 		t.Errorf("dirName = %s", rows[1].dirName())
 	}
 	single := MatrixRows([]int{1}, nil, nil, nil, nil, nil)
-	if len(single) != 2 || single[0].Name != "reference" || single[1].Name != "rarpar-w1" {
+	if len(single) != 3 || single[0].Name != "reference" || single[1].Name != "rarpar-w1" ||
+		single[2].Name != "rarpar-w1-backup" || !single[2].Backup {
 		t.Errorf("untargeted rows = %+v", single)
+	}
+	if targeted := MatrixRows([]int{1}, nil, nil, nil, []string{ToolCandidate}, targets); len(targeted) != 4 ||
+		targeted[1].Name != "rarpar-w1-backup@local" || !targeted[1].Backup || targeted[1].dirName() != "w1-backup" {
+		t.Errorf("targeted rarpar rows = %+v", targeted)
 	}
 	engine := EngineRows([]int{8}, nil)
 	if len(engine) != 1 || engine[0].Name != "engine-w8" {
@@ -221,5 +227,58 @@ func TestVerifyDamagedStageLinksTheSharedDamagedInputs(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(stageDir, "set.par3")); err != nil {
 		t.Error(err)
+	}
+}
+
+// An engine_perf create or repair counts as buffered only on its own
+// evidence, read from the output each build prints: the first builds print
+// none, later ones a creation_durability line and a Sync stage line (their
+// repair ignores PAR3_BENCH_REPAIR_DURABILITY and always syncs), later ones
+// file_syncs and file_opens in the totals, and par3-rs 0.6.0 and later
+// file_opens with no barrier at all.
+func TestEngineSyncProblemReadsEachBuildsEvidence(t *testing.T) {
+	const (
+		firstTotals  = `{"file_read_bytes":1048576,"file_write_bytes":2048,"memory_limit":268435456,"workers":8}`
+		stageTotals  = `{"file_read_bytes":1048576,"file_read_calls":4,"file_write_bytes":2048,"file_write_calls":2,"memory_limit":268435456,"workers":8}`
+		syncTotals   = `{"file_read_bytes":1048576,"file_read_calls":4,"file_write_bytes":2048,"file_write_calls":2,"file_opens":9,"file_syncs":%d,"file_clones":0,"file_in_place":0,"snapshots":1,"scan_work_used":0,"memory_limit":268435456,"workers":8}`
+		barrierFree  = `{"file_read_bytes":1048576,"file_read_calls":4,"file_write_bytes":2048,"file_write_calls":2,"file_opens":9,"file_clones":0,"file_in_place":0,"snapshots":1,"scan_work_used":0,"memory_limit":268435456,"workers":8}`
+		syncStage    = `{"internal_stage":"Sync","seconds":0.012000000,"calls":%d}`
+		repairStage  = `{"internal_stage":"Repair","seconds":0.500000000,"calls":1}`
+		mount        = `{"mount_local":2,"mount_remote":0,"mount_unknown":0,"verify_whole_first":2,"verify_single_pass":0,"whole_file_first":true,"mount_kind":"local"}`
+		createLine   = `{"creation_durability":"%s"}`
+		noEvidence   = "printed no sync evidence"
+		oldRepair    = "predates PAR3_BENCH_REPAIR_DURABILITY"
+		completedTwo = "completed 2 file syncs"
+	)
+	lines := func(parts ...string) string { return strings.Join(parts, "\n") + "\n" }
+	cases := []struct {
+		name, op, stdout, want string
+	}{
+		{"first build create", OpCreate, lines(`{"status":"Ready"}`, firstTotals), noEvidence},
+		{"first build repair", OpRepair, lines(`{"installed":2}`, firstTotals), noEvidence},
+		{"stage build buffered create", OpCreate, lines(fmt.Sprintf(createLine, "Buffered"), `{"carriers":3}`, repairStage, fmt.Sprintf(syncStage, 0), stageTotals), ""},
+		{"stage build synced create", OpCreate, lines(fmt.Sprintf(createLine, "SyncFiles"), fmt.Sprintf(syncStage, 4), stageTotals), "creation_durability SyncFiles, not Buffered"},
+		{"stage build repair", OpRepair, lines(`{"installed":2}`, repairStage, fmt.Sprintf(syncStage, 3), stageTotals), oldRepair},
+		{"stage build repair that synced nothing", OpRepair, lines(repairStage, fmt.Sprintf(syncStage, 0), stageTotals), ""},
+		{"sync-count build buffered repair", OpRepair, lines(repairStage, fmt.Sprintf(syncStage, 0), fmt.Sprintf(syncTotals, 0), mount), ""},
+		{"sync-count build synced repair", OpRepair, lines(repairStage, fmt.Sprintf(syncStage, 2), fmt.Sprintf(syncTotals, 2), mount), completedTwo},
+		{"sync-count build synced create", OpCreate, lines(fmt.Sprintf(createLine, "Buffered"), fmt.Sprintf(syncStage, 2), fmt.Sprintf(syncTotals, 2)), completedTwo},
+		{"barrier-free build create", OpCreate, lines(`{"carriers":3}`, repairStage, barrierFree, mount), ""},
+		{"barrier-free build repair", OpRepair, lines(`{"installed":2}`, repairStage, barrierFree, mount), ""},
+		{"truncated head", OpRepair, lines(`ge":"Repair","seconds":0.5,"calls":1}`, barrierFree), ""},
+		{"verify needs no evidence", OpVerify, lines(firstTotals), ""},
+		{"damaged verify needs no evidence", OpVerifyDamaged, "", ""},
+	}
+	for _, c := range cases {
+		got := EngineSyncProblem(c.op, c.stdout)
+		if (c.want == "") != (got == "") || !strings.Contains(got, c.want) {
+			t.Errorf("%s: %q, want %q", c.name, got, c.want)
+		}
+	}
+	// A build that cannot run buffered ends its row: every remaining run
+	// would fail the same way.
+	record := RunRecord{Tool: ToolEngine, Status: StatusFailed, Failure: FailureEngineNotBuffered}
+	if !settleRow(&record) || record.Status != StatusFailed {
+		t.Fatalf("an engine row that synced: finished false or status %s", record.Status)
 	}
 }

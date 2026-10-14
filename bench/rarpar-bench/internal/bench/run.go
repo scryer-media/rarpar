@@ -627,6 +627,17 @@ func perfStatArgs(program string, args []string) []string {
 	return append(commandArgs, args...)
 }
 
+// PerfStatEvents is the `perf stat -e` list the --perf collector counts. The
+// PAR3 suite's perf pass counts the same events, so its counters read the
+// same way as the corpus suites'.
+func PerfStatEvents() string { return strings.Join(perfEvents, ",") }
+
+// ParsePerfStat reads what `perf stat --no-big-num -x, -e PerfStatEvents()`
+// writes, as the --perf collector does: hybrid PMU rows sum, an optional
+// event the PMU does not expose is left out, and anything else missing or
+// unusable is an error.
+func ParsePerfStat(output []byte) (*PerfCounters, error) { return parsePerfStatOutput(output) }
+
 // runTimed is the timed launch; tests replace it to simulate a measurement
 // the harness failed to complete.
 var runTimed = timedCommand
