@@ -25,6 +25,19 @@ documented in each crate's own changelog so those notes ship with the crate.
   `"fsync": true|false`. `auto` mode repair has no `--fsync` and does not
   sync.
 
+### Benchmark harness only
+
+- The bench harness (`bench/rarpar-bench`) gains a `fleet` PAR3 profile for
+  the `macro-par3` fleet suite: Cauchy and FFT pairs at the small and medium
+  shapes, Set A, the over-PAR2-cap Set C FFT shape, and PAR-inside repair of
+  a ZIP. `par3 render` draws the PAR3 SVGs, and the fleet collector now
+  renders them per platform. These harness changes carry no
+  version impact of their own.
+- The harness probes each candidate's `par3 create|repair --help` for
+  `--fsync` or `--buffered` to learn which durability a plain command gives
+  and which switch selects the other, so durable rows against rarpar 0.6.3
+  run with `--fsync` and rows are labelled by the mode that ran.
+
 ## rarpar 0.6.2
 
 ### Fixes

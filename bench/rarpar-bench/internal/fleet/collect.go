@@ -3,6 +3,7 @@ package fleet
 import (
 	"context"
 	"fmt"
+	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/par3bench"
 	"io"
 	"os"
 	"path/filepath"
@@ -347,9 +348,34 @@ func (orch *orchestrator) finish(ctx context.Context) (Summary, error) {
 	return summary, nil
 }
 
-// render turns a host's report.json files into SVGs under the run directory.
-// Charts land in the run directory, never in the repository's docs.
+// render turns a host's report.json files into SVGs under the run directory,
+// then the macro-par3 results.json, when the host ran it, into per-operation
+// PAR3 SVGs beside them. Charts land in the run directory, never in the
+// repository's docs.
 func (orch *orchestrator) render(hostState *MachineState) ([]string, map[string]int, error) {
+	paths, counts, err := orch.renderReports(hostState)
+	if err != nil {
+		return paths, counts, err
+	}
+	par3Results := filepath.Join(hostState.ResultsDir, "par3", "results.json")
+	if _, statErr := os.Stat(par3Results); statErr != nil {
+		return paths, counts, nil
+	}
+	results, err := par3bench.ReadResults(par3Results)
+	if err != nil {
+		return paths, counts, err
+	}
+	out := filepath.Join(orch.runDir, "charts", hostState.PlatformLabel, "par3")
+	_ = os.RemoveAll(out)
+	rendered, err := par3bench.RenderSVGs(results, out)
+	if counts == nil {
+		counts = map[string]int{}
+	}
+	counts["par3"] = len(par3bench.Summarize(results))
+	return append(paths, rendered...), counts, err
+}
+
+func (orch *orchestrator) renderReports(hostState *MachineState) ([]string, map[string]int, error) {
 	entries, err := os.ReadDir(hostState.ResultsDir)
 	if err != nil {
 		return nil, nil, err
