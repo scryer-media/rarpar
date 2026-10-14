@@ -365,7 +365,7 @@ class NativeCodeTests(unittest.TestCase):
         # aws-lc-sys passes its crate directory to clang-cl in 8.3 short form.
         output = self.build_output(compiler="clang-cl", ordinary=("-O2", "/O2"),
                                    jitter=("-O2", "-Od", "-Od"), windows=True,
-                                   crate="/Users/RUNNER~1/.cargo/registry/src/INDEXC~1.IO-/AWS-LC~1.0")
+                                   crate="C:/RUNNER~1/CARGO~1/registry/src/INDEXC~1.IO-/AWS-LC~1.0")
         errors, summary = native.check_aws_lc_build(output, "aarch64-pc-windows-msvc")
         self.assertEqual(errors, [])
         self.assertIn("120 C sources at O2", summary)
