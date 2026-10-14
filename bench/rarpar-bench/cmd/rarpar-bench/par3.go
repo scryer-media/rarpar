@@ -26,6 +26,7 @@ const par3Usage = `Usage:
         [--candidate-arg ARG]... [--machine LABEL] [--timeout 20m] [--reference-timeout DURATION] [--keep-stages]
         [--target NAME=DIR]... [--target-meta NAME:KEY=V[,KEY=V]]... [--rows reference,rarpar,engine]
         [--engine-workers 8] [--engine-variant NAME:VAR=V[,VAR=V]]... [--drop-caches]
+        [--perf-stat N] [--perf-ops repair] [--perf-record SET]... [--perf-freq 499] [--perf-out DIR]
   rarpar-bench par3 report --input results.json [--out report.md]
   rarpar-bench par3 render --input results.json --out DIR
   rarpar-bench par3 versus --candidate PATH --work DIR --out DIR [--par2 PATH] [--profile versus-smoke|versus]
@@ -48,6 +49,15 @@ the -backup rows --backup; one listing --no-backup (0.7.0 and earlier) gives
 the in-place rows --no-backup; one listing neither runs only the -backup rows,
 plain, and the results say so. A PAR-inside set keeps one compatible rs row,
 which keeps a .1 like the reference.
+--perf-stat N and --perf-record SET add an untimed Linux perf pass after each
+--perf-ops operation's timed runs (default: repair), on the plain sets and the
+first target: N perf stat runs of every reference and rarpar row, each on a
+fresh stage, counting the corpus suites' --perf events; and on each named set
+one perf record -F 499 run (--perf-freq) of every rarpar row, kept as perf
+script text and folded stacks. Files go under --perf-out (default OUT/perf);
+a host without Linux perf skips the pass, and the results say so. A pass that
+was skipped, had a perf run fail, or ran nothing also writes INCOMPLETE.txt
+there, one problem per line.
 par3 versus compares PAR2 (rarpar par, and par2cmdline-turbo with --par2) with
 PAR3 Cauchy and FFT at one block size, recovery count and damage pattern, on the
 scale par2 ÷ par3 (above 1 = PAR3 faster), with every repair SHA-256 checked.
@@ -254,7 +264,12 @@ func runPAR3Suite(ctx context.Context, args []string, stdout io.Writer) error {
 	engineWorkers := flags.String("engine-workers", "", "add timed engine_perf rows at these worker counts (needs --engine-perf)")
 	rows := flags.String("rows", "", "timed row kinds: "+strings.Join(par3bench.KnownRowKinds, ",")+" (default: reference,rarpar, plus engine with --engine-workers)")
 	dropCaches := flags.Bool("drop-caches", false, "drop the page cache before every timed run (Linux, root)")
-	var sets, kernels, candidateArgs, targets, targetMeta, engineVariants stringList
+	perfStat := flags.Int("perf-stat", 0, "untimed perf stat runs of every reference and rarpar row per --perf-ops op, after its timed runs (Linux; 0 = none)")
+	perfOps := flags.String("perf-ops", strings.Join(par3bench.DefaultPerfOps, ","), "operations the perf pass covers")
+	perfFreq := flags.Int("perf-freq", par3bench.DefaultPerfFrequency, "perf record sampling frequency (-F)")
+	perfOut := flags.String("perf-out", "", "directory for perf's files (default: OUT/perf)")
+	var sets, kernels, candidateArgs, targets, targetMeta, engineVariants, perfRecord stringList
+	flags.Var(&perfRecord, "perf-record", "plain set whose rarpar rows also get one untimed perf record run per --perf-ops op (repeatable)")
 	flags.Var(&targets, "target", "storage target NAME=DIR; every row runs on every target, interleaved (repeatable; replaces --work)")
 	flags.Var(&targetMeta, "target-meta", "facts about a target the client cannot see, NAME:key=value[,key=value] (repeatable)")
 	flags.Var(&engineVariants, "engine-variant", "extra engine row NAME:VAR=value[,VAR=value] (repeatable)")
@@ -323,6 +338,8 @@ func runPAR3Suite(ctx context.Context, args []string, stdout io.Writer) error {
 		KeepStages: *keep, Timeout: *timeout, ReferenceTimeout: *referenceTimeout, Log: os.Stderr,
 		Targets: targetList, Rows: splitList(*rows), EngineWorkers: engineWorkerList, EngineVariants: engineVariantList,
 		DropCaches: *dropCaches,
+		Perf: par3bench.PerfOptions{StatRepeats: *perfStat, Ops: splitList(*perfOps), RecordSets: perfRecord,
+			Frequency: *perfFreq, Out: workspacePath(*perfOut)},
 	})
 	if err != nil {
 		return err

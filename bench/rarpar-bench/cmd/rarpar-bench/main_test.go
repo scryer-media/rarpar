@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/fleet"
 )
 
 // `payload video` refuses anything but a fully specified request before it
@@ -210,5 +214,53 @@ func TestNFSPassthroughAndFlagValue(t *testing.T) {
 	}
 	if got := flagValue([]string{"--outer", "/a"}, "out"); got != "" {
 		t.Errorf("flagValue matched a longer flag: %q", got)
+	}
+}
+
+// The fleet run script hands `par3 run` the macro-par3 perf pass flags; each
+// must be a flag par3 run takes, with values its validation accepts. The run
+// then gets as far as probing the reference's version, which a file that is
+// not a program fails.
+func TestPAR3RunAcceptsTheFleetPerfFlags(t *testing.T) {
+	config, err := fleet.LoadConfig(filepath.Join("..", "..", "..", "fleet.example.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	machines, err := fleet.Select(config, []string{"linux-avx2"}, []string{fleet.SuiteMacroPAR3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := fleet.RunScript(machines[0], config.Fleet.Defaults, "t", fleet.LayoutFor(machines[0], "t"), map[string]string{"par3": "/o/par3"})
+	const prefix = `    --perf-out "$R/perf/par3" `
+	start := strings.Index(script, prefix)
+	if start < 0 {
+		t.Fatalf("the run script passes no perf flags:\n%s", script)
+	}
+	line := script[start+len(prefix) : start+strings.Index(script[start:], "\n")]
+	dir := t.TempDir()
+	args := []string{"--perf-out", filepath.Join(dir, "perf")}
+	for _, word := range regexp.MustCompile(`'([^']*)'`).FindAllStringSubmatch(line, -1) {
+		args = append(args, word[1])
+	}
+	if strings.Join(args[2:], " ") != "--perf-stat 3 --perf-ops repair --perf-freq 499 --perf-record a-gf16" {
+		t.Fatalf("perf flags: %q", args[2:])
+	}
+	reference, candidate := filepath.Join(dir, "par3"), filepath.Join(dir, "rarpar")
+	for _, path := range []string{reference, candidate} {
+		if err := os.WriteFile(path, []byte("not a program"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run := func(extra ...string) error {
+		base := []string{"--reference", reference, "--candidate", candidate,
+			"--work", filepath.Join(dir, "w"), "--out", filepath.Join(dir, "out"), "--profile", "full"}
+		return runPAR3Suite(context.Background(), append(append(base, args...), extra...), io.Discard)
+	}
+	if err := run(); err == nil || !strings.Contains(err.Error(), "binary "+reference+": version probe -V") {
+		t.Fatalf("the fleet's perf flags must pass parsing and validation; got %v", err)
+	}
+	// Validation does run before the reference is looked at.
+	if err := run("--perf-record", "z-gf99"); err == nil || !strings.Contains(err.Error(), `--perf-record: "z-gf99" is not a set`) {
+		t.Fatalf("got %v", err)
 	}
 }

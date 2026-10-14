@@ -100,15 +100,22 @@ type PAR3View struct {
 }
 
 type Protocol struct {
-	WarmupPass    bool     `json:"warmup_pass"`
-	Warmups       int      `json:"warmups"`
-	Repeats       int      `json:"repeats"`
-	Families      []string `json:"families,omitempty"`
-	Cases         []string `json:"cases,omitempty"`
-	QuietLoadMax  float64  `json:"quiet_load_threshold"`
-	PerfStat      int      `json:"perf_stat_repeats,omitempty"`
+	WarmupPass   bool     `json:"warmup_pass"`
+	Warmups      int      `json:"warmups"`
+	Repeats      int      `json:"repeats"`
+	Families     []string `json:"families,omitempty"`
+	Cases        []string `json:"cases,omitempty"`
+	QuietLoadMax float64  `json:"quiet_load_threshold"`
+	PerfStat     int      `json:"perf_stat_repeats,omitempty"`
+	// PerfRecord are the corpus cases perf record (or samply) profiles; set
+	// only when a corpus suite runs, since the record loop runs only then.
 	PerfRecord    []string `json:"perf_record_cases,omitempty"`
 	PerfFrequency int      `json:"perf_record_frequency,omitempty"`
+	// PerfPAR3Ops and PerfPAR3RecordSets are the macro-par3 perf pass on a
+	// linux-perf host: perf stat PerfStat times on every reference and rarpar
+	// row of these ops, perf record on the rarpar rows of these sets.
+	PerfPAR3Ops        []string `json:"perf_par3_ops,omitempty"`
+	PerfPAR3RecordSets []string `json:"perf_par3_record_sets,omitempty"`
 }
 
 type CloudPlan struct {
@@ -207,8 +214,14 @@ func BuildPlan(config Config, machines []Machine, runID string) FleetPlan {
 		}
 		if machine.Capabilities.Perf != PerfNone {
 			item.Protocol.PerfStat = machine.Perf.StatRepeats
-			item.Protocol.PerfRecord = machine.Perf.RecordCases
+			if len(machine.families()) > 0 {
+				item.Protocol.PerfRecord = machine.Perf.RecordCases
+			}
 			item.Protocol.PerfFrequency = machine.Perf.RecordFrequency
+			if ops := machine.par3PerfOps(); len(ops) > 0 {
+				item.Protocol.PerfPAR3Ops = ops
+				item.Protocol.PerfPAR3RecordSets = machine.Perf.PAR3RecordSets
+			}
 		}
 		item.Oracles = map[string]OracleResolution{}
 		for _, role := range sortedKeys(machine.Oracles) {
@@ -347,6 +360,9 @@ func machineSteps(machine Machine, layout RemoteLayout) []string {
 		steps = append(steps, fmt.Sprintf("on host: macro-par3, profile %s, workers %v, buffered rarpar rows only (never --fsync): per worker count rarpar-wN for every op, repairing in place with no backup, and the repair row rarpar-wN-backup, which keeps a numbered .1 as the reference does (like for like on bytes written); warmups=%d repeats=%d, %s, reference failures are DNF, work %s",
 			machine.PAR3.Profile, machine.PAR3.Workers, machine.PAR3.Warmups, machine.PAR3.Repeats,
 			timeout, PAR3Work(machine, layout)))
+		if step := par3PerfStep(machine); step != "" {
+			steps = append(steps, step)
+		}
 		if machine.PAR3.Versus != "" {
 			steps = append(steps, fmt.Sprintf("on host: par3 versus, profile %s: PAR2 (rarpar par, plus the par2 oracle when present) against PAR3 Cauchy and FFT, each PAR3 repair in place and as a -backup twin that keeps a .1, par2 ÷ par3, every repair SHA-256 checked",
 				machine.PAR3.Versus))
@@ -371,14 +387,7 @@ func machineSteps(machine Machine, layout RemoteLayout) []string {
 			fmt.Sprintf("on host: sevenz-turbo run, profile %s%s, %dm per-case timeout, results under results/sevenz-turbo",
 				machine.Turbo.SevenzProfile, turboOnlyNote(machine.Turbo.SevenzOnly, machine.Turbo.SevenzRepeats), machine.Turbo.TimeoutMinutes))
 	}
-	switch machine.Capabilities.Perf {
-	case PerfLinux:
-		steps = append(steps, "on host: perf diagnostic pass (harness --perf counters for both subjects, plus perf record/script/folded on the designated cases)")
-	case PerfSamply:
-		steps = append(steps, "on host: samply diagnostic pass on the designated cases")
-	default:
-		steps = append(steps, "on host: no sampling collector; harness phase timings only")
-	}
+	steps = append(steps, perfStep(machine))
 	steps = append(steps,
 		"on host: "+remoteBase(layout.Tarball)+" + MANIFEST.json inventory + DONE sentinel",
 		"orchestrator: poll for DONE, pull "+remoteBase(layout.Tarball)+", verify the manifest digests")
@@ -389,6 +398,118 @@ func machineSteps(machine Machine, layout RemoteLayout) []string {
 	}
 	steps = append(steps, "orchestrator: render SVGs for "+machine.PlatformLabel+" and fold into the fleet summary")
 	return steps
+}
+
+// par3PerfStep is the macro-par3 perf pass, which runs inside par3 run,
+// naming the sets and rows it covers, or "" when the machine runs none (or
+// its matrix does not resolve, which blocks the run anyway).
+func par3PerfStep(machine Machine) string {
+	ops := machine.par3PerfOps()
+	if len(ops) == 0 {
+		return ""
+	}
+	profile, err := par3bench.LookupProfile(machine.PAR3.Profile)
+	if err == nil {
+		profile, err = profile.Select(machine.PAR3.Sets)
+	}
+	if err != nil {
+		return ""
+	}
+	var kernels []par3bench.KernelVariant
+	for _, text := range machine.PAR3.KernelVariants {
+		if variant, err := par3bench.ParseKernelVariant(text); err == nil {
+			kernels = append(kernels, variant)
+		}
+	}
+	variants := par3bench.Variants(machine.PAR3.Workers, kernels)
+	rows := par3bench.RowsByOp(variants, ops)
+	var plain, stat []string
+	for _, config := range profile.Configs {
+		if config.Carrier == "" {
+			plain = append(plain, config.ID)
+		}
+	}
+	for _, op := range ops {
+		stat = append(stat, fmt.Sprintf("each %s row (%s)", op, strings.Join(rows[op], ",")))
+	}
+	step := fmt.Sprintf("on host: macro-par3 perf pass inside par3 run (untimed, after each op's timed runs) on the plain sets %s: perf stat x%d of %s, each run on a fresh stage",
+		strings.Join(plain, ","), machine.Perf.StatRepeats, strings.Join(stat, " and "))
+	if sets := machine.Perf.PAR3RecordSets; len(sets) > 0 {
+		step += fmt.Sprintf("; on %s, one perf record -F %d with frame-pointer call graphs of each rarpar row, exported as perf script text and folded stacks",
+			strings.Join(sets, ","), machine.Perf.RecordFrequency)
+	} else {
+		step += "; no perf record (perf.par3_record_sets is empty)"
+	}
+	perf := par3bench.PerfOptions{StatRepeats: machine.Perf.StatRepeats, Ops: ops, RecordSets: machine.Perf.PAR3RecordSets}
+	return step + fmt.Sprintf("; up to %d untimed runs; evidence under results/perf/par3, and %s plus a par3-perf-incomplete warning when the pass falls short",
+		par3bench.PerfPassRuns(profile, variants, perf), par3bench.PerfIncompleteFile)
+}
+
+// perfStep is the run script's perf section: the corpus suites' perf pass,
+// or only the collector's version when no corpus suite runs here.
+func perfStep(machine Machine) string {
+	families := machine.families()
+	cases := strings.Join(machine.Perf.RecordCases, ",")
+	switch machine.Capabilities.Perf {
+	case PerfLinux:
+		if len(families) == 0 {
+			return "on host: record perf --version and kernel.perf_event_paranoid (no corpus suite runs here: no harness --perf pass, no perf record of corpus cases)"
+		}
+		record := "perf record/script/folded on " + cases
+		if cases == "" {
+			record = "no perf record (perf.record_cases is empty)"
+		}
+		return fmt.Sprintf("on host: perf diagnostic pass on the %s cases (harness --perf counters for both subjects, x%d per case; %s)",
+			strings.Join(families, ","), machine.Perf.StatRepeats, record)
+	case PerfSamply:
+		switch {
+		case len(families) == 0:
+			return "on host: record samply --version (no corpus suite runs here, so nothing is profiled)"
+		case cases == "":
+			return "on host: record samply --version (perf.record_cases is empty, so nothing is profiled)"
+		}
+		return "on host: samply diagnostic pass on " + cases
+	default:
+		return "on host: no sampling collector; harness phase timings only"
+	}
+}
+
+// perfLine is the plan's account of what the perf pass runs, per suite; it
+// names only what the run script does.
+func perfLine(machine MachinePlan) string {
+	protocol := machine.Protocol
+	switch machine.Perf {
+	case PerfLinux:
+		var parts []string
+		if len(protocol.Families) > 0 {
+			record := "no perf record"
+			if len(protocol.PerfRecord) > 0 {
+				record = fmt.Sprintf("record -F %d on %s", protocol.PerfFrequency, strings.Join(protocol.PerfRecord, ","))
+			}
+			parts = append(parts, fmt.Sprintf("%s: stat repeats=%d per case, %s", strings.Join(protocol.Families, ","), protocol.PerfStat, record))
+		}
+		if len(protocol.PerfPAR3Ops) > 0 {
+			record := "no perf record"
+			if len(protocol.PerfPAR3RecordSets) > 0 {
+				record = fmt.Sprintf("record -F %d on the rarpar rows of %s", protocol.PerfFrequency, strings.Join(protocol.PerfPAR3RecordSets, ","))
+			}
+			parts = append(parts, fmt.Sprintf("macro-par3: stat repeats=%d on the reference and rarpar rows of %s, %s",
+				protocol.PerfStat, strings.Join(protocol.PerfPAR3Ops, ","), record))
+		} else if contains(machine.Suites, SuiteMacroPAR3) {
+			parts = append(parts, "macro-par3: off (perf.par3_ops is empty)")
+		}
+		if len(parts) == 0 {
+			return PerfLinux + " (version and perf_event_paranoid only: no selected suite runs under perf)"
+		}
+		return PerfLinux + " (" + strings.Join(parts, "; ") + ")"
+	case PerfSamply:
+		if len(protocol.Families) > 0 && len(protocol.PerfRecord) > 0 {
+			return fmt.Sprintf("%s (record --rate %d on %s)", PerfSamply, protocol.PerfFrequency, strings.Join(protocol.PerfRecord, ","))
+		}
+		return PerfSamply + " (version only: no designated corpus case runs here)"
+	default:
+		return machine.Perf
+	}
 }
 
 // par3View resolves the macro-par3 matrix and checks the work path against the
@@ -478,12 +599,7 @@ func WritePlanText(writer io.Writer, plan FleetPlan) {
 			}
 			fmt.Fprintln(writer)
 		}
-		fmt.Fprintf(writer, "  perf       %s", machine.Perf)
-		if machine.Perf != PerfNone {
-			fmt.Fprintf(writer, " (stat repeats=%d, record -F %d on %s)",
-				protocol.PerfStat, protocol.PerfFrequency, orNone(strings.Join(protocol.PerfRecord, ",")))
-		}
-		fmt.Fprintln(writer)
+		fmt.Fprintf(writer, "  perf       %s\n", perfLine(machine))
 		for _, role := range sortedKeys(machine.Oracles) {
 			oracle := machine.Oracles[role]
 			fmt.Fprintf(writer, "  oracle %-4s %s -> %s\n", role, oracle.Policy, oracle.RemotePath)
@@ -552,13 +668,6 @@ func WritePlanText(writer io.Writer, plan FleetPlan) {
 			fmt.Fprintf(writer, "  ! %s\n", warning)
 		}
 	}
-}
-
-func orNone(value string) string {
-	if value == "" {
-		return "(none)"
-	}
-	return value
 }
 
 func short(value string) string {

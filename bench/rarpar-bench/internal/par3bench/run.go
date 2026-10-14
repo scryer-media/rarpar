@@ -130,7 +130,10 @@ type Options struct {
 	EngineVariants []KernelVariant
 	// DropCaches drops the page cache before every timed run (Linux, root).
 	DropCaches bool
-	Log        io.Writer
+	// Perf asks for the untimed Linux perf pass after each op's timed runs
+	// (see PerfOptions); the zero value runs none.
+	Perf PerfOptions
+	Log  io.Writer
 }
 
 // Variant is one benchmarked tool configuration.
@@ -474,7 +477,11 @@ type Results struct {
 	Runs           []RunRecord        `json:"runs"`
 	IOCounts       []IOCountRecord    `json:"io_counts,omitempty"`
 	EnginePerfRuns []EnginePerfRecord `json:"engine_perf_runs,omitempty"`
-	Notes          []string           `json:"notes,omitempty"`
+	// Perf is the untimed Linux perf pass that was asked for, and PerfRuns
+	// its runs (see PerfOptions).
+	Perf     *PerfPass `json:"perf,omitempty"`
+	PerfRuns []PerfRun `json:"perf_runs,omitempty"`
+	Notes    []string  `json:"notes,omitempty"`
 	// DNF lists every reference row that did not finish. DNF rows do not
 	// change Status.
 	DNF      []string `json:"dnf,omitempty"`
@@ -600,6 +607,9 @@ func RunSuite(ctx context.Context, options Options) (*Results, error) {
 			r.options.IOCount = false
 		}
 	}
+	if err := r.startPerf(ctx); err != nil {
+		return nil, err
+	}
 	if err := r.probeBuffered(ctx); err != nil {
 		return nil, err
 	}
@@ -629,6 +639,9 @@ func RunSuite(ctx context.Context, options Options) (*Results, error) {
 				break
 			}
 		}
+	}
+	if err := r.finishPerf(); err != nil {
+		results.Notes = append(results.Notes, "perf pass: "+err.Error())
 	}
 	results.FinishedUTC = time.Now().UTC().Format(time.RFC3339)
 	results.Failures = r.failures
@@ -788,7 +801,7 @@ func validateOptions(options *Options) error {
 			return fmt.Errorf("binary %s is not a regular file", path)
 		}
 	}
-	return nil
+	return validatePerf(options)
 }
 
 // probeBuffered finds, from each writing op's own --help, the arguments that
@@ -1216,6 +1229,7 @@ func (r *runner) runConfig(ctx context.Context, config Config, dataset Dataset, 
 				}
 			}
 		}
+		r.perfPass(ctx, op, config, dataset, first, variants)
 		if r.options.EnginePerf != "" && !contains(r.options.Rows, ToolEngine) && config.Carrier == "" {
 			for _, workers := range r.options.Workers {
 				r.enginePerf(ctx, op, config, dataset, first.dataDir, first.canonical, first.stageRoot, workers)

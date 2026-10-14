@@ -255,6 +255,9 @@ func RenderReport(results *Results) string {
 	if results.DropCaches {
 		fmt.Fprintln(&b, "- Page cache dropped before every timed run (cold reads)")
 	}
+	if line := perfSummary(results.Perf); line != "" {
+		fmt.Fprintln(&b, line)
+	}
 	for _, target := range results.Targets {
 		name := target.Target
 		if name == "" {
@@ -374,6 +377,7 @@ func RenderReport(results *Results) string {
 			writeDNFDetail(&b, rows, group, configs[row.Config])
 			writeIdentityDetail(&b, results, row.Config, row.Op)
 			writeIOCounts(&b, results, row.Config, row.Op)
+			writePerfRuns(&b, results, row.Config, row.Op)
 			writeDiskWork(&b, rows, group)
 		}
 	}

@@ -210,6 +210,14 @@ ghz = 4.4
 record_cases = ["par2-generate-rar5-v7-volumes", "rar5-v7-solid-multivolume"]
 stat_repeats = 3
 record_frequency = 499
+# macro-par3 runs its own perf pass inside `par3 run`, untimed, after each
+# op's timed runs, on the plain sets and the first target: stat_repeats perf
+# stat runs of the reference and every rarpar row of these ops, each on a
+# fresh stage. Default on a linux-perf host: ["repair"]; [] turns it off.
+par3_ops = ["repair"]
+# One perf record -F record_frequency run of every rarpar row of these plain
+# sets, per op above, kept as perf script text and folded stacks. Default: none.
+par3_record_sets = ["a-gf16"]
 
 # macro-par3: the shipped rarpar CLI against the pinned par3cmdline reference
 # on generated data (no corpus). par3cmdline publishes no release and no Linux
