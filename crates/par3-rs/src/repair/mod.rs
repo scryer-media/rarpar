@@ -125,7 +125,7 @@ impl Default for RepairLimits {
 }
 
 /// How a repair should treat the files it replaces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct RepairOptions {
     /// Whether a damaged file is kept before its rebuilt copy takes its place.
@@ -153,15 +153,6 @@ impl RepairOptions {
     pub fn with_limits(mut self, limits: RepairLimits) -> Self {
         self.limits = limits;
         self
-    }
-}
-
-impl Default for RepairOptions {
-    fn default() -> Self {
-        Self {
-            backup: false,
-            limits: RepairLimits::default(),
-        }
     }
 }
 
