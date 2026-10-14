@@ -50,3 +50,48 @@ lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+[profile.test]
+debug = 0
+split-debuginfo = "off"
+incremental = false
+
+# Dev and test builds optimise only the crates that dominate test time. Each
+# comment gives the measured cost of leaving that crate at opt-level 0 with the
+# other overrides in place (local runs on an Apple M5 Max).
+
+# GF(2^8)/GF(2^16) kernels: fixture-tests 85 s instead of 26 s, par2-rs lib tests 12 s instead of 2.4 s.
+[profile.dev.package.reedsolomon-rs]
+opt-level = 3
+
+# par2-tests 20 s instead of 7 s.
+[profile.dev.package.par2-rs]
+opt-level = 3
+
+# par3-tests 15 s instead of 6 s. Optimise it only together with reedsolomon-rs: build.rs
+# enables the grouped GF(2^16) kernel at this crate's opt-level, and that kernel left
+# unoptimised in reedsolomon-rs overflows a pool worker's stack on aarch64.
+[profile.dev.package.par3-rs]
+opt-level = 3
+
+# PPMd decoding: unrar-rs tests 58 s instead of 24 s under nextest.
+[profile.dev.package.ppmd-turbo]
+opt-level = 3
+
+# PAR3 and corpus-manifest hashing: par3-tests 36 s instead of 6 s, test-corpus verify 9.1 s instead of 1 s.
+[profile.dev.package.blake3]
+opt-level = 3
+
+# Deflate in the rarpar CLI tests: par3_archive_zip 16 s instead of 8 s.
+[profile.dev.package.zlib-rs]
+opt-level = 3
+
+# LZMA in the rarpar CLI tests: xz_cli 3.3 s instead of 0.5 s.
+[profile.dev.package.lzma-turbo]
+opt-level = 3
+
+# RAR decoding: unrar-rs lib tests 18.5 s instead of 4.9 s. Its test binaries build optimised
+# too, in every unrar-tests shard (a cold unrar-rs test build is 587 CPU-s instead of 69);
+# the operator chose test speed over that compile cost.
+[profile.dev.package.unrar-rs]
+opt-level = 3
