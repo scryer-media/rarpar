@@ -37,6 +37,31 @@ A minor bump, as for 0.4.0 and 0.6.0: a command line that 0.6.x accepted
   par3-rs 0.6.1 shares delete access on its view of the carrier, so the
   rename succeeds as on other platforms.
 
+### Release workflow
+
+- Release binaries are now built with the workspace release profile (fat
+  LTO, one codegen unit, stripped symbols, abort on panic) on every
+  platform. The release job builds the crate as packaged for crates.io,
+  where the workspace profile does not apply, so the binaries of 0.2.1
+  through 0.6.2 were built with Cargo's default release profile instead:
+  the Linux and macOS binaries kept their symbol table, and a panic
+  unwound rather than aborting. The job now reads the profile from the
+  workspace `Cargo.toml`, passes it to the build, and fails if a Linux or
+  macOS binary still carries a symbol table.
+- Windows release binaries, and the Windows binaries CI tests, now reserve
+  the 8 MiB main-thread stack that `.cargo/config.toml` asks for. Both
+  workflows set `RUSTFLAGS`, which replaces the config's `rustflags`, so
+  the Windows binaries of 0.3.0 through 0.6.2 reserved the MSVC default of
+  1 MiB. The release job now checks the reserve in the built binary.
+- The release build runs as one job per OS (`build-linux`, `build-macos`,
+  `build-windows`), and CI's `platform-tests` and `target-checks` are split
+  the same way, so no job carries another OS's steps only to skip them.
+  The step bodies live in `.github/scripts/release/` and
+  `.github/scripts/ci/`. Check names (`build-<platform>`,
+  `platform-tests-<platform>`, `target-checks-<platform>`) and artifact
+  names are unchanged. This restructuring carries no version impact of
+  its own.
+
 ### Benchmark harness only
 
 - The bench harness (`bench/rarpar-bench`) gains a `fleet` PAR3 profile for

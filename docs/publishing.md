@@ -124,13 +124,20 @@ Verify repository metadata before the first publish.
   installs.
 - `.github/workflows/release.yml` builds eight release archives: GNU and musl
   Linux builds for both Linux architectures, Apple Silicon and Intel macOS,
-  and x86_64 and ARM64 Windows. Every build is CPU-only: GPU backends are
+  and x86_64 and ARM64 Windows, in one build job per OS (`build-linux`,
+  `build-macos`, `build-windows`) whose step bodies live in
+  `.github/scripts/release/`. Every build is CPU-only: GPU backends are
   disabled on all platforms. The musl archives also
   supply the GHCR image. The workflow validates this target-specific feature
   policy against the dependency graph and builds from `cargo package -p rarpar`
   output unpacked outside the
   workspace, so the binary resolves published `weaver-*` crates just as a
-  downstream consumer would. GNU direct builds upload package-root inspection
+  downstream consumer would. The workspace `[profile.release]` does not
+  reach a crate unpacked there, so the build passes it as `--config`
+  overrides read from `Cargo.toml` by
+  `.github/scripts/release/release_profile.py`, and the Linux and macOS
+  jobs fail if the binary still carries a symbol table. GNU direct builds
+  upload package-root inspection
   artifacts for future distro packages; GitHub Releases receive eight archives
   and `SHA256SUMS`.
 - The release workflow also publishes a CPU-only multi-architecture image to
@@ -151,7 +158,10 @@ Verify repository metadata before the first publish.
 Release builds intentionally avoid `target-cpu` and other CPU-specific compile
 flags so acceleration comes from runtime dispatch instead of host-specific
 artifact lanes. Linker and reproducibility flags, such as `mold`, `lld-link`,
-and `--remap-path-prefix`, are allowed. Every native artifact enables AWS-LC;
+and `--remap-path-prefix`, are allowed. The workflows set `RUSTFLAGS`, which
+replaces the `rustflags` in `.cargo/config.toml`, so the Windows lanes repeat
+its `link-arg=/STACK:8388608` and `build-windows` checks the reserve in the
+built binary. Every native artifact enables AWS-LC;
 the feature audit requires one resolved `aws-lc-sys` and blocks Metal and
 WGPU from every shipped `rarpar` artifact on every platform.
 
