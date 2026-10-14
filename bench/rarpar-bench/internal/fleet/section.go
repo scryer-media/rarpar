@@ -163,6 +163,16 @@ func (item *section) has(key string) bool {
 	return valueOK || tableOK || arrayOK
 }
 
+// removed reports a key an earlier schema accepted, saying what replaced it,
+// instead of the generic unknown-key error a typo gets.
+func (item *section) removed(key, why string) {
+	if !item.has(key) {
+		return
+	}
+	item.used[key] = true
+	item.state.fail("%s is no longer accepted: %s", item.label(key), why)
+}
+
 func (item *section) child(key string) *section {
 	if !item.present {
 		return newSection(item.state, newTomlTable("", 0), item.label(key), false)

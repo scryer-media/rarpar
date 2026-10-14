@@ -1286,8 +1286,10 @@ impl Par3RepairSession {
     /// Reconstruct damaged files into an explicitly selected output directory.
     /// A staged output is installed only after every protected extent matches
     /// its authenticated checksum (and, when it is read back, the whole-file
-    /// fingerprint too). Each staged output is synchronized before
-    /// installation; see [`Self::repair_with_durability`]. Sources are only
+    /// fingerprint too). Outputs are flushed but never synchronized to
+    /// storage; a caller that needs durability synchronizes the installed
+    /// paths in the report, and their parent directories if it wants the
+    /// installation itself to survive a crash. Sources are only
     /// read, except that on macOS and Linux, with `backup` off and no clone
     /// available, a damaged file whose destination is that very file (single
     /// link, handed over by its registry, read by nothing else in the repair)
@@ -1298,27 +1300,10 @@ impl Par3RepairSession {
         output: &Path,
         backup: bool,
     ) -> EngineResult<crate::session_repair::SessionRepairReport> {
-        self.repair_with_durability(
-            output,
-            backup,
-            crate::session_repair::RepairDurability::SyncFiles,
-        )
-    }
-
-    /// [`Self::repair`] with an explicit file synchronization policy. Under
-    /// [`crate::session_repair::RepairDurability::Buffered`] every output is
-    /// still verified before installation, but a crash after installation can
-    /// leave a partial file under its name; the host owns the barrier.
-    pub fn repair_with_durability(
-        &mut self,
-        output: &Path,
-        backup: bool,
-        durability: crate::session_repair::RepairDurability,
-    ) -> EngineResult<crate::session_repair::SessionRepairReport> {
         let _progress = self.options.stage(crate::runtime::Stage::Repair)?;
         // `assess` already counts its own refusals; only the repair's are added.
         self.assess()?;
-        let outcome = crate::session_repair::repair(self, output, backup, durability);
+        let outcome = crate::session_repair::repair(self, output, backup);
         if let Err(error) = &outcome {
             self.options.diagnostics.note_refusal(error);
         }

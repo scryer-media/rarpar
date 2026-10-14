@@ -74,6 +74,9 @@ func decodePowerShell(t *testing.T, line string) string {
 
 func TestWindowsPowerShellGolden(t *testing.T) {
 	config, machine := windowsExample(t)
+	// The golden also covers the crc-probe step, which runs only from a
+	// prebuilt bundle; the example's release machine does not list it.
+	machine.Suites = append([]string{SuiteCRCProbe}, machine.Suites...)
 	layout := windowsLayout(machine, "fleet-testrun")
 	checkGolden(t, "run.ps1", WindowsRunScript(machine, config.Fleet.Defaults, "fleet-testrun", layout,
 		map[string]string{"rar": `C:\bench\oracles\UnRAR.exe`, "par3": `C:\bench\fleet-stage\fleet-testrun\oracles\par3.exe`}))

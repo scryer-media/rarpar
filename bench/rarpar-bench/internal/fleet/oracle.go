@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -28,10 +27,21 @@ type OracleResolution struct {
 
 // ResolveOracles decides, per machine, where each oracle comes from.
 //
-// Standing rule: never build an oracle where an official binary exists. The
-// official-binary policy fetches a pinned release asset and verifies its digest;
-// source-build exists only for platforms with no official binary (linux-arm
-// unrar), uses an audited portable-flags recipe, and records why.
+// Standing rule: the benches use what the vendor provides. The official-binary
+// policy fetches a pinned release asset and verifies its digest. source-build
+// exists only where the vendor publishes no binary for the platform, records
+// why, and builds on the host itself at run start, never on the orchestrator
+// and never in a container:
+//   - unrar-portable-onhost, on Linux arm64 only: RARLAB's download page has
+//     no Linux arm64 UnRAR, and the only Linux ARM build on its extras page,
+//     unrar-5.5.0-arm.gz, is UnRAR 5.5.0 for 32-bit armhf (dynamically linked
+//     against /lib/ld-linux-armhf.so.3). The pinned source tarball ships in the
+//     bundle and `rarpar-bench fleet build-unrar` builds it with the audited
+//     portable recipe: stock makefile and CXXFLAGS, CXX=g++, a static link,
+//     and no -march/-mcpu/-mtune.
+//   - par3cmdline-onhost: par3cmdline publishes no release and no Linux
+//     binary; the tree ships only windows/par3.exe, which Windows hosts use
+//     as an official binary.
 func ResolveOracles(ctx context.Context, machine Machine, bundleDir, cacheDir string, layout RemoteLayout, allowFetch bool) (map[string]OracleResolution, error) {
 	resolutions := map[string]OracleResolution{}
 	for _, role := range sortedKeys(machine.Oracles) {
@@ -55,22 +65,20 @@ func ResolveOracles(ctx context.Context, machine Machine, bundleDir, cacheDir st
 			resolution.SHA256 = digest
 			resolution.Origin = "official release asset " + oracle.URL
 		case OracleSourceBuild:
-			if oracle.Recipe == RecipePAR3CmdlineHost {
-				// Built on the host by the run script itself; nothing ships but
-				// the toolchain lock that pins the source.
-				resolution = sourceBuildResolution(machine, role, oracle, layout)
-				break
+			// Built on the host by the run script itself. The UnRAR recipe
+			// ships its sha256-verified source tarball in the bundle; the
+			// par3cmdline one ships only the toolchain lock that pins its
+			// source.
+			if oracle.Recipe == RecipeUnrarHost {
+				archive, err := cachedDownload(ctx, oracle.URL, oracle.SHA256, cacheDir, allowFetch)
+				if err != nil {
+					return nil, fmt.Errorf("machine %s: oracle %s: %w", machine.Name, role, err)
+				}
+				if err := copyFileMode(archive, filepath.Join(bundleDir, unrarSourceName), 0o644); err != nil {
+					return nil, fmt.Errorf("machine %s: oracle %s: staging the UnRAR source: %w", machine.Name, role, err)
+				}
 			}
-			name := oracleBinaryName(machine, role, oracle)
-			local := filepath.Join(bundleDir, name)
-			digest, err := buildOracleFromSource(ctx, machine, oracle, cacheDir, local, allowFetch)
-			if err != nil {
-				return nil, fmt.Errorf("machine %s: oracle %s: %w", machine.Name, role, err)
-			}
-			resolution.RemotePath = hostJoin(machine, layout.Bin, name)
-			resolution.SHA256 = digest
-			resolution.Origin = "source build (" + oracle.Recipe + ") from " + oracle.URL
-			resolution.Note = oracle.Reason
+			resolution = sourceBuildResolution(machine, role, oracle, layout)
 		}
 		resolutions[role] = resolution
 	}
@@ -89,17 +97,20 @@ func oracleBinaryName(machine Machine, role string, oracle Oracle) string {
 }
 
 // sourceBuildResolution describes a source-built oracle without building it.
-// The par3cmdline-onhost recipe builds on the host during the run, at the path
-// `rarpar-bench par3 build-reference` produces.
+// Both recipes build on the host during the run, at the path their builder
+// produces: `rarpar-bench par3 build-reference` for par3cmdline-onhost,
+// `rarpar-bench fleet build-unrar` for unrar-portable-onhost.
 func sourceBuildResolution(machine Machine, role string, oracle Oracle, layout RemoteLayout) OracleResolution {
 	resolution := OracleResolution{Role: role, Policy: oracle.Policy, Note: oracle.Reason}
-	if oracle.Recipe == RecipePAR3CmdlineHost {
+	switch oracle.Recipe {
+	case RecipePAR3CmdlineHost:
 		resolution.RemotePath = hostJoin(machine, par3ReferenceDir(machine, layout), "build", "par3cmd", oracleBinaryName(machine, role, oracle))
 		resolution.Origin = "on-host source build (" + oracle.Recipe + ") of the config/toolchains.json par3_generator pin"
-		return resolution
+	case RecipeUnrarHost:
+		resolution.RemotePath = hostJoin(machine, unrarReferenceDir(machine, layout), unrarBinaryName)
+		resolution.SHA256 = oracle.BinarySHA256
+		resolution.Origin = "on-host audited portable source build (" + oracle.Recipe + ") of " + oracle.URL + ", source sha256 " + oracle.SHA256
 	}
-	resolution.RemotePath = hostJoin(machine, layout.Bin, oracleBinaryName(machine, role, oracle))
-	resolution.Origin = "audited portable source build (" + oracle.Recipe + ")"
 	return resolution
 }
 
@@ -264,82 +275,6 @@ func copyFileMode(source, destination string, mode os.FileMode) error {
 		return err
 	}
 	return out.Close()
-}
-
-// buildOracleFromSource implements the audited portable-flags recipe. The whole
-// point of the amendment that allows it is that the build adds no
-// -march/-mcpu/-mtune of its own: an oracle compiled for the host it runs on
-// would not be the oracle anyone else can reproduce.
-func buildOracleFromSource(ctx context.Context, machine Machine, oracle Oracle, cacheDir, destination string, allowFetch bool) (string, error) {
-	if oracle.Recipe != "unrar-portable" {
-		return "", fmt.Errorf("unknown oracle recipe %q", oracle.Recipe)
-	}
-	archive, err := cachedDownload(ctx, oracle.URL, oracle.SHA256, cacheDir, allowFetch)
-	if err != nil {
-		return "", err
-	}
-	work, err := os.MkdirTemp(cacheDir, "unrar-src-")
-	if err != nil {
-		return "", err
-	}
-	defer os.RemoveAll(work)
-	if err := extractTarTree(archive, work); err != nil {
-		return "", err
-	}
-	source := filepath.Join(work, "unrar")
-	if _, err := os.Stat(source); err != nil {
-		source = work
-	}
-	script := `#!/bin/sh
-set -eu
-apk add --no-cache build-base g++ make binutils >/dev/null 2>&1
-cd /work/src
-# Audit trail: the stock makefile must carry no target-cpu flag of its own.
-# Comments are stripped first: unrar 7.2.3's stock makefile explains in a
-# comment that upstream REMOVED -march=native, and matching that text made
-# the guard refuse a makefile that carries no flag at all.
-grep -vE '^[[:space:]]*#' makefile | grep -nE -- '-march|-mcpu|-mtune|native' && { echo "REFUSING: stock makefile carries a target-cpu flag"; exit 1; } || echo "flag audit: no -march/-mcpu/-mtune in the stock makefile (comments ignored)"
-make clean >/dev/null 2>&1 || true
-# Only CXX and a static link are set. Stock CXXFLAGS are used verbatim.
-make CXX=g++ LDFLAGS="-pthread -static"
-cp unrar /work/out/unrar
-cd /work/out && sha256sum unrar && file unrar
-`
-	container := filepath.Join(cacheDir, "unrar-build")
-	if err := os.RemoveAll(container); err != nil {
-		return "", err
-	}
-	if err := os.MkdirAll(filepath.Join(container, "out"), 0o755); err != nil {
-		return "", err
-	}
-	if err := copyTree(source, filepath.Join(container, "src")); err != nil {
-		return "", err
-	}
-	scriptPath := filepath.Join(container, "build.sh")
-	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
-		return "", err
-	}
-	image := machine.Bundle.Image
-	if image == "" {
-		image = "docker.io/library/rust:1.97-alpine"
-	}
-	command := exec.CommandContext(ctx, "docker", "run", "--rm", "-v", container+":/work", "-w", "/work", image, "sh", "/work/build.sh")
-	command.Stdout = os.Stderr
-	command.Stderr = os.Stderr
-	if err := command.Run(); err != nil {
-		return "", fmt.Errorf("portable source build failed: %w", err)
-	}
-	if err := copyFileMode(filepath.Join(container, "out", "unrar"), destination, 0o755); err != nil {
-		return "", err
-	}
-	digest, err := fileSHA256(destination)
-	if err != nil {
-		return "", err
-	}
-	if oracle.BinarySHA256 != "" && digest != oracle.BinarySHA256 {
-		return "", fmt.Errorf("source-built oracle sha256 %s does not match the recorded binary_sha256 %s", digest, oracle.BinarySHA256)
-	}
-	return digest, nil
 }
 
 func extractTarTree(archive, destination string) error {

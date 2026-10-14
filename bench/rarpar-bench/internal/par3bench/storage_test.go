@@ -216,7 +216,11 @@ func TestVerifyDamagedStageLinksTheSharedDamagedInputs(t *testing.T) {
 }
 
 func TestEngineBufferedRowsDoNotNeedTheCLIFlag(t *testing.T) {
-	r := &runner{results: &Results{BufferedArgs: map[string][]string{}}}
+	// An old candidate: durable by default, no --buffered on repair.
+	r := &runner{results: &Results{
+		DefaultDurability: map[string]string{OpRepair: DurabilityDurable},
+		DurabilityArgs:    map[string]map[string][]string{OpRepair: {DurabilityDurable: {}}},
+	}}
 	engine := Variant{Name: "engine-w8-buffered", Tool: ToolEngine, Workers: 8, Durability: DurabilityBuffered}
 	cli := Variant{Name: "rarpar-w8-buffered", Tool: ToolCandidate, Workers: 8, Durability: DurabilityBuffered}
 	if !r.runsOp(engine, OpRepair) {
@@ -224,6 +228,9 @@ func TestEngineBufferedRowsDoNotNeedTheCLIFlag(t *testing.T) {
 	}
 	if r.runsOp(cli, OpRepair) {
 		t.Error("CLI buffered repair row kept without a --buffered flag")
+	}
+	if !r.runsOp(Variant{Name: "rarpar-w8", Tool: ToolCandidate, Workers: 8}, OpRepair) {
+		t.Error("CLI durable repair row dropped on a durable-by-default candidate")
 	}
 	if r.runsOp(engine, OpVerify) {
 		t.Error("buffered row for a read-only op")

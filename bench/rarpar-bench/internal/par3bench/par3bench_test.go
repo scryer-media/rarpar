@@ -366,7 +366,7 @@ func TestReportShowsMediansRangesAndRatios(t *testing.T) {
 	report := RenderReport(results)
 	for _, want := range []string{
 		"| reference | none (never syncs) | 2.000 [1.000–3.000] |",
-		"| rarpar-w1 | durable (default) | 1.000 [0.500–1.500] |",
+		"| rarpar-w1 | durable | 1.000 [0.500–1.500] |",
 		"| 2.000 | 2.000 | 1.000 |",
 		"payloads-only",
 		"f.bin.1",
@@ -416,7 +416,7 @@ func TestReportShowsDurabilityRowsAndReferenceDNF(t *testing.T) {
 	for _, want := range []string{
 		"| variant | durability | wall s |",
 		"| reference | none (never syncs) | 4.000 [4.000–4.000] |",
-		"| rarpar-w1 | durable (default) | 2.000 [2.000–2.000] | 2.000 [2.000–2.000] | 10 [10–10] | 2.000 | 2.000 | 1.000 |",
+		"| rarpar-w1 | durable | 2.000 [2.000–2.000] | 2.000 [2.000–2.000] | 10 [10–10] | 2.000 | 2.000 | 1.000 |",
 		"| rarpar-w1-buffered | buffered | 1.000 [1.000–1.000] | 1.000 [1.000–1.000] | 10 [10–10] | 4.000 | 4.000 | 1.000 |",
 		"| rarpar-w1 | 1.000 [1.000–1.000] |", // verify: no durability column
 		"| reference | none (never syncs) | DNF | - | - | - | - | - |",
@@ -432,7 +432,7 @@ func TestReportShowsDurabilityRowsAndReferenceDNF(t *testing.T) {
 		}
 	}
 	// Ours against a DNF reference has no ratio.
-	if !strings.Contains(report, "| rarpar-w1 | durable (default) | 3.000 [3.000–3.000] | 3.000 [3.000–3.000] | 10 [10–10] | - | - | - |") {
+	if !strings.Contains(report, "| rarpar-w1 | durable | 3.000 [3.000–3.000] | 3.000 [3.000–3.000] | 10 [10–10] | - | - | - |") {
 		t.Fatalf("a rarpar row against a DNF reference must show no ratio:\n%s", report)
 	}
 	// Within the configuration's table, not the peak RSS summary above it.
@@ -524,6 +524,87 @@ func TestHelpListsFlagMatchesWholeTokens(t *testing.T) {
 		if got := helpListsFlag(help, "--buffered"); got != want {
 			t.Errorf("%q: got %t, want %t", help, got, want)
 		}
+	}
+	for help, want := range map[string]bool{
+		"      --fsync  After a successful run, fsync every file installed": true,
+		"      --fsync-dirs  something else":                                false,
+	} {
+		if got := helpListsFlag(help, "--fsync"); got != want {
+			t.Errorf("%q: got %t, want %t", help, got, want)
+		}
+	}
+}
+
+func TestClassifyDurabilityHelpFollowsTheCandidateGeneration(t *testing.T) {
+	// rarpar 0.7.0+: buffered by default, --fsync selects durable.
+	mode, args := classifyDurabilityHelp("Usage: rarpar par3 repair [OPTIONS] <SET>\n      --fsync  After a successful repair, fsync every file installed\n")
+	if mode != DurabilityBuffered || len(args[DurabilityBuffered]) != 0 || strings.Join(args[DurabilityDurable], " ") != "--fsync" {
+		t.Errorf("0.7.0 help: mode %q args %v", mode, args)
+	}
+	if _, ok := args[DurabilityBuffered]; !ok {
+		t.Error("0.7.0 help: buffered mode must be selectable with no arguments")
+	}
+	// rarpar up to 0.6.2: durable by default, --buffered selects buffered.
+	mode, args = classifyDurabilityHelp("Usage: rarpar par3 create [OPTIONS]\n      --buffered  Flush buffers without requesting durable storage barriers\n")
+	if mode != DurabilityDurable || len(args[DurabilityDurable]) != 0 || strings.Join(args[DurabilityBuffered], " ") != "--buffered" {
+		t.Errorf("0.6.2 help: mode %q args %v", mode, args)
+	}
+	// Neither flag: durable only.
+	mode, args = classifyDurabilityHelp("Usage: rarpar par3 repair [OPTIONS] <SET>\n")
+	if mode != DurabilityDurable || len(args) != 1 {
+		t.Errorf("flagless help: mode %q args %v", mode, args)
+	}
+	if _, ok := args[DurabilityBuffered]; ok {
+		t.Error("flagless help: buffered must not be selectable")
+	}
+}
+
+func TestRunsOpOnABufferedByDefaultCandidate(t *testing.T) {
+	r := &runner{results: &Results{
+		DefaultDurability: map[string]string{OpCreate: DurabilityBuffered, OpRepair: DurabilityBuffered},
+		DurabilityArgs: map[string]map[string][]string{
+			OpCreate: {DurabilityBuffered: {}, DurabilityDurable: {"--fsync"}},
+			OpRepair: {DurabilityBuffered: {}, DurabilityDurable: {"--fsync"}},
+		},
+	}}
+	durable := Variant{Name: "rarpar-w4", Tool: ToolCandidate, Workers: 4}
+	buffered := Variant{Name: "rarpar-w4-buffered", Tool: ToolCandidate, Workers: 4, Durability: DurabilityBuffered}
+	if !r.runsOp(durable, OpRepair) || !r.runsOp(buffered, OpRepair) {
+		t.Error("both CLI rows must run when both modes are selectable")
+	}
+	if got := strings.Join(r.durabilityArgs(OpRepair, durable), " "); got != "--fsync" {
+		t.Errorf("durable row args = %q, want --fsync", got)
+	}
+	if got := r.durabilityArgs(OpRepair, buffered); len(got) != 0 {
+		t.Errorf("buffered row args = %v, want none", got)
+	}
+	if r.durabilityArgs(OpVerify, durable) != nil {
+		t.Error("a read-only op takes no durability argument")
+	}
+	// The probe only covers create and repair; rows for the other ops, and
+	// the reference everywhere, must not be dropped for lacking an entry.
+	reference := Variant{Name: "reference", Tool: ToolReference}
+	for _, op := range []string{OpCreate, OpVerify, OpVerifyDamaged, OpRepair} {
+		if !r.runsOp(reference, op) {
+			t.Errorf("reference row missing for %s", op)
+		}
+		if !r.runsOp(durable, op) {
+			t.Errorf("rarpar-w4 row missing for %s", op)
+		}
+	}
+	if r.runsOp(buffered, OpVerify) || r.runsOp(buffered, OpVerifyDamaged) {
+		t.Error("buffered rows exist only for writing ops")
+	}
+	engineDurable := Variant{Name: "engine-w4", Tool: ToolEngine, Workers: 4}
+	engineBuffered := Variant{Name: "engine-w4-buffered", Tool: ToolEngine, Workers: 4, Durability: DurabilityBuffered}
+	if r.runsOp(engineDurable, OpRepair) || !r.runsOp(engineBuffered, OpRepair) {
+		t.Error("an engine without a durability switch runs only its buffered writing rows")
+	}
+	if !r.runsOp(engineDurable, OpVerify) {
+		t.Error("engine read-only rows are unaffected")
+	}
+	if got := r.enginePerfDurabilities(OpCreate); len(got) != 1 || got[0] != DurabilityBuffered {
+		t.Errorf("engine_perf create modes = %v, want buffered only", got)
 	}
 }
 

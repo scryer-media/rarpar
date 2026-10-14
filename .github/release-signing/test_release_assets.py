@@ -2,10 +2,12 @@
 
 import copy
 import json
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -17,6 +19,8 @@ TAG = "rarpar-v1.2.3"
 REPO = "scryer-media/rarpar"
 COMMIT = "a" * 40
 ROOT = Path(__file__).resolve().parents[2]
+RELEASE_SCRIPTS = ROOT / ".github/scripts/release"
+BUILD_JOBS = {"build-linux": "linux-", "build-macos": "darwin-", "build-windows": "windows-"}
 
 
 class AssetsTests(unittest.TestCase):
@@ -286,9 +290,11 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn(forbidden, workflow)
         jobs = dict(re.findall(r"^  ([a-z-]+):\n(.*?)(?=^  [a-z-]+:\n|\Z)",
                                workflow.split("jobs:\n", 1)[1], re.M | re.S))
-        self.assertEqual(set(jobs), {"release-trust", "preflight", "build", "collect", "archive-provenance", "deploy"})
-        for job, needs in {"preflight": "release-trust", "build": "release-trust, preflight",
-                           "collect": "build", "archive-provenance": "collect",
+        self.assertEqual(set(jobs), {"release-trust", "preflight", *BUILD_JOBS, "collect",
+                                     "archive-provenance", "deploy"})
+        for job, needs in {"preflight": "release-trust",
+                           **dict.fromkeys(BUILD_JOBS, "release-trust, preflight"),
+                           "collect": ", ".join(BUILD_JOBS), "archive-provenance": "collect",
                            "deploy": "collect, archive-provenance"}.items():
             self.assertIn(f"    needs: [{needs}]", jobs[job])
             self.assertNotRegex(jobs[job], re.compile(r"^    if:", re.M))
@@ -299,7 +305,55 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("steps.finalize.outputs.published == 'true'", jobs["deploy"])
         self.assertIn("commit -S", jobs["deploy"])
         self.assertIn("verify-commit HEAD", jobs["deploy"])
-        self.assertEqual(sorted(re.findall(r"- platform: (\S+)", jobs["build"])), sorted(release.PLATFORMS))
+        platforms = []
+        for job, prefix in BUILD_JOBS.items():
+            # One build job per operating system: its rows are that system's,
+            # and nothing in it asks which system it runs on.
+            rows = re.findall(r"- platform: (\S+)", jobs[job])
+            self.assertTrue(rows and all(row.startswith(prefix) for row in rows), (job, rows))
+            for marker in ("runner.os", "RUNNER_OS"):
+                self.assertNotIn(marker, jobs[job])
+            platforms += rows
+        self.assertEqual(sorted(platforms), sorted(release.PLATFORMS))
+
+    def test_release_scripts_exist(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        scripts = sorted(set(re.findall(r"\.github/scripts/release/[\w.-]+", workflow)))
+        self.assertTrue(scripts)
+        for script in scripts:
+            self.assertTrue((ROOT / script).is_file(), script)
+            if script.endswith(".sh"):
+                # The build jobs run these by path.
+                self.assertTrue(os.access(ROOT / script, os.X_OK), f"{script} is not executable")
+
+    def run_release_profile(self, manifest):
+        return subprocess.run([sys.executable, "-B", str(RELEASE_SCRIPTS / "release_profile.py"), str(manifest)],
+                              capture_output=True, text=True)
+
+    def test_release_profile_reaches_the_build(self):
+        result = self.run_release_profile(ROOT / "Cargo.toml")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        settings = result.stdout.splitlines()
+        for setting in settings:
+            self.assertRegex(setting, r"^profile\.release\.[a-z-]+=(?:'[^']*'|true|false|[+-]?\d+)$")
+        # The symbol-table checks in build-linux and build-macos assume it.
+        self.assertIn("profile.release.strip=true", settings)
+
+    def test_release_profile_refuses_what_it_cannot_pass(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manifest = Path(temp) / "Cargo.toml"
+            manifest.write_text('[workspace]\n\n[profile.release] # shipped\nlto = "fat"\ndebug = 0\n')
+            result = self.run_release_profile(manifest)
+            self.assertEqual(result.stdout.splitlines(), ["profile.release.lto='fat'", "profile.release.debug=0"])
+            for body in ('[profile.release]\nlto = "fat"\n[profile.release.package.foo]\nopt-level = 1\n',
+                         '[profile]\nrelease.lto = "fat"\n',
+                         'profile.release.lto = "fat"\n',
+                         '[profile.release]\nlto = ["fat"]\n',
+                         '[workspace]\nmembers = []\n'):
+                manifest.write_text(body)
+                result = self.run_release_profile(manifest)
+                self.assertNotEqual(result.returncode, 0, body)
+                self.assertEqual(result.stdout, "", body)
 
 
 if __name__ == "__main__":

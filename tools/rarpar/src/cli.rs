@@ -333,7 +333,7 @@ pub enum Par3Command {
     /// Verify protected files and report per-cohort recovery requirements.
     Verify(Par3Args),
     /// Rebuild damaged files in the working directory, keeping numbered backups.
-    Repair(Par3Args),
+    Repair(Par3RepairArgs),
     /// Write a 7z archive and protect it with PAR3 in the same pass.
     #[cfg(feature = "sevenz")]
     #[command(long_about = "\
@@ -423,9 +423,9 @@ pub struct Par3InsideInsertArgs {
     /// Scratch directory for recovery encoding; defaults to the output directory.
     #[arg(long)]
     pub scratch_dir: Option<PathBuf>,
-    /// Flush buffers without requesting durable storage barriers.
+    /// After a successful run, fsync every archive written (not their directories).
     #[arg(long)]
-    pub buffered: bool,
+    pub fsync: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -448,6 +448,9 @@ pub struct Par3InsideRepairArgs {
     /// Scratch directory for staging; defaults to the output directory.
     #[arg(long)]
     pub scratch_dir: Option<PathBuf>,
+    /// After a successful run, fsync every volume written (not their directories).
+    #[arg(long)]
+    pub fsync: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -465,6 +468,9 @@ pub struct Par3InsideRemoveArgs {
     /// Replace each archive with its stripped original.
     #[arg(long, conflicts_with = "output_dir")]
     pub in_place: bool,
+    /// After a successful run, fsync every archive written (not their directories).
+    #[arg(long)]
+    pub fsync: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -479,6 +485,15 @@ pub struct Par3Args {
     /// Replace damaged files without keeping numbered backups.
     #[arg(long)]
     pub no_backup: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct Par3RepairArgs {
+    #[command(flatten)]
+    pub set: Par3Args,
+    /// After a successful repair, fsync every file installed (not their directories).
+    #[arg(long)]
+    pub fsync: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -529,9 +544,9 @@ pub struct Par3CreateArgs {
     /// Scratch directory for recovery encoding; defaults to the output directory.
     #[arg(long)]
     pub scratch_dir: Option<PathBuf>,
-    /// Flush buffers without requesting durable storage barriers.
+    /// After a successful run, fsync every PAR3 file written (not their directories).
     #[arg(long)]
-    pub buffered: bool,
+    pub fsync: bool,
 }
 
 #[cfg(feature = "sevenz")]

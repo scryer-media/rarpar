@@ -399,8 +399,8 @@ named by more than one extent is fetched again for, so each copy can be compared
 with the bytes already assembled. Every write is one relaxed atomic operation
 per event and every read allocates nothing, so a host may sample these at
 work-unit handback from another thread.
-`file_sync()` measures file synchronization attempts, successes, and storage
-wait time; this time is already included in enclosing operation stages.
+The engine issues no storage barriers, so there is no synchronization counter;
+a host that synchronizes outputs measures that itself.
 Read requests include short reads and failures; byte counts measure successful
 transfers. Disk source reads appear at both the provider and file layers, so do
 not sum those layers. Lazy payload reads retain their scanner's diagnostics;

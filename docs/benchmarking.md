@@ -159,6 +159,23 @@ inventory only names its local path. SSH uses batch mode, supports optional
 per-host ports and additional OpenSSH options, and leaves host-key verification
 under the operator's normal SSH policy.
 
+### Fleet rounds
+
+`rarpar-bench fleet` runs a whole cross-machine round from one command; see
+[fleet.md](fleet.md). Its candidate is the published release. Each machine's
+`[machines.bundle]` names a release tag (`source = "release"`, the default),
+and the orchestrator downloads that platform's asset and the release's
+`SHA256SUMS` from GitHub, refuses an asset whose sha256 does not match, and
+stages the unpacked `rarpar` (`rarpar.exe` on Windows) exactly as published.
+This happens before any credential check, host probe or launch. Nothing is
+built from source or run in a container; only the pure-Go harness is
+cross-compiled for the host. `fleet plan --stage` runs the same download,
+verification and staging as a dry check without contacting a host.
+`source = "prebuilt"` stages a local bundle directory instead. It is for
+early dev spot tests, never a measured round. See
+[fleet.md](fleet.md#candidates-the-published-release) for the asset names, the
+checks and what a release bundle cannot run.
+
 ## PAR3 Suite
 
 `rarpar-bench par3` compares the shipped `rarpar` CLI with the pinned
@@ -168,7 +185,9 @@ If you pass `--engine-perf PATH`, it also runs the `par3-rs` `engine_perf`
 example once per set and durability as an untimed stage breakdown, selecting
 the durability with `PAR3_BENCH_CREATE_DURABILITY` and
 `PAR3_BENCH_REPAIR_DURABILITY` (`durable` or `buffered`; older builds ignore
-the repair variable). Nothing from that pass goes into the timing tables.
+the repair variable). From par3-rs 0.6.0 the engine issues no storage barrier
+and ignores both variables, so its durable and buffered passes are the same
+work. Nothing from that pass goes into the timing tables.
 
 ```sh
 cd bench/rarpar-bench
@@ -267,19 +286,24 @@ NAME:VAR=value[,VAR=value]` adds a `rarpar` row with extra environment
 variables. The env-gated kernel pins on main are currently no-ops for PAR3;
 the flag is plumbing for when they exist.
 
-Every `rarpar` create and repair row runs twice: once durable, which is the
-default (no flag, one fsync per output), and once buffered (`--buffered`, no
-fsync). The durable row is listed first and labelled `durable (default)`; the
-buffered row is named `rarpar-wN-buffered`. Both carry ratios against the
-single reference row, whose durability column reads `none (never syncs)`.
-Verify rows write nothing and run once. `--durability durable` drops the
-buffered rows; durable is always required. The suite probes
-`rarpar par3 <op> --help` for `--buffered` as a whole token. When the help
-prints but lacks it, which is the case for `par3 repair` today, the suite skips
-that op's buffered row and says so in the report notes. When the help itself
-fails (a timeout, a non-zero exit, a start failure, or a quarantine), the run
-stops with that error rather than guessing. `par3 matrix --profile full` prints
-the rows per op.
+Every `rarpar` create and repair row runs twice: once durable (one fsync per
+output) and once buffered (no fsync). Which of the two a plain
+`rarpar par3 <op>` gives depends on the candidate, so the suite probes
+`rarpar par3 <op> --help` once per op, for `--fsync` and `--buffered` as whole
+tokens. A help that lists `--fsync` (rarpar 0.7.0 and later) means the plain
+command is buffered and `--fsync` selects durable; one that lists `--buffered`
+(0.6.x and earlier) means the plain command is durable and `--buffered`
+selects buffered; one that lists neither, which is the case for `par3 repair`
+before 0.7.0, runs only the durable row and says so in the report notes. The
+durable row is listed first and labelled `durable`; the buffered row is named
+`rarpar-wN-buffered`. Both carry ratios against the single reference row,
+whose durability column reads `none (never syncs)`, and the report's summary
+states per op which mode the plain command gave and which switch selected the
+other. Verify rows write nothing and run once. `--durability durable` drops
+the buffered rows; durable is always required. When the help itself fails (a
+timeout, a non-zero exit, a start failure, or a quarantine), the run stops
+with that error rather than guessing. `par3 matrix --profile full` prints the
+rows per op.
 
 Each variant gets the warmups, then the measured repeats, and the variant order
 alternates on every repeat. Each table cell is the median with the range,
@@ -346,8 +370,8 @@ bytes) and `harness-missing-rss`.
 
 Verify and repair need a canonical recovery set, normally written by an untimed
 reference create. If that create is DNF (one of the classes above; any other
-failure stops the set), `rarpar` (durable, most workers) writes
-the canonical set instead, the reference still verifies and repairs it, the
+failure stops the set), `rarpar` (durable, using whichever switch the probe
+found selects it, most workers) writes the canonical set instead, the reference still verifies and repairs it, the
 identity verdicts are skipped, and the report says where the set came from.
 
 ### Identity verdicts

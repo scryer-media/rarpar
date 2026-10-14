@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.6.1
+
+- On Windows, the immutable view `DiskSourceAccess::pin` opens for a packet
+  carrier shares delete access (`FILE_SHARE_READ | FILE_SHARE_DELETE`)
+  instead of read access alone. Writers are still refused for the view's
+  lifetime, and a rename or delete leaves the bytes the view reads unchanged;
+  what this allows is moving or replacing the carrier while a session that
+  scanned it is alive. Before, PAR-inside self-repair of a damaged ZIP
+  carrier through `rarpar rs` failed with a sharing violation (os error 32)
+  at the rename of the damaged carrier to `.1`, because the session's own
+  view of the carrier held it. Other platforms were not affected.
+
+## 0.6.0
+
+Breaking: par3-rs no longer issues storage barriers. Buffered output is the
+only mode.
+
+- No creation, insertion, carrier-reconstruction or repair path calls
+  `sync_all`, `sync_data` or any other fsync any more. Every output is still
+  flushed from application buffers and authenticated before it is installed,
+  but acknowledged output can be lost after a crash. A caller that needs
+  durability syncs the output paths a call returns (and their parent
+  directories, if it wants the installation renames to survive a crash)
+  after the call. This reverses the 0.4.x default of one sync per staged
+  output before installation, including the sync of a destination-local copy
+  on a cross-filesystem repair install and of the staged output in
+  PAR-inside insertion, self-repair and removal.
+- Removed: `creation::CreationDurability`, `CreationPlan::execute_with_durability`,
+  `inside::InsertionPlan::execute_with_durability`,
+  `session_repair::RepairDurability` and
+  `Par3RepairSession::repair_with_durability`. `CreationPlan::execute`,
+  `InsertionPlan::execute` and `Par3RepairSession::repair` are the only
+  entries and behave as the removed `Buffered` policy did.
+- Removed the `durability` argument of `inside::rar5::insert_set` and of the
+  experimental `inside::rar4::insert_set`.
+- Removed `runtime::ExecutionDiagnostics::file_sync`, which counted the
+  barriers; with none issued it had nothing to count. The `engine_perf`
+  example drops `PAR3_BENCH_CREATE_DURABILITY`,
+  `PAR3_BENCH_REPAIR_DURABILITY`, its `Sync` stage line and its
+  `file_syncs` field.
+
 ## 0.5.2
 
 - **Experimental**, outside the supported scope and absent from the README and

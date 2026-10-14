@@ -308,8 +308,13 @@ as `par3 archive` lays out its sibling sets; verify it against the saved file.
 Use `--dry-run --json par3 create ...` to obtain output paths, sizes, block counts,
 and scratch requirements without writing. Existing carriers require `--overwrite`;
 creation stages and authenticates every output before installation and refuses
-to overwrite an input. Files are synchronized by default; `--buffered` opts out
-of storage barriers. Installation is per file, not atomic for the entire set.
+to overwrite an input. par3-rs flushes every file it writes but never fsyncs,
+so by default `par3 create`, `par3 repair` and `par3 inside` issue no storage
+barrier. `--fsync` on `par3 create`, `par3 repair`, and
+`par3 inside insert|repair|remove` opts in:
+once the run has succeeded, each file it wrote is opened and synced (parent
+directories are not), and the JSON report records `"fsync": true`.
+Installation is per file, not atomic for the entire set.
 An overwrite that would leave obsolete authenticated carriers is rejected before
 writing. Move the old set aside or choose a new output directory when changing
 volume layouts.

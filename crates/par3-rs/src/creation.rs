@@ -64,20 +64,6 @@ pub enum VolumeLayout {
     SizeLimited(u64),
 }
 
-/// File synchronization policy for standalone creation.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum CreationDurability {
-    /// Preserve the default: synchronize each staged carrier file once before
-    /// installation. Scratch files are never synchronized. This does not
-    /// synchronize parent directories or promise atomic installation of the
-    /// complete set across a crash.
-    #[default]
-    SyncFiles,
-    /// Flush application buffers without requesting durable storage barriers.
-    /// Authentication still runs, but a crash can lose acknowledged output.
-    Buffered,
-}
-
 /// Advanced creation options. Recovery indices are global across cohorts.
 #[derive(Clone, Debug)]
 pub struct CreationOptions {
@@ -1084,19 +1070,12 @@ impl CreationPlan {
     /// Execute into explicit local output and scratch directories. Existing
     /// destinations are never replaced. Every carrier is staged and authenticated
     /// before installation; scratch storage is removed after success.
+    ///
+    /// Outputs are flushed from application buffers but never synchronized
+    /// to storage: no storage barrier is issued. A caller that
+    /// needs durability synchronizes the returned paths, and their parent
+    /// directories if it wants the installation itself to survive a crash.
     pub fn execute(&self, stem: &Path, scratch_directory: &Path) -> EngineResult<Vec<PathBuf>> {
-        self.execute_with_durability(stem, scratch_directory, CreationDurability::SyncFiles)
-    }
-
-    /// Execute with an explicit file synchronization policy. Both policies flush
-    /// application buffers and authenticate staged carriers before installation.
-    /// This does not change verification or repair behavior.
-    pub fn execute_with_durability(
-        &self,
-        stem: &Path,
-        scratch_directory: &Path,
-        durability: CreationDurability,
-    ) -> EngineResult<Vec<PathBuf>> {
         let mut progress = self
             .options
             .execution
@@ -1143,7 +1122,7 @@ impl CreationPlan {
             }
         }
         let mut spool = self.encode_sources(scratch_directory)?;
-        // The spool is scratch this process reads back and deletes; no policy
+        // The spool is scratch this process reads back and deletes; nothing
         // makes it durable.
         let mut staged = Vec::new();
         for (number, destination) in destinations.iter().enumerate() {
@@ -1179,9 +1158,6 @@ impl CreationPlan {
             // The temporary was created empty and written from its start, so
             // the bytes counted are its length.
             out.finish(self.requirements.output_sizes[number])?;
-            if durability == CreationDurability::SyncFiles {
-                out.get_ref().sync_all()?;
-            }
             drop(out);
             drop(_output_buffer);
             staged.push(temporary);

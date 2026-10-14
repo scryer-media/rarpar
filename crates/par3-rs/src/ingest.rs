@@ -735,6 +735,7 @@ impl<'k, W: std::io::Write> AuthenticatingWriter<'k, W> {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn get_ref(&self) -> &W {
         &self.inner
     }

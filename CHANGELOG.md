@@ -3,7 +3,75 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
-## Unreleased
+## rarpar 0.7.0
+
+A minor bump, as for 0.4.0 and 0.6.0: a command line that 0.6.x accepted
+(`--buffered`) is now a usage error, and a JSON field is gone.
+
+### Changed
+
+- On par3-rs 0.6.0, which issues no storage barriers, `par3 create`,
+  `par3 repair` and `par3 inside insert|repair|remove` no longer fsync what
+  they write by default. Outputs are still flushed and authenticated before
+  installation, but a crash can lose them. `par3 create -` from standard
+  input follows the same default.
+- `par3 create --buffered` and `par3 inside insert --buffered` are removed;
+  buffered output is the default, and passing `--buffered` is a usage error
+  (exit 2). The `"buffered"` field of the `par3 create` JSON report is gone.
+
+### Added
+
+- `--fsync` on `par3 create`, `par3 repair` and
+  `par3 inside insert|repair|remove`: once the run has succeeded, every file
+  it wrote (the installed carriers, repaired files or archive volumes) is
+  opened and synced. Parent directories are not synced. These reports carry
+  `"fsync": true|false`. `auto` mode repair has no `--fsync` and does not
+  sync.
+
+### Fixed
+
+- On Windows, `rarpar rs` of a damaged ZIP that carries its own PAR3
+  packets (PAR-inside self-repair) failed with "The process cannot access
+  the file because it is being used by another process" when it moved the
+  damaged carrier to `.1`, and left the rebuilt `par3_<id>_0.tmp` beside it.
+  par3-rs 0.6.1 shares delete access on its view of the carrier, so the
+  rename succeeds as on other platforms.
+
+### Release workflow
+
+- Release binaries are now built with the workspace release profile (fat
+  LTO, one codegen unit, stripped symbols, abort on panic) on every
+  platform. The release job builds the crate as packaged for crates.io,
+  where the workspace profile does not apply, so the binaries of 0.2.1
+  through 0.6.2 were built with Cargo's default release profile instead:
+  the Linux and macOS binaries kept their symbol table, and a panic
+  unwound rather than aborting. The job now reads the profile from the
+  workspace `Cargo.toml`, passes it to the build, and fails if a Linux or
+  macOS binary still carries a symbol table.
+- Windows release binaries, and the Windows binaries CI tests, now reserve
+  the 8 MiB main-thread stack that `.cargo/config.toml` asks for. Both
+  workflows set `RUSTFLAGS`, which replaces the config's `rustflags`, so
+  the Windows binaries of 0.3.0 through 0.6.2 reserved the MSVC default of
+  1 MiB. The release job now checks the reserve in the built binary.
+- The release build runs as one job per OS (`build-linux`, `build-macos`,
+  `build-windows`), and CI's `platform-tests` and `target-checks` are split
+  the same way, so no job carries another OS's steps only to skip them.
+  The step bodies live in `.github/scripts/release/` and
+  `.github/scripts/ci/`. Check names (`build-<platform>`,
+  `platform-tests-<platform>`, `target-checks-<platform>`) and artifact
+  names are unchanged. This restructuring carries no version impact of
+  its own.
+
+### Test builds
+
+- The workspace test profile drops debuginfo, split-debuginfo and incremental
+  compilation, and dev/test builds optimise only the crates that dominate test
+  time (reedsolomon-rs, par2-rs, par3-rs, ppmd-turbo, blake3, zlib-rs,
+  lzma-turbo at opt-level 3; debug assertions and overflow checks
+  stay on). Measured locally, the test phase of every lane falls 3x to 20x
+  (platform lane 107 s to 32 s, par3-rs 83 s to 12 s, reedsolomon-rs 86 s to
+  5 s); test binaries at opt-level 3 cost more to compile, and sccache cannot
+  cache them. No version impact: only the root dev and test profiles change.
 
 ### Benchmark harness only
 
@@ -11,8 +79,37 @@ documented in each crate's own changelog so those notes ship with the crate.
   the `macro-par3` fleet suite: Cauchy and FFT pairs at the small and medium
   shapes, Set A, the over-PAR2-cap Set C FFT shape, and PAR-inside repair of
   a ZIP. `par3 render` draws the PAR3 SVGs, and the fleet collector now
-  renders them per platform. Version impact: none. No publishable crate, crate
-  feature or `rarpar` CLI behaviour changes, so no version is bumped.
+  renders them per platform. These harness changes carry no
+  version impact of their own.
+- The harness probes each candidate's `par3 create|repair --help` for
+  `--fsync` or `--buffered` to learn which durability a plain command gives
+  and which switch selects the other, so durable rows against rarpar 0.7.0
+  run with `--fsync` and rows are labelled by the mode that ran.
+- `rarpar-bench fleet` benchmarks the published rarpar release, run natively
+  on each host. `[machines.bundle] source = "release"` (the default) with a
+  `tag` or `version` downloads each host platform's release asset and the
+  release's `SHA256SUMS` from GitHub, refuses an asset whose sha256 does not
+  match, and stages the unpacked `rarpar` (`rarpar.exe` from the Windows zip),
+  all before any credential check, host probe or launch; the asset, its digest
+  and the release are recorded in the run state and `BUILDINFO.json`.
+  `fleet plan --stage` runs that download, verification and staging as a dry
+  check that contacts no host. The container build is gone:
+  `bundle.source = "docker"`, the `image`, `build_host`, `rust_target` and
+  `crt_static` bundle keys, `[fleet] docker` and `capabilities.docker` are
+  config errors, and `prebuilt` remains for dev spot tests. No version impact
+  of its own.
+- The fleet builds no oracle on the orchestrator and runs nothing in a
+  container. RARLAB publishes no Linux arm64 UnRAR, so a Linux arm64 host
+  builds its `rar` oracle itself at run start with the new
+  `unrar-portable-onhost` recipe. The orchestrator ships the sha256-pinned
+  `unrarsrc` tarball, and `rarpar-bench fleet build-unrar` checks it again,
+  refuses a makefile that carries `-march`, `-mcpu` or `-mtune`, runs the
+  stock makefile with only `CXX=g++` and a static link and with the flag
+  variables removed from make's environment, refuses a dynamically linked
+  result or one that misses its `binary_sha256` pin, and records
+  `results/unrar-build.json`. `recipe = "unrar-portable"`, which built UnRAR
+  in a container, and `lane = "docker-cpu"` are config errors. No version
+  impact of its own.
 
 ## rarpar 0.6.2
 

@@ -19,7 +19,7 @@ $EDITOR bench/fleet.toml
 
 `bench/fleet.example.toml` documents every key. Replace all of it: hostnames,
 users, ports, key paths, staging directories, corpus paths, oracle URLs and
-digests, and the AWS account.
+digests, the release tag under test, and the AWS account.
 
 The config holds **no secrets**. Authentication is either
 
@@ -35,26 +35,39 @@ A `password`, `secret`, or `token` key in the file is rejected by validation.
 # Read exactly what would happen. No side effects at all.
 rarpar-bench fleet plan --config bench/fleet.toml
 
+# Dry check: also download, verify and stage every bundle here. No fleet host
+# is contacted and nothing is launched.
+rarpar-bench fleet plan --config bench/fleet.toml --stage
+
 # Run the whole round.
 rarpar-bench fleet run --config bench/fleet.toml
 
 # Narrow it.
-rarpar-bench fleet run --config bench/fleet.toml --machine nas-atom --suite crc-probe
+rarpar-bench fleet run --config bench/fleet.toml --machine nas-atom --suite macro-rar
 ```
 
 `fleet run` is non-interactive from start to finish. It:
 
-1. **Preflights, fail-fast.** With cloud machines it checks AWS credentials
-   *first* — an expired session is reported with remediation before anything is
-   built or launched — then validates the whole parallel launch against the
-   account vCPU quota (cross-checked against `describe-instance-types`), then
-   discovers this machine's public IPv4 by DNS for the session security group.
-   Local hosts are probed over their own configured endpoint, and host-path
-   oracles are proven present and digest-matched.
-2. **Builds bundles.** Either staged from a prebuilt directory or built in the
-   recorded container recipe (musl, `crt-static`, no `-march`/`-mcpu`/`-mtune`
-   anywhere, aws-lc built in-container, Go with CGO off). Every bundle carries a
-   `BUILDINFO.json` with tree revisions, dirty-file counts, binary digests, and
+1. **Verifies the candidates, then preflights, fail-fast.** Every release
+   bundle's asset and the release's `SHA256SUMS` are downloaded and the asset's
+   sha256 is checked first (see
+   [Candidates: the published release](#candidates-the-published-release)); a
+   missing asset or `SHA256SUMS`, or a mismatch, stops the round before any
+   credential check, host probe or launch. With cloud machines it then checks
+   AWS credentials — an expired session is reported with remediation before
+   anything is built or launched — then validates the whole parallel launch
+   against the account vCPU quota (cross-checked against
+   `describe-instance-types`), then discovers this machine's public IPv4 by DNS
+   for the session security group. Local hosts are probed over their own
+   configured endpoint, and host-path oracles are proven present and
+   digest-matched.
+2. **Stages bundles.** A release bundle stages the verified `rarpar`
+   (`rarpar.exe` for a Windows host) as published, and only the pure-Go harness
+   is cross-compiled here, with CGO off (`rarpar-bench`, or `rarpar-bench.exe`
+   for a Windows bundle). Nothing in the fleet builds a candidate from source,
+   and nothing in it runs in a container. A prebuilt bundle is copied from a
+   local directory as it is. Every bundle carries a `BUILDINFO.json` with the
+   release it staged, tree revisions, dirty-file counts, binary digests, and
    the codegen policy.
 3. **Spawns everything in parallel.** EC2 instances launch concurrently against a
    session security group scoped to your address and an ephemeral keypair, with
@@ -70,6 +83,12 @@ rarpar-bench fleet run --config bench/fleet.toml --machine nas-atom --suite crc-
    `setsid`/`nohup` and needs no further orchestrator contact. On the host it
    does: quiet-load gate → warmup pass (discarded) → timed repeats → perf
    diagnostic pass → evidence tarball + inventory manifest + `DONE` sentinel.
+   An oracle whose vendor publishes no binary for the platform is compiled
+   here, on the host, never on the orchestrator: UnRAR on Linux arm64 before
+   the first suite (see
+   [The UnRAR oracle on Linux arm64](#the-unrar-oracle-on-linux-arm64)),
+   par3cmdline at the start of the PAR3 suite, and XZ Utils in the lzma-turbo
+   suite.
 5. **Collects as hosts finish.** Each host is polled for its sentinel; on DONE
    the tarball is pulled and verified against the manifest, then cloud hosts are
    terminated and the teardown is verified resource by resource. A slow or hung
@@ -84,12 +103,95 @@ Everything lands under `<results_root>/<run-id>/`:
 ```
 plan.json plan.txt          what the run intended to do
 run-state.json              live state; the resume path reads this
+release-cache/<tag>/        SHA256SUMS and the verified release assets
 run-<machine>.sh            the exact script that ran on each host
 bundles/<machine>/          what was shipped, with BUILDINFO.json
 hosts/<machine>/results/    the verified evidence
 charts/<platform-label>/    rendered SVGs
 fleet-summary.json/.txt     the round
 ```
+
+## Candidates: the published release
+
+A machine's rarpar is the published release asset for its platform, run
+natively on the host. It is never built for the round.
+
+```toml
+[machines.bundle]
+source = "release"        # the default
+tag = "rarpar-v0.7.0"     # or version = "0.7.0"
+go_os = "linux"           # linux | darwin | windows
+go_arch = "amd64"         # amd64 | arm64
+flavor = "musl-direct"    # Linux only: musl-direct (default) | gnu-direct
+```
+
+`go_os`, `go_arch` and, on Linux, `flavor` pick one asset of the release:
+
+| Host | Asset | Binary |
+| --- | --- | --- |
+| Linux x86_64 / arm64 | `rarpar-<tag>-linux-<x86_64\|arm64>-<flavor>.tar.gz` | `rarpar` |
+| macOS x86_64 / arm64 | `rarpar-<tag>-darwin-<x86_64\|arm64>.tar.gz` | `rarpar` |
+| Windows x86_64 / arm64 | `rarpar-<tag>-windows-<x86_64\|arm64>.zip` | `rarpar.exe` |
+
+`musl-direct` is the statically linked musl build and `gnu-direct` the glibc
+build. When `build_target` is set it must be the asset's Rust target, so a
+mismatch is a config error rather than a mislabelled chart. A `powershell` host needs
+`go_os = "windows"`, and `go_os = "windows"` needs a `powershell` host.
+
+How the asset is checked:
+
+- `SHA256SUMS` is fetched from
+  `https://github.com/scryer-media/rarpar/releases/download/<tag>/SHA256SUMS`
+  on every run. A line that is not a `<sha256>  <file>` entry fails the
+  round rather than being skipped.
+- The asset is downloaded once per (tag, platform), however many machines
+  share it, into `<run dir>/release-cache/<tag>/<platform>/`. It is hashed
+  as it streams and kept only if its sha256 is the one `SHA256SUMS` lists.
+  A cached copy is hashed again before it is reused.
+- Downloads come from GitHub and nowhere else: a redirect to any host other
+  than `github.com` or GitHub's asset hosts is refused.
+- Only the binary at the archive root is unpacked. The tarballs also carry a
+  bash completion named `rarpar`, which is never taken for the binary. An
+  archive member that would escape the cache directory, a root binary that
+  appears twice, or one that is not a regular file is refused.
+- A missing asset, a missing `SHA256SUMS` or a mismatch stops the round
+  before any credential check, host probe or launch.
+- The machine's `release` record in `run-state.json` and the bundle's
+  `BUILDINFO.json` hold the provenance: tag, release URL, platform, Rust
+  target, asset name, URL, size and sha256, the `SHA256SUMS` URL and digest,
+  and the unpacked binary's digest and size. The staged binary is checked
+  against that digest once more when the bundle is assembled.
+
+The release's cosign signature (`SHA256SUMS.sigstore.json`) is not verified;
+the check rests on HTTPS to GitHub and the digest match.
+
+Two things a release bundle cannot do:
+
+- `crc-probe` and `yenc-micro` measure weaver's own binaries, which no rarpar
+  release publishes. With a release bundle they are a config error; run them
+  from a prebuilt bundle.
+- The release binaries are built without forced frame pointers or debug info.
+  The perf pass still runs, but its frame-pointer call graphs
+  (`--call-graph fp`) stop early inside `rarpar`. For full call graphs, use a
+  prebuilt bundle built with frame pointers in a spot test.
+
+**Dry check.** `rarpar-bench fleet plan --config bench/fleet.toml --stage`
+prints the plan, then downloads and verifies every release asset and
+assembles every bundle exactly as `fleet run` would, under
+`<results_root>/<run-id>/` (never `bundle_cache`). It records the result in
+`stage-state.json`, never `run-state.json`, so `fleet collect` and
+`fleet teardown` cannot mistake it for a round, and it refuses a run id that
+already has a `run-state.json`. It contacts no fleet host, checks no
+credential and launches nothing. Oracles are resolved as in a round, so an
+`official-binary` oracle, and the source tarball of an `unrar-portable-onhost`
+oracle, is downloaded unless `--no-fetch` is given.
+
+**Prebuilt, for dev spot tests.** `source = "prebuilt"` with `path` set to an
+absolute local directory stages that directory as it is: early development
+spot tests only, never a measured round. The plan flags every prebuilt
+machine as a dev spot test. The directory must hold `rarpar-bench` and
+`rarpar` (`.exe` names for a Windows host) plus the binaries of any suite
+that needs them, such as `crc_probe`.
 
 ## Resume
 
@@ -129,30 +231,45 @@ Append a `[[machines]]` block. The mandatory decisions:
 | --- | --- |
 | `kind` | `local-ssh` (a machine you own) or `aws-ec2` (launched and destroyed per run; `ec2.access` = `ssh` or `ssm`) |
 | `platform_label` | Names the SVGs and the report machine label. Must be unique — a collision overwrites another machine's charts |
-| `suites` | `crc-probe`, `yenc-micro`, `macro-rar`, `macro-par2`, `macro-par3` |
+| `suites` | `macro-rar`, `macro-par2`, `macro-par3`; `crc-probe` and `yenc-micro` from a prebuilt bundle only |
 | `capabilities.perf` | `linux-perf`, `samply`, or `none`. Decides which diagnostic pass runs |
 | `capabilities.no_pgrep` | Set on busybox-class appliances; the load gate falls back to `ps -ef \| grep` |
-| `bundle.source` | `docker` (build the recipe) or `prebuilt` (stage a directory) |
+| `bundle.source` | `release` (the default: the published release asset, with `tag` or `version`) or `prebuilt` (stage a local directory; dev spot tests only) |
 | `oracles.*` | `host-path`, `official-binary`, or `source-build` |
 
 Then:
 
 ```sh
-rarpar-bench fleet plan --config bench/fleet.toml --machine <new-name>
-rarpar-bench fleet run  --config bench/fleet.toml --machine <new-name> --suite crc-probe
+rarpar-bench fleet plan --config bench/fleet.toml --machine <new-name> --stage
+rarpar-bench fleet run  --config bench/fleet.toml --machine <new-name> --suite macro-rar
 ```
 
-Start with `crc-probe`: it is short, needs no corpus, and proves the transport,
-the bundle, the sentinel, and the collection path before you spend an hour of
-macro suite on a host that turns out to be missing an oracle.
+Start with `fleet plan --stage`: it proves the release publishes an asset for
+the machine's platform, verifies it and assembles the bundle without touching
+the host. Then run one macro suite, narrowed with `[machines.run].cases`, to
+prove the transport, the bundle, the sentinel, and the collection path before
+you spend an hour of macro suite on a host that turns out to be missing an
+oracle.
 
 ### Rules the tool enforces so you do not have to remember them
 
-- **Never rebuild an oracle where an official binary exists.** `source-build`
-  requires a recorded `reason`, a pinned source tarball digest, and one of the
-  audited recipes. `unrar-portable` uses the stock makefile and stock
-  `CXXFLAGS`, sets only `CXX` and a static link, and refuses to build if the
-  makefile has acquired a `-march`/`-mcpu`/`-mtune` of its own.
+- **The candidate is the published release, checked before anything runs.**
+  Each machine runs its platform's release asset, verified against the
+  release's `SHA256SUMS`. Nothing in the fleet builds a candidate from source
+  or runs one in a container.
+- **Never build an oracle the vendor publishes a binary for.** `source-build`
+  requires a recorded `reason`, a pinned source, and one of two audited
+  recipes. Each is refused on every platform its vendor publishes a binary
+  for, and each compiles natively on the host during the run, never on the
+  orchestrator and never in a container. `unrar-portable-onhost` builds UnRAR
+  on Linux arm64 only (see
+  [The UnRAR oracle on Linux arm64](#the-unrar-oracle-on-linux-arm64)).
+  `par3cmdline-onhost` builds par3cmdline on Linux and macOS (see
+  [PAR3 suite on the fleet](#par3-suite-on-the-fleet)). The removed
+  `unrar-portable` recipe, which compiled UnRAR in a container on the
+  orchestrating machine, is refused with a pointer to `unrar-portable-onhost`.
+- **Hosts run natively.** `fleet.defaults.lane` must be `cpu` or `metal`;
+  `docker-cpu` is refused.
 - **Explicit `user@host:port` from the machine's own config entry.** ssh_config
   aliases are rejected; an alias that resolved to the wrong user has
   mis-authenticated a whole round.
@@ -189,6 +306,66 @@ exiting) therefore blocks that host until the orchestrator's
 it is waiting on. Clear the process, or drop that name from
 `quiet_load_process_names` for the run.
 
+## The UnRAR oracle on Linux arm64
+
+RARLAB publishes no Linux arm64 UnRAR. rarlab.com/download.htm lists none,
+and the only Linux ARM entries on rarlab.com/rar_add.htm are
+`unrar-4.1.3-armv4l.tar.gz` and `unrar-5.5.0-arm.gz`. The second is UnRAR
+5.5.0 from 2017: an ELF 32-bit ARM EABI5 binary, dynamically linked against
+`/lib/ld-linux-armhf.so.3`. An AArch64-only server core cannot execute it,
+and it predates RAR 7. So a Linux arm64 host's `rar` oracle is the one UnRAR
+the fleet builds, and the host builds it itself. Every other host runs
+RARLAB's own binary.
+
+```toml
+[machines.oracles.rar]
+policy = "source-build"
+reason = "RARLAB publishes no Linux arm64 UnRAR: rarlab.com/download.htm lists none, and the only Linux ARM entries on rarlab.com/rar_add.htm are unrar-4.1.3-armv4l.tar.gz and unrar-5.5.0-arm.gz, an UnRAR 5.5.0 (2017) ELF 32-bit ARM EABI5 binary dynamically linked against /lib/ld-linux-armhf.so.3, which an AArch64-only server core cannot execute and which predates RAR 7"
+url = "https://www.rarlab.com/rar/unrarsrc-7.2.3.tar.gz"
+sha256 = "3995af0aa32b1505a566da053725551a1f0698dc42b2fdf7ba7d65db0d004e33"
+recipe = "unrar-portable-onhost"
+# binary_sha256 = "<64 hex>"      # optional: hold later runs to one binary
+version = "unrar 7.2.3 (portable on-host build)"
+```
+
+- **The orchestrator compiles nothing.** It downloads the source tarball,
+  refuses it unless its sha256 matches the pin, and ships it in the bundle.
+  `fleet plan --stage` does the same; with `--no-fetch` the tarball must
+  already be in the cache.
+- **The host builds it at run start**, after `environment.txt` records the
+  quiet box and before `binaries.txt` hashes the binaries, by running
+  `rarpar-bench fleet build-unrar`. That checks the shipped tarball against
+  the pin again and unpacks it. It refuses to build if the stock makefile
+  carries `-march`, `-mcpu`, `-mtune` or `native` outside a comment line. It
+  runs the stock makefile with its stock `CXXFLAGS`, setting only `CXX=g++`
+  and `LDFLAGS=-pthread -static`, and removes `CPPFLAGS`, `CFLAGS`,
+  `CXXFLAGS`, `LDFLAGS`, `LIBS`, `MAKEFLAGS`, `MFLAGS`, `GNUMAKEFLAGS` and
+  `MAKEFILES` from make's environment, so none of them can carry a flag from
+  the host into the build. It refuses a result that names an ELF interpreter
+  or needs a shared library, and one whose sha256 differs from
+  `binary_sha256` when that is set. Only then does it install
+  `unrar-reference/unrar` in the run's staging directory, the path every
+  suite uses. It first deletes any binary an earlier build left there, so a
+  refused build leaves none. The quiet-load gate before the first suite waits
+  out the build's load.
+- **Evidence.** `results/unrar-build.json` records the source URL and
+  digest, the makefile digest, the flag audit, the make arguments, the
+  removed variables, the make and compiler versions, the binary digest and
+  whether a pin held it, the ELF machine and the static-link check.
+  `results/unrar-build.log` holds the full build output.
+- **A failed build fails the host** as `unrar-build`. Every run that needs
+  the oracle then stops at its missing-binary check before it runs a case.
+- **Host requirements.** make, g++, and the static libc and libstdc++
+  archives. EC2 user-data installs `build-essential` when this recipe is
+  selected; a local host must already have them.
+- **Pinning the binary.** The digest depends on the host's compiler, so a run
+  without `binary_sha256` records the digest and does not check it. Review
+  `results/unrar-build.json`, then set `binary_sha256` to hold later runs to
+  that binary.
+- **Refusals.** The recipe needs `bundle.go_arch = "arm64"` on a Linux host
+  and is refused anywhere else, since RARLAB publishes the binary there. It
+  needs the `url` and `sha256` of an `unrarsrc-*.tar.gz`.
+
 ## PAR3 suite on the fleet
 
 Add `macro-par3` to a machine's `suites` and give it a `par3` oracle. The
@@ -200,6 +377,7 @@ itself is documented in [benchmarking.md](benchmarking.md#par3-suite).
 ```toml
 [machines.oracles.par3]
 policy = "source-build"
+reason = "par3cmdline publishes no release and no Linux binary; the tree ships only windows/par3.exe"
 recipe = "par3cmdline-onhost"     # built on the host from the pinned archive
 
 [machines.par3]
@@ -213,13 +391,17 @@ pin_cpus = "0-7"
 work = "/bench/p3"                # keep it short, see below
 timeout_minutes = 20              # per run, rarpar rows too; a reference over it is DNF
 # reference_timeout_minutes = 60  # default 0: the reference uses timeout_minutes
-# durability = ["durable"]        # default: durable and buffered rows
+# durability = ["durable"]        # default: durable and buffered rows; the probe
+                                  # finds which one a plain `rarpar par3` gives
 ```
 
-- **Durability rows.** Every `rarpar` create and repair runs durable (the
-  default) and buffered; the reference gets one row. `durability` narrows that
-  and must include `durable`. Verify writes nothing, so it has no buffered
-  row and runs once per worker count. In the text plan, the macro-par3 step
+- **Durability rows.** Every `rarpar` create and repair runs durable and
+  buffered; the reference gets one row. The harness probes each candidate's
+  `par3 <op> --help`: a build that lists `--fsync` (0.7.0 and later) is
+  buffered when run plain and durable with `--fsync`, one that lists
+  `--buffered` is the reverse, and one that lists neither runs the durable row
+  only. `durability` narrows the rows and must include `durable`. Verify
+  writes nothing, so it has no buffered row and runs once per worker count. In the text plan, the macro-par3 step
   lists the durabilities and the per-run timeout, and the machine's `par3`
   block lists the variants and the rows each op produces; `--json` carries
   the same rows under `par3.rows`.
@@ -233,11 +415,13 @@ timeout_minutes = 20              # per run, rarpar rows too; a reference over i
   wrongly fails the section; see
   [benchmarking.md](benchmarking.md#timeouts-and-reference-dnf).
 
-- **Linux and macOS hosts** use `recipe = "par3cmdline-onhost"`. The host runs
-  `par3 build-reference` against the shipped `toolchains.json`, so the
-  reference is compiled natively and never emulated. It needs CMake and a C
-  compiler; EC2 user-data installs `build-essential` and `cmake` when this
-  recipe is selected. This recipe takes no `url` or `sha256`.
+- **Linux and macOS hosts** use `recipe = "par3cmdline-onhost"`, because
+  par3cmdline publishes no release and no Linux binary; the tree ships only
+  windows/par3.exe. The host runs `par3 build-reference` against the shipped
+  `toolchains.json`, so the reference is compiled natively and never
+  emulated. It needs CMake and a C compiler; EC2 user-data installs
+  `build-essential` and `cmake` when this recipe is selected. This recipe
+  takes no `url` or `sha256`.
 - **Windows hosts** use `policy = "official-binary"` with the pinned archive's
   `windows/par3.exe` (`archive_member`, `binary_sha256`); see the example
   config. `par3cmdline-onhost` is refused on Windows, and so is
@@ -294,8 +478,9 @@ harness refuses a binary whose embedded commit is not the checkout's clean
 HEAD, and lzma's fixtures come from `cargo xtask` in that checkout. So the
 bundle carries, per suite, a `git bundle` of the checkout's HEAD commit, a
 `.commit` sidecar, and the harness cross-compiled with CGO off. The build
-refuses a dirty checkout. A machine that runs only turbo suites skips the
-container build entirely; its `[machines.bundle]` still sets the Go target.
+refuses a dirty checkout. A machine that runs only turbo suites still stages
+its platform's rarpar release asset, though neither suite runs it, and its
+`[machines.bundle]` sets the Go target.
 
 On the host, the run script:
 
@@ -367,9 +552,10 @@ spot = true                                    # optional, SSM only
 
 ## Known limits
 
-- `bundle.build_host` accepts a machine name but only `"local"` is implemented.
-  A remote build host is refused at build time with a message telling you to
-  build there yourself and use `bundle.source = "prebuilt"`.
+- The on-host UnRAR build (`unrar-portable-onhost`) has not yet compiled
+  UnRAR on a live Linux arm64 host. Its checks are unit-tested around a
+  stand-in `make`, and the builder has run on RARLAB's real 7.2.3 source
+  tarball with that stand-in. Treat its first run as bring-up.
 - The Windows runner has never been executed (see below).
 - The SSM access mode is implemented and unit-tested but has not been run
   against a live account yet. Treat its first run as bring-up.

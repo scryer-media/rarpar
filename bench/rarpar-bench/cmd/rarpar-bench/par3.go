@@ -122,7 +122,7 @@ func runPAR3Matrix(args []string, stdout io.Writer) error {
 	profileName := flags.String("profile", "smoke", "profile: smoke, full or fleet")
 	workers := flags.String("workers", "1,8", "rarpar worker counts")
 	ops := flags.String("ops", strings.Join(par3bench.DefaultOps, ","), "operations: "+strings.Join(par3bench.KnownOps, ","))
-	durability := flags.String("durability", strings.Join(par3bench.KnownDurabilities, ","), "rarpar durability rows for create and repair (durable is the default and always runs)")
+	durability := flags.String("durability", strings.Join(par3bench.KnownDurabilities, ","), "rarpar durability rows for create and repair (durable always runs; which flag selects each mode is probed from the candidate's --help)")
 	jsonOut := flags.Bool("json", false, "emit JSON")
 	var sets, kernels stringList
 	flags.Var(&sets, "set", "restrict to a set ID (repeatable)")
@@ -192,9 +192,7 @@ func runPAR3Matrix(args []string, stdout io.Writer) error {
 	if err := table.Flush(); err != nil {
 		return err
 	}
-	if containsString(durabilities, par3bench.DurabilityBuffered) {
-		_, err = fmt.Fprintln(stdout, "buffered rows run with the candidate's --buffered flag; an op whose `rarpar par3 OP --help` lists none keeps only its durable row (noted in the results).")
-	}
+	_, err = fmt.Fprintln(stdout, "the flag selecting each mode is probed from `rarpar par3 OP --help`: a 0.7.0+ candidate is buffered by default and takes --fsync for durable rows, an older one is durable by default and takes --buffered; an op listing neither keeps only its durable row (noted in the results).")
 	return err
 }
 
@@ -209,8 +207,6 @@ func matrixLabel(variants []par3bench.Variant, name, op string) string {
 		switch variant.EffectiveDurability() {
 		case "":
 			return name
-		case par3bench.DurabilityDurable:
-			return name + " (durable, default)"
 		default:
 			return name + " (" + variant.EffectiveDurability() + ")"
 		}
@@ -273,7 +269,7 @@ func runPAR3Suite(ctx context.Context, args []string, stdout io.Writer) error {
 	memory := flags.Int("engine-perf-memory-mib", 256, "engine_perf memory budget")
 	timeout := flags.Duration("timeout", par3bench.DefaultTimeout, "per-run timeout for every timed process; a reference run past it is DNF")
 	referenceTimeout := flags.Duration("reference-timeout", 0, "per-run timeout for reference processes (default: --timeout)")
-	durability := flags.String("durability", strings.Join(par3bench.KnownDurabilities, ","), "rarpar durability rows for create and repair (durable is the default and always runs)")
+	durability := flags.String("durability", strings.Join(par3bench.KnownDurabilities, ","), "rarpar durability rows for create and repair (durable always runs; which flag selects each mode is probed from the candidate's --help)")
 	keep := flags.Bool("keep-stages", false, "keep per-run stage directories")
 	engineWorkers := flags.String("engine-workers", "", "add timed engine_perf rows at these worker counts (needs --engine-perf)")
 	rows := flags.String("rows", "", "timed row kinds: "+strings.Join(par3bench.KnownRowKinds, ",")+" (default: reference,rarpar, plus engine with --engine-workers)")

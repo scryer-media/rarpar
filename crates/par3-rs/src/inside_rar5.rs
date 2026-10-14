@@ -32,9 +32,7 @@ use std::sync::Arc;
 use crc_fast::{CrcAlgorithm, Digest};
 
 use crate::carrier::{CarrierPlan, CarrierRestoration};
-use crate::creation::{
-    CreationCodec, CreationDurability, CreationOptions, CreationPlan, CreationSource,
-};
+use crate::creation::{CreationCodec, CreationOptions, CreationPlan, CreationSource};
 use crate::ingest::{AuthenticatingWriter, IngestedPacket, PacketScanner, PayloadKind, ScanEvent};
 use crate::runtime::{
     EngineError, EngineFile as File, EngineResult, ExecutionOptions, OpenBudgeted,
@@ -561,7 +559,6 @@ pub fn insert_set(
     layout: Rar5Layout,
     options: CreationOptions,
     scratch_directory: &Path,
-    durability: CreationDurability,
 ) -> EngineResult<Vec<Rar5Inserted>> {
     if options.codec != CreationCodec::Cauchy || options.store_data {
         return Err(EngineError::Unsupported(
@@ -715,9 +712,7 @@ pub fn insert_set(
                     "embedded output failed verification",
                 ));
             }
-            if durability == CreationDurability::SyncFiles {
-                file.sync_all()?;
-            }
+            file.flush()?;
             drop(file);
             reports.push(Rar5Inserted {
                 path: outputs[index].clone(),
@@ -869,7 +864,7 @@ fn install_by_copy(
             output.write_all(&buffer[..take])?;
             at += take as u64;
         }
-        output.sync_all()?;
+        output.flush()?;
         drop((from, output));
         let mut from = File::open(temporary, options)?;
         let mut copied = File::open(&staged, options)?;
@@ -1793,11 +1788,7 @@ impl Rar5Set {
             )?);
         }
         let temporaries: Vec<PathBuf> = scratch.iter().map(|file| file.path().to_owned()).collect();
-        crate::session_repair::stage_embedded_files(
-            &mut self.session,
-            &temporaries,
-            crate::session_repair::RepairDurability::Buffered,
-        )?;
+        crate::session_repair::stage_embedded_files(&mut self.session, &temporaries)?;
         let mut disk = DiskSourceAccess::with_options(options.clone());
         for (index, path) in temporaries.iter().enumerate() {
             disk.insert(SourceId(index as u64), path.clone());
@@ -1874,7 +1865,7 @@ impl Rar5Set {
                     output.write_all_at(host.gap.start + host.prefix + at, &buffer[..take])?;
                     at += take as u64;
                 }
-                output.sync_all()?;
+                // Positional writes leave nothing buffered to flush.
                 drop(output);
                 let proof = crate::evidence::verify_source(
                     layout.clone(),
@@ -2003,7 +1994,7 @@ impl Rar5Set {
                         "stripped host differs from the original",
                     ));
                 }
-                output.sync_all()?;
+                output.flush()?;
                 drop(output);
                 std::fs::hard_link(&temporary, destination)?;
                 written.push(destination.clone());
@@ -2221,7 +2212,6 @@ mod tests {
                     Rar5Layout::Trailing,
                     creation(2),
                     &scratch,
-                    CreationDurability::Buffered,
                 )
                 .unwrap();
             }
@@ -2235,7 +2225,6 @@ mod tests {
                 Rar5Layout::Trailing,
                 creation(total),
                 &scratch,
-                CreationDurability::Buffered,
             )
             .unwrap();
         }
@@ -2406,7 +2395,6 @@ mod tests {
                     ..CreationOptions::default()
                 },
                 &scratch,
-                CreationDurability::Buffered,
             )
         };
         FAIL_INSTALL_AT.with(|at| at.set(Some(1)));

@@ -82,8 +82,8 @@ func TestExampleMachineDetails(t *testing.T) {
 	if float64(cloud.EC2.DeadmanMinutes) < cloud.EC2.MaxHours*60 {
 		t.Fatal("the deadman must outlast the cost cap")
 	}
-	if cloud.Oracles["rar"].Policy != OracleSourceBuild || cloud.Oracles["rar"].Reason == "" {
-		t.Fatal("the linux-arm unrar oracle must be a source build with a recorded reason")
+	if rar := cloud.Oracles["rar"]; rar.Policy != OracleSourceBuild || rar.Recipe != RecipeUnrarHost || !strings.Contains(rar.Reason, "unrar-5.5.0-arm.gz") {
+		t.Fatal("the linux-arm64 unrar oracle must be the on-host source build, with RARLAB's missing arm64 binary as its reason")
 	}
 	if cloud.EC2.CorpusSource == "" || cloud.Paths.Corpus != "" {
 		t.Fatal("the EC2 example must provision its corpus via corpus_source, not a pre-seeded host path")
@@ -197,15 +197,45 @@ func TestConfigValidation(t *testing.T) {
 		},
 		{
 			name: "source build without a reason is refused",
-			old:  "reason = \"RARLAB publishes no official linux-arm64 UnRAR binary; recorded amendment\"",
+			old:  "reason = \"RARLAB publishes no Linux arm64 UnRAR: rarlab.com/download.htm lists none, and the only Linux ARM entries on rarlab.com/rar_add.htm are unrar-4.1.3-armv4l.tar.gz and unrar-5.5.0-arm.gz, an UnRAR 5.5.0 (2017) ELF 32-bit ARM EABI5 binary dynamically linked against /lib/ld-linux-armhf.so.3, which an AArch64-only server core cannot execute and which predates RAR 7\"",
 			new:  "",
 			want: "reason is required",
 		},
 		{
 			name: "unknown oracle recipe is refused",
-			old:  "recipe = \"unrar-portable\"",
+			old:  "recipe = \"unrar-portable-onhost\"",
 			new:  "recipe = \"unrar-native-march\"",
 			want: "recipe must be one of",
+		},
+		{
+			name: "the removed container recipe names the on-host one",
+			old:  "recipe = \"unrar-portable-onhost\"",
+			new:  "recipe = \"unrar-portable\"",
+			want: "recipe \"unrar-portable\" was removed: it compiled UnRAR in a container on the orchestrating machine; use recipe \"unrar-portable-onhost\"",
+		},
+		{
+			name: "the on-host UnRAR build is refused where RARLAB publishes a binary",
+			old:  "go_arch = \"arm64\"                        # the linux-arm64-musl-direct asset",
+			new:  "go_arch = \"amd64\"",
+			want: "builds UnRAR only on linux/arm64, where RARLAB publishes no current binary; a linux/amd64 host uses RARLAB's official binary",
+		},
+		{
+			name: "the on-host UnRAR build needs its source pin",
+			old:  "sha256 = \"3995af0aa32b1505a566da053725551a1f0698dc42b2fdf7ba7d65db0d004e33\"",
+			new:  "",
+			want: "needs url and sha256 for RARLAB's unrarsrc source tarball",
+		},
+		{
+			name: "the on-host UnRAR source is RARLAB's tarball",
+			old:  "url = \"https://www.rarlab.com/rar/unrarsrc-7.2.3.tar.gz\"",
+			new:  "url = \"https://www.rarlab.com/rar/unrarsrc-7.2.3.zip\"",
+			want: "must name RARLAB's unrarsrc-*.tar.gz source tarball",
+		},
+		{
+			name: "the container lane label is refused",
+			old:  "lane = \"cpu\"                      # cpu | metal (fleet hosts run natively)",
+			new:  "lane = \"docker-cpu\"",
+			want: "fleet.defaults.lane must be cpu or metal",
 		},
 		{
 			name: "deadman shorter than the cost cap is refused",
@@ -239,8 +269,8 @@ func TestConfigValidation(t *testing.T) {
 		},
 		{
 			name: "unknown suite is refused",
-			old:  "suites = [\"crc-probe\", \"yenc-micro\", \"macro-rar\", \"macro-par2\"]",
-			new:  "suites = [\"crc-probe\", \"macro-tar\"]",
+			old:  "suites = [\"macro-rar\", \"macro-par2\"]",
+			new:  "suites = [\"macro-rar\", \"macro-tar\"]",
 			want: "unknown suite",
 		},
 		{
@@ -404,11 +434,11 @@ func TestSelect(t *testing.T) {
 		}
 	})
 	t.Run("suite filter narrows a machine's suites", func(t *testing.T) {
-		machines, err := Select(config, []string{"nas-atom"}, []string{SuiteCRCProbe})
+		machines, err := Select(config, []string{"nas-atom"}, []string{SuiteMacroRAR})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(machines) != 1 || len(machines[0].Suites) != 1 || machines[0].Suites[0] != SuiteCRCProbe {
+		if len(machines) != 1 || len(machines[0].Suites) != 1 || machines[0].Suites[0] != SuiteMacroRAR {
 			t.Fatalf("suite filter did not narrow the machine: %+v", machines)
 		}
 	})
@@ -437,9 +467,13 @@ func TestBuildPlan(t *testing.T) {
 	if len(plan.Machines) != len(machines) {
 		t.Fatalf("plan covers %d machines, want %d", len(plan.Machines), len(machines))
 	}
-	// Credentials are checked before anything is built or launched.
-	if len(plan.Preflight) == 0 || !strings.Contains(plan.Preflight[0], "AWS credential check") {
-		t.Fatalf("AWS credential check must come first: %v", plan.Preflight)
+	// The release assets are verified first, then credentials are checked
+	// before anything is built or launched.
+	if len(plan.Preflight) < 2 || !strings.Contains(plan.Preflight[0], "SHA256SUMS") {
+		t.Fatalf("release verification must come first: %v", plan.Preflight)
+	}
+	if !strings.Contains(plan.Preflight[1], "AWS credential check") {
+		t.Fatalf("the AWS credential check must follow release verification: %v", plan.Preflight)
 	}
 	for _, machine := range plan.Machines {
 		if !strings.Contains(machine.Remote.Base, "fleet-testrun") {
@@ -460,64 +494,11 @@ func TestBuildPlan(t *testing.T) {
 	}
 	var text strings.Builder
 	WritePlanText(&text, plan)
-	for _, expected := range []string{"PREFLIGHT", "AWS QUOTA AND COST", "teardown:", "linux-atom-c3538-noavx"} {
+	for _, expected := range []string{"PREFLIGHT", "AWS QUOTA AND COST", "teardown:", "linux-atom-c3538-noavx",
+		"bundle     release rarpar-v0.7.0, asset rarpar-rarpar-v0.7.0-linux-x86_64-musl-direct.tar.gz"} {
 		if !strings.Contains(text.String(), expected) {
 			t.Fatalf("plan text is missing %q", expected)
 		}
-	}
-}
-
-func TestContainerBuildAliasesTheManifestRarparPathForWeaver(t *testing.T) {
-	// The roots MUST come from weaver's own manifest: the first live fire of
-	// this fix aliased the harness's rarpar_path (a scratch snapshot) while
-	// the manifest named the canonical checkout, and the build died on the
-	// same rc=101 the alias exists to prevent.
-	weaverDir := t.TempDir()
-	manifest := `[workspace]
-members = ["server/crates/weaver-yenc"]
-
-[patch.crates-io]
-par2-rs = { path = "/Users/example/dev/scryer-media/rarpar/crates/par2-rs" }
-unrar-rs = { path = "/Users/example/dev/scryer-media/rarpar/crates/unrar-rs" }
-reedsolomon-rs = { path = "/Users/example/dev/scryer-media/rarpar/crates/reedsolomon-rs" }
-`
-	if err := os.WriteFile(filepath.Join(weaverDir, "Cargo.toml"), []byte(manifest), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	roots, err := weaverPatchRarparRoots(weaverDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(roots) != 1 || roots[0] != "/Users/example/dev/scryer-media/rarpar" {
-		t.Fatalf("three same-root patch entries must collapse to that one root, got %v", roots)
-	}
-
-	machine := Machine{
-		Suites: []string{SuiteYencMicro},
-		Bundle: Bundle{RustTarget: "x86_64-unknown-linux-musl"},
-	}
-	snapshot := "/scratch/round/tree"
-	script := containerBuildScript(machine, "RUSTFLAGS", "", true, append(roots, snapshot))
-	for _, root := range []string{roots[0], snapshot} {
-		alias := "ln -s /work/rarpar '" + root + "'"
-		if !strings.Contains(script, alias) {
-			t.Fatalf("weaver container build is missing the alias for %s; script:\n%s", root, script)
-		}
-		if strings.Index(script, alias) > strings.Index(script, "cd /work/weaver") {
-			t.Fatalf("the alias for %s must be created before the weaver build starts", root)
-		}
-	}
-	// A rarpar-only bundle must not conjure host paths inside its container.
-	bare := containerBuildScript(machine, "RUSTFLAGS", "", false, roots)
-	if strings.Contains(bare, "ln -s /work/rarpar") {
-		t.Fatal("non-weaver container builds must not create the alias")
-	}
-	// No patch block -> no roots -> nothing to alias.
-	if err := os.WriteFile(filepath.Join(weaverDir, "Cargo.toml"), []byte("[workspace]\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if roots, err := weaverPatchRarparRoots(weaverDir); err != nil || len(roots) != 0 {
-		t.Fatalf("patch-free manifest must yield no roots, got %v, %v", roots, err)
 	}
 }
 
@@ -987,46 +968,51 @@ func TestBuildKeyGroupsIdenticalBundles(t *testing.T) {
 	base := Machine{
 		Name:   "a",
 		Suites: []string{"macro-rar", "macro-par2"},
-		Bundle: Bundle{
-			Source: BundleDocker, Image: "docker.io/library/rust:1.97-alpine",
-			BuildHost: "local", RustTarget: "aarch64-unknown-linux-musl",
-			GoOS: "linux", GoArch: "arm64", CrtStatic: true,
-		},
+		Bundle: Bundle{Source: BundleRelease, Tag: "rarpar-v0.7.0", GoOS: "linux", GoArch: "arm64"},
 	}
 	twin := base
 	twin.Name = "b"
 	if buildKey(base) != buildKey(twin) {
-		t.Fatal("machines with identical bundles and suite content must share one build")
+		t.Fatal("machines with identical bundles and suite content must share one bundle")
 	}
-	other := base
-	other.Name = "c"
-	other.Bundle.RustTarget = "x86_64-unknown-linux-musl"
-	if buildKey(base) == buildKey(other) {
-		t.Fatal("different rust targets must not share a build")
+	// A version names the same release as its tag, and the default flavor is
+	// musl-direct: all three stage the same asset.
+	byVersion := base
+	byVersion.Bundle.Tag, byVersion.Bundle.Version = "", "0.7.0"
+	explicit := base
+	explicit.Bundle.Flavor = FlavorMuslDirect
+	if buildKey(byVersion) != buildKey(base) || buildKey(explicit) != buildKey(base) {
+		t.Fatal("a version and its tag, or the default and explicit musl flavor, must share one bundle")
 	}
-	if sharedBundleName(base, "tree0") == sharedBundleName(other, "tree0") {
-		t.Fatal("shared bundle names must differ per key")
+	for name, change := range map[string]func(*Machine){
+		"another release": func(machine *Machine) { machine.Bundle.Tag = "rarpar-v0.6.2" },
+		"another flavor":  func(machine *Machine) { machine.Bundle.Flavor = FlavorGNUDirect },
+		"another arch":    func(machine *Machine) { machine.Bundle.GoArch = "amd64" },
+		"another source": func(machine *Machine) {
+			machine.Bundle = Bundle{Source: BundlePrebuilt, Path: "/bundles/linux-arm64", GoOS: "linux", GoArch: "arm64"}
+		},
+		"other suite contents": func(machine *Machine) { machine.Suites = []string{"macro-rar", "macro-par3"} },
+	} {
+		other := base
+		other.Name = "c"
+		change(&other)
+		if buildKey(base) == buildKey(other) {
+			t.Fatalf("%s must not share a bundle", name)
+		}
+		if sharedBundleName(base, "tree0") == sharedBundleName(other, "tree0") {
+			t.Fatalf("%s: shared bundle names must differ per key", name)
+		}
 	}
 	if sharedBundleName(base, "tree0") == sharedBundleName(base, "tree1") {
-		t.Fatal("shared bundle names must differ per candidate tree")
+		t.Fatal("shared bundle names must differ per harness tree")
 	}
-	wider := base
-	wider.Name = "d"
-	wider.Suites = []string{"macro-rar", "yenc-micro"}
-	if buildKey(base) == buildKey(wider) {
-		t.Fatal("different suite-driven bundle contents must not share a build")
+	if name := sharedBundleName(base, "tree0"); !strings.HasPrefix(name, "shared-linux-arm64-musl-direct-") {
+		t.Fatalf("a release bundle is named after its platform: %s", name)
 	}
-}
-
-func TestNativeBuildArchMapping(t *testing.T) {
-	if rustTargetGoArch("x86_64-unknown-linux-musl") != "amd64" {
-		t.Fatal("x86_64 target must map to amd64")
-	}
-	if rustTargetGoArch("aarch64-unknown-linux-musl") != "arm64" {
-		t.Fatal("aarch64 target must map to arm64")
-	}
-	if unameToGoArch("x86_64\n") != "amd64" || unameToGoArch("aarch64") != "arm64" {
-		t.Fatal("uname arch normalization is wrong")
+	prebuilt := base
+	prebuilt.Bundle = Bundle{Source: BundlePrebuilt, Path: "/bundles/linux-arm64"}
+	if name := sharedBundleName(prebuilt, "tree0"); !strings.HasPrefix(name, "shared-prebuilt-") {
+		t.Fatalf("a prebuilt bundle is named after its source: %s", name)
 	}
 }
 
@@ -1076,8 +1062,8 @@ func TestExampleTurboMachine(t *testing.T) {
 	if !turbo.hasTurbo() || !turbo.hasSuite(SuiteLzmaTurbo) || !turbo.hasSuite(SuiteSevenzTurbo) {
 		t.Fatal("the turbo machine runs both turbo suites")
 	}
-	if turbo.needsContainerBuild() {
-		t.Fatal("a turbo-only machine builds its candidates on the host and needs no container build")
+	if turbo.Bundle.Source != BundleRelease || turbo.needsCandidate() {
+		t.Fatal("the turbo machine stages the release like every other machine but runs no rarpar suite")
 	}
 	if turbo.Turbo.LzmaProfile != "fleet" || turbo.Turbo.SevenzProfile != "fleet" || turbo.Turbo.TimeoutMinutes != 60 {
 		t.Fatalf("unexpected turbo plan: %+v", turbo.Turbo)
@@ -1175,7 +1161,7 @@ func TestTurboConfigValidation(t *testing.T) {
 		{"relative", `lzma_turbo_path = "/Users/example/dev/lzma-turbo"`, `lzma_turbo_path = "dev/lzma-turbo"`, "must be an absolute path"},
 		// The run script installs Linux rustup and 7-Zip builds, so a macOS
 		// host would pass validation only to fail on the host.
-		{"darwin", "rust_target = \"x86_64-unknown-linux-gnu\"\ngo_os = \"linux\"", "rust_target = \"x86_64-unknown-linux-gnu\"\ngo_os = \"darwin\"", `bundle.go_os = "darwin" hosts are not supported`},
+		{"darwin", "flavor = \"gnu-direct\"\ngo_os = \"linux\"", "go_os = \"darwin\"", `bundle.go_os = "darwin" hosts are not supported`},
 	}
 	for _, tc := range cases {
 		_, err := loadMutatedExample(t, tc.old, tc.new)

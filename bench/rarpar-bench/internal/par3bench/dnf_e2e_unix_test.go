@@ -91,7 +91,7 @@ func TestReferenceExit6IsDNFEndToEnd(t *testing.T) {
 		t.Fatalf("results.json must reload: %v", err)
 	}
 	report := RenderReport(reloaded)
-	for _, want := range []string{"| reference | none (never syncs) | DNF |", "| rarpar-w1 | durable (default) |", "exit 6: Failed to open Recovery File"} {
+	for _, want := range []string{"| reference | none (never syncs) | DNF |", "| rarpar-w1 | durable |", "exit 6: Failed to open Recovery File"} {
 		if !strings.Contains(report, want) {
 			t.Fatalf("report lacks %q:\n%s", want, report)
 		}

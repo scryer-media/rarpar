@@ -881,7 +881,10 @@ jobs:
           fi
           echo "all unrar shards passed"
 
-  platform-tests:
+  # platform-tests and target-checks run one job per operating system, so each
+  # job lists exactly the steps its platforms run. Step bodies longer than a
+  # line or two live in .github/scripts/ci/.
+  platform-tests-linux:
     name: platform-tests-${{ matrix.platform }}
     needs: [changes, fmt, clippy, unit-tests]
     if: needs.changes.outputs.crates == 'true'
@@ -893,14 +896,6 @@ jobs:
         include:
           - platform: linux-arm64
             runs_on: ubuntu-24.04-arm
-          - platform: darwin-arm64
-            runs_on: macos-26
-          - platform: darwin-x86_64
-            runs_on: macos-26-intel
-          - platform: windows-x86_64
-            runs_on: windows-2025-vs2026
-          - platform: windows-arm64
-            runs_on: windows-11-arm
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -913,29 +908,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Install native build dependencies (Linux)
-        if: runner.os == 'Linux'
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mold
-      - name: Install NASM (macOS)
-        if: matrix.platform == 'darwin-x86_64'
-        run: brew install nasm
-      - name: Install NASM (Windows x86_64)
-        if: matrix.platform == 'windows-x86_64'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $url = "https://www.nasm.us/pub/nasm/releasebuilds/3.01/win64/nasm-3.01-win64.zip"
-          $expectedSha256 = "e0ba5157007abc7b1a65118a96657a961ddf55f7e3f632ee035366dfce039ca4"
-          Invoke-WebRequest $url -OutFile nasm.zip
-          $actualSha256 = (Get-FileHash nasm.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualSha256 -ne $expectedSha256) {
-            throw "NASM checksum mismatch: expected $expectedSha256, got $actualSha256"
-          }
-          Expand-Archive nasm.zip -DestinationPath C:\nasm
-          $dir = (Get-ChildItem C:\nasm -Directory | Select-Object -First 1).FullName
-          $dir | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
       - name: Restore sccache directory
         id: sccache-restore
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -947,25 +923,8 @@ jobs:
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-
       - name: Install sccache
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
-      - name: Configure compiler flags (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          {
-            if [ "${{ runner.os }}" = "Linux" ]; then
-              echo "RUSTFLAGS=--remap-path-prefix=${GITHUB_WORKSPACE}=. -C link-arg=-fuse-ld=mold"
-              echo "CC=sccache cc"
-              echo "CXX=sccache c++"
-            else
-              echo "RUSTFLAGS=--remap-path-prefix=${GITHUB_WORKSPACE}=."
-              echo "CC=sccache clang"
-              echo "CXX=sccache clang++"
-            fi
-          } >> "$GITHUB_ENV"
-      - name: Configure compiler flags (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          "RUSTFLAGS=--remap-path-prefix=$env:GITHUB_WORKSPACE=." | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: Configure compiler flags
+        run: .github/scripts/ci/platform-tests-configure-compiler-flags-linux.sh
       - name: Prime sccache server
         shell: bash
         run: |
@@ -990,7 +949,151 @@ jobs:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
-  target-checks:
+  platform-tests-macos:
+    name: platform-tests-${{ matrix.platform }}
+    needs: [changes, fmt, clippy, unit-tests]
+    if: needs.changes.outputs.crates == 'true'
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            runs_on: macos-26
+            nasm: false
+          - platform: darwin-x86_64
+            runs_on: macos-26-intel
+            nasm: true
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install NASM
+        env:
+          NEEDS_NASM: ${{ matrix.nasm }}
+        run: .github/scripts/ci/install-nasm-macos.sh
+      - name: Restore sccache directory
+        id: sccache-restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-${{ matrix.platform }}-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-${{ matrix.platform }}-
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - name: Configure compiler flags
+        run: .github/scripts/ci/configure-compiler-flags-macos.sh
+      - name: Prime sccache server
+        shell: bash
+        run: |
+          sccache --start-server || true
+          sccache --zero-stats || true
+      - name: Hydrate the test corpus (unit)
+        # The par3-rs insertion unit tests install into the original PAR-inside
+        # containers from the advanced corpus. The published `unit` profile
+        # predates them, so the `par3` profile rides along until a corpus
+        # revision carrying the widened `unit` profile is pinned.
+        run: cargo run --locked -p xtask -- test-corpus hydrate --profile unit --profile par3
+      - name: Run platform unit tests
+        run: cargo test --locked --workspace --lib --bins --no-fail-fast
+      - name: Show sccache stats
+        if: always()
+        shell: bash
+        run: sccache --show-stats || true
+      - name: Save sccache directory
+        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
+
+  platform-tests-windows:
+    name: platform-tests-${{ matrix.platform }}
+    needs: [changes, fmt, clippy, unit-tests]
+    if: needs.changes.outputs.crates == 'true'
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x86_64
+            runs_on: windows-2025-vs2026
+            nasm: true
+          - platform: windows-arm64
+            runs_on: windows-11-arm
+            nasm: false
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install NASM
+        shell: pwsh
+        env:
+          NEEDS_NASM: ${{ matrix.nasm }}
+        run: ./.github/scripts/ci/install-nasm.ps1
+      - name: Restore sccache directory
+        id: sccache-restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-${{ matrix.platform }}-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-${{ matrix.platform }}-
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - name: Configure compiler flags
+        # RUSTFLAGS replaces the [target.'cfg(all(windows, target_env = "msvc"))']
+        # rustflags in .cargo/config.toml rather than adding to them, so the
+        # 8 MiB main-thread stack reserve set there is repeated here.
+        shell: pwsh
+        run: |
+          "RUSTFLAGS=--remap-path-prefix=$env:GITHUB_WORKSPACE=. -C link-arg=/STACK:8388608" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: Prime sccache server
+        shell: bash
+        run: |
+          sccache --start-server || true
+          sccache --zero-stats || true
+      - name: Hydrate the test corpus (unit)
+        # The par3-rs insertion unit tests install into the original PAR-inside
+        # containers from the advanced corpus. The published `unit` profile
+        # predates them, so the `par3` profile rides along until a corpus
+        # revision carrying the widened `unit` profile is pinned.
+        run: cargo run --locked -p xtask -- test-corpus hydrate --profile unit --profile par3
+      - name: Run platform unit tests
+        run: cargo test --locked --workspace --lib --bins --no-fail-fast
+      - name: Show sccache stats
+        if: always()
+        shell: bash
+        run: sccache --show-stats || true
+      - name: Save sccache directory
+        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
+
+  target-checks-linux:
     name: target-checks-${{ matrix.platform }}
     needs: [changes, fmt, clippy, unit-tests]
     if: needs.changes.outputs.crates == 'true' || needs.changes.outputs.rarpar == 'true'
@@ -1016,22 +1119,6 @@ jobs:
             runs_on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             features: runtime,crypto-aws-lc,sevenz
-          - platform: darwin-arm64
-            runs_on: macos-26
-            target: aarch64-apple-darwin
-            features: runtime,crypto-aws-lc,sevenz
-          - platform: darwin-x86_64
-            runs_on: macos-26-intel
-            target: x86_64-apple-darwin
-            features: runtime,crypto-aws-lc,sevenz
-          - platform: windows-x86_64
-            runs_on: windows-2025-vs2026
-            target: x86_64-pc-windows-msvc
-            features: runtime,crypto-aws-lc,sevenz
-          - platform: windows-arm64
-            runs_on: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            features: runtime,crypto-aws-lc,sevenz
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -1045,39 +1132,10 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
-      - name: Install native build dependencies (Linux)
-        if: runner.os == 'Linux'
+      - name: Install build dependencies
         env:
           TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          packages=(mold)
-          case "$TARGET" in
-            x86_64-*) packages+=(nasm) ;;
-          esac
-          case "$TARGET" in
-            *-musl) packages+=(musl-tools) ;;
-          esac
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends "${packages[@]}"
-      - name: Install NASM (macOS)
-        if: matrix.platform == 'darwin-x86_64'
-        run: brew install nasm
-      - name: Install NASM (Windows x86_64)
-        if: matrix.platform == 'windows-x86_64'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $url = "https://www.nasm.us/pub/nasm/releasebuilds/3.01/win64/nasm-3.01-win64.zip"
-          $expectedSha256 = "e0ba5157007abc7b1a65118a96657a961ddf55f7e3f632ee035366dfce039ca4"
-          Invoke-WebRequest $url -OutFile nasm.zip
-          $actualSha256 = (Get-FileHash nasm.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualSha256 -ne $expectedSha256) {
-            throw "NASM checksum mismatch: expected $expectedSha256, got $actualSha256"
-          }
-          Expand-Archive nasm.zip -DestinationPath C:\nasm
-          $dir = (Get-ChildItem C:\nasm -Directory | Select-Object -First 1).FullName
-          $dir | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+        run: .github/scripts/ci/target-checks-install-build-dependencies-linux.sh
       - name: Restore sccache directory
         id: sccache-restore
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -1089,35 +1147,10 @@ jobs:
             gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-
       - name: Install sccache
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
-      - name: Configure compiler flags (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          set -euo pipefail
-          {
-            if [ "${{ runner.os }}" = "Linux" ]; then
-              echo "RUSTFLAGS=--remap-path-prefix=${GITHUB_WORKSPACE}=. -C link-arg=-fuse-ld=mold"
-              case "${{ matrix.target }}" in
-                *-musl)
-                  target_env="${{ matrix.target }}"
-                  target_env="${target_env//-/_}"
-                  printf 'CC_%s=%s\n' "$target_env" "sccache musl-gcc"
-                  ;;
-                *)
-                  echo "CC=sccache cc"
-                  echo "CXX=sccache c++"
-                  ;;
-              esac
-            else
-              echo "RUSTFLAGS=--remap-path-prefix=${GITHUB_WORKSPACE}=."
-              echo "CC=sccache clang"
-              echo "CXX=sccache clang++"
-            fi
-          } >> "$GITHUB_ENV"
-      - name: Configure compiler flags (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          "RUSTFLAGS=--remap-path-prefix=$env:GITHUB_WORKSPACE=." | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: Configure compiler flags
+        env:
+          TARGET: ${{ matrix.target }}
+        run: .github/scripts/ci/target-checks-configure-compiler-flags-linux.sh
       - name: Prime sccache server
         shell: bash
         run: |
@@ -1133,10 +1166,180 @@ jobs:
           --manifest tools/rarpar/Cargo.toml --target ${{ matrix.target }}
           --features ${{ matrix.features }}
       - name: Confirm the release feature list links AWS-LC
-        # Same guard the release workflow runs after its build, at PR time: the
-        # dependency graph of the exact matrix feature list must contain
-        # `aws-lc-sys`, so an entry that lost `crypto-aws-lc` fails here rather
-        # than shipping the RustCrypto backend.
+        env:
+          TARGET: ${{ matrix.target }}
+          FEATURES: ${{ matrix.features }}
+        run: .github/scripts/ci/target-checks-confirm-aws-lc.sh
+      - name: Check workspace target
+        run: cargo check --locked --workspace --all-targets --target ${{ matrix.target }}
+      - name: Show sccache stats
+        if: always()
+        shell: bash
+        run: sccache --show-stats || true
+      - name: Save sccache directory
+        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
+
+  target-checks-macos:
+    name: target-checks-${{ matrix.platform }}
+    needs: [changes, fmt, clippy, unit-tests]
+    if: needs.changes.outputs.crates == 'true' || needs.changes.outputs.rarpar == 'true'
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            runs_on: macos-26
+            target: aarch64-apple-darwin
+            features: runtime,crypto-aws-lc,sevenz
+            nasm: false
+          - platform: darwin-x86_64
+            runs_on: macos-26-intel
+            target: x86_64-apple-darwin
+            features: runtime,crypto-aws-lc,sevenz
+            nasm: true
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      - name: Install NASM
+        env:
+          NEEDS_NASM: ${{ matrix.nasm }}
+        run: .github/scripts/ci/install-nasm-macos.sh
+      - name: Restore sccache directory
+        id: sccache-restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-${{ matrix.platform }}-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-${{ matrix.platform }}-
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - name: Configure compiler flags
+        run: .github/scripts/ci/configure-compiler-flags-macos.sh
+      - name: Prime sccache server
+        shell: bash
+        run: |
+          sccache --start-server || true
+          sccache --zero-stats || true
+      - name: Check release target features
+        run: >-
+          cargo check --locked -p rarpar --no-default-features
+          --features ${{ matrix.features }} --target ${{ matrix.target }}
+      - name: Audit release target features
+        run: >-
+          cargo run --locked -p xtask -- feature-audit
+          --manifest tools/rarpar/Cargo.toml --target ${{ matrix.target }}
+          --features ${{ matrix.features }}
+      - name: Confirm the release feature list links AWS-LC
+        env:
+          TARGET: ${{ matrix.target }}
+          FEATURES: ${{ matrix.features }}
+        run: .github/scripts/ci/target-checks-confirm-aws-lc.sh
+      - name: Check workspace target
+        run: cargo check --locked --workspace --all-targets --target ${{ matrix.target }}
+      - name: Show sccache stats
+        if: always()
+        shell: bash
+        run: sccache --show-stats || true
+      - name: Save sccache directory
+        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
+
+  target-checks-windows:
+    name: target-checks-${{ matrix.platform }}
+    needs: [changes, fmt, clippy, unit-tests]
+    if: needs.changes.outputs.crates == 'true' || needs.changes.outputs.rarpar == 'true'
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x86_64
+            runs_on: windows-2025-vs2026
+            target: x86_64-pc-windows-msvc
+            features: runtime,crypto-aws-lc,sevenz
+            nasm: true
+          - platform: windows-arm64
+            runs_on: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            features: runtime,crypto-aws-lc,sevenz
+            nasm: false
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      - name: Install NASM
+        shell: pwsh
+        env:
+          NEEDS_NASM: ${{ matrix.nasm }}
+        run: ./.github/scripts/ci/install-nasm.ps1
+      - name: Restore sccache directory
+        id: sccache-restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-${{ matrix.platform }}-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-${{ matrix.platform }}-
+            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - name: Configure compiler flags
+        # RUSTFLAGS replaces the [target.'cfg(all(windows, target_env = "msvc"))']
+        # rustflags in .cargo/config.toml rather than adding to them, so the
+        # 8 MiB main-thread stack reserve set there is repeated here.
+        shell: pwsh
+        run: |
+          "RUSTFLAGS=--remap-path-prefix=$env:GITHUB_WORKSPACE=. -C link-arg=/STACK:8388608" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: Prime sccache server
+        shell: bash
+        run: |
+          sccache --start-server || true
+          sccache --zero-stats || true
+      - name: Check release target features
+        run: >-
+          cargo check --locked -p rarpar --no-default-features
+          --features ${{ matrix.features }} --target ${{ matrix.target }}
+      - name: Audit release target features
+        run: >-
+          cargo run --locked -p xtask -- feature-audit
+          --manifest tools/rarpar/Cargo.toml --target ${{ matrix.target }}
+          --features ${{ matrix.features }}
+      - name: Confirm the release feature list links AWS-LC
+        # The body of .github/scripts/ci/target-checks-confirm-aws-lc.sh, kept
+        # inline: this step runs under Git Bash, and Windows runners check the
+        # repository out with CRLF line endings (no .gitattributes), which bash
+        # does not accept in a script file.
         shell: bash
         run: |
           set -euo pipefail
@@ -1996,8 +2199,12 @@ jobs:
       - par2-tests
       - par3-tests
       - unrar-tests
-      - platform-tests
-      - target-checks
+      - platform-tests-linux
+      - platform-tests-macos
+      - platform-tests-windows
+      - target-checks-linux
+      - target-checks-macos
+      - target-checks-windows
       - package
       - docs-package
       - cli-smoke

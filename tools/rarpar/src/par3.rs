@@ -12,7 +12,9 @@ use par3_rs::runtime::{EngineError, ExecutionOptions, MemoryBudget};
 use par3_rs::session::{Par3RepairSession, RepairStatus};
 use par3_rs::source::{DiskSourceAccess, SourceAccess, SourceId};
 use par3_rs::{InputSetId, ScanLimits};
-use rarpar::cli::{Cli, Par3Args, Par3Codec, Par3Command, Par3CreateArgs, Par3Dedup, ParPlacement};
+use rarpar::cli::{
+    Cli, Par3Args, Par3Codec, Par3Command, Par3CreateArgs, Par3Dedup, Par3RepairArgs, ParPlacement,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -230,6 +232,30 @@ pub(crate) fn parent(path: &Path) -> PathBuf {
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
         .to_path_buf()
+}
+
+/// `--fsync`: synchronize each file a PAR3 subcommand wrote, once it has
+/// succeeded. par3-rs flushes its outputs but issues no storage barrier, so
+/// this is the only one. Parent directories are not synchronized.
+pub(crate) fn fsync_outputs<P: AsRef<Path>>(
+    paths: impl IntoIterator<Item = P>,
+) -> Result<(), RarparError> {
+    for path in paths {
+        let path = path.as_ref();
+        // Windows flushes a file's buffers only through a handle with write
+        // access; opening for write neither creates nor truncates it.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| {
+                RarparError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!("fsync {}: {error}", path.display()),
+                ))
+            })?;
+    }
+    Ok(())
 }
 
 pub(crate) fn reject_symlinks(path: &Path) -> Result<(), RarparError> {
@@ -487,10 +513,10 @@ pub fn run_command(cli: &Cli, command: Par3Command) -> Result<u8, RarparError> {
         Par3Command::Inside(command) => return crate::par3_inside::run(cli, command),
         Par3Command::Create(args) => create(cli, &args),
         Par3Command::Verify(args) => {
-            verify_repair(cli, &args, false).map(|outcome| (outcome.success, outcome.report))
+            verify_repair(cli, &args, false, false).map(|outcome| (outcome.success, outcome.report))
         }
-        Par3Command::Repair(args) => {
-            verify_repair(cli, &args, true).map(|outcome| (outcome.success, outcome.report))
+        Par3Command::Repair(Par3RepairArgs { set, fsync }) => {
+            verify_repair(cli, &set, true, fsync).map(|outcome| (outcome.success, outcome.report))
         }
         #[cfg(feature = "sevenz")]
         Par3Command::Archive(args) => crate::archive::run(cli, &args),
@@ -640,7 +666,7 @@ pub fn repair_set(cli: &Cli, set: &Par3Set) -> Result<RepairOutcome, RarparError
         .loaded
         .as_ref()
         .ok_or(EngineError::InvalidState("PAR3 carriers already released"))?;
-    verify_repair_loaded(cli, &args, true, loaded)
+    verify_repair_loaded(cli, &args, true, false, loaded)
 }
 
 impl RepairOutcome {
@@ -654,16 +680,22 @@ impl RepairOutcome {
     }
 }
 
-fn verify_repair(cli: &Cli, args: &Par3Args, repair: bool) -> Result<RepairOutcome, RarparError> {
+fn verify_repair(
+    cli: &Cli,
+    args: &Par3Args,
+    repair: bool,
+    fsync: bool,
+) -> Result<RepairOutcome, RarparError> {
     let options = options(cli)?;
     let loaded = load_selected(cli, args, &options)?;
-    verify_repair_loaded(cli, args, repair, &loaded)
+    verify_repair_loaded(cli, args, repair, fsync, &loaded)
 }
 
 fn verify_repair_loaded(
     cli: &Cli,
     args: &Par3Args,
     repair: bool,
+    fsync: bool,
     loaded: &LoadedSet,
 ) -> Result<RepairOutcome, RarparError> {
     // Discovery, every set, and any reassessment share cumulative budgets.
@@ -786,8 +818,14 @@ fn verify_repair_loaded(
         "requirements":assessment.requirements.iter().map(|need| json!({"matrix":need.matrix.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),"cohort":need.cohort,"cohorts":need.cohorts,"recovery_indices":need.recovery_indices,"available":need.available,"additional":need.additional})).collect::<Vec<_>>(),
         "installed":[], "reconstructed_blocks":0
     });
+    if repair {
+        report["fsync"] = json!(fsync);
+    }
     if repair && ready && !cli.dry_run {
         let result = session.repair(&root, !args.no_backup)?;
+        if fsync {
+            fsync_outputs(result.installed.iter().map(|file| &file.path))?;
+        }
         success = true;
         report["success"] = json!(true);
         report["status"] = json!("Repaired");
@@ -1076,7 +1114,7 @@ fn create(cli: &Cli, args: &Par3CreateArgs) -> Result<(bool, Value), RarparError
         }
     }
     let requirements = plan.requirements();
-    let report = json!({"operation":"par3_create", "success":true,"dry_run":cli.dry_run,"set_id":plan.input_set_id().to_string(),"outputs":outputs,"output_sizes":requirements.output_sizes,"blocks":requirements.blocks,"source_bytes":requirements.source_bytes,"reused_blocks":requirements.reused_blocks,"scratch_bytes":requirements.scratch_bytes,"metadata_bytes":requirements.metadata_bytes,"cohorts":requirements.cohorts,"field_bytes":requirements.field.size,"buffered":args.buffered});
+    let report = json!({"operation":"par3_create", "success":true,"dry_run":cli.dry_run,"set_id":plan.input_set_id().to_string(),"outputs":outputs,"output_sizes":requirements.output_sizes,"blocks":requirements.blocks,"source_bytes":requirements.source_bytes,"reused_blocks":requirements.reused_blocks,"scratch_bytes":requirements.scratch_bytes,"metadata_bytes":requirements.metadata_bytes,"cohorts":requirements.cohorts,"field_bytes":requirements.field.size,"fsync":args.fsync});
     if !cli.dry_run {
         let directory = parent(&stem);
         std::fs::create_dir_all(&directory)?;
@@ -1087,12 +1125,7 @@ fn create(cli: &Cli, args: &Par3CreateArgs) -> Result<(bool, Value), RarparError
         );
         let scratch = args.scratch_dir.as_deref().unwrap_or(stage.path());
         reject_symlinks(scratch)?;
-        let durability = if args.buffered {
-            par3_rs::creation::CreationDurability::Buffered
-        } else {
-            par3_rs::creation::CreationDurability::SyncFiles
-        };
-        let staged = plan.execute_with_durability(&stage_stem, scratch, durability)?;
+        let staged = plan.execute(&stage_stem, scratch)?;
         let mut installed = Vec::new();
         for (source, destination) in staged.iter().zip(&outputs) {
             let result = if cli.overwrite {
@@ -1108,6 +1141,9 @@ fn create(cli: &Cli, args: &Par3CreateArgs) -> Result<(bool, Value), RarparError
                 .into());
             }
             installed.push(destination.clone());
+        }
+        if args.fsync {
+            fsync_outputs(&installed)?;
         }
     }
     Ok((true, report))

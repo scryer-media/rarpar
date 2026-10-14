@@ -37,12 +37,49 @@ type MachinePlan struct {
 	Suites        []string                    `json:"suites"`
 	Perf          string                      `json:"perf"`
 	Bundle        Bundle                      `json:"bundle"`
+	Release       *ReleasePlan                `json:"release,omitempty"`
 	Oracles       map[string]OracleResolution `json:"oracles,omitempty"`
 	Remote        RemoteLayout                `json:"remote"`
 	Protocol      Protocol                    `json:"protocol"`
 	Steps         []string                    `json:"steps"`
 	Cloud         *CloudPlan                  `json:"cloud,omitempty"`
 	PAR3          *PAR3View                   `json:"par3,omitempty"`
+}
+
+// ReleasePlan is the published release asset a release bundle will stage, and
+// where it and the SHA256SUMS it is checked against come from.
+type ReleasePlan struct {
+	Tag        string `json:"tag"`
+	Platform   string `json:"platform"`
+	RustTarget string `json:"rust_target"`
+	Asset      string `json:"asset"`
+	Binary     string `json:"binary"`
+	ReleaseURL string `json:"release_url"`
+	AssetURL   string `json:"asset_url"`
+	SumsURL    string `json:"sha256sums_url"`
+}
+
+// releasePlan describes a release bundle's asset; nil for any other bundle.
+func releasePlan(bundle Bundle) *ReleasePlan {
+	if bundle.Source != BundleRelease {
+		return nil
+	}
+	platform, err := resolveReleasePlatform(bundle)
+	if err != nil {
+		return nil
+	}
+	tag := bundle.releaseTag()
+	asset := releaseAssetName(tag, platform)
+	return &ReleasePlan{
+		Tag:        tag,
+		Platform:   platform.Name,
+		RustTarget: platform.RustTarget,
+		Asset:      asset,
+		Binary:     platform.Binary,
+		ReleaseURL: releasePageURL(tag),
+		AssetURL:   releaseAssetURL(tag, asset),
+		SumsURL:    releaseAssetURL(tag, releaseSumsName),
+	}
 }
 
 // PAR3View is the macro-par3 matrix one machine will run.
@@ -98,8 +135,11 @@ func BuildPlan(config Config, machines []Machine, runID string) FleetPlan {
 		RunDir:        runDir,
 	}
 
-	cloud, cloudSSH, cloudSSM := false, false, false
+	cloud, cloudSSH, cloudSSM, release := false, false, false, false
 	for _, machine := range machines {
+		if machine.Bundle.Source == BundleRelease {
+			release = true
+		}
 		if machine.Kind == KindAWSEC2 {
 			cloud = true
 			if machine.usesSSM() {
@@ -109,9 +149,17 @@ func BuildPlan(config Config, machines []Machine, runID string) FleetPlan {
 			}
 		}
 	}
+	if release {
+		// The candidates are fixed before anything else runs: a release
+		// without the asset or its SHA256SUMS, or a hash mismatch, stops
+		// the round here.
+		plan.Preflight = append(plan.Preflight,
+			"rarpar release assets and their SHA256SUMS downloaded from "+releaseBaseURL+", each asset's sha256 checked against SHA256SUMS, before any credential check, host probe or launch")
+	}
 	if cloud {
-		// Credentials first, always: an expired session discovered after the
-		// first launch is how a fleet strands paid instances.
+		// Credentials before anything is built or launched, always: an
+		// expired session discovered after the first launch is how a fleet
+		// strands paid instances.
 		plan.Preflight = append(plan.Preflight,
 			"AWS credential check (sts get-caller-identity) before anything is built or launched",
 			fmt.Sprintf("vCPU quota arithmetic per launch wave against fleet.aws.total_vcpu_quota (%d), held machines charged against every later wave", config.Fleet.AWS.TotalVCPUQuota))
@@ -143,6 +191,7 @@ func BuildPlan(config Config, machines []Machine, runID string) FleetPlan {
 			Suites:        machine.Suites,
 			Perf:          machine.Capabilities.Perf,
 			Bundle:        machine.Bundle,
+			Release:       releasePlan(machine.Bundle),
 			Remote:        layout,
 			Protocol: Protocol{
 				WarmupPass:   machine.Run.WarmupPass(),
@@ -213,6 +262,10 @@ func BuildPlan(config Config, machines []Machine, runID string) FleetPlan {
 				Teardown:       teardown,
 			}
 		}
+		if machine.Bundle.Source == BundlePrebuilt {
+			plan.Warnings = append(plan.Warnings,
+				fmt.Sprintf("machine %s stages a prebuilt bundle from %s: a dev spot test, not the published release artifacts", machine.Name, machine.Bundle.Path))
+		}
 		if machine.isWindows() {
 			plan.Warnings = append(plan.Warnings,
 				fmt.Sprintf("machine %s is a Windows host: UNVALIDATED, the Windows transport (scp + PowerShell, no sh or tar) has never run live; treat this run as bring-up. The runner uploads and executes a .ps1 and perf is unavailable", machine.Name))
@@ -232,10 +285,17 @@ func BuildPlan(config Config, machines []Machine, runID string) FleetPlan {
 	return plan
 }
 
-func machineSteps(machine Machine, layout RemoteLayout) []string {
-	steps := []string{
-		fmt.Sprintf("assemble bundle (%s) and write BUILDINFO.json", machine.Bundle.Source),
+// bundleStep is the first step of every machine: what its bundle holds.
+func bundleStep(bundle Bundle) string {
+	if release := releasePlan(bundle); release != nil {
+		return fmt.Sprintf("assemble bundle (release %s: the verified %s from %s, Go harness cross-compiled here) and write BUILDINFO.json",
+			release.Tag, release.Binary, release.Asset)
 	}
+	return fmt.Sprintf("assemble bundle (%s from %s, a dev spot test) and write BUILDINFO.json", bundle.Source, bundle.Path)
+}
+
+func machineSteps(machine Machine, layout RemoteLayout) []string {
+	steps := []string{bundleStep(machine.Bundle)}
 	switch {
 	case machine.usesSSM():
 		market := "on-demand"
@@ -263,6 +323,9 @@ func machineSteps(machine Machine, layout RemoteLayout) []string {
 		"upload bundle by "+channel+" to "+layout.Bin,
 		"upload the generated run script to "+layout.Script,
 		startStep(machine))
+	if oracle, ok := machine.Oracles["rar"]; ok && oracle.Policy == OracleSourceBuild && oracle.Recipe == RecipeUnrarHost {
+		steps = append(steps, "on host: build the UnRAR oracle from the shipped, sha256-pinned source (stock makefile and CXXFLAGS, CXX=g++, static link, no -march/-mcpu/-mtune; refused if the makefile carries one)")
+	}
 	steps = append(steps, "on host: quiet-load gate")
 	if len(machine.families()) > 0 {
 		if machine.Run.WarmupPass() {
@@ -408,13 +471,12 @@ func WritePlanText(writer io.Writer, plan FleetPlan) {
 		fmt.Fprintf(writer, "MACHINE %s  [%s]  platform=%s\n", machine.Name, machine.Kind, machine.PlatformLabel)
 		fmt.Fprintf(writer, "  endpoint   %s (auth %s)\n", machine.Endpoint, machine.Auth)
 		fmt.Fprintf(writer, "  suites     %s\n", strings.Join(machine.Suites, ", "))
-		fmt.Fprintf(writer, "  bundle     %s", machine.Bundle.Source)
-		if machine.Bundle.Source == BundlePrebuilt {
-			fmt.Fprintf(writer, " from %s", machine.Bundle.Path)
+		if release := machine.Release; release != nil {
+			fmt.Fprintf(writer, "  bundle     release %s, asset %s (%s)\n", release.Tag, release.Asset, release.RustTarget)
+			fmt.Fprintf(writer, "             sha256 checked against %s before any launch\n", release.SumsURL)
 		} else {
-			fmt.Fprintf(writer, " %s target=%s on %s", machine.Bundle.Image, machine.Bundle.RustTarget, machine.Bundle.BuildHost)
+			fmt.Fprintf(writer, "  bundle     %s from %s (dev spot test, not a published release artifact)\n", machine.Bundle.Source, machine.Bundle.Path)
 		}
-		fmt.Fprintln(writer)
 		protocol := machine.Protocol
 		fmt.Fprintf(writer, "  protocol   warmup_pass=%t warmups=%d repeats=%d load<%s\n",
 			protocol.WarmupPass, protocol.Warmups, protocol.Repeats, trimFloat(protocol.QuietLoadMax))

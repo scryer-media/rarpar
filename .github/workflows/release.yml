@@ -224,13 +224,23 @@ jobs:
           cargo clippy --locked -p rarpar --all-targets -- -D warnings
           cargo test --locked -p rarpar --no-fail-fast
 
-  build:
+  # One build job per operating system, so each job lists exactly the steps
+  # its platforms run. Step bodies live in .github/scripts/release/, one script
+  # per step, and read the matrix through the job environment.
+  build-linux:
     name: build-${{ matrix.platform }}
     needs: [release-trust, preflight]
     runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 45
     env:
       RARPAR_RELEASE_TARGET_DIR: ${{ github.workspace }}/target/rarpar-release
+      RELEASE_PLATFORM: ${{ matrix.platform }}
+      RELEASE_TARGET: ${{ matrix.target }}
+      RELEASE_FEATURES: ${{ matrix.features }}
+      RELEASE_ARCHIVE_EXT: ${{ matrix.archive_ext }}
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -259,30 +269,6 @@ jobs:
             archive_ext: tar.gz
             features: runtime,crypto-aws-lc,sevenz
             package_root: false
-          - platform: darwin-arm64
-            runs_on: macos-26
-            target: aarch64-apple-darwin
-            archive_ext: tar.gz
-            features: runtime,crypto-aws-lc,sevenz
-            package_root: false
-          - platform: darwin-x86_64
-            runs_on: macos-26-intel
-            target: x86_64-apple-darwin
-            archive_ext: tar.gz
-            features: runtime,crypto-aws-lc,sevenz
-            package_root: false
-          - platform: windows-x86_64
-            runs_on: windows-2025-vs2026
-            target: x86_64-pc-windows-msvc
-            archive_ext: zip
-            features: runtime,crypto-aws-lc,sevenz
-            package_root: false
-          - platform: windows-arm64
-            runs_on: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            archive_ext: zip
-            features: runtime,crypto-aws-lc,sevenz
-            package_root: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -292,301 +278,31 @@ jobs:
         with:
           toolchain: 1.97.1
           targets: ${{ matrix.target }}
-      - name: Install native build dependencies (Linux)
-        if: runner.os == 'Linux'
-        shell: bash
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          packages=(mold)
-          case "$TARGET" in
-            x86_64-*) packages+=(nasm) ;;
-          esac
-          case "$TARGET" in
-            *-musl) packages+=(musl-tools) ;;
-          esac
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends "${packages[@]}"
-      - name: Install NASM (macOS)
-        if: matrix.platform == 'darwin-x86_64'
-        run: brew install nasm
-      - name: Install NASM (Windows)
-        if: matrix.platform == 'windows-x86_64'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $url = "https://www.nasm.us/pub/nasm/releasebuilds/3.01/win64/nasm-3.01-win64.zip"
-          $expectedSha256 = "e0ba5157007abc7b1a65118a96657a961ddf55f7e3f632ee035366dfce039ca4"
-          Invoke-WebRequest $url -OutFile nasm.zip
-          $actualSha256 = (Get-FileHash nasm.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualSha256 -ne $expectedSha256) {
-            throw "NASM checksum mismatch: expected $expectedSha256, got $actualSha256"
-          }
-          Expand-Archive nasm.zip -DestinationPath C:\nasm
-          $dir = (Get-ChildItem C:\nasm -Directory | Select-Object -First 1).FullName
-          $dir | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
-      - name: Exclude build dir from Windows Defender
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          try {
-            Add-MpPreference -ExclusionPath "${{ github.workspace }}" -ErrorAction Stop
-          } catch {
-            Write-Warning "Unable to configure Windows Defender exclusion: $($_.Exception.Message)"
-          }
-      - name: Configure build environment (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "${{ runner.os }}" in
-            Linux)
-              echo "RUSTFLAGS=--remap-path-prefix=${GITHUB_WORKSPACE}=. -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
-              case "${{ matrix.target }}" in
-                *-musl)
-                  target_env="${{ matrix.target }}"
-                  target_env="${target_env//-/_}"
-                  printf 'CC_%s=%s\n' "$target_env" "musl-gcc" >> "$GITHUB_ENV"
-                  ;;
-                *)
-                  echo "CC=cc" >> "$GITHUB_ENV"
-                  echo "CXX=c++" >> "$GITHUB_ENV"
-                  ;;
-              esac
-              ;;
-            macOS)
-              echo "RUSTFLAGS=--remap-path-prefix=${GITHUB_WORKSPACE}=." >> "$GITHUB_ENV"
-              echo "CC=clang" >> "$GITHUB_ENV"
-              echo "CXX=clang++" >> "$GITHUB_ENV"
-              ;;
-          esac
-      - name: Configure build environment (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          "RUSTFLAGS=--remap-path-prefix=$env:GITHUB_WORKSPACE=. -Clinker=lld-link" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-      - name: Stage rarpar release source (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${RELEASE_TAG#rarpar-v}"
-          cargo package --locked --no-verify -p rarpar
-          rm -rf "$RUNNER_TEMP/rarpar-release-source"
-          mkdir -p "$RUNNER_TEMP/rarpar-release-source"
-          tar -xzf "target/package/rarpar-${version}.crate" -C "$RUNNER_TEMP/rarpar-release-source"
-          source_dir="$RUNNER_TEMP/rarpar-release-source/rarpar-${version}"
-          cargo metadata --locked --format-version 1 --no-deps \
-            --manifest-path "$source_dir/Cargo.toml" \
-            > "$RUNNER_TEMP/rarpar-release-source/metadata.json"
-          python3 - "$RUNNER_TEMP/rarpar-release-source/metadata.json" <<'PY'
-          import json
-          import sys
-
-          metadata = json.load(open(sys.argv[1], "r", encoding="utf-8"))
-          package = next(
-              package for package in metadata["packages"] if package["name"] == "rarpar"
-          )
-          dependencies = {dep["name"]: dep for dep in package["dependencies"]}
-          for name in ("par2-rs", "unrar-rs"):
-              dep = dependencies.get(name)
-              if dep is None or dep.get("source") is None or dep.get("path") or not dep.get("req"):
-                  print(f"{name} must be a registry dependency in packaged rarpar", file=sys.stderr)
-                  sys.exit(1)
-          PY
-          echo "RARPAR_RELEASE_SOURCE=$source_dir" >> "$GITHUB_ENV"
-      - name: Stage rarpar release source (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $version = $env:RELEASE_TAG -replace '^rarpar-v', ''
-          cargo package --locked --no-verify -p rarpar
-          $root = Join-Path $env:RUNNER_TEMP "rarpar-release-source"
-          Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force $root | Out-Null
-          tar -xzf "target/package/rarpar-$version.crate" -C $root
-          $sourceDir = Join-Path $root "rarpar-$version"
-          $manifest = Join-Path $sourceDir "Cargo.toml"
-          $metadata = Join-Path $root "metadata.json"
-          cargo metadata --locked --format-version 1 --no-deps --manifest-path $manifest `
-            | Out-File -Encoding utf8 $metadata
-          $check = @'
-          import json
-          import sys
-
-          metadata = json.load(open(sys.argv[1], "r", encoding="utf-8"))
-          package = next(
-              package for package in metadata["packages"] if package["name"] == "rarpar"
-          )
-          dependencies = {dep["name"]: dep for dep in package["dependencies"]}
-          for name in ("par2-rs", "unrar-rs"):
-              dep = dependencies.get(name)
-              if dep is None or dep.get("source") is None or dep.get("path") or not dep.get("req"):
-                  print(f"{name} must be a registry dependency in packaged rarpar", file=sys.stderr)
-                  sys.exit(1)
-          '@
-          $check | python3 - $metadata
-          if ($LASTEXITCODE -ne 0) {
-            throw "packaged rarpar manifest dependency validation failed"
-          }
-          "RARPAR_RELEASE_SOURCE=$sourceDir" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-      - name: Audit release target features (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: >-
-          cargo run --locked -p xtask -- feature-audit
-          --manifest "$RARPAR_RELEASE_SOURCE/Cargo.toml" --target ${{ matrix.target }}
-          --features ${{ matrix.features }}
-      - name: Audit release target features (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $manifest = Join-Path $env:RARPAR_RELEASE_SOURCE "Cargo.toml"
-          cargo run --locked -p xtask -- feature-audit `
-            --manifest $manifest --target ${{ matrix.target }} `
-            --features ${{ matrix.features }}
-      - name: Build rarpar (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p logs
-          cargo build --locked --release --no-default-features \
-            --manifest-path "$RARPAR_RELEASE_SOURCE/Cargo.toml" \
-            --features "${{ matrix.features }}" \
-            --target "${{ matrix.target }}" \
-            --target-dir "$RARPAR_RELEASE_TARGET_DIR" 2>&1 \
-            | tee "logs/rarpar-${{ matrix.platform }}-build.log"
-      - name: Build rarpar (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          New-Item -ItemType Directory -Force logs | Out-Null
-          $manifest = Join-Path $env:RARPAR_RELEASE_SOURCE "Cargo.toml"
-          cargo build --locked --release --no-default-features `
-            --manifest-path $manifest `
-            --features ${{ matrix.features }} `
-            --target ${{ matrix.target }} `
-            --target-dir $env:RARPAR_RELEASE_TARGET_DIR 2>&1 `
-            | Tee-Object -FilePath "logs\rarpar-${{ matrix.platform }}-build.log"
-      - name: Confirm the built artifact links AWS-LC (Unix)
-        # The feature audit reads the resolver's feature sets; this reads the
-        # dependency graph of the exact feature list that was just built. Both
-        # have to agree that `aws-lc-sys` is in it before the binary ships: a
-        # matrix entry that lost `crypto-aws-lc` would otherwise build, test
-        # and release a RustCrypto binary without a word.
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          log="logs/rarpar-${{ matrix.platform }}-tree.log"
-          cargo tree --locked -e normal \
-            --manifest-path "$RARPAR_RELEASE_SOURCE/Cargo.toml" \
-            --no-default-features --features "${{ matrix.features }}" \
-            --target "${{ matrix.target }}" > "$log"
-          if ! grep -q aws-lc-sys "$log"; then
-            echo "::error::release build resolved no aws-lc-sys; the crypto backend regressed to RustCrypto"
-            exit 1
-          fi
-      - name: Confirm the built artifact links AWS-LC (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $manifest = Join-Path $env:RARPAR_RELEASE_SOURCE "Cargo.toml"
-          $log = "logs\rarpar-${{ matrix.platform }}-tree.log"
-          cargo tree --locked -e normal `
-            --manifest-path $manifest `
-            --no-default-features --features ${{ matrix.features }} `
-            --target ${{ matrix.target }} | Out-File -Encoding utf8 $log
-          if (-not (Select-String -Path $log -Pattern "aws-lc-sys" -Quiet)) {
-            throw "release build resolved no aws-lc-sys; the crypto backend regressed to RustCrypto"
-          }
+      - name: Install build dependencies
+        run: .github/scripts/release/install-build-dependencies-linux.sh
+      - name: Configure build environment
+        run: .github/scripts/release/configure-build-environment-linux.sh
+      - name: Stage rarpar release source
+        run: .github/scripts/release/stage-release-source.sh
+      - name: Audit release target features
+        run: .github/scripts/release/audit-release-target-features.sh
+      - name: Build rarpar
+        run: .github/scripts/release/build-rarpar.sh
+      - name: Confirm the release binary carries no symbol table
+        run: .github/scripts/release/confirm-no-symbol-table-linux.sh
+      - name: Confirm the built artifact links AWS-LC
+        run: .github/scripts/release/confirm-aws-lc.sh
       - name: Generate manpage and completions
-        shell: bash
         run: cargo run --locked -p xtask -- docs --out target/dist/docs
       - name: Hydrate the test corpus (cli)
-        shell: bash
         run: cargo run --locked -p xtask -- test-corpus hydrate --profile cli
-      - name: Smoke test release binary (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          exe="$RARPAR_RELEASE_TARGET_DIR/${{ matrix.target }}/release/rarpar"
-          "$exe" --help > "logs/rarpar-${{ matrix.platform }}-help.log"
-          "$exe" --version > "logs/rarpar-${{ matrix.platform }}-version.log"
-          grep -Fxq "rarpar ${RELEASE_TAG#rarpar-v}" "logs/rarpar-${{ matrix.platform }}-version.log"
-          "$exe" lb crates/unrar-rs/tests/fixtures/rar5/rar5_store.rar \
-            > "logs/rarpar-${{ matrix.platform }}-lb.log"
-          grep -Fxq small.txt "logs/rarpar-${{ matrix.platform }}-lb.log"
-      - name: Smoke test release binary (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $exe = Join-Path $env:RARPAR_RELEASE_TARGET_DIR "${{ matrix.target }}\release\rarpar.exe"
-          & $exe --help | Tee-Object -FilePath "logs\rarpar-${{ matrix.platform }}-help.log"
-          & $exe --version | Tee-Object -FilePath "logs\rarpar-${{ matrix.platform }}-version.log"
-          $version = Get-Content "logs\rarpar-${{ matrix.platform }}-version.log" -Raw
-          if ($version.Trim() -ne "rarpar $($env:RELEASE_TAG -replace '^rarpar-v', '')") {
-            throw "rarpar --version output did not match release tag"
-          }
-          & $exe lb crates\unrar-rs\tests\fixtures\rar5\rar5_store.rar `
-            | Tee-Object -FilePath "logs\rarpar-${{ matrix.platform }}-lb.log"
-          if (-not (Select-String -Path "logs\rarpar-${{ matrix.platform }}-lb.log" -Pattern '^small\.txt$' -Quiet)) {
-            throw "rarpar lb smoke test did not list small.txt"
-          }
-      - name: Package artifact (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          archive="rarpar-${RELEASE_TAG}-${{ matrix.platform }}.${{ matrix.archive_ext }}"
-          rm -rf package
-          mkdir -p package dist
-          cp "$RARPAR_RELEASE_TARGET_DIR/${{ matrix.target }}/release/rarpar" package/
-          cp README.md package/
-          cp tools/rarpar/LICENSE package/LICENSE
-          cp LICENSE package/LICENSE.GPL-3.0-or-later
-          cp crates/unrar-rs/LICENSE package/LICENSE.unrar-rs
-          cp -R target/dist/docs/share package/share
-          tar -czf "$archive" -C package .
-          mv "$archive" dist/
-      - name: Package artifact (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $archive = "rarpar-$env:RELEASE_TAG-${{ matrix.platform }}.${{ matrix.archive_ext }}"
-          Remove-Item -Recurse -Force package -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force package, dist | Out-Null
-          Copy-Item (Join-Path $env:RARPAR_RELEASE_TARGET_DIR "${{ matrix.target }}\release\rarpar.exe") package\
-          Copy-Item README.md package\
-          Copy-Item tools\rarpar\LICENSE package\LICENSE
-          Copy-Item LICENSE package\LICENSE.GPL-3.0-or-later
-          Copy-Item crates\unrar-rs\LICENSE package\LICENSE.unrar-rs
-          Copy-Item target\dist\docs\share package\share -Recurse
-          Compress-Archive -Path package\* -DestinationPath $archive
-          Move-Item $archive dist\
-      - name: Stage package root inspection artifact (Linux GNU)
+      - name: Smoke test release binary
+        run: .github/scripts/release/smoke-test-release-binary.sh
+      - name: Package artifact
+        run: .github/scripts/release/package-artifact.sh
+      - name: Stage package root inspection artifact
         if: matrix.package_root
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf package-root package-roots
-          mkdir -p package-roots
-          cargo run --locked -p xtask -- package-root \
-            --binary "$RARPAR_RELEASE_TARGET_DIR/${{ matrix.target }}/release/rarpar" \
-            --docs target/dist/docs \
-            --out package-root \
-            --target "${{ matrix.target }}"
-          tar -czf "package-roots/package-root-${RELEASE_TAG}-${{ matrix.platform }}.tar.gz" \
-            -C package-root .
+        run: .github/scripts/release/stage-package-root-linux.sh
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -605,9 +321,162 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  build-macos:
+    name: build-${{ matrix.platform }}
+    needs: [release-trust, preflight]
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 45
+    env:
+      RARPAR_RELEASE_TARGET_DIR: ${{ github.workspace }}/target/rarpar-release
+      RELEASE_PLATFORM: ${{ matrix.platform }}
+      RELEASE_TARGET: ${{ matrix.target }}
+      RELEASE_FEATURES: ${{ matrix.features }}
+      RELEASE_ARCHIVE_EXT: ${{ matrix.archive_ext }}
+      RELEASE_NASM: ${{ matrix.nasm }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            runs_on: macos-26
+            target: aarch64-apple-darwin
+            archive_ext: tar.gz
+            features: runtime,crypto-aws-lc,sevenz
+            nasm: false
+          - platform: darwin-x86_64
+            runs_on: macos-26-intel
+            target: x86_64-apple-darwin
+            archive_ext: tar.gz
+            features: runtime,crypto-aws-lc,sevenz
+            nasm: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+        with:
+          toolchain: 1.97.1
+          targets: ${{ matrix.target }}
+      - name: Install NASM
+        run: .github/scripts/release/install-nasm-macos.sh
+      - name: Configure build environment
+        run: .github/scripts/release/configure-build-environment-macos.sh
+      - name: Stage rarpar release source
+        run: .github/scripts/release/stage-release-source.sh
+      - name: Audit release target features
+        run: .github/scripts/release/audit-release-target-features.sh
+      - name: Build rarpar
+        run: .github/scripts/release/build-rarpar.sh
+      - name: Confirm the release binary carries no symbol table
+        run: .github/scripts/release/confirm-no-symbol-table-macos.sh
+      - name: Confirm the built artifact links AWS-LC
+        run: .github/scripts/release/confirm-aws-lc.sh
+      - name: Generate manpage and completions
+        run: cargo run --locked -p xtask -- docs --out target/dist/docs
+      - name: Hydrate the test corpus (cli)
+        run: cargo run --locked -p xtask -- test-corpus hydrate --profile cli
+      - name: Smoke test release binary
+        run: .github/scripts/release/smoke-test-release-binary.sh
+      - name: Package artifact
+        run: .github/scripts/release/package-artifact.sh
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rarpar-release-${{ matrix.platform }}
+          path: |
+            dist/*
+            logs/*
+          if-no-files-found: error
+          retention-days: 14
+
+  build-windows:
+    name: build-${{ matrix.platform }}
+    needs: [release-trust, preflight]
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 45
+    env:
+      RARPAR_RELEASE_TARGET_DIR: ${{ github.workspace }}/target/rarpar-release
+      RELEASE_PLATFORM: ${{ matrix.platform }}
+      RELEASE_TARGET: ${{ matrix.target }}
+      RELEASE_FEATURES: ${{ matrix.features }}
+      RELEASE_ARCHIVE_EXT: ${{ matrix.archive_ext }}
+      RELEASE_NASM: ${{ matrix.nasm }}
+    defaults:
+      run:
+        shell: pwsh
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x86_64
+            runs_on: windows-2025-vs2026
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+            features: runtime,crypto-aws-lc,sevenz
+            nasm: true
+          - platform: windows-arm64
+            runs_on: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            archive_ext: zip
+            features: runtime,crypto-aws-lc,sevenz
+            nasm: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+        with:
+          toolchain: 1.97.1
+          targets: ${{ matrix.target }}
+      - name: Install NASM
+        run: ./.github/scripts/release/install-nasm.ps1
+      - name: Exclude build dir from Windows Defender
+        run: ./.github/scripts/release/exclude-build-dir-from-defender.ps1
+      - name: Configure build environment
+        run: ./.github/scripts/release/configure-build-environment.ps1
+      - name: Stage rarpar release source
+        run: ./.github/scripts/release/stage-release-source.ps1
+      - name: Audit release target features
+        run: ./.github/scripts/release/audit-release-target-features.ps1
+      - name: Build rarpar
+        run: ./.github/scripts/release/build-rarpar.ps1
+      - name: Confirm the 8 MiB stack reserve
+        run: ./.github/scripts/release/confirm-stack-reserve.ps1
+      # No symbol-table check here. rustc passes /DEBUG and /PDBALTPATH:%_PDB%
+      # to every MSVC link whatever the strip setting, so the executable always
+      # carries a CodeView entry naming rarpar.pdb, and its symbols are in that
+      # PDB, which the package does not include. No check exists without new
+      # tools.
+      - name: Confirm the built artifact links AWS-LC
+        run: ./.github/scripts/release/confirm-aws-lc.ps1
+      - name: Generate manpage and completions
+        shell: bash
+        run: cargo run --locked -p xtask -- docs --out target/dist/docs
+      - name: Hydrate the test corpus (cli)
+        shell: bash
+        run: cargo run --locked -p xtask -- test-corpus hydrate --profile cli
+      - name: Smoke test release binary
+        run: ./.github/scripts/release/smoke-test-release-binary.ps1
+      - name: Package artifact
+        run: ./.github/scripts/release/package-artifact.ps1
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rarpar-release-${{ matrix.platform }}
+          path: |
+            dist/*
+            logs/*
+          if-no-files-found: error
+          retention-days: 14
+
   collect:
     name: collect-and-sign-archives
-    needs: [build]
+    needs: [build-linux, build-macos, build-windows]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

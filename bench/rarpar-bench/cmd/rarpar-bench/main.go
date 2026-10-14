@@ -80,7 +80,7 @@ func usage() {
   rarpar-bench run --corpus DIR --plan FILE --candidate PATH --out DIR [--reference-rar PATH --reference-par2 PATH] [--source-manifest PATH --source-target TRIPLE] [--perf]
   rarpar-bench report --input FILE --out FILE   (also writes FILE with .md: wall, CPU, peak RSS)
   rarpar-bench render --input FILE --out DIR
-  rarpar-bench fleet plan|run|collect|teardown --config PATH
+  rarpar-bench fleet plan|run|collect|teardown --config PATH   (rarpar-bench fleet help)
   rarpar-bench par3 matrix|build-reference|run|report ...   (rarpar-bench par3 help)
   rarpar-bench nfs run|down|server|ready|client ...         (rarpar-bench nfs help)
 

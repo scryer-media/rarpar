@@ -727,7 +727,7 @@ impl CarrierPlan {
                 }
             }
         }
-        out.sync_all()?;
+        out.flush()?;
         drop(out);
         if std::fs::metadata(temporary)?.len() != self.bytes {
             return Err(EngineError::InvalidState("rebuilt carrier length differs"));

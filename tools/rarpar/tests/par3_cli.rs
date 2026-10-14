@@ -402,6 +402,62 @@ fn repair_rejects_target_filesystem_aliases_before_installation() {
     }
 }
 
+/// par3-rs issues no storage barriers; `--fsync` is the opt-in that syncs
+/// the files `par3 create` and `par3 repair` wrote, and the report says
+/// which way each run went. `--buffered` is gone, and verify writes nothing
+/// so it takes no `--fsync`.
+#[test]
+fn create_and_repair_report_and_honour_fsync() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let bytes = input(root, "data.bin");
+    let create = |stem: &str, extra: &[&str]| {
+        let mut args = vec!["par3", "create", stem, "data.bin", "-s", "256", "-c", "2"];
+        args.extend(extra);
+        run(root, &args, 0)
+    };
+    let plain = create("plain.par3", &[]);
+    assert_eq!(plain["fsync"], false);
+    let synced = create("synced.par3", &["--fsync"]);
+    assert_eq!(synced["fsync"], true);
+    for (left, right) in plain["outputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(synced["outputs"].as_array().unwrap())
+    {
+        let left = std::fs::read(root.join(left.as_str().unwrap())).unwrap();
+        let right = std::fs::read(root.join(right.as_str().unwrap())).unwrap();
+        assert_eq!(left.len(), right.len());
+    }
+    run(root, &["par3", "verify", "synced.par3"], 0);
+
+    let mut damaged = bytes.clone();
+    damaged[10] ^= 0x80;
+    std::fs::write(root.join("data.bin"), &damaged).unwrap();
+    let repaired = run(root, &["par3", "repair", "synced.par3", "--fsync"], 0);
+    assert_eq!(repaired["fsync"], true);
+    assert_eq!(repaired["installed"].as_array().unwrap().len(), 1);
+    assert_eq!(std::fs::read(root.join("data.bin")).unwrap(), bytes);
+
+    std::fs::write(root.join("data.bin"), &damaged).unwrap();
+    let repaired = run(root, &["par3", "repair", "plain.par3", "--no-backup"], 0);
+    assert_eq!(repaired["fsync"], false);
+    assert_eq!(std::fs::read(root.join("data.bin")).unwrap(), bytes);
+
+    for args in [
+        &["par3", "create", "gone.par3", "data.bin", "--buffered"][..],
+        &["par3", "verify", "plain.par3", "--fsync"][..],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_rarpar"))
+            .current_dir(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+    }
+}
+
 #[test]
 fn cauchy_create_verify_repair_preserves_clean_files_and_backups() {
     let temp = tempfile::tempdir().unwrap();

@@ -4,7 +4,7 @@ package fleet
 // harnesses (bench/lzma-turbo-bench, bench/sevenz-turbo-bench), which each
 // write a report.json a fleet collects.
 //
-// Both candidates are built ON THE HOST, not in the bundle container. The
+// Both candidates are built ON THE HOST, not on the orchestrator. The
 // lzma harness refuses a binary whose embedded commit is not the checkout's
 // clean HEAD, both harnesses record the checkout's rustc and Cargo.lock as
 // provenance, and lzma's fixture generation and pinned 7-Zip fetch run

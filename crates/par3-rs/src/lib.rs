@@ -94,6 +94,8 @@
 //! - Inferring an unknown carrier's original byte order or missing metadata.
 //!   Exact restoration requires a captured manifest; explicit replacement APIs
 //!   report replacement separately from protected-data completeness.
+//! - Storage barriers: outputs are flushed, never synchronized to storage.
+//!   Durability is the caller's, by synchronizing the returned output paths.
 //!
 //! The workspace's `rarpar` binary exposes `par3 create`, `par3 verify`,
 //! `par3 repair`, `par3 archive` (a 7z or ZIP archive protected in the same

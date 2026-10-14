@@ -12,7 +12,7 @@ mod driver {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use par3_rs::creation::{CreationDurability, CreationOptions};
+    use par3_rs::creation::CreationOptions;
     use par3_rs::inside::rar4::{self, Crypto, Layout, RarCipher};
     use par3_rs::inside::rar5::{Rar5Placement, placement_counts};
     use par3_rs::runtime::ExecutionOptions;
@@ -126,7 +126,6 @@ mod driver {
                     spec,
                     options,
                     scratch.path(),
-                    CreationDurability::Buffered,
                     crypto.as_deref(),
                 )?;
                 println!("spec {spec:?} block_size {block_size} recovery {count}");
