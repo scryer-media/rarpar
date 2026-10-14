@@ -211,9 +211,10 @@ record_cases = ["par2-generate-rar5-v7-volumes", "rar5-v7-solid-multivolume"]
 stat_repeats = 3
 record_frequency = 499
 # macro-par3 runs its own perf pass inside `par3 run`, untimed, after each
-# op's timed runs, on the plain sets and the first target: stat_repeats perf
-# stat runs of the reference and every rarpar row of these ops, each on a
-# fresh stage. Default on a linux-perf host: ["repair"]; [] turns it off.
+# listed op's timed runs, on the plain sets: stat_repeats perf stat runs of
+# the reference and every rarpar row of these ops, each on a fresh stage.
+# Every op listed adds stat_repeats untimed runs per row and set. Default on a
+# linux-perf host with macro-par3: ["repair"]; [] turns it off.
 par3_ops = ["repair"]
 # One perf record -F record_frequency run of every rarpar row of these plain
 # sets, per op above, kept as perf script text and folded stacks. Default: none.
@@ -234,6 +235,9 @@ version = "par3cmdline 0.0.1 (2971702e)"
 profile = "full"                         # full | smoke | fleet
 # sets = ["a-gf16", "c-gf16"]            # default: every set in the profile
 # ops = ["create", "verify", "repair"]   # default; verify-damaged is opt-in
+# Per worker count, rarpar-wN runs every op and repairs in place with no
+# backup; rarpar-wN-backup runs repair only and keeps a numbered .1 backup, as
+# the reference does (like for like on bytes written).
 workers = [1, 8]                         # rarpar rows; the reference is single-threaded
 warmups = 1
 repeats = 5

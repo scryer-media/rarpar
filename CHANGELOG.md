@@ -53,6 +53,45 @@ documented in each crate's own changelog so those notes ship with the crate.
   `rarpar-par3-bench-v2`, which drops the durability fields and adds
   `buffered_args` and `buffered_unsupported`; the v2 harness refuses a v1
   file. No version impact of its own.
+- `rarpar-bench par3` and the fleet `macro-par3` suite split every `rarpar`
+  repair row in two. `rarpar-wN` repairs in place and keeps no backup; the
+  new repair-only `rarpar-wN-backup` keeps a numbered `.1` backup of every
+  file it repairs, as par3cmdline does, so it is the row that is like for
+  like with the reference on bytes written. Each row's switch comes from
+  `rarpar par3 repair --help`: `--backup` for the `-backup` rows where the
+  help lists it, `--no-backup` for the in-place rows where it lists that
+  (0.7.0 and earlier); a help that lists neither runs only the `-backup`
+  rows, plain, with a note. A repair whose numbered backups contradict its
+  row fails as `backup-mismatch`. A PAR-inside set keeps its one compatible
+  `rs` row. The report, the repair SVG labels, `par3 matrix` and the fleet
+  plan name the like-for-like rows. `results.json` moves on to schema
+  `rarpar-par3-bench-v3`, adding `backup_args` and `in_place_unsupported`;
+  the v3 harness refuses v1 and v2 files. `par3 versus` gives each PAR3 arm a
+  `-backup` repair twin on the same set, reports what each repair left
+  behind and whether each PAR2/PAR3 pair is like for like on bytes written,
+  and moves to schema `rarpar-par3-versus-v2`, refusing v1. No version
+  impact of its own.
+- An `engine_perf` create or repair counts as buffered only on its own
+  output evidence: a build that synced, or cannot show it did not, fails
+  its timed row as `engine-not-buffered` and has its untimed stage breakdown
+  flagged. The report no longer says a PAR-inside set's compatible repair
+  runs buffered; it syncs the rebuilt carrier. No version impact of its own.
+- `rarpar-bench par3 run` gains an untimed Linux perf pass after each
+  covered op's timed runs, on the plain sets: `--perf-stat N` runs every
+  reference and `rarpar` row of `--perf-ops` (default `repair`) N times
+  under `perf stat`, and `--perf-record SET` runs each `rarpar` row of that
+  set once under `perf record` (`--perf-freq`, default 499), kept as perf
+  script text and folded stacks under `--perf-out`. `results.json` gains
+  `perf` and `perf_runs`, the report a counter table per row, and a pass
+  that was skipped, had a perf run fail, or ran nothing writes
+  `INCOMPLETE.txt`. A fleet `linux-perf` machine with `macro-par3` now runs
+  it (`perf.par3_ops`, default `["repair"]`, and `perf.par3_record_sets`)
+  and warns `par3-perf-incomplete` when it falls short. Until now the
+  fleet's perf pass covered only the corpus suites, so macro-par3 rows never
+  ran under perf, and the plan's perf line listed the record cases whether
+  or not they ran ("(none)" when there were none). The plan now names only
+  what runs, and a `samply` machine that runs no corpus suite no longer
+  tries to profile corpus cases. No version impact of its own.
 
 ## rarpar 0.7.0
 

@@ -160,9 +160,9 @@ func RunScript(machine Machine, defaults RunDefaults, runID string, layout Remot
 	write(`log() { echo "[$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)] $*"; }`)
 	write(`fail() { STATUS=failed; FAILURES="$FAILURES $1"; log "FAILURE: $1"; }`)
 	// A diagnostic pass that cannot run does not invalidate the timed evidence,
-	// so it is recorded separately rather than failing the host. Hybrid-CPU perf
-	// output, for instance, defeats the harness's perf-stat parser while the
-	// measurements themselves are perfectly good.
+	// so it is recorded separately rather than failing the host: a host without
+	// perf, for instance, or a macro-par3 perf pass that fell short, while the
+	// timed measurements themselves are perfectly good.
 	write(`warn() { WARNINGS="$WARNINGS $1"; log "WARNING: $1"; }`)
 	write("")
 	write("# sha256 helper: coreutils on Linux, shasum on BSD-class userlands.")

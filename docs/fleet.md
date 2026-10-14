@@ -232,7 +232,7 @@ Append a `[[machines]]` block. The mandatory decisions:
 | `kind` | `local-ssh` (a machine you own) or `aws-ec2` (launched and destroyed per run; `ec2.access` = `ssh` or `ssm`) |
 | `platform_label` | Names the SVGs and the report machine label. Must be unique — a collision overwrites another machine's charts |
 | `suites` | `macro-rar`, `macro-par2`, `macro-par3`; `crc-probe` and `yenc-micro` from a prebuilt bundle only |
-| `capabilities.perf` | `linux-perf`, `samply`, or `none`. Decides which diagnostic pass runs |
+| `capabilities.perf` | `linux-perf`, `samply`, or `none`. Decides which diagnostic pass runs; `linux-perf` also runs the macro-par3 perf pass (`perf.par3_ops`) |
 | `capabilities.no_pgrep` | Set on busybox-class appliances; the load gate falls back to `ps -ef \| grep` |
 | `bundle.source` | `release` (the default: the published release asset, with `tag` or `version`) or `prebuilt` (stage a local directory; dev spot tests only) |
 | `oracles.*` | `host-path`, `official-binary`, or `source-build` |
@@ -291,9 +291,9 @@ oracle.
 A host is only *failed* when its measured evidence is compromised — a corpus
 that does not verify, a suite that did not run, a report that was not written.
 A diagnostic pass that could not run is recorded as a **warning** instead: the
-timed numbers stand, and the summary says what was missed. `perf stat` output on
-Intel hybrid (P-core + E-core) CPUs, for instance, defeats the harness's
-counter parser while the measurements themselves are perfectly good.
+timed numbers stand, and the summary says what was missed. A host without
+`perf`, for instance, warns `perf-missing`, and a macro-par3 perf pass that
+fell short warns `par3-perf-incomplete`.
 
 Both lists travel in the host manifest and appear in `fleet-summary.json`.
 
@@ -370,9 +370,11 @@ version = "unrar 7.2.3 (portable on-host build)"
 
 Add `macro-par3` to a machine's `suites` and give it a `par3` oracle. The
 bundle then carries `toolchains.json`, and the host runs `rarpar-bench par3 run`
-before the perf pass. Evidence goes to `<results>/par3/` (`results.json`,
-`runs.jsonl`, `report.md`), and logs go to `par3-run.out`/`.err`. The suite
-itself is documented in [benchmarking.md](benchmarking.md#par3-suite).
+before the corpus suites' perf pass. Evidence goes to `<results>/par3/`
+(`results.json`, `runs.jsonl`, `report.md`), and logs go to
+`par3-run.stdout.log` and `par3-run.stderr.log` (`par3-run.log` on Windows).
+The suite itself is documented in
+[benchmarking.md](benchmarking.md#par3-suite).
 
 ```toml
 [machines.oracles.par3]
@@ -400,11 +402,51 @@ timeout_minutes = 20              # per run, rarpar rows too; a reference over i
   lists `--buffered` (0.6.x and earlier) gets it, one that lists only
   `--fsync` (0.7.0 and later) is buffered when run plain, and one that lists
   neither runs the plain command and says so in the report notes. A
-  `par3.durability` key is a config error. In the text plan, the macro-par3
-  step reads "one buffered rarpar row per worker count (never --fsync)" and
-  gives the per-run timeout, and the machine's `par3` block lists the
-  variants and the rows each op produces; `--json` carries the same rows
-  under `par3.rows`.
+  `par3.durability` key is a config error.
+- **Repair rows.** Each worker count also gets a repair-only
+  `rarpar-wN-backup` row. `rarpar-wN` repairs in place with no backup;
+  `rarpar-wN-backup` keeps a numbered `.1` of every file it repairs, as the
+  reference does, so it is the row that is like for like with the reference
+  on bytes written. Each row's switch comes from the candidate's
+  `par3 repair --help` (`--backup` after 0.7.0, `--no-backup` for 0.7.0 and
+  earlier); see [benchmarking.md](benchmarking.md#rows-and-protocol). A
+  PAR-inside set keeps its one compatible `rs` row. In the text plan, the
+  macro-par3 step reads "buffered rarpar rows only (never --fsync): per
+  worker count rarpar-wN for every op, repairing in place with no backup,
+  and the repair row rarpar-wN-backup, which keeps a numbered .1 as the
+  reference does (like for like on bytes written)" and gives the per-run
+  timeout, and the machine's `par3` block lists the variants and the rows
+  each op produces; `--json` carries the same rows under `par3.rows`.
+- **Perf pass.** On a `linux-perf` machine, `par3 run` runs the untimed
+  [perf pass](benchmarking.md#linux-perf-pass) itself, after each covered
+  op's timed runs: `stat_repeats` perf stat runs of every reference and
+  `rarpar` row of the `par3_ops` ops, each on a fresh stage, and one
+  perf record at `record_frequency` of every `rarpar` row on each set in
+  `par3_record_sets`:
+
+  ```toml
+  [machines.perf]
+  stat_repeats = 3
+  record_frequency = 499
+  par3_ops = ["repair"]            # the default with macro-par3; [] turns the pass off
+  par3_record_sets = ["a-gf16"]    # plain sets this machine selects; default none
+  ```
+
+  Every op added to `par3_ops` costs `stat_repeats` more untimed runs per
+  row and plain set. Both keys are checked when the config loads: each op
+  must be one the machine's macro-par3 run measures, each record set a plain
+  (not PAR-inside) set it selects, listed once; record sets need `par3_ops`,
+  and either key needs `capabilities.perf = "linux-perf"` and the macro-par3
+  suite. The plan's `perf` line says what runs under perf per suite, and a
+  step after the macro-par3 step names the sets, the rows, the record sets
+  and an upper bound on the untimed runs; `--json` carries the keys as
+  `protocol.perf_par3_ops` and `protocol.perf_par3_record_sets`. Evidence
+  goes to `<results>/perf/par3/`. A pass that was skipped, had a perf run
+  fail, or ran nothing writes `INCOMPLETE.txt` there, and the host warns
+  `par3-perf-incomplete`, as it does when that directory is empty; neither
+  fails the host. The corpus suites' perf work runs only when one of them is
+  selected: a machine that runs macro-par3 alone records only
+  `perf --version` and `kernel.perf_event_paranoid` in the corpus perf step.
 - **Timeouts.** `timeout_minutes` (default 20, lower than before) applies to
   `rarpar` rows too; raise it on slow hosts. `reference_timeout_minutes`
   gives the reference its own limit (0 = the same).
@@ -564,6 +606,9 @@ spot = true                                    # optional, SSM only
 - The turbo suites' host-side flow (rustup, checkout build, oracle fetch and
   build, harness run) is unit-tested from the generated script but has not run
   on a live host yet. Treat the first run as bring-up.
+- The macro-par3 perf pass is unit-tested against a stub `perf` and from the
+  generated script, but has not run under a real `perf` on a live host yet.
+  Treat its first run as bring-up.
 
 ## Windows hosts
 
