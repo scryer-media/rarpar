@@ -266,6 +266,11 @@ func copyFileMode(source, destination string, mode os.FileMode) error {
 	return out.Close()
 }
 
+// unrarPortableImage is the build image of the audited unrar-portable recipe.
+// It used to follow bundle.image, which left with the container candidate
+// build; this was that key's default.
+const unrarPortableImage = "docker.io/library/rust:1.97-alpine"
+
 // buildOracleFromSource implements the audited portable-flags recipe. The whole
 // point of the amendment that allows it is that the build adds no
 // -march/-mcpu/-mtune of its own: an oracle compiled for the host it runs on
@@ -319,11 +324,7 @@ cd /work/out && sha256sum unrar && file unrar
 	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
 		return "", err
 	}
-	image := machine.Bundle.Image
-	if image == "" {
-		image = "docker.io/library/rust:1.97-alpine"
-	}
-	command := exec.CommandContext(ctx, "docker", "run", "--rm", "-v", container+":/work", "-w", "/work", image, "sh", "/work/build.sh")
+	command := exec.CommandContext(ctx, "docker", "run", "--rm", "-v", container+":/work", "-w", "/work", unrarPortableImage, "sh", "/work/build.sh")
 	command.Stdout = os.Stderr
 	command.Stderr = os.Stderr
 	if err := command.Run(); err != nil {

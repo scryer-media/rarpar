@@ -159,6 +159,23 @@ inventory only names its local path. SSH uses batch mode, supports optional
 per-host ports and additional OpenSSH options, and leaves host-key verification
 under the operator's normal SSH policy.
 
+### Fleet rounds
+
+`rarpar-bench fleet` runs a whole cross-machine round from one command; see
+[fleet.md](fleet.md). Its candidate is the published release. Each machine's
+`[machines.bundle]` names a release tag (`source = "release"`, the default),
+and the orchestrator downloads that platform's asset and the release's
+`SHA256SUMS` from GitHub, refuses an asset whose sha256 does not match, and
+stages the unpacked `rarpar` (`rarpar.exe` on Windows) exactly as published.
+This happens before any credential check, host probe or launch. Nothing is
+built from source or run in a container; only the pure-Go harness is
+cross-compiled for the host. `fleet plan --stage` runs the same download,
+verification and staging as a dry check without contacting a host.
+`source = "prebuilt"` stages a local bundle directory instead. It is for
+early dev spot tests, never a measured round. See
+[fleet.md](fleet.md#candidates-the-published-release) for the asset names, the
+checks and what a release bundle cannot run.
+
 ## PAR3 Suite
 
 `rarpar-bench par3` compares the shipped `rarpar` CLI with the pinned

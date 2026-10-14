@@ -6,7 +6,17 @@
 #   cp bench/fleet.example.toml bench/fleet.toml
 #   $EDITOR bench/fleet.toml
 #   rarpar-bench fleet plan --config bench/fleet.toml     # dry run, no side effects
+#   rarpar-bench fleet plan --config bench/fleet.toml --stage
+#                                   # also download, verify and stage every
+#                                   # bundle here; contacts no fleet host
 #   rarpar-bench fleet run  --config bench/fleet.toml     # the whole round
+#
+# CANDIDATES: every machine runs the published rarpar release asset for its
+# platform ([machines.bundle] source = "release"), checked against the
+# release's SHA256SUMS before anything is launched. Nothing in the fleet builds
+# a candidate from source or runs one in a container. source = "prebuilt"
+# stages a local bundle directory as it is; it is for early dev spot tests,
+# never a measured round.
 #
 # SECRETS: this file holds no secrets, ever. Authentication is either a path to
 # a private key (auth = "key") or a path to an askpass helper that reads the
@@ -27,12 +37,16 @@ results_root = "/Users/example/bench/fleet-results"
 # Run ids are "<prefix>-<UTC timestamp>".
 run_id_prefix = "fleet"
 # Optional: where bundles are assembled and where verified oracle artifacts are
-# cached between runs. Each bundle directory is rebuilt from scratch every run
-# (a stale binary would otherwise be shipped and measured); the oracle artifact
-# cache beside it is reused and re-verified. Defaults to <run dir>/bundles.
+# cached between runs. Each bundle directory is re-assembled from scratch every
+# run (a stale binary would otherwise be shipped and measured); the oracle
+# artifact cache beside it is reused and re-verified. Defaults to
+# <run dir>/bundles. Release assets are not cached here: each run downloads
+# them into <run dir>/release-cache and verifies them there.
 bundle_cache = "/Users/example/bench/fleet-bundles"
-# Source trees. rarpar_path defaults to the current directory. weaver_path and
-# rapidyenc_path are only needed for the yenc-micro and crc-probe suites.
+# Source trees. rarpar_path is the checkout the Go harness is cross-compiled
+# from (the rarpar candidate is the release asset); it defaults to the current
+# directory. weaver_path and rapidyenc_path are only recorded for prebuilt
+# bundles that carry the yenc-micro and crc-probe binaries.
 rarpar_path = "/Users/example/dev/rarpar"
 weaver_path = "/Users/example/dev/weaver"
 rapidyenc_path = "/Users/example/dev/rapidyenc"
@@ -41,7 +55,6 @@ rapidyenc_path = "/Users/example/dev/rapidyenc"
 # clean HEAD and is built there.
 lzma_turbo_path = "/Users/example/dev/lzma-turbo"
 sevenz_turbo_path = "/Users/example/dev/sevenz-turbo"
-docker = "docker"
 # How often a host is asked whether it has written its DONE sentinel.
 poll_seconds = 20
 # Hard cap per host. A host past this is abandoned (and, if it is a cloud host,
@@ -122,7 +135,7 @@ kind = "local-ssh"                       # local-ssh | aws-ec2
 platform_label = "linux-x86_64-adl-avx2"
 build_target = "x86_64-unknown-linux-musl"
 enabled = true
-suites = ["crc-probe", "yenc-micro", "macro-rar", "macro-par2", "macro-par3"]
+suites = ["macro-rar", "macro-par2", "macro-par3"]
 
 [machines.connection]
 # Always an explicit address, user, and port. ssh_config aliases are refused:
@@ -137,7 +150,6 @@ ssh_options = ["-o", "ConnectTimeout=20"]
 
 [machines.capabilities]
 perf = "linux-perf"                      # linux-perf | samply | none
-docker = true
 no_pgrep = false
 
 [machines.paths]
@@ -148,22 +160,21 @@ corpus = "/home/bench/bench/corpus"
 cleanup = true
 
 [machines.bundle]
-source = "docker"                        # docker | prebuilt
-image = "docker.io/library/rust:1.97-alpine"
-# Where the container build runs. Bundles are deduped by (bundle config +
-# suite contents) and built in parallel, one build per unique key. "local" is
-# only legal when the target architecture matches this machine's silicon —
-# emulated builds are refused (a QEMU build's build scripts can probe the
-# emulated CPU and emit a different binary; measured binaries build on native
-# hardware, always with portable stock flags). For a foreign target, name a
-# native ssh host here and the same pinned recipe runs there; its cargo cache
-# persists so the next round's build is incremental.
-build_host = "local"
-rust_target = "x86_64-unknown-linux-musl"
+# The candidate is the published release asset for this machine's platform.
+# go_os and go_arch (plus flavor on Linux) pick the asset; the orchestrator
+# downloads it with the release's SHA256SUMS and stops the round, before any
+# host is contacted, unless its sha256 matches. Only the pure-Go harness is
+# built for the round, cross-compiled here for go_os/go_arch. Bundles are
+# deduped by (bundle config + suite contents), one per unique key.
+# "prebuilt" (with path = a local bundle directory) is the dev spot-test
+# source. crc-probe and yenc-micro measure weaver's own binaries, which no
+# rarpar release publishes, so they run only from a prebuilt bundle.
+source = "release"                       # release | prebuilt
+tag = "rarpar-v0.7.0"                    # the release under test; or version = "0.7.0"
+flavor = "musl-direct"                   # Linux only: musl-direct (default) | gnu-direct
 go_os = "linux"
 go_arch = "amd64"
 goamd64 = "v2"
-crt_static = true
 
 # Oracles. Policy is host-path | official-binary | source-build.
 # Standing rule: never build an oracle where an official binary exists.
@@ -246,7 +257,7 @@ kind = "local-ssh"
 platform_label = "linux-atom-c3538-noavx"
 build_target = "x86_64-unknown-linux-musl"
 enabled = true
-suites = ["crc-probe", "macro-rar", "macro-par2"]
+suites = ["macro-rar", "macro-par2"]
 
 [machines.connection]
 host = "198.51.100.20"
@@ -260,7 +271,6 @@ shell = "sh"
 
 [machines.capabilities]
 perf = "none"
-docker = false
 # busybox userland: the load gate falls back to `ps -ef | grep`, because a
 # missing pgrep silently makes every gate pass.
 no_pgrep = true
@@ -272,10 +282,13 @@ corpus = "/var/services/homes/bench/bench/fixtures/corpus"
 cleanup = true
 
 [machines.bundle]
-# The bundle for this class is built elsewhere and staged from a local
-# directory; the appliance has no toolchain of its own.
-source = "prebuilt"
-path = "/Users/example/bench/fleet-bundles/linux-x86_64-musl"
+# The appliance needs no toolchain of its own: the static musl release binary
+# runs as it is, and its runtime dispatch picks the tier this no-AVX part
+# supports.
+source = "release"
+tag = "rarpar-v0.7.0"
+go_os = "linux"
+go_arch = "amd64"
 
 [machines.oracles.rar]
 policy = "host-path"
@@ -305,7 +318,7 @@ enabled = true
 # Launch wave (cloud machines only). Wave N+1 launches after wave N's
 # instances are terminated; a held machine stays charged against later waves.
 wave = 1
-suites = ["crc-probe", "yenc-micro", "macro-rar", "macro-par2"]
+suites = ["macro-rar", "macro-par2"]
 
 [machines.connection]
 # host is filled in from the launched instance; only the login user matters.
@@ -318,7 +331,6 @@ shell = "sh"
 
 [machines.capabilities]
 perf = "linux-perf"
-docker = false
 
 [machines.paths]
 staging = "/home/ubuntu/fleet-stage"
@@ -327,13 +339,10 @@ scratch = "/dev/shm/fleet"
 cleanup = false                          # the whole instance is destroyed anyway
 
 [machines.bundle]
-source = "docker"
-image = "docker.io/library/rust:1.97-alpine"
-build_host = "local"                     # native aarch64 container on an Apple Silicon Mac
-rust_target = "aarch64-unknown-linux-musl"
+source = "release"
+tag = "rarpar-v0.7.0"
 go_os = "linux"
-go_arch = "arm64"
-crt_static = true
+go_arch = "arm64"                        # the linux-arm64-musl-direct asset
 
 [machines.oracles.par2]
 policy = "official-binary"
@@ -419,14 +428,11 @@ staging = "/home/ubuntu/fs"
 cleanup = false
 
 [machines.bundle]
-source = "docker"
-image = "docker.io/library/rust:1.97-alpine"
-build_host = "local"
-rust_target = "x86_64-unknown-linux-musl"
+source = "release"
+tag = "rarpar-v0.7.0"
 go_os = "linux"
 go_arch = "amd64"
 goamd64 = "v2"
-crt_static = true
 
 [machines.oracles.par3]
 policy = "source-build"
@@ -452,7 +458,7 @@ spot = true                              # one-time spot, terminated on interrup
 # instance_profile = "..."               # default: fleet.aws.instance_profile
 
 # ---------------------------------------- machine: EC2 turbo suites (SSM) ----
-# lzma-turbo and sevenz-turbo on one spot host. No rarpar candidate is built:
+# lzma-turbo and sevenz-turbo on one spot host. These suites do not run rarpar:
 # the bundle carries a git bundle of each checkout plus its Go harness, and
 # the run script installs a pinned rustup, builds the candidates with each
 # checkout's rust-toolchain.toml, fetches the official 7-Zip release and
@@ -479,16 +485,15 @@ staging = "/home/ubuntu/fs"
 cleanup = false
 
 [machines.bundle]
-# Only the Go harnesses are cross-compiled here; the Rust candidates are built
-# on the host, so the image is unused and the glibc target is fine.
-source = "docker"
-image = "docker.io/library/rust:1.97-alpine"
-build_host = "local"
-rust_target = "x86_64-unknown-linux-gnu"
+# The Go harnesses are cross-compiled here and the turbo candidates are built
+# on the host. The bundle still stages the release's glibc build, matching
+# build_target, though neither suite runs it.
+source = "release"
+tag = "rarpar-v0.7.0"
+flavor = "gnu-direct"
 go_os = "linux"
 go_arch = "amd64"
 goamd64 = "v2"
-crt_static = false
 
 [machines.turbo]
 lzma_profile = "fleet"                   # quick | full | fleet
@@ -522,7 +527,7 @@ kind = "local-ssh"
 platform_label = "windows-x86_64-zen4"
 build_target = "x86_64-pc-windows-msvc"
 enabled = false
-suites = ["crc-probe", "macro-rar", "macro-par3"]
+suites = ["macro-rar", "macro-par3"]
 
 [machines.connection]
 host = "203.0.113.30"
@@ -534,7 +539,6 @@ shell = "powershell"
 
 [machines.capabilities]
 perf = "none"                            # enforced: Windows has no perf collector
-docker = false
 
 [machines.paths]
 staging = "C:\\bench\\fleet-stage"
@@ -543,8 +547,12 @@ corpus = "C:\\bench\\corpus"
 cleanup = true
 
 [machines.bundle]
-source = "prebuilt"
-path = "/Users/example/bench/fleet-bundles/windows-x86_64"
+# go_os = "windows" stages rarpar.exe from the windows-x86_64 release zip and
+# cross-compiles rarpar-bench.exe; a powershell host requires it.
+source = "release"
+tag = "rarpar-v0.7.0"
+go_os = "windows"
+go_arch = "amd64"
 
 [machines.oracles.rar]
 policy = "host-path"

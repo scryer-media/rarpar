@@ -19,7 +19,7 @@ $EDITOR bench/fleet.toml
 
 `bench/fleet.example.toml` documents every key. Replace all of it: hostnames,
 users, ports, key paths, staging directories, corpus paths, oracle URLs and
-digests, and the AWS account.
+digests, the release tag under test, and the AWS account.
 
 The config holds **no secrets**. Authentication is either
 
@@ -35,27 +35,39 @@ A `password`, `secret`, or `token` key in the file is rejected by validation.
 # Read exactly what would happen. No side effects at all.
 rarpar-bench fleet plan --config bench/fleet.toml
 
+# Dry check: also download, verify and stage every bundle here. No fleet host
+# is contacted and nothing is launched.
+rarpar-bench fleet plan --config bench/fleet.toml --stage
+
 # Run the whole round.
 rarpar-bench fleet run --config bench/fleet.toml
 
 # Narrow it.
-rarpar-bench fleet run --config bench/fleet.toml --machine nas-atom --suite crc-probe
+rarpar-bench fleet run --config bench/fleet.toml --machine nas-atom --suite macro-rar
 ```
 
 `fleet run` is non-interactive from start to finish. It:
 
-1. **Preflights, fail-fast.** With cloud machines it checks AWS credentials
-   *first* — an expired session is reported with remediation before anything is
-   built or launched — then validates the whole parallel launch against the
-   account vCPU quota (cross-checked against `describe-instance-types`), then
-   discovers this machine's public IPv4 by DNS for the session security group.
-   Local hosts are probed over their own configured endpoint, and host-path
-   oracles are proven present and digest-matched.
-2. **Builds bundles.** Either staged from a prebuilt directory or built in the
-   recorded container recipe (musl, `crt-static`, no `-march`/`-mcpu`/`-mtune`
-   anywhere, aws-lc built in-container, Go with CGO off). Every bundle carries a
-   `BUILDINFO.json` with tree revisions, dirty-file counts, binary digests, and
-   the codegen policy.
+1. **Verifies the candidates, then preflights, fail-fast.** Every release
+   bundle's asset and the release's `SHA256SUMS` are downloaded and the asset's
+   sha256 is checked first (see
+   [Candidates: the published release](#candidates-the-published-release)); a
+   missing asset or `SHA256SUMS`, or a mismatch, stops the round before any
+   credential check, host probe or launch. With cloud machines it then checks
+   AWS credentials — an expired session is reported with remediation before
+   anything is built or launched — then validates the whole parallel launch
+   against the account vCPU quota (cross-checked against
+   `describe-instance-types`), then discovers this machine's public IPv4 by DNS
+   for the session security group. Local hosts are probed over their own
+   configured endpoint, and host-path oracles are proven present and
+   digest-matched.
+2. **Stages bundles.** A release bundle stages the verified `rarpar`
+   (`rarpar.exe` for a Windows host) as published, and only the pure-Go harness
+   is cross-compiled here, with CGO off (`rarpar-bench`, or `rarpar-bench.exe`
+   for a Windows bundle). Nothing in the fleet builds a candidate from source or
+   runs one in a container. A prebuilt bundle is copied from a local directory
+   as it is. Every bundle carries a `BUILDINFO.json` with the release it staged,
+   tree revisions, dirty-file counts, binary digests, and the codegen policy.
 3. **Spawns everything in parallel.** EC2 instances launch concurrently against a
    session security group scoped to your address and an ephemeral keypair, with
    `DeleteOnTermination`, terminate-on-shutdown, and a deadman shutdown inside
@@ -84,12 +96,94 @@ Everything lands under `<results_root>/<run-id>/`:
 ```
 plan.json plan.txt          what the run intended to do
 run-state.json              live state; the resume path reads this
+release-cache/<tag>/        SHA256SUMS and the verified release assets
 run-<machine>.sh            the exact script that ran on each host
 bundles/<machine>/          what was shipped, with BUILDINFO.json
 hosts/<machine>/results/    the verified evidence
 charts/<platform-label>/    rendered SVGs
 fleet-summary.json/.txt     the round
 ```
+
+## Candidates: the published release
+
+A machine's rarpar is the published release asset for its platform, run
+natively on the host. It is never built for the round.
+
+```toml
+[machines.bundle]
+source = "release"        # the default
+tag = "rarpar-v0.7.0"     # or version = "0.7.0"
+go_os = "linux"           # linux | darwin | windows
+go_arch = "amd64"         # amd64 | arm64
+flavor = "musl-direct"    # Linux only: musl-direct (default) | gnu-direct
+```
+
+`go_os`, `go_arch` and, on Linux, `flavor` pick one asset of the release:
+
+| Host | Asset | Binary |
+| --- | --- | --- |
+| Linux x86_64 / arm64 | `rarpar-<tag>-linux-<x86_64\|arm64>-<flavor>.tar.gz` | `rarpar` |
+| macOS x86_64 / arm64 | `rarpar-<tag>-darwin-<x86_64\|arm64>.tar.gz` | `rarpar` |
+| Windows x86_64 / arm64 | `rarpar-<tag>-windows-<x86_64\|arm64>.zip` | `rarpar.exe` |
+
+`musl-direct` is the statically linked musl build and `gnu-direct` the glibc
+build. When `build_target` is set it must be the asset's Rust target, so a
+mismatch is a config error rather than a mislabelled chart. A `powershell` host needs
+`go_os = "windows"`, and `go_os = "windows"` needs a `powershell` host.
+
+How the asset is checked:
+
+- `SHA256SUMS` is fetched from
+  `https://github.com/scryer-media/rarpar/releases/download/<tag>/SHA256SUMS`
+  on every run. A line that is not a `<sha256>  <file>` entry fails the
+  round rather than being skipped.
+- The asset is downloaded once per (tag, platform), however many machines
+  share it, into `<run dir>/release-cache/<tag>/<platform>/`. It is hashed
+  as it streams and kept only if its sha256 is the one `SHA256SUMS` lists.
+  A cached copy is hashed again before it is reused.
+- Downloads come from GitHub and nowhere else: a redirect to any host other
+  than `github.com` or GitHub's asset hosts is refused.
+- Only the binary at the archive root is unpacked. The tarballs also carry a
+  bash completion named `rarpar`, which is never taken for the binary. An
+  archive member that would escape the cache directory, a root binary that
+  appears twice, or one that is not a regular file is refused.
+- A missing asset, a missing `SHA256SUMS` or a mismatch stops the round
+  before any credential check, host probe or launch.
+- The machine's `release` record in `run-state.json` and the bundle's
+  `BUILDINFO.json` hold the provenance: tag, release URL, platform, Rust
+  target, asset name, URL, size and sha256, the `SHA256SUMS` URL and digest,
+  and the unpacked binary's digest and size. The staged binary is checked
+  against that digest once more when the bundle is assembled.
+
+The release's cosign signature (`SHA256SUMS.sigstore.json`) is not verified;
+the check rests on HTTPS to GitHub and the digest match.
+
+Two things a release bundle cannot do:
+
+- `crc-probe` and `yenc-micro` measure weaver's own binaries, which no rarpar
+  release publishes. With a release bundle they are a config error; run them
+  from a prebuilt bundle.
+- The release binaries are built without forced frame pointers or debug info.
+  The perf pass still runs, but its frame-pointer call graphs
+  (`--call-graph fp`) stop early inside `rarpar`. For full call graphs, use a
+  prebuilt bundle built with frame pointers in a spot test.
+
+**Dry check.** `rarpar-bench fleet plan --config bench/fleet.toml --stage`
+prints the plan, then downloads and verifies every release asset and
+assembles every bundle exactly as `fleet run` would, under
+`<results_root>/<run-id>/` (never `bundle_cache`). It records the result in
+`stage-state.json`, never `run-state.json`, so `fleet collect` and
+`fleet teardown` cannot mistake it for a round, and it refuses a run id that
+already has a `run-state.json`. It contacts no fleet host, checks no
+credential and launches nothing. Oracles are resolved as in a round, so an
+`official-binary` oracle is downloaded unless `--no-fetch` is given.
+
+**Prebuilt, for dev spot tests.** `source = "prebuilt"` with `path` set to an
+absolute local directory stages that directory as it is: early development
+spot tests only, never a measured round. The plan flags every prebuilt
+machine as a dev spot test. The directory must hold `rarpar-bench` and
+`rarpar` (`.exe` names for a Windows host) plus the binaries of any suite
+that needs them, such as `crc_probe`.
 
 ## Resume
 
@@ -129,25 +223,32 @@ Append a `[[machines]]` block. The mandatory decisions:
 | --- | --- |
 | `kind` | `local-ssh` (a machine you own) or `aws-ec2` (launched and destroyed per run; `ec2.access` = `ssh` or `ssm`) |
 | `platform_label` | Names the SVGs and the report machine label. Must be unique — a collision overwrites another machine's charts |
-| `suites` | `crc-probe`, `yenc-micro`, `macro-rar`, `macro-par2`, `macro-par3` |
+| `suites` | `macro-rar`, `macro-par2`, `macro-par3`; `crc-probe` and `yenc-micro` from a prebuilt bundle only |
 | `capabilities.perf` | `linux-perf`, `samply`, or `none`. Decides which diagnostic pass runs |
 | `capabilities.no_pgrep` | Set on busybox-class appliances; the load gate falls back to `ps -ef \| grep` |
-| `bundle.source` | `docker` (build the recipe) or `prebuilt` (stage a directory) |
+| `bundle.source` | `release` (the default: the published release asset, with `tag` or `version`) or `prebuilt` (stage a local directory; dev spot tests only) |
 | `oracles.*` | `host-path`, `official-binary`, or `source-build` |
 
 Then:
 
 ```sh
-rarpar-bench fleet plan --config bench/fleet.toml --machine <new-name>
-rarpar-bench fleet run  --config bench/fleet.toml --machine <new-name> --suite crc-probe
+rarpar-bench fleet plan --config bench/fleet.toml --machine <new-name> --stage
+rarpar-bench fleet run  --config bench/fleet.toml --machine <new-name> --suite macro-rar
 ```
 
-Start with `crc-probe`: it is short, needs no corpus, and proves the transport,
-the bundle, the sentinel, and the collection path before you spend an hour of
-macro suite on a host that turns out to be missing an oracle.
+Start with `fleet plan --stage`: it proves the release publishes an asset for
+the machine's platform, verifies it and assembles the bundle without touching
+the host. Then run one macro suite, narrowed with `[machines.run].cases`, to
+prove the transport, the bundle, the sentinel, and the collection path before
+you spend an hour of macro suite on a host that turns out to be missing an
+oracle.
 
 ### Rules the tool enforces so you do not have to remember them
 
+- **The candidate is the published release, checked before anything runs.**
+  Each machine runs its platform's release asset, verified against the
+  release's `SHA256SUMS`. Nothing in the fleet builds a candidate from source
+  or runs one in a container.
 - **Never rebuild an oracle where an official binary exists.** `source-build`
   requires a recorded `reason`, a pinned source tarball digest, and one of the
   audited recipes. `unrar-portable` uses the stock makefile and stock
@@ -298,8 +399,9 @@ harness refuses a binary whose embedded commit is not the checkout's clean
 HEAD, and lzma's fixtures come from `cargo xtask` in that checkout. So the
 bundle carries, per suite, a `git bundle` of the checkout's HEAD commit, a
 `.commit` sidecar, and the harness cross-compiled with CGO off. The build
-refuses a dirty checkout. A machine that runs only turbo suites skips the
-container build entirely; its `[machines.bundle]` still sets the Go target.
+refuses a dirty checkout. A machine that runs only turbo suites still stages
+its platform's rarpar release asset, though neither suite runs it, and its
+`[machines.bundle]` sets the Go target.
 
 On the host, the run script:
 
@@ -371,9 +473,9 @@ spot = true                                    # optional, SSM only
 
 ## Known limits
 
-- `bundle.build_host` accepts a machine name but only `"local"` is implemented.
-  A remote build host is refused at build time with a message telling you to
-  build there yourself and use `bundle.source = "prebuilt"`.
+- The `unrar-portable` oracle recipe (a `source-build` oracle, never a
+  candidate) still compiles UnRAR in a container on the orchestrating
+  machine. It is the one container left in the fleet.
 - The Windows runner has never been executed (see below).
 - The SSM access mode is implemented and unit-tested but has not been run
   against a live account yet. Treat its first run as bring-up.

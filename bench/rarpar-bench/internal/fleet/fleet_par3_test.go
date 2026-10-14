@@ -226,6 +226,8 @@ func TestBundleRequiresExeNamesOnWindows(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	machine.Bundle.Source = BundlePrebuilt
+	machine.Bundle.Tag = ""
 	machine.Bundle.Path = prebuilt
 	rarpar, err := filepath.Abs("../../../..")
 	if err != nil {

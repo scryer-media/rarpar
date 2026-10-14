@@ -42,9 +42,12 @@ func (orch *orchestrator) holds(name string) bool {
 }
 
 type orchestrator struct {
-	options   Options
-	state     *RunState
-	runDir    string
+	options Options
+	state   *RunState
+	runDir  string
+	// releases are the verified release binaries, by releaseKey, that
+	// resolveReleases downloaded before preflight.
+	releases  map[string]*ReleaseArtifact
 	aws       *AWS
 	session   *SessionResources
 	sessionMu sync.Mutex
@@ -88,9 +91,10 @@ func (orch *orchestrator) log(format string, args ...any) {
 	fmt.Fprintf(orch.options.Log, "[%s] %s\n", time.Now().UTC().Format("15:04:05Z"), fmt.Sprintf(format, args...))
 }
 
-// Run executes a whole fleet round: preflight, build, parallel spawn, per-host
-// detached protocol, collect-as-they-finish, teardown with verification, render,
-// summary. It is non-interactive from the first line to the last.
+// Run executes a whole fleet round: release download and verification,
+// preflight, build, parallel spawn, per-host detached protocol,
+// collect-as-they-finish, teardown with verification, render, summary. It is
+// non-interactive from the first line to the last.
 func Run(ctx context.Context, options Options) (Summary, error) {
 	if options.Log == nil {
 		options.Log = os.Stderr
@@ -103,34 +107,15 @@ func Run(ctx context.Context, options Options) (Summary, error) {
 		return Summary{}, err
 	}
 	orch := &orchestrator{options: options, runDir: runDir}
-
-	plan := BuildPlan(options.Config, options.Machines, options.RunID)
-	if err := writeJSONFile(filepath.Join(runDir, "plan.json"), plan); err != nil {
-		return Summary{}, err
-	}
-	planText, err := os.Create(filepath.Join(runDir, "plan.txt"))
-	if err != nil {
-		return Summary{}, err
-	}
-	WritePlanText(planText, plan)
-	planText.Close()
-
-	orch.state = NewRunState(runDir, options.RunID, options.Config, options.DryRunAWS)
-	for _, machine := range options.Machines {
-		orch.state.Machines = append(orch.state.Machines, &MachineState{
-			Name:          machine.Name,
-			Kind:          machine.Kind,
-			PlatformLabel: machine.PlatformLabel,
-			Status:        StatusPending,
-			Suites:        machine.Suites,
-			Endpoint:      endpointOf(machine),
-			Remote:        HostLayout(machine, options.RunID),
-		})
-	}
-	if err := orch.state.Save(); err != nil {
+	if err := orch.begin(RunStateFile); err != nil {
 		return Summary{}, err
 	}
 
+	// The release assets are downloaded and checked against their
+	// SHA256SUMS first: before any credential check, host probe or launch.
+	if err := orch.resolveReleases(ctx); err != nil {
+		return Summary{}, err
+	}
 	if err := orch.preflight(ctx); err != nil {
 		return Summary{}, err
 	}
@@ -143,6 +128,37 @@ func Run(ctx context.Context, options Options) (Summary, error) {
 	orch.state.FinishedUTC = time.Now().UTC().Format(time.RFC3339)
 	_ = orch.state.Save()
 	return orch.finish(ctx)
+}
+
+// begin writes the plan into the run directory and starts the run state in
+// stateFile, with every machine pending.
+func (orch *orchestrator) begin(stateFile string) error {
+	options := orch.options
+	plan := BuildPlan(options.Config, options.Machines, options.RunID)
+	if err := writeJSONFile(filepath.Join(orch.runDir, "plan.json"), plan); err != nil {
+		return err
+	}
+	planText, err := os.Create(filepath.Join(orch.runDir, "plan.txt"))
+	if err != nil {
+		return err
+	}
+	WritePlanText(planText, plan)
+	planText.Close()
+
+	orch.state = NewRunState(orch.runDir, options.RunID, options.Config, options.DryRunAWS)
+	orch.state.path = filepath.Join(orch.runDir, stateFile)
+	for _, machine := range options.Machines {
+		orch.state.Machines = append(orch.state.Machines, &MachineState{
+			Name:          machine.Name,
+			Kind:          machine.Kind,
+			PlatformLabel: machine.PlatformLabel,
+			Status:        StatusPending,
+			Suites:        machine.Suites,
+			Endpoint:      endpointOf(machine),
+			Remote:        HostLayout(machine, options.RunID),
+		})
+	}
+	return orch.state.Save()
 }
 
 // Resume re-enters collection for hosts that are still running or failed
@@ -426,14 +442,19 @@ func (orch *orchestrator) checkHostOracles(ctx context.Context, transport *Trans
 }
 
 func (orch *orchestrator) build(ctx context.Context) error {
-	bundler := &Bundler{Settings: orch.options.Config.Fleet, RunDir: orch.runDir, Log: orch.log}
+	bundler := &Bundler{
+		Settings: orch.options.Config.Fleet,
+		RunDir:   orch.runDir,
+		Releases: orch.releases,
+		Log:      orch.log,
+	}
 	cacheDir := filepath.Join(orch.runDir, "oracle-cache")
 	if orch.options.Config.Fleet.BundleCache != "" {
 		cacheDir = filepath.Join(orch.options.Config.Fleet.BundleCache, "oracle-cache")
 	}
 
-	// One container build per unique bundle content, all of them in parallel:
-	// machines sharing a target reuse the artifacts instead of rebuilding.
+	// One staged bundle per unique bundle content, all of them in parallel:
+	// machines sharing a target reuse it instead of staging their own.
 	type buildGroup struct {
 		name     string
 		machines []Machine
@@ -505,8 +526,13 @@ func (orch *orchestrator) build(ctx context.Context) error {
 			}
 			hostState.BundleDir = bundleDir
 			hostState.Oracles = oracles
-			orch.state.Record(hostState, "build", "bundle ready: %d binaries, rarpar tree %s (%d dirty)",
-				len(info.Binaries), short(info.Trees["rarpar"].GitSHA), info.Trees["rarpar"].DirtyFiles)
+			if info.Release != nil {
+				orch.state.Record(hostState, "build", "bundle ready: %d binaries, rarpar release %s (%s), harness tree %s (%d dirty)",
+					len(info.Binaries), info.Release.Tag, info.Release.Asset, short(info.Trees["rarpar"].GitSHA), info.Trees["rarpar"].DirtyFiles)
+			} else {
+				orch.state.Record(hostState, "build", "bundle ready: %d binaries (prebuilt from %s, dev spot test), rarpar tree %s (%d dirty)",
+					len(info.Binaries), machine.Bundle.Path, short(info.Trees["rarpar"].GitSHA), info.Trees["rarpar"].DirtyFiles)
+			}
 		}
 	}
 	return nil

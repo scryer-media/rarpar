@@ -10,9 +10,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -20,7 +18,8 @@ import (
 
 // BuildInfo travels with every bundle. A benchmark number whose binary cannot be
 // identified later is not evidence, and a commit id alone does not identify a
-// build made from a dirty tree.
+// build made from a dirty tree. Schema 2 records the published release a
+// release bundle stages and drops the container build's image and build host.
 type BuildInfo struct {
 	SchemaVersion int               `json:"schema_version"`
 	Bundle        string            `json:"bundle"`
@@ -29,8 +28,7 @@ type BuildInfo struct {
 	PlatformLabel string            `json:"platform_label"`
 	BuildTarget   string            `json:"build_target"`
 	Source        string            `json:"source"`
-	BuildHost     string            `json:"build_host"`
-	Image         string            `json:"image,omitempty"`
+	Release       *ReleaseArtifact  `json:"release,omitempty"`
 	CodegenPolicy map[string]string `json:"codegen_policy"`
 	Trees         map[string]Tree   `json:"trees"`
 	Binaries      map[string]string `json:"binary_sha256"`
@@ -50,6 +48,9 @@ type Tree struct {
 type Bundler struct {
 	Settings Settings
 	RunDir   string
+	// Releases holds the verified release binaries by releaseKey; release
+	// bundles are staged from it and never fetch anything themselves.
+	Releases map[string]*ReleaseArtifact
 	Log      func(format string, args ...any)
 }
 
@@ -59,9 +60,11 @@ func (bundler *Bundler) log(format string, args ...any) {
 	}
 }
 
-// SharedBuild produces the build artifacts for one bundle KEY — every machine
-// whose bundle configuration and content needs are identical shares one
-// container build instead of repeating it per machine.
+// SharedBuild stages the bundle for one bundle KEY: every machine whose bundle
+// configuration and content needs are identical shares one staged bundle.
+// Nothing here builds a candidate. A release bundle stages the verified
+// release binary, a prebuilt bundle copies the operator's local bundle, and
+// only the pure-Go harness is cross-compiled on the orchestrator.
 func (bundler *Bundler) SharedBuild(ctx context.Context, sharedName string, rep Machine, machineNames []string) (string, BuildInfo, error) {
 	target := filepath.Join(bundler.bundleRoot(), sharedName)
 	// Assemble into a clean directory. A stale binary left over from an earlier
@@ -73,42 +76,53 @@ func (bundler *Bundler) SharedBuild(ctx context.Context, sharedName string, rep 
 		return "", BuildInfo{}, err
 	}
 	info := BuildInfo{
-		SchemaVersion: 1,
+		SchemaVersion: 2,
 		Bundle:        sharedName,
 		BuiltUTC:      time.Now().UTC().Format(time.RFC3339),
 		Machine:       strings.Join(machineNames, ","),
-		PlatformLabel: rep.Bundle.RustTarget,
+		PlatformLabel: BundlePrebuilt,
 		BuildTarget:   rep.BuildTarget,
 		Source:        rep.Bundle.Source,
-		BuildHost:     rep.Bundle.BuildHost,
-		Image:         rep.Bundle.Image,
 		CodegenPolicy: map[string]string{},
 		Trees:         map[string]Tree{},
 		Binaries:      map[string]string{},
 	}
 
+	var release *ReleaseArtifact
 	switch rep.Bundle.Source {
+	case BundleRelease:
+		artifact, err := bundler.release(rep.Bundle)
+		if err != nil {
+			return "", info, fmt.Errorf("bundle %s: %w", sharedName, err)
+		}
+		release = artifact
+		info.PlatformLabel = artifact.Platform
+		info.Release = artifact
+		if err := copyFileMode(artifact.binaryPath, filepath.Join(target, artifact.Binary), 0o755); err != nil {
+			return "", info, fmt.Errorf("bundle %s: staging %s from %s: %w", sharedName, artifact.Binary, artifact.Asset, err)
+		}
+		info.CodegenPolicy["rarpar"] = fmt.Sprintf("published release %s, asset %s (%s); sha256 verified against %s, not rebuilt",
+			artifact.Tag, artifact.Asset, artifact.RustTarget, releaseSumsName)
+		info.CodegenPolicy["go_flags"] = harnessGoFlags(rep.Bundle)
+		info.Notes = append(info.Notes,
+			fmt.Sprintf("rarpar is the published release binary from %s (%s, sha256 %s)", artifact.ReleaseURL, artifact.Asset, artifact.SHA256),
+			"trees.rarpar is the checkout the Go harness was cross-compiled from, not the candidate's source")
+		if err := bundler.buildHarness(ctx, sharedName, rep.Bundle, target); err != nil {
+			return "", info, err
+		}
 	case BundlePrebuilt:
 		if err := copyTree(rep.Bundle.Path, target); err != nil {
 			return "", info, fmt.Errorf("bundle %s: staging the prebuilt bundle: %w", sharedName, err)
 		}
 		info.Notes = append(info.Notes,
-			"prebuilt bundle staged from "+rep.Bundle.Path+"; its own BUILDINFO (if any) records the codegen policy")
-	case BundleDocker:
-		if rep.needsContainerBuild() {
-			if err := bundler.dockerBuild(ctx, sharedName, rep, target, &info); err != nil {
-				return "", info, err
-			}
-		} else {
-			// Turbo-only machines build their candidates on the host from
-			// git bundles; the orchestrator only cross-compiles the harness.
-			info.CodegenPolicy["candidates"] = "built on host with the checkout's pinned toolchain (rust-toolchain.toml); see turbo.go"
-			if err := bundler.buildHarness(ctx, sharedName, rep.Bundle, target); err != nil {
-				return "", info, err
-			}
-		}
+			"prebuilt bundle staged from "+rep.Bundle.Path+" for a dev spot test, not the published release artifacts; its own BUILDINFO (if any) records the codegen policy")
+	default:
+		return "", info, fmt.Errorf("bundle %s: bundle.source %q is neither %q nor %q", sharedName, rep.Bundle.Source, BundleRelease, BundlePrebuilt)
 	}
 	if rep.hasTurbo() {
+		// The turbo candidates are built on the host from git bundles of
+		// their checkouts; see turbo.go.
+		info.CodegenPolicy["turbo"] = "lzma-turbo/sevenz-turbo built on host with each checkout's pinned toolchain (rust-toolchain.toml); see turbo.go"
 		if err := bundler.stageTurbo(ctx, rep, target, &info); err != nil {
 			return "", info, fmt.Errorf("bundle %s: %w", sharedName, err)
 		}
@@ -125,7 +139,7 @@ func (bundler *Bundler) SharedBuild(ctx context.Context, sharedName string, rep 
 		required = append(required, source[1]+"-bench", source[1]+".bundle", source[1]+".commit")
 	}
 	for index, name := range required {
-		// Windows bundles are prebuilt PE binaries; the names carry .exe.
+		// Windows bundles hold PE binaries; the names carry .exe.
 		if rep.isWindows() {
 			name += ".exe"
 			required[index] = name
@@ -150,12 +164,22 @@ func (bundler *Bundler) SharedBuild(ctx context.Context, sharedName string, rep 
 		}
 		info.Binaries[entry.Name()] = digest
 	}
-	info.Trees["rarpar"] = describeTree(ctx, bundler.rarparPath())
-	if bundler.Settings.WeaverPath != "" {
-		info.Trees["weaver"] = describeTree(ctx, bundler.Settings.WeaverPath)
+	// The staged rarpar must be byte for byte the binary the verified asset
+	// unpacked to.
+	if release != nil && info.Binaries[release.Binary] != release.BinarySHA256 {
+		return "", info, fmt.Errorf("bundle %s: staged %s has sha256 %s, but %s unpacked to %s",
+			sharedName, release.Binary, info.Binaries[release.Binary], release.Asset, release.BinarySHA256)
 	}
-	if bundler.Settings.RapidyencPath != "" {
-		info.Trees["rapidyenc"] = describeTree(ctx, bundler.Settings.RapidyencPath)
+	info.Trees["rarpar"] = describeTree(ctx, bundler.rarparPath())
+	// Only the weaver suites, which run from a prebuilt bundle, carry weaver
+	// binaries.
+	if rep.hasSuite(SuiteYencMicro) || rep.hasSuite(SuiteCRCProbe) {
+		if bundler.Settings.WeaverPath != "" {
+			info.Trees["weaver"] = describeTree(ctx, bundler.Settings.WeaverPath)
+		}
+		if bundler.Settings.RapidyencPath != "" {
+			info.Trees["rapidyenc"] = describeTree(ctx, bundler.Settings.RapidyencPath)
+		}
 	}
 	if err := writeJSONFile(filepath.Join(target, "BUILDINFO.json"), info); err != nil {
 		return "", info, err
@@ -206,9 +230,9 @@ func (bundler *Bundler) Assemble(machine Machine, sharedDir string, sharedInfo B
 	return target, info, nil
 }
 
-// buildKey groups machines whose bundles are content-identical: the same build
-// configuration AND the same suite-driven bundle contents. One container build
-// serves the whole group.
+// buildKey groups machines whose bundles are content-identical: the same
+// bundle configuration AND the same suite-driven bundle contents. One staged
+// bundle serves the whole group.
 func buildKey(machine Machine) string {
 	bundle := machine.Bundle
 	features := []string{}
@@ -231,33 +255,39 @@ func buildKey(machine Machine) string {
 		features = append(features, "sevenz-turbo")
 	}
 	return strings.Join([]string{
-		bundle.Source, bundle.Path, bundle.Image, bundle.BuildHost,
-		bundle.RustTarget, bundle.GoOS, bundle.GoArch, bundle.GOAMD64,
-		fmt.Sprintf("crt=%t", bundle.CrtStatic),
+		bundle.Source, bundle.Path, bundle.releaseTag(), bundlePlatform(bundle),
+		bundle.GoOS, bundle.GoArch, bundle.GOAMD64,
 		strings.Join(features, "+"),
 	}, "|")
 }
 
-// sharedBundleName is the stable directory name for one build key AND one
-// candidate tree. The tree digest is part of the name on purpose: two
-// concurrent runs with identical bundle configuration but different
-// candidates once resolved to the same remote build directory, where one
-// run's destructive clean deleted the other's in-progress build (loud,
-// $0 — build precedes launch), and where timing alone could have made a run
-// build and ship the OTHER run's source while reporting its own candidate
-// in BUILDINFO (silent). Content-addressing the name closes both for
-// different trees; the per-run remote directory closes the clean race for
-// identical ones.
-func sharedBundleName(machine Machine, treeID string) string {
-	sum := sha256.Sum256([]byte(buildKey(machine) + "|tree=" + treeID))
-	return "shared-" + machine.Bundle.RustTarget + "-" + hex.EncodeToString(sum[:4])
+// bundlePlatform labels a bundle: the release platform a release bundle
+// stages, or the bundle source.
+func bundlePlatform(bundle Bundle) string {
+	if bundle.Source == BundleRelease {
+		if platform, err := resolveReleasePlatform(bundle); err == nil {
+			return platform.Name
+		}
+	}
+	return bundle.Source
 }
 
-// bundleTreeID content-digests the candidate tree that will be pushed to
-// build hosts: every regular file's relative path and bytes, in sorted
-// order, with VCS and build-output directories skipped. Unlike
-// [`describeTree`] this needs no git metadata, so snapshot trees digest the
-// same as checkouts.
+// sharedBundleName is the stable directory name for one build key AND one
+// harness tree. The tree digest is part of the name on purpose: two runs
+// with identical bundle configuration but different checkouts must not
+// assemble into the same directory, where one run's clean could delete the
+// other's bundle and timing alone could ship the OTHER run's harness while
+// BUILDINFO reports its own. Content-addressing the name closes both for
+// different trees.
+func sharedBundleName(machine Machine, treeID string) string {
+	sum := sha256.Sum256([]byte(buildKey(machine) + "|tree=" + treeID))
+	return "shared-" + bundlePlatform(machine.Bundle) + "-" + hex.EncodeToString(sum[:4])
+}
+
+// bundleTreeID content-digests the checkout the harness is cross-compiled
+// from: every regular file's relative path and bytes, in sorted order, with
+// VCS and build-output directories skipped. Unlike [`describeTree`] this
+// needs no git metadata, so snapshot trees digest the same as checkouts.
 func bundleTreeID(root string) (string, error) {
 	digest := sha256.New()
 	skip := map[string]bool{".git": true, "target": true, "results": true, "bundles": true}
@@ -314,44 +344,26 @@ func bundleTreeID(root string) (string, error) {
 	return hex.EncodeToString(digest.Sum(nil)[:8]), nil
 }
 
-// remoteBuildDir is per run as well as per bundle name: even two runs
-// building the IDENTICAL tree and configuration must never share a remote
-// workspace, because the pre-build clean is destructive.
-func remoteBuildDir(bundleName, runID string) string {
-	return ".rarpar-fleet-build/" + bundleName + "-" + runID
-}
-
-// rustTargetGoArch maps a Rust target triple to the GOARCH of the silicon it
-// runs on, for native-build enforcement.
-func rustTargetGoArch(rustTarget string) string {
-	switch {
-	case strings.HasPrefix(rustTarget, "x86_64-"):
-		return "amd64"
-	case strings.HasPrefix(rustTarget, "aarch64-"):
-		return "arm64"
-	case strings.HasPrefix(rustTarget, "i686-"):
-		return "386"
-	case strings.HasPrefix(rustTarget, "armv7-"):
-		return "arm"
-	}
-	return ""
-}
-
-func unameToGoArch(uname string) string {
-	switch strings.TrimSpace(uname) {
-	case "x86_64", "amd64":
-		return "amd64"
-	case "aarch64", "arm64":
-		return "arm64"
-	}
-	return strings.TrimSpace(uname)
-}
-
 func (bundler *Bundler) bundleRoot() string {
 	if bundler.Settings.BundleCache != "" {
 		return bundler.Settings.BundleCache
 	}
 	return filepath.Join(bundler.RunDir, "bundles")
+}
+
+// release returns the verified release binary a release bundle stages. The
+// orchestrator resolves every release before preflight; a miss here is a bug,
+// never a reason to fetch.
+func (bundler *Bundler) release(bundle Bundle) (*ReleaseArtifact, error) {
+	platform, err := resolveReleasePlatform(bundle)
+	if err != nil {
+		return nil, err
+	}
+	artifact, ok := bundler.Releases[releaseKey(bundle.releaseTag(), platform.Name)]
+	if !ok || artifact.binaryPath == "" {
+		return nil, fmt.Errorf("release %s (%s) was not downloaded and verified before the build", bundle.releaseTag(), platform.Name)
+	}
+	return artifact, nil
 }
 
 func (bundler *Bundler) rarparPath() string {
@@ -361,106 +373,29 @@ func (bundler *Bundler) rarparPath() string {
 	return "."
 }
 
-// dockerBuild runs the recorded container recipe. The flags are not incidental:
-//   - crt-static via the target-specific RUSTFLAGS variable only, so proc-macros
-//     still build for the host;
-//   - no -march/-mcpu/-mtune anywhere: tier selection is runtime dispatch, and a
-//     target-cpu flag would silently make one platform's numbers incomparable;
-//   - aws-lc built in-container against musl (cmake + clang), which is what keeps
-//     the native crypto backend rather than falling back to RustCrypto;
-//   - Go with CGO off so the harness is a static binary on appliance hosts.
-func (bundler *Bundler) dockerBuild(ctx context.Context, bundleName string, machine Machine, target string, info *BuildInfo) error {
-	bundle := machine.Bundle
-	rustFlagVar := "CARGO_TARGET_" + strings.ToUpper(strings.ReplaceAll(bundle.RustTarget, "-", "_")) + "_RUSTFLAGS"
-	rustFlags := ""
-	if bundle.CrtStatic {
-		rustFlags = "-C target-feature=+crt-static"
+// harnessBinary is the harness's file name in a bundle: a Windows host runs
+// rarpar-bench.exe.
+func harnessBinary(bundle Bundle) string {
+	if bundle.GoOS == "windows" {
+		return "rarpar-bench.exe"
 	}
-	// x86 release builds omit frame pointers, which reduces perf's fp
-	// unwinder to 3-deep stubs while ARM gets full graphs; the round-1
-	// profiles were caller-blind on x86 for exactly this reason.
-	if strings.HasPrefix(bundle.RustTarget, "x86_64") {
-		rustFlags = strings.TrimSpace(rustFlags + " -C force-frame-pointers=yes")
-	}
-	info.CodegenPolicy["target_cpu"] = "NONE (baseline); tier selection is runtime dispatch only"
-	info.CodegenPolicy["rust_target"] = bundle.RustTarget
-	info.CodegenPolicy["rust_flags"] = rustFlags + " (" + rustFlagVar + ", target-only)"
-	info.CodegenPolicy["go_flags"] = fmt.Sprintf("CGO_ENABLED=0 GOOS=%s GOARCH=%s %s -trimpath",
-		bundle.GoOS, bundle.GoArch, goamd64Flag(bundle))
+	return "rarpar-bench"
+}
 
-	work := filepath.Join(bundler.RunDir, "build", bundleName)
-	if err := os.MkdirAll(filepath.Join(work, "out"), 0o755); err != nil {
-		return err
+// harnessGoFlags records how buildHarness cross-compiles the harness.
+func harnessGoFlags(bundle Bundle) string {
+	flags := "CGO_ENABLED=0 GOOS=" + bundle.GoOS + " GOARCH=" + bundle.GoArch
+	if bundle.GOAMD64 != "" {
+		flags += " GOAMD64=" + bundle.GOAMD64
 	}
-	// The alias targets must come from weaver's OWN manifest, not from this
-	// harness's rarpar_path: a round that snapshots rarpar (rarpar_path under
-	// a scratch tree) still builds a weaver whose [patch.crates-io] names the
-	// canonical checkout. Aliasing the config path instead of the manifest
-	// path is exactly how the first live fire of this fix failed.
-	aliasRoots, err := weaverPatchRarparRoots(bundler.Settings.WeaverPath)
-	if err != nil {
-		return fmt.Errorf("bundle %s: reading weaver's patch paths: %w", bundleName, err)
-	}
-	if rarparAbs, err := filepath.Abs(bundler.rarparPath()); err == nil && !contains(aliasRoots, rarparAbs) {
-		aliasRoots = append(aliasRoots, rarparAbs)
-	}
-	script := containerBuildScript(machine, rustFlagVar, rustFlags, bundler.Settings.WeaverPath != "", aliasRoots)
-	scriptPath := filepath.Join(work, "build-in-container.sh")
-	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
-		return err
-	}
-
-	sources := map[string]string{"rarpar": bundler.rarparPath()}
-	if bundler.Settings.WeaverPath != "" && (machine.hasSuite(SuiteYencMicro) || machine.hasSuite(SuiteCRCProbe)) {
-		sources["weaver"] = bundler.Settings.WeaverPath
-		if bundler.Settings.RapidyencPath != "" {
-			sources["rapidyenc"] = bundler.Settings.RapidyencPath
-		}
-	}
-	for name, path := range sources {
-		if err := snapshotTree(ctx, path, filepath.Join(work, name)); err != nil {
-			return fmt.Errorf("bundle %s: snapshotting %s: %w", bundleName, name, err)
-		}
-	}
-
-	// Measured binaries must be built on native silicon: a QEMU-emulated
-	// build's build scripts can probe the emulated CPU and emit a different
-	// binary, which is not evidence. (Fixture/corpus generation may run
-	// cross-arch docker — this gate is for candidate binaries only.)
-	targetArch := rustTargetGoArch(bundle.RustTarget)
-	if bundle.BuildHost == "" || bundle.BuildHost == "local" {
-		if targetArch != "" && targetArch != runtime.GOARCH {
-			return fmt.Errorf(
-				"bundle %s: refusing an emulated build: rust target %s needs %s silicon but this host is %s; set bundle.build_host to a native %s ssh host or use source = %q",
-				bundleName, bundle.RustTarget, targetArch, runtime.GOARCH, targetArch, BundlePrebuilt)
-		}
-		docker := bundler.Settings.Docker
-		if docker == "" {
-			docker = "docker"
-		}
-		bundler.log("bundle %s: building in %s (%s, local)", bundleName, bundle.Image, bundle.RustTarget)
-		command := exec.CommandContext(ctx, docker, "run", "--rm",
-			"-v", work+":/work", "-w", "/work", bundle.Image, "sh", "/work/build-in-container.sh")
-		command.Stdout = os.Stderr
-		command.Stderr = os.Stderr
-		if err := command.Run(); err != nil {
-			return fmt.Errorf("bundle %s: container build failed: %w", bundleName, err)
-		}
-	} else if err := bundler.remoteDockerBuild(ctx, bundleName, bundle, work, targetArch); err != nil {
-		return err
-	}
-
-	if err := bundler.buildHarness(ctx, bundleName, bundle, filepath.Join(work, "out")); err != nil {
-		return err
-	}
-	return copyTree(filepath.Join(work, "out"), target)
+	return flags + " -trimpath"
 }
 
 // buildHarness cross-compiles the pure-Go harness on the orchestrator. It is
 // not a measured binary — CGO is off, output is byte-identical from any build
 // host — so there is nothing an on-host build would add.
 func (bundler *Bundler) buildHarness(ctx context.Context, bundleName string, bundle Bundle, outDir string) error {
-	goBuild := exec.CommandContext(ctx, "go", "build", "-trimpath", "-o", filepath.Join(outDir, "rarpar-bench"), "./cmd/rarpar-bench")
+	goBuild := exec.CommandContext(ctx, "go", "build", "-trimpath", "-o", filepath.Join(outDir, harnessBinary(bundle)), "./cmd/rarpar-bench")
 	goBuild.Dir = filepath.Join(bundler.rarparPath(), "bench", "rarpar-bench")
 	goBuild.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS="+bundle.GoOS, "GOARCH="+bundle.GoArch)
 	if bundle.GOAMD64 != "" {
@@ -472,168 +407,6 @@ func (bundler *Bundler) buildHarness(ctx context.Context, bundleName string, bun
 		return fmt.Errorf("bundle %s: building the Go harness: %w", bundleName, err)
 	}
 	return nil
-}
-
-// remoteDockerBuild runs the same pinned container recipe on a native remote
-// host over ssh (BatchMode — it must never prompt). The remote workspace is
-// per bundle name AND per run id (see [`remoteBuildDir`]), and is removed
-// after a successful pull: the pre-build clean below is destructive, so no
-// two runs may ever share a workspace, and nothing is cached between rounds
-// (the clean always wiped it anyway).
-func (bundler *Bundler) remoteDockerBuild(ctx context.Context, bundleName string, bundle Bundle, work, targetArch string) error {
-	host := bundle.BuildHost
-	uname, err := exec.CommandContext(ctx, "ssh", "-o", "BatchMode=yes", host, "uname", "-m").Output()
-	if err != nil {
-		return fmt.Errorf("bundle %s: build host %s unreachable over ssh: %w", bundleName, host, err)
-	}
-	if got := unameToGoArch(string(uname)); targetArch != "" && got != targetArch {
-		return fmt.Errorf("bundle %s: build host %s is %s silicon but rust target %s needs %s — emulated builds are refused everywhere",
-			bundleName, host, got, bundle.RustTarget, targetArch)
-	}
-	remote := remoteBuildDir(bundleName, filepath.Base(bundler.RunDir))
-	bundler.log("bundle %s: building in %s (%s) on %s", bundleName, bundle.Image, bundle.RustTarget, host)
-	// The build container runs as root and leaves root-owned cargo/build
-	// caches in the remote workdir; a plain user rm -rf then fails EACCES on
-	// every run after the first. Clean via a root container first (same
-	// image, already pulled), falling back to plain rm for a fresh host.
-	remoteName := path.Base(remote)
-	clean := fmt.Sprintf(
-		"mkdir -p %s && docker run --rm -v \"$HOME/.rarpar-fleet-build\":/clean %s rm -rf /clean/%s >/dev/null 2>&1 || rm -rf %s",
-		remote, bundle.Image, remoteName, remote)
-	push := fmt.Sprintf("set -o pipefail; tar -C %s -cf - . | ssh -o BatchMode=yes %s %s",
-		shellQuote(work), shellQuote(host),
-		shellQuote(fmt.Sprintf("%s; mkdir -p %s && tar -C %s -xf -", clean, remote, remote)))
-	if err := runShell(ctx, push); err != nil {
-		return fmt.Errorf("bundle %s: pushing sources to %s: %w", bundleName, host, err)
-	}
-	// chown the workdir back to the ssh user on success so the NEXT round's
-	// cache reuse and cleanup need no root path at all.
-	build := fmt.Sprintf(
-		"cd %s && docker run --rm -v \"$(pwd)\":/work -w /work %s sh -c 'sh /work/build-in-container.sh && chown -R '\"$(id -u)\":\"$(id -g)\"' /work'",
-		remote, bundle.Image)
-	if err := runShell(ctx, fmt.Sprintf("ssh -o BatchMode=yes %s %s", shellQuote(host), shellQuote(build))); err != nil {
-		return fmt.Errorf("bundle %s: remote container build on %s failed: %w", bundleName, host, err)
-	}
-	pull := fmt.Sprintf("set -o pipefail; ssh -o BatchMode=yes %s %s | tar -C %s -xf -",
-		shellQuote(host), shellQuote(fmt.Sprintf("tar -C %s/out -cf - .", remote)),
-		shellQuote(filepath.Join(work, "out")))
-	if err := runShell(ctx, pull); err != nil {
-		return fmt.Errorf("bundle %s: pulling the bundle back from %s: %w", bundleName, host, err)
-	}
-	// Best-effort removal of the per-run workspace; root-owned cache files
-	// need the container, a fresh tree does not. Failure only costs disk.
-	tidy := fmt.Sprintf(
-		"docker run --rm -v \"$HOME/.rarpar-fleet-build\":/clean %s rm -rf /clean/%s >/dev/null 2>&1 || rm -rf %s || true",
-		bundle.Image, remoteName, remote)
-	if err := runShell(ctx, fmt.Sprintf("ssh -o BatchMode=yes %s %s", shellQuote(host), shellQuote(tidy))); err != nil {
-		bundler.log("bundle %s: leftover workspace on %s not removed (harmless): %v", bundleName, host, err)
-	}
-	return nil
-}
-
-func runShell(ctx context.Context, script string) error {
-	command := exec.CommandContext(ctx, "sh", "-c", script)
-	command.Stdout = os.Stderr
-	command.Stderr = os.Stderr
-	return command.Run()
-}
-
-func goamd64Flag(bundle Bundle) string {
-	if bundle.GOAMD64 == "" {
-		return ""
-	}
-	return "GOAMD64=" + bundle.GOAMD64
-}
-
-// weaverPatchRarparRoots extracts the rarpar checkout roots that weaver's
-// [patch.crates-io] block names by absolute path (each entry points at
-// <root>/crates/<crate>). A weaver tree with no patch block yields no roots
-// and no aliases — published crates resolve on their own.
-func weaverPatchRarparRoots(weaverPath string) ([]string, error) {
-	if weaverPath == "" {
-		return nil, nil
-	}
-	manifest, err := os.ReadFile(filepath.Join(weaverPath, "Cargo.toml"))
-	if err != nil {
-		return nil, err
-	}
-	var roots []string
-	inPatch := false
-	for _, line := range strings.Split(string(manifest), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "[") {
-			inPatch = trimmed == "[patch.crates-io]"
-			continue
-		}
-		if !inPatch {
-			continue
-		}
-		_, rest, found := strings.Cut(trimmed, `path = "`)
-		if !found {
-			continue
-		}
-		entry, _, found := strings.Cut(rest, `"`)
-		if !found || !filepath.IsAbs(entry) {
-			continue
-		}
-		root := entry
-		if idx := strings.LastIndex(filepath.ToSlash(entry), "/crates/"); idx > 0 {
-			root = entry[:idx]
-		}
-		if !contains(roots, root) {
-			roots = append(roots, root)
-		}
-	}
-	return roots, nil
-}
-
-func containerBuildScript(machine Machine, rustFlagVar, rustFlags string, weaver bool, rarparHostPaths []string) string {
-	var script strings.Builder
-	script.WriteString("#!/bin/sh\nset -eu\n")
-	script.WriteString("apk add --no-cache musl-dev g++ make cmake clang clang-dev llvm-dev linux-headers perl pkgconfig git bash file >/dev/null 2>&1\n")
-	script.WriteString("export CARGO_HOME=/work/cargo-home\n")
-	script.WriteString("export CARGO_TARGET_DIR=/work/build-target\n")
-	// Keep symbol tables in the shipped binaries (overrides the workspace's
-	// strip=true). Symtabs are not loaded at runtime, so measurements are
-	// unaffected — but perf on the bench host can finally attribute samples
-	// instead of exporting 0%-symbolized profiles that need offline
-	// reconstruction against a rebuilt twin.
-	script.WriteString("export CARGO_PROFILE_RELEASE_STRIP=none\n")
-	if rustFlags != "" {
-		fmt.Fprintf(&script, "export %s=%q\n", rustFlagVar, rustFlags)
-	}
-	script.WriteString("mkdir -p /work/out\n")
-	script.WriteString("rustc --version; cargo --version; clang --version | head -1; cmake --version | head -1\n")
-	fmt.Fprintf(&script, "cd /work/rarpar && cargo build --release --target %s -p rarpar --bin rarpar\n", machine.Bundle.RustTarget)
-	fmt.Fprintf(&script, "cp /work/build-target/%s/release/rarpar /work/out/rarpar\n", machine.Bundle.RustTarget)
-	if weaver && (machine.hasSuite(SuiteYencMicro) || machine.hasSuite(SuiteCRCProbe)) {
-		script.WriteString("if [ -d /work/rapidyenc ]; then export WEAVER_RAPIDYENC_SRC=/work/rapidyenc; fi\n")
-		// weaver's workspace root carries a [patch.crates-io] block pinning
-		// par2-rs/unrar-rs/reedsolomon-rs to a rarpar checkout by ABSOLUTE
-		// path, which exists in no build container — resolution dies loudly
-		// on the first weaver build (measured: yenc-micro's dev-dep on
-		// par2-rs). The bundle already stages rarpar sources at /work/rarpar,
-		// so alias every root the manifest names (plus the harness's own
-		// rarpar_path) to the snapshot. This is better than a host mount even
-		// where one is possible: the build consumes the bundle's own
-		// content-addressed rarpar tree on ANY build host.
-		for _, hostPath := range rarparHostPaths {
-			fmt.Fprintf(&script, "if [ ! -e %s ]; then mkdir -p %s && ln -s /work/rarpar %s; fi\n",
-				shellQuote(hostPath), shellQuote(path.Dir(filepath.ToSlash(hostPath))), shellQuote(hostPath))
-		}
-		script.WriteString("cd /work/weaver\n")
-		if machine.hasSuite(SuiteYencMicro) {
-			fmt.Fprintf(&script, "cargo build --release --target %s -p weaver-yenc --example decode_timing --example searchend_timing\n", machine.Bundle.RustTarget)
-			fmt.Fprintf(&script, "cp /work/build-target/%s/release/examples/decode_timing /work/out/decode_timing\n", machine.Bundle.RustTarget)
-			fmt.Fprintf(&script, "cp /work/build-target/%s/release/examples/searchend_timing /work/out/searchend_timing\n", machine.Bundle.RustTarget)
-		}
-		if machine.hasSuite(SuiteCRCProbe) {
-			fmt.Fprintf(&script, "cargo build --release --target %s -p weaver-yenc --example crc_probe\n", machine.Bundle.RustTarget)
-			fmt.Fprintf(&script, "cp /work/build-target/%s/release/examples/crc_probe /work/out/crc_probe\n", machine.Bundle.RustTarget)
-		}
-	}
-	script.WriteString("cd /work/out && sha256sum * && file *\n")
-	return script.String()
 }
 
 func describeTree(ctx context.Context, path string) Tree {
@@ -658,36 +431,6 @@ func describeTree(ctx context.Context, path string) Tree {
 		}
 	}
 	return tree
-}
-
-// snapshotTree copies a source tree without build output, so a container build
-// starts from exactly the tree the operator is measuring.
-func snapshotTree(ctx context.Context, source, destination string) error {
-	if err := os.MkdirAll(destination, 0o755); err != nil {
-		return err
-	}
-	pack := exec.CommandContext(ctx, "tar", "-cf", "-",
-		"--exclude", "./target", "--exclude", "./.git", "--exclude", "./build",
-		"-C", source, ".")
-	pack.Env = append(os.Environ(), "COPYFILE_DISABLE=1")
-	pipe, err := pack.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	unpack := exec.CommandContext(ctx, "tar", "-xf", "-", "-C", destination)
-	unpack.Stdin = pipe
-	unpack.Stderr = os.Stderr
-	if err := pack.Start(); err != nil {
-		return err
-	}
-	if err := unpack.Start(); err != nil {
-		_ = pack.Process.Kill()
-		return err
-	}
-	if err := unpack.Wait(); err != nil {
-		return err
-	}
-	return pack.Wait()
 }
 
 func copyTree(source, destination string) error {

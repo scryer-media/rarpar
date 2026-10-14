@@ -1,8 +1,9 @@
 // Package fleet orchestrates a full cross-machine rarpar benchmark round from
-// one non-interactive command: build per-target bundles, spawn every configured
-// host in parallel (local SSH targets and EC2 instances), run the standard
-// protocol on each, collect results as hosts finish, tear cloud hosts down with
-// verification, and render charts plus a fleet summary on the orchestrator.
+// one non-interactive command: stage per-target bundles of the published rarpar
+// release, spawn every configured host in parallel (local SSH targets and EC2
+// instances), run the standard protocol on each, collect results as hosts
+// finish, tear cloud hosts down with verification, and render charts plus a
+// fleet summary on the orchestrator.
 //
 // It productizes the per-round shell scripts that produced the recorded
 // evidence rounds. House rules learned the hard way in those rounds are encoded
@@ -77,11 +78,18 @@ const (
 	OracleSourceBuild    = "source-build"
 )
 
-// Bundle sources.
+// Bundle sources. A release bundle stages the published rarpar release asset
+// for the machine's platform, verified against the release's SHA256SUMS; it is
+// the default and what every measured round uses. A prebuilt bundle stages a
+// local directory as it is, for the operator's early dev spot tests. Nothing in
+// the fleet builds a candidate from source or in a container.
 const (
+	BundleRelease  = "release"
 	BundlePrebuilt = "prebuilt"
-	BundleDocker   = "docker"
 )
+
+// containerBuildRemoved explains the keys the removed container build read.
+const containerBuildRemoved = `the container build is gone; candidates come from bundle.source = "release" (the published release artifacts) or "prebuilt" (a local bundle, for dev spot tests)`
 
 var (
 	knownSuites   = []string{SuiteCRCProbe, SuiteYencMicro, SuiteMacroRAR, SuiteMacroPAR2, SuiteMacroPAR3, SuiteLzmaTurbo, SuiteSevenzTurbo}
@@ -112,7 +120,6 @@ type Settings struct {
 	// ship as git bundles and build on the host.
 	LzmaTurboPath      string      `json:"lzma_turbo_path,omitempty"`
 	SevenzTurboPath    string      `json:"sevenz_turbo_path,omitempty"`
-	Docker             string      `json:"docker"`
 	PollSeconds        int         `json:"poll_seconds"`
 	HostTimeoutMinutes int         `json:"host_timeout_minutes"`
 	Defaults           RunDefaults `json:"defaults"`
@@ -223,8 +230,7 @@ type Connection struct {
 }
 
 type Capabilities struct {
-	Perf   string `json:"perf"`
-	Docker bool   `json:"docker"`
+	Perf string `json:"perf"`
 	// NoPgrep marks hosts whose busybox-class userland has no pgrep. The run
 	// script falls back to `ps -ef | grep` there; the DSM-class NAS taught us
 	// that a missing pgrep silently makes every load gate pass.
@@ -239,15 +245,33 @@ type HostPaths struct {
 }
 
 type Bundle struct {
-	Source     string `json:"source"`
-	Path       string `json:"path,omitempty"`
-	Image      string `json:"image,omitempty"`
-	BuildHost  string `json:"build_host,omitempty"`
-	RustTarget string `json:"rust_target,omitempty"`
-	GoOS       string `json:"go_os,omitempty"`
-	GoArch     string `json:"go_arch,omitempty"`
-	GOAMD64    string `json:"goamd64,omitempty"`
-	CrtStatic  bool   `json:"crt_static"`
+	Source string `json:"source"`
+	// Path is the local directory a prebuilt bundle is staged from.
+	Path string `json:"path,omitempty"`
+	// Tag (rarpar-v0.7.0) or Version (0.7.0) names the release a release
+	// bundle stages.
+	Tag     string `json:"tag,omitempty"`
+	Version string `json:"version,omitempty"`
+	// Flavor picks the Linux release build: musl-direct (the default) or
+	// gnu-direct. Darwin and Windows publish one build per architecture.
+	Flavor string `json:"flavor,omitempty"`
+	// GoOS and GoArch name the host's platform: they pick the release asset
+	// and are what the Go harness is cross-compiled for.
+	GoOS    string `json:"go_os,omitempty"`
+	GoArch  string `json:"go_arch,omitempty"`
+	GOAMD64 string `json:"goamd64,omitempty"`
+}
+
+// releaseTag is the release a release bundle stages: the tag as written, or
+// the tag a version names.
+func (bundle Bundle) releaseTag() string {
+	if bundle.Tag != "" {
+		return bundle.Tag
+	}
+	if bundle.Version != "" {
+		return "rarpar-v" + strings.TrimPrefix(bundle.Version, "v")
+	}
+	return ""
 }
 
 type Oracle struct {
@@ -372,10 +396,10 @@ func decodeSettings(item *section) Settings {
 		RapidyencPath:      item.str("rapidyenc_path", ""),
 		LzmaTurboPath:      item.str("lzma_turbo_path", ""),
 		SevenzTurboPath:    item.str("sevenz_turbo_path", ""),
-		Docker:             item.str("docker", "docker"),
 		PollSeconds:        item.integer("poll_seconds", 20),
 		HostTimeoutMinutes: item.integer("host_timeout_minutes", 240),
 	}
+	item.removed("docker", containerBuildRemoved)
 
 	defaults := item.child("defaults")
 	settings.Defaults = RunDefaults{
@@ -473,9 +497,9 @@ func decodeMachine(item *section, settings Settings) Machine {
 	capabilities := item.child("capabilities")
 	machine.Capabilities = Capabilities{
 		Perf:    capabilities.str("perf", PerfNone),
-		Docker:  capabilities.boolean("docker", false),
 		NoPgrep: capabilities.boolean("no_pgrep", false),
 	}
+	capabilities.removed("docker", containerBuildRemoved)
 	capabilities.finish()
 
 	paths := item.requiredChild("paths")
@@ -489,15 +513,17 @@ func decodeMachine(item *section, settings Settings) Machine {
 
 	bundle := item.requiredChild("bundle")
 	machine.Bundle = Bundle{
-		Source:     bundle.requiredStr("source"),
-		Path:       bundle.str("path", ""),
-		Image:      bundle.str("image", ""),
-		BuildHost:  bundle.str("build_host", "local"),
-		RustTarget: bundle.str("rust_target", ""),
-		GoOS:       bundle.str("go_os", "linux"),
-		GoArch:     bundle.str("go_arch", ""),
-		GOAMD64:    bundle.str("goamd64", ""),
-		CrtStatic:  bundle.boolean("crt_static", true),
+		Source:  bundle.str("source", BundleRelease),
+		Path:    bundle.str("path", ""),
+		Tag:     bundle.str("tag", ""),
+		Version: bundle.str("version", ""),
+		Flavor:  bundle.str("flavor", ""),
+		GoOS:    bundle.str("go_os", "linux"),
+		GoArch:  bundle.str("go_arch", ""),
+		GOAMD64: bundle.str("goamd64", ""),
+	}
+	for _, key := range []string{"image", "build_host", "rust_target", "crt_static"} {
+		bundle.removed(key, containerBuildRemoved)
 	}
 	bundle.finish()
 
@@ -867,25 +893,54 @@ func validateHostPath(state *decodeState, prefix, name, value string, windows bo
 }
 
 func validateBundle(state *decodeState, prefix string, machine *Machine) {
-	switch machine.Bundle.Source {
+	bundle := machine.Bundle
+	switch bundle.Source {
+	case BundleRelease:
+		if bundle.Path != "" {
+			state.fail("%s: bundle.path is only used with source = %q", prefix, BundlePrebuilt)
+		}
+		switch {
+		case bundle.Tag != "" && bundle.Version != "":
+			state.fail("%s: set bundle.tag or bundle.version, not both", prefix)
+		case bundle.releaseTag() == "":
+			state.fail("%s: bundle.tag (for example \"rarpar-v0.7.0\") or bundle.version is required for source = %q", prefix, BundleRelease)
+		case !releaseTagPattern.MatchString(bundle.releaseTag()):
+			state.fail("%s: %q is not a rarpar release tag (rarpar-vMAJOR.MINOR.PATCH)", prefix, bundle.releaseTag())
+		}
+		platform, err := resolveReleasePlatform(bundle)
+		if err != nil {
+			state.fail("%s: %v", prefix, err)
+		} else if machine.BuildTarget != "" && machine.BuildTarget != platform.RustTarget {
+			state.fail("%s: build_target %q does not match the %s release asset, which is built for %s", prefix, machine.BuildTarget, platform.Name, platform.RustTarget)
+		}
+		// The Windows runner and the bundle's .exe names follow the
+		// connection shell; the asset and the harness follow go_os.
+		if machine.isWindows() && bundle.GoOS != "windows" {
+			state.fail("%s: a powershell host needs bundle.go_os = \"windows\" to stage the Windows release asset", prefix)
+		} else if !machine.isWindows() && bundle.GoOS == "windows" {
+			state.fail("%s: bundle.go_os = \"windows\" needs connection.shell = \"powershell\"", prefix)
+		}
+		for _, suite := range []string{SuiteCRCProbe, SuiteYencMicro} {
+			if machine.hasSuite(suite) {
+				state.fail("%s: suite %q measures weaver's own binaries, which no rarpar release publishes; run it from a bundle.source = %q bundle", prefix, suite, BundlePrebuilt)
+			}
+		}
 	case BundlePrebuilt:
-		if machine.Bundle.Path == "" {
+		if bundle.Path == "" {
 			state.fail("%s: bundle.path is required for source = %q", prefix, BundlePrebuilt)
-		} else if !filepath.IsAbs(machine.Bundle.Path) {
-			state.fail("%s: bundle.path must be absolute: %s", prefix, machine.Bundle.Path)
+		} else if !filepath.IsAbs(bundle.Path) {
+			state.fail("%s: bundle.path must be absolute: %s", prefix, bundle.Path)
 		}
-	case BundleDocker:
-		if machine.Bundle.Image == "" {
-			state.fail("%s: bundle.image is required for source = %q", prefix, BundleDocker)
+		for _, key := range []struct{ name, value string }{{"tag", bundle.Tag}, {"version", bundle.Version}, {"flavor", bundle.Flavor}} {
+			if key.value != "" {
+				state.fail("%s: bundle.%s is only used with source = %q", prefix, key.name, BundleRelease)
+			}
 		}
-		if machine.Bundle.RustTarget == "" {
-			state.fail("%s: bundle.rust_target is required for source = %q", prefix, BundleDocker)
-		}
-		if machine.Bundle.GoArch == "" {
-			state.fail("%s: bundle.go_arch is required for source = %q", prefix, BundleDocker)
-		}
+	case "docker":
+		state.fail("%s: bundle.source = \"docker\" was removed: candidates are never built in a container. Use %q for the published release artifacts, or %q for a local bundle in a dev spot test",
+			prefix, BundleRelease, BundlePrebuilt)
 	default:
-		state.fail("%s: bundle.source must be %q or %q", prefix, BundlePrebuilt, BundleDocker)
+		state.fail("%s: bundle.source must be %q or %q", prefix, BundleRelease, BundlePrebuilt)
 	}
 }
 
@@ -1217,14 +1272,6 @@ func (machine Machine) needsCorpus() bool {
 // needsCandidate reports whether the bundle must carry the rarpar CLI.
 func (machine Machine) needsCandidate() bool {
 	return machine.needsCorpus() || machine.hasSuite(SuiteMacroPAR3)
-}
-
-// needsContainerBuild reports whether the bundle needs the container build
-// at all: the rarpar CLI or weaver's examples. A machine running only the
-// turbo suites ships git bundles and a cross-compiled harness and builds its
-// candidates on the host.
-func (machine Machine) needsContainerBuild() bool {
-	return machine.needsCandidate() || machine.hasSuite(SuiteYencMicro) || machine.hasSuite(SuiteCRCProbe)
 }
 
 // usesSSM reports whether this cloud machine is reached through SSM.

@@ -10,11 +10,16 @@ import (
 
 const RunStateSchemaVersion = 1
 
+// RunStateFile is the state `fleet run` keeps in its run directory.
+const RunStateFile = "run-state.json"
+
 // Status values a machine moves through. They are persisted so `fleet collect
-// --resume` can re-enter a run for stragglers and failures only.
+// --resume` can re-enter a run for stragglers and failures only. StatusStaged
+// ends a `fleet plan --stage` dry check, which contacts no host.
 const (
 	StatusPending    = "pending"
 	StatusBuilding   = "building"
+	StatusStaged     = "staged"
 	StatusSpawning   = "spawning"
 	StatusRunning    = "running"
 	StatusCollecting = "collecting"
@@ -49,6 +54,7 @@ type MachineState struct {
 	Endpoint      string                      `json:"endpoint"`
 	Remote        RemoteLayout                `json:"remote"`
 	BundleDir     string                      `json:"bundle_dir,omitempty"`
+	Release       *ReleaseArtifact            `json:"release,omitempty"`
 	Oracles       map[string]OracleResolution `json:"oracles,omitempty"`
 	Cloud         *CloudState                 `json:"cloud,omitempty"`
 	Teardown      *TeardownEvidence           `json:"teardown,omitempty"`
@@ -101,16 +107,16 @@ func NewRunState(runDir, runID string, config Config, dryRunAWS bool) *RunState 
 		ConfigSHA256:  config.SHA256,
 		RunDir:        runDir,
 		DryRunAWS:     dryRunAWS,
-		path:          filepath.Join(runDir, "run-state.json"),
+		path:          filepath.Join(runDir, RunStateFile),
 	}
 }
 
 func LoadRunState(runDir string) (*RunState, error) {
-	state := &RunState{path: filepath.Join(runDir, "run-state.json")}
+	state := &RunState{path: filepath.Join(runDir, RunStateFile)}
 	if err := readJSONFile(state.path, state); err != nil {
 		return nil, fmt.Errorf("read run state: %w", err)
 	}
-	state.path = filepath.Join(runDir, "run-state.json")
+	state.path = filepath.Join(runDir, RunStateFile)
 	return state, nil
 }
 
