@@ -17,15 +17,16 @@ import (
 )
 
 const par3Usage = `Usage:
-  rarpar-bench par3 matrix [--profile smoke|full|fleet] [--set ID]... [--ops LIST] [--workers 1,8] [--durability durable,buffered]
+  rarpar-bench par3 matrix [--profile smoke|full|fleet] [--set ID]... [--ops LIST] [--workers 1,8]
         [--kernel-variant NAME:VAR=V]... [--json]
   rarpar-bench par3 build-reference --out DIR [--toolchains PATH] [--cache DIR] [--mirror-base URL] [--cmake PATH] [--jobs N]
   rarpar-bench par3 run --reference PATH --candidate PATH --work DIR --out DIR [--profile smoke|full|fleet] [--set ID]...
         [--ops create,verify,repair] [--warmups N] [--repeats N] [--workers 1,8] [--pin-cpus 0-7]
-        [--durability durable,buffered] [--kernel-variant NAME:VAR=V[,VAR=V]]... [--iocount] [--engine-perf PATH]
+        [--kernel-variant NAME:VAR=V[,VAR=V]]... [--iocount] [--engine-perf PATH]
         [--candidate-arg ARG]... [--machine LABEL] [--timeout 20m] [--reference-timeout DURATION] [--keep-stages]
         [--target NAME=DIR]... [--target-meta NAME:KEY=V[,KEY=V]]... [--rows reference,rarpar,engine]
         [--engine-workers 8] [--engine-variant NAME:VAR=V[,VAR=V]]... [--drop-caches]
+        [--perf-stat N] [--perf-ops repair] [--perf-record SET]... [--perf-freq 499] [--perf-out DIR]
   rarpar-bench par3 report --input results.json [--out report.md]
   rarpar-bench par3 render --input results.json --out DIR
   rarpar-bench par3 versus --candidate PATH --work DIR --out DIR [--par2 PATH] [--profile versus-smoke|versus]
@@ -33,10 +34,35 @@ const par3Usage = `Usage:
   rarpar-bench par3 versus-report --input results.json [--out report.md]
 
 The PAR3 suite benchmarks the shipped rarpar CLI against the pinned par3cmdline
-reference on deterministic generated inputs. See docs/benchmarking.md.
+reference on deterministic generated inputs. See docs/benchmarking.md. Every
+rarpar row runs buffered, one row per worker count (rarpar-wN) and kernel
+variant; the bench never passes --fsync, because durability is the caller's
+concern, not PAR3's. A candidate whose par3 create or repair --help lists
+--buffered (0.6.x and earlier) gets --buffered; one that lists neither runs
+plain, and the results say so.
+Repair has two rarpar rows per worker count: rarpar-wN repairs in place and
+keeps no backup (the candidate's default), and rarpar-wN-backup keeps a
+numbered .1 backup of every file it repairs, as the reference always does, so
+the -backup rows are like for like with the reference on bytes written. The
+candidate's par3 repair --help picks the switches: one listing --backup gives
+the -backup rows --backup; one listing --no-backup (0.7.0 and earlier) gives
+the in-place rows --no-backup; one listing neither runs only the -backup rows,
+plain, and the results say so. A PAR-inside set keeps one compatible rs row,
+which keeps a .1 like the reference.
+--perf-stat N and --perf-record SET add an untimed Linux perf pass after each
+--perf-ops operation's timed runs (default: repair), on the plain sets and the
+first target: N perf stat runs of every reference and rarpar row, each on a
+fresh stage, counting the corpus suites' --perf events; and on each named set
+one perf record -F 499 run (--perf-freq) of every rarpar row, kept as perf
+script text and folded stacks. Files go under --perf-out (default OUT/perf);
+a host without Linux perf skips the pass, and the results say so. A pass that
+was skipped, had a perf run fail, or ran nothing also writes INCOMPLETE.txt
+there, one problem per line.
 par3 versus compares PAR2 (rarpar par, and par2cmdline-turbo with --par2) with
 PAR3 Cauchy and FFT at one block size, recovery count and damage pattern, on the
 scale par2 ÷ par3 (above 1 = PAR3 faster), with every repair SHA-256 checked.
+Each PAR3 arm's repair runs in place, and its -backup twin keeps a .1; the
+report says which PAR2 arm each is like for like with on bytes written.
 `
 
 func runPAR3(ctx context.Context, args []string, stdout io.Writer) error {
@@ -122,7 +148,6 @@ func runPAR3Matrix(args []string, stdout io.Writer) error {
 	profileName := flags.String("profile", "smoke", "profile: smoke, full or fleet")
 	workers := flags.String("workers", "1,8", "rarpar worker counts")
 	ops := flags.String("ops", strings.Join(par3bench.DefaultOps, ","), "operations: "+strings.Join(par3bench.KnownOps, ","))
-	durability := flags.String("durability", strings.Join(par3bench.KnownDurabilities, ","), "rarpar durability rows for create and repair (durable always runs; which flag selects each mode is probed from the candidate's --help)")
 	jsonOut := flags.Bool("json", false, "emit JSON")
 	var sets, kernels stringList
 	flags.Var(&sets, "set", "restrict to a set ID (repeatable)")
@@ -142,21 +167,17 @@ func runPAR3Matrix(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	durabilities, err := par3bench.ParseDurabilities(*durability)
-	if err != nil {
-		return err
-	}
 	opList := splitList(*ops)
 	if err := par3bench.CheckOps(opList); err != nil {
 		return err
 	}
-	rows := par3bench.Variants(workerList, variants, durabilities)
+	rows := par3bench.Variants(workerList, variants)
 	if err := par3bench.CheckVariantNames(rows); err != nil {
 		return err
 	}
 	byOp := par3bench.RowsByOp(rows, opList)
 	if *jsonOut {
-		return writeJSONTo(stdout, map[string]any{"profile": profile, "ops": opList, "durabilities": durabilities, "variants": rows, "rows": byOp})
+		return writeJSONTo(stdout, map[string]any{"profile": profile, "ops": opList, "variants": rows, "rows": byOp})
 	}
 	table := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(table, "SET\tDATASET\tBYTES\tBLOCK\tINPUT\tRECOVERY\tCODEC\tFIELD\tDAMAGE")
@@ -180,47 +201,17 @@ func runPAR3Matrix(args []string, stdout io.Writer) error {
 	if err := table.Flush(); err != nil {
 		return err
 	}
-	fmt.Fprintln(stdout, "\nrows per set (the reference never syncs and has one row; rarpar's durable row is the default):")
+	fmt.Fprintln(stdout, "\nrows per set (one reference row, which never syncs and keeps a .1 backup of what it repairs; one buffered rarpar row per worker count and kernel variant, repairing in place with no backup; at repair, one rarpar-wN-backup row per worker count that keeps a .1 like the reference, like for like on bytes written):")
 	table = tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
 	for _, op := range opList {
-		labels := make([]string, 0, len(byOp[op]))
-		for _, name := range byOp[op] {
-			labels = append(labels, matrixLabel(rows, name, op))
-		}
-		fmt.Fprintf(table, "  %s\t%s\n", op, strings.Join(labels, ", "))
+		fmt.Fprintf(table, "  %s\t%s\n", op, strings.Join(byOp[op], ", "))
 	}
 	if err := table.Flush(); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintln(stdout, "the flag selecting each mode is probed from `rarpar par3 OP --help`: a 0.7.0+ candidate is buffered by default and takes --fsync for durable rows, an older one is durable by default and takes --buffered; an op listing neither keeps only its durable row (noted in the results).")
+	_, err = fmt.Fprintln(stdout, "rarpar rows never pass --fsync: a 0.7.0+ candidate is buffered when run plain, an older one whose `rarpar par3 OP --help` lists --buffered gets it, and an op listing neither runs plain (noted in the results).\n"+
+		"repair rows take their backup switch from `rarpar par3 repair --help`: --backup listed gives the -backup rows --backup; only --no-backup listed (0.7.0 and earlier) gives the in-place rows --no-backup; neither listed runs only the -backup rows, plain (noted in the results). A PAR-inside set runs one compatible rs row instead.")
 	return err
-}
-
-func matrixLabel(variants []par3bench.Variant, name, op string) string {
-	for _, variant := range variants {
-		if variant.Name != name {
-			continue
-		}
-		if op != par3bench.OpCreate && op != par3bench.OpRepair {
-			return name
-		}
-		switch variant.EffectiveDurability() {
-		case "":
-			return name
-		default:
-			return name + " (" + variant.EffectiveDurability() + ")"
-		}
-	}
-	return name
-}
-
-func containsString(list []string, value string) bool {
-	for _, item := range list {
-		if item == value {
-			return true
-		}
-	}
-	return false
 }
 
 func runPAR3BuildReference(ctx context.Context, args []string, stdout io.Writer) error {
@@ -269,12 +260,16 @@ func runPAR3Suite(ctx context.Context, args []string, stdout io.Writer) error {
 	memory := flags.Int("engine-perf-memory-mib", 256, "engine_perf memory budget")
 	timeout := flags.Duration("timeout", par3bench.DefaultTimeout, "per-run timeout for every timed process; a reference run past it is DNF")
 	referenceTimeout := flags.Duration("reference-timeout", 0, "per-run timeout for reference processes (default: --timeout)")
-	durability := flags.String("durability", strings.Join(par3bench.KnownDurabilities, ","), "rarpar durability rows for create and repair (durable always runs; which flag selects each mode is probed from the candidate's --help)")
 	keep := flags.Bool("keep-stages", false, "keep per-run stage directories")
 	engineWorkers := flags.String("engine-workers", "", "add timed engine_perf rows at these worker counts (needs --engine-perf)")
 	rows := flags.String("rows", "", "timed row kinds: "+strings.Join(par3bench.KnownRowKinds, ",")+" (default: reference,rarpar, plus engine with --engine-workers)")
 	dropCaches := flags.Bool("drop-caches", false, "drop the page cache before every timed run (Linux, root)")
-	var sets, kernels, candidateArgs, targets, targetMeta, engineVariants stringList
+	perfStat := flags.Int("perf-stat", 0, "untimed perf stat runs of every reference and rarpar row per --perf-ops op, after its timed runs (Linux; 0 = none)")
+	perfOps := flags.String("perf-ops", strings.Join(par3bench.DefaultPerfOps, ","), "operations the perf pass covers")
+	perfFreq := flags.Int("perf-freq", par3bench.DefaultPerfFrequency, "perf record sampling frequency (-F)")
+	perfOut := flags.String("perf-out", "", "directory for perf's files (default: OUT/perf)")
+	var sets, kernels, candidateArgs, targets, targetMeta, engineVariants, perfRecord stringList
+	flags.Var(&perfRecord, "perf-record", "plain set whose rarpar rows also get one untimed perf record run per --perf-ops op (repeatable)")
 	flags.Var(&targets, "target", "storage target NAME=DIR; every row runs on every target, interleaved (repeatable; replaces --work)")
 	flags.Var(&targetMeta, "target-meta", "facts about a target the client cannot see, NAME:key=value[,key=value] (repeatable)")
 	flags.Var(&engineVariants, "engine-variant", "extra engine row NAME:VAR=value[,VAR=value] (repeatable)")
@@ -296,10 +291,6 @@ func runPAR3Suite(ctx context.Context, args []string, stdout io.Writer) error {
 		return err
 	}
 	variants, err := parseKernelVariants(kernels)
-	if err != nil {
-		return err
-	}
-	durabilities, err := par3bench.ParseDurabilities(*durability)
 	if err != nil {
 		return err
 	}
@@ -344,9 +335,11 @@ func runPAR3Suite(ctx context.Context, args []string, stdout io.Writer) error {
 		Work: workspacePath(*work), Out: workspacePath(*out), Profile: profile, Ops: splitList(*ops),
 		Warmups: *warmups, Repeats: *repeats, Workers: workerList, PinCPUs: *pin, KernelVariants: variants,
 		IOCount: *iocount, MachineLabel: *machine, CandidateArgs: candidateArgs, EnginePerfMemoryMiB: *memory,
-		KeepStages: *keep, Timeout: *timeout, ReferenceTimeout: *referenceTimeout, Durabilities: durabilities, Log: os.Stderr,
+		KeepStages: *keep, Timeout: *timeout, ReferenceTimeout: *referenceTimeout, Log: os.Stderr,
 		Targets: targetList, Rows: splitList(*rows), EngineWorkers: engineWorkerList, EngineVariants: engineVariantList,
 		DropCaches: *dropCaches,
+		Perf: par3bench.PerfOptions{StatRepeats: *perfStat, Ops: splitList(*perfOps), RecordSets: perfRecord,
+			Frequency: *perfFreq, Out: workspacePath(*perfOut)},
 	})
 	if err != nil {
 		return err

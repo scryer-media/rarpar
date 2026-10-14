@@ -575,19 +575,25 @@ fn repair_rejects_a_source_changed_within_or_between_stripe_passes() {
     let mut options = ExecutionOptions::default();
     options.workers = 1;
     options.stripe_bytes = 1024;
-    // Thirty surviving blocks are read per pass: read 5 is inside the first
-    // pass, read 30 opens the second, after the first pass was staged. A
-    // replaced file still reads through the old handle and is caught when
-    // that pass settles, after its thirtieth read; a truncated one fails at
-    // block 16, the fifteenth read of the pass, the first past its new end.
-    // Either way the staged temporary is never installed. Without POSIX
-    // rename a held handle refuses the replacement, so only truncation is
-    // tried.
+    // The output is staged first as a copy of its thirty surviving blocks,
+    // in three reads, one per run between the two lost blocks; a source
+    // replaced during the copy is caught by the check that follows it, and
+    // one truncated to half fails the third read short, at its new end, and
+    // is caught there. Then thirty surviving blocks are read per pass: read 8
+    // is inside the first pass, read 33 opens the second, after the first
+    // pass was staged. A replaced file still reads through the old handle and
+    // is caught when that pass settles, after its thirtieth read; a truncated
+    // one fails at block 16, the fifteenth read of the pass, the first past
+    // its new end. Either way the staged temporary is never installed.
+    // Without POSIX rename a held handle refuses the replacement, so only
+    // truncation is tried.
     for (at, truncate, reads) in [
-        (5, false, 30),
-        (5, true, 15),
-        (30, false, 60),
-        (30, true, 45),
+        (1, false, 3),
+        (1, true, 4),
+        (8, false, 33),
+        (8, true, 18),
+        (33, false, 63),
+        (33, true, 48),
     ] {
         if !truncate && !common::temp_volume_has_posix_unlink_rename() {
             continue;
@@ -621,14 +627,16 @@ fn repair_checks_sources_it_does_not_write_once_per_pass() {
     let mut options = ExecutionOptions::default();
     options.workers = 1;
     let run = repair_from_disk(&set, &[(1, 70)], &options);
-    // One stripe pass reads all 127 surviving blocks in file order, and only
-    // the damaged second file is written. Each of the eight sources is checked
-    // once, when the pass settles; staging its writes no longer checks the
-    // reads before each one (that cost 15 + 7 more). The other 32 are the
-    // evidence checks before and after reconstruction, four per file.
-    // Checking every read cost 159.
-    assert_eq!(run.reads, 127);
-    assert_eq!(run.snapshots, 32 + 8);
+    // The damaged second file, the only one written, is staged as a copy of
+    // its fifteen surviving blocks in two reads, one per run beside the lost
+    // block, and its source is checked once the copy is done. One stripe pass
+    // then reads all 127 surviving blocks in file order. Each of the eight
+    // sources is checked once, when the pass settles; staging its writes no
+    // longer checks the reads before each one (that cost 15 + 7 more). The
+    // other 32 are the evidence checks before and after reconstruction, four
+    // per file. Checking every read cost 159.
+    assert_eq!(run.reads, 2 + 127);
+    assert_eq!(run.snapshots, 32 + 8 + 1);
 }
 
 #[cfg(any(unix, windows))]

@@ -197,10 +197,7 @@ fn par3_create_from_a_pipe_verifies_and_repairs_like_a_set_made_from_the_file() 
         let ours = par3_verdicts(&piped, "set.par3");
         assert_eq!(ours.0, Some(1));
         assert_eq!(ours, par3_verdicts(&from_file, "set.par3"));
-        ok(&rarpar(
-            &piped,
-            &["par3", "repair", "set.par3", "--no-backup"],
-        ));
+        ok(&rarpar(&piped, &["par3", "repair", "set.par3"]));
         assert!(std::fs::read(piped.join("data.bin")).unwrap() == data);
     }
 }

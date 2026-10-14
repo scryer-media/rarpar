@@ -17,9 +17,12 @@ const par3ChartWidth = 1200
 // rarpar row against the reference row: the bar is reference/rarpar median
 // wall time on the same symmetric log scale as the RAR and PAR2 charts, and
 // the line under it carries wall, CPU (user+sys) and peak RSS medians for
-// both sides with the measured run count. Only durable rarpar rows are drawn
-// (the default); buffered rows stay in the Markdown report. The output is a
-// pure function of results.json: no timestamps or local paths.
+// both sides with the measured run count. A repair row's label also says
+// whether it is like for like with the reference on bytes written (it keeps
+// a numbered .1 backup, as par3cmdline does) or repairs in place (see
+// repairModeLabel). Every rarpar row is drawn; engine rows have no reference
+// ratio and stay in the Markdown report. The output is a pure function of
+// results.json: no timestamps or local paths.
 func RenderSVGs(results *Results, out string) ([]string, error) {
 	if err := ValidateResults(results); err != nil {
 		return nil, err
@@ -57,9 +60,13 @@ func renderOpSVG(results *Results, rows []Row, op string) ([]byte, bool) {
 			references[row.Config+"@"+row.Target] = row
 		}
 	}
+	carriers := map[string]bool{}
+	for _, config := range results.Configs {
+		carriers[config.ID] = config.Carrier != ""
+	}
 	var chart []par3ChartRow
 	for _, row := range rows {
-		if row.Op != op || row.Tool != ToolCandidate || row.Durability == DurabilityBuffered || row.Wall.N == 0 {
+		if row.Op != op || row.Tool != ToolCandidate || row.Wall.N == 0 {
 			continue
 		}
 		reference, ok := references[row.Config+"@"+row.Target]
@@ -69,6 +76,9 @@ func renderOpSVG(results *Results, rows []Row, op string) ([]byte, bool) {
 		label := row.Config + " / " + row.Variant
 		if row.Target != "" {
 			label += " @" + row.Target
+		}
+		if op == OpRepair {
+			label += repairModeLabel(row, carriers[row.Config])
 		}
 		chart = append(chart, par3ChartRow{label: label, reference: reference, candidate: row, dnf: reference.DNF})
 	}
@@ -81,6 +91,9 @@ func renderOpSVG(results *Results, rows []Row, op string) ([]byte, bool) {
 	}
 	title := "rarpar PAR3 " + op + " against par3cmdline"
 	description := fmt.Sprintf("PAR3 %s on %s. Relative speed is par3cmdline median wall time divided by rarpar median wall time; each row also lists CPU time and peak RSS for both.", op, results.Machine.Label)
+	if op == OpRepair {
+		description += " par3cmdline keeps a numbered .1 backup of every file it repairs. Rows marked like for like keep one too, so they write the same bytes as the reference; rows marked in place repair in place and write no backup."
+	}
 	var document bytes.Buffer
 	fmt.Fprintf(&document, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%d\" height=\"%d\" viewBox=\"0 0 %d %d\" role=\"img\" aria-labelledby=\"title desc\">\n", par3ChartWidth, height, par3ChartWidth, height)
 	fmt.Fprintf(&document, "  <title id=\"title\">%s</title>\n  <desc id=\"desc\">%s</desc>\n", bench.EscapeXML(title), bench.EscapeXML(description))
@@ -133,6 +146,24 @@ func renderOpSVG(results *Results, rows []Row, op string) ([]byte, bool) {
 	}
 	document.WriteString("  </g>\n</svg>\n")
 	return document.Bytes(), true
+}
+
+// repairModeLabel is a repair row's label suffix: which rarpar row is like
+// for like with the reference on bytes written (it keeps a numbered .1
+// backup, as par3cmdline does) and which repairs in place. A PAR-inside
+// set's one row runs the compatible rs, like for like when its repairs kept
+// the damaged carrier as a backup.
+func repairModeLabel(row Row, carrier bool) string {
+	switch {
+	case carrier && row.LeftBackup == "true":
+		return " — compatible rs, keeps .1 like the reference: like for like"
+	case carrier:
+		return " — compatible rs"
+	case row.Backup:
+		return " — keeps .1 like the reference: like for like"
+	default:
+		return " — in place, no backup"
+	}
 }
 
 // par3TimingLine is "wall 4.65 -> 0.93 s | CPU 4.43 -> 2.36 s | RSS 321 -> 29 MiB | n=7".

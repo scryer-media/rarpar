@@ -100,6 +100,9 @@ const (
 // containerBuildRemoved explains the keys the removed container build read.
 const containerBuildRemoved = `the container build is gone; candidates come from bundle.source = "release" (the published release artifacts) or "prebuilt" (a local bundle, for dev spot tests)`
 
+// par3DurabilityRemoved explains the removed par3.durability key.
+const par3DurabilityRemoved = `the PAR3 bench runs buffered rarpar rows only (one rarpar-wN row per worker count) and never passes --fsync; durability is a consumer concern, not a PAR3 one, so there is no durable row to select; drop the key`
+
 var (
 	knownSuites   = []string{SuiteCRCProbe, SuiteYencMicro, SuiteMacroRAR, SuiteMacroPAR2, SuiteMacroPAR3, SuiteLzmaTurbo, SuiteSevenzTurbo}
 	knownShells   = []string{"sh", "bash", "powershell"}
@@ -211,9 +214,6 @@ type PAR3Plan struct {
 	// checks it against every selected set.
 	Work           string   `json:"work,omitempty"`
 	KernelVariants []string `json:"kernel_variants,omitempty"`
-	// Durability lists rarpar's durability rows for create and repair
-	// (default: durable, buffered). Durable is always included.
-	Durability []string `json:"durability,omitempty"`
 	// TimeoutMinutes bounds every timed process (default 20); a reference run
 	// past it is DNF.
 	TimeoutMinutes int `json:"timeout_minutes"`
@@ -311,6 +311,15 @@ type PerfPlan struct {
 	RecordCases     []string `json:"record_cases,omitempty"`
 	StatRepeats     int      `json:"stat_repeats"`
 	RecordFrequency int      `json:"record_frequency"`
+	// PAR3Ops are the macro-par3 ops whose reference and rarpar rows run
+	// StatRepeats times under perf stat, untimed, after the op's timed runs
+	// (`par3 run --perf-stat --perf-ops`). A linux-perf machine with the
+	// macro-par3 suite defaults to repair; par3_ops = [] turns the pass off.
+	PAR3Ops []string `json:"par3_ops,omitempty"`
+	// PAR3RecordSets are the plain macro-par3 sets whose rarpar rows of
+	// PAR3Ops also run once under perf record -F RecordFrequency
+	// (`par3 run --perf-record`). Empty records none.
+	PAR3RecordSets []string `json:"par3_record_sets,omitempty"`
 }
 
 type EC2 struct {
@@ -575,6 +584,13 @@ func decodeMachine(item *section, settings Settings) Machine {
 		RecordCases:     perf.strings("record_cases", nil),
 		StatRepeats:     perf.integer("stat_repeats", settings.Defaults.PerfStatRepeats),
 		RecordFrequency: perf.integer("record_frequency", settings.Defaults.PerfRecordFrequency),
+		PAR3Ops:         perf.strings("par3_ops", nil),
+		PAR3RecordSets:  perf.strings("par3_record_sets", nil),
+	}
+	if machine.Perf.PAR3Ops == nil && machine.Capabilities.Perf == PerfLinux && contains(machine.Suites, SuiteMacroPAR3) {
+		// A perf host counts its macro-par3 rows unless told otherwise: the
+		// diagnostic pass is what capabilities.perf promises.
+		machine.Perf.PAR3Ops = append([]string(nil), par3bench.DefaultPerfOps...)
 	}
 	perf.finish()
 
@@ -590,11 +606,11 @@ func decodeMachine(item *section, settings Settings) Machine {
 		IOCount:                 par3.boolean("iocount", false),
 		Work:                    par3.str("work", ""),
 		KernelVariants:          par3.strings("kernel_variants", nil),
-		Durability:              par3.strings("durability", nil),
 		TimeoutMinutes:          par3.integer("timeout_minutes", 20),
 		ReferenceTimeoutMinutes: par3.integer("reference_timeout_minutes", 0),
 		Versus:                  par3.str("versus", ""),
 	}
+	par3.removed("durability", par3DurabilityRemoved)
 	par3.finish()
 
 	turbo := item.child("turbo")
@@ -798,6 +814,10 @@ func validate(state *decodeState, config *Config) {
 		}
 		if machine.Perf.StatRepeats < 1 {
 			state.fail("%s: perf.stat_repeats must be positive", prefix)
+		}
+		if (len(machine.Perf.PAR3Ops) > 0 || len(machine.Perf.PAR3RecordSets) > 0) &&
+			(machine.Capabilities.Perf != PerfLinux || !machine.hasSuite(SuiteMacroPAR3)) {
+			state.fail("%s: perf.par3_ops and perf.par3_record_sets configure the macro-par3 perf pass, which needs capabilities.perf = %q and the macro-par3 suite", prefix, PerfLinux)
 		}
 
 		validateBundle(state, prefix, machine)
@@ -1061,8 +1081,10 @@ func validatePAR3(state *decodeState, prefix string, machine *Machine) {
 		state.fail("%s: par3.profile: %v", prefix, err)
 		return
 	}
-	if _, err := profile.Select(plan.Sets); err != nil {
+	if selected, err := profile.Select(plan.Sets); err != nil {
 		state.fail("%s: par3.sets: %v", prefix, err)
+	} else if machine.Capabilities.Perf == PerfLinux {
+		validatePAR3Perf(state, prefix, machine, selected)
 	}
 	if plan.Versus != "" {
 		if _, err := par3bench.LookupVersusProfile(plan.Versus); err != nil {
@@ -1098,10 +1120,7 @@ func validatePAR3(state *decodeState, prefix string, machine *Machine) {
 		}
 		kernels = append(kernels, kernel)
 	}
-	durabilities, err := par3bench.ParseDurabilities(strings.Join(plan.Durability, ","))
-	if err != nil {
-		state.fail("%s: par3.durability: %v", prefix, err)
-	} else if err := par3bench.CheckVariantNames(par3bench.Variants(plan.Workers, kernels, durabilities)); err != nil {
+	if err := par3bench.CheckVariantNames(par3bench.Variants(plan.Workers, kernels)); err != nil {
 		state.fail("%s: par3: %v", prefix, err)
 	}
 	if err := par3bench.ValidatePinCPUs(plan.PinCPUs); err != nil {
@@ -1112,6 +1131,49 @@ func validatePAR3(state *decodeState, prefix string, machine *Machine) {
 	}
 	if plan.Work != "" {
 		validateHostPath(state, prefix, "par3.work", plan.Work, machine.isWindows())
+	}
+}
+
+// validatePAR3Perf checks the macro-par3 perf pass against the suite's ops
+// and selected sets as `par3 run` will, so a typo fails before any launch.
+func validatePAR3Perf(state *decodeState, prefix string, machine *Machine, selected par3bench.Profile) {
+	perf := machine.Perf
+	if err := par3bench.CheckOps(perf.PAR3Ops); err != nil {
+		state.fail("%s: perf.par3_ops: %v", prefix, err)
+		return
+	}
+	ops := machine.PAR3.Ops
+	if len(ops) == 0 {
+		ops = par3bench.DefaultOps
+	}
+	for _, op := range perf.PAR3Ops {
+		if !contains(ops, op) {
+			state.fail("%s: perf.par3_ops: %s is not one of the macro-par3 ops (%s)", prefix, op, strings.Join(ops, ","))
+		}
+	}
+	if len(perf.PAR3RecordSets) > 0 && len(perf.PAR3Ops) == 0 {
+		state.fail("%s: perf.par3_record_sets needs perf.par3_ops: the perf record runs follow those ops' timed runs", prefix)
+	}
+	seen := map[string]bool{}
+	for _, id := range perf.PAR3RecordSets {
+		if seen[id] {
+			state.fail("%s: perf.par3_record_sets: %q is listed more than once", prefix, id)
+			continue
+		}
+		seen[id] = true
+		var config *par3bench.Config
+		for i := range selected.Configs {
+			if selected.Configs[i].ID == id {
+				config = &selected.Configs[i]
+			}
+		}
+		switch {
+		case config == nil:
+			state.fail("%s: perf.par3_record_sets: %q is not a set this machine's macro-par3 run selects (profile %s, sets %s)",
+				prefix, id, machine.PAR3.Profile, strings.Join(selected.ConfigIDs(), ","))
+		case config.Carrier != "":
+			state.fail("%s: perf.par3_record_sets: %q is a PAR-inside set; the perf pass covers plain sets only", prefix, id)
+		}
 	}
 }
 
@@ -1326,6 +1388,15 @@ func (machine Machine) families() []string {
 		}
 	}
 	return families
+}
+
+// par3PerfOps are the macro-par3 ops this machine runs under perf stat, or
+// nil when it runs no macro-par3 perf pass.
+func (machine Machine) par3PerfOps() []string {
+	if machine.Capabilities.Perf != PerfLinux || !machine.hasSuite(SuiteMacroPAR3) {
+		return nil
+	}
+	return machine.Perf.PAR3Ops
 }
 
 func (machine Machine) isWindows() bool { return machine.Connection.Shell == "powershell" }

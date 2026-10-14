@@ -323,9 +323,10 @@ Verification and repair accept a carrier or directory, matching sibling `.par3`
 files and magic-detected renamed carriers by authenticated set identity.
 `--set-id` selects among multiple sets.
 `-C DIR` chooses the protected-data working directory, defaulting to the selected
-carrier's directory; `--output` controls RAR extraction only. Repair retains
-numbered backups unless `--no-backup` is given
-and does not rewrite clean files. Smart placement searches explicit
+carrier's directory; `--output` controls RAR extraction only. Repair replaces
+a damaged file without keeping it unless `--backup` is given, which keeps it
+as a numbered backup (`NAME.1`, or the next free number), and does not rewrite
+clean files. Smart placement searches explicit
 `--search-dir` candidates by content when recovery is insufficient; canonical
 placement uses recorded paths only. JSON reports include file-coordinate damage,
 verified prefixes, cohort deficits, and installed paths and backups.

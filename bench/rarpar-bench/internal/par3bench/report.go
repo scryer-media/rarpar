@@ -37,8 +37,6 @@ type Row struct {
 	Op      string
 	Variant string
 	Tool    string
-	// Durability is "durable"/"buffered" for rarpar rows, "" for the reference.
-	Durability string
 	// DNF describes why a reference row did not finish; empty otherwise.
 	DNF      string
 	Wall     Stat
@@ -67,6 +65,11 @@ type Row struct {
 	Identity                                             string
 	Repaired                                             string
 	Extra                                                string
+	// Backup is the row's Variant.Backup; LeftBackup says whether its
+	// measured repairs kept a numbered backup of a repaired file ("true",
+	// "false", or "false/true" when they disagreed; "" without one).
+	Backup     bool
+	LeftBackup string
 }
 
 // Summarize groups measured (non-warmup) runs into rows, in variant order.
@@ -99,7 +102,7 @@ func Summarize(results *Results) []Row {
 				if len(runs) == 0 && !didNotFinish {
 					continue
 				}
-				row := Row{Config: config.ID, Op: op, Variant: variant.Name, Tool: variant.Tool, Durability: variant.EffectiveDurability(), Target: variant.Target}
+				row := Row{Config: config.ID, Op: op, Variant: variant.Name, Tool: variant.Tool, Target: variant.Target, Backup: variant.Backup}
 				if didNotFinish {
 					row.DNF = describeDNF(stopped)
 				}
@@ -109,6 +112,7 @@ func Summarize(results *Results) []Row {
 				identities := map[string]bool{}
 				repaired := map[string]bool{}
 				extras := map[string]bool{}
+				kept := map[string]bool{}
 				for _, run := range runs {
 					if run.Status != StatusOK {
 						row.Failed++
@@ -144,6 +148,7 @@ func Summarize(results *Results) []Row {
 						for _, extra := range run.Repair.ExtraFiles {
 							extras[extra] = true
 						}
+						kept[fmt.Sprint(len(run.Repair.Backups) > 0)] = true
 					}
 				}
 				row.Wall, row.CPU, row.RSS = stat(wall), stat(cpu), stat(rss)
@@ -157,6 +162,7 @@ func Summarize(results *Results) []Row {
 				row.Identity = strings.Join(sortedKeys(identities), "/")
 				row.Repaired = strings.Join(sortedKeys(repaired), "/")
 				row.Extra = strings.Join(sortedKeys(extras), " ")
+				row.LeftBackup = strings.Join(sortedKeys(kept), "/")
 				rows = append(rows, row)
 			}
 		}
@@ -212,28 +218,29 @@ func RenderReport(results *Results) string {
 		fmt.Fprintf(&b, "; pinned to CPUs %s (applied: %t)", results.PinCPUs, results.PinApplied)
 	}
 	fmt.Fprintln(&b)
-	durabilities := results.Durabilities
-	if len(durabilities) == 0 {
-		durabilities = []string{DurabilityDurable}
+	carrierSets := hasCarrierSet(results)
+	if carrierSets {
+		fmt.Fprint(&b, "- Output: every rarpar row on a plain set runs buffered and the bench never passes `--fsync`; durability is the caller's concern, not PAR3's. The reference never syncs.")
+	} else {
+		fmt.Fprint(&b, "- Output: every rarpar row runs buffered and the bench never passes `--fsync`; durability is the caller's concern, not PAR3's. The reference never syncs.")
 	}
-	fmt.Fprintf(&b, "- Durability: rarpar create and repair run as %s; **durable** syncs every output before the command returns, **buffered** only flushes. The reference never syncs and has one row.", strings.Join(durabilities, " and "))
-	for _, op := range []string{OpCreate, OpRepair} {
-		mode, ok := results.DefaultDurability[op]
-		if !ok {
-			continue
-		}
-		fmt.Fprintf(&b, " A plain `rarpar par3 %s` on this candidate is %s", op, mode)
-		for _, other := range KnownDurabilities {
-			if args := results.DurabilityArgs[op][other]; other != mode && len(args) > 0 {
-				fmt.Fprintf(&b, "; `%s` selects %s", strings.Join(args, " "), other)
-			}
-		}
-		fmt.Fprint(&b, ".")
+	if summary := bufferedSummary(results.Ops, results.BufferedArgs, results.BufferedUnsupported); summary != "" {
+		fmt.Fprint(&b, " "+summary)
 	}
-	for _, op := range results.BufferedUnsupported {
-		fmt.Fprintf(&b, " This candidate has no buffered %s mode, so %s has only the durable row.", op, op)
+	if carrierSets {
+		fmt.Fprint(&b, " On a PAR-inside set rarpar runs its par3cmdline-compatible front end (`vs`/`rs`) instead, which has no buffered mode: its repair syncs the rebuilt carrier, so those repair rows are not buffered.")
 	}
 	fmt.Fprintln(&b)
+	if contains(results.Ops, OpRepair) {
+		fmt.Fprint(&b, "- Repair rows: the reference keeps a numbered `.1` backup of every file it repairs. Each `rarpar-wN-backup` row does the same, so the `-backup` rows are the rarpar rows that are like for like with the reference on bytes written; each `rarpar-wN` row (and every kernel row) repairs in place and keeps no backup, the candidate's default. A rarpar repair on a plain set whose backups contradict its row (a `-backup` row that kept none, an in-place row that kept one) fails as `backup-mismatch`.")
+		if summary := backupSummary(results); summary != "" {
+			fmt.Fprint(&b, " "+summary)
+		}
+		if carrierSets {
+			fmt.Fprint(&b, " A PAR-inside set has one rarpar row, through the compatible `rs`, which keeps the damaged carrier as a numbered `.1` as the reference does: like for like on bytes written.")
+		}
+		fmt.Fprintln(&b)
+	}
 	if results.TimeoutSeconds > 0 {
 		fmt.Fprintf(&b, "- Per-run timeout %s (reference %s); a reference run that exits non-zero, is killed, times out, or writes missing, unreadable or truncated carriers is **DNF** and the rest of the matrix still runs\n",
 			formatTimeout(results.TimeoutSeconds), formatTimeout(results.ReferenceTimeoutSeconds))
@@ -247,6 +254,9 @@ func RenderReport(results *Results) string {
 	}
 	if results.DropCaches {
 		fmt.Fprintln(&b, "- Page cache dropped before every timed run (cold reads)")
+	}
+	if line := perfSummary(results.Perf); line != "" {
+		fmt.Fprintln(&b, line)
 	}
 	for _, target := range results.Targets {
 		name := target.Target
@@ -263,7 +273,7 @@ func RenderReport(results *Results) string {
 		fmt.Fprintln(&b)
 	}
 	fmt.Fprintf(&b, "- Started %s, finished %s, status **%s**\n\n", results.StartedUTC, results.FinishedUTC, results.Status)
-	fmt.Fprintln(&b, "Wall and CPU (user+sys) are seconds, RSS is peak MiB; cells are median [min–max]. Every ratio is reference/rarpar medians: above 1.000 rarpar was faster or used less. The reference is single-threaded. Every rarpar row, durable and buffered, is compared with the same reference row.")
+	fmt.Fprintln(&b, "Wall and CPU (user+sys) are seconds, RSS is peak MiB; cells are median [min–max]. Every ratio is reference/rarpar medians: above 1.000 rarpar was faster or used less. The reference is single-threaded. Every rarpar row is compared with the same reference row.")
 	fmt.Fprintln(&b, "Carriers: `identical` = byte-identical to the reference's set; `payloads-only` = every recovery block's payload matches but packet metadata differs; `DIFFERENT` = recovery payloads differ.")
 	fmt.Fprintln(&b)
 	procmeasure.RenderRSSSummary(&b, RSSSummary(results))
@@ -301,14 +311,13 @@ func RenderReport(results *Results) string {
 				fmt.Fprintf(&b, "; damage %s (%d blocks)", config.Damage.Name, config.Damage.LostBlocks())
 			}
 			fmt.Fprint(&b, ".\n\n")
-			header := "| variant |"
-			rule := "|---|"
-			if writes(row.Op) {
-				header += " durability |"
-				rule += "---|"
+			if row.Op == OpRepair {
+				if line := likeForLikeLine(rows, row.Config, config.Carrier != ""); line != "" {
+					fmt.Fprintf(&b, "%s\n\n", line)
+				}
 			}
-			header += " wall s | CPU s | RSS MiB | wall ratio | CPU ratio | RSS ratio |"
-			rule += "---|---|---|---|---|---|"
+			header := "| variant | wall s | CPU s | RSS MiB | wall ratio | CPU ratio | RSS ratio |"
+			rule := "|---|---|---|---|---|---|---|"
 			if windowsCounters {
 				header += " read ops | write ops |"
 				rule += "---|---|"
@@ -331,9 +340,6 @@ func RenderReport(results *Results) string {
 		}
 		reference, hasReference := references[group+"@"+row.Target]
 		line := fmt.Sprintf("| %s |", row.Variant)
-		if writes(row.Op) {
-			line += fmt.Sprintf(" %s |", durabilityLabel(row))
-		}
 		switch {
 		case row.DNF != "":
 			line += " DNF | - | - | - | - | - |"
@@ -371,6 +377,7 @@ func RenderReport(results *Results) string {
 			writeDNFDetail(&b, rows, group, configs[row.Config])
 			writeIdentityDetail(&b, results, row.Config, row.Op)
 			writeIOCounts(&b, results, row.Config, row.Op)
+			writePerfRuns(&b, results, row.Config, row.Op)
 			writeDiskWork(&b, rows, group)
 		}
 	}
@@ -378,11 +385,7 @@ func RenderReport(results *Results) string {
 		fmt.Fprintln(&b, "## engine_perf stage breakdown (untimed pass)")
 		fmt.Fprintln(&b)
 		for _, run := range results.EnginePerfRuns {
-			fmt.Fprintf(&b, "- %s %s w%d", run.Config, run.Op, run.Workers)
-			if run.Durability != "" {
-				fmt.Fprintf(&b, " %s", run.Durability)
-			}
-			fmt.Fprintf(&b, ": %.3fs", run.WallSeconds)
+			fmt.Fprintf(&b, "- %s %s w%d: %.3fs", run.Config, run.Op, run.Workers, run.WallSeconds)
 			if run.Error != "" {
 				fmt.Fprintf(&b, " — error: %s", run.Error)
 			}
@@ -409,16 +412,122 @@ func RenderReport(results *Results) string {
 	return b.String()
 }
 
-// writes reports whether op writes output, and so has durability rows.
-func writes(op string) bool { return op == OpCreate || op == OpRepair }
-
-func durabilityLabel(row Row) string {
-	switch row.Durability {
-	case "":
-		return "none (never syncs)"
-	default:
-		return row.Durability
+// bufferedSummary says, per writing op in ops, how its rarpar rows ran
+// buffered on this candidate (see Results.BufferedArgs), or "" when no
+// writing op was probed.
+func bufferedSummary(ops []string, args map[string][]string, unsupported []string) string {
+	var parts []string
+	for _, op := range []string{OpCreate, OpRepair} {
+		if !contains(ops, op) {
+			continue
+		}
+		selected, probed := args[op]
+		switch {
+		case contains(unsupported, op):
+			parts = append(parts, fmt.Sprintf("`rarpar par3 %s` on this candidate has no buffered mode and runs the plain command", op))
+		case !probed:
+			continue
+		case len(selected) == 0:
+			parts = append(parts, fmt.Sprintf("`rarpar par3 %s` is buffered when run plain", op))
+		default:
+			parts = append(parts, fmt.Sprintf("`rarpar par3 %s` runs with `%s`", op, strings.Join(selected, " ")))
+		}
 	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, "; ") + "."
+}
+
+// describeArgs is how a row's probed arguments read in a sentence.
+func describeArgs(args []string) string {
+	if len(args) == 0 {
+		return "plain"
+	}
+	return "with `" + strings.Join(args, " ") + "`"
+}
+
+// backupSummary says how the rarpar repair rows selected their backup mode
+// on this candidate (see Results.BackupArgs), or "" when repair was not
+// probed.
+func backupSummary(results *Results) string {
+	if results.BackupArgs == nil {
+		return ""
+	}
+	var inPlace, backup []string
+	var haveInPlace, haveBackup bool
+	for _, variant := range results.Variants {
+		args, probed := results.BackupArgs[variant.Name]
+		switch {
+		case !probed:
+		case variant.Backup && !haveBackup:
+			backup, haveBackup = args, true
+		case !variant.Backup && !haveInPlace:
+			inPlace, haveInPlace = args, true
+		}
+	}
+	switch {
+	case results.InPlaceUnsupported && haveBackup:
+		return "This candidate's `par3 repair --help` lists neither --backup nor --no-backup, so it cannot be told to repair in place: only the `-backup` rows ran repair, " + describeArgs(backup) + "."
+	case haveInPlace && haveBackup:
+		return "On this candidate the in-place rows run " + describeArgs(inPlace) + " and the `-backup` rows " + describeArgs(backup) + "."
+	}
+	return ""
+}
+
+// likeForLikeLine names, under a repair table, the rarpar rows that are like
+// for like with the reference on bytes written: the `-backup` rows on a plain
+// set, and on a PAR-inside set the compatible `rs` row when its repairs kept
+// the damaged carrier as a numbered backup.
+func likeForLikeLine(rows []Row, config string, carrier bool) string {
+	var like, other []string
+	for _, row := range rows {
+		if row.Config != config || row.Op != OpRepair || row.Tool != ToolCandidate {
+			continue
+		}
+		if carrier {
+			if row.LeftBackup == "true" {
+				return fmt.Sprintf("Like for like with the reference on bytes written: `%s`, which runs the compatible `rs` and keeps the damaged carrier as a numbered backup, as the reference does.", row.Variant)
+			}
+			if row.LeftBackup != "" {
+				return fmt.Sprintf("`%s` runs the compatible `rs` but did not keep the damaged carrier as a numbered backup in every run (see left behind), so it is not like for like with the reference on bytes written.", row.Variant)
+			}
+			continue
+		}
+		if row.Backup {
+			like = append(like, "`"+row.Variant+"`")
+		} else {
+			other = append(other, "`"+row.Variant+"`")
+		}
+	}
+	if len(like) == 0 {
+		return ""
+	}
+	line := "Like for like with the reference on bytes written: " + strings.Join(like, ", ") +
+		plural(len(like), ", which keeps a numbered `.1` backup of every file it repairs", ", which keep a numbered `.1` backup of every file they repair") +
+		", as the reference does."
+	if len(other) > 0 {
+		line += " " + strings.Join(other, ", ") + plural(len(other), " repairs in place and writes no backup.", " repair in place and write no backup.")
+	}
+	return line
+}
+
+// plural picks the singular or plural form for n subjects.
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
+// hasCarrierSet reports whether any configuration is a PAR-inside set.
+func hasCarrierSet(results *Results) bool {
+	for _, config := range results.Configs {
+		if config.Carrier != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func formatTimeout(seconds float64) string {

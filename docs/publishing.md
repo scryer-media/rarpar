@@ -163,7 +163,49 @@ replaces the `rustflags` in `.cargo/config.toml`, so the Windows lanes repeat
 its `link-arg=/STACK:8388608` and `build-windows` checks the reserve in the
 built binary. Every native artifact enables AWS-LC;
 the feature audit requires one resolved `aws-lc-sys` and blocks Metal and
-WGPU from every shipped `rarpar` artifact on every platform.
+WGPU from every shipped `rarpar` artifact on every platform. The musl
+artifacts also enable `musl-allocator`, which makes mimalloc the global
+allocator in place of musl's own.
+
+Required release build environment, set on the `build-linux`, `build-macos`
+and `build-windows` jobs:
+
+- AWS-LC is built from source by the aws-lc-sys cc builder and linked
+  statically, with assembly and at full size: `CARGO_INCREMENTAL=0`,
+  `AWS_LC_SYS_USE_SYSTEM=0`, `AWS_LC_SYS_STATIC=1`, `AWS_LC_SYS_SMALL=0`,
+  `AWS_LC_SYS_CMAKE_BUILDER=0`. The Windows jobs add
+  `AWS_LC_SYS_PREBUILT_NASM=0` (x86_64 assembles with the NASM that
+  `install-nasm.ps1` installs) and compile AWS-LC with clang-cl
+  (`CC_x86_64_pc_windows_msvc=clang-cl`, `CXX_x86_64_pc_windows_msvc=clang-cl`;
+  on ARM64 aws-lc-sys selects clang-cl itself).
+- Per-target `CFLAGS_<target>` and `CXXFLAGS_<target>`, for every C
+  dependency: `-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden`
+  on Linux and macOS, plus `-mno-outline-atomics` for aarch64 musl, and
+  `/O2 /DNDEBUG /Gy /Gw` on Windows. The Linux and macOS flags carry no
+  optimisation level, and none of them carries `-O3`: the release profile's
+  opt-level 3 reaches the cc crate, which passes `-O3` (`-O2` to clang-cl,
+  whose cl dialect has no `-O3`), and the cc crate appends CFLAGS after a
+  build script's own flags, so a level in CFLAGS would override the `-O0`
+  that AWS-LC's jitterentropy sources require (`jitterentropy-base.c` refuses
+  to compile with `__OPTIMIZE__` defined). Nothing in the workspace pins a
+  release or build-override `opt-level`, and `release_profile.py` refuses a
+  nested `[profile.release.*]` table.
+- `CC_ENABLE_DEBUG_OUTPUT=1`, which makes the cc crate record every compiler
+  command in the build-script output Cargo keeps (what `cargo build -vv`
+  prints). After the build, `confirm-native-code.sh`/`.ps1` run
+  `.github/scripts/release/confirm_native_code.py`, which fails the job unless
+  the dependency graph of the built feature list contains `aws-lc-sys` (and
+  `mimalloc` on musl); the aws-lc-sys output shows the cc builder, a static
+  link, no `OPENSSL_SMALL` or `OPENSSL_NO_ASM`, AWS-LC's C sources compiled
+  at `-O3` (`/O2` with clang-cl, which the Windows jobs require) and the six
+  `third_party/jitterentropy/jitterentropy-library/src/jitterentropy-*.c`
+  sources at `-O0` (`-Od`); and the stripped binary still carries AWS-LC's
+  assembly (the `CRYPTOGAMS by <appro@openssl.org>` credit in its perlasm
+  code) and, on musl, mimalloc (its `mimalloc: warning: ` message prefix).
+  The job keeps the dependency graph and the aws-lc-sys output in `logs/`.
+  The `target-checks` lanes in `ci.yml` build the same feature lists with
+  the same flags from the workspace and run the same check on every pull
+  request.
 
 Required repository configuration:
 

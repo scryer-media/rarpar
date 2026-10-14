@@ -100,9 +100,12 @@ fn main() -> Result<()> {
 ```
 
 Clean files are left alone. Rebuilt files are staged and verified before
-installation; backups are enabled by default. Inspect the report for incomplete
-repairs. `plan_repair` is available for a separate assessment, but
-`repair_set` performs its own analysis. Use a retained session to reuse evidence.
+installation. No backup of a damaged file is kept by default;
+`RepairOptions::default().with_backup(true)` keeps it as `<name>.1` (or the
+next free number) before the rebuilt file is renamed over it. Inspect the
+report for incomplete repairs. `plan_repair` is available for a separate
+assessment, but `repair_set` performs its own analysis. Use a retained session
+to reuse evidence.
 
 On native targets, repair holds the output root open and performs rebuild reads
 and installs relative to that directory capability. It refuses symbolic links

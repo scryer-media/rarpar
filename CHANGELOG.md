@@ -3,6 +3,115 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.8.0
+
+A minor bump, as for 0.7.0: a command line that 0.7.0 accepted
+(`--no-backup`) is now a usage error.
+
+### Changed
+
+- `par3 repair` and `par3 inside repair` keep no backup of a damaged file by
+  default: the rebuilt file replaces it, and the damaged bytes are not kept.
+  The new `--backup` keeps the damaged file as a numbered backup
+  (`NAME.1`, or the next free number), as both did by default before.
+  `--no-backup` is removed, and passing it is a usage error (exit 2), as it
+  is on `par3 verify`, which accepted it and ignored it. `auto` mode's PAR3
+  repair keeps no backup either. The par3cmdline front end's `r` and `rs`
+  keep the `.1` backup as par3cmdline does.
+- On par3-rs 0.7.0, a repaired file that can be neither cloned nor patched
+  in place is staged by copying the bytes its source holds intact in
+  sequential runs, and the rebuilt extents are written whole, in offset
+  order, where the memory budget allows, rather than in one piece per stripe
+  pass.
+
+### Release workflow
+
+- The musl archives now use mimalloc as their global allocator. The
+  `musl-allocator` feature has been a default feature since 0.3.2, but the
+  release jobs build with `--no-default-features` and an explicit feature
+  list that left it out, so the musl archives of 0.3.2 through 0.7.0 used
+  musl's own allocator. The musl rows now list `musl-allocator`, and the job
+  fails if a musl binary carries no mimalloc.
+- AWS-LC is built the way weaver builds it, in the release jobs and in CI:
+  from source by the aws-lc-sys cc builder, linked statically, with assembly
+  and not size-optimised (`AWS_LC_SYS_USE_SYSTEM=0`, `AWS_LC_SYS_STATIC=1`,
+  `AWS_LC_SYS_SMALL=0`, `AWS_LC_SYS_CMAKE_BUILDER=0`, `CARGO_INCREMENTAL=0`).
+  On Windows it compiles with clang-cl, where x86_64 used MSVC's `cl`
+  before, and never falls back to aws-lc-sys's prebuilt NASM objects
+  (`AWS_LC_SYS_PREBUILT_NASM=0`).
+- The release jobs pass per-target `CFLAGS_<target>`/`CXXFLAGS_<target>` to
+  every C dependency: `-DNDEBUG -ffunction-sections -fdata-sections
+  -fvisibility=hidden` on Linux and macOS (with `-mno-outline-atomics` on
+  aarch64 musl) and `/O2 /DNDEBUG /Gy /Gw` on Windows. AWS-LC's C assertions
+  are now compiled out, as in its own release builds. No flag sets `-O3`:
+  the release profile already compiles AWS-LC at `-O3` (`/O2` with clang-cl),
+  and a level in CFLAGS would override the `-O0` its jitterentropy sources
+  need.
+- The release job's AWS-LC check (`confirm-native-code.sh`/`.ps1`, replacing
+  `confirm-aws-lc.*`) now reads the aws-lc-sys build output as well as the
+  dependency graph, and the binary: it fails unless AWS-LC came from the cc
+  builder, statically, without `OPENSSL_SMALL` or `OPENSSL_NO_ASM`, with its
+  C sources at `-O3` (`/O2`) and its six jitterentropy sources at `-O0`
+  (`-Od`), and unless the stripped binary still carries AWS-LC's assembly
+  (and mimalloc on musl). CI's `target-checks` lanes now build the release
+  feature list in release mode with the same flags and run the same check.
+
+### Benchmark harness only
+
+- `rarpar-bench par3` and the fleet `macro-par3` suite run every `rarpar`
+  create and repair buffered, one `rarpar-wN` row per worker count (and per
+  kernel variant), and never pass `--fsync`: durability is a consumer
+  concern, not a PAR3 one. The durable rows, the `rarpar-wN-buffered` rows
+  and the report's durability column are gone. The `--help` probe stays for
+  older candidates: `--buffered` is passed where `par3 create|repair --help`
+  lists it (0.6.x and earlier), and an op that lists neither switch
+  (`par3 repair` before 0.7.0) runs the plain command with a note in the
+  results. `engine_perf` rows and stage breakdowns, and the PAR3 arms of
+  `par3 versus`, run buffered too. `--durability` is removed and
+  `par3.durability` is a fleet config error. `results.json` moves to schema
+  `rarpar-par3-bench-v2`, which drops the durability fields and adds
+  `buffered_args` and `buffered_unsupported`; the v2 harness refuses a v1
+  file. No version impact of its own.
+- `rarpar-bench par3` and the fleet `macro-par3` suite split every `rarpar`
+  repair row in two. `rarpar-wN` repairs in place and keeps no backup; the
+  new repair-only `rarpar-wN-backup` keeps a numbered `.1` backup of every
+  file it repairs, as par3cmdline does, so it is the row that is like for
+  like with the reference on bytes written. Each row's switch comes from
+  `rarpar par3 repair --help`: `--backup` for the `-backup` rows where the
+  help lists it, `--no-backup` for the in-place rows where it lists that
+  (0.7.0 and earlier); a help that lists neither runs only the `-backup`
+  rows, plain, with a note. A repair whose numbered backups contradict its
+  row fails as `backup-mismatch`. A PAR-inside set keeps its one compatible
+  `rs` row. The report, the repair SVG labels, `par3 matrix` and the fleet
+  plan name the like-for-like rows. `results.json` moves on to schema
+  `rarpar-par3-bench-v3`, adding `backup_args` and `in_place_unsupported`;
+  the v3 harness refuses v1 and v2 files. `par3 versus` gives each PAR3 arm a
+  `-backup` repair twin on the same set, reports what each repair left
+  behind and whether each PAR2/PAR3 pair is like for like on bytes written,
+  and moves to schema `rarpar-par3-versus-v2`, refusing v1. No version
+  impact of its own.
+- An `engine_perf` create or repair counts as buffered only on its own
+  output evidence: a build that synced, or cannot show it did not, fails
+  its timed row as `engine-not-buffered` and has its untimed stage breakdown
+  flagged. The report no longer says a PAR-inside set's compatible repair
+  runs buffered; it syncs the rebuilt carrier. No version impact of its own.
+- `rarpar-bench par3 run` gains an untimed Linux perf pass after each
+  covered op's timed runs, on the plain sets: `--perf-stat N` runs every
+  reference and `rarpar` row of `--perf-ops` (default `repair`) N times
+  under `perf stat`, and `--perf-record SET` runs each `rarpar` row of that
+  set once under `perf record` (`--perf-freq`, default 499), kept as perf
+  script text and folded stacks under `--perf-out`. `results.json` gains
+  `perf` and `perf_runs`, the report a counter table per row, and a pass
+  that was skipped, had a perf run fail, or ran nothing writes
+  `INCOMPLETE.txt`. A fleet `linux-perf` machine with `macro-par3` now runs
+  it (`perf.par3_ops`, default `["repair"]`, and `perf.par3_record_sets`)
+  and warns `par3-perf-incomplete` when it falls short. Until now the
+  fleet's perf pass covered only the corpus suites, so macro-par3 rows never
+  ran under perf, and the plan's perf line listed the record cases whether
+  or not they ran ("(none)" when there were none). The plan now names only
+  what runs, and a `samply` machine that runs no corpus suite no longer
+  tries to profile corpus cases. No version impact of its own.
+
 ## rarpar 0.7.0
 
 A minor bump, as for 0.4.0 and 0.6.0: a command line that 0.6.x accepted

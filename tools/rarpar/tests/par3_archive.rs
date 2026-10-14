@@ -135,7 +135,7 @@ fn a_sibling_set_repairs_the_archive_it_was_written_with() {
     damage(&archive, original.len() - 40, 30);
     let output = rarpar(
         &root.join("out"),
-        &["--quiet", "par3", "repair", "--no-backup", "set.par3"],
+        &["--quiet", "par3", "repair", "set.par3"],
     );
     assert_eq!(
         output.status.code(),

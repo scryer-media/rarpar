@@ -3,6 +3,8 @@ package fleet
 import (
 	"fmt"
 	"strings"
+
+	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/par3bench"
 )
 
 // RemoteLayout is the on-host directory contract shared by the generated run
@@ -158,9 +160,9 @@ func RunScript(machine Machine, defaults RunDefaults, runID string, layout Remot
 	write(`log() { echo "[$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)] $*"; }`)
 	write(`fail() { STATUS=failed; FAILURES="$FAILURES $1"; log "FAILURE: $1"; }`)
 	// A diagnostic pass that cannot run does not invalidate the timed evidence,
-	// so it is recorded separately rather than failing the host. Hybrid-CPU perf
-	// output, for instance, defeats the harness's perf-stat parser while the
-	// measurements themselves are perfectly good.
+	// so it is recorded separately rather than failing the host: a host without
+	// perf, for instance, or a macro-par3 perf pass that fell short, while the
+	// timed measurements themselves are perfectly good.
 	write(`warn() { WARNINGS="$WARNINGS $1"; log "WARNING: $1"; }`)
 	write("")
 	write("# sha256 helper: coreutils on Linux, shasum on BSD-class userlands.")
@@ -474,8 +476,25 @@ func par3Args(machine Machine) []string {
 	for _, variant := range plan.KernelVariants {
 		args = append(args, "--kernel-variant", variant)
 	}
-	if len(plan.Durability) > 0 {
-		args = append(args, "--durability", strings.Join(plan.Durability, ","))
+	return args
+}
+
+// par3PerfArgs is the macro-par3 perf pass's `rarpar-bench par3 run` flags
+// (before --perf-out), or nil when the machine runs none: perf stat
+// StatRepeats times on every reference and rarpar row of PAR3Ops, and perf
+// record on the rarpar rows of PAR3RecordSets. Only POSIX linux-perf hosts
+// run it, so the PowerShell runner never takes these.
+func par3PerfArgs(machine Machine) []string {
+	ops := machine.par3PerfOps()
+	if len(ops) == 0 {
+		return nil
+	}
+	args := []string{"--perf-stat", fmt.Sprint(machine.Perf.StatRepeats), "--perf-ops", strings.Join(ops, ",")}
+	if len(machine.Perf.PAR3RecordSets) > 0 {
+		args = append(args, "--perf-freq", fmt.Sprint(machine.Perf.RecordFrequency))
+		for _, set := range machine.Perf.PAR3RecordSets {
+			args = append(args, "--perf-record", set)
+		}
 	}
 	return args
 }
@@ -515,12 +534,30 @@ func par3Section(machine Machine, layout RemoteLayout, reference string) string 
 	}
 	write("if [ -x \"$P3_REFERENCE\" ]; then")
 	write("  gate macro-par3")
+	perfArgs := par3PerfArgs(machine)
+	if perfArgs != nil {
+		write("  # The macro-par3 perf pass runs inside par3 run, untimed, after each")
+		write("  # covered op's timed runs: perf stat on every reference and rarpar row,")
+		write("  # perf record on the rarpar rows of the record sets.")
+	}
 	write("  \"$BENCH\" par3 run --reference \"$P3_REFERENCE\" --candidate \"$CANDIDATE\" --work \"$P3_WORK\" \\")
 	write("    --out \"$R/par3\" --machine \"$MACHINE\" %s \\", strings.Join(quoted, " "))
+	if perfArgs != nil {
+		quotedPerf := make([]string, 0, len(perfArgs))
+		for _, arg := range perfArgs {
+			quotedPerf = append(quotedPerf, shellQuote(arg))
+		}
+		write("    --perf-out \"$R/perf/par3\" %s \\", strings.Join(quotedPerf, " "))
+	}
 	write("    > \"$R/par3-run.stdout.log\" 2> \"$R/par3-run.stderr.log\"")
 	write("  rc=$?")
 	write("  log \"macro-par3 rc=$rc\"")
 	write("  [ \"$rc\" -eq 0 ] || fail macro-par3")
+	if perfArgs != nil {
+		write("  # Diagnostic: a pass that fell short warns and never fails the host.")
+		write("  if [ -f \"$R/perf/par3/%s\" ] || [ -z \"$(ls -A \"$R/perf/par3\" 2>/dev/null)\" ]; then warn par3-perf-incomplete; fi",
+			par3bench.PerfIncompleteFile)
+	}
 	write("else")
 	write("  fail par3-reference-missing")
 	write("fi")
@@ -555,6 +592,8 @@ func perfSection(machine Machine, families []string) string {
 		write("#  1. perf stat counters for EVERY case and BOTH subjects, via the harness")
 		write("#     --perf collector (it wraps each subject invocation in perf stat);")
 		write("#  2. perf record + perf script + folded stacks on the designated heavy cases.")
+		write("# Both cover the corpus suites (macro-rar, macro-par2); macro-par3 runs its")
+		write("# own perf pass inside par3 run, into $R/perf/par3.")
 		write("if command -v perf >/dev/null 2>&1; then")
 		write("  perf --version > \"$R/perf/perf-version.txt\" 2>&1")
 		write("  cat /proc/sys/kernel/perf_event_paranoid > \"$R/perf/perf_event_paranoid.txt\" 2>/dev/null")
@@ -623,6 +662,15 @@ func perfSection(machine Machine, families []string) string {
 		write("# a sampled profile per designated heavy case, exported for later reading.")
 		write("if command -v samply >/dev/null 2>&1; then")
 		write("  samply --version > \"$R/perf/samply-version.txt\" 2>&1")
+		if len(families) == 0 {
+			// The designated cases are corpus cases; with no corpus suite
+			// selected there is nothing to profile.
+			write("else")
+			write("  warn samply-missing")
+			write("  echo 'samply is not installed on this host' > \"$R/perf/UNAVAILABLE.txt\"")
+			write("fi")
+			break
+		}
 		write("  for c in $RECORD_CASES; do")
 		write("    \"$BENCH\" plan create --corpus \"$CORPUS\" --out \"$W/plan-rec-$c.json\" --seed \"$SEED\" \\")
 		write("      --lane \"$LANE\" --par2-placement \"$PLACEMENT\" --warmups 0 --repeats 1 --case \"$c\" \\")

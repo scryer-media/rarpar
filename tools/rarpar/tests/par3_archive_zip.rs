@@ -164,7 +164,7 @@ fn a_sibling_set_repairs_the_zip_it_was_written_with() {
     run_ok(
         Command::new(env!("CARGO_BIN_EXE_rarpar"))
             .current_dir(root.join("out"))
-            .args(["--quiet", "par3", "repair", "--no-backup", "set.par3"]),
+            .args(["--quiet", "par3", "repair", "set.par3"]),
     );
     assert_eq!(std::fs::read(&archive).unwrap(), original);
 }

@@ -20,7 +20,14 @@ import (
 )
 
 const (
-	ResultsSchema = "rarpar-par3-bench-v1"
+	// ResultsSchema names the results.json layout. v2 dropped the v1
+	// durability fields: every rarpar row runs buffered (see
+	// Results.BufferedArgs), so no row records a durability mode. v3 split
+	// the rarpar repair rows in two: rarpar-wN repairs in place and keeps no
+	// backup, rarpar-wN-backup keeps a numbered `.1` backup of every file it
+	// repairs, as the reference does (see Results.BackupArgs). A v2
+	// rarpar-wN repair row kept that backup.
+	ResultsSchema = "rarpar-par3-bench-v3"
 
 	OpCreate        = "create"
 	OpVerify        = "verify"
@@ -43,17 +50,6 @@ const (
 	// for either tool and is never turned into a reference DNF.
 	FailureMissingRSS = procmeasure.FailureMissingRSS
 
-	// DurabilityDurable syncs every output file before the command returns;
-	// DurabilityBuffered flushes without requesting storage barriers. Which
-	// one a plain `rarpar par3 create|repair` performs depends on the
-	// candidate: before rarpar 0.7.0 the CLI was durable and `--buffered`
-	// selected buffered; from 0.7.0 it is buffered and `--fsync` selects
-	// durable. The runner probes each op's --help and records the answer in
-	// Results.DefaultDurability. The reference never syncs, so it has no
-	// durability mode and gets one row.
-	DurabilityDurable  = "durable"
-	DurabilityBuffered = "buffered"
-
 	// DefaultTimeout bounds every timed process ("per row": a row that hits it
 	// is finished, see StatusDNF). Set C Cauchy on the reference otherwise
 	// runs for hours.
@@ -61,9 +57,6 @@ const (
 
 	carrierName = "set.par3"
 )
-
-// KnownDurabilities lists the rarpar durability modes, default first.
-var KnownDurabilities = []string{DurabilityDurable, DurabilityBuffered}
 
 // KnownOps lists every operation in run order.
 var KnownOps = []string{OpCreate, OpVerify, OpVerifyDamaged, OpRepair}
@@ -120,9 +113,6 @@ type Options struct {
 	// EnginePerfMemoryMiB is engine_perf's memory budget (the CLI default is 256).
 	EnginePerfMemoryMiB int
 	KeepStages          bool
-	// Durabilities are the rarpar durability rows for create and repair
-	// (default: durable, then buffered). Durable is always included.
-	Durabilities []string
 	// Timeout bounds every timed process (default DefaultTimeout).
 	Timeout time.Duration
 	// ReferenceTimeout bounds every reference process (default: Timeout).
@@ -134,13 +124,16 @@ type Options struct {
 	// reference and rarpar, plus engine when EngineWorkers is set.
 	Rows []string
 	// EngineWorkers adds timed engine_perf rows (needs EnginePerf), one per
-	// worker count and durability; EngineVariants adds env-variant rows of
-	// them, as KernelVariants does for rarpar.
+	// worker count; EngineVariants adds env-variant rows of them, as
+	// KernelVariants does for rarpar.
 	EngineWorkers  []int
 	EngineVariants []KernelVariant
 	// DropCaches drops the page cache before every timed run (Linux, root).
 	DropCaches bool
-	Log        io.Writer
+	// Perf asks for the untimed Linux perf pass after each op's timed runs
+	// (see PerfOptions); the zero value runs none.
+	Perf PerfOptions
+	Log  io.Writer
 }
 
 // Variant is one benchmarked tool configuration.
@@ -150,31 +143,21 @@ type Variant struct {
 	Workers int      `json:"workers,omitempty"`
 	Kernel  string   `json:"kernel,omitempty"`
 	Env     []string `json:"env,omitempty"`
-	// Durability is "durable" or "buffered" for rarpar rows and empty for
-	// the reference. Results written before durability rows existed have it
-	// empty on rarpar rows too; those ran durable.
-	Durability string `json:"durability,omitempty"`
+	// Backup marks a rarpar repair row that keeps a numbered backup
+	// (`<file>.1`) of every file it repairs, as par3cmdline always does:
+	// the row that is like for like with the reference on bytes written. It
+	// runs repair only, and its name ends in "-backup". Every other rarpar
+	// row repairs in place and keeps no backup (see Results.BackupArgs).
+	Backup bool `json:"backup,omitempty"`
 	// Target is the storage target the row runs on; its name is the
 	// suffix after "@" in Name. Empty for a run with one unnamed target.
 	Target string `json:"target,omitempty"`
 }
 
-// EffectiveDurability is the variant's durability mode: "" for the
-// reference, "durable" for a rarpar row that does not say.
-func (v Variant) EffectiveDurability() string {
-	if v.Tool == ToolReference {
-		return ""
-	}
-	if v.Durability == "" {
-		return DurabilityDurable
-	}
-	return v.Durability
-}
-
-// RunsOp reports whether the variant has a row for op. Buffered rows exist
-// only for the operations that write: create and repair.
+// RunsOp reports whether the row runs op at all: a backup row runs repair
+// only, every other row runs every op.
 func (v Variant) RunsOp(op string) bool {
-	return v.EffectiveDurability() != DurabilityBuffered || op == OpCreate || op == OpRepair
+	return !v.Backup || op == OpRepair
 }
 
 // dirName is the variant's short stage-directory name. Stage paths are kept
@@ -187,35 +170,26 @@ func (v Variant) dirName() string {
 	return strings.TrimPrefix(name, "rarpar-")
 }
 
-// Variants expands the reference plus every candidate worker/kernel row, each
-// rarpar row once per durability mode: the durable row first, named as before,
-// then "<name>-buffered". Which mode a plain command gives is the candidate's
-// choice (probed from its --help); the row names only say which mode ran.
-// Nil durabilities means both modes.
-func Variants(workers []int, kernels []KernelVariant, durabilities []string) []Variant {
-	if len(durabilities) == 0 {
-		durabilities = KnownDurabilities
-	}
+// Variants expands the reference, then per worker count a rarpar row and its
+// backup row, then one row per kernel variant and worker count. The rarpar
+// row (rarpar-wN) runs every op; its repair is the candidate's in-place
+// default, which keeps no backup. The backup row (rarpar-wN-backup) runs
+// repair only and keeps a numbered `.1` backup of every file it repairs, as
+// the reference always does, so it is the row that is like for like with
+// the reference on bytes written (see probeBackup). Kernel rows repair in
+// place. Every rarpar row runs buffered: durability is the caller's concern,
+// not PAR3's, so the bench measures the plain buffered command and never
+// passes --fsync (see probeBuffered).
+func Variants(workers []int, kernels []KernelVariant) []Variant {
 	variants := []Variant{{Name: "reference", Tool: ToolReference}}
-	add := func(base Variant) {
-		for _, durability := range KnownDurabilities {
-			if !contains(durabilities, durability) {
-				continue
-			}
-			variant := base
-			variant.Durability = durability
-			if durability != DurabilityDurable {
-				variant.Name += "-" + durability
-			}
-			variants = append(variants, variant)
-		}
-	}
 	for _, count := range workers {
-		add(Variant{Name: fmt.Sprintf("rarpar-w%d", count), Tool: ToolCandidate, Workers: count})
+		variants = append(variants,
+			Variant{Name: fmt.Sprintf("rarpar-w%d", count), Tool: ToolCandidate, Workers: count},
+			Variant{Name: fmt.Sprintf("rarpar-w%d-backup", count), Tool: ToolCandidate, Workers: count, Backup: true})
 	}
 	for _, kernel := range kernels {
 		for _, count := range workers {
-			add(Variant{
+			variants = append(variants, Variant{
 				Name: fmt.Sprintf("rarpar-w%d-%s", count, kernel.Name), Tool: ToolCandidate,
 				Workers: count, Kernel: kernel.Name, Env: kernel.Env,
 			})
@@ -224,32 +198,17 @@ func Variants(workers []int, kernels []KernelVariant, durabilities []string) []V
 	return variants
 }
 
-// EngineRows lists the timed engine_perf rows: one per worker count and
-// durability, then one per env variant, named like the rarpar rows.
-func EngineRows(workers []int, variants []KernelVariant, durabilities []string) []Variant {
-	if len(durabilities) == 0 {
-		durabilities = KnownDurabilities
-	}
+// EngineRows lists the timed engine_perf rows: one per worker count, then one
+// per env variant, named like the rarpar rows. They run buffered too (see
+// engineCommand).
+func EngineRows(workers []int, variants []KernelVariant) []Variant {
 	var rows []Variant
-	add := func(base Variant) {
-		for _, durability := range KnownDurabilities {
-			if !contains(durabilities, durability) {
-				continue
-			}
-			row := base
-			row.Durability = durability
-			if durability != DurabilityDurable {
-				row.Name += "-" + durability
-			}
-			rows = append(rows, row)
-		}
-	}
 	for _, count := range workers {
-		add(Variant{Name: fmt.Sprintf("engine-w%d", count), Tool: ToolEngine, Workers: count})
+		rows = append(rows, Variant{Name: fmt.Sprintf("engine-w%d", count), Tool: ToolEngine, Workers: count})
 	}
 	for _, variant := range variants {
 		for _, count := range workers {
-			add(Variant{Name: fmt.Sprintf("engine-w%d-%s", count, variant.Name), Tool: ToolEngine,
+			rows = append(rows, Variant{Name: fmt.Sprintf("engine-w%d-%s", count, variant.Name), Tool: ToolEngine,
 				Workers: count, Kernel: variant.Name, Env: variant.Env})
 		}
 	}
@@ -258,9 +217,9 @@ func EngineRows(workers []int, variants []KernelVariant, durabilities []string) 
 
 // MatrixRows is every timed row of a run: the CLI rows and the engine rows,
 // filtered to the selected kinds, then once per named target ("NAME@TARGET").
-func MatrixRows(workers []int, kernels []KernelVariant, durabilities []string,
+func MatrixRows(workers []int, kernels []KernelVariant,
 	engineWorkers []int, engineVariants []KernelVariant, kinds []string, targets []Target) []Variant {
-	all := append(Variants(workers, kernels, durabilities), EngineRows(engineWorkers, engineVariants, durabilities)...)
+	all := append(Variants(workers, kernels), EngineRows(engineWorkers, engineVariants)...)
 	var rows []Variant
 	for _, row := range all {
 		if len(kinds) == 0 || contains(kinds, row.Tool) {
@@ -312,6 +271,9 @@ func CheckVariantNames(variants []Variant) error {
 	seen := map[string]bool{}
 	for _, variant := range variants {
 		if seen[variant.Name] {
+			if name, _, _ := strings.Cut(variant.Name, "@"); strings.HasSuffix(name, "-backup") {
+				return fmt.Errorf("row %q appears twice in the matrix; a kernel variant may not be named \"backup\": rarpar-wN-backup is the repair row that keeps backups", variant.Name)
+			}
 			return fmt.Errorf("row %q appears twice in the matrix; list each worker count and kernel variant once", variant.Name)
 		}
 		seen[variant.Name] = true
@@ -319,32 +281,10 @@ func CheckVariantNames(variants []Variant) error {
 	return nil
 }
 
-// ParseDurabilities reads a comma-separated durability list. Durable is the
-// default mode and is always measured.
-func ParseDurabilities(text string) ([]string, error) {
-	var modes []string
-	for _, field := range strings.Split(text, ",") {
-		field = strings.TrimSpace(field)
-		if field == "" {
-			continue
-		}
-		if !contains(KnownDurabilities, field) {
-			return nil, fmt.Errorf("unknown durability %q (known: %s)", field, strings.Join(KnownDurabilities, ", "))
-		}
-		if !contains(modes, field) {
-			modes = append(modes, field)
-		}
-	}
-	if len(modes) == 0 {
-		return append([]string(nil), KnownDurabilities...), nil
-	}
-	if !contains(modes, DurabilityDurable) {
-		return nil, fmt.Errorf("durability %q must include %q: every ratio starts from it", text, DurabilityDurable)
-	}
-	return modes, nil
-}
-
-// RowsByOp lists, per operation, the row names a matrix produces.
+// RowsByOp lists, per operation, the row names a matrix produces. Every row
+// runs every operation except a backup row, which runs repair only; a
+// PAR-inside set narrows them when it runs (see carrierRuns), and so does a
+// candidate that cannot repair in place (see probeBackup).
 func RowsByOp(variants []Variant, ops []string) map[string][]string {
 	rows := map[string][]string{}
 	for _, op := range ops {
@@ -369,6 +309,9 @@ type RepairCheck struct {
 	Match      bool     `json:"match"`
 	Mismatched []string `json:"mismatched,omitempty"`
 	ExtraFiles []string `json:"extra_files,omitempty"`
+	// Backups lists the ExtraFiles that are numbered backups of a protected
+	// file (`<name>.<n>`): the damaged originals the repair kept.
+	Backups []string `json:"backups,omitempty"`
 }
 
 // RunRecord is one process run.
@@ -379,9 +322,6 @@ type RunRecord struct {
 	Tool    string `json:"tool"`
 	Workers int    `json:"workers,omitempty"`
 	Kernel  string `json:"kernel,omitempty"`
-	// Durability is the rarpar durability mode ("durable"/"buffered"); empty
-	// for the reference.
-	Durability string `json:"durability,omitempty"`
 	// Canonical marks the untimed reference create that seeds the canonical
 	// carriers. It is only recorded when it did not finish (StatusDNF).
 	Canonical bool   `json:"canonical,omitempty"`
@@ -430,7 +370,6 @@ type EnginePerfRecord struct {
 	Config      string            `json:"config"`
 	Op          string            `json:"op"`
 	Workers     int               `json:"workers"`
-	Durability  string            `json:"durability,omitempty"`
 	WallSeconds float64           `json:"wall_seconds"`
 	Lines       []json.RawMessage `json:"lines"`
 	Error       string            `json:"error,omitempty"`
@@ -499,17 +438,27 @@ type Results struct {
 	PinApplied     bool            `json:"pin_applied"`
 	KernelVariants []KernelVariant `json:"kernel_variants,omitempty"`
 	CandidateArgs  []string        `json:"candidate_args,omitempty"`
-	// Durabilities are the rarpar durability modes measured for create and
-	// repair, durable first. DefaultDurability records, per writing op, what
-	// a plain `rarpar par3 <op>` on this candidate does (probed from its
-	// --help); DurabilityArgs records, per op and mode, the arguments that
-	// select that mode (empty for the default). A mode an op cannot select is
-	// absent from DurabilityArgs, and a buffered one is listed in
-	// BufferedUnsupported.
-	Durabilities        []string                       `json:"durabilities,omitempty"`
-	DefaultDurability   map[string]string              `json:"default_durability,omitempty"`
-	DurabilityArgs      map[string]map[string][]string `json:"durability_args,omitempty"`
-	BufferedUnsupported []string                       `json:"buffered_unsupported,omitempty"`
+	// BufferedArgs records, per writing op, the arguments that make a
+	// `rarpar par3 <op>` row buffered on this candidate, probed from its
+	// --help: none from rarpar 0.7.0, which is buffered when run plain, and
+	// `--buffered` before it. An op in BufferedUnsupported has no buffered
+	// mode (`par3 repair` before 0.7.0): its rows run the plain command and
+	// Notes say so. The bench never passes --fsync.
+	BufferedArgs        map[string][]string `json:"buffered_args,omitempty"`
+	BufferedUnsupported []string            `json:"buffered_unsupported,omitempty"`
+	// BackupArgs records, per rarpar row that runs repair, the arguments
+	// that select its repair mode on this candidate, probed from `par3
+	// repair --help` (see backupArgsFromHelp). A rarpar-wN row (and every
+	// kernel row) repairs in place and keeps no backup: nothing on a
+	// candidate that lists --backup, `--no-backup` on one that lists only
+	// --no-backup (0.7.0 and earlier). A rarpar-wN-backup row keeps a
+	// numbered `.1` backup of every file it repairs, as the reference does:
+	// `--backup`, or nothing on a candidate whose plain repair keeps one.
+	// InPlaceUnsupported records a candidate whose help lists neither
+	// switch: only its backup rows run repair, with the plain command, and
+	// Notes say so.
+	BackupArgs         map[string][]string `json:"backup_args,omitempty"`
+	InPlaceUnsupported bool                `json:"in_place_unsupported,omitempty"`
 	// TimeoutSeconds / ReferenceTimeoutSeconds bound each timed process.
 	TimeoutSeconds          float64   `json:"timeout_seconds,omitempty"`
 	ReferenceTimeoutSeconds float64   `json:"reference_timeout_seconds,omitempty"`
@@ -528,7 +477,11 @@ type Results struct {
 	Runs           []RunRecord        `json:"runs"`
 	IOCounts       []IOCountRecord    `json:"io_counts,omitempty"`
 	EnginePerfRuns []EnginePerfRecord `json:"engine_perf_runs,omitempty"`
-	Notes          []string           `json:"notes,omitempty"`
+	// Perf is the untimed Linux perf pass that was asked for, and PerfRuns
+	// its runs (see PerfOptions).
+	Perf     *PerfPass `json:"perf,omitempty"`
+	PerfRuns []PerfRun `json:"perf_runs,omitempty"`
+	Notes    []string  `json:"notes,omitempty"`
 	// DNF lists every reference row that did not finish. DNF rows do not
 	// change Status.
 	DNF      []string `json:"dnf,omitempty"`
@@ -597,15 +550,13 @@ func RunSuite(ctx context.Context, options Options) (*Results, error) {
 		PinCPUs:        options.PinCPUs,
 		KernelVariants: options.KernelVariants,
 		CandidateArgs:  options.CandidateArgs,
-		Variants: MatrixRows(options.Workers, options.KernelVariants, options.Durabilities,
+		Variants: MatrixRows(options.Workers, options.KernelVariants,
 			options.EngineWorkers, options.EngineVariants, options.Rows, options.Targets),
-		Durabilities:      options.Durabilities,
-		DropCaches:        options.DropCaches,
-		Rows:              options.Rows,
-		EngineWorkers:     options.EngineWorkers,
-		EngineVariants:    options.EngineVariants,
-		DefaultDurability: map[string]string{},
-		DurabilityArgs:    map[string]map[string][]string{},
+		DropCaches:     options.DropCaches,
+		Rows:           options.Rows,
+		EngineWorkers:  options.EngineWorkers,
+		EngineVariants: options.EngineVariants,
+		BufferedArgs:   map[string][]string{},
 
 		TimeoutSeconds:          options.Timeout.Seconds(),
 		ReferenceTimeoutSeconds: options.ReferenceTimeout.Seconds(),
@@ -656,7 +607,13 @@ func RunSuite(ctx context.Context, options Options) (*Results, error) {
 			r.options.IOCount = false
 		}
 	}
-	if err := r.probeDurability(ctx); err != nil {
+	if err := r.startPerf(ctx); err != nil {
+		return nil, err
+	}
+	if err := r.probeBuffered(ctx); err != nil {
+		return nil, err
+	}
+	if err := r.probeBackup(ctx); err != nil {
 		return nil, err
 	}
 
@@ -682,6 +639,9 @@ func RunSuite(ctx context.Context, options Options) (*Results, error) {
 				break
 			}
 		}
+	}
+	if err := r.finishPerf(); err != nil {
+		results.Notes = append(results.Notes, "perf pass: "+err.Error())
 	}
 	results.FinishedUTC = time.Now().UTC().Format(time.RFC3339)
 	results.Failures = r.failures
@@ -747,11 +707,6 @@ func validateOptions(options *Options) error {
 	if options.EnginePerfMemoryMiB == 0 {
 		options.EnginePerfMemoryMiB = 256
 	}
-	durabilities, err := ParseDurabilities(strings.Join(options.Durabilities, ","))
-	if err != nil {
-		return err
-	}
-	options.Durabilities = durabilities
 	if options.Timeout < 0 || options.ReferenceTimeout < 0 {
 		return errors.New("timeouts cannot be negative")
 	}
@@ -818,7 +773,7 @@ func validateOptions(options *Options) error {
 			return errors.New("--drop-caches: " + why)
 		}
 	}
-	rows := MatrixRows(options.Workers, options.KernelVariants, options.Durabilities,
+	rows := MatrixRows(options.Workers, options.KernelVariants,
 		options.EngineWorkers, options.EngineVariants, options.Rows, options.Targets)
 	if len(rows) == 0 {
 		return errors.New("the selected row kinds leave no row to run")
@@ -846,80 +801,143 @@ func validateOptions(options *Options) error {
 			return fmt.Errorf("binary %s is not a regular file", path)
 		}
 	}
-	return nil
+	return validatePerf(options)
 }
 
-// probeDurability finds out, from each writing op's own --help, what a plain
-// `rarpar par3 <op>` does on this candidate and which flag selects the other
-// mode. A help screen listing --fsync is a 0.7.0+ CLI: buffered by default,
-// durable with --fsync. One listing --buffered is older: durable by default,
-// buffered with --buffered. One listing neither is durable only; it gets no
-// buffered row, because running the durable command twice under a buffered
-// label would be a lie. The probe always runs, since the durable row's
-// arguments depend on it.
-func (r *runner) probeDurability(ctx context.Context) error {
+// probeBuffered finds, from each writing op's own --help, the arguments that
+// make `rarpar par3 <op>` buffered on this candidate (see
+// bufferedArgsFromHelp) and records them in Results.BufferedArgs. An op with
+// no buffered mode keeps the plain command; Results.BufferedUnsupported and
+// a note say so.
+func (r *runner) probeBuffered(ctx context.Context) error {
 	for _, op := range []string{OpCreate, OpRepair} {
 		if !contains(r.options.Ops, op) {
 			continue
 		}
-		result := Run(ctx, Command{Path: r.options.Candidate, Args: []string{"par3", op, "--help"}, Timeout: 30 * time.Second})
+		result, err := opHelp(ctx, r.options.Candidate, op, "--fsync/--buffered")
 		if result.Failure == "binary-quarantined" {
 			return r.quarantined(ctx, r.options.Candidate, "refused to start: "+fmt.Sprint(result.Err))
 		}
-		if result.Failure != "" || result.ExitCode != 0 {
-			// A help screen that did not print says nothing about the flags;
-			// guessing would mislabel every durability row.
-			return fmt.Errorf("probing `%s par3 %s --help` for --fsync/--buffered failed (%s, exit %d): %s",
-				r.options.Candidate, op, firstNonEmpty(result.Failure, "exit"), result.ExitCode, lastLine(result))
+		if err != nil {
+			return err
 		}
-		defaultMode, args := classifyDurabilityHelp(result.Stdout + result.Stderr)
-		r.results.DefaultDurability[op] = defaultMode
-		r.results.DurabilityArgs[op] = args
-		if _, ok := args[DurabilityBuffered]; ok || !contains(r.options.Durabilities, DurabilityBuffered) {
+		if args, ok := bufferedArgsFromHelp(result.Stdout + result.Stderr); ok {
+			r.results.BufferedArgs[op] = args
 			continue
 		}
 		r.results.BufferedUnsupported = append(r.results.BufferedUnsupported, op)
-		note := fmt.Sprintf("buffered %s rows not run: `rarpar par3 %s --help` on this candidate lists neither --fsync nor --buffered, so only its durable %s row exists", op, op, op)
-		r.results.Notes = append(r.results.Notes, note)
-		r.logf("%s", note)
-	}
-	if r.options.EnginePerf != "" && !r.engineHasDurabilitySwitch() && contains(r.options.Durabilities, DurabilityDurable) {
-		note := "engine rows run buffered only: this candidate's par3-rs issues no storage barrier and its engine_perf has no durability switch, so a durable engine row would repeat the buffered one under another label"
+		note := noBufferedModeNote(op)
 		r.results.Notes = append(r.results.Notes, note)
 		r.logf("%s", note)
 	}
 	return nil
 }
 
-// classifyDurabilityHelp reads a `rarpar par3 <op> --help` screen and returns
-// the mode a plain invocation performs and, per mode, the arguments that
-// select it (empty for the default; absent when the op cannot select it).
-func classifyDurabilityHelp(help string) (string, map[string][]string) {
+// opHelp runs `candidate par3 <op> --help` for a flag probe; flags names the
+// switches it looks for, for the error. A help screen that did not print
+// says nothing about the flags, so a failed probe is an error rather than a
+// guess that could run every row durable, or every repair row in the wrong
+// backup mode.
+func opHelp(ctx context.Context, candidate, op, flags string) (Result, error) {
+	result := Run(ctx, Command{Path: candidate, Args: []string{"par3", op, "--help"}, Timeout: 30 * time.Second})
+	if result.Failure != "" || result.ExitCode != 0 {
+		return result, fmt.Errorf("probing `%s par3 %s --help` for %s failed (%s, exit %d): %s",
+			candidate, op, flags, firstNonEmpty(result.Failure, "exit"), result.ExitCode, lastLine(result))
+	}
+	return result, nil
+}
+
+// probeBackup finds, from `rarpar par3 repair --help`, the arguments that
+// select each rarpar repair row's mode on this candidate (see
+// backupArgsFromHelp) and records them per row in Results.BackupArgs. A
+// candidate whose help lists neither --backup nor --no-backup cannot be told
+// to repair in place, so only its backup rows run repair, with the plain
+// command; Results.InPlaceUnsupported and a note say so. Each repair run's
+// backups are then checked against its row's mode (see backupProblem).
+func (r *runner) probeBackup(ctx context.Context) error {
+	if !contains(r.options.Ops, OpRepair) {
+		return nil
+	}
+	result, err := opHelp(ctx, r.options.Candidate, OpRepair, "--backup/--no-backup")
+	if result.Failure == "binary-quarantined" {
+		return r.quarantined(ctx, r.options.Candidate, "refused to start: "+fmt.Sprint(result.Err))
+	}
+	if err != nil {
+		return err
+	}
+	inPlace, backup, inPlaceOK := backupArgsFromHelp(result.Stdout + result.Stderr)
+	if r.results.BackupArgs == nil {
+		r.results.BackupArgs = map[string][]string{}
+	}
+	for _, variant := range r.results.Variants {
+		switch {
+		case variant.Tool != ToolCandidate:
+		case variant.Backup:
+			r.results.BackupArgs[variant.Name] = backup
+		case inPlaceOK:
+			r.results.BackupArgs[variant.Name] = inPlace
+		}
+	}
+	if !inPlaceOK {
+		r.results.InPlaceUnsupported = true
+		note := noInPlaceRepairNote()
+		r.results.Notes = append(r.results.Notes, note)
+		r.logf("%s", note)
+	}
+	return nil
+}
+
+// backupArgsFromHelp reads a `rarpar par3 repair --help` screen and returns
+// the arguments for an in-place row and for a backup row, and false for the
+// in-place row when the help lists neither switch. A screen listing
+// --backup (releases after 0.7.0, which repair in place by default) gives
+// the backup row `--backup` and the in-place row nothing. One listing
+// --no-backup instead (0.7.0 and earlier, which keep numbered backups by
+// default) gives the in-place row `--no-backup` and the backup row nothing.
+// One listing both gives each row its own switch. One listing neither can
+// only run the plain command, on the backup rows alone.
+func backupArgsFromHelp(help string) (inPlace, backup []string, inPlaceOK bool) {
+	listsBackup, listsNoBackup := helpListsFlag(help, "--backup"), helpListsFlag(help, "--no-backup")
 	switch {
-	case helpListsFlag(help, "--fsync"):
-		return DurabilityBuffered, map[string][]string{DurabilityBuffered: {}, DurabilityDurable: {"--fsync"}}
-	case helpListsFlag(help, "--buffered"):
-		return DurabilityDurable, map[string][]string{DurabilityDurable: {}, DurabilityBuffered: {"--buffered"}}
+	case listsBackup && listsNoBackup:
+		return []string{"--no-backup"}, []string{"--backup"}, true
+	case listsBackup:
+		return []string{}, []string{"--backup"}, true
+	case listsNoBackup:
+		return []string{"--no-backup"}, []string{}, true
 	default:
-		return DurabilityDurable, map[string][]string{DurabilityDurable: {}}
+		return nil, []string{}, false
 	}
 }
 
-// engineHasDurabilitySwitch reports whether engine_perf on this candidate can
-// run durable at all. The example and the CLI are built from the same par3-rs:
-// a CLI that is buffered by default (0.7.0+) sits on a par3-rs with no storage
-// barriers, where PAR3_BENCH_<OP>_DURABILITY is ignored. An unprobed candidate
-// is assumed to have the switch.
-func (r *runner) engineHasDurabilitySwitch() bool {
-	if r.results == nil || len(r.results.DefaultDurability) == 0 {
-		return true
+// noInPlaceRepairNote is the results note for a candidate whose repair
+// --help lists neither --backup nor --no-backup.
+func noInPlaceRepairNote() string {
+	return "`rarpar par3 repair --help` on this candidate lists neither --backup nor --no-backup, so it cannot be told to repair in place: only the rarpar-wN-backup rows ran repair, with the plain command, and each run had to leave a numbered backup; the in-place rarpar repair rows (rarpar-wN and kernel variants) did not run"
+}
+
+// bufferedArgsFromHelp reads a `rarpar par3 <op> --help` screen and returns
+// the arguments that make the op buffered, or false when it has no buffered
+// mode. A screen listing --buffered (rarpar 0.6.x and earlier, durable by
+// default) takes it. One listing only --fsync (0.7.0 and later) is buffered
+// when run plain, so it takes nothing: the bench never passes --fsync. One
+// listing neither (`par3 repair` before 0.7.0) can only run the plain
+// command, which syncs.
+func bufferedArgsFromHelp(help string) ([]string, bool) {
+	switch {
+	case helpListsFlag(help, "--buffered"):
+		return []string{"--buffered"}, true
+	case helpListsFlag(help, "--fsync"):
+		return []string{}, true
+	default:
+		return nil, false
 	}
-	for _, mode := range r.results.DefaultDurability {
-		if mode == DurabilityDurable {
-			return true
-		}
-	}
-	return false
+}
+
+// noBufferedModeNote is the results note for an op whose --help lists
+// neither --fsync nor --buffered.
+func noBufferedModeNote(op string) string {
+	return fmt.Sprintf("`rarpar par3 %s --help` on this candidate lists neither --fsync nor --buffered, so it has no buffered %s mode and every %s runs the plain command", op, op, op)
 }
 
 // helpListsFlag matches flag as a whole token of a help screen, so
@@ -943,33 +961,6 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
-}
-
-// runsOp reports whether variant has a row for op on this candidate.
-func (r *runner) runsOp(variant Variant, op string) bool {
-	if !variant.RunsOp(op) {
-		return false
-	}
-	if variant.Tool == ToolEngine {
-		// Engine rows select buffered output through their environment
-		// (PAR3_BENCH_<OP>_DURABILITY), not a CLI flag. On a par3-rs with no
-		// storage barriers that switch does nothing, so only the buffered
-		// engine row is honest there.
-		if variant.EffectiveDurability() == DurabilityDurable && (op == OpCreate || op == OpRepair) {
-			return r.engineHasDurabilitySwitch()
-		}
-		return true
-	}
-	if variant.Tool == ToolReference || (op != OpCreate && op != OpRepair) {
-		// The reference has no durability modes, and the probe covers only
-		// the writing operations; neither depends on the candidate's flags.
-		return true
-	}
-	if r.results == nil || r.results.DurabilityArgs == nil {
-		return variant.EffectiveDurability() != DurabilityBuffered
-	}
-	_, ok := r.results.DurabilityArgs[op][variant.EffectiveDurability()]
-	return ok
 }
 
 func (r *runner) timeoutFor(tool string) time.Duration {
@@ -1096,7 +1087,7 @@ func (r *runner) record(record RunRecord) {
 		extra = " carriers=" + record.Identity.Verdict()
 	}
 	if record.Repair != nil {
-		extra = fmt.Sprintf(" repaired=%t", record.Repair.Match)
+		extra = fmt.Sprintf(" repaired=%t backups=%d", record.Repair.Match, len(record.Repair.Backups))
 	}
 	if record.Canonical {
 		phase = "canonical-seed"
@@ -1197,7 +1188,7 @@ func (r *runner) runConfig(ctx context.Context, config Config, dataset Dataset, 
 		}
 		var variants []Variant
 		for _, variant := range r.results.Variants {
-			if r.runsOp(variant, op) && r.carrierRuns(config, variant) {
+			if r.rowRuns(config, variant, op) {
 				variants = append(variants, variant)
 			}
 		}
@@ -1238,11 +1229,10 @@ func (r *runner) runConfig(ctx context.Context, config Config, dataset Dataset, 
 				}
 			}
 		}
+		r.perfPass(ctx, op, config, dataset, first, variants)
 		if r.options.EnginePerf != "" && !contains(r.options.Rows, ToolEngine) && config.Carrier == "" {
 			for _, workers := range r.options.Workers {
-				for _, durability := range r.enginePerfDurabilities(op) {
-					r.enginePerf(ctx, op, config, dataset, first.dataDir, first.canonical, first.stageRoot, workers, durability)
-				}
+				r.enginePerf(ctx, op, config, dataset, first.dataDir, first.canonical, first.stageRoot, workers)
 			}
 		}
 	}
@@ -1322,7 +1312,7 @@ func (r *runner) seedCanonical(ctx context.Context, config Config, dataset Datas
 			workers = count
 		}
 	}
-	fallback := Variant{Name: "rarpar-canonical", Tool: ToolCandidate, Workers: workers, Durability: DurabilityDurable}
+	fallback := Variant{Name: "rarpar-canonical", Tool: ToolCandidate, Workers: workers}
 	if err := resetDir(canonical); err != nil {
 		return CarrierSet{}, "", err
 	}
@@ -1338,7 +1328,7 @@ func (r *runner) seedCanonical(ctx context.Context, config Config, dataset Datas
 	if failure != "" {
 		return CarrierSet{}, "", fmt.Errorf("rarpar's fallback canonical create (%s): %s", failure, detail)
 	}
-	r.results.Notes = append(r.results.Notes, fmt.Sprintf("%s: the reference did not finish the canonical create, so rarpar (durable, %d workers) wrote the carriers every verify and repair read; create identity verdicts are unavailable for this set", config.ID, workers))
+	r.results.Notes = append(r.results.Notes, fmt.Sprintf("%s: the reference did not finish the canonical create, so rarpar (%d workers) wrote the carriers every verify and repair read; create identity verdicts are unavailable for this set", config.ID, workers))
 	return set, ToolCandidate, nil
 }
 
@@ -1353,6 +1343,11 @@ func settleRow(record *RunRecord) bool {
 	}
 	if record.Tool == ToolReference && IsDNFFailure(record.Failure) {
 		record.Status = StatusDNF
+		return true
+	}
+	if record.Tool == ToolEngine && record.Failure == FailureEngineNotBuffered {
+		// The build decides it, so every remaining run would fail the same
+		// way.
 		return true
 	}
 	return record.Tool == ToolCandidate && record.Failure == "timeout"
@@ -1495,19 +1490,18 @@ func (r *runner) createCommand(config Config, dataset Dataset, dataDir, outDir s
 	if config.Codec == "fft" {
 		args = append(args, "--codec", "fft", "--capacity-log2", strconv.Itoa(config.CapacityLog2()))
 	}
-	args = append(args, r.durabilityArgs(OpCreate, variant)...)
+	args = append(args, r.bufferedArgs(OpCreate)...)
 	return Command{Path: r.options.Candidate, Args: args, Dir: dataDir, Env: variant.Env, PinCPUs: r.pin(), Timeout: r.timeoutFor(ToolCandidate)}
 }
 
-// durabilityArgs selects the row's durability mode on this candidate: the
-// probed flag for the mode that is not the CLI's default, nothing for the
-// mode that is.
-func (r *runner) durabilityArgs(op string, variant Variant) []string {
-	mode := variant.EffectiveDurability()
-	if mode == "" || r.results == nil {
+// bufferedArgs is what makes a rarpar op buffered on this candidate: nothing
+// on 0.7.0 and later, `--buffered` where an older candidate's --help lists
+// it, and nothing for an op with no buffered mode (see probeBuffered).
+func (r *runner) bufferedArgs(op string) []string {
+	if r.results == nil {
 		return nil
 	}
-	return r.results.DurabilityArgs[op][mode]
+	return r.results.BufferedArgs[op]
 }
 
 func (r *runner) candidateGlobals(variant Variant) []string {
@@ -1526,8 +1520,8 @@ func (r *runner) checkCommand(op string, stage string, variant Variant, config C
 	if config.Carrier != "" {
 		// PAR-inside: par3cmdline's verify-itself and repair-itself on the
 		// carrier. rarpar runs the same command line through its shipped
-		// par3cmdline-compatible front end, which has no worker or
-		// durability switch (its self-repair syncs the carrier).
+		// par3cmdline-compatible front end, which has no worker switch and
+		// no buffered mode (its self-repair syncs the rebuilt carrier).
 		letters := "vs"
 		if op == OpRepair {
 			letters = "rs"
@@ -1551,9 +1545,19 @@ func (r *runner) checkCommand(op string, stage string, variant Variant, config C
 	}
 	args := append(r.candidateGlobals(variant), "par3", sub, carrierName)
 	if op == OpRepair {
-		args = append(args, r.durabilityArgs(OpRepair, variant)...)
+		args = append(args, r.bufferedArgs(OpRepair)...)
+		args = append(args, r.backupArgs(variant)...)
 	}
 	return Command{Path: r.options.Candidate, Args: args, Dir: stage, Env: variant.Env, PinCPUs: r.pin(), Timeout: r.timeoutFor(ToolCandidate)}
+}
+
+// backupArgs selects a rarpar repair row's backup mode on this candidate
+// (see Results.BackupArgs).
+func (r *runner) backupArgs(variant Variant) []string {
+	if r.results == nil {
+		return nil
+	}
+	return r.results.BackupArgs[variant.Name]
 }
 
 // stage lays out a verify or repair directory: inputs (linked when the op
@@ -1618,7 +1622,7 @@ func (r *runner) runOne(ctx context.Context, op string, config Config, dataset D
 	state *targetState, canonicalSet CarrierSet, canonicalSource string, variant Variant) (RunRecord, error) {
 	storage := state.storage
 	record := RunRecord{Config: config.ID, Op: op, Variant: variant.Name, Tool: variant.Tool, Workers: variant.Workers, Kernel: variant.Kernel,
-		Durability: variant.EffectiveDurability(), Target: variant.Target, Storage: &storage, DropCaches: r.options.DropCaches}
+		Target: variant.Target, Storage: &storage, DropCaches: r.options.DropCaches}
 	dir := filepath.Join(state.stageRoot, op+"-"+variant.dirName())
 	if !r.options.KeepStages {
 		// One stage at a time: a large set staged once per row and op would
@@ -1711,6 +1715,17 @@ func (r *runner) runOne(ctx context.Context, op string, config Config, dataset D
 		record.Error = "the process exited but the harness recorded no peak RSS (expected " + procmeasure.DescribeRSSSource(procmeasure.NativeRSSSource) + ")"
 		return record, nil
 	}
+	if variant.Tool == ToolEngine {
+		// An engine row is reported as buffered, as every rarpar row is; a
+		// build whose output shows it synced, or cannot show it did not, is
+		// not the row the report names.
+		if problem := EngineSyncProblem(op, result.Stdout); problem != "" {
+			record.Status = StatusFailed
+			record.Failure = FailureEngineNotBuffered
+			record.Error = problem
+			return record, nil
+		}
+	}
 	switch op {
 	case OpCreate:
 		if variant.Tool == ToolReference {
@@ -1757,9 +1772,32 @@ func (r *runner) runOne(ctx context.Context, op string, config Config, dataset D
 			record.Failure = "repair-mismatch"
 			record.StderrTail = result.Stderr
 			record.StderrLine = lastLine(result)
+			break
+		}
+		if variant.Tool == ToolCandidate && config.Carrier == "" {
+			if problem := backupProblem(variant.Backup, check); problem != "" {
+				record.Status = StatusFailed
+				record.Failure = "backup-mismatch"
+				record.Error = problem
+			}
 		}
 	}
 	return record, nil
+}
+
+// backupProblem checks that a rarpar repair left what its row's mode
+// promises: a backup row at least one numbered backup of a file it repaired,
+// an in-place row none. It returns "" when it did. A row that broke its
+// mode is not the row the report names (like for like with the reference,
+// or in place), so it fails.
+func backupProblem(backup bool, check RepairCheck) string {
+	switch {
+	case backup && len(check.Backups) == 0:
+		return "a backup row left no numbered backup of the files it repaired"
+	case !backup && len(check.Backups) > 0:
+		return "an in-place row left numbered backups: " + strings.Join(check.Backups, ", ")
+	}
+	return ""
 }
 
 // exitAccepted reports whether a tool's run of op exited with the status of a
@@ -1815,7 +1853,29 @@ func checkRepair(dir string, manifest DatasetManifest, canonical string) (Repair
 			check.ExtraFiles = append(check.ExtraFiles, entry.Name())
 		}
 	}
+	check.Backups = numberedBackups(check.ExtraFiles, manifest)
 	return check, nil
+}
+
+// numberedBackups picks the names that are numbered backups of a protected
+// file, `<name>.<n>`, the way par3cmdline and rarpar keep the damaged
+// original of a file they repair.
+func numberedBackups(names []string, manifest DatasetManifest) []string {
+	protected := map[string]bool{}
+	for _, digest := range manifest.SHA256 {
+		protected[digest.Name] = true
+	}
+	var backups []string
+	for _, name := range names {
+		dot := strings.LastIndexByte(name, '.')
+		if dot <= 0 || dot == len(name)-1 || !protected[name[:dot]] {
+			continue
+		}
+		if _, err := strconv.ParseUint(name[dot+1:], 10, 32); err == nil {
+			backups = append(backups, name)
+		}
+	}
+	return backups
 }
 
 func (r *runner) countIO(ctx context.Context, op string, config Config, dataset Dataset, manifest DatasetManifest,
@@ -1859,20 +1919,17 @@ func resetDir(dir string) error {
 
 // enginePerf runs the par3-rs engine_perf example once, untimed, for its
 // per-stage JSON lines. It drives the library directly, so it explains where
-// the CLI's time goes; it is never the headline number.
+// the CLI's time goes; it is never the headline number. It runs buffered, as
+// the rarpar rows do (see engineBufferedEnv).
 func (r *runner) enginePerf(ctx context.Context, op string, config Config, dataset Dataset,
-	dataDir, canonical, stageRoot string, workers int, durability string) {
+	dataDir, canonical, stageRoot string, workers int) {
 	if op == OpVerifyDamaged {
 		return
 	}
-	record := EnginePerfRecord{Config: config.ID, Op: op, Workers: workers, Durability: durability}
+	record := EnginePerfRecord{Config: config.ID, Op: op, Workers: workers}
 	memory := strconv.Itoa(r.options.EnginePerfMemoryMiB)
-	base := filepath.Join(stageRoot, fmt.Sprintf("engine-perf-%s-w%d-%s", op, workers, durability))
-	var env []string
-	if durability == DurabilityBuffered {
-		// engine_perf's own switches; unset means its sync-files default.
-		env = []string{fmt.Sprintf("PAR3_BENCH_%s_DURABILITY=buffered", strings.ToUpper(op))}
-	}
+	base := filepath.Join(stageRoot, fmt.Sprintf("engine-perf-%s-w%d", op, workers))
+	env := engineBufferedEnv(op)
 	carriers, output, damaged := filepath.Join(base, "carriers"), filepath.Join(base, "output"), filepath.Join(base, "data")
 	var args []string
 	var setupErr error
@@ -1913,25 +1970,15 @@ func (r *runner) enginePerf(ctx context.Context, op string, config Config, datas
 		}
 		if result.Failure != "" || result.ExitCode != 0 {
 			record.Error = fmt.Sprintf("exit %d %s: %s", result.ExitCode, result.Failure, firstLine(result.Stderr))
+		} else if problem := EngineSyncProblem(op, result.Stdout); problem != "" {
+			// The stage breakdown is kept, flagged: it is not the buffered
+			// run the report describes.
+			record.Error = problem
 		}
 	}
 	r.results.EnginePerfRuns = append(r.results.EnginePerfRuns, record)
-	r.logf("%s %s engine_perf w%d %s %.3fs lines=%d %s", config.ID, op, workers, durability, record.WallSeconds, len(record.Lines), record.Error)
+	r.logf("%s %s engine_perf w%d %.3fs lines=%d %s", config.ID, op, workers, record.WallSeconds, len(record.Lines), record.Error)
 	_ = os.RemoveAll(base)
-}
-
-// enginePerfDurabilities is the durability modes the untimed engine_perf pass
-// covers for op: every requested mode for the writing ops, durable otherwise.
-// On a candidate whose engine has no durability switch the writing ops run
-// buffered only (see engineHasDurabilitySwitch).
-func (r *runner) enginePerfDurabilities(op string) []string {
-	if op != OpCreate && op != OpRepair {
-		return []string{DurabilityDurable}
-	}
-	if r.engineHasDurabilitySwitch() {
-		return r.options.Durabilities
-	}
-	return []string{DurabilityBuffered}
 }
 
 func writeJSONFile(path string, value any) error {
@@ -1953,7 +2000,18 @@ func ReadResults(path string) (*Results, error) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	if results.Schema != ResultsSchema {
-		return nil, fmt.Errorf("%s: schema %q, want %q", path, results.Schema, ResultsSchema)
+		hint := ""
+		switch results.Schema {
+		case "rarpar-par3-bench-v1":
+			// A v1 rarpar-wN row may be a durable run; this harness would
+			// report it as buffered.
+			hint = "; a v1 file predates buffered-only rows, so read it with the harness that wrote it"
+		case "rarpar-par3-bench-v2":
+			// A v2 rarpar-wN repair row kept numbered backups; this harness
+			// would report it as the in-place row.
+			hint = "; a v2 file predates the in-place and -backup repair rows (its rarpar-wN repair rows kept a numbered backup), so read it with the harness that wrote it"
+		}
+		return nil, fmt.Errorf("%s: schema %q, want %q%s", path, results.Schema, ResultsSchema, hint)
 	}
 	if err := ValidateResults(&results); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
@@ -2007,16 +2065,31 @@ func CollectMachine(ctx context.Context, label string) bench.Machine {
 	return machine
 }
 
+// rowRuns reports whether a row runs op on a configuration: a backup row
+// runs repair only (Variant.RunsOp); a PAR-inside set narrows the rows
+// (carrierRuns); and on a candidate that cannot repair in place
+// (Results.InPlaceUnsupported) only the backup rows run a plain set's
+// repair.
+func (r *runner) rowRuns(config Config, variant Variant, op string) bool {
+	if !variant.RunsOp(op) || !r.carrierRuns(config, variant) {
+		return false
+	}
+	inPlaceRepair := op == OpRepair && variant.Tool == ToolCandidate && !variant.Backup && config.Carrier == ""
+	return !(inPlaceRepair && r.results.InPlaceUnsupported)
+}
+
 // carrierRuns reports whether a variant runs on a configuration. Every
 // variant runs on a plain set. On a PAR-inside carrier rarpar runs through
-// its par3cmdline-compatible front end, which takes no worker count and no
-// durability switch, so only one rarpar row runs there: the durable default
-// at the most workers, with no kernel override. Engine rows do not run.
+// its par3cmdline-compatible front end, which takes no worker count, has no
+// buffered mode and no backup switch (its `rs` keeps the damaged carrier as
+// a numbered `.1`, as the reference does), so only one rarpar row runs
+// there: the row at the most workers, with no kernel override and not the
+// backup row. Engine rows do not run.
 func (r *runner) carrierRuns(config Config, variant Variant) bool {
 	if config.Carrier == "" || variant.Tool == ToolReference {
 		return true
 	}
-	if variant.Tool != ToolCandidate || variant.Kernel != "" || variant.EffectiveDurability() != DurabilityDurable {
+	if variant.Tool != ToolCandidate || variant.Kernel != "" || variant.Backup {
 		return false
 	}
 	most := 0
@@ -2084,7 +2157,7 @@ func (r *runner) seedCarrier(ctx context.Context, config Config, dataset Dataset
 	summary.ExpectedField = embedded.Field
 	summary.fillShape(dataset)
 	summary.CanonicalSource = ToolReference
-	r.results.Notes = append(r.results.Notes, fmt.Sprintf("%s: original ZIP %d bytes (sha256 %s); the reference's insert (-r%d, untimed, %.3fs) chose %d-byte blocks, %d input and %d recovery blocks (%s), carrier %d bytes; create is not timed for a carrier, and rarpar runs one row through its par3cmdline-compatible front end (vs/rs)",
+	r.results.Notes = append(r.results.Notes, fmt.Sprintf("%s: original ZIP %d bytes (sha256 %s); the reference's insert (-r%d, untimed, %.3fs) chose %d-byte blocks, %d input and %d recovery blocks (%s), carrier %d bytes; create is not timed for a carrier, and rarpar runs one row through its par3cmdline-compatible front end (vs/rs), which has no buffered mode: its repair syncs the rebuilt carrier, and it keeps the damaged carrier as a numbered .1 backup, as the reference does, so that row is like for like with the reference on bytes written (it has no -backup twin)",
 		config.ID, original, short(originalDigest), config.InsertRedundancy, result.WallSeconds, config.BlockSize, summary.InputBlocks, config.Recovery, embedded.Field, size))
 	manifest := DatasetManifest{Generator: generatorVersion, Dataset: Dataset{ID: config.ID, Files: []FileSpec{{Name: carrierZIPName, Size: size}}},
 		SHA256: []FileDigest{{Name: carrierZIPName, Size: size, SHA256: digest}}}

@@ -655,7 +655,7 @@ fn repair(cli: &Cli, args: &Par3InsideRepairArgs) -> Result<(bool, Value), Rarpa
         let report = set.repair(&staged, &scratch)?;
         for (entry, index) in report.iter().zip(&needed) {
             let destination = &finals[*index];
-            if args.output_dir.is_none() && destination.exists() && !args.no_backup {
+            if args.output_dir.is_none() && destination.exists() && args.backup {
                 let backup = numbered_backup(destination);
                 std::fs::rename(destination, &backup)?;
             }

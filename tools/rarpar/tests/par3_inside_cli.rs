@@ -148,6 +148,19 @@ fn inside_lifecycle_repairs_lost_and_damaged_volumes_and_removes_exactly() {
         );
     }
     run(root, &["par3", "inside", "verify", entry], 0);
+    // No backup by default; --backup keeps the damaged volume as `.1`.
+    let backup = protected.join(format!("{}.1", name(4)));
+    assert!(!backup.exists());
+    let mut bytes = pristine[3].clone();
+    for byte in &mut bytes[middle..middle + 64] {
+        *byte ^= 0x5a;
+    }
+    std::fs::write(&damaged, &bytes).unwrap();
+    let repaired = run(root, &["par3", "inside", "repair", entry, "--backup"], 0);
+    assert_eq!(repaired["status"], "repaired");
+    assert_eq!(std::fs::read(&damaged).unwrap(), pristine[3]);
+    assert_eq!(std::fs::read(&backup).unwrap(), bytes);
+    std::fs::remove_file(&backup).unwrap();
 
     let removed = run(
         root,

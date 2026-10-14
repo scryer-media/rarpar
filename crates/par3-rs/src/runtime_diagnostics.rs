@@ -149,6 +149,29 @@ impl IoCounters {
             }
         }
     }
+    /// One in-kernel copy between two engine files, counted as the read and
+    /// the write it stands for.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn copy(
+        &self,
+        requested: usize,
+        copy: impl FnOnce() -> io::Result<usize>,
+    ) -> io::Result<usize> {
+        add(&self.reads, 1);
+        add(&self.requested, requested as u64);
+        add(&self.writes, 1);
+        match copy() {
+            Ok(n) => {
+                add(&self.read_bytes, n as u64);
+                add(&self.write_bytes, n as u64);
+                Ok(n)
+            }
+            Err(error) => {
+                add(&self.errors, 1);
+                Err(error)
+            }
+        }
+    }
     pub(crate) fn write(&self, write: impl FnOnce() -> io::Result<usize>) -> io::Result<usize> {
         add(&self.writes, 1);
         match write() {
@@ -343,6 +366,7 @@ struct State {
     files: IoCounters,
     opens: AtomicU64,
     clones: AtomicU64,
+    copies: AtomicU64,
     in_place: AtomicU64,
     stages: [StageCounters; STAGES],
     next: AtomicU64,
@@ -413,6 +437,17 @@ impl ExecutionDiagnostics {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn note_clone(&self) {
         add(&self.0.clones, 1);
+    }
+    /// Repair outputs that could be neither cloned nor patched in place and
+    /// were staged by copying the extents their source holds intact, in
+    /// sequential runs, before the repair wrote the rest. The copy is in
+    /// [`Self::file_io`]: on Linux one in-kernel copy counts as a read and a
+    /// write of the bytes it moved.
+    pub fn file_copies(&self) -> u64 {
+        self.0.copies.load(Ordering::Relaxed)
+    }
+    pub(crate) fn note_copy(&self) {
+        add(&self.0.copies, 1);
     }
     /// Repair outputs that could not be cloned and were repaired in place,
     /// with backups off: only the extents the repair rebuilt were written

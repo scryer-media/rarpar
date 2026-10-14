@@ -441,13 +441,19 @@ fn create_and_repair_report_and_honour_fsync() {
     assert_eq!(std::fs::read(root.join("data.bin")).unwrap(), bytes);
 
     std::fs::write(root.join("data.bin"), &damaged).unwrap();
-    let repaired = run(root, &["par3", "repair", "plain.par3", "--no-backup"], 0);
+    let repaired = run(root, &["par3", "repair", "plain.par3"], 0);
     assert_eq!(repaired["fsync"], false);
+    // Neither repair kept a backup: that takes --backup.
+    assert!(repaired["installed"][0]["backup"].is_null());
+    assert!(!root.join("data.bin.1").exists());
     assert_eq!(std::fs::read(root.join("data.bin")).unwrap(), bytes);
 
     for args in [
         &["par3", "create", "gone.par3", "data.bin", "--buffered"][..],
         &["par3", "verify", "plain.par3", "--fsync"][..],
+        &["par3", "repair", "plain.par3", "--no-backup"][..],
+        &["par3", "verify", "plain.par3", "--no-backup"][..],
+        &["par3", "inside", "repair", "plain.par3", "--no-backup"][..],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_rarpar"))
             .current_dir(root)
@@ -455,6 +461,24 @@ fn create_and_repair_report_and_honour_fsync() {
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(2), "{args:?}");
+    }
+}
+
+#[test]
+fn repair_help_lists_backup_and_not_no_backup() {
+    for args in [
+        &["par3", "repair", "--help"][..],
+        &["par3", "inside", "repair", "--help"][..],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_rarpar"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}");
+        let help = String::from_utf8(output.stdout).unwrap();
+        assert!(help.contains("--backup"), "{args:?}: {help}");
+        assert!(help.contains("numbered backup"), "{args:?}: {help}");
+        assert!(!help.contains("--no-backup"), "{args:?}: {help}");
     }
 }
 
@@ -493,7 +517,7 @@ fn cauchy_create_verify_repair_preserves_clean_files_and_backups() {
     let planned = run(root, &["par3", "repair", "set.par3", "--dry-run"], 0);
     assert_eq!(planned["installed"], serde_json::json!([]));
     assert_eq!(std::fs::read(root.join("data.bin")).unwrap(), damaged);
-    let repaired = run(root, &["par3", "repair", "set.par3"], 0);
+    let repaired = run(root, &["par3", "repair", "set.par3", "--backup"], 0);
     assert_eq!(repaired["installed"].as_array().unwrap().len(), 1);
     let backup = repaired["installed"][0]["backup"].as_str().unwrap();
     assert_eq!(std::fs::read(root.join(backup)).unwrap(), damaged);
@@ -572,7 +596,7 @@ fn data_only_and_deduplicated_creation_restore_aliases() {
         assert!(created["reused_blocks"].as_u64().unwrap() > 0);
         std::fs::remove_file(root.join("first.bin")).unwrap();
         std::fs::remove_file(root.join("alias.bin")).unwrap();
-        run(root, &["par3", "repair", "data.par3", "--no-backup"], 0);
+        run(root, &["par3", "repair", "data.par3"], 0);
         assert_eq!(std::fs::read(root.join("first.bin")).unwrap(), bytes);
         assert_eq!(std::fs::read(root.join("alias.bin")).unwrap(), bytes);
     }

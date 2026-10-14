@@ -332,7 +332,7 @@ pub enum Par3Command {
     Create(Par3CreateArgs),
     /// Verify protected files and report per-cohort recovery requirements.
     Verify(Par3Args),
-    /// Rebuild damaged files in the working directory, keeping numbered backups.
+    /// Rebuild damaged files in the working directory; --backup keeps the damaged ones.
     Repair(Par3RepairArgs),
     /// Write a 7z archive and protect it with PAR3 in the same pass.
     #[cfg(feature = "sevenz")]
@@ -442,9 +442,9 @@ pub struct Par3InsideRepairArgs {
     /// Write rebuilt volumes here instead of replacing them in place.
     #[arg(short = 'd', long, value_name = "DIR")]
     pub output_dir: Option<PathBuf>,
-    /// Replace damaged volumes without keeping numbered backups.
+    /// Keep each damaged volume as a numbered backup (NAME.1, or the next free number).
     #[arg(long, conflicts_with = "output_dir")]
-    pub no_backup: bool,
+    pub backup: bool,
     /// Scratch directory for staging; defaults to the output directory.
     #[arg(long)]
     pub scratch_dir: Option<PathBuf>,
@@ -482,15 +482,15 @@ pub struct Par3Args {
     /// Select an input-set ID when a directory or carrier contains multiple sets.
     #[arg(long)]
     pub set_id: Option<String>,
-    /// Replace damaged files without keeping numbered backups.
-    #[arg(long)]
-    pub no_backup: bool,
 }
 
 #[derive(Debug, Clone, Args)]
 pub struct Par3RepairArgs {
     #[command(flatten)]
     pub set: Par3Args,
+    /// Keep each damaged file as a numbered backup (NAME.1, or the next free number).
+    #[arg(long)]
+    pub backup: bool,
     /// After a successful repair, fsync every file installed (not their directories).
     #[arg(long)]
     pub fsync: bool,

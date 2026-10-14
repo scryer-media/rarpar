@@ -1,6 +1,7 @@
 """Offline release policy tests. External verifiers and GitHub are mocked."""
 
 import copy
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,38 @@ COMMIT = "a" * 40
 ROOT = Path(__file__).resolve().parents[2]
 RELEASE_SCRIPTS = ROOT / ".github/scripts/release"
 BUILD_JOBS = {"build-linux": "linux-", "build-macos": "darwin-", "build-windows": "windows-"}
+AWS_LC_ENV = {
+    "CARGO_INCREMENTAL": '"0"',
+    "AWS_LC_SYS_USE_SYSTEM": '"0"',
+    "AWS_LC_SYS_STATIC": '"1"',
+    "AWS_LC_SYS_SMALL": '"0"',
+    "AWS_LC_SYS_CMAKE_BUILDER": '"0"',
+}
+_spec = importlib.util.spec_from_file_location("confirm_native_code",
+                                               RELEASE_SCRIPTS / "confirm_native_code.py")
+native = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(native)
+
+
+def workflow_jobs(path):
+    workflow = (ROOT / path).read_text()
+    return dict(re.findall(r"^  ([a-z0-9-]+):\n(.*?)(?=^  [a-z0-9-]+:\n|\Z)",
+                           workflow.split("jobs:\n", 1)[1], re.M | re.S))
+
+
+def env_block(text, indent):
+    """The KEY: value pairs of the first `env:` block at this indent."""
+    match = re.search(rf"^{indent}env:\n((?:{indent}  .*\n|\s*#.*\n)+)", text, re.M)
+    return dict(re.findall(rf"^{indent}  ([A-Za-z0-9_]+): (.*)$", match.group(1), re.M)) if match else {}
+
+
+def matrix_rows(job):
+    rows = re.findall(r"- platform: (\S+)\n(.*?)(?=\n {10}- platform: |\n    [a-z]|\Z)", job, re.S)
+    return {platform: dict(re.findall(r"^ {12}([a-z_]+): (.*)$", body, re.M)) for platform, body in rows}
+
+
+def cflags(target):
+    return target.replace("-", "_")
 
 
 class AssetsTests(unittest.TestCase):
@@ -281,6 +314,109 @@ class MetadataTests(unittest.TestCase):
                     release.release_metadata(REPO, TAG)
 
 
+class NativeCodeTests(unittest.TestCase):
+    """confirm_native_code.py against build outputs shaped like real ones."""
+
+    CRATE = "/opt/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-lc-sys-0.45.0"
+    JITTER = ("base", "gcd", "health", "noise", "sha3", "timer")
+
+    def build_output(self, compiler="cc", ordinary=("-O3",), jitter=("-O3", "-O0"), tail=(),
+                     header=("Building with: CC",), link=True, windows=False, extra=(),
+                     crate=CRATE):
+        def debug(text):
+            # How Rust's {:?} prints an argument.
+            return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+        def quote(path):
+            return debug("C:" + path.replace("/", "\\") if windows else path)
+
+        def running(flags, source):
+            words = [debug(compiler), *(debug(flag) for flag in (*flags, *extra, *tail)),
+                     '"-o"', quote("/out/x.o"), '"-c"', quote(f"{crate}/aws-lc/{source}")]
+            return "running: " + " ".join(words)
+
+        lines = [f"cargo:warning={line}" for line in header]
+        lines += [running(ordinary, f"crypto/fipsmodule/f{i}.c") for i in range(120)]
+        lines += [running(ordinary, "generated-src/linux-x86_64/crypto/fipsmodule/x.S")]
+        lines += [running(("-O0",), "tests/compiler_features_tests/c11.c")]
+        lines += [running(jitter, f"third_party/jitterentropy/jitterentropy-library/src/jitterentropy-{name}.c")
+                  for name in self.JITTER]
+        lines += ['running: "cc" "-O0" "-o" "/out/flag_check.o" "-c" "/out/flag_check.c"']
+        if link:
+            lines += ["cargo:rustc-link-lib=static=aws_lc_0_45_0_crypto", "cargo:link_kind=static"]
+        return "\n".join(lines) + "\n"
+
+    def errors(self, output, target="x86_64-unknown-linux-musl"):
+        return native.check_aws_lc_build(output, target)[0]
+
+    def test_release_shaped_builds_pass(self):
+        self.assertEqual(self.errors(self.build_output()), [])
+        # sccache in front of the compiler, as in the CI lanes.
+        output = self.build_output(compiler="sccache").replace('"sccache" ', '"sccache" "musl-gcc" ')
+        self.assertEqual(self.errors(output), [])
+        # clang-cl: cc passes -O2 and the cl dialect's /O2 comes from CFLAGS;
+        # aws-lc-sys swaps CFLAGS' optimisation flags for -Od on jitterentropy.
+        output = self.build_output(compiler="C:\\Program Files\\LLVM\\bin\\clang-cl.exe",
+                                   ordinary=("-O2", "/O2"), jitter=("-O2", "-Od", "-Od"), windows=True)
+        errors, summary = native.check_aws_lc_build(output, "x86_64-pc-windows-msvc")
+        self.assertEqual(errors, [])
+        self.assertIn("120 C sources at O2", summary)
+        self.assertIn("jitterentropy at Od", summary)
+        # aws-lc-sys passes its crate directory to clang-cl in 8.3 short form.
+        output = self.build_output(compiler="clang-cl", ordinary=("-O2", "/O2"),
+                                   jitter=("-O2", "-Od", "-Od"), windows=True,
+                                   crate="C:/RUNNER~1/CARGO~1/registry/src/INDEXC~1.IO-/AWS-LC~1.0")
+        errors, summary = native.check_aws_lc_build(output, "aarch64-pc-windows-msvc")
+        self.assertEqual(errors, [])
+        self.assertIn("120 C sources at O2", summary)
+        self.assertIn("jitterentropy at Od", summary)
+
+    def test_an_optimisation_flag_in_cflags_overrides_jitterentropy(self):
+        errors = self.errors(self.build_output(tail=("-O3",)))
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("6 jitterentropy AWS-LC C sources were compiled at O3, not O0", errors[0])
+
+    def test_ordinary_sources_below_the_release_level_fail(self):
+        errors = self.errors(self.build_output(ordinary=("-O2",)))
+        self.assertTrue(any("120 ordinary AWS-LC C sources were compiled at O2, not O3" in e for e in errors), errors)
+
+    def test_builder_link_and_assembly_failures(self):
+        cases = {
+            "not built from source by the aws-lc-sys cc builder": self.build_output(header=("Building with: CMake",)),
+            "did not link AWS-LC statically": self.build_output(link=False),
+            "-DOPENSSL_NO_ASM=1": self.build_output(extra=("-DOPENSSL_NO_ASM=1",)),
+            "/DOPENSSL_SMALL=1": self.build_output(extra=("/DOPENSSL_SMALL=1",)),
+            "Size-optimized AWS-LC build enabled": self.build_output(header=(
+                "Building with: CC",
+                "Size-optimized AWS-LC build enabled. Applying OPENSSL_SMALL and disabling AVX-512 assembly.")),
+            "records no compiler commands": "cargo:warning=Building with: CC\ncargo:link_kind=static\n"
+                                            "cargo:rustc-link-lib=static=aws_lc_0_45_0_crypto\n",
+        }
+        for message, output in cases.items():
+            with self.subTest(message):
+                self.assertTrue(any(message in e for e in self.errors(output)), self.errors(output))
+
+    def test_windows_requires_clang_cl_and_jitterentropy_base(self):
+        output = self.build_output(compiler="cl.exe", ordinary=("-O2",), jitter=("-O2", "-Od"), windows=True)
+        errors = self.errors(output, "aarch64-pc-windows-msvc")
+        self.assertEqual(errors, ["AWS-LC was compiled with cl, not clang-cl"])
+        output = self.build_output().replace("jitterentropy-base.c", "jitterentropy-other.c")
+        self.assertIn("the build output records no jitterentropy-base.c compile", self.errors(output))
+
+    def test_dependency_graph_and_binary_markers(self):
+        tree = "rarpar v0.8.0\n├── aws-lc-rs v1.18.1\n│   └── aws-lc-sys v0.45.0\n"
+        self.assertEqual(native.check_dependency_graph(tree, "x86_64-apple-darwin"), [])
+        self.assertEqual(len(native.check_dependency_graph(tree, "aarch64-unknown-linux-musl")), 1)
+        self.assertEqual(native.check_dependency_graph(tree + "├── mimalloc v0.1.48\n",
+                                                       "aarch64-unknown-linux-musl"), [])
+        self.assertEqual(len(native.check_dependency_graph("rarpar v0.8.0\n", "x86_64-apple-darwin")), 1)
+        binary = b"\0SHA256 block transform for x86_64, CRYPTOGAMS by <appro@openssl.org>\0"
+        self.assertEqual(native.check_binary(binary, "x86_64-unknown-linux-gnu"), [])
+        self.assertEqual(len(native.check_binary(binary, "x86_64-unknown-linux-musl")), 1)
+        self.assertEqual(native.check_binary(binary + b"mimalloc: warning: ", "x86_64-unknown-linux-musl"), [])
+        self.assertEqual(len(native.check_binary(b"mimalloc: warning: ", "x86_64-unknown-linux-musl")), 1)
+
+
 class WorkflowTests(unittest.TestCase):
     def test_release_policy(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
@@ -325,6 +461,73 @@ class WorkflowTests(unittest.TestCase):
             if script.endswith(".sh"):
                 # The build jobs run these by path.
                 self.assertTrue(os.access(ROOT / script, os.X_OK), f"{script} is not executable")
+
+    def test_release_native_code_policy(self):
+        jobs = workflow_jobs(".github/workflows/release.yml")
+        for job in BUILD_JOBS:
+            env = env_block(jobs[job], "    ")
+            for key, value in AWS_LC_ENV.items():
+                self.assertEqual(env.get(key), value, (job, key))
+            self.assertEqual(env.get("CC_ENABLE_DEBUG_OUTPUT"), '"1"', job)
+            self.assertNotIn("CFLAGS", env, job)
+            self.assertNotIn("CXXFLAGS", env, job)
+            rows = matrix_rows(jobs[job])
+            self.assertTrue(rows, job)
+            for platform, row in rows.items():
+                target = row["target"]
+                features = row["features"].split(",")
+                self.assertNotIn("crypto-rust", features, platform)
+                self.assertIn("crypto-aws-lc", features, platform)
+                # mimalloc replaces musl's allocator; nothing else takes it.
+                self.assertEqual("musl-allocator" in features, target.endswith("-musl"), platform)
+                for name in ("CFLAGS", "CXXFLAGS"):
+                    flags = env.get(f"{name}_{cflags(target)}", "").strip('"').split()
+                    self.assertIn("-DNDEBUG" if "-" in flags[0] else "/DNDEBUG", flags, (platform, name))
+                    if job == "build-windows":
+                        self.assertEqual(flags, ["/O2", "/DNDEBUG", "/Gy", "/Gw"], platform)
+                    else:
+                        # The cc crate appends CFLAGS last: a level here would
+                        # override jitterentropy's -O0.
+                        self.assertFalse([f for f in flags if f.startswith("-O")], (platform, flags))
+                        self.assertEqual("-mno-outline-atomics" in flags,
+                                         target == "aarch64-unknown-linux-musl", platform)
+            build = jobs[job].index("- name: Build rarpar")
+            script = "confirm-native-code.ps1" if job == "build-windows" else "confirm-native-code.sh"
+            self.assertGreater(jobs[job].index(f".github/scripts/release/{script}"), build, job)
+        windows = env_block(jobs["build-windows"], "    ")
+        self.assertEqual(windows.get("AWS_LC_SYS_PREBUILT_NASM"), '"0"')
+        self.assertEqual(windows.get("CC_x86_64_pc_windows_msvc"), "clang-cl")
+        self.assertEqual(windows.get("CXX_x86_64_pc_windows_msvc"), "clang-cl")
+
+    def test_ci_target_checks_build_what_the_release_builds(self):
+        release_jobs = workflow_jobs(".github/workflows/release.yml")
+        ci_jobs = workflow_jobs(".github/workflows/ci.yml")
+        workflow_env = env_block((ROOT / ".github/workflows/ci.yml").read_text(), "")
+        for key, value in AWS_LC_ENV.items():
+            self.assertEqual(workflow_env.get(key), value, key)
+        for job in ("platform-tests-windows", "target-checks-windows"):
+            env = env_block(ci_jobs[job], "    ")
+            self.assertEqual(env.get("AWS_LC_SYS_PREBUILT_NASM"), '"0"', job)
+            self.assertEqual(env.get("CC_x86_64_pc_windows_msvc"), "clang-cl", job)
+            self.assertEqual(env.get("CXX_x86_64_pc_windows_msvc"), "clang-cl", job)
+        release_rows, ci_rows = {}, {}
+        for build_job, checks_job in (("build-linux", "target-checks-linux"),
+                                      ("build-macos", "target-checks-macos"),
+                                      ("build-windows", "target-checks-windows")):
+            release_env = env_block(release_jobs[build_job], "    ")
+            release_rows.update(matrix_rows(release_jobs[build_job]))
+            ci_rows.update(matrix_rows(ci_jobs[checks_job]))
+            step = ci_jobs[checks_job].split("- name: Build the release binary\n", 1)[1]
+            step_env = env_block(step.split("\n      - name:", 1)[0], "        ")
+            self.assertEqual(step_env.get("CC_ENABLE_DEBUG_OUTPUT"), '"1"', checks_job)
+            release_flags = {k: v for k, v in release_env.items() if "FLAGS_" in k}
+            self.assertTrue(release_flags, build_job)
+            self.assertEqual({k: v for k, v in step_env.items() if "FLAGS_" in k}, release_flags, checks_job)
+            self.assertIn(".github/scripts/release/confirm_native_code.py", ci_jobs[checks_job], checks_job)
+        self.assertEqual(sorted(ci_rows), sorted(release.PLATFORMS))
+        for platform, row in ci_rows.items():
+            self.assertEqual((row["target"], row["features"]),
+                             (release_rows[platform]["target"], release_rows[platform]["features"]), platform)
 
     def run_release_profile(self, manifest):
         return subprocess.run([sys.executable, "-B", str(RELEASE_SCRIPTS / "release_profile.py"), str(manifest)],

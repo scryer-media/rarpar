@@ -1289,12 +1289,20 @@ impl Par3RepairSession {
     /// fingerprint too). Outputs are flushed but never synchronized to
     /// storage; a caller that needs durability synchronizes the installed
     /// paths in the report, and their parent directories if it wants the
-    /// installation itself to survive a crash. Sources are only
-    /// read, except that on macOS and Linux, with `backup` off and no clone
-    /// available, a damaged file whose destination is that very file (single
-    /// link, handed over by its registry, read by nothing else in the repair)
-    /// is patched in place: only its damaged extents are written, and it is
-    /// then read back whole before it is reported repaired.
+    /// installation itself to survive a crash.
+    ///
+    /// With `backup` on, a damaged file at a destination is kept as
+    /// `<name>.1`, or the next free number, and the rebuilt file is renamed
+    /// over it; with it off, which is [`crate::RepairOptions`]'s default, the
+    /// damaged bytes are not kept. Sources are only read, except that on macOS
+    /// and Linux, with `backup` off and no clone available, a damaged file
+    /// whose destination is that very file (single link, handed over by its
+    /// registry, read by nothing else in the repair) is patched in place: only
+    /// its damaged extents are written, and it is then read back whole before
+    /// it is reported repaired. Otherwise an output that cannot be cloned is
+    /// staged by copying the extents its source holds intact, in sequential
+    /// runs, before the repair writes the rest; see
+    /// [`crate::runtime::ExecutionDiagnostics::file_copies`].
     pub fn repair(
         &mut self,
         output: &Path,

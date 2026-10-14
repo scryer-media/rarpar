@@ -512,11 +512,11 @@ pub fn run_command(cli: &Cli, command: Par3Command) -> Result<u8, RarparError> {
     let result = match command {
         Par3Command::Inside(command) => return crate::par3_inside::run(cli, command),
         Par3Command::Create(args) => create(cli, &args),
-        Par3Command::Verify(args) => {
-            verify_repair(cli, &args, false, false).map(|outcome| (outcome.success, outcome.report))
-        }
-        Par3Command::Repair(Par3RepairArgs { set, fsync }) => {
-            verify_repair(cli, &set, true, fsync).map(|outcome| (outcome.success, outcome.report))
+        Par3Command::Verify(args) => verify_repair(cli, &args, false, false, false)
+            .map(|outcome| (outcome.success, outcome.report)),
+        Par3Command::Repair(Par3RepairArgs { set, backup, fsync }) => {
+            verify_repair(cli, &set, true, backup, fsync)
+                .map(|outcome| (outcome.success, outcome.report))
         }
         #[cfg(feature = "sevenz")]
         Par3Command::Archive(args) => crate::archive::run(cli, &args),
@@ -660,13 +660,13 @@ pub fn repair_set(cli: &Cli, set: &Par3Set) -> Result<RepairOutcome, RarparError
         input: set.paths[0].clone(),
         search_dirs: Vec::new(),
         set_id: Some(set.id.clone()),
-        no_backup: false,
     };
     let loaded = set
         .loaded
         .as_ref()
         .ok_or(EngineError::InvalidState("PAR3 carriers already released"))?;
-    verify_repair_loaded(cli, &args, true, false, loaded)
+    // `auto` keeps no backup either, as `par3 repair` without --backup.
+    verify_repair_loaded(cli, &args, true, false, false, loaded)
 }
 
 impl RepairOutcome {
@@ -684,17 +684,19 @@ fn verify_repair(
     cli: &Cli,
     args: &Par3Args,
     repair: bool,
+    backup: bool,
     fsync: bool,
 ) -> Result<RepairOutcome, RarparError> {
     let options = options(cli)?;
     let loaded = load_selected(cli, args, &options)?;
-    verify_repair_loaded(cli, args, repair, fsync, &loaded)
+    verify_repair_loaded(cli, args, repair, backup, fsync, &loaded)
 }
 
 fn verify_repair_loaded(
     cli: &Cli,
     args: &Par3Args,
     repair: bool,
+    backup: bool,
     fsync: bool,
     loaded: &LoadedSet,
 ) -> Result<RepairOutcome, RarparError> {
@@ -822,7 +824,7 @@ fn verify_repair_loaded(
         report["fsync"] = json!(fsync);
     }
     if repair && ready && !cli.dry_run {
-        let result = session.repair(&root, !args.no_backup)?;
+        let result = session.repair(&root, backup)?;
         if fsync {
             fsync_outputs(result.installed.iter().map(|file| &file.path))?;
         }
@@ -1202,7 +1204,6 @@ mod tests {
             input: index.clone(),
             search_dirs: Vec::new(),
             set_id: None,
-            no_backup: false,
         };
         let select = || {
             SNIFFED.with(|sniffed| sniffed.borrow_mut().clear());

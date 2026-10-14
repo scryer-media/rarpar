@@ -50,6 +50,8 @@ func TestPAR3ConfigValidation(t *testing.T) {
 		{"duplicate op", `# ops = ["create", "verify", "repair"]   # default; verify-damaged is opt-in`, `ops = ["create", "create"]`, `op "create" is listed more than once`},
 		{"zero workers", `workers = [1, 8]                         # rarpar rows; the reference is single-threaded`, `workers = [0]`, "par3.workers must be positive"},
 		{"bad kernel variant", `# kernel_variants = ["name:VAR=value"]`, `kernel_variants = ["novar"]`, "kernel_variants"},
+		{"durability is gone", `# kernel_variants = ["name:VAR=value"]`, `durability = ["durable"]`,
+			"par3.durability is no longer accepted: the PAR3 bench runs buffered rarpar rows only"},
 		{"duplicate worker count", `workers = [1, 8]                         # rarpar rows; the reference is single-threaded`, `workers = [8, 8]`, "appears twice"},
 		{"pin list", `pin_cpus = "0-7"`, `pin_cpus = "0,2"`, "par3.pin_cpus"},
 		{"unknown versus profile", `versus = "versus"`, `versus = "versus-huge"`, "par3.versus"},
@@ -152,11 +154,14 @@ func TestPAR3PlanWarnsAboutALongWorkPathButRuns(t *testing.T) {
 	if problem != "" || len(view.Warnings) != 0 {
 		t.Fatalf("the example work path must pass cleanly: %s %v", problem, view.Warnings)
 	}
-	if len(view.Configs) == 0 || strings.Join(view.Variants, ",") != "reference,rarpar-w1,rarpar-w1-buffered,rarpar-w8,rarpar-w8-buffered" {
+	// One buffered rarpar row per worker count for every op, plus at repair
+	// one rarpar-wN-backup row per worker count.
+	if len(view.Configs) == 0 || strings.Join(view.Variants, ",") != "reference,rarpar-w1,rarpar-w1-backup,rarpar-w8,rarpar-w8-backup" {
 		t.Fatalf("unexpected view: %+v", view)
 	}
-	if strings.Join(view.Rows["create"], ",") != "reference,rarpar-w1,rarpar-w1-buffered,rarpar-w8,rarpar-w8-buffered" ||
-		strings.Join(view.Rows["verify"], ",") != "reference,rarpar-w1,rarpar-w8" {
+	if strings.Join(view.Rows["create"], ",") != "reference,rarpar-w1,rarpar-w8" ||
+		strings.Join(view.Rows["verify"], ",") != "reference,rarpar-w1,rarpar-w8" ||
+		strings.Join(view.Rows["repair"], ",") != "reference,rarpar-w1,rarpar-w1-backup,rarpar-w8,rarpar-w8-backup" {
 		t.Fatalf("unexpected rows: %v", view.Rows)
 	}
 	machine.PAR3.Work = "/home/bench/" + strings.Repeat("deep/", 20) + "p3"
@@ -172,9 +177,23 @@ func TestPAR3PlanWarnsAboutALongWorkPathButRuns(t *testing.T) {
 	if !strings.Contains(warnings, "par3 work path") || strings.Contains(warnings, "would refuse") {
 		t.Fatalf("plan warnings: %s", warnings)
 	}
-	machine.PAR3.Durability = []string{"buffered"}
-	if _, problem := par3View(machine, layout); !strings.Contains(problem, "durable") {
-		t.Fatalf("a durability list without durable must be refused: %q", problem)
+	var step string
+	for _, line := range plan.Machines[0].Steps {
+		if strings.HasPrefix(line, "on host: macro-par3,") {
+			step = line
+		}
+	}
+	for _, want := range []string{
+		"buffered rarpar rows only (never --fsync)",
+		"rarpar-wN for every op, repairing in place with no backup",
+		"rarpar-wN-backup, which keeps a numbered .1 as the reference does (like for like on bytes written)",
+	} {
+		if !strings.Contains(step, want) {
+			t.Fatalf("macro-par3 plan step lacks %q: %q", want, step)
+		}
+	}
+	if strings.Contains(step, "durable") {
+		t.Fatalf("macro-par3 plan step = %q", step)
 	}
 }
 
@@ -319,5 +338,203 @@ func TestRunScriptWaitsForEC2UserData(t *testing.T) {
 	config, local := exampleMachine(t, "linux-avx2")
 	if script := RunScript(local, config.Fleet.Defaults, "fleet-testrun", LayoutFor(local, "fleet-testrun"), map[string]string{}); strings.Contains(script, "USERDATA_DONE") {
 		t.Fatal("a local host must not wait for EC2 user-data")
+	}
+}
+
+// mutateExample applies old/new substitutions to the example config text in
+// order, each to its first occurrence, which must exist.
+func mutateExample(t *testing.T, pairs ...string) string {
+	t.Helper()
+	data, err := os.ReadFile(examplePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for i := 0; i+1 < len(pairs); i += 2 {
+		if !strings.Contains(text, pairs[i]) {
+			t.Fatalf("example config no longer contains %q; update the test", pairs[i])
+		}
+		text = strings.Replace(text, pairs[i], pairs[i+1], 1)
+	}
+	return text
+}
+
+func parsesAsShell(t *testing.T, script string) {
+	t.Helper()
+	if _, err := exec.LookPath("sh"); err != nil {
+		return
+	}
+	path := filepath.Join(t.TempDir(), "run.sh")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("sh", "-n", path).CombinedOutput(); err != nil {
+		t.Fatalf("generated script does not parse: %v\n%s", err, output)
+	}
+}
+
+func planText(t *testing.T, config Config, machines []Machine) (FleetPlan, string) {
+	t.Helper()
+	plan := BuildPlan(config, machines, "fleet-testrun")
+	var text strings.Builder
+	WritePlanText(&text, plan)
+	return plan, text.String()
+}
+
+// The 2026-10-14 round planned a macro-par3 perf pass ("stat repeats=3,
+// record -F 499 on (none)") that never ran: the run script's perf section
+// covered the corpus suites only, so a macro-par3 host kept nothing but
+// perf --version. macro-par3 runs its own pass inside par3 run; the script
+// must pass its flags, warn when the pass falls short, and do no corpus perf
+// work on a host that runs no corpus suite, and the plan must say so.
+func TestPAR3PerfPassReachesTheRunScript(t *testing.T) {
+	config := loadExample(t)
+	machines, err := Select(config, []string{"linux-avx2"}, []string{SuiteMacroPAR3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	machine := machines[0]
+	if machine.Bundle.Source != "release" || len(machine.families()) != 0 || machine.Capabilities.Perf != PerfLinux {
+		t.Fatalf("want a linux-perf release-bundle machine running macro-par3 alone: %+v %v", machine.Bundle, machine.Suites)
+	}
+	script := RunScript(machine, config.Fleet.Defaults, "fleet-testrun", LayoutFor(machine, "fleet-testrun"),
+		map[string]string{"par3": "/o/par3"})
+	for _, expected := range []string{
+		`  "$BENCH" par3 run --reference "$P3_REFERENCE" --candidate "$CANDIDATE" --work "$P3_WORK" \` + "\n" +
+			`    --out "$R/par3" --machine "$MACHINE" '--profile' 'full' '--workers' '1,8' '--warmups' '1' '--repeats' '5' '--timeout' '20m' '--pin-cpus' '0-7' \` + "\n" +
+			`    --perf-out "$R/perf/par3" '--perf-stat' '3' '--perf-ops' 'repair' '--perf-freq' '499' '--perf-record' 'a-gf16' \` + "\n" +
+			`    > "$R/par3-run.stdout.log" 2> "$R/par3-run.stderr.log"`,
+		`  if [ -f "$R/perf/par3/INCOMPLETE.txt" ] || [ -z "$(ls -A "$R/perf/par3" 2>/dev/null)" ]; then warn par3-perf-incomplete; fi`,
+		`  perf --version > "$R/perf/perf-version.txt" 2>&1`,
+	} {
+		if !strings.Contains(script, expected) {
+			t.Fatalf("run script is missing:\n%s", expected)
+		}
+	}
+	for _, unexpected := range []string{"plan-perf-", "$RECORD_CASES", `perf record -F "$PERF_FREQ"`} {
+		if strings.Contains(script, unexpected) {
+			t.Fatalf("a host running no corpus suite must do no corpus perf work, but the script has %q", unexpected)
+		}
+	}
+	parsesAsShell(t, script)
+
+	plan, text := planText(t, config, machines)
+	for _, expected := range []string{
+		"  perf       linux-perf (macro-par3: stat repeats=3 on the reference and rarpar rows of repair, record -F 499 on the rarpar rows of a-gf16)\n",
+		"on host: macro-par3 perf pass inside par3 run (untimed, after each op's timed runs) on the plain sets a-gf16,a-gf8,a-fft,b-gf16,c-gf16,c-fft,smoke-gf8,smoke-gf16,smoke-fft: " +
+			"perf stat x3 of each repair row (reference,rarpar-w1,rarpar-w1-backup,rarpar-w8,rarpar-w8-backup), each run on a fresh stage; " +
+			"on a-gf16, one perf record -F 499 with frame-pointer call graphs of each rarpar row, exported as perf script text and folded stacks; " +
+			"up to 139 untimed runs; evidence under results/perf/par3, and INCOMPLETE.txt plus a par3-perf-incomplete warning when the pass falls short",
+		"on host: record perf --version and kernel.perf_event_paranoid (no corpus suite runs here",
+	} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("plan text is missing %q:\n%s", expected, text)
+		}
+	}
+	for _, unexpected := range []string{"(none)", "par2-generate-rar5-v7-volumes", "perf diagnostic pass on the"} {
+		if strings.Contains(text, unexpected) {
+			t.Fatalf("the plan promises %q, which this run does not do", unexpected)
+		}
+	}
+	protocol := plan.Machines[0].Protocol
+	if len(protocol.PerfRecord) != 0 || strings.Join(protocol.PerfPAR3Ops, ",") != "repair" ||
+		strings.Join(protocol.PerfPAR3RecordSets, ",") != "a-gf16" {
+		t.Fatalf("plan protocol: %+v", protocol)
+	}
+
+	// With the corpus suites too, the plan names both passes, and the corpus
+	// pass keeps its record loop.
+	all, err := Select(config, []string{"linux-avx2"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, text := planText(t, config, all); !strings.Contains(text, "  perf       linux-perf (par2,rar: stat repeats=3 per case, record -F 499 on par2-generate-rar5-v7-volumes,rar5-v7-solid-multivolume; macro-par3: stat repeats=3 on the reference and rarpar rows of repair, record -F 499 on the rarpar rows of a-gf16)\n") {
+		t.Fatalf("plan text for every suite:\n%s", text)
+	}
+	if script := RunScript(all[0], config.Fleet.Defaults, "fleet-testrun", LayoutFor(all[0], "fleet-testrun"), nil); !strings.Contains(script, "--perf-out \"$R/perf/par3\"") ||
+		!strings.Contains(script, `perf record -F "$PERF_FREQ"`) {
+		t.Fatal("with the corpus suites the script runs both perf passes")
+	}
+}
+
+// A linux-perf macro-par3 host with no [machines.perf] block counts its
+// repair rows and records nothing; par3_ops = [] turns the pass off.
+func TestPAR3PerfPassDefaults(t *testing.T) {
+	ssmNone := "[machines.capabilities]\nperf = \"none\"\n\n[machines.paths]\nstaging = \"/home/ubuntu/fs\""
+	ssmPerf := "[machines.capabilities]\nperf = \"linux-perf\"\n\n[machines.paths]\nstaging = \"/home/ubuntu/fs\""
+	config, err := DecodeConfig("fleet.toml", mutateExample(t, ssmNone, ssmPerf))
+	if err != nil {
+		t.Fatal(err)
+	}
+	machines, err := Select(config, []string{"ec2-zen4-ssm"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	machine := machines[0]
+	if strings.Join(machine.Perf.PAR3Ops, ",") != "repair" || len(machine.Perf.PAR3RecordSets) != 0 {
+		t.Fatalf("defaults: %+v", machine.Perf)
+	}
+	script := RunScript(machine, config.Fleet.Defaults, "fleet-testrun", LayoutFor(machine, "fleet-testrun"), nil)
+	if !strings.Contains(script, `    --perf-out "$R/perf/par3" '--perf-stat' '3' '--perf-ops' 'repair' \`+"\n"+`    > "$R/par3-run.stdout.log"`) ||
+		strings.Contains(script, "'--perf-record'") {
+		t.Fatalf("an SSM macro-par3 host's run script must carry the default perf pass and no record:\n%s", script)
+	}
+	parsesAsShell(t, script)
+	_, text := planText(t, config, machines)
+	if !strings.Contains(text, "  perf       linux-perf (macro-par3: stat repeats=3 on the reference and rarpar rows of repair, no perf record)\n") ||
+		!strings.Contains(text, "each run on a fresh stage; no perf record (perf.par3_record_sets is empty); up to 135 untimed runs;") {
+		t.Fatalf("plan text:\n%s", text)
+	}
+
+	config, err = DecodeConfig("fleet.toml", mutateExample(t, `par3_record_sets = ["a-gf16"]`, `par3_record_sets = []`, `par3_ops = ["repair"]`, `par3_ops = []`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	machines, err = Select(config, []string{"linux-avx2"}, []string{SuiteMacroPAR3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if script := RunScript(machines[0], config.Fleet.Defaults, "fleet-testrun", LayoutFor(machines[0], "fleet-testrun"), nil); strings.Contains(script, "'--perf-") ||
+		strings.Contains(script, "--perf-out") ||
+		strings.Contains(script, "par3-perf-incomplete") {
+		t.Fatal("par3_ops = [] must turn the macro-par3 perf pass off")
+	}
+	if _, text := planText(t, config, machines); !strings.Contains(text, "  perf       linux-perf (macro-par3: off (perf.par3_ops is empty))\n") ||
+		strings.Contains(text, "macro-par3 perf pass") {
+		t.Fatalf("plan text:\n%s", text)
+	}
+}
+
+func TestPAR3PerfConfigValidation(t *testing.T) {
+	cases := []struct {
+		name  string
+		pairs []string
+		want  string
+	}{
+		{"unknown op", []string{`par3_ops = ["repair"]`, `par3_ops = ["explode"]`}, "perf.par3_ops: unknown op"},
+		{"op the run does not measure", []string{`par3_ops = ["repair"]`, `par3_ops = ["verify-damaged"]`},
+			"perf.par3_ops: verify-damaged is not one of the macro-par3 ops (create,verify,repair)"},
+		{"unknown record set", []string{`par3_record_sets = ["a-gf16"]`, `par3_record_sets = ["z-gf99"]`},
+			`perf.par3_record_sets: "z-gf99" is not a set this machine's macro-par3 run selects`},
+		{"duplicate record set", []string{`par3_record_sets = ["a-gf16"]`, `par3_record_sets = ["a-gf16", "a-gf16"]`},
+			`perf.par3_record_sets: "a-gf16" is listed more than once`},
+		{"record without ops", []string{`par3_ops = ["repair"]`, `par3_ops = []`}, "perf.par3_record_sets needs perf.par3_ops"},
+		{"record set outside par3.sets", []string{`# sets = ["a-gf16", "c-gf16"]            # default: every set in the profile`, `sets = ["c-gf16"]`},
+			`perf.par3_record_sets: "a-gf16" is not a set this machine's macro-par3 run selects (profile full, sets c-gf16)`},
+		{"PAR-inside record set", []string{`profile = "full"                         # full | smoke | fleet`, `profile = "fleet"`,
+			`par3_record_sets = ["a-gf16"]`, `par3_record_sets = ["zip-inside"]`},
+			`perf.par3_record_sets: "zip-inside" is a PAR-inside set; the perf pass covers plain sets only`},
+		{"keys on a host without perf", []string{`work = "/home/ubuntu/p3"`, "work = \"/home/ubuntu/p3\"\n\n[machines.perf]\npar3_ops = [\"repair\"]"},
+			`machine "ec2-zen4-ssm": perf.par3_ops and perf.par3_record_sets configure the macro-par3 perf pass, which needs capabilities.perf = "linux-perf" and the macro-par3 suite`},
+		{"keys on a host without macro-par3", []string{`record_cases = ["par2-generate-rar5-v7-volumes"]`, "record_cases = [\"par2-generate-rar5-v7-volumes\"]\npar3_record_sets = [\"a-gf16\"]"},
+			`machine "ec2-graviton4": perf.par3_ops and perf.par3_record_sets configure the macro-par3 perf pass`},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, err := DecodeConfig("fleet.toml", mutateExample(t, testCase.pairs...))
+			if err == nil || !strings.Contains(err.Error(), testCase.want) {
+				t.Fatalf("want an error containing %q, got %v", testCase.want, err)
+			}
+		})
 	}
 }

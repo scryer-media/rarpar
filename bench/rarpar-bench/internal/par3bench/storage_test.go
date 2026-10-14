@@ -1,6 +1,7 @@
 package par3bench
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -121,7 +122,7 @@ func TestParseTargetAndMeta(t *testing.T) {
 
 func TestMatrixRowsExpandPerTargetAndFilterKinds(t *testing.T) {
 	targets := []Target{{Name: "local", Work: "/w"}, {Name: "nfs", Work: "/na"}}
-	rows := MatrixRows([]int{8}, nil, []string{DurabilityDurable}, []int{8},
+	rows := MatrixRows([]int{8}, nil, []int{8},
 		[]KernelVariant{{Name: "wff-off", Env: []string{"PAR3_BENCH_WHOLE_FILE_FIRST=0"}}}, []string{ToolEngine}, targets)
 	var names []string
 	for _, row := range rows {
@@ -137,29 +138,43 @@ func TestMatrixRowsExpandPerTargetAndFilterKinds(t *testing.T) {
 	if rows[1].dirName() != "engine-w8-wff-off" {
 		t.Errorf("dirName = %s", rows[1].dirName())
 	}
-	single := MatrixRows([]int{1}, nil, []string{DurabilityDurable}, nil, nil, nil, nil)
-	if len(single) != 2 || single[0].Name != "reference" || single[1].Name != "rarpar-w1" {
+	single := MatrixRows([]int{1}, nil, nil, nil, nil, nil)
+	if len(single) != 3 || single[0].Name != "reference" || single[1].Name != "rarpar-w1" ||
+		single[2].Name != "rarpar-w1-backup" || !single[2].Backup {
 		t.Errorf("untargeted rows = %+v", single)
 	}
-	buffered := EngineRows([]int{8}, nil, nil)
-	if len(buffered) != 2 || buffered[1].Name != "engine-w8-buffered" {
-		t.Errorf("engine durability rows = %+v", buffered)
+	if targeted := MatrixRows([]int{1}, nil, nil, nil, []string{ToolCandidate}, targets); len(targeted) != 4 ||
+		targeted[1].Name != "rarpar-w1-backup@local" || !targeted[1].Backup || targeted[1].dirName() != "w1-backup" {
+		t.Errorf("targeted rarpar rows = %+v", targeted)
+	}
+	engine := EngineRows([]int{8}, nil)
+	if len(engine) != 1 || engine[0].Name != "engine-w8" {
+		t.Errorf("engine rows = %+v: one buffered row per worker count", engine)
 	}
 }
 
-func TestEngineCommandPassesBufferedDurabilityPerOp(t *testing.T) {
+// Every engine_perf create and repair runs buffered, as the rarpar rows do.
+// par3-rs 0.6.0 and later ignore the variable; an older engine_perf would sync
+// its outputs without it. Read-only ops get no variable.
+func TestEngineCommandRunsWritingOpsBuffered(t *testing.T) {
 	r := &runner{options: Options{EnginePerf: "/bin/engine_perf", EnginePerfMemoryMiB: 256}, results: &Results{}}
 	config := Config{Codec: "cauchy", BlockSize: 1 << 20, Recovery: 52}
-	command := r.engineCommand(OpRepair, config, "/d", "/s/repair-engine-w8", Variant{Workers: 8, Durability: DurabilityBuffered})
+	command := r.engineCommand(OpRepair, config, "/d", "/s/repair-engine-w8", Variant{Workers: 8})
 	if strings.Join(command.Args, " ") != "repair /s/repair-engine-w8 /s/repair-engine-w8 /s/repair-engine-w8 8 256" {
 		t.Errorf("args = %v", command.Args)
 	}
-	if len(command.Env) != 1 || command.Env[0] != "PAR3_BENCH_REPAIR_DURABILITY=buffered" || command.Dir != "/s" {
+	if strings.Join(command.Env, " ") != "PAR3_BENCH_REPAIR_DURABILITY=buffered" || command.Dir != "/s" {
 		t.Errorf("env = %v dir = %s", command.Env, command.Dir)
 	}
-	create := r.engineCommand(OpCreate, config, "/d", "/s/c", Variant{Workers: 1})
-	if strings.Join(create.Args, " ") != "create /d /s/c /s/c-spool 1 256 cauchy 1048576 52 0" || len(create.Env) != 0 {
+	create := r.engineCommand(OpCreate, config, "/d", "/s/c", Variant{Workers: 1, Env: []string{"PAR3_BENCH_WHOLE_FILE_FIRST=0"}})
+	if strings.Join(create.Args, " ") != "create /d /s/c /s/c-spool 1 256 cauchy 1048576 52 0" ||
+		strings.Join(create.Env, " ") != "PAR3_BENCH_WHOLE_FILE_FIRST=0 PAR3_BENCH_CREATE_DURABILITY=buffered" {
 		t.Errorf("create = %v %v", create.Args, create.Env)
+	}
+	for _, op := range []string{OpVerify, OpVerifyDamaged} {
+		if read := r.engineCommand(op, config, "/d", "/s/v", Variant{Workers: 1}); len(read.Env) != 0 {
+			t.Errorf("%s env = %v, want none", op, read.Env)
+		}
 	}
 }
 
@@ -215,24 +230,55 @@ func TestVerifyDamagedStageLinksTheSharedDamagedInputs(t *testing.T) {
 	}
 }
 
-func TestEngineBufferedRowsDoNotNeedTheCLIFlag(t *testing.T) {
-	// An old candidate: durable by default, no --buffered on repair.
-	r := &runner{results: &Results{
-		DefaultDurability: map[string]string{OpRepair: DurabilityDurable},
-		DurabilityArgs:    map[string]map[string][]string{OpRepair: {DurabilityDurable: {}}},
-	}}
-	engine := Variant{Name: "engine-w8-buffered", Tool: ToolEngine, Workers: 8, Durability: DurabilityBuffered}
-	cli := Variant{Name: "rarpar-w8-buffered", Tool: ToolCandidate, Workers: 8, Durability: DurabilityBuffered}
-	if !r.runsOp(engine, OpRepair) {
-		t.Error("engine buffered repair row dropped when the CLI has no --buffered")
+// An engine_perf create or repair counts as buffered only on its own
+// evidence, read from the output each build prints: the first builds print
+// none, later ones a creation_durability line and a Sync stage line (their
+// repair ignores PAR3_BENCH_REPAIR_DURABILITY and always syncs), later ones
+// file_syncs and file_opens in the totals, and par3-rs 0.6.0 and later
+// file_opens with no barrier at all.
+func TestEngineSyncProblemReadsEachBuildsEvidence(t *testing.T) {
+	const (
+		firstTotals  = `{"file_read_bytes":1048576,"file_write_bytes":2048,"memory_limit":268435456,"workers":8}`
+		stageTotals  = `{"file_read_bytes":1048576,"file_read_calls":4,"file_write_bytes":2048,"file_write_calls":2,"memory_limit":268435456,"workers":8}`
+		syncTotals   = `{"file_read_bytes":1048576,"file_read_calls":4,"file_write_bytes":2048,"file_write_calls":2,"file_opens":9,"file_syncs":%d,"file_clones":0,"file_in_place":0,"snapshots":1,"scan_work_used":0,"memory_limit":268435456,"workers":8}`
+		barrierFree  = `{"file_read_bytes":1048576,"file_read_calls":4,"file_write_bytes":2048,"file_write_calls":2,"file_opens":9,"file_clones":0,"file_in_place":0,"snapshots":1,"scan_work_used":0,"memory_limit":268435456,"workers":8}`
+		syncStage    = `{"internal_stage":"Sync","seconds":0.012000000,"calls":%d}`
+		repairStage  = `{"internal_stage":"Repair","seconds":0.500000000,"calls":1}`
+		mount        = `{"mount_local":2,"mount_remote":0,"mount_unknown":0,"verify_whole_first":2,"verify_single_pass":0,"whole_file_first":true,"mount_kind":"local"}`
+		createLine   = `{"creation_durability":"%s"}`
+		noEvidence   = "printed no sync evidence"
+		oldRepair    = "predates PAR3_BENCH_REPAIR_DURABILITY"
+		completedTwo = "completed 2 file syncs"
+	)
+	lines := func(parts ...string) string { return strings.Join(parts, "\n") + "\n" }
+	cases := []struct {
+		name, op, stdout, want string
+	}{
+		{"first build create", OpCreate, lines(`{"status":"Ready"}`, firstTotals), noEvidence},
+		{"first build repair", OpRepair, lines(`{"installed":2}`, firstTotals), noEvidence},
+		{"stage build buffered create", OpCreate, lines(fmt.Sprintf(createLine, "Buffered"), `{"carriers":3}`, repairStage, fmt.Sprintf(syncStage, 0), stageTotals), ""},
+		{"stage build synced create", OpCreate, lines(fmt.Sprintf(createLine, "SyncFiles"), fmt.Sprintf(syncStage, 4), stageTotals), "creation_durability SyncFiles, not Buffered"},
+		{"stage build repair", OpRepair, lines(`{"installed":2}`, repairStage, fmt.Sprintf(syncStage, 3), stageTotals), oldRepair},
+		{"stage build repair that synced nothing", OpRepair, lines(repairStage, fmt.Sprintf(syncStage, 0), stageTotals), ""},
+		{"sync-count build buffered repair", OpRepair, lines(repairStage, fmt.Sprintf(syncStage, 0), fmt.Sprintf(syncTotals, 0), mount), ""},
+		{"sync-count build synced repair", OpRepair, lines(repairStage, fmt.Sprintf(syncStage, 2), fmt.Sprintf(syncTotals, 2), mount), completedTwo},
+		{"sync-count build synced create", OpCreate, lines(fmt.Sprintf(createLine, "Buffered"), fmt.Sprintf(syncStage, 2), fmt.Sprintf(syncTotals, 2)), completedTwo},
+		{"barrier-free build create", OpCreate, lines(`{"carriers":3}`, repairStage, barrierFree, mount), ""},
+		{"barrier-free build repair", OpRepair, lines(`{"installed":2}`, repairStage, barrierFree, mount), ""},
+		{"truncated head", OpRepair, lines(`ge":"Repair","seconds":0.5,"calls":1}`, barrierFree), ""},
+		{"verify needs no evidence", OpVerify, lines(firstTotals), ""},
+		{"damaged verify needs no evidence", OpVerifyDamaged, "", ""},
 	}
-	if r.runsOp(cli, OpRepair) {
-		t.Error("CLI buffered repair row kept without a --buffered flag")
+	for _, c := range cases {
+		got := EngineSyncProblem(c.op, c.stdout)
+		if (c.want == "") != (got == "") || !strings.Contains(got, c.want) {
+			t.Errorf("%s: %q, want %q", c.name, got, c.want)
+		}
 	}
-	if !r.runsOp(Variant{Name: "rarpar-w8", Tool: ToolCandidate, Workers: 8}, OpRepair) {
-		t.Error("CLI durable repair row dropped on a durable-by-default candidate")
-	}
-	if r.runsOp(engine, OpVerify) {
-		t.Error("buffered row for a read-only op")
+	// A build that cannot run buffered ends its row: every remaining run
+	// would fail the same way.
+	record := RunRecord{Tool: ToolEngine, Status: StatusFailed, Failure: FailureEngineNotBuffered}
+	if !settleRow(&record) || record.Status != StatusFailed {
+		t.Fatalf("an engine row that synced: finished false or status %s", record.Status)
 	}
 }

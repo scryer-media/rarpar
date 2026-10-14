@@ -125,7 +125,7 @@ fn verify_damage_repair(directory: &Path, format: &str, set: &str, archive: &str
         "par2" => (&["--quiet", "par", "verify"], &["--quiet", "par", "repair"]),
         _ => (
             &["--quiet", "par3", "verify"],
-            &["--quiet", "par3", "repair", "--no-backup"],
+            &["--quiet", "par3", "repair"],
         ),
     };
     let with = |head: &[&str]| -> Vec<String> {
