@@ -73,6 +73,15 @@ func TestReferenceExit6IsDNFEndToEnd(t *testing.T) {
 			if run.MaxRSSBytes <= 0 {
 				t.Errorf("rarpar row %s/%s has no peak RSS", run.Op, run.Variant)
 			}
+			if strings.Contains(run.Command, "--fsync") {
+				t.Errorf("rarpar row %s/%s passed --fsync: %s", run.Op, run.Variant, run.Command)
+			}
+		}
+	}
+	// Both writing ops were probed: buffered arguments, or no buffered mode.
+	for _, op := range []string{OpCreate, OpRepair} {
+		if _, probed := results.BufferedArgs[op]; !probed && !contains(results.BufferedUnsupported, op) {
+			t.Errorf("%s was not probed for a buffered mode", op)
 		}
 	}
 	if !seedDNF {
@@ -91,7 +100,7 @@ func TestReferenceExit6IsDNFEndToEnd(t *testing.T) {
 		t.Fatalf("results.json must reload: %v", err)
 	}
 	report := RenderReport(reloaded)
-	for _, want := range []string{"| reference | none (never syncs) | DNF |", "| rarpar-w1 | durable |", "exit 6: Failed to open Recovery File"} {
+	for _, want := range []string{"| reference | DNF |", "| rarpar-w1 |", "exit 6: Failed to open Recovery File"} {
 		if !strings.Contains(report, want) {
 			t.Fatalf("report lacks %q:\n%s", want, report)
 		}

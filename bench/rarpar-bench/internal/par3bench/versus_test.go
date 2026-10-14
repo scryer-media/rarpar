@@ -71,3 +71,40 @@ func TestVersusArmsShareTheBlockSizeAndRecoveryCount(t *testing.T) {
 		t.Fatalf("arms without a par2cmdline-turbo binary: %v", got)
 	}
 }
+
+// The PAR3 arms run buffered, as the PAR3 suite's rarpar rows do: --buffered
+// where an older candidate's help lists it, nothing on 0.7.0 and later, and
+// never --fsync. The PAR2 arms take no PAR3 switch.
+func TestVersusPAR3ArmsRunBuffered(t *testing.T) {
+	config := versusSmokeProfile().Configs[0]
+	names := []string{"v0.bin"}
+	older := VersusOptions{Candidate: "/bin/rarpar", PAR2Turbo: "/bin/par2", buffered: map[string][]string{OpCreate: {"--buffered"}}}
+	current := VersusOptions{Candidate: "/bin/rarpar", PAR2Turbo: "/bin/par2", buffered: map[string][]string{OpCreate: {}, OpRepair: {}}}
+	for _, arm := range []string{ArmPAR3Cauchy, ArmPAR3FFT} {
+		if line := strings.Join(versusCreateCommand(older, config, "/data", "/out", arm, names).Args, " "); !strings.HasSuffix(line, " --buffered") {
+			t.Errorf("%s create on an older candidate %q lacks --buffered", arm, line)
+		}
+		// The older candidate's repair lists neither switch: plain command.
+		if line := strings.Join(versusRepairCommand(older, "/s", arm).Args, " "); line != "--quiet par3 repair "+carrierName {
+			t.Errorf("%s repair on an older candidate = %q", arm, line)
+		}
+		for _, line := range []string{
+			strings.Join(versusCreateCommand(current, config, "/data", "/out", arm, names).Args, " "),
+			strings.Join(versusRepairCommand(current, "/s", arm).Args, " "),
+		} {
+			if strings.Contains(line, "--buffered") || strings.Contains(line, "--fsync") {
+				t.Errorf("%s on 0.7.0 = %q, want no durability switch", arm, line)
+			}
+		}
+	}
+	for _, arm := range []string{ArmPAR2, ArmPAR2Turbo} {
+		for _, line := range []string{
+			strings.Join(versusCreateCommand(older, config, "/data", "/out", arm, names).Args, " "),
+			strings.Join(versusRepairCommand(older, "/s", arm).Args, " "),
+		} {
+			if strings.Contains(line, "--buffered") || strings.Contains(line, "--fsync") {
+				t.Errorf("%s = %q carries a PAR3 switch", arm, line)
+			}
+		}
+	}
+}

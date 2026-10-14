@@ -121,7 +121,7 @@ func TestParseTargetAndMeta(t *testing.T) {
 
 func TestMatrixRowsExpandPerTargetAndFilterKinds(t *testing.T) {
 	targets := []Target{{Name: "local", Work: "/w"}, {Name: "nfs", Work: "/na"}}
-	rows := MatrixRows([]int{8}, nil, []string{DurabilityDurable}, []int{8},
+	rows := MatrixRows([]int{8}, nil, []int{8},
 		[]KernelVariant{{Name: "wff-off", Env: []string{"PAR3_BENCH_WHOLE_FILE_FIRST=0"}}}, []string{ToolEngine}, targets)
 	var names []string
 	for _, row := range rows {
@@ -137,29 +137,38 @@ func TestMatrixRowsExpandPerTargetAndFilterKinds(t *testing.T) {
 	if rows[1].dirName() != "engine-w8-wff-off" {
 		t.Errorf("dirName = %s", rows[1].dirName())
 	}
-	single := MatrixRows([]int{1}, nil, []string{DurabilityDurable}, nil, nil, nil, nil)
+	single := MatrixRows([]int{1}, nil, nil, nil, nil, nil)
 	if len(single) != 2 || single[0].Name != "reference" || single[1].Name != "rarpar-w1" {
 		t.Errorf("untargeted rows = %+v", single)
 	}
-	buffered := EngineRows([]int{8}, nil, nil)
-	if len(buffered) != 2 || buffered[1].Name != "engine-w8-buffered" {
-		t.Errorf("engine durability rows = %+v", buffered)
+	engine := EngineRows([]int{8}, nil)
+	if len(engine) != 1 || engine[0].Name != "engine-w8" {
+		t.Errorf("engine rows = %+v: one buffered row per worker count", engine)
 	}
 }
 
-func TestEngineCommandPassesBufferedDurabilityPerOp(t *testing.T) {
+// Every engine_perf create and repair runs buffered, as the rarpar rows do.
+// par3-rs 0.6.0 and later ignore the variable; an older engine_perf would sync
+// its outputs without it. Read-only ops get no variable.
+func TestEngineCommandRunsWritingOpsBuffered(t *testing.T) {
 	r := &runner{options: Options{EnginePerf: "/bin/engine_perf", EnginePerfMemoryMiB: 256}, results: &Results{}}
 	config := Config{Codec: "cauchy", BlockSize: 1 << 20, Recovery: 52}
-	command := r.engineCommand(OpRepair, config, "/d", "/s/repair-engine-w8", Variant{Workers: 8, Durability: DurabilityBuffered})
+	command := r.engineCommand(OpRepair, config, "/d", "/s/repair-engine-w8", Variant{Workers: 8})
 	if strings.Join(command.Args, " ") != "repair /s/repair-engine-w8 /s/repair-engine-w8 /s/repair-engine-w8 8 256" {
 		t.Errorf("args = %v", command.Args)
 	}
-	if len(command.Env) != 1 || command.Env[0] != "PAR3_BENCH_REPAIR_DURABILITY=buffered" || command.Dir != "/s" {
+	if strings.Join(command.Env, " ") != "PAR3_BENCH_REPAIR_DURABILITY=buffered" || command.Dir != "/s" {
 		t.Errorf("env = %v dir = %s", command.Env, command.Dir)
 	}
-	create := r.engineCommand(OpCreate, config, "/d", "/s/c", Variant{Workers: 1})
-	if strings.Join(create.Args, " ") != "create /d /s/c /s/c-spool 1 256 cauchy 1048576 52 0" || len(create.Env) != 0 {
+	create := r.engineCommand(OpCreate, config, "/d", "/s/c", Variant{Workers: 1, Env: []string{"PAR3_BENCH_WHOLE_FILE_FIRST=0"}})
+	if strings.Join(create.Args, " ") != "create /d /s/c /s/c-spool 1 256 cauchy 1048576 52 0" ||
+		strings.Join(create.Env, " ") != "PAR3_BENCH_WHOLE_FILE_FIRST=0 PAR3_BENCH_CREATE_DURABILITY=buffered" {
 		t.Errorf("create = %v %v", create.Args, create.Env)
+	}
+	for _, op := range []string{OpVerify, OpVerifyDamaged} {
+		if read := r.engineCommand(op, config, "/d", "/s/v", Variant{Workers: 1}); len(read.Env) != 0 {
+			t.Errorf("%s env = %v, want none", op, read.Env)
+		}
 	}
 }
 
@@ -212,27 +221,5 @@ func TestVerifyDamagedStageLinksTheSharedDamagedInputs(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(stageDir, "set.par3")); err != nil {
 		t.Error(err)
-	}
-}
-
-func TestEngineBufferedRowsDoNotNeedTheCLIFlag(t *testing.T) {
-	// An old candidate: durable by default, no --buffered on repair.
-	r := &runner{results: &Results{
-		DefaultDurability: map[string]string{OpRepair: DurabilityDurable},
-		DurabilityArgs:    map[string]map[string][]string{OpRepair: {DurabilityDurable: {}}},
-	}}
-	engine := Variant{Name: "engine-w8-buffered", Tool: ToolEngine, Workers: 8, Durability: DurabilityBuffered}
-	cli := Variant{Name: "rarpar-w8-buffered", Tool: ToolCandidate, Workers: 8, Durability: DurabilityBuffered}
-	if !r.runsOp(engine, OpRepair) {
-		t.Error("engine buffered repair row dropped when the CLI has no --buffered")
-	}
-	if r.runsOp(cli, OpRepair) {
-		t.Error("CLI buffered repair row kept without a --buffered flag")
-	}
-	if !r.runsOp(Variant{Name: "rarpar-w8", Tool: ToolCandidate, Workers: 8}, OpRepair) {
-		t.Error("CLI durable repair row dropped on a durable-by-default candidate")
-	}
-	if r.runsOp(engine, OpVerify) {
-		t.Error("buffered row for a read-only op")
 	}
 }

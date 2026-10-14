@@ -100,6 +100,9 @@ const (
 // containerBuildRemoved explains the keys the removed container build read.
 const containerBuildRemoved = `the container build is gone; candidates come from bundle.source = "release" (the published release artifacts) or "prebuilt" (a local bundle, for dev spot tests)`
 
+// par3DurabilityRemoved explains the removed par3.durability key.
+const par3DurabilityRemoved = `the PAR3 bench runs buffered rarpar rows only (one rarpar-wN row per worker count) and never passes --fsync; durability is a consumer concern, not a PAR3 one, so there is no durable row to select; drop the key`
+
 var (
 	knownSuites   = []string{SuiteCRCProbe, SuiteYencMicro, SuiteMacroRAR, SuiteMacroPAR2, SuiteMacroPAR3, SuiteLzmaTurbo, SuiteSevenzTurbo}
 	knownShells   = []string{"sh", "bash", "powershell"}
@@ -211,9 +214,6 @@ type PAR3Plan struct {
 	// checks it against every selected set.
 	Work           string   `json:"work,omitempty"`
 	KernelVariants []string `json:"kernel_variants,omitempty"`
-	// Durability lists rarpar's durability rows for create and repair
-	// (default: durable, buffered). Durable is always included.
-	Durability []string `json:"durability,omitempty"`
 	// TimeoutMinutes bounds every timed process (default 20); a reference run
 	// past it is DNF.
 	TimeoutMinutes int `json:"timeout_minutes"`
@@ -590,11 +590,11 @@ func decodeMachine(item *section, settings Settings) Machine {
 		IOCount:                 par3.boolean("iocount", false),
 		Work:                    par3.str("work", ""),
 		KernelVariants:          par3.strings("kernel_variants", nil),
-		Durability:              par3.strings("durability", nil),
 		TimeoutMinutes:          par3.integer("timeout_minutes", 20),
 		ReferenceTimeoutMinutes: par3.integer("reference_timeout_minutes", 0),
 		Versus:                  par3.str("versus", ""),
 	}
+	par3.removed("durability", par3DurabilityRemoved)
 	par3.finish()
 
 	turbo := item.child("turbo")
@@ -1098,10 +1098,7 @@ func validatePAR3(state *decodeState, prefix string, machine *Machine) {
 		}
 		kernels = append(kernels, kernel)
 	}
-	durabilities, err := par3bench.ParseDurabilities(strings.Join(plan.Durability, ","))
-	if err != nil {
-		state.fail("%s: par3.durability: %v", prefix, err)
-	} else if err := par3bench.CheckVariantNames(par3bench.Variants(plan.Workers, kernels, durabilities)); err != nil {
+	if err := par3bench.CheckVariantNames(par3bench.Variants(plan.Workers, kernels)); err != nil {
 		state.fail("%s: par3: %v", prefix, err)
 	}
 	if err := par3bench.ValidatePinCPUs(plan.PinCPUs); err != nil {

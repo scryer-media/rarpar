@@ -37,8 +37,6 @@ type Row struct {
 	Op      string
 	Variant string
 	Tool    string
-	// Durability is "durable"/"buffered" for rarpar rows, "" for the reference.
-	Durability string
 	// DNF describes why a reference row did not finish; empty otherwise.
 	DNF      string
 	Wall     Stat
@@ -99,7 +97,7 @@ func Summarize(results *Results) []Row {
 				if len(runs) == 0 && !didNotFinish {
 					continue
 				}
-				row := Row{Config: config.ID, Op: op, Variant: variant.Name, Tool: variant.Tool, Durability: variant.EffectiveDurability(), Target: variant.Target}
+				row := Row{Config: config.ID, Op: op, Variant: variant.Name, Tool: variant.Tool, Target: variant.Target}
 				if didNotFinish {
 					row.DNF = describeDNF(stopped)
 				}
@@ -212,26 +210,9 @@ func RenderReport(results *Results) string {
 		fmt.Fprintf(&b, "; pinned to CPUs %s (applied: %t)", results.PinCPUs, results.PinApplied)
 	}
 	fmt.Fprintln(&b)
-	durabilities := results.Durabilities
-	if len(durabilities) == 0 {
-		durabilities = []string{DurabilityDurable}
-	}
-	fmt.Fprintf(&b, "- Durability: rarpar create and repair run as %s; **durable** syncs every output before the command returns, **buffered** only flushes. The reference never syncs and has one row.", strings.Join(durabilities, " and "))
-	for _, op := range []string{OpCreate, OpRepair} {
-		mode, ok := results.DefaultDurability[op]
-		if !ok {
-			continue
-		}
-		fmt.Fprintf(&b, " A plain `rarpar par3 %s` on this candidate is %s", op, mode)
-		for _, other := range KnownDurabilities {
-			if args := results.DurabilityArgs[op][other]; other != mode && len(args) > 0 {
-				fmt.Fprintf(&b, "; `%s` selects %s", strings.Join(args, " "), other)
-			}
-		}
-		fmt.Fprint(&b, ".")
-	}
-	for _, op := range results.BufferedUnsupported {
-		fmt.Fprintf(&b, " This candidate has no buffered %s mode, so %s has only the durable row.", op, op)
+	fmt.Fprint(&b, "- Output: every rarpar row runs buffered and the bench never passes `--fsync`; durability is the caller's concern, not PAR3's. The reference never syncs.")
+	if summary := bufferedSummary(results.Ops, results.BufferedArgs, results.BufferedUnsupported); summary != "" {
+		fmt.Fprint(&b, " "+summary)
 	}
 	fmt.Fprintln(&b)
 	if results.TimeoutSeconds > 0 {
@@ -263,7 +244,7 @@ func RenderReport(results *Results) string {
 		fmt.Fprintln(&b)
 	}
 	fmt.Fprintf(&b, "- Started %s, finished %s, status **%s**\n\n", results.StartedUTC, results.FinishedUTC, results.Status)
-	fmt.Fprintln(&b, "Wall and CPU (user+sys) are seconds, RSS is peak MiB; cells are median [min–max]. Every ratio is reference/rarpar medians: above 1.000 rarpar was faster or used less. The reference is single-threaded. Every rarpar row, durable and buffered, is compared with the same reference row.")
+	fmt.Fprintln(&b, "Wall and CPU (user+sys) are seconds, RSS is peak MiB; cells are median [min–max]. Every ratio is reference/rarpar medians: above 1.000 rarpar was faster or used less. The reference is single-threaded. Every rarpar row is compared with the same reference row.")
 	fmt.Fprintln(&b, "Carriers: `identical` = byte-identical to the reference's set; `payloads-only` = every recovery block's payload matches but packet metadata differs; `DIFFERENT` = recovery payloads differ.")
 	fmt.Fprintln(&b)
 	procmeasure.RenderRSSSummary(&b, RSSSummary(results))
@@ -301,14 +282,8 @@ func RenderReport(results *Results) string {
 				fmt.Fprintf(&b, "; damage %s (%d blocks)", config.Damage.Name, config.Damage.LostBlocks())
 			}
 			fmt.Fprint(&b, ".\n\n")
-			header := "| variant |"
-			rule := "|---|"
-			if writes(row.Op) {
-				header += " durability |"
-				rule += "---|"
-			}
-			header += " wall s | CPU s | RSS MiB | wall ratio | CPU ratio | RSS ratio |"
-			rule += "---|---|---|---|---|---|"
+			header := "| variant | wall s | CPU s | RSS MiB | wall ratio | CPU ratio | RSS ratio |"
+			rule := "|---|---|---|---|---|---|---|"
 			if windowsCounters {
 				header += " read ops | write ops |"
 				rule += "---|---|"
@@ -331,9 +306,6 @@ func RenderReport(results *Results) string {
 		}
 		reference, hasReference := references[group+"@"+row.Target]
 		line := fmt.Sprintf("| %s |", row.Variant)
-		if writes(row.Op) {
-			line += fmt.Sprintf(" %s |", durabilityLabel(row))
-		}
 		switch {
 		case row.DNF != "":
 			line += " DNF | - | - | - | - | - |"
@@ -378,11 +350,7 @@ func RenderReport(results *Results) string {
 		fmt.Fprintln(&b, "## engine_perf stage breakdown (untimed pass)")
 		fmt.Fprintln(&b)
 		for _, run := range results.EnginePerfRuns {
-			fmt.Fprintf(&b, "- %s %s w%d", run.Config, run.Op, run.Workers)
-			if run.Durability != "" {
-				fmt.Fprintf(&b, " %s", run.Durability)
-			}
-			fmt.Fprintf(&b, ": %.3fs", run.WallSeconds)
+			fmt.Fprintf(&b, "- %s %s w%d: %.3fs", run.Config, run.Op, run.Workers, run.WallSeconds)
 			if run.Error != "" {
 				fmt.Fprintf(&b, " — error: %s", run.Error)
 			}
@@ -409,16 +377,31 @@ func RenderReport(results *Results) string {
 	return b.String()
 }
 
-// writes reports whether op writes output, and so has durability rows.
-func writes(op string) bool { return op == OpCreate || op == OpRepair }
-
-func durabilityLabel(row Row) string {
-	switch row.Durability {
-	case "":
-		return "none (never syncs)"
-	default:
-		return row.Durability
+// bufferedSummary says, per writing op in ops, how its rarpar rows ran
+// buffered on this candidate (see Results.BufferedArgs), or "" when no
+// writing op was probed.
+func bufferedSummary(ops []string, args map[string][]string, unsupported []string) string {
+	var parts []string
+	for _, op := range []string{OpCreate, OpRepair} {
+		if !contains(ops, op) {
+			continue
+		}
+		selected, probed := args[op]
+		switch {
+		case contains(unsupported, op):
+			parts = append(parts, fmt.Sprintf("`rarpar par3 %s` on this candidate has no buffered mode and runs the plain command", op))
+		case !probed:
+			continue
+		case len(selected) == 0:
+			parts = append(parts, fmt.Sprintf("`rarpar par3 %s` is buffered when run plain", op))
+		default:
+			parts = append(parts, fmt.Sprintf("`rarpar par3 %s` runs with `%s`", op, strings.Join(selected, " ")))
+		}
 	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, "; ") + "."
 }
 
 func formatTimeout(seconds float64) string {

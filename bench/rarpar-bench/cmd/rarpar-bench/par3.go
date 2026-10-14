@@ -17,12 +17,12 @@ import (
 )
 
 const par3Usage = `Usage:
-  rarpar-bench par3 matrix [--profile smoke|full|fleet] [--set ID]... [--ops LIST] [--workers 1,8] [--durability durable,buffered]
+  rarpar-bench par3 matrix [--profile smoke|full|fleet] [--set ID]... [--ops LIST] [--workers 1,8]
         [--kernel-variant NAME:VAR=V]... [--json]
   rarpar-bench par3 build-reference --out DIR [--toolchains PATH] [--cache DIR] [--mirror-base URL] [--cmake PATH] [--jobs N]
   rarpar-bench par3 run --reference PATH --candidate PATH --work DIR --out DIR [--profile smoke|full|fleet] [--set ID]...
         [--ops create,verify,repair] [--warmups N] [--repeats N] [--workers 1,8] [--pin-cpus 0-7]
-        [--durability durable,buffered] [--kernel-variant NAME:VAR=V[,VAR=V]]... [--iocount] [--engine-perf PATH]
+        [--kernel-variant NAME:VAR=V[,VAR=V]]... [--iocount] [--engine-perf PATH]
         [--candidate-arg ARG]... [--machine LABEL] [--timeout 20m] [--reference-timeout DURATION] [--keep-stages]
         [--target NAME=DIR]... [--target-meta NAME:KEY=V[,KEY=V]]... [--rows reference,rarpar,engine]
         [--engine-workers 8] [--engine-variant NAME:VAR=V[,VAR=V]]... [--drop-caches]
@@ -33,7 +33,12 @@ const par3Usage = `Usage:
   rarpar-bench par3 versus-report --input results.json [--out report.md]
 
 The PAR3 suite benchmarks the shipped rarpar CLI against the pinned par3cmdline
-reference on deterministic generated inputs. See docs/benchmarking.md.
+reference on deterministic generated inputs. See docs/benchmarking.md. Every
+rarpar row runs buffered, one row per worker count (rarpar-wN) and kernel
+variant; the bench never passes --fsync, because durability is the caller's
+concern, not PAR3's. A candidate whose par3 create or repair --help lists
+--buffered (0.6.x and earlier) gets --buffered; one that lists neither runs
+plain, and the results say so.
 par3 versus compares PAR2 (rarpar par, and par2cmdline-turbo with --par2) with
 PAR3 Cauchy and FFT at one block size, recovery count and damage pattern, on the
 scale par2 ÷ par3 (above 1 = PAR3 faster), with every repair SHA-256 checked.
@@ -122,7 +127,6 @@ func runPAR3Matrix(args []string, stdout io.Writer) error {
 	profileName := flags.String("profile", "smoke", "profile: smoke, full or fleet")
 	workers := flags.String("workers", "1,8", "rarpar worker counts")
 	ops := flags.String("ops", strings.Join(par3bench.DefaultOps, ","), "operations: "+strings.Join(par3bench.KnownOps, ","))
-	durability := flags.String("durability", strings.Join(par3bench.KnownDurabilities, ","), "rarpar durability rows for create and repair (durable always runs; which flag selects each mode is probed from the candidate's --help)")
 	jsonOut := flags.Bool("json", false, "emit JSON")
 	var sets, kernels stringList
 	flags.Var(&sets, "set", "restrict to a set ID (repeatable)")
@@ -142,21 +146,17 @@ func runPAR3Matrix(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	durabilities, err := par3bench.ParseDurabilities(*durability)
-	if err != nil {
-		return err
-	}
 	opList := splitList(*ops)
 	if err := par3bench.CheckOps(opList); err != nil {
 		return err
 	}
-	rows := par3bench.Variants(workerList, variants, durabilities)
+	rows := par3bench.Variants(workerList, variants)
 	if err := par3bench.CheckVariantNames(rows); err != nil {
 		return err
 	}
 	byOp := par3bench.RowsByOp(rows, opList)
 	if *jsonOut {
-		return writeJSONTo(stdout, map[string]any{"profile": profile, "ops": opList, "durabilities": durabilities, "variants": rows, "rows": byOp})
+		return writeJSONTo(stdout, map[string]any{"profile": profile, "ops": opList, "variants": rows, "rows": byOp})
 	}
 	table := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(table, "SET\tDATASET\tBYTES\tBLOCK\tINPUT\tRECOVERY\tCODEC\tFIELD\tDAMAGE")
@@ -180,47 +180,16 @@ func runPAR3Matrix(args []string, stdout io.Writer) error {
 	if err := table.Flush(); err != nil {
 		return err
 	}
-	fmt.Fprintln(stdout, "\nrows per set (the reference never syncs and has one row; rarpar's durable row is the default):")
+	fmt.Fprintln(stdout, "\nrows per set (one reference row, which never syncs; one buffered rarpar row per worker count and kernel variant):")
 	table = tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
 	for _, op := range opList {
-		labels := make([]string, 0, len(byOp[op]))
-		for _, name := range byOp[op] {
-			labels = append(labels, matrixLabel(rows, name, op))
-		}
-		fmt.Fprintf(table, "  %s\t%s\n", op, strings.Join(labels, ", "))
+		fmt.Fprintf(table, "  %s\t%s\n", op, strings.Join(byOp[op], ", "))
 	}
 	if err := table.Flush(); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintln(stdout, "the flag selecting each mode is probed from `rarpar par3 OP --help`: a 0.7.0+ candidate is buffered by default and takes --fsync for durable rows, an older one is durable by default and takes --buffered; an op listing neither keeps only its durable row (noted in the results).")
+	_, err = fmt.Fprintln(stdout, "rarpar rows never pass --fsync: a 0.7.0+ candidate is buffered when run plain, an older one whose `rarpar par3 OP --help` lists --buffered gets it, and an op listing neither runs plain (noted in the results).")
 	return err
-}
-
-func matrixLabel(variants []par3bench.Variant, name, op string) string {
-	for _, variant := range variants {
-		if variant.Name != name {
-			continue
-		}
-		if op != par3bench.OpCreate && op != par3bench.OpRepair {
-			return name
-		}
-		switch variant.EffectiveDurability() {
-		case "":
-			return name
-		default:
-			return name + " (" + variant.EffectiveDurability() + ")"
-		}
-	}
-	return name
-}
-
-func containsString(list []string, value string) bool {
-	for _, item := range list {
-		if item == value {
-			return true
-		}
-	}
-	return false
 }
 
 func runPAR3BuildReference(ctx context.Context, args []string, stdout io.Writer) error {
@@ -269,7 +238,6 @@ func runPAR3Suite(ctx context.Context, args []string, stdout io.Writer) error {
 	memory := flags.Int("engine-perf-memory-mib", 256, "engine_perf memory budget")
 	timeout := flags.Duration("timeout", par3bench.DefaultTimeout, "per-run timeout for every timed process; a reference run past it is DNF")
 	referenceTimeout := flags.Duration("reference-timeout", 0, "per-run timeout for reference processes (default: --timeout)")
-	durability := flags.String("durability", strings.Join(par3bench.KnownDurabilities, ","), "rarpar durability rows for create and repair (durable always runs; which flag selects each mode is probed from the candidate's --help)")
 	keep := flags.Bool("keep-stages", false, "keep per-run stage directories")
 	engineWorkers := flags.String("engine-workers", "", "add timed engine_perf rows at these worker counts (needs --engine-perf)")
 	rows := flags.String("rows", "", "timed row kinds: "+strings.Join(par3bench.KnownRowKinds, ",")+" (default: reference,rarpar, plus engine with --engine-workers)")
@@ -296,10 +264,6 @@ func runPAR3Suite(ctx context.Context, args []string, stdout io.Writer) error {
 		return err
 	}
 	variants, err := parseKernelVariants(kernels)
-	if err != nil {
-		return err
-	}
-	durabilities, err := par3bench.ParseDurabilities(*durability)
 	if err != nil {
 		return err
 	}
@@ -344,7 +308,7 @@ func runPAR3Suite(ctx context.Context, args []string, stdout io.Writer) error {
 		Work: workspacePath(*work), Out: workspacePath(*out), Profile: profile, Ops: splitList(*ops),
 		Warmups: *warmups, Repeats: *repeats, Workers: workerList, PinCPUs: *pin, KernelVariants: variants,
 		IOCount: *iocount, MachineLabel: *machine, CandidateArgs: candidateArgs, EnginePerfMemoryMiB: *memory,
-		KeepStages: *keep, Timeout: *timeout, ReferenceTimeout: *referenceTimeout, Durabilities: durabilities, Log: os.Stderr,
+		KeepStages: *keep, Timeout: *timeout, ReferenceTimeout: *referenceTimeout, Log: os.Stderr,
 		Targets: targetList, Rows: splitList(*rows), EngineWorkers: engineWorkerList, EngineVariants: engineVariantList,
 		DropCaches: *dropCaches,
 	})

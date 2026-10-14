@@ -50,6 +50,8 @@ func TestPAR3ConfigValidation(t *testing.T) {
 		{"duplicate op", `# ops = ["create", "verify", "repair"]   # default; verify-damaged is opt-in`, `ops = ["create", "create"]`, `op "create" is listed more than once`},
 		{"zero workers", `workers = [1, 8]                         # rarpar rows; the reference is single-threaded`, `workers = [0]`, "par3.workers must be positive"},
 		{"bad kernel variant", `# kernel_variants = ["name:VAR=value"]`, `kernel_variants = ["novar"]`, "kernel_variants"},
+		{"durability is gone", `# kernel_variants = ["name:VAR=value"]`, `durability = ["durable"]`,
+			"par3.durability is no longer accepted: the PAR3 bench runs buffered rarpar rows only"},
 		{"duplicate worker count", `workers = [1, 8]                         # rarpar rows; the reference is single-threaded`, `workers = [8, 8]`, "appears twice"},
 		{"pin list", `pin_cpus = "0-7"`, `pin_cpus = "0,2"`, "par3.pin_cpus"},
 		{"unknown versus profile", `versus = "versus"`, `versus = "versus-huge"`, "par3.versus"},
@@ -152,11 +154,13 @@ func TestPAR3PlanWarnsAboutALongWorkPathButRuns(t *testing.T) {
 	if problem != "" || len(view.Warnings) != 0 {
 		t.Fatalf("the example work path must pass cleanly: %s %v", problem, view.Warnings)
 	}
-	if len(view.Configs) == 0 || strings.Join(view.Variants, ",") != "reference,rarpar-w1,rarpar-w1-buffered,rarpar-w8,rarpar-w8-buffered" {
+	// One buffered rarpar row per worker count, for every op.
+	if len(view.Configs) == 0 || strings.Join(view.Variants, ",") != "reference,rarpar-w1,rarpar-w8" {
 		t.Fatalf("unexpected view: %+v", view)
 	}
-	if strings.Join(view.Rows["create"], ",") != "reference,rarpar-w1,rarpar-w1-buffered,rarpar-w8,rarpar-w8-buffered" ||
-		strings.Join(view.Rows["verify"], ",") != "reference,rarpar-w1,rarpar-w8" {
+	if strings.Join(view.Rows["create"], ",") != "reference,rarpar-w1,rarpar-w8" ||
+		strings.Join(view.Rows["verify"], ",") != "reference,rarpar-w1,rarpar-w8" ||
+		strings.Join(view.Rows["repair"], ",") != "reference,rarpar-w1,rarpar-w8" {
 		t.Fatalf("unexpected rows: %v", view.Rows)
 	}
 	machine.PAR3.Work = "/home/bench/" + strings.Repeat("deep/", 20) + "p3"
@@ -172,9 +176,14 @@ func TestPAR3PlanWarnsAboutALongWorkPathButRuns(t *testing.T) {
 	if !strings.Contains(warnings, "par3 work path") || strings.Contains(warnings, "would refuse") {
 		t.Fatalf("plan warnings: %s", warnings)
 	}
-	machine.PAR3.Durability = []string{"buffered"}
-	if _, problem := par3View(machine, layout); !strings.Contains(problem, "durable") {
-		t.Fatalf("a durability list without durable must be refused: %q", problem)
+	var step string
+	for _, line := range plan.Machines[0].Steps {
+		if strings.HasPrefix(line, "on host: macro-par3,") {
+			step = line
+		}
+	}
+	if !strings.Contains(step, "one buffered rarpar row per worker count (never --fsync)") || strings.Contains(step, "durable") {
+		t.Fatalf("macro-par3 plan step = %q", step)
 	}
 }
 

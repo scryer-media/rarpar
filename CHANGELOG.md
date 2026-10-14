@@ -3,6 +3,25 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## Unreleased
+
+### Benchmark harness only
+
+- `rarpar-bench par3` and the fleet `macro-par3` suite run every `rarpar`
+  create and repair buffered, one `rarpar-wN` row per worker count (and per
+  kernel variant), and never pass `--fsync`: durability is a consumer
+  concern, not a PAR3 one. The durable rows, the `rarpar-wN-buffered` rows
+  and the report's durability column are gone. The `--help` probe stays for
+  older candidates: `--buffered` is passed where `par3 create|repair --help`
+  lists it (0.6.x and earlier), and an op that lists neither switch
+  (`par3 repair` before 0.7.0) runs the plain command with a note in the
+  results. `engine_perf` rows and stage breakdowns, and the PAR3 arms of
+  `par3 versus`, run buffered too. `--durability` is removed and
+  `par3.durability` is a fleet config error. `results.json` moves to schema
+  `rarpar-par3-bench-v2`, which drops the durability fields and adds
+  `buffered_args` and `buffered_unsupported`; the v2 harness refuses a v1
+  file. No version impact of its own.
+
 ## rarpar 0.7.0
 
 A minor bump, as for 0.4.0 and 0.6.0: a command line that 0.6.x accepted

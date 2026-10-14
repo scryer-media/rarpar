@@ -182,12 +182,12 @@ checks and what a release bundle cannot run.
 `par3cmdline` reference on create, verify and repair. It measures the CLI
 because that is what ships, the same way the PAR2 suite drives `rarpar par`.
 If you pass `--engine-perf PATH`, it also runs the `par3-rs` `engine_perf`
-example once per set and durability as an untimed stage breakdown, selecting
-the durability with `PAR3_BENCH_CREATE_DURABILITY` and
-`PAR3_BENCH_REPAIR_DURABILITY` (`durable` or `buffered`; older builds ignore
-the repair variable). From par3-rs 0.6.0 the engine issues no storage barrier
-and ignores both variables, so its durable and buffered passes are the same
-work. Nothing from that pass goes into the timing tables.
+example once per set, op and worker count as an untimed stage breakdown.
+That pass is buffered, as the `rarpar` rows are: from par3-rs 0.6.0 the
+engine issues no storage barrier and reads no durability variable, and for an
+older build the harness sets `PAR3_BENCH_CREATE_DURABILITY=buffered` and
+`PAR3_BENCH_REPAIR_DURABILITY=buffered` (the oldest builds ignore the repair
+variable). Nothing from that pass goes into the timing tables.
 
 ```sh
 cd bench/rarpar-bench
@@ -267,13 +267,14 @@ size and recovery count back from the inserted packets without changing
 them. Damage is applied only to a staged copy of the carrier, inside the
 original ZIP bytes and clear of the embedded PAR3 region. The rows are the
 reference's `vs` and `rs` against `rarpar`'s par3cmdline-compatible `vs` and
-`rs`, which take no worker or durability switch, so a carrier set runs one
-`rarpar` row (the widest worker count, durable). A repair row passes only
+`rs`, which take no worker switch and have no buffered mode (`rs` syncs the
+rebuilt carrier before installing it), so a carrier set runs one `rarpar`
+row, at the widest worker count. A repair row passes only
 when the carrier hashes back to the inserted original. The ZIP set has no
 create row: the insert is the fixture, not a measurement.
 
 `par3 render --input results.json --out DIR` draws one SVG per op
-(`rarpar-par3-<op>.svg`): each set's durable `rarpar` rows against the
+(`rarpar-par3-<op>.svg`): each set's `rarpar` rows against the
 reference, with wall, CPU and peak RSS on every row. The fleet collector
 renders these into `charts/<platform>/par3/`.
 
@@ -286,24 +287,22 @@ NAME:VAR=value[,VAR=value]` adds a `rarpar` row with extra environment
 variables. The env-gated kernel pins on main are currently no-ops for PAR3;
 the flag is plumbing for when they exist.
 
-Every `rarpar` create and repair row runs twice: once durable (one fsync per
-output) and once buffered (no fsync). Which of the two a plain
-`rarpar par3 <op>` gives depends on the candidate, so the suite probes
-`rarpar par3 <op> --help` once per op, for `--fsync` and `--buffered` as whole
-tokens. A help that lists `--fsync` (rarpar 0.7.0 and later) means the plain
-command is buffered and `--fsync` selects durable; one that lists `--buffered`
-(0.6.x and earlier) means the plain command is durable and `--buffered`
-selects buffered; one that lists neither, which is the case for `par3 repair`
-before 0.7.0, runs only the durable row and says so in the report notes. The
-durable row is listed first and labelled `durable`; the buffered row is named
-`rarpar-wN-buffered`. Both carry ratios against the single reference row,
-whose durability column reads `none (never syncs)`, and the report's summary
-states per op which mode the plain command gave and which switch selected the
-other. Verify rows write nothing and run once. `--durability durable` drops
-the buffered rows; durable is always required. When the help itself fails (a
-timeout, a non-zero exit, a start failure, or a quarantine), the run stops
-with that error rather than guessing. `par3 matrix --profile full` prints the
-rows per op.
+Every `rarpar` create and repair row runs buffered, and the suite never
+passes `--fsync`: durability is the caller's concern, not PAR3's, so the
+suite measures the plain buffered command, one `rarpar-wN` row per worker
+count (and per kernel variant). Older candidates were durable by default, so
+the suite probes `rarpar par3 <op> --help` once per writing op for `--fsync`
+and `--buffered` as whole tokens. A help that lists `--buffered` (0.6.x and
+earlier) gets `--buffered`; one that lists only `--fsync` (0.7.0 and later)
+is buffered when run plain and gets nothing; one that lists neither, which is
+the case for `par3 repair` before 0.7.0, has no buffered mode, so that op runs
+the plain command and the report notes say so. The report header states per
+op how the rows ran. Every `rarpar` row carries ratios against the single
+reference row, which never syncs. Verify rows write nothing and take no
+switch. When the help itself fails (a timeout, a non-zero exit, a start
+failure, or a quarantine), the run stops with that error rather than
+guessing. There is no `--durability` flag, and the fleet refuses
+`par3.durability`. `par3 matrix --profile full` prints the rows per op.
 
 Each variant gets the warmups, then the measured repeats, and the variant order
 alternates on every repeat. Each table cell is the median with the range,
@@ -370,8 +369,8 @@ bytes) and `harness-missing-rss`.
 
 Verify and repair need a canonical recovery set, normally written by an untimed
 reference create. If that create is DNF (one of the classes above; any other
-failure stops the set), `rarpar` (durable, using whichever switch the probe
-found selects it, most workers) writes the canonical set instead, the reference still verifies and repairs it, the
+failure stops the set), `rarpar` (buffered, as its rows are, at the most
+workers) writes the canonical set instead, the reference still verifies and repairs it, the
 identity verdicts are skipped, and the report says where the set came from.
 
 ### Identity verdicts
@@ -441,13 +440,18 @@ Defender settings, and none may.
 
 ### Output
 
-`--out` receives `results.json` (schema `rarpar-par3-bench-v1`; the
-durability, DNF, timeout and canonical-source fields were added without
-changing any existing field, so the schema name stays v1), `runs.jsonl`
-(one line per process, warmups included) and `report.md`. Generated datasets
-and the reference's canonical sets are cached under `--work`; delete it to
-reclaim the space. `--keep-stages` keeps the per-run directories for
-inspection.
+`--out` receives `results.json`, `runs.jsonl` (one line per process, warmups
+included) and `report.md`. The results schema is `rarpar-par3-bench-v2`.
+Fields added without changing an existing one keep the schema name, as the
+DNF, timeout and canonical-source fields did under v1. v2 removed v1's
+durability fields (`durabilities`, `default_durability`, `durability_args`
+and the per-variant, per-run and engine_perf `durability`) and added
+`buffered_args` and `buffered_unsupported`. A v1 `rarpar-wN` row may be a
+durable run, so the v2 harness refuses a v1 file (`par3 report`,
+`par3 render` and the fleet collector alike); read it with the harness that
+wrote it. Generated datasets and the reference's canonical sets are cached
+under `--work`; delete it to reclaim the space. `--keep-stages` keeps the
+per-run directories for inspection.
 
 ### Storage targets and engine rows
 
@@ -512,8 +516,12 @@ The report gives, per row:
   above 1 means the PAR3 arm was faster.
 
 Every arm runs at its default thread count, because `rarpar par` has no thread
-flag, so the arms are not thread-matched. `--out` receives `results.json`
-(schema `rarpar-par3-versus-v1`) and `report.md`.
+flag, so the arms are not thread-matched. The PAR3 arms run buffered, as the
+PAR3 suite's rows do: the same `--help` probe adds `--buffered` where an older
+candidate lists it, and `--fsync` is never passed. `--out` receives
+`results.json` (schema `rarpar-par3-versus-v1`; `buffered_args` and
+`buffered_unsupported` were added without changing an existing field) and
+`report.md`.
 
 In the fleet, `versus = "versus"` (or `"versus-smoke"`) under
 `[machines.par3]` adds the run after the PAR3 suite. It passes the machine's

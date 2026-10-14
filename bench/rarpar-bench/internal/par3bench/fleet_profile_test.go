@@ -175,7 +175,7 @@ func TestCarrierDamageStaysInTheOriginalBytes(t *testing.T) {
 func TestCarrierRunsOneFrontEndRow(t *testing.T) {
 	r := &runner{options: Options{Workers: []int{1, 4}}}
 	carrier := Config{Carrier: CarrierZIP}
-	variants := Variants([]int{1, 4}, []KernelVariant{{Name: "k", Env: []string{"X=1"}}}, KnownDurabilities)
+	variants := Variants([]int{1, 4}, []KernelVariant{{Name: "k", Env: []string{"X=1"}}})
 	var kept []string
 	for _, variant := range variants {
 		if r.carrierRuns(carrier, variant) {
@@ -195,21 +195,21 @@ func TestCarrierRunsOneFrontEndRow(t *testing.T) {
 
 func TestRenderSVGsCarriesWallCPUAndRSS(t *testing.T) {
 	results := &Results{
-		Schema: ResultsSchema, Profile: "unit", Ops: []string{OpCreate, OpRepair}, Repeats: 2, Workers: []int{4},
-		Variants: Variants([]int{4}, nil, KnownDurabilities),
+		Schema: ResultsSchema, Profile: "unit", Ops: []string{OpCreate, OpRepair}, Repeats: 2, Workers: []int{4, 8},
+		Variants: Variants([]int{4, 8}, nil),
 		Configs:  []ConfigSummary{{Config: Config{ID: "u", BlockSize: MiB, Recovery: 3, Codec: "cauchy"}, InputBlocks: 30}},
 		Status:   StatusOK,
 	}
-	add := func(op, variant, tool, durability string, wall float64) {
-		results.Runs = append(results.Runs, RunRecord{Config: "u", Op: op, Variant: variant, Tool: tool, Durability: durability, Status: StatusOK,
+	add := func(op, variant, tool string, wall float64) {
+		results.Runs = append(results.Runs, RunRecord{Config: "u", Op: op, Variant: variant, Tool: tool, Status: StatusOK,
 			Measurement: Measurement{WallSeconds: wall, UserSeconds: wall * 2, MaxRSSBytes: 100 << 20}})
 	}
 	for range 2 {
-		add(OpCreate, "reference", ToolReference, "", 4)
-		add(OpCreate, "rarpar-w4", ToolCandidate, DurabilityDurable, 1)
-		add(OpCreate, "rarpar-w4-buffered", ToolCandidate, DurabilityBuffered, 0.5)
-		add(OpRepair, "reference", ToolReference, "", 1)
-		add(OpRepair, "rarpar-w4", ToolCandidate, DurabilityDurable, 2)
+		add(OpCreate, "reference", ToolReference, 4)
+		add(OpCreate, "rarpar-w4", ToolCandidate, 1)
+		add(OpCreate, "rarpar-w8", ToolCandidate, 0.5)
+		add(OpRepair, "reference", ToolReference, 1)
+		add(OpRepair, "rarpar-w4", ToolCandidate, 2)
 	}
 	out := t.TempDir()
 	paths, err := RenderSVGs(results, out)
@@ -225,8 +225,11 @@ func TestRenderSVGsCarriesWallCPUAndRSS(t *testing.T) {
 			t.Fatalf("create chart lacks %q:\n%s", want, create)
 		}
 	}
-	if strings.Contains(string(create), "buffered") {
-		t.Fatal("a buffered row was drawn")
+	// Every rarpar row is drawn: one per worker count.
+	for _, want := range []string{"u / rarpar-w4", "u / rarpar-w8", "8.0x"} {
+		if !strings.Contains(string(create), want) {
+			t.Fatalf("create chart lacks %q:\n%s", want, create)
+		}
 	}
 	repair, _ := os.ReadFile(filepath.Join(out, "rarpar-par3-repair.svg"))
 	if !strings.Contains(string(repair), "class=\"slower\"") {

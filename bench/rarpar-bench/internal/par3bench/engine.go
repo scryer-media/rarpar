@@ -12,8 +12,8 @@ import (
 // ToolEngine marks a timed row driven by the par3-rs engine_perf example
 // instead of the CLI. Its value is the engine's own disk-work counters, which
 // the CLI does not print, and the PAR3_BENCH_* switches the CLI does not have
-// (buffered repair, verification order). It is not the shipped binary, so its
-// rows carry no ratio to the reference.
+// (verification order). It is not the shipped binary, so its rows carry no
+// ratio to the reference.
 const ToolEngine = "engine"
 
 // Row kinds selectable with Options.Rows.
@@ -132,9 +132,18 @@ func (r *runner) engineCommand(op string, config Config, dataDir, dir string, va
 	case OpRepair:
 		args = []string{"repair", dir, dir, dir, workers, memory}
 	}
-	env := append([]string(nil), variant.Env...)
-	if variant.EffectiveDurability() == DurabilityBuffered {
-		env = append(env, fmt.Sprintf("PAR3_BENCH_%s_DURABILITY=buffered", strings.ToUpper(op)))
-	}
+	env := append(append([]string(nil), variant.Env...), engineBufferedEnv(op)...)
 	return Command{Path: r.options.EnginePerf, Args: args, Dir: filepath.Dir(dir), Env: env, PinCPUs: r.pin(), Timeout: r.timeoutFor(ToolCandidate)}
+}
+
+// engineBufferedEnv makes an engine_perf create or repair buffered, as the
+// rarpar rows are. From par3-rs 0.6.0 the engine issues no storage barrier
+// and reads no durability variable, so this changes nothing there; an older
+// engine_perf syncs its outputs unless PAR3_BENCH_<OP>_DURABILITY is
+// "buffered".
+func engineBufferedEnv(op string) []string {
+	if op != OpCreate && op != OpRepair {
+		return nil
+	}
+	return []string{fmt.Sprintf("PAR3_BENCH_%s_DURABILITY=buffered", strings.ToUpper(op))}
 }

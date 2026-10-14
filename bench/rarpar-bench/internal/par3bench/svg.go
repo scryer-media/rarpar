@@ -17,9 +17,9 @@ const par3ChartWidth = 1200
 // rarpar row against the reference row: the bar is reference/rarpar median
 // wall time on the same symmetric log scale as the RAR and PAR2 charts, and
 // the line under it carries wall, CPU (user+sys) and peak RSS medians for
-// both sides with the measured run count. Only durable rarpar rows are drawn
-// (the default); buffered rows stay in the Markdown report. The output is a
-// pure function of results.json: no timestamps or local paths.
+// both sides with the measured run count. Every rarpar row is drawn; engine
+// rows have no reference ratio and stay in the Markdown report. The output
+// is a pure function of results.json: no timestamps or local paths.
 func RenderSVGs(results *Results, out string) ([]string, error) {
 	if err := ValidateResults(results); err != nil {
 		return nil, err
@@ -59,7 +59,7 @@ func renderOpSVG(results *Results, rows []Row, op string) ([]byte, bool) {
 	}
 	var chart []par3ChartRow
 	for _, row := range rows {
-		if row.Op != op || row.Tool != ToolCandidate || row.Durability == DurabilityBuffered || row.Wall.N == 0 {
+		if row.Op != op || row.Tool != ToolCandidate || row.Wall.N == 0 {
 			continue
 		}
 		reference, ok := references[row.Config+"@"+row.Target]

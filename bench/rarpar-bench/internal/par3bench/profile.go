@@ -4,7 +4,8 @@
 //
 // It drives the CLI rather than the par3-rs engine_perf example for the same
 // reason the PAR2 suite drives `rarpar par`: the CLI is what ships, so its
-// startup, planning, durability and output layout are all part of the number.
+// startup, planning and output layout are all part of the number. Its output
+// runs buffered; durability is the caller's concern, not PAR3's.
 // engine_perf is available as an optional, untimed stage-breakdown pass.
 package par3bench
 

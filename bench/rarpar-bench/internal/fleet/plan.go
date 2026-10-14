@@ -88,8 +88,8 @@ type PAR3View struct {
 	Args     []string `json:"args"`
 	Configs  []string `json:"configs"`
 	Variants []string `json:"variants"`
-	// Rows lists, per op, the rows each set produces: rarpar's create and
-	// repair rows come in durable (default) and buffered pairs.
+	// Rows lists, per op, the rows each set produces: the reference and one
+	// buffered rarpar row per worker count and kernel variant.
 	Rows map[string][]string `json:"rows"`
 	// Warnings are reference work-path warnings: the run goes ahead and a
 	// reference that fails is recorded as DNF.
@@ -341,8 +341,8 @@ func machineSteps(machine Machine, layout RemoteLayout) []string {
 		if machine.PAR3.ReferenceTimeoutMinutes > 0 {
 			timeout += fmt.Sprintf(" (reference %dm)", machine.PAR3.ReferenceTimeoutMinutes)
 		}
-		steps = append(steps, fmt.Sprintf("on host: macro-par3, profile %s, workers %v, rarpar create/repair %s (verify runs once), warmups=%d repeats=%d, %s, reference failures are DNF, work %s",
-			machine.PAR3.Profile, machine.PAR3.Workers, strings.Join(par3Durabilities(machine), "+"), machine.PAR3.Warmups, machine.PAR3.Repeats,
+		steps = append(steps, fmt.Sprintf("on host: macro-par3, profile %s, workers %v, one buffered rarpar row per worker count (never --fsync), warmups=%d repeats=%d, %s, reference failures are DNF, work %s",
+			machine.PAR3.Profile, machine.PAR3.Workers, machine.PAR3.Warmups, machine.PAR3.Repeats,
 			timeout, PAR3Work(machine, layout)))
 		if machine.PAR3.Versus != "" {
 			steps = append(steps, fmt.Sprintf("on host: par3 versus, profile %s: PAR2 (rarpar par, plus the par2 oracle when present) against PAR3 Cauchy and FFT, par2 ÷ par3, every repair SHA-256 checked",
@@ -412,11 +412,7 @@ func par3View(machine Machine, layout RemoteLayout) (*PAR3View, string) {
 		}
 		variants = append(variants, variant)
 	}
-	durabilities, err := par3bench.ParseDurabilities(strings.Join(machine.PAR3.Durability, ","))
-	if err != nil {
-		return view, "par3: " + err.Error()
-	}
-	all := par3bench.Variants(machine.PAR3.Workers, variants, durabilities)
+	all := par3bench.Variants(machine.PAR3.Workers, variants)
 	for _, variant := range all {
 		view.Variants = append(view.Variants, variant.Name)
 	}
@@ -427,14 +423,6 @@ func par3View(machine Machine, layout RemoteLayout) (*PAR3View, string) {
 	view.Rows = par3bench.RowsByOp(all, ops)
 	view.Warnings = par3bench.WorkPathWarnings(profile, work)
 	return view, ""
-}
-
-func par3Durabilities(machine Machine) []string {
-	durabilities, err := par3bench.ParseDurabilities(strings.Join(machine.PAR3.Durability, ","))
-	if err != nil {
-		return machine.PAR3.Durability
-	}
-	return durabilities
 }
 
 func startStep(machine Machine) string {

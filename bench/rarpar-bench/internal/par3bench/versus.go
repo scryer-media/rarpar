@@ -9,7 +9,8 @@ package par3bench
 //
 // The one ratio scale is par2 ÷ par3 wall time, so a ratio above 1 means the
 // PAR3 arm was faster. Peak RSS is reported raw for every arm, never as a
-// ratio.
+// ratio. The PAR3 arms run buffered, as the PAR3 suite's rarpar rows do (see
+// probeBuffered), and never pass --fsync.
 
 import (
 	"context"
@@ -309,6 +310,9 @@ type VersusOptions struct {
 	PinCPUs string
 	Timeout time.Duration
 	Log     func(string, ...any)
+	// buffered is what makes each PAR3 op buffered on the candidate, as
+	// probed by RunVersus (VersusResults.BufferedArgs).
+	buffered map[string][]string
 }
 
 // VersusRun is one timed process run.
@@ -345,6 +349,11 @@ type VersusResults struct {
 	Notes       []string       `json:"notes,omitempty"`
 	Status      string         `json:"status"`
 	Failures    []string       `json:"failures,omitempty"`
+	// BufferedArgs and BufferedUnsupported record, as in the PAR3 suite's
+	// results, the arguments that make the PAR3 arms' create and repair
+	// buffered on this candidate, and the ops that have no buffered mode.
+	BufferedArgs        map[string][]string `json:"buffered_args,omitempty"`
+	BufferedUnsupported []string            `json:"buffered_unsupported,omitempty"`
 }
 
 // RunVersus runs the comparison and writes results.json and report.md under
@@ -405,6 +414,20 @@ func RunVersus(ctx context.Context, options VersusOptions) (*VersusResults, erro
 	} else {
 		results.Notes = append(results.Notes, "no par2cmdline-turbo binary was given, so its arm did not run")
 	}
+	results.BufferedArgs = map[string][]string{}
+	for _, op := range VersusOps {
+		help, err := bufferedHelp(ctx, options.Candidate, op)
+		if err != nil {
+			return nil, err
+		}
+		if args, ok := bufferedArgsFromHelp(help.Stdout + help.Stderr); ok {
+			results.BufferedArgs[op] = args
+			continue
+		}
+		results.BufferedUnsupported = append(results.BufferedUnsupported, op)
+		results.Notes = append(results.Notes, noBufferedModeNote(op))
+	}
+	options.buffered = results.BufferedArgs
 	results.Notes = append(results.Notes,
 		"every arm runs at its own default thread count (every CPU it may use); rarpar's PAR2 engine has no thread flag, so no arm is given one",
 		"each arm repairs the set its own create wrote, over one identically damaged copy of the inputs per run")
@@ -628,7 +651,7 @@ func versusCreateCommand(options VersusOptions, config VersusConfig, dataDir, ou
 		if codec == "fft" {
 			args = append(args, "--codec", "fft", "--capacity-log2", strconv.Itoa(par3.CapacityLog2()))
 		}
-		command.Args = args
+		command.Args = append(args, options.buffered[OpCreate]...)
 	}
 	return command
 }
@@ -642,7 +665,7 @@ func versusRepairCommand(options VersusOptions, stage, arm string) Command {
 		command.Path = options.PAR2Turbo
 		command.Args = []string{"r", "-q", versusPAR2Name}
 	default:
-		command.Args = []string{"--quiet", "par3", "repair", carrierName}
+		command.Args = append([]string{"--quiet", "par3", "repair", carrierName}, options.buffered[OpRepair]...)
 	}
 	return command
 }
@@ -701,6 +724,11 @@ func RenderVersusReport(results *VersusResults) string {
 	if results.PAR2Turbo != nil {
 		fmt.Fprintf(&b, "- par2cmdline-turbo: %s\n", results.PAR2Turbo.Version)
 	}
+	fmt.Fprint(&b, "- PAR3 arms run buffered and never pass `--fsync`.")
+	if summary := bufferedSummary(VersusOps, results.BufferedArgs, results.BufferedUnsupported); summary != "" {
+		fmt.Fprint(&b, " "+summary)
+	}
+	fmt.Fprintln(&b)
 	fmt.Fprintf(&b, "- status: %s\n\n", results.Status)
 	fmt.Fprintf(&b, "Scale: par2 ÷ par3 median wall time; above 1 means the PAR3 arm was faster. Peak RSS is raw MiB (median, range).\n")
 	fmt.Fprintf(&b, "Every repair is checked against the inputs' SHA-256; only matching repairs are counted.\n\n")

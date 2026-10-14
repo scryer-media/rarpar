@@ -391,20 +391,20 @@ pin_cpus = "0-7"
 work = "/bench/p3"                # keep it short, see below
 timeout_minutes = 20              # per run, rarpar rows too; a reference over it is DNF
 # reference_timeout_minutes = 60  # default 0: the reference uses timeout_minutes
-# durability = ["durable"]        # default: durable and buffered rows; the probe
-                                  # finds which one a plain `rarpar par3` gives
 ```
 
-- **Durability rows.** Every `rarpar` create and repair runs durable and
-  buffered; the reference gets one row. The harness probes each candidate's
-  `par3 <op> --help`: a build that lists `--fsync` (0.7.0 and later) is
-  buffered when run plain and durable with `--fsync`, one that lists
-  `--buffered` is the reverse, and one that lists neither runs the durable row
-  only. `durability` narrows the rows and must include `durable`. Verify
-  writes nothing, so it has no buffered row and runs once per worker count. In the text plan, the macro-par3 step
-  lists the durabilities and the per-run timeout, and the machine's `par3`
-  block lists the variants and the rows each op produces; `--json` carries
-  the same rows under `par3.rows`.
+- **Buffered rows.** Every `rarpar` create and repair runs buffered, one
+  `rarpar-wN` row per worker count, and the bench never passes `--fsync`:
+  durability is a consumer concern, not a PAR3 one. The reference gets one
+  row. The harness probes each candidate's `par3 <op> --help`: a build that
+  lists `--buffered` (0.6.x and earlier) gets it, one that lists only
+  `--fsync` (0.7.0 and later) is buffered when run plain, and one that lists
+  neither runs the plain command and says so in the report notes. A
+  `par3.durability` key is a config error. In the text plan, the macro-par3
+  step reads "one buffered rarpar row per worker count (never --fsync)" and
+  gives the per-run timeout, and the machine's `par3` block lists the
+  variants and the rows each op produces; `--json` carries the same rows
+  under `par3.rows`.
 - **Timeouts.** `timeout_minutes` (default 20, lower than before) applies to
   `rarpar` rows too; raise it on slow hosts. `reference_timeout_minutes`
   gives the reference its own limit (0 = the same).
