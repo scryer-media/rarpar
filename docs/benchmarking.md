@@ -210,6 +210,55 @@ The same inputs and damage are produced on every host:
 `--profile full` runs sets A, B and C and then the smoke sets.
 `--profile smoke` runs only the three smoke sets. Use `--set ID` (repeatable) to narrow either profile.
 
+### Fleet profile
+
+`--profile fleet` is the set list the `macro-par3` fleet suite runs. It is
+ordered so that each size's Cauchy and FFT rows sit next to each other:
+
+| set | data | block | input / recovery | codec | damage | covers |
+|---|---|---|---|---|---|---|
+| `b-gf16` | 300 MiB, many files | 1 MiB | 300 / 30 | Cauchy GF(2^16) | 10 lost blocks | small Cauchy |
+| `b-fft` | 300 MiB, many files | 1 MiB | 300 / 30 | FFT | 10 lost blocks | small FFT |
+| `m-gf16` | 4 x 128 MiB | 1 MiB | 512 / 52 | Cauchy GF(2^16) | 24 lost blocks, 6 per file | medium Cauchy |
+| `m-fft` | 4 x 128 MiB | 1 MiB | 512 / 52 | FFT | 24 lost blocks, 6 per file | medium FFT |
+| `a-gf16` | 1 GiB | 1 MiB | 1024 / 103 | Cauchy GF(2^16) | 50 lost blocks | large Cauchy |
+| `c-fft` | 1.5 GiB | 32 KiB | 49152 / 4916 | FFT | 2000 lost blocks | over the PAR2 cap |
+| `zip-inside` | 4 x 64 MiB in one stored ZIP | chosen by the reference | chosen by the reference, `-r10` | Cauchy | 40 lost blocks in the ZIP | PAR-inside repair |
+
+FFT is forced on both sides, never chosen by size: the reference gets its
+explicit `-e8` switch and `rarpar` gets `--codec fft` with
+`--capacity-log2` of the next power of two at or above the recovery count.
+Neither tool refuses FFT at these sizes, so the small and medium FFT rows
+measure the same shapes as their Cauchy neighbours. `a-gf16` and `c-fft` cap
+their measured repeats at 3 (`max_repeats` in `results.json`) so the slowest
+hosts finish within the fleet's time budget; the report notes the cap.
+
+Each set's shape is recorded in `results.json` for joining with PAR2 rows
+later: payload bytes, block size, input and recovery blocks, lost blocks, the
+codec and field, the PAR2 source-block count for the same payload and block
+size, and `par2_equivalent`, which is false for `c-fft` (49152 input blocks,
+where PAR2 allows 32768) and for the ZIP carrier.
+
+`zip-inside` builds a deterministic stored ZIP of the four files (no
+timestamps, no data descriptors), then runs the reference's untimed
+`par3 i -r10 inside.zip` to protect it in place. The reference refuses
+`-s`, `-b` and `-c` on insert ("Cannot specify block size unless
+creating."), so it picks the block size itself; the harness reads the block
+size and recovery count back from the inserted packets without changing
+them. Damage is applied only to a staged copy of the carrier, inside the
+original ZIP bytes and clear of the embedded PAR3 region. The rows are the
+reference's `vs` and `rs` against `rarpar`'s par3cmdline-compatible `vs` and
+`rs`, which take no worker or durability switch, so a carrier set runs one
+`rarpar` row (the widest worker count, durable). A repair row passes only
+when the carrier hashes back to the inserted original. The ZIP set has no
+create row: the insert is the fixture, not a measurement.
+
+`par3 render --input results.json --out DIR` draws one SVG per op
+(`rarpar-par3-<op>.svg`): each set's durable `rarpar` rows against the
+reference, with wall, CPU and peak RSS on every row. The fleet collector
+renders these into `charts/<platform>/par3/`.
+
+
 ### Rows and protocol
 
 The rows are the reference (single-threaded), `rarpar-w1` and `rarpar-w8`. Use

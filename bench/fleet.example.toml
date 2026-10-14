@@ -211,7 +211,7 @@ recipe = "par3cmdline-onhost"
 version = "par3cmdline 0.0.1 (2971702e)"
 
 [machines.par3]
-profile = "full"                         # full | smoke
+profile = "full"                         # full | smoke | fleet
 # sets = ["a-gf16", "c-gf16"]            # default: every set in the profile
 # ops = ["create", "verify", "repair"]   # default; verify-damaged is opt-in
 workers = [1, 8]                         # rarpar rows; the reference is single-threaded

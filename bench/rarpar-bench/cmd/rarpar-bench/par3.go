@@ -17,16 +17,17 @@ import (
 )
 
 const par3Usage = `Usage:
-  rarpar-bench par3 matrix [--profile smoke|full] [--set ID]... [--ops LIST] [--workers 1,8] [--durability durable,buffered]
+  rarpar-bench par3 matrix [--profile smoke|full|fleet] [--set ID]... [--ops LIST] [--workers 1,8] [--durability durable,buffered]
         [--kernel-variant NAME:VAR=V]... [--json]
   rarpar-bench par3 build-reference --out DIR [--toolchains PATH] [--cache DIR] [--mirror-base URL] [--cmake PATH] [--jobs N]
-  rarpar-bench par3 run --reference PATH --candidate PATH --work DIR --out DIR [--profile smoke|full] [--set ID]...
+  rarpar-bench par3 run --reference PATH --candidate PATH --work DIR --out DIR [--profile smoke|full|fleet] [--set ID]...
         [--ops create,verify,repair] [--warmups N] [--repeats N] [--workers 1,8] [--pin-cpus 0-7]
         [--durability durable,buffered] [--kernel-variant NAME:VAR=V[,VAR=V]]... [--iocount] [--engine-perf PATH]
         [--candidate-arg ARG]... [--machine LABEL] [--timeout 20m] [--reference-timeout DURATION] [--keep-stages]
         [--target NAME=DIR]... [--target-meta NAME:KEY=V[,KEY=V]]... [--rows reference,rarpar,engine]
         [--engine-workers 8] [--engine-variant NAME:VAR=V[,VAR=V]]... [--drop-caches]
   rarpar-bench par3 report --input results.json [--out report.md]
+  rarpar-bench par3 render --input results.json --out DIR
   rarpar-bench par3 versus --candidate PATH --work DIR --out DIR [--par2 PATH] [--profile versus-smoke|versus]
         [--set ID]... [--warmups N] [--repeats N] [--pin-cpus 0-7] [--machine LABEL] [--timeout 20m]
   rarpar-bench par3 versus-report --input results.json [--out report.md]
@@ -41,7 +42,7 @@ scale par2 ÷ par3 (above 1 = PAR3 faster), with every repair SHA-256 checked.
 func runPAR3(ctx context.Context, args []string, stdout io.Writer) error {
 	if len(args) == 0 {
 		fmt.Fprint(os.Stderr, par3Usage)
-		return fmt.Errorf("par3 requires matrix, build-reference, run, report, versus, or versus-report")
+		return fmt.Errorf("par3 requires matrix, build-reference, run, report, render, versus, or versus-report")
 	}
 	switch args[0] {
 	case "matrix":
@@ -52,6 +53,8 @@ func runPAR3(ctx context.Context, args []string, stdout io.Writer) error {
 		return runPAR3Suite(ctx, args[1:], stdout)
 	case "report":
 		return runPAR3Report(args[1:], stdout)
+	case "render":
+		return runPAR3Render(args[1:], stdout)
 	case "versus":
 		return runPAR3Versus(ctx, args[1:], stdout)
 	case "versus-report":
@@ -116,7 +119,7 @@ func selectedProfile(name string, sets []string) (par3bench.Profile, error) {
 
 func runPAR3Matrix(args []string, stdout io.Writer) error {
 	flags := flag.NewFlagSet("par3 matrix", flag.ContinueOnError)
-	profileName := flags.String("profile", "smoke", "profile: smoke or full")
+	profileName := flags.String("profile", "smoke", "profile: smoke, full or fleet")
 	workers := flags.String("workers", "1,8", "rarpar worker counts")
 	ops := flags.String("ops", strings.Join(par3bench.DefaultOps, ","), "operations: "+strings.Join(par3bench.KnownOps, ","))
 	durability := flags.String("durability", strings.Join(par3bench.KnownDurabilities, ","), "rarpar durability rows for create and repair (durable is the default and always runs)")
@@ -162,6 +165,13 @@ func runPAR3Matrix(args []string, stdout io.Writer) error {
 		codec := config.Codec
 		if codec == "fft" {
 			codec = fmt.Sprintf("fft(2^%d)", config.CapacityLog2())
+		}
+		if config.Carrier != "" {
+			// The reference's insert picks the block size and recovery count.
+			fmt.Fprintf(table, "%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s (%d)\n", config.ID, dataset.ID, dataset.TotalBytes(),
+				"insert", "insert", fmt.Sprintf("-r%d", config.InsertRedundancy), codec+"/"+config.Carrier+"-inside",
+				"insert", config.Damage.Name, config.Damage.LostBlocks())
+			continue
 		}
 		fmt.Fprintf(table, "%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\t%s (%d)\n", config.ID, dataset.ID, dataset.TotalBytes(),
 			config.BlockSize, par3bench.InputBlocks(dataset, config.BlockSize), config.Recovery, codec,
@@ -252,7 +262,7 @@ func runPAR3Suite(ctx context.Context, args []string, stdout io.Writer) error {
 	enginePerf := flags.String("engine-perf", "", "optional par3-rs engine_perf example binary for an untimed stage pass")
 	work := flags.String("work", "", "work directory: generated datasets, canonical carriers, stages")
 	out := flags.String("out", "", "evidence directory: results.json, runs.jsonl, report.md")
-	profileName := flags.String("profile", "smoke", "profile: smoke or full")
+	profileName := flags.String("profile", "smoke", "profile: smoke, full or fleet")
 	ops := flags.String("ops", strings.Join(par3bench.DefaultOps, ","), "operations: "+strings.Join(par3bench.KnownOps, ","))
 	warmups := flags.Int("warmups", 1, "warmup runs per variant (recorded, not summarised)")
 	repeats := flags.Int("repeats", 5, "measured runs per variant")
@@ -446,4 +456,28 @@ func runPAR3VersusReport(args []string, stdout io.Writer) error {
 		return err
 	}
 	return os.WriteFile(workspacePath(*out), []byte(report), 0o644)
+}
+
+func runPAR3Render(args []string, stdout io.Writer) error {
+	flags := flag.NewFlagSet("par3 render", flag.ContinueOnError)
+	input := flags.String("input", "", "results.json from par3 run")
+	out := flags.String("out", "", "directory for the per-operation SVGs")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *input == "" || *out == "" {
+		return fmt.Errorf("--input and --out are required")
+	}
+	results, err := par3bench.ReadResults(workspacePath(*input))
+	if err != nil {
+		return err
+	}
+	paths, err := par3bench.RenderSVGs(results, workspacePath(*out))
+	if err != nil {
+		return err
+	}
+	for _, path := range paths {
+		fmt.Fprintln(stdout, path)
+	}
+	return nil
 }

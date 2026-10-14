@@ -83,6 +83,11 @@ func LayoutFor(machine Machine, runID string) RemoteLayout {
 //
 // It is POSIX sh on purpose (DSM-class appliances have no bash), and it never
 // interpolates orchestrator state beyond the values quoted here.
+// userDataWaitSeconds bounds the run script's wait for the EC2 user-data
+// sentinel: apt update plus build-essential and cmake take a few minutes on
+// the slowest fleet member.
+const userDataWaitSeconds = 1200
+
 func RunScript(machine Machine, defaults RunDefaults, runID string, layout RemoteLayout, oracles map[string]string) string {
 	var script strings.Builder
 	write := func(format string, args ...any) {
@@ -192,6 +197,21 @@ func RunScript(machine Machine, defaults RunDefaults, runID string, layout Remot
 	write("  done")
 	write("}")
 	write("")
+
+	// ---- user-data gate ----------------------------------------------------
+	// sshd moves to the bench port early in user-data, so SSH answers while
+	// the package install (cmake for the on-host par3 reference) and the
+	// quiet-box hygiene are still running. Wait for the sentinel user-data
+	// writes last; a box that never writes it fails rather than running on a
+	// half-provisioned host.
+	if machine.EC2 != nil {
+		write("# Wait for user-data to finish (packages, hygiene) before anything runs.")
+		write("USERDATA_DONE=/var/lib/cloud/instance/BENCH_USERDATA_DONE")
+		write("udwaited=0")
+		write("while [ ! -f \"$USERDATA_DONE\" ] && [ \"$udwaited\" -lt %d ]; do sleep 5; udwaited=$((udwaited + 5)); done", userDataWaitSeconds)
+		write("if [ -f \"$USERDATA_DONE\" ]; then log \"user-data done (waited ${udwaited}s)\"; else fail userdata-timeout; fi")
+		write("")
+	}
 
 	// ---- fingerprint -----------------------------------------------------
 	write("log \"FLEET RUN $RUN_ID machine=$MACHINE start=$STARTED\"")
