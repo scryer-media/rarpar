@@ -3,7 +3,26 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
-## Unreleased
+## rarpar 0.8.0
+
+A minor bump, as for 0.7.0: a command line that 0.7.0 accepted
+(`--no-backup`) is now a usage error.
+
+### Changed
+
+- `par3 repair` and `par3 inside repair` keep no backup of a damaged file by
+  default: the rebuilt file replaces it, and the damaged bytes are not kept.
+  The new `--backup` keeps the damaged file as a numbered backup
+  (`NAME.1`, or the next free number), as both did by default before.
+  `--no-backup` is removed, and passing it is a usage error (exit 2), as it
+  is on `par3 verify`, which accepted it and ignored it. `auto` mode's PAR3
+  repair keeps no backup either. The par3cmdline front end's `r` and `rs`
+  keep the `.1` backup as par3cmdline does.
+- On par3-rs 0.7.0, a repaired file that can be neither cloned nor patched
+  in place is staged by copying the bytes its source holds intact in
+  sequential runs, and the rebuilt extents are written whole, in offset
+  order, where the memory budget allows, rather than in one piece per stripe
+  pass.
 
 ### Release workflow
 
