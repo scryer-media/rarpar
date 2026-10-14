@@ -3983,15 +3983,18 @@ impl RarArchive {
         Ok(())
     }
 
+    // A reader error that carries a `RarError` is that error; any other one is
+    // kept whole, OS error code and payload included, so callers can match on
+    // its kind and cause instead of its wording.
     fn read_error_to_rar(error: std::io::Error) -> RarError {
+        if !error.get_ref().is_some_and(|inner| inner.is::<RarError>()) {
+            return RarError::Io(error);
+        }
         let kind = error.kind();
-        let message = error.to_string();
-        match error.into_inner() {
-            Some(inner) => match inner.downcast::<RarError>() {
-                Ok(error) => *error,
-                Err(inner) => RarError::Io(std::io::Error::new(kind, inner)),
-            },
-            None => RarError::Io(std::io::Error::new(kind, message)),
+        match error.into_inner().map(|inner| inner.downcast::<RarError>()) {
+            Some(Ok(error)) => *error,
+            Some(Err(inner)) => RarError::Io(std::io::Error::new(kind, inner)),
+            None => RarError::Io(kind.into()),
         }
     }
 
@@ -7456,6 +7459,13 @@ impl SegmentPackedHashVerifier {
     }
 }
 
+// The provider's error rides inside the reader's I/O error as itself, so a
+// caller can downcast it and tell a volume that will never arrive from a
+// failed open, and read the OS error code of the latter.
+fn volume_provider_io_error(error: crate::volume::VolumeProviderError) -> std::io::Error {
+    std::io::Error::other(error)
+}
+
 fn packed_hash_io_error(error: RarError) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, error)
 }
@@ -7747,7 +7757,7 @@ impl<'a> ChainedSegmentReader<'a> {
         let mut reader = self
             .provider
             .get_volume(seg.volume_index)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+            .map_err(volume_provider_io_error)?;
         reader
             .seek(SeekFrom::Start(seg.data_offset))
             .map_err(std::io::Error::other)?;
@@ -7768,13 +7778,13 @@ impl<'a> ChainedSegmentReader<'a> {
         let mut reader = self
             .provider
             .get_volume(vol_idx)
-            .map_err(|e| std::io::Error::other(format!("volume {vol_idx}: {e}")))?;
+            .map_err(volume_provider_io_error)?;
 
         reader
             .seek(SeekFrom::Start(0))
             .map_err(std::io::Error::other)?;
-        let format = crate::signature::read_signature(&mut reader)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let format =
+            crate::signature::read_signature(&mut reader).map_err(std::io::Error::other)?;
 
         if format != self.format {
             return Err(std::io::Error::other(
@@ -7792,7 +7802,7 @@ impl<'a> ChainedSegmentReader<'a> {
                 scan,
                 &mut None,
             )
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+            .map_err(std::io::Error::other)?;
             // Find the first file with split_before (continuation).
             for fh in &parsed.files {
                 if fh.split_before
@@ -7837,7 +7847,7 @@ impl<'a> ChainedSegmentReader<'a> {
                 },
                 scan,
             )
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+            .map_err(std::io::Error::other)?;
             // Find the first file header with split_before.
             for pf in &parsed.files {
                 if pf.header.split_before
@@ -7995,6 +8005,67 @@ mod tests {
     use crate::types::{ArchiveFormat, CompressionInfo, FileAttributes, HostOs};
     use std::io::{Cursor, Read};
     use std::sync::Arc;
+
+    // A reader error keeps its OS code, its kind and its payload through the
+    // conversion; one that carries a `RarError` becomes that error.
+    #[test]
+    fn read_errors_keep_their_typed_cause() {
+        let RarError::Io(error) =
+            RarArchive::read_error_to_rar(std::io::Error::from_raw_os_error(24))
+        else {
+            panic!("an OS error stays an I/O error");
+        };
+        assert_eq!(error.raw_os_error(), Some(24));
+
+        let short = std::io::Read::read_exact(&mut Cursor::new([0u8; 1]), &mut [0u8; 2])
+            .expect_err("a short read fails");
+        let RarError::Io(error) = RarArchive::read_error_to_rar(short) else {
+            panic!("a short read stays an I/O error");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(error.get_ref().is_none(), "the short read gains no payload");
+
+        let provider = volume_provider_io_error(crate::volume::VolumeProviderError::Io(
+            std::io::Error::from_raw_os_error(24),
+        ));
+        let RarError::Io(error) = RarArchive::read_error_to_rar(provider) else {
+            panic!("a provider failure stays an I/O error");
+        };
+        let Some(crate::volume::VolumeProviderError::Io(inner)) = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<crate::volume::VolumeProviderError>())
+        else {
+            panic!("the provider's own error rides inside the I/O error");
+        };
+        assert_eq!(inner.raw_os_error(), Some(24));
+
+        let unavailable =
+            volume_provider_io_error(crate::volume::VolumeProviderError::Unavailable {
+                volume: 3,
+                reason: "never posted".into(),
+            });
+        assert!(matches!(
+            unavailable
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<crate::volume::VolumeProviderError>()),
+            Some(crate::volume::VolumeProviderError::Unavailable { volume: 3, .. })
+        ));
+
+        let wrapped = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            RarError::HeaderCrcMismatch {
+                expected: 1,
+                actual: 2,
+            },
+        );
+        assert!(matches!(
+            RarArchive::read_error_to_rar(wrapped),
+            RarError::HeaderCrcMismatch {
+                expected: 1,
+                actual: 2
+            }
+        ));
+    }
 
     const SAMPLE_BLAKE2: [u8; 32] = [0x5a; 32];
 

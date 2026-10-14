@@ -165,7 +165,14 @@ impl fmt::Display for VolumeProviderError {
     }
 }
 
-impl std::error::Error for VolumeProviderError {}
+impl std::error::Error for VolumeProviderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Unavailable { .. } => None,
+            Self::Io(error) => Some(error),
+        }
+    }
+}
 
 /// Provides volume readers on demand for streaming extraction.
 ///

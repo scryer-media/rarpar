@@ -19,6 +19,13 @@ pub enum RarError {
     #[error("corrupt archive: {detail}")]
     CorruptArchive { detail: String },
 
+    // The display keeps the wording this failure had while it was reported as
+    // `CorruptArchive`, so logs read the same.
+    #[error(
+        "corrupt archive: RAR5 block header checksum mismatch: expected {expected:#04x}, got {actual:#04x}"
+    )]
+    BlockHeaderChecksumMismatch { expected: u8, actual: u8 },
+
     #[error("header CRC mismatch: expected {expected:#010x}, got {actual:#010x}")]
     HeaderCrcMismatch { expected: u32, actual: u32 },
 

@@ -504,11 +504,9 @@ impl LzDecoder {
         }
 
         if xor_sum != checksum {
-            return Err(RarError::CorruptArchive {
-                detail: format!(
-                    "RAR5 block header checksum mismatch: expected {:#04x}, got {:#04x}",
-                    checksum, xor_sum
-                ),
+            return Err(RarError::BlockHeaderChecksumMismatch {
+                expected: checksum,
+                actual: xor_sum,
             });
         }
 
@@ -582,11 +580,9 @@ impl LzDecoder {
         }
 
         if xor_sum != checksum {
-            return Err(RarError::CorruptArchive {
-                detail: format!(
-                    "RAR5 block header checksum mismatch: expected {:#04x}, got {:#04x}",
-                    checksum, xor_sum
-                ),
+            return Err(RarError::BlockHeaderChecksumMismatch {
+                expected: checksum,
+                actual: xor_sum,
             });
         }
 
@@ -2289,6 +2285,32 @@ mod tests {
 
         assert!(!decoder.try_read_block_header_buffered(&mut reader).unwrap());
         assert!(decoder.parallel_mode_exhausted);
+    }
+
+    // A block header whose checksum disagrees is its own variant, so callers
+    // tell damaged compressed bytes apart without reading the message.
+    #[test]
+    fn block_header_checksum_mismatch_is_typed() {
+        let mut data = [0u8; 16];
+        data[0] = 0x00;
+        data[1] = 0x00;
+        data[2] = 0x10;
+        let mut decoder = LzDecoder::new(128 * 1024, 0);
+        let mut reader = BitReader::new(&data);
+        let error = decoder
+            .read_block_header_bitreader(&mut reader)
+            .expect_err("a wrong checksum fails the header");
+        assert!(matches!(
+            error,
+            RarError::BlockHeaderChecksumMismatch {
+                expected: 0x00,
+                actual: 0x4A
+            }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "corrupt archive: RAR5 block header checksum mismatch: expected 0x00, got 0x4a"
+        );
     }
 
     #[test]
