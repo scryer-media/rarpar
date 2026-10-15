@@ -21,7 +21,7 @@ env:
   WASM_CACHE_VERSION: v2
   # Pinned: the wasm harness lanes are only comparable with each other if they
   # all executed on the same runtime. Bump deliberately, not incidentally.
-  WASMTIME_VERSION: 47.0.3
+  WASMTIME_VERSION: 48.0.6
   # Pinned: the corpus signature is verified by the same cosign release the
   # publish workflow signs with. Bump both together.
   COSIGN_VERSION: v3.1.3
@@ -1922,7 +1922,7 @@ jobs:
           run_lane wasip1-portable "$w1"
           run_lane wasip1-simd128 "$w1s"
           # No wasm32-wasip1-threads lanes, by decision (2026-08-13): the
-          # production host runs wasmtime 47, which removed wasi-threads and
+          # the production host runs wasmtime 47 or later, which removed wasi-threads and
           # wasi-common outright (RELEASES.md 47.0.0), so threads-target
           # modules fail to instantiate there ("unknown import: `env::memory`")
           # and no flag restores them. The MT wasm code stays in-tree behind
