@@ -633,3 +633,58 @@ peak is that figure or lower. This is why every verify peak and every
 reference Cauchy peak is unresolved. On Neoverse V2 the floor on `a-gf16` was
 139 MiB, which hides both tools there. The FFT reference peaks and every
 `rarpar` create and repair peak sit above the floor and are real measurements.
+
+## PAR2 against PAR3
+
+`rarpar-bench par3 versus` protects and repairs the same generated inputs with
+PAR2 and PAR3 at one block size, one recovery count and one damage pattern for
+every arm: `rarpar par` (`par2-rs`), `par2cmdline-turbo 1.4.0`, and `rarpar
+par3` with the Cauchy and FFT codecs. It ran with the published `rarpar 0.8.1`
+binaries on nine machines: the seven cloud machines above (4 vCPU each; the
+Skylake-SP slot landed on an Intel Xeon Platinum 8275CL, Cascade Lake, this
+round), the Alder Lake laptop (16 threads) and the Zen 2 desktop under Windows
+(12 threads). One warmup and seven measured runs per arm; every arm runs at its
+default thread count, and every repair is checked against the inputs' SHA-256.
+
+| Comparison | Data | Blocks | Arms |
+|---|---|---|---|
+| `vs-a-equal` | 1 GiB | 1024 + 103, 1 MiB | all four |
+| `vs-b-equal` | 10 × 30 MiB | 300 + 30, 1 MiB | all four |
+| `vs-a-fft10` | 1 GiB | 16384 + 1639, 64 KiB | PAR2 arms and `par3-fft` |
+| `vs-a-fft30` | 1 GiB | 16384 + 4916, 64 KiB | PAR2 arms and `par3-fft` |
+
+Each chart draws every arm against `par2cmdline-turbo` on the same scale as
+the rest of this page: its median wall time divided by the arm's. At repair,
+`par2cmdline-turbo` keeps a numbered `.1` of every file it repairs, so the
+rows marked **keeps .1** (`rarpar par3 repair --backup`) write the same bytes
+it does; rows marked **in place** write no backup, and are like for like with
+`par2-rs`, which also repairs in place.
+
+- **Create.** `par3-fft` is ahead on every machine: 2.5–5.3× on set A and
+  1.7–3.6× on set B at 1 MiB blocks, 7–31× at 64 KiB blocks and 10% recovery,
+  and 18–66× at 30%. `par3-cauchy` ranges from 0.62× (Cortex-A72) to 2.5×
+  (Zen 4). At 64 KiB blocks `par2-rs` is itself 2.1–12× ahead of
+  `par2cmdline-turbo`.
+- **Repair in place.** 1.2–14× ahead of `par2cmdline-turbo` across the
+  equal-count rows, and 3.0–24× on the FFT-only rows.
+- **Repair keeping `.1`, like for like.** On the seven cloud machines this is
+  behind `par2cmdline-turbo` on the equal-count sets, except Cortex-A72's FFT
+  row on set A: 0.55–1.16× on set A and 0.23–0.66× on set B. The same sets repaired in place run 1.2–14× ahead there,
+  so the loss is in keeping the backups, not in the codec. On Alder Lake it is
+  0.74–2.2×, and on Zen 2 under Windows 2.2–3.3×.
+
+[![vs-a-equal create on nine machines](par3-versus/rarpar-par3-versus-vs-a-equal-create.svg)](par3-versus/rarpar-par3-versus-vs-a-equal-create.svg)
+
+[![vs-a-equal repair on nine machines](par3-versus/rarpar-par3-versus-vs-a-equal-repair.svg)](par3-versus/rarpar-par3-versus-vs-a-equal-repair.svg)
+
+[![vs-b-equal create on nine machines](par3-versus/rarpar-par3-versus-vs-b-equal-create.svg)](par3-versus/rarpar-par3-versus-vs-b-equal-create.svg)
+
+[![vs-b-equal repair on nine machines](par3-versus/rarpar-par3-versus-vs-b-equal-repair.svg)](par3-versus/rarpar-par3-versus-vs-b-equal-repair.svg)
+
+[![vs-a-fft10 create on nine machines](par3-versus/rarpar-par3-versus-vs-a-fft10-create.svg)](par3-versus/rarpar-par3-versus-vs-a-fft10-create.svg)
+
+[![vs-a-fft10 repair on nine machines](par3-versus/rarpar-par3-versus-vs-a-fft10-repair.svg)](par3-versus/rarpar-par3-versus-vs-a-fft10-repair.svg)
+
+[![vs-a-fft30 create on nine machines](par3-versus/rarpar-par3-versus-vs-a-fft30-create.svg)](par3-versus/rarpar-par3-versus-vs-a-fft30-create.svg)
+
+[![vs-a-fft30 repair on nine machines](par3-versus/rarpar-par3-versus-vs-a-fft30-repair.svg)](par3-versus/rarpar-par3-versus-vs-a-fft30-repair.svg)

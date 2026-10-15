@@ -32,6 +32,7 @@ const par3Usage = `Usage:
   rarpar-bench par3 versus --candidate PATH --work DIR --out DIR [--par2 PATH] [--profile versus-smoke|versus]
         [--set ID]... [--warmups N] [--repeats N] [--pin-cpus 0-7] [--machine LABEL] [--timeout 20m]
   rarpar-bench par3 versus-report --input results.json [--out report.md]
+  rarpar-bench par3 versus-render --input [NAME=]results.json... --out DIR
 
 The PAR3 suite benchmarks the shipped rarpar CLI against the pinned par3cmdline
 reference on deterministic generated inputs. See docs/benchmarking.md. Every
@@ -63,12 +64,16 @@ PAR3 Cauchy and FFT at one block size, recovery count and damage pattern, on the
 scale par2 ÷ par3 (above 1 = PAR3 faster), with every repair SHA-256 checked.
 Each PAR3 arm's repair runs in place, and its -backup twin keeps a .1; the
 report says which PAR2 arm each is like for like with on bytes written.
+par3 versus-render draws one SVG per comparison and op from one or more
+machines' versus results.json (repeat --input, in chart order; NAME= sets the
+machine's row name), every arm against par2cmdline-turbo, or par2-rs when any
+machine has none, for the whole chart.
 `
 
 func runPAR3(ctx context.Context, args []string, stdout io.Writer) error {
 	if len(args) == 0 {
 		fmt.Fprint(os.Stderr, par3Usage)
-		return fmt.Errorf("par3 requires matrix, build-reference, run, report, render, versus, or versus-report")
+		return fmt.Errorf("par3 requires matrix, build-reference, run, report, render, versus, versus-report, or versus-render")
 	}
 	switch args[0] {
 	case "matrix":
@@ -85,6 +90,8 @@ func runPAR3(ctx context.Context, args []string, stdout io.Writer) error {
 		return runPAR3Versus(ctx, args[1:], stdout)
 	case "versus-report":
 		return runPAR3VersusReport(args[1:], stdout)
+	case "versus-render":
+		return runPAR3VersusRender(args[1:], stdout)
 	case "-h", "--help", "help":
 		fmt.Fprint(stdout, par3Usage)
 		return nil
@@ -462,6 +469,42 @@ func runPAR3Render(args []string, stdout io.Writer) error {
 		return err
 	}
 	paths, err := par3bench.RenderSVGs(results, workspacePath(*out))
+	if err != nil {
+		return err
+	}
+	for _, path := range paths {
+		fmt.Fprintln(stdout, path)
+	}
+	return nil
+}
+
+func runPAR3VersusRender(args []string, stdout io.Writer) error {
+	flags := flag.NewFlagSet("par3 versus-render", flag.ContinueOnError)
+	var inputs stringList
+	flags.Var(&inputs, "input", "[NAME=]results.json from par3 versus (repeatable, in chart order)")
+	out := flags.String("out", "", "directory for the per-comparison SVGs")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	if len(inputs) == 0 || *out == "" {
+		return fmt.Errorf("--input and --out are required")
+	}
+	var charts []par3bench.VersusChartInput
+	for _, input := range inputs {
+		name, path := "", input
+		if before, after, ok := strings.Cut(input, "="); ok {
+			name, path = before, after
+		}
+		results, err := par3bench.ReadVersusResults(workspacePath(path))
+		if err != nil {
+			return err
+		}
+		charts = append(charts, par3bench.VersusChartInput{Name: name, Results: results})
+	}
+	paths, err := par3bench.RenderVersusSVGs(charts, workspacePath(*out))
 	if err != nil {
 		return err
 	}

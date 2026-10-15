@@ -3,6 +3,24 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## Unreleased
+
+### Benchmark harness only
+
+- `rarpar-bench par3 versus-render` charts the PAR2-against-PAR3 comparison:
+  one SVG per comparison and op, with every machine given as `--input` as a
+  group of rows, one per arm (`par2-rs`, `par2cmdline-turbo`, `par3-cauchy`,
+  `par3-fft`, and at repair the `.1`-keeping twins), each against
+  `par2cmdline-turbo` on the shared log scale, with median wall, CPU and peak
+  RSS, and at repair whether the arm kept a `.1` or repaired in place. No
+  version impact.
+
+### Documentation only
+
+- The benchmark page gains a PAR2-against-PAR3 section from the `rarpar
+  0.8.1` fleet round on nine machines, with its eight charts under
+  `docs/par3-versus/`. No version impact.
+
 ## rarpar 0.8.1
 
 ### Changed

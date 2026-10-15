@@ -573,6 +573,11 @@ target/rarpar-bench par3 versus --profile versus-smoke \
 
 # Re-render the Markdown from a saved results.json.
 target/rarpar-bench par3 versus-report --input target/par3-versus-smoke/results.json
+
+# Chart one or more machines' results, one SVG per comparison and op.
+target/rarpar-bench par3 versus-render --out target/vs-charts \
+  --input "Zen 4=zen4/par3-versus/results.json" \
+  --input "Neoverse N1=n1/par3-versus/results.json"
 ```
 
 The arms are:
@@ -628,6 +633,19 @@ existing field; v2 added the in-place PAR3 repair arms and their `-backup`
 twins, `backup_args`, `in_place_unsupported` and each repair's `backups`. A
 v1 PAR3 arm may have run durable and kept a backup, so `par3 versus-report`
 refuses a v1 file; read it with the harness that wrote it.
+
+`par3 versus-render` writes `rarpar-par3-versus-<comparison>-<op>.svg` for
+every comparison and op in its inputs. Each `--input` is one machine's
+`results.json`, drawn in the order given; `NAME=` sets the name its rows
+carry, and without it the machine label from the results is used. Each
+machine is a group with one row per arm that ran: the arm's median wall, CPU
+and peak RSS, and a bar on the same log scale as the other charts, the
+baseline's median wall time divided by the arm's. The baseline is
+`par2cmdline-turbo`, or `par2-rs` for the whole chart when any machine has no
+`par2cmdline-turbo` run. A repair row says whether the arm kept a numbered
+`.1` of what it repaired or repaired in place, so like for like on bytes
+written can be read off the chart. A comparison must have the same dataset,
+block size, recovery count and damage on every input, or the render fails.
 
 In the fleet, `versus = "versus"` (or `"versus-smoke"`) under
 `[machines.par3]` adds the run after the PAR3 suite. It passes the machine's
