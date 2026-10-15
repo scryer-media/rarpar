@@ -1650,15 +1650,10 @@ pub(crate) fn write_outputs(
     let mut hydrated = false;
     let mut staged = loop {
         // The plan's sources carry their identity but not their content hashes
-        // (see `CreationSource`). The encoder's own feed can produce those for
-        // free — it is about to read exactly these bytes — but only when it is
-        // the CPU encoder, only when there are recovery blocks for it to
-        // compute, and only when the pass is single-stripe, because a
-        // stripe-major feed does not deliver a file's bytes in file order.
-        // A multi-pass transform still needs that one file-order read, but
-        // takes its first band from it instead of reading the band strided
-        // (see `DiskSourceProvider::hash_during_first_band`). Anything else
-        // reads them here.
+        // (see `CreationSource`). Dense single-stripe feeds can hash directly.
+        // Transform feeds use a file-parallel hashing sweep that also fills
+        // their first band (see `DiskSourceProvider::hash_during_first_band`).
+        // Other feeds hydrate the hashes before encoding.
         let feed = if plan.recovery_count > 0 && matches!(backend, SelectedBackend::Cpu) {
             Some(super::encode::forward_feed_shape(
                 plan.slice_size,
@@ -1667,15 +1662,15 @@ pub(crate) fn write_outputs(
                 options
                     .memory_limit
                     .unwrap_or_else(super::plan::default_memory_limit),
+                options.memory_limit.is_some(),
                 options.forward_kernel,
                 transform_policy,
             )?)
         } else {
             None
         };
-        let fuse_source_hashing = feed.is_some_and(|feed| feed.passes == 1);
-        let hash_during_first_band =
-            !hydrated && feed.is_some_and(|feed| feed.transform && feed.passes > 1);
+        let fuse_source_hashing = feed.is_some_and(|feed| !feed.transform && feed.passes == 1);
+        let hash_during_first_band = !hydrated && feed.is_some_and(|feed| feed.transform);
         if !fuse_source_hashing && !hash_during_first_band && !hydrated {
             super::source::hydrate_source_hashes(
                 &mut sources,

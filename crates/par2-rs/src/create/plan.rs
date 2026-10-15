@@ -377,6 +377,7 @@ pub struct Par2CreatePlan {
     pub backend: CreationBackend,
     /// Memory accounting for this plan.
     pub memory: Par2MemoryPlan,
+    pub(crate) explicit_memory_limit: bool,
     /// Whether the caller requested a write-free operation.
     pub dry_run: bool,
     /// Inputs excluded from the set because they are zero-length, in input
@@ -456,8 +457,9 @@ impl Par2CreatePlan {
         let cpu_memory = estimate_forward_memory(
             self.slice_size,
             self.source_slice_count as usize,
-            self.recovery_count as usize,
+            &self.recovery_exponents,
             self.memory.processing_buffer_limit_bytes,
+            self.explicit_memory_limit,
             self.forward_kernel,
         )?;
         let forward_memory = estimate_processing_memory(
@@ -842,6 +844,9 @@ pub(crate) fn build_plan_with_cache(
         options.first_exponent,
     )?;
     validate_exponent_range(options.first_exponent, recovery_count)?;
+    let recovery_exponents: Vec<RecoveryExponent> = (0..recovery_count)
+        .map(|offset| options.first_exponent + offset)
+        .collect();
 
     let forward_memory_limit = options.memory_limit.unwrap_or_else(default_memory_limit);
     if forward_memory_limit == 0 {
@@ -852,8 +857,9 @@ pub(crate) fn build_plan_with_cache(
     let cpu_memory = estimate_forward_memory(
         block_size,
         source_slice_count as usize,
-        recovery_count as usize,
+        &recovery_exponents,
         forward_memory_limit,
+        options.memory_limit.is_some(),
         options.forward_kernel,
     )?;
     let forward_memory = estimate_processing_memory(
@@ -895,9 +901,6 @@ pub(crate) fn build_plan_with_cache(
         main_body.extend_from_slice(source.file_id.as_bytes());
     }
     let recovery_set_id = RecoverySetId::from_bytes(md5(&main_body));
-    let recovery_exponents = (0..recovery_count)
-        .map(|offset| options.first_exponent + offset)
-        .collect();
     let memory = memory_plan_for(
         &sources,
         input_lengths.len(),
@@ -933,6 +936,7 @@ pub(crate) fn build_plan_with_cache(
         forward_kernel: options.forward_kernel,
         backend: options.backend,
         memory,
+        explicit_memory_limit: options.memory_limit.is_some(),
         dry_run: options.dry_run,
         skipped_empty,
     })

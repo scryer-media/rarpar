@@ -33,9 +33,8 @@
 //! ```
 //!
 //! and [`admit`] picks the largest `band` that keeps the sum inside the budget
-//! it is handed — which is never more than the dense arm's own admitted peak
-//! at the same limit, so the transform arm cannot make a create resident in
-//! more memory than it already was.
+//! it is handed. The default transform budget is 192 MiB, independently of
+//! the dense arm's reservation; an explicit memory limit controls both arms.
 //!
 //! # Band, stripe and pass
 //!
@@ -57,15 +56,10 @@
 //! Slice order is file order, so a pass is one forward, strided sweep per file
 //! rather than a random walk. What it is not is *sequential*: the bytes of one
 //! slice arrive `passes` times, split. The whole-file MD5 and the 16 KiB digest
-//! are single serial messages over a file's bytes in file order, so they cannot
-//! be driven from a multi-pass feed — exactly the rule the dense arm already
-//! follows when its own stripe count exceeds one. A single-pass transform *is*
-//! in file order and fuses the digests as before. A multi-pass one still needs
-//! one file-order read of every source for them, so `write_outputs` makes that
-//! read the first pass's feed: the provider's
-//! [`fill_band`](super::encode::ForwardSourceProvider::fill_band) serves band
-//! zero from the sequential hashing sweep, and only the remaining passes read
-//! strided. No per-slice digest state is carried across passes.
+//! are serial within each file, but independent across files; slice digests are
+//! independent as well. The first band of either a single-pass or multi-pass
+//! transform comes from a file-parallel, file-order hashing sweep. Only later
+//! bands use strided reads. No per-slice digest state crosses passes.
 //!
 //! # The safety row
 //!
@@ -94,9 +88,8 @@ use super::encode::{
 /// degenerates into a seek per kilobyte or so and the pass count explodes; the
 /// create takes the dense path instead.
 ///
-/// The band a budget buys is `budget / (sources + outputs)`, and the budget is
-/// the dense arm's own reservation, which for a narrow slice or a modest
-/// recovery count is little more than `outputs * slice`. Two shapes measured
+/// The band a budget buys is roughly `budget / (sources + outputs)`. Before
+/// the transform had its own budget, two shapes measured
 /// on an x86-64 performance core (GFNI, page-cached inputs, 1 thread) sit
 /// below a 4 KiB floor by that arithmetic: 10 x 100 MiB at 32,008-byte slices
 /// with 3,277 recovery blocks buys a ~2.9 KiB band, and 32,768 slices of 5,552
@@ -278,8 +271,7 @@ pub(crate) mod test_probe {
         static BUDGET: Cell<Option<usize>> = const { Cell::new(None) };
     }
 
-    /// Run `body` with the transform arm's budget pinned to `bytes` instead of
-    /// the dense reservation, which differs by architecture.
+    /// Run `body` with the transform arm's budget pinned to `bytes`.
     pub(crate) fn with_budget<T>(bytes: usize, body: impl FnOnce() -> T) -> T {
         struct Restore(Option<usize>);
         impl Drop for Restore {
@@ -389,9 +381,8 @@ pub(crate) enum EncodeAttempt {
 /// Decide whether this create takes the transform arm, and at what geometry.
 ///
 /// `budget` is the total bytes every arena of the arm may occupy together. The
-/// caller passes the smaller of its own memory limit and the dense arm's
-/// admitted peak, which is what makes the transform's residency a bound on the
-/// dense arm's rather than an addition to it.
+/// caller passes the default transform cap or an explicit memory limit. The
+/// create planner accounts for the dense fallback separately.
 pub(crate) fn admit(
     slice_size: usize,
     source_count: usize,
@@ -480,21 +471,14 @@ pub(crate) fn admit(
 
 /// Order two admissible geometries.
 ///
-/// A single pass comes first and beats everything, because it is not an
-/// arithmetic property at all: a one-pass arm delivers the payload in file
-/// order, so the create fuses the source digests into it and never reads the
-/// payload a second time. Nothing else on this list is worth a whole extra
-/// sweep of the inputs.
-///
-/// Past that, the pass count itself is nearly free — the bytes read are the
-/// payload however many passes they arrive in — so the next key is the parallel
-/// width, which is what the arithmetic's wall clock follows, and then the band,
-/// which is how long each file's strided run is.
+/// Prefer useful parallel width. Every shape hashes its first band with the
+/// file-parallel sweep, so a single pass no longer avoids a separate read.
+/// With equal width, one pass wins; otherwise a larger band reduces seeks.
 fn better(candidate: TransformShape, incumbent: TransformShape) -> bool {
     let key = |shape: TransformShape| {
         (
-            shape.passes == 1,
             shape.workers.min(shape.chunks),
+            shape.passes == 1,
             shape.band,
             shape.stripe,
         )
@@ -1481,8 +1465,7 @@ mod tests {
             first_exponent: 3,
             memory_limit: Some(4 * 1024 * 1024),
         };
-        // The budget is pinned: the dense reservation it otherwise follows
-        // depends on the architecture's dense kernel.
+        // Pin the budget so geometry is independent of the test host.
         let passes =
             test_probe::with_budget(4 * 1024 * 1024, || compare_arms(&shape, "2 KiB band"));
         assert_eq!(passes, 4, "expected four 2 KiB passes, ran {passes}");
@@ -1612,22 +1595,23 @@ mod tests {
     }
 
     #[test]
-    fn a_single_pass_arm_fuses_the_source_digests_and_is_byte_identical() {
-        // Few slices and many recovery blocks is the shape whose band covers
-        // the whole slice: the feed is then in file order and the create drives
-        // the fused hasher from it, so the FileDesc and IFSC packets in these
-        // bytes are the ones the transform arm produced.
-        let passes = compare_arms(
-            &Shape {
-                lengths: vec![8 * 32_768, 4 * 32_768 + 11],
-                slice_size: 32_768,
-                recovery: 128,
-                first_exponent: 0,
-                memory_limit: None,
-            },
-            "single pass, fused hashing",
-        );
+    fn a_single_pass_arm_hashes_files_in_parallel_and_is_byte_identical() {
+        // The first-band sweep also handles a whole-slice band. Its file tasks
+        // produce the FileDesc and IFSC hashes without a serial producer hash.
+        let (passes, sweeps, hydrates) = crate::create::source::test_probe::counted(|| {
+            compare_arms(
+                &Shape {
+                    lengths: vec![8 * 32_768, 4 * 32_768 + 11],
+                    slice_size: 32_768,
+                    recovery: 128,
+                    first_exponent: 0,
+                    memory_limit: None,
+                },
+                "single pass, parallel hashing",
+            )
+        });
         assert_eq!(passes, 1, "expected a single-pass arm, ran {passes}");
+        assert_eq!((sweeps, hydrates), (1, 0));
     }
 
     /// `PAR2_TURBO_BINARY` names the reference implementation, exactly as the

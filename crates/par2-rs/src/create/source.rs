@@ -519,16 +519,14 @@ impl<'a> DiskSourceProvider<'a> {
         })
     }
 
-    /// Serve the first band of a multi-pass transform from one sequential,
+    /// Serve the first band of a transform from one sequential,
     /// file-order read of every source that also produces the deferred content
     /// hashes, instead of a strided band read followed by a separate hashing
     /// read of every file.
     ///
-    /// A multi-pass feed cannot drive the whole-file MD5 itself: that digest
-    /// is one serial message over a file's bytes in file order, and the
-    /// passes deliver each slice in `passes` pieces. So the bytes are read in
-    /// file order once regardless; this makes that read also the first pass's
-    /// source feed, so the strided reads cover the remaining passes only. The
+    /// A whole-file MD5 is serial within one file, so parallel file tasks hash
+    /// each source in order while slice checksums use independent lanes. This
+    /// first read also feeds the transform's first band. The
     /// sweep keeps the hashing fallback's own per-task staging (see
     /// [`create_hash_window_bytes`]) and its per-file parallel split.
     pub(crate) fn hash_during_first_band(&mut self) {
@@ -977,10 +975,8 @@ pub(crate) struct SourceContentHashes {
 /// Two callers: [`hydrate_source_hashes`], the fallback for a feed that cannot
 /// serve the hashes at all (a non-CPU backend, a pass with no recovery blocks,
 /// or a dense stripe schedule that visits a file's bytes out of file order),
-/// and the first pass of a multi-pass transform, where [`DiskSourceProvider`]
-/// uses `on_bytes` to fill the pass's band from this same read. The
-/// single-pass fast path is [`FusedSourceHasher`], which sees the encoder's
-/// bytes for free.
+/// and the first pass of a transform, where [`DiskSourceProvider`] uses
+/// `on_bytes` to fill the pass's band from this same read.
 fn hash_source_contents(
     file: &File,
     input: &Path,
