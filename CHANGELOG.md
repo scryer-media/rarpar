@@ -20,6 +20,17 @@ documented in each crate's own changelog so those notes ship with the crate.
   `unrar-build.json` records the shared libraries and the banner in place of
   `static_link`. No version impact of its own.
 
+### Documentation only
+
+- The benchmark page and the README's performance table carry the `rarpar
+  0.8.0` fleet round for the seven cloud machines (Zen 4, Sapphire Rapids,
+  Skylake-SP, Haswell, Cortex-A72, Neoverse N1, Neoverse V2), with their 14
+  charts regenerated. Alder Lake, Zen 2, Denverton and both Apple M5 Max lanes
+  are carried from the 0.3.3 publication, marked †, pending a re-measure. The
+  Linux arm64 UnRAR reference is now the dynamically linked on-host build
+  above. A new PAR3 section compares `rarpar par3` with `par3cmdline 0.0.1` on
+  the same seven machines. No version impact.
+
 ## rarpar 0.8.0
 
 A minor bump, as for 0.7.0: a command line that 0.7.0 accepted
