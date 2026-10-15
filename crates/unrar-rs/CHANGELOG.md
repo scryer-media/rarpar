@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.11.1 (unreleased)
+
+### Changed
+
+- Direct-to-file extraction preallocates stored members on Linux and macOS
+  when at least 8 MiB is both declared and present in their open volume
+  segments. It leaves logical length unchanged and skips compressed members;
+  truncated or overstated inputs cannot reserve the declared size alone.
+
 ## 0.11.0
 
 ### Added

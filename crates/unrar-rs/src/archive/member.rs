@@ -1845,6 +1845,69 @@ impl RarArchive {
         }
     }
 
+    /// Reserve no more output space than the stored bytes currently readable
+    /// from this member's open volumes. A truncated or overstated header cannot
+    /// reserve its declared size before the input exists.
+    fn stored_preallocation_bound(&mut self, index: usize, fh: &FileHeader) -> Option<u64> {
+        const MIN_BYTES: u64 = 8 * 1024 * 1024;
+        if fh.compression.method != CompressionMethod::Store || self.member_is_solid(fh) {
+            return None;
+        }
+        let declared = fh.unpacked_size?;
+        if declared < MIN_BYTES {
+            return None;
+        }
+        let segments = self.members.get(index)?.segments.clone();
+        let mut available = 0u64;
+        for segment in segments {
+            let reader = &mut self.volumes.get_mut(segment.volume_index)?.as_mut()?.reader;
+            let position = reader.stream_position().ok()?;
+            let end = reader.seek(SeekFrom::End(0));
+            reader.seek(SeekFrom::Start(position)).ok()?;
+            let present = end
+                .ok()?
+                .saturating_sub(segment.data_offset)
+                .min(segment.data_size);
+            available = available.checked_add(present)?;
+        }
+        let bound = declared.min(available);
+        (bound >= MIN_BYTES && bound <= i64::MAX as u64).then_some(bound)
+    }
+
+    fn preallocate_stored_output_file(file: &std::fs::File, bytes: u64) {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            // KEEP_SIZE reserves blocks without changing the logical file size.
+            let _ = unsafe {
+                libc::fallocate(
+                    file.as_raw_fd(),
+                    libc::FALLOC_FL_KEEP_SIZE,
+                    0,
+                    bytes as libc::off_t,
+                )
+            };
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            let mut store = libc::fstore_t {
+                fst_flags: libc::F_ALLOCATECONTIG,
+                fst_posmode: libc::F_PEOFPOSMODE,
+                fst_offset: 0,
+                fst_length: bytes as libc::off_t,
+                fst_bytesalloc: 0,
+            };
+            let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store) };
+            if result == -1 {
+                store.fst_flags = libc::F_ALLOCATEALL;
+                let _ = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store) };
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let _ = (file, bytes);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn create_symlink_output(
         fh: &FileHeader,
@@ -4624,6 +4687,9 @@ impl RarArchive {
         // Create output file with buffered writer.
         let (file, resolved_out_path) =
             Self::create_regular_output_file_for_member(&member_name, out_path)?;
+        if let Some(bytes) = self.stored_preallocation_bound(index, &fh) {
+            Self::preallocate_stored_output_file(&file, bytes);
+        }
         let out_path = resolved_out_path.as_path();
         let mut writer = BufWriter::with_capacity(OUTPUT_WRITE_BUFFER_BYTES, file);
 
@@ -8728,6 +8794,46 @@ mod tests {
             reader: Box::new(Cursor::new(data.to_vec())),
         })];
         archive
+    }
+
+    #[test]
+    fn stored_preallocation_uses_present_segment_bytes_for_plain_and_encrypted_members() {
+        const MIB: usize = 1024 * 1024;
+        for encrypted in [false, true] {
+            let mut archive = archive_with_single_volume(&vec![0; 9 * MIB]);
+            let mut service = test_rar5_service("stored.bin", (32 * MIB) as u64, (16 * MIB) as u64);
+            service.file_header.is_encrypted = encrypted;
+            archive.members.push(MemberEntry {
+                file_header: service.file_header,
+                is_encrypted: encrypted,
+                file_encryption: None,
+                rar4_salt: None,
+                hash: None,
+                redirection: None,
+                owner: None,
+                segments: vec![DataSegment::new(0, MIB as u64, (16 * MIB) as u64)],
+            });
+            let fh = archive.members[0].file_header.clone();
+            assert_eq!(
+                archive.stored_preallocation_bound(0, &fh),
+                Some((8 * MIB) as u64)
+            );
+            assert_eq!(
+                archive.volumes[0]
+                    .as_mut()
+                    .unwrap()
+                    .reader
+                    .stream_position()
+                    .unwrap(),
+                0,
+            );
+            let file = tempfile::tempfile().unwrap();
+            RarArchive::preallocate_stored_output_file(&file, (8 * MIB) as u64);
+            assert_eq!(file.metadata().unwrap().len(), 0);
+            archive.members[0].file_header.compression.method = CompressionMethod::Normal;
+            let compressed = archive.members[0].file_header.clone();
+            assert_eq!(archive.stored_preallocation_bound(0, &compressed), None);
+        }
     }
 
     #[cfg(target_os = "linux")]

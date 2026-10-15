@@ -3,6 +3,17 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.8.1 (unreleased)
+
+### Changed
+
+- `par create` uses a 192 MiB default transform processing budget and parallel
+  source hashing in single-pass mode. `--memory-mib` remains the explicit
+  processing limit and can select a larger or smaller transform budget.
+- Stored RAR extraction can preallocate output blocks up to the bytes confirmed
+  present in its input volume segments, reducing allocation work on supported
+  filesystems without trusting an overstated output size.
+
 ## rarpar 0.8.0
 
 A minor bump, as for 0.7.0: a command line that 0.7.0 accepted

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.10.10 (unreleased)
+
+### Changed
+
+- PAR2 creation gives the transform a separate 192 MiB default processing
+  budget; an explicit memory limit controls its budget directly. The plan
+  includes the larger of the transform and dense fallback peaks. This can
+  increase create memory use in exchange for wider, faster transform bands.
+- A single-pass transform hashes source files in parallel while filling its
+  first band, preserving the same FileDesc and IFSC bytes and dense safety
+  fallback. The geometry selector favors active workers over a single pass.
+
 ## 0.10.9
 
 Faster PAR2 creation where the transform arm used to be refused or left
