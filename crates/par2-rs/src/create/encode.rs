@@ -2380,7 +2380,9 @@ pub(crate) fn estimate_forward_memory(
         explicit_memory_limit,
         TransformPolicy::Force,
     )
-    .map_or(0, |_| transform_budget(memory_limit, explicit_memory_limit));
+    .map_or(0, |arm| {
+        arm.estimated_peak_bytes(transform_budget(memory_limit, explicit_memory_limit))
+    });
     Ok(ForwardMemoryEstimate {
         factor_workspace_bytes,
         jit_workspace_bytes,
@@ -3266,18 +3268,37 @@ mod tests {
             .unwrap();
             assert!(estimate.processing_peak_bytes >= dense.memory_bytes);
             assert!(estimate.processing_peak_bytes <= limit);
-            if admit_transform(
+            if let Some(arm) = admit_transform(
                 65_536,
                 4_096,
                 &exponents,
                 limit,
                 explicit,
                 TransformPolicy::Auto,
-            )
-            .is_some()
-            {
-                assert!(estimate.processing_peak_bytes >= transform_budget(limit, explicit));
+            ) {
+                assert!(estimate.processing_peak_bytes >= arm.shape().total_bytes);
+                assert!(
+                    estimate.processing_peak_bytes
+                        >= arm.estimated_peak_bytes(transform_budget(limit, explicit))
+                );
             }
+        }
+    }
+
+    #[test]
+    fn a_small_create_does_not_report_the_entire_transform_allowance() {
+        let limit = 1024 * 1024 * 1024;
+        for explicit in [false, true] {
+            let estimate = estimate_forward_memory(
+                4096,
+                16,
+                &[0, 1],
+                limit,
+                explicit,
+                ForwardKernel::Portable,
+            )
+            .unwrap();
+            assert!(estimate.processing_peak_bytes < transform_budget(limit, explicit) / 2);
         }
     }
 

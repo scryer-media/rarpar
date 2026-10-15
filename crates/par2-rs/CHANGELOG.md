@@ -8,6 +8,8 @@
   budget; an explicit memory limit controls its budget directly. The plan
   includes the larger of the transform and dense fallback peaks. This can
   increase create memory use in exchange for wider, faster transform bands.
+- Memory estimates charge the selected transform buffers plus their overhead
+  reserve, rather than charging unused capacity from the transform allowance.
 - A single-pass transform hashes source files in parallel while filling its
   first band, preserving the same FileDesc and IFSC bytes and dense safety
   fallback. The geometry selector favors active workers over a single pass.
