@@ -366,6 +366,14 @@ impl TransformArm {
     pub(crate) fn shape(&self) -> TransformShape {
         self.shape
     }
+
+    /// Charge the selected arenas and the same overhead reserve used by `fit`.
+    pub(crate) fn estimated_peak_bytes(&self, budget: usize) -> usize {
+        self.shape
+            .total_bytes
+            .saturating_add(budget >> BUDGET_SLACK_SHIFT)
+            .min(budget)
+    }
 }
 
 /// What one encode attempt produced.

@@ -37,8 +37,8 @@ type OracleResolution struct {
 //     unrar-5.5.0-arm.gz, is UnRAR 5.5.0 for 32-bit armhf (dynamically linked
 //     against /lib/ld-linux-armhf.so.3). The pinned source tarball ships in the
 //     bundle and `rarpar-bench fleet build-unrar` builds it with the audited
-//     portable recipe: stock makefile and CXXFLAGS, CXX=g++, a static link,
-//     and no -march/-mcpu/-mtune.
+//     portable recipe: stock makefile, CXXFLAGS and LDFLAGS, CXX=g++, linked
+//     against the host's glibc, and no -march/-mcpu/-mtune.
 //   - par3cmdline-onhost: par3cmdline publishes no release and no Linux
 //     binary; the tree ships only windows/par3.exe, which Windows hosts use
 //     as an official binary.
