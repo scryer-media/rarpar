@@ -163,7 +163,7 @@ pub(super) fn write_files(
             .map_err(|source| io_error(&temporary, source))?;
         let verified = verify_file_handle(set, file, staged)? == FileVerdict::Complete;
         let backup = if verified {
-            tree.install_with_moved_backup(&stage_name, &target, options.backup)
+            tree.install(&stage_name, &target, options.backup)
                 .map_err(|source| io_error(&target.display, source))?
         } else {
             None

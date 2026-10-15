@@ -592,53 +592,20 @@ impl RepairTree {
             .map(cap_std::fs::File::into_std)
     }
 
+    /// Move the verified stage `stage_name` to `destination`, and return the
+    /// numbered backup kept of what was there.
+    ///
+    /// With `backup`, an existing destination keeps its bytes under the first
+    /// free name of `.1`, `.2`, ...: the name is claimed with a hard link (or,
+    /// where the filesystem has none, a rename into a name found free), the
+    /// destination name is released, and the stage moves into it. The stage
+    /// never renames over a file there: on ext4 a rename over an existing file
+    /// writes the whole new file back to disk inside the rename
+    /// (`auto_da_alloc`), so a kept backup would cost a full flush before the
+    /// repair returns. Without `backup`, the stage replaces the destination in
+    /// one rename. If the stage cannot be moved, the original goes back under
+    /// its name.
     pub(crate) fn install(
-        &self,
-        stage_name: &OsStr,
-        destination: &Destination,
-        backup: bool,
-    ) -> EngineResult<Option<PathBuf>> {
-        let (parent, filename) = self.destination_parent(&destination.relative, true)?;
-        let mut saved = None;
-        match parent.symlink_metadata(&filename) {
-            Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
-                return Err(EngineError::InvalidState(
-                    "destination is not a regular file",
-                ));
-            }
-            Ok(_) if backup => {
-                for index in 1..=100_000 {
-                    let mut backup_name = filename.to_os_string();
-                    backup_name.push(format!(".{index}"));
-                    match parent.hard_link(&filename, &parent, &backup_name) {
-                        Ok(()) => {
-                            let mut display = destination.display.as_os_str().to_os_string();
-                            display.push(format!(".{index}"));
-                            saved = Some(PathBuf::from(display));
-                            break;
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                        Err(error) => return Err(error.into()),
-                    }
-                }
-                if saved.is_none() {
-                    return Err(EngineError::resource_limit("backup names"));
-                }
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        if let Err(error) = self.move_stage(stage_name, &parent, &filename) {
-            if let Some(path) = &saved {
-                parent.remove_file(path.file_name().expect("backup filename"))?;
-            }
-            return Err(error.into());
-        }
-        Ok(saved)
-    }
-
-    pub(crate) fn install_with_moved_backup(
         &self,
         stage_name: &OsStr,
         destination: &Destination,
@@ -647,43 +614,30 @@ impl RepairTree {
         let (parent, filename) = self.destination_parent(&destination.relative, true)?;
         let mut saved = None;
         match parent.symlink_metadata(&filename) {
+            Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+                return Err(io::Error::other(EngineError::InvalidState(
+                    "destination is not a regular file",
+                )));
+            }
             Ok(_) if backup => {
-                for index in 1..10_000u32 {
-                    let mut backup_name = filename.to_os_string();
-                    backup_name.push(format!(".{index}"));
-                    match parent.symlink_metadata(&backup_name) {
-                        Ok(_) => continue,
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error),
-                    }
-                    parent.rename(&filename, &parent, &backup_name)?;
-                    let mut display = destination.display.as_os_str().to_os_string();
-                    display.push(format!(".{index}"));
-                    saved = Some(PathBuf::from(display));
-                    break;
-                }
-                if saved.is_none() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "every backup name from .1 to .9999 is taken",
-                    ));
-                }
+                let suffix = format!(".{}", move_to_backup(&parent, &filename)?);
+                let mut backup_name = filename.to_os_string();
+                backup_name.push(&suffix);
+                let mut display = destination.display.as_os_str().to_os_string();
+                display.push(&suffix);
+                saved = Some((backup_name, PathBuf::from(display)));
             }
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
         if let Err(error) = self.move_stage(stage_name, &parent, &filename) {
-            if let Some(path) = &saved {
-                parent.rename(
-                    path.file_name().expect("backup filename"),
-                    &parent,
-                    &filename,
-                )?;
+            if let Some((backup_name, _)) = &saved {
+                parent.rename(backup_name, &parent, &filename)?;
             }
             return Err(error);
         }
-        Ok(saved)
+        Ok(saved.map(|(_, display)| display))
     }
 
     fn move_stage(&self, name: &OsStr, parent: &BudgetedDir, filename: &OsStr) -> io::Result<()> {
@@ -958,6 +912,39 @@ fn relative_parent(
     Ok((directory, filename.clone()))
 }
 
+/// Move `filename` in `parent` to the first free numbered backup name,
+/// `filename.1` to `filename.99999`, and return the number. The name is
+/// claimed with a hard link, which never replaces a file, and the original
+/// name released after it; a filesystem without hard links gets a rename into
+/// a name found free instead.
+fn move_to_backup(parent: &Dir, filename: &OsStr) -> io::Result<u32> {
+    for index in 1..100_000u32 {
+        let mut backup_name = filename.to_os_string();
+        backup_name.push(format!(".{index}"));
+        match parent.hard_link(filename, parent, &backup_name) {
+            Ok(()) => {
+                if let Err(error) = parent.remove_file(filename) {
+                    parent.remove_file(&backup_name)?;
+                    return Err(error);
+                }
+                return Ok(index);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(_) => match parent.symlink_metadata(&backup_name) {
+                Ok(_) => continue,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    parent.rename(filename, parent, &backup_name)?;
+                    return Ok(index);
+                }
+                Err(error) => return Err(error),
+            },
+        }
+    }
+    Err(io::Error::other(EngineError::resource_limit(
+        "backup names",
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1002,8 +989,7 @@ mod tests {
         output.write_all(b"verified output").unwrap();
         drop(output);
 
-        tree.install_with_moved_backup(&stage_name, &destination, false)
-            .unwrap();
+        tree.install(&stage_name, &destination, false).unwrap();
 
         assert_eq!(
             std::fs::read(root.path().join(".par3-repair-0.tmp")).unwrap(),
@@ -1031,8 +1017,7 @@ mod tests {
 
         std::fs::rename(&base, &moved).unwrap();
         symlink(&outside, &base).unwrap();
-        tree.install_with_moved_backup(&stage_name, &destination, false)
-            .unwrap();
+        tree.install(&stage_name, &destination, false).unwrap();
 
         assert_eq!(
             std::fs::read(moved.join("nested/file.bin")).unwrap(),
@@ -1058,7 +1043,7 @@ mod tests {
         std::fs::rename(root.path().join("nested"), root.path().join("old-parent")).unwrap();
         symlink(&outside, root.path().join("nested")).unwrap();
         let error = tree
-            .install_with_moved_backup(&stage_name, &destination, false)
+            .install(&stage_name, &destination, false)
             .expect_err("a replaced parent must not be followed");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
@@ -1245,6 +1230,44 @@ mod tests {
         assert_eq!(options.handles.used(), 0);
     }
 
+    /// A kept backup is the original file itself under the first free
+    /// numbered name, and the stage moves into the name it vacated.
+    #[cfg(unix)]
+    #[test]
+    fn install_with_backup_moves_the_original_to_the_first_free_number() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = TestRoot::new("backup-move");
+        let tree = RepairTree::new(root.path(), ["file.bin"]).unwrap();
+        let destination = tree.destination("file.bin").unwrap();
+        std::fs::write(&destination.display, b"damaged").unwrap();
+        std::fs::write(root.path().join("file.bin.1"), b"earlier backup").unwrap();
+        let original = std::fs::metadata(&destination.display).unwrap().ino();
+        let (stage_name, staged, mut output) = tree.create_stage_file(0).unwrap();
+        output.write_all(b"repaired").unwrap();
+        drop(output);
+        let stage = std::fs::metadata(&staged).unwrap().ino();
+
+        let saved = tree.install(&stage_name, &destination, true).unwrap();
+
+        assert_eq!(saved, Some(root.path().join("file.bin.2")));
+        assert_eq!(std::fs::read(&destination.display).unwrap(), b"repaired");
+        assert_eq!(
+            std::fs::metadata(&destination.display).unwrap().ino(),
+            stage
+        );
+        let kept = std::fs::metadata(root.path().join("file.bin.2")).unwrap();
+        assert_eq!((kept.ino(), kept.nlink()), (original, 1));
+        assert_eq!(
+            std::fs::read(root.path().join("file.bin.2")).unwrap(),
+            b"damaged"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("file.bin.1")).unwrap(),
+            b"earlier backup"
+        );
+    }
+
     #[test]
     fn failed_install_removes_a_new_backup_and_preserves_the_original() {
         let root = TestRoot::new("backup-failure");
@@ -1253,12 +1276,6 @@ mod tests {
         std::fs::write(&destination.display, b"original").unwrap();
         assert!(
             tree.install(OsStr::new("missing-stage"), &destination, true)
-                .is_err()
-        );
-        assert_eq!(std::fs::read(&destination.display).unwrap(), b"original");
-        assert!(!root.path().join("file.bin.1").exists());
-        assert!(
-            tree.install_with_moved_backup(OsStr::new("missing-stage"), &destination, true)
                 .is_err()
         );
         assert_eq!(std::fs::read(&destination.display).unwrap(), b"original");

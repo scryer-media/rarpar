@@ -213,48 +213,10 @@ impl RepairTree {
         StdFile::open(&destination.display)
     }
 
+    /// Move the verified stage to `destination`; see the native tree's
+    /// `install`. With `backup`, the original moves to the first free `.N`
+    /// and the stage into the name it vacated, never renaming over a file.
     pub(crate) fn install(
-        &self,
-        stage_name: &OsStr,
-        destination: &Destination,
-        backup: bool,
-    ) -> EngineResult<Option<PathBuf>> {
-        let (parent, filename) = relative_parent(&self.base, &destination.relative, true)?;
-        let target = parent.join(&filename);
-        let mut saved = None;
-        match std::fs::symlink_metadata(&target) {
-            Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
-                return Err(EngineError::InvalidState(
-                    "destination is not a regular file",
-                ));
-            }
-            Ok(_) if backup => {
-                for index in 1..=100_000 {
-                    let mut backup_name = filename.to_os_string();
-                    backup_name.push(format!(".{index}"));
-                    let backup_path = parent.join(backup_name);
-                    match std::fs::hard_link(&target, &backup_path) {
-                        Ok(()) => {
-                            saved = Some(backup_path);
-                            break;
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                        Err(error) => return Err(error.into()),
-                    }
-                }
-                if saved.is_none() {
-                    return Err(EngineError::resource_limit("backup names"));
-                }
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        std::fs::rename(self.stage.join(stage_name), target)?;
-        Ok(saved)
-    }
-
-    pub(crate) fn install_with_moved_backup(
         &self,
         stage_name: &OsStr,
         destination: &Destination,
@@ -264,32 +226,51 @@ impl RepairTree {
         let target = parent.join(&filename);
         let mut saved = None;
         match std::fs::symlink_metadata(&target) {
+            Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+                return Err(io::Error::other(EngineError::InvalidState(
+                    "destination is not a regular file",
+                )));
+            }
             Ok(_) if backup => {
-                for index in 1..10_000u32 {
+                for index in 1..100_000u32 {
                     let mut backup_name = filename.to_os_string();
                     backup_name.push(format!(".{index}"));
                     let backup_path = parent.join(backup_name);
-                    match std::fs::symlink_metadata(&backup_path) {
-                        Ok(_) => continue,
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error),
+                    match std::fs::hard_link(&target, &backup_path) {
+                        Ok(()) => {
+                            if let Err(error) = std::fs::remove_file(&target) {
+                                std::fs::remove_file(&backup_path)?;
+                                return Err(error);
+                            }
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                        Err(_) => match std::fs::symlink_metadata(&backup_path) {
+                            Ok(_) => continue,
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                                std::fs::rename(&target, &backup_path)?;
+                            }
+                            Err(error) => return Err(error),
+                        },
                     }
-                    std::fs::rename(&target, &backup_path)?;
                     saved = Some(backup_path);
                     break;
                 }
                 if saved.is_none() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "every backup name from .1 to .9999 is taken",
-                    ));
+                    return Err(io::Error::other(EngineError::resource_limit(
+                        "backup names",
+                    )));
                 }
             }
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        std::fs::rename(self.stage.join(stage_name), target)?;
+        if let Err(error) = std::fs::rename(self.stage.join(stage_name), &target) {
+            if let Some(backup_path) = &saved {
+                std::fs::rename(backup_path, &target)?;
+            }
+            return Err(error);
+        }
         Ok(saved)
     }
 

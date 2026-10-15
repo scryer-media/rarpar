@@ -3,7 +3,18 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
-## Unreleased
+## rarpar 0.8.2 (unreleased)
+
+### Changed
+
+- `par3 repair --backup` keeps the damaged file by moving it to `<name>.1`
+  (or the next free number) and moving the rebuilt file into its name,
+  instead of renaming the rebuilt file over it (par3-rs 0.7.1). On ext4 the
+  rename over a file flushes the whole rebuilt file to disk before the
+  command returns. That is the likely main cost behind a repair keeping
+  backups running at 0.23–0.77× of `par2cmdline-turbo`'s on cloud block
+  volumes in the 0.8.1 PAR2-against-PAR3 comparison; not yet re-measured.
+  Repair without `--backup` is unchanged.
 
 ### Benchmark harness only
 
