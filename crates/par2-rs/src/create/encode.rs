@@ -604,7 +604,7 @@ impl ForwardEncoder {
             provider.source_count(),
             &self.recovery_exponents,
             memory_limit,
-            &buffers,
+            options.memory_limit.is_some(),
             options.transform,
         ) && (observer.is_none() || arm.shape().passes == 1)
         {
@@ -2262,10 +2262,10 @@ pub(crate) struct ForwardFeedShape {
 /// The feed one forward pass will take under the same budget the pass itself
 /// resolves.
 ///
-/// Creation asks this to decide where the whole-file digests come from: one
-/// pass means the feed visits each file's bytes in file order and can drive
-/// them; a multi-pass transform can serve its first band from the hashing
-/// read; a multi-stripe dense pass is stripe-major and can do neither. Funnels
+/// Creation asks this to decide where the whole-file digests come from: a
+/// transform serves its first band from the file-parallel hashing sweep; a
+/// one-stripe dense pass can drive a fused hasher, while other dense feeds
+/// hydrate hashes separately. Funnels
 /// through `select_kernel_for_memory` exactly as `estimate_forward_memory`
 /// does, so the answer is the shape the pass will actually take.
 pub(crate) fn forward_feed_shape(
@@ -2273,6 +2273,7 @@ pub(crate) fn forward_feed_shape(
     source_count: usize,
     exponents: &[RecoveryExponent],
     memory_limit: usize,
+    explicit_memory_limit: bool,
     requested_kernel: ForwardKernel,
     transform_policy: TransformPolicy,
 ) -> Result<ForwardFeedShape> {
@@ -2300,7 +2301,7 @@ pub(crate) fn forward_feed_shape(
         source_count,
         exponents,
         memory_limit,
-        &buffers,
+        explicit_memory_limit,
         transform_policy,
     ) {
         return Ok(ForwardFeedShape {
@@ -2317,21 +2318,27 @@ pub(crate) fn forward_feed_shape(
 /// The one place the transform arm's admission is resolved, for the pass and
 /// for the planning question that must agree with it.
 ///
-/// The arm is admitted against the smaller of the caller's budget and what the
-/// dense arm reserves for the same shape, so taking it can only lower a pass's
-/// residency, never raise it — and the dense reservation the plan reports as
-/// the create's processing peak stays a true bound whichever arm runs.
+/// The transform has its own bounded budget. A caller's lower limit still wins;
+/// the create plan reports the larger of the transform and dense fallback peaks.
+const DEFAULT_TRANSFORM_BUDGET_BYTES: usize = 192 * 1024 * 1024;
+
+fn transform_budget(memory_limit: usize, explicit_memory_limit: bool) -> usize {
+    if explicit_memory_limit {
+        memory_limit
+    } else {
+        memory_limit.min(DEFAULT_TRANSFORM_BUDGET_BYTES)
+    }
+}
+
 fn admit_transform(
     slice_size: usize,
     source_count: usize,
     exponents: &[RecoveryExponent],
     memory_limit: usize,
-    dense: &BufferPlan,
+    explicit_memory_limit: bool,
     policy: TransformPolicy,
 ) -> Option<transform::TransformArm> {
-    let budget = memory_limit.min(dense.memory_bytes);
-    // The dense reservation differs by architecture (its kernel and stripe
-    // choice do), so tests that pin a transform geometry pin its budget.
+    let budget = transform_budget(memory_limit, explicit_memory_limit);
     #[cfg(test)]
     let budget = transform::test_probe::budget_override().unwrap_or(budget);
     transform::admit(slice_size, source_count, exponents, budget, policy)
@@ -2340,10 +2347,12 @@ fn admit_transform(
 pub(crate) fn estimate_forward_memory(
     slice_size: u64,
     source_count: usize,
-    output_count: usize,
+    exponents: &[RecoveryExponent],
     memory_limit: usize,
+    explicit_memory_limit: bool,
     requested_kernel: ForwardKernel,
 ) -> Result<ForwardMemoryEstimate> {
+    let output_count = exponents.len();
     if output_count == 0 {
         return Ok(ForwardMemoryEstimate {
             factor_workspace_bytes: 0,
@@ -2363,11 +2372,20 @@ pub(crate) fn estimate_forward_memory(
     )?;
     let factor_workspace_bytes = factor_workspace_bytes(kernel, source_count)?;
     let (jit_workspace_bytes, _) = jit_workspace_bytes(kernel, output_count)?;
+    let transform_peak = admit_transform(
+        slice_size,
+        source_count,
+        exponents,
+        memory_limit,
+        explicit_memory_limit,
+        TransformPolicy::Force,
+    )
+    .map_or(0, |_| transform_budget(memory_limit, explicit_memory_limit));
     Ok(ForwardMemoryEstimate {
         factor_workspace_bytes,
         jit_workspace_bytes,
         stripe_buffer_bytes: buffers.data_bytes,
-        processing_peak_bytes: buffers.memory_bytes,
+        processing_peak_bytes: buffers.memory_bytes.max(transform_peak),
     })
 }
 
@@ -3189,8 +3207,7 @@ mod tests {
     use super::*;
 
     /// The transform arm the automatic policy admits for one create shape,
-    /// resolved exactly as a pass resolves it: the dense arm's reservation at
-    /// `memory_limit` first, then the transform against it.
+    /// resolved against the default transform budget.
     fn auto_transform_for(
         slice_size: usize,
         source_count: usize,
@@ -3211,7 +3228,7 @@ mod tests {
             source_count,
             &exponents,
             memory_limit,
-            &dense,
+            false,
             TransformPolicy::Auto,
         );
         (arm.map(|arm| arm.shape()), dense.memory_bytes)
@@ -3222,7 +3239,50 @@ mod tests {
     const MEASURED_HOST_LIMIT: usize = 8 * 1024 * 1024 * 1024;
 
     #[test]
-    fn narrow_band_shapes_take_the_transform_inside_the_dense_reservation() {
+    fn transform_budget_and_plan_peak_follow_explicit_limits() {
+        const MIB: usize = 1024 * 1024;
+        assert_eq!(transform_budget(64 * MIB, true), 64 * MIB);
+        assert_eq!(transform_budget(1024 * MIB, false), 192 * MIB);
+        assert_eq!(transform_budget(384 * MIB, true), 384 * MIB);
+
+        let exponents: Vec<RecoveryExponent> = (0..819).collect();
+        for (limit, explicit) in [(64 * MIB, true), (1024 * MIB, false), (384 * MIB, true)] {
+            let (_, dense) = select_kernel_for_memory(
+                65_536,
+                exponents.len(),
+                4_096,
+                limit,
+                ForwardKernel::Auto,
+            )
+            .unwrap();
+            let estimate = estimate_forward_memory(
+                65_536,
+                4_096,
+                &exponents,
+                limit,
+                explicit,
+                ForwardKernel::Auto,
+            )
+            .unwrap();
+            assert!(estimate.processing_peak_bytes >= dense.memory_bytes);
+            assert!(estimate.processing_peak_bytes <= limit);
+            if admit_transform(
+                65_536,
+                4_096,
+                &exponents,
+                limit,
+                explicit,
+                TransformPolicy::Auto,
+            )
+            .is_some()
+            {
+                assert!(estimate.processing_peak_bytes >= transform_budget(limit, explicit));
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_band_shapes_fit_the_default_transform_budget() {
         // 10 x 100 MiB at 32,008-byte slices: 32,760 sources and 3,277
         // recovery blocks (10%), whose dense reservation buys a ~2.9 KiB band.
         // 32,768 slices of 5,552 bytes with 32,768 recovery blocks buys
@@ -3232,12 +3292,11 @@ mod tests {
             ("10x100MiB/32008/3277", 32_008, 32_760, 3_277),
             ("1x173MiB/5552/32768", 5_552, 32_768, 32_768),
         ] {
-            let (arm, dense_bytes) =
-                auto_transform_for(slice_size, sources, recovery, MEASURED_HOST_LIMIT);
+            let (arm, _) = auto_transform_for(slice_size, sources, recovery, MEASURED_HOST_LIMIT);
             let shape = arm.unwrap_or_else(|| panic!("{label}: the transform was refused"));
             assert!(
-                shape.total_bytes <= dense_bytes,
-                "{label}: {shape:?} exceeds the dense reservation {dense_bytes}"
+                shape.total_bytes <= DEFAULT_TRANSFORM_BUDGET_BYTES,
+                "{label}: {shape:?} exceeds the default transform budget"
             );
             assert!(shape.band >= 2 * 1024, "{label}: {shape:?}");
             assert!(shape.passes > 1, "{label}: expected a multi-pass arm");
@@ -4178,16 +4237,18 @@ mod tests {
         let one = estimate_forward_memory(
             4,
             MAX_TOTAL_INPUT_SLICES,
-            1,
+            &[0],
             3 * 1024 * 1024,
+            true,
             ForwardKernel::Portable,
         )
         .unwrap();
         let many = estimate_forward_memory(
             4,
             MAX_TOTAL_INPUT_SLICES,
-            MAX_TOTAL_INPUT_SLICES,
+            &(0..MAX_TOTAL_INPUT_SLICES as u32).collect::<Vec<_>>(),
             3 * 1024 * 1024,
+            true,
             ForwardKernel::Portable,
         )
         .unwrap();
@@ -4201,8 +4262,9 @@ mod tests {
         let result = estimate_forward_memory(
             4096,
             MAX_TOTAL_INPUT_SLICES,
-            MAX_TOTAL_INPUT_SLICES,
+            &(0..MAX_TOTAL_INPUT_SLICES as u32).collect::<Vec<_>>(),
             64 * 1024,
+            true,
             ForwardKernel::Portable,
         );
         assert!(matches!(
