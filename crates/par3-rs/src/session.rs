@@ -1291,9 +1291,9 @@ impl Par3RepairSession {
     /// paths in the report, and their parent directories if it wants the
     /// installation itself to survive a crash.
     ///
-    /// With `backup` on, a damaged file at a destination is kept as
-    /// `<name>.1`, or the next free number, and the rebuilt file is renamed
-    /// over it; with it off, which is [`crate::RepairOptions`]'s default, the
+    /// With `backup` on, a damaged file at a destination moves to
+    /// `<name>.1`, or the next free number, and the rebuilt file moves into
+    /// the name it vacated; with it off, which is [`crate::RepairOptions`]'s default, the
     /// damaged bytes are not kept. Sources are only read, except that on macOS
     /// and Linux, with `backup` off and no clone available, a damaged file
     /// whose destination is that very file (single link, handed over by its

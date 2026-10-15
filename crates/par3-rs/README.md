@@ -101,8 +101,8 @@ fn main() -> Result<()> {
 
 Clean files are left alone. Rebuilt files are staged and verified before
 installation. No backup of a damaged file is kept by default;
-`RepairOptions::default().with_backup(true)` keeps it as `<name>.1` (or the
-next free number) before the rebuilt file is renamed over it. Inspect the
+`RepairOptions::default().with_backup(true)` moves it to `<name>.1` (or the
+next free number) and the rebuilt file into the name it vacated. Inspect the
 report for incomplete repairs. `plan_repair` is available for a separate
 assessment, but `repair_set` performs its own analysis. Use a retained session
 to reuse evidence.
