@@ -1704,7 +1704,7 @@ dependencies = [
 [[package]]
 name = "lzma-turbo"
 version = "0.10.0"
-source = "git+https://github.com/scryer-media/lzma-turbo?rev=81024decc63b3a39d91ce30620661785148ad280#81024decc63b3a39d91ce30620661785148ad280"
+source = "git+https://github.com/scryer-media/lzma-turbo?rev=9692dc792998041d70ef470dcc5fd6a6fa3dc4c5#9692dc792998041d70ef470dcc5fd6a6fa3dc4c5"
 dependencies = [
  "aws-lc-rs",
  "crc-fast",
