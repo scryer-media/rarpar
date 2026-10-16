@@ -326,10 +326,16 @@ jobs:
         # predates them, so the `par3` profile rides along until a corpus
         # revision carrying the widened `unit` profile is pinned.
         run: cargo run --locked -p xtask -- test-corpus hydrate --profile unit --profile par3
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - name: Run no-fixture Rust tests
         # `--features unrar-rs/unstable-internals`: see the clippy lane. Without
         # it the `probe_volumes` example is skipped rather than compiled.
-        run: cargo test --locked --workspace --lib --bins --examples --no-fail-fast --features unrar-rs/unstable-internals
+        # `--lib --bins --examples` never selected doctests, so nextest, which
+        # does not run them, loses nothing here.
+        run: cargo nextest run --locked --workspace --lib --bins --examples --no-fail-fast --features unrar-rs/unstable-internals
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
@@ -413,27 +419,32 @@ jobs:
               exit 1
             fi
           done
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - name: Test unrar-rs on the RustCrypto backend
         # The crypto module (KDF, AES-CBC seam, BLAKE2sp) and the encrypted
-        # archives that run through it end to end.
+        # archives that run through it end to end. The trailing names are
+        # nextest substring filters, as they were cargo test filters.
         run: |
           set -euo pipefail
-          cargo test --locked -p unrar-rs --lib --no-default-features --features crypto-rust crypto::
-          cargo test --locked -p unrar-rs --test integration --no-default-features --features crypto-rust encrypted
+          cargo nextest run --locked --no-fail-fast -p unrar-rs --lib --no-default-features --features crypto-rust crypto::
+          cargo nextest run --locked --no-fail-fast -p unrar-rs --test integration --no-default-features --features crypto-rust encrypted
       - name: Test par2-rs on the RustCrypto backend
         # The MD5/CRC seam, and a verify/repair pass that runs on top of it.
         run: |
           set -euo pipefail
-          cargo test --locked -p par2-rs --lib --no-default-features --features crypto-rust checksum::
-          cargo test --locked -p par2-rs --test checksum --no-default-features --features crypto-rust
-          cargo test --locked -p par2-rs --test stateful_session --no-default-features --features crypto-rust
+          cargo nextest run --locked --no-fail-fast -p par2-rs --lib --no-default-features --features crypto-rust checksum::
+          cargo nextest run --locked --no-fail-fast -p par2-rs --test checksum --no-default-features --features crypto-rust
+          cargo nextest run --locked --no-fail-fast -p par2-rs --test stateful_session --no-default-features --features crypto-rust
       - name: Test the libraries with both backends enabled
         # Enabling both must keep AWS-LC active and compile the pure-Rust
         # backend beside it, which is what the differential tests compare.
         run: |
           set -euo pipefail
-          cargo test --locked -p unrar-rs --lib --features crypto-rust crypto::
-          cargo test --locked -p par2-rs --lib --features crypto-rust checksum::
+          cargo nextest run --locked --no-fail-fast -p unrar-rs --lib --features crypto-rust crypto::
+          cargo nextest run --locked --no-fail-fast -p par2-rs --lib --features crypto-rust checksum::
       - name: Check rarpar on the RustCrypto backend
         run: cargo check --locked -p rarpar --no-default-features --features runtime,crypto-rust
       - name: Run clippy on the RustCrypto backend
@@ -562,6 +573,10 @@ jobs:
           cosign-release: ${{ env.COSIGN_VERSION }}
       - name: Verify the corpus against its ledger, lock and signature
         run: cargo run --locked -p xtask -- test-corpus verify --all-present --require-signature
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - name: Run the workspace fixture tests outside the per-crate lanes
         run: |
           set -euo pipefail
@@ -595,7 +610,13 @@ jobs:
               exit 1
             fi
           done
-          cargo test --locked --workspace --no-fail-fast \
+          cargo nextest run --locked --workspace --no-fail-fast \
+            --exclude unrar-rs \
+            --exclude par2-rs \
+            --exclude par3-rs
+          # nextest does not run doctests; this keeps the ones the old
+          # `cargo test --workspace` pass ran.
+          cargo test --locked --workspace --doc --no-fail-fast \
             --exclude unrar-rs \
             --exclude par2-rs \
             --exclude par3-rs
@@ -651,11 +672,16 @@ jobs:
           sccache --zero-stats || true
       - name: Hydrate the test corpus (par2)
         run: cargo run --locked -p xtask -- test-corpus hydrate --profile par2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - name: Run the par2-rs suite
         run: |
           set -euo pipefail
 
-          # The whole crate, once: lib, every `tests/` target, and doctests.
+          # The whole crate, once: lib and every `tests/` target under
+          # nextest, then the doctests, which nextest does not run.
           # `fixture-tests` excludes par2-rs, so nothing here is a repeat.
           # `--features slow-tests` brings the gated coverage along in the same
           # build and the same pass — the three fully-gated targets
@@ -664,7 +690,8 @@ jobs:
           # `src/repairer.rs` — instead of a second, separately-compiled lane.
           # A feature name that stops existing is a hard cargo error, not a
           # silent zero.
-          cargo test --locked -p par2-rs --features slow-tests --no-fail-fast
+          cargo nextest run --locked -p par2-rs --features slow-tests --no-fail-fast
+          cargo test --locked -p par2-rs --features slow-tests --doc --no-fail-fast
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
@@ -696,8 +723,16 @@ jobs:
           targets: wasm32-wasip1
       - name: Hydrate the test corpus (par3)
         run: cargo run --locked -p xtask -- test-corpus hydrate --profile par3
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - name: Run the par3-rs suite
-        run: cargo test --locked -p par3-rs --no-fail-fast
+        # nextest does not run doctests; the second command keeps them.
+        run: |
+          set -euo pipefail
+          cargo nextest run --locked -p par3-rs --no-fail-fast
+          cargo test --locked -p par3-rs --doc --no-fail-fast
       - name: Check the wasm32-wasip1 build
         run: cargo check --locked -p par3-rs --target wasm32-wasip1
 
@@ -944,8 +979,13 @@ jobs:
         # predates them, so the `par3` profile rides along until a corpus
         # revision carrying the widened `unit` profile is pinned.
         run: cargo run --locked -p xtask -- test-corpus hydrate --profile unit --profile par3
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - name: Run platform unit tests
-        run: cargo test --locked --workspace --lib --bins --no-fail-fast
+        # `--lib --bins` never selected doctests, so nextest loses none.
+        run: cargo nextest run --locked --workspace --lib --bins --no-fail-fast
       - name: Show sccache stats
         if: always()
         shell: bash
@@ -1013,8 +1053,13 @@ jobs:
         # predates them, so the `par3` profile rides along until a corpus
         # revision carrying the widened `unit` profile is pinned.
         run: cargo run --locked -p xtask -- test-corpus hydrate --profile unit --profile par3
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - name: Run platform unit tests
-        run: cargo test --locked --workspace --lib --bins --no-fail-fast
+        # `--lib --bins` never selected doctests, so nextest loses none.
+        run: cargo nextest run --locked --workspace --lib --bins --no-fail-fast
       - name: Show sccache stats
         if: always()
         shell: bash
@@ -1093,8 +1138,13 @@ jobs:
         # predates them, so the `par3` profile rides along until a corpus
         # revision carrying the widened `unit` profile is pinned.
         run: cargo run --locked -p xtask -- test-corpus hydrate --profile unit --profile par3
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - name: Run platform unit tests
-        run: cargo test --locked --workspace --lib --bins --no-fail-fast
+        # `--lib --bins` never selected doctests, so nextest loses none.
+        run: cargo nextest run --locked --workspace --lib --bins --no-fail-fast
       - name: Show sccache stats
         if: always()
         shell: bash

@@ -572,7 +572,6 @@ jobs:
           cp "$RUNNER_TEMP/build/test-corpus/sources.json" test-corpus/sources.json
 
       - name: Install cargo-nextest
-        if: ${{ matrix.lane == 'unrar' }}
         uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
         with:
           tool: cargo-nextest@0.9.143
@@ -582,7 +581,9 @@ jobs:
           set -euo pipefail
           case "$LANE" in
             workspace)
-              cargo test --locked --workspace --no-fail-fast
+              cargo nextest run --locked --workspace --no-fail-fast
+              # nextest does not run doctests.
+              cargo test --locked --workspace --doc --no-fail-fast
               ;;
             unrar)
               cargo nextest run --locked -p unrar-rs --features slow-tests \
@@ -594,7 +595,8 @@ jobs:
               fi
               ;;
             par2)
-              cargo test --locked -p par2-rs --features slow-tests --no-fail-fast
+              cargo nextest run --locked -p par2-rs --features slow-tests --no-fail-fast
+              cargo test --locked -p par2-rs --features slow-tests --doc --no-fail-fast
               ;;
             *)
               echo "::error::unknown validation lane $LANE"
