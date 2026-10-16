@@ -25,6 +25,14 @@ documented in each crate's own changelog so those notes ship with the crate.
 - Stored members extract without a second copy of every byte for hashing
   (unrar-rs 0.11.2). On a 4-core Atom C3538 the stored-media cases move from
   0.85–0.92× of UnRAR 7.23 to 1.08–1.22×.
+- The Linux musl binaries build mimalloc with transparent huge pages off by
+  default (`MI_DEFAULT_ALLOW_THP=0`), so mimalloc no longer asks the kernel
+  for huge pages. On a kernel with THP set to `madvise` or `always`, peak RSS
+  roughly halves at the same wall time: on a 16-core Alder Lake, 67 → 20 MiB
+  for an 820 KiB RAR5 archive and 105 → 49 MiB for a compressed binary set.
+  The exception is RAR4 PPMd with a 32 MiB model, which runs about 6% slower
+  (6.2 → 6.6 s). `MIMALLOC_ALLOW_THP=1` restores the old behaviour. The glibc,
+  macOS and Windows binaries use the system allocator and are unchanged.
 
 ### Benchmark harness only
 
