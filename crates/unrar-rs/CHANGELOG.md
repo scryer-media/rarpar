@@ -12,6 +12,15 @@
   460 ms (UnRAR 7.23: 400 ms), and peak RSS falls from 14.5 to 9.5 MiB.
 - Hash worker buffers are allocated at the 1 MiB they are filled to,
   instead of 4 MiB.
+- When the hash runs on worker threads (a member of 8 MiB or more on a
+  native target), a stored member's reads run on their own thread, up to two
+  spans ahead of the writes, so reading the volume and writing the output
+  overlap instead of taking turns. Spans still reach the output and the hash
+  in order; a read error is reported after every span read before it has been
+  written; the reads and writes are the same calls. `DecodeMode::Serial`
+  keeps the reads on the calling thread. On the Atom C3538 the 248 MiB set takes 260 ms instead of
+  350 ms, and the other stored cases are 8–29% faster; peak RSS on that set
+  rises from 9.8 to 13.6 MiB.
 
 ## 0.11.1
 

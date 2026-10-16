@@ -22,9 +22,11 @@ documented in each crate's own changelog so those notes ship with the crate.
   directory, because those members are checked against their targets.
   Each tested file prints `Testing  <name> OK`. On a 4-core Atom C3538,
   testing 248 MiB of stored media takes 0.20 s instead of 0.50 s.
-- Stored members extract without a second copy of every byte for hashing
-  (unrar-rs 0.11.2). On a 4-core Atom C3538 the stored-media cases move from
-  0.85–0.92× of UnRAR 7.23 to 1.08–1.22×.
+- Stored members extract without a second copy of every byte for hashing,
+  and large ones read ahead of the writes on a second thread (unrar-rs
+  0.11.2). On a 4-core Atom C3538 the stored-media cases move from
+  0.85–0.92× of UnRAR 7.23 to 1.17–1.57×, and encrypted stored media from
+  1.79× to 2.50×.
 - The Linux musl binaries build mimalloc with transparent huge pages off by
   default (`MI_DEFAULT_ALLOW_THP=0`), so mimalloc no longer asks the kernel
   for huge pages. On a kernel with THP set to `madvise` or `always`, peak RSS

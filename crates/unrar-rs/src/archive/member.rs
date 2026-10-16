@@ -21,6 +21,9 @@ const STREAMING_STORE_CHUNK_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 /// stays at or above [`OUTPUT_WRITE_BUFFER_BYTES`] so writes bypass the
 /// `BufWriter`.
 const STORE_HASHED_CHUNK_BYTES: usize = crate::hash_pipeline::PENDING_FLUSH_BYTES;
+/// Spans an overlapped store copy's reader thread may queue ahead of the
+/// writer. Two keep both kernel copies busy; more only adds resident buffers.
+const STORE_READ_AHEAD_CHUNKS: usize = 2;
 /// Output buffer for member extraction, deliberately smaller than the spans the
 /// producers hand down (store copies at [`STREAMING_STORE_CHUNK_BUFFER_BYTES`],
 /// LZ window flushes at up to 4 MiB). `BufWriter` bypasses its buffer only for
@@ -3997,12 +4000,85 @@ impl RarArchive {
     /// store copy: each span is read straight into a buffer from
     /// `stream_hash`'s pool, written, and then handed to the hash lanes, so no
     /// byte is copied a second time on the way to the hasher.
-    fn copy_reader_hashed<R: Read, W: Write + ?Sized>(
-        mut reader: R,
+    ///
+    /// When the stream hashes on worker threads (a large member on a native
+    /// target), the reads run on a scoped thread ahead of the writes, so the
+    /// kernel's copy out of the volume and its copy into the output overlap
+    /// instead of taking turns. Chunks still reach the writer and the hasher in
+    /// order, a read error surfaces after every span read before it is
+    /// written, as in the serial loop, and the I/O calls are the same ones.
+    fn copy_reader_hashed<R: Read + Send, W: Write + ?Sized>(
+        reader: R,
         writer: &mut W,
         stream_hash: &SharedHashStream,
         limit: StoreCopyLimit,
         member_name: &str,
+    ) -> RarResult<u64> {
+        if stream_hash.is_pipelined() && !crate::decompress::policy::serial() {
+            return Self::copy_reader_hashed_overlapped(
+                reader,
+                writer,
+                stream_hash,
+                limit,
+                member_name,
+            );
+        }
+        Self::read_store_chunks(reader, stream_hash, limit, member_name, |chunk| {
+            writer.write_all(&chunk).map_err(RarError::Io)?;
+            stream_hash.submit(chunk).map_err(RarError::Io)
+        })
+    }
+
+    fn copy_reader_hashed_overlapped<R: Read + Send, W: Write + ?Sized>(
+        reader: R,
+        writer: &mut W,
+        stream_hash: &SharedHashStream,
+        limit: StoreCopyLimit,
+        member_name: &str,
+    ) -> RarResult<u64> {
+        let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel(STORE_READ_AHEAD_CHUNKS);
+        std::thread::scope(|scope| {
+            let read_thread = std::thread::Builder::new()
+                .name("weaver-rar-read".into())
+                .spawn_scoped(scope, move || {
+                    Self::read_store_chunks(reader, stream_hash, limit, member_name, |chunk| {
+                        // A closed channel means the writer failed; its error
+                        // is the one returned.
+                        chunk_tx.send(chunk).map_err(|_| {
+                            RarError::Io(std::io::Error::other("store copy writer stopped"))
+                        })
+                    })
+                })
+                .map_err(RarError::Io)?;
+
+            let mut write_result = Ok(());
+            for chunk in &chunk_rx {
+                write_result = writer
+                    .write_all(&chunk)
+                    .and_then(|()| stream_hash.submit(chunk))
+                    .map_err(RarError::Io);
+                if write_result.is_err() {
+                    break;
+                }
+            }
+            // Unblocks a reader waiting on a full channel after a write error.
+            drop(chunk_rx);
+            let read_result = read_thread
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            write_result?;
+            read_result
+        })
+    }
+
+    /// The hashed store copy's read loop: fills pooled spans up to `limit`
+    /// and passes each to `sink` in order. Returns the bytes read.
+    fn read_store_chunks<R: Read>(
+        mut reader: R,
+        stream_hash: &SharedHashStream,
+        limit: StoreCopyLimit,
+        member_name: &str,
+        mut sink: impl FnMut(Vec<u8>) -> RarResult<()>,
     ) -> RarResult<u64> {
         let mut written = 0u64;
 
@@ -4027,9 +4103,8 @@ impl RarArchive {
                 break;
             }
             chunk.truncate(read);
-            writer.write_all(&chunk).map_err(RarError::Io)?;
             written += read as u64;
-            stream_hash.submit(chunk).map_err(RarError::Io)?;
+            sink(chunk)?;
         }
 
         Ok(written)
@@ -5461,7 +5536,7 @@ impl RarArchive {
         let base_reader =
             ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &entry.segments, &fh.name)
                 .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
-        let reader: Box<dyn std::io::Read + '_> = if let Some(password) = member_password.as_deref()
+        let reader: Box<dyn std::io::Read + Send + '_> = if let Some(password) = member_password.as_deref()
         {
             if archive_format.is_rar4_family() {
                 Box::new(Self::wrap_rar4_encrypted_reader(
@@ -9662,5 +9737,201 @@ mod tests {
             Err(err) => panic!("expected unsupported encryption KDF count, got {err}"),
             Ok(_) => panic!("expected unsupported encryption KDF count, got success"),
         }
+    }
+
+    /// Hands out at most `step` bytes per read and, with `fail_at`, fails
+    /// every read once that many bytes are out.
+    struct ScriptedStoreReader {
+        data: Vec<u8>,
+        pos: usize,
+        step: usize,
+        fail_at: Option<usize>,
+    }
+
+    impl Read for ScriptedStoreReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.fail_at.is_some_and(|at| self.pos >= at) {
+                return Err(std::io::Error::other("scripted read failure"));
+            }
+            let mut end = self.data.len().min(self.pos + self.step.min(buf.len()));
+            if let Some(at) = self.fail_at {
+                end = end.min(at);
+            }
+            let read = end - self.pos;
+            buf[..read].copy_from_slice(&self.data[self.pos..end]);
+            self.pos = end;
+            Ok(read)
+        }
+    }
+
+    fn scripted_store_reader(data: &[u8], fail_at: Option<usize>) -> ScriptedStoreReader {
+        // An odd step makes reads end inside spans, as volume boundaries do.
+        ScriptedStoreReader {
+            data: data.to_vec(),
+            pos: 0,
+            step: 300_001,
+            fail_at,
+        }
+    }
+
+    /// Accepts `capacity` bytes, then fails every write.
+    struct FailingStoreWriter {
+        accepted: Vec<u8>,
+        capacity: usize,
+    }
+
+    impl Write for FailingStoreWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let take = buf.len().min(self.capacity - self.accepted.len());
+            if take == 0 {
+                return Err(std::io::Error::other("scripted write failure"));
+            }
+            self.accepted.extend_from_slice(&buf[..take]);
+            Ok(take)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn stored_payload(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i.wrapping_mul(31) ^ (i >> 7)) as u8).collect()
+    }
+
+    fn overlapped_store_len() -> usize {
+        crate::hash_pipeline::PIPELINE_MIN_BYTES as usize + 3 * STORE_HASHED_CHUNK_BYTES + 777
+    }
+
+    fn pipelined_store_hash(len: usize) -> Arc<SharedHashStream> {
+        let stream = SharedHashStream::new(true, false, true, len as u64);
+        assert!(stream.is_pipelined(), "expected the worker hash path");
+        stream
+    }
+
+    fn overlapped_store_copy<R: Read + Send, W: Write + ?Sized>(
+        reader: R,
+        writer: &mut W,
+        stream_hash: &SharedHashStream,
+        limit: StoreCopyLimit,
+    ) -> RarResult<u64> {
+        RarArchive::copy_reader_hashed_overlapped(reader, writer, stream_hash, limit, "member.bin")
+    }
+
+    /// The overlapped store copy writes and hashes exactly what the serial
+    /// loop does, with reads that end inside spans.
+    #[test]
+    fn overlapped_store_copy_matches_serial_copy() {
+        let data = stored_payload(overlapped_store_len());
+        let limit = StoreCopyLimit::Exact(data.len() as u64);
+
+        let overlapped_hash = pipelined_store_hash(data.len());
+        let mut overlapped = Vec::new();
+        let written = overlapped_store_copy(
+            scripted_store_reader(&data, None),
+            &mut overlapped,
+            &overlapped_hash,
+            limit,
+        )
+        .expect("overlapped copy");
+        let overlapped_outputs = overlapped_hash.finalize().expect("overlapped hashes");
+
+        let serial_hash = SharedHashStream::new(true, false, true, 0);
+        assert!(!serial_hash.is_pipelined());
+        let mut serial = Vec::new();
+        RarArchive::copy_reader_hashed(
+            scripted_store_reader(&data, None),
+            &mut serial,
+            &serial_hash,
+            limit,
+            "member.bin",
+        )
+        .expect("serial copy");
+        let serial_outputs = serial_hash.finalize().expect("serial hashes");
+
+        assert_eq!(written, data.len() as u64);
+        assert!(overlapped == data, "overlapped output differs from the source");
+        assert!(serial == data, "serial output differs from the source");
+        assert_eq!(overlapped_outputs.crc32, Some(crate::crc::hash(&data)));
+        assert_eq!(overlapped_outputs.crc32, serial_outputs.crc32);
+        assert_eq!(overlapped_outputs.blake2sp, serial_outputs.blake2sp);
+        assert!(overlapped_outputs.blake2sp.is_some());
+    }
+
+    /// A member that ends early is still an error, after everything read
+    /// before the end was written.
+    #[test]
+    fn overlapped_store_copy_reports_early_eof_after_writing_what_was_read() {
+        let data = stored_payload(overlapped_store_len());
+        let short = &data[..data.len() - 1000];
+        let stream_hash = pipelined_store_hash(data.len());
+        let mut output = Vec::new();
+        let err = overlapped_store_copy(
+            scripted_store_reader(short, None),
+            &mut output,
+            &stream_hash,
+            StoreCopyLimit::Exact(data.len() as u64),
+        )
+        .expect_err("short member must fail");
+        assert!(
+            matches!(&err, RarError::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof),
+            "unexpected error: {err}"
+        );
+        assert!(output == short, "output must hold every byte read");
+    }
+
+    /// A read error ends the copy at the same byte the serial loop would.
+    #[test]
+    fn overlapped_store_copy_stops_at_a_read_error() {
+        let data = stored_payload(overlapped_store_len());
+        let fail_at = 5 * STORE_HASHED_CHUNK_BYTES + 3;
+        let stream_hash = pipelined_store_hash(data.len());
+        let mut output = Vec::new();
+        let err = overlapped_store_copy(
+            scripted_store_reader(&data, Some(fail_at)),
+            &mut output,
+            &stream_hash,
+            StoreCopyLimit::Exact(data.len() as u64),
+        )
+        .expect_err("read error must fail the copy");
+        assert!(format!("{err}").contains("scripted read failure"), "{err}");
+        assert!(output == data[..fail_at], "output must stop at the failed read");
+    }
+
+    /// A write error returns that error and does not leave the reader thread
+    /// blocked on a full queue.
+    #[test]
+    fn overlapped_store_copy_returns_the_write_error() {
+        let data = stored_payload(overlapped_store_len());
+        let stream_hash = pipelined_store_hash(data.len());
+        let mut writer = FailingStoreWriter {
+            accepted: Vec::new(),
+            capacity: 2 * STORE_HASHED_CHUNK_BYTES + 5,
+        };
+        let err = overlapped_store_copy(
+            scripted_store_reader(&data, None),
+            &mut writer,
+            &stream_hash,
+            StoreCopyLimit::Exact(data.len() as u64),
+        )
+        .expect_err("write error must fail the copy");
+        assert!(format!("{err}").contains("scripted write failure"), "{err}");
+        assert!(writer.accepted == data[..writer.capacity]);
+    }
+
+    /// A member longer than its ceiling still fails the ceiling check.
+    #[test]
+    fn overlapped_store_copy_enforces_the_ceiling() {
+        let data = stored_payload(overlapped_store_len());
+        let stream_hash = pipelined_store_hash(data.len());
+        let mut output = Vec::new();
+        let err = overlapped_store_copy(
+            scripted_store_reader(&data, None),
+            &mut output,
+            &stream_hash,
+            StoreCopyLimit::AtMost(data.len() as u64 - 10),
+        )
+        .expect_err("oversized member must fail");
+        assert!(matches!(err, RarError::ResourceLimit { .. }), "unexpected error: {err}");
     }
 }

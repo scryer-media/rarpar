@@ -830,6 +830,12 @@ impl SharedHashStream {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Whether chunks are hashed on worker threads: a large member on a
+    /// native target. The store copy overlaps its reads and writes only then.
+    pub(crate) fn is_pipelined(&self) -> bool {
+        matches!(*self.lock(), StreamState::Pipelined { .. })
+    }
+
     /// Borrow-slice update (writer wrappers). May copy into an internal
     /// accumulation buffer in pipelined mode. Do not mix with
     /// [`Self::submit`] on the same stream.
