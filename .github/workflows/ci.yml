@@ -2395,7 +2395,9 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: valgrind --quiet --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: valgrind --quiet --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect
+          # ARM64 alone loads one documented suppression; see
+          # .github/valgrind/aarch64-memcheck.supp.
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: valgrind --quiet --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect --suppressions=${{ github.workspace }}/.github/valgrind/aarch64-memcheck.supp
         run: cargo nextest run --locked --no-fail-fast -p "$CRATE" --lib -E "$FILTER"
 
   unsafe-sanitizer:

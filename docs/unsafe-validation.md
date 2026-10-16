@@ -114,5 +114,19 @@ What no lane above runs, so that a pass is not read as more than it is:
 failed, cancelled or skipped while crates are affected; the Miri shards alone
 may be skipped, and only when discovery found no Miri-covered crate
 affected. `ci-complete` needs it, so a memory-safety failure fails the
-required check. No sanitizer suppression, retry or interpreter check is
-disabled.
+required check. No retry or interpreter check is disabled, and no sanitizer
+suppression is used. Memcheck carries one suppression, on ARM64 only:
+`.github/valgrind/aarch64-memcheck.supp`, loaded by the ARM64
+`unsafe-valgrind` runner (the reedsolomon-rs and par3-rs lanes hit it), holds
+one `Memcheck:Cond` entry for `reedsolomon_rs::fft::add_tile`. ARM64 Memcheck
+reports a conditional jump on uninitialised values there, reached from
+`transform_tiles_alone`/`transform_sum` in
+`fft::tests::tiled_transforms_match_whole_row_sweeps` (reedsolomon-rs) and
+`fft::lane_tests::the_four_step_gate_does_not_change_a_byte` and
+`fft::lane_tests::the_byte_lane_matches_the_word_lane_bit_for_bit` (par3-rs).
+It is judged a false positive: everything `add_tile` reads is initialised
+(`after` is cloned from a collected vector; the tile views and `sum` are rows
+of `RowBank::zeroed` or collected `Vec`s, with no `set_len` or `MaybeUninit`
+in either crate's FFT), and the same tests pass under x86-64 Memcheck and
+under AddressSanitizer on both architectures. Remove it when a newer Valgrind
+passes those tests without it.
