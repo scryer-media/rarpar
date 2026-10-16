@@ -31,7 +31,8 @@
   encrypted stored media extracts in 110 ms instead of 140 ms, with or
   without encrypted headers; CPU time rises from 190 to 230 ms and peak RSS
   from 12.2 to 15.5 MiB, because the decrypt thread copies each span out of
-  the read-ahead buffer.
+  the read-ahead buffer. The reading thread reuses those buffers at their
+  full length, so only a newly allocated one is ever zeroed.
 
 ## 0.11.1
 

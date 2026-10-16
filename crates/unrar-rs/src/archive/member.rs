@@ -57,9 +57,9 @@ const WINDOWS_FILE_ATTRIBUTE_READONLY: u32 = 0x1;
 /// thread read, served as one ordered byte stream to the decrypting reader.
 /// Spent spans go back to the fetch thread for reuse.
 struct StagedCiphertext {
-    chunks: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    chunks: std::sync::mpsc::Receiver<std::io::Result<StagedSpan>>,
     spare: std::sync::mpsc::Sender<Vec<u8>>,
-    current: Vec<u8>,
+    current: StagedSpan,
     pos: usize,
     finished: bool,
     /// The fetch error, kept so that every read after it fails too. The
@@ -68,9 +68,18 @@ struct StagedCiphertext {
     failed: Option<(std::io::ErrorKind, String)>,
 }
 
+/// One span the fetch thread read: a buffer kept at its full length, so the
+/// next read into it after recycling needs no resize and no zeroing, and the
+/// count of bytes the read put at its start.
+#[derive(Default)]
+struct StagedSpan {
+    bytes: Vec<u8>,
+    filled: usize,
+}
+
 impl Read for StagedCiphertext {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        while self.pos == self.current.len() {
+        while self.pos == self.current.filled {
             if let Some((kind, message)) = &self.failed {
                 return Err(std::io::Error::new(*kind, message.clone()));
             }
@@ -78,8 +87,8 @@ impl Read for StagedCiphertext {
                 return Ok(0);
             }
             let spent = std::mem::take(&mut self.current);
-            if spent.capacity() > 0 {
-                let _ = self.spare.send(spent);
+            if !spent.bytes.is_empty() {
+                let _ = self.spare.send(spent.bytes);
             }
             self.pos = 0;
             match self.chunks.recv() {
@@ -94,8 +103,8 @@ impl Read for StagedCiphertext {
                 }
             }
         }
-        let n = (self.current.len() - self.pos).min(buf.len());
-        buf[..n].copy_from_slice(&self.current[self.pos..self.pos + n]);
+        let n = (self.current.filled - self.pos).min(buf.len());
+        buf[..n].copy_from_slice(&self.current.bytes[self.pos..self.pos + n]);
         self.pos += n;
         Ok(n)
     }
@@ -4147,7 +4156,7 @@ impl RarArchive {
         let reader = decrypt(Box::new(StagedCiphertext {
             chunks: raw_rx,
             spare: spare_tx,
-            current: Vec::new(),
+            current: StagedSpan::default(),
             pos: 0,
             finished: false,
             failed: None,
@@ -4157,18 +4166,20 @@ impl RarArchive {
                 .name("weaver-rar-fetch".into())
                 .spawn_scoped(scope, move || {
                     let mut ciphertext = ciphertext;
+                    // A buffer an interrupted read left unused.
+                    let mut unused: Option<Vec<u8>> = None;
                     loop {
-                        let mut chunk = spare_rx
-                            .try_recv()
-                            .unwrap_or_else(|_| vec![0u8; STORE_HASHED_CHUNK_BYTES]);
-                        chunk.resize(STORE_HASHED_CHUNK_BYTES, 0);
-                        let sent = match ciphertext.read(&mut chunk) {
+                        // Recycled buffers come back at their full length, so
+                        // only a fresh allocation is ever zeroed.
+                        let mut bytes = unused
+                            .take()
+                            .or_else(|| spare_rx.try_recv().ok())
+                            .unwrap_or_else(|| vec![0u8; STORE_HASHED_CHUNK_BYTES]);
+                        let sent = match ciphertext.read(&mut bytes) {
                             Ok(0) => break,
-                            Ok(read) => {
-                                chunk.truncate(read);
-                                raw_tx.send(Ok(chunk))
-                            }
+                            Ok(filled) => raw_tx.send(Ok(StagedSpan { bytes, filled })),
                             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                                unused = Some(bytes);
                                 continue;
                             }
                             Err(error) => {
@@ -10242,7 +10253,12 @@ mod tests {
     fn staged_ciphertext_repeats_a_fetch_error() {
         let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel(4);
         let (spare_tx, _spare_rx) = std::sync::mpsc::channel();
-        chunk_tx.send(Ok(vec![1, 2, 3])).expect("queue span");
+        chunk_tx
+            .send(Ok(StagedSpan {
+                bytes: vec![1, 2, 3],
+                filled: 3,
+            }))
+            .expect("queue span");
         chunk_tx
             .send(Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionReset,
@@ -10254,7 +10270,7 @@ mod tests {
         let mut staged = StagedCiphertext {
             chunks: chunk_rx,
             spare: spare_tx,
-            current: Vec::new(),
+            current: StagedSpan::default(),
             pos: 0,
             finished: false,
             failed: None,
@@ -10277,6 +10293,39 @@ mod tests {
                 "attempt {attempt}: {err}"
             );
         }
+    }
+
+    /// The staged ciphertext serves only the filled part of each span and
+    /// hands the buffer back at its full length, so the fetch thread can read
+    /// into it again without resizing or zeroing it.
+    #[test]
+    fn staged_ciphertext_serves_filled_bytes_and_recycles_whole_buffers() {
+        let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel(4);
+        let (spare_tx, spare_rx) = std::sync::mpsc::channel();
+        let mut first = vec![0xEE; 16];
+        first[..5].copy_from_slice(&[1, 2, 3, 4, 5]);
+        let mut second = vec![0xEE; 16];
+        second[..2].copy_from_slice(&[6, 7]);
+        for (bytes, filled) in [(first, 5), (second, 2)] {
+            chunk_tx
+                .send(Ok(StagedSpan { bytes, filled }))
+                .expect("queue span");
+        }
+        drop(chunk_tx);
+        let mut staged = StagedCiphertext {
+            chunks: chunk_rx,
+            spare: spare_tx,
+            current: StagedSpan::default(),
+            pos: 0,
+            finished: false,
+            failed: None,
+        };
+
+        let mut stream = Vec::new();
+        staged.read_to_end(&mut stream).expect("staged stream");
+        assert_eq!(stream, [1, 2, 3, 4, 5, 6, 7]);
+        let recycled: Vec<usize> = spare_rx.try_iter().map(|buffer| buffer.len()).collect();
+        assert_eq!(recycled, [16, 16], "spent spans come back whole");
     }
 
     /// A write error returns that error and does not leave the reader thread
