@@ -246,12 +246,21 @@ func (t tableRows) cell(config, op string, workers int, backup bool) string {
 		return "–"
 	}
 	if ratio, ok := t.ratio(config, op, workers, backup); ok {
-		return fmt.Sprintf("%.1f (%s)", candidate.Wall.Median, speedText(ratio))
+		return fmt.Sprintf("%s (%s)", secondsText(candidate.Wall.Median), speedText(ratio))
 	}
 	if reference := t.reference(config, op); reference != nil && reference.DNF != "" {
-		return fmt.Sprintf("%.1f (reference DNF)", candidate.Wall.Median)
+		return secondsText(candidate.Wall.Median) + " (reference DNF)"
 	}
-	return fmt.Sprintf("%.1f", candidate.Wall.Median)
+	return secondsText(candidate.Wall.Median)
+}
+
+// secondsText is one decimal, or two below 0.1 s so a fast row never reads
+// "0.0".
+func secondsText(seconds float64) string {
+	if seconds < 0.095 {
+		return fmt.Sprintf("%.2f", seconds)
+	}
+	return fmt.Sprintf("%.1f", seconds)
 }
 
 // speedText keeps one decimal below 10× and none above: "4.4×", "14×".

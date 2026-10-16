@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="578" viewBox="0 0 1200 578" role="img" aria-labelledby="title desc">
+  <title id="title">PAR2 against PAR3: a-4m, create</title>
+  <desc id="desc">PAR2 (par2-rs, par2cmdline-turbo) and PAR3 (par3cmdline and rarpar par3, Cauchy and FFT) create of posting shape a-4m on 2 machine(s). Damage lost-13x4m (13 blocks). 1 GiB in one file, 4 MiB blocks, 10% (256 + 26): the census median block size and redundancy. Relative speed is par2cmdline-turbo median wall time divided by each arm&#39;s median wall time; each row also lists the arm&#39;s CPU time and peak RSS. par3cmdline is single-threaded and the PAR2 tools run at their default thread count. Every repair was checked against the inputs&#39; SHA-256.</desc>
+  <style>
+    .bg { fill: #ffffff; } text { font-family: Arial, sans-serif; fill: #172033; }
+    .title { font-size: 28px; font-weight: 600; } .subtitle { font-size: 14px; fill: #667085; }
+    .column { font-size: 12px; font-weight: 600; fill: #667085; letter-spacing: .04em; text-transform: uppercase; }
+    .machine { font-size: 15px; font-weight: 600; } .workload { font-size: 13px; font-weight: 500; }
+    .timing { font-size: 12px; fill: #667085; } .tick { font-size: 11px; fill: #667085; } .ratio { font-size: 12px; font-weight: 600; }
+    .grid { stroke: #d7dce5; stroke-width: 1; } .parity { stroke: #172033; stroke-width: 1.5; } .rule { stroke: #e7eaf0; stroke-width: 1; }
+    .cpu { fill: #2563eb; } .gpu { fill: #7c3aed; } .slower { fill: #d97706; }
+    @media (prefers-color-scheme: dark) { .bg { fill: #0d1117; } text { fill: #e6edf3; } .subtitle, .column, .timing, .tick { fill: #9ca7b5; } .grid { stroke: #30363d; } .parity { stroke: #e6edf3; } .rule { stroke: #21262d; } .cpu { fill: #58a6ff; } .gpu { fill: #bc8cff; } .slower { fill: #f2a65a; } }
+  </style>
+  <metadata>schema=rarpar-par3-bench-v4; shape=a-4m; op=create; baseline=par2cmdline-turbo; inputs=Alder Lake:93a71095a0cbe63c5423a1db0f7563455e0878d1ce5c298d9542e8bc992fb62b:1/7, Denverton:93a71095a0cbe63c5423a1db0f7563455e0878d1ce5c298d9542e8bc992fb62b:1/7</metadata>
+  <rect class="bg" width="1200" height="578"/>
+  <text class="title" x="48" y="48">PAR2 against PAR3: a-4m, create</text>
+  <text class="subtitle" x="48" y="75">Damage lost-13x4m (13 blocks). 1 GiB in one file, 4 MiB blocks, 10% (256 + 26): the census median block size and redundancy.</text>
+  <g aria-label="Legend"><rect class="slower" x="570" y="84" width="14" height="14" rx="2"/><text class="subtitle" x="592" y="96">par2cmdline-turbo faster</text><rect class="cpu" x="890" y="84" width="14" height="14" rx="2"/><text class="subtitle" x="912" y="96">arm faster</text></g>
+  <text class="column" x="48" y="112">Machine / arm / median wall, CPU, peak RSS</text>
+  <text class="column" x="620" y="112">Speed against par2cmdline-turbo</text>
+  <g aria-label="Relative speed axis">
+    <line class="grid" x1="620.0" y1="121" x2="620.0" y2="520"/><text class="tick" x="620.0" y="538" text-anchor="middle">8x</text>
+    <line class="grid" x1="708.3" y1="121" x2="708.3" y2="520"/><text class="tick" x="708.3" y="538" text-anchor="middle">4x</text>
+    <line class="grid" x1="796.7" y1="121" x2="796.7" y2="520"/><text class="tick" x="796.7" y="538" text-anchor="middle">2x</text>
+    <line class="parity" x1="885.0" y1="121" x2="885.0" y2="520"/><text class="tick" x="885.0" y="538" text-anchor="middle">1x parity</text>
+    <line class="grid" x1="973.3" y1="121" x2="973.3" y2="520"/><text class="tick" x="973.3" y="538" text-anchor="middle">2x</text>
+    <line class="grid" x1="1061.7" y1="121" x2="1061.7" y2="520"/><text class="tick" x="1061.7" y="538" text-anchor="middle">4x</text>
+    <line class="grid" x1="1150.0" y1="121" x2="1150.0" y2="520"/><text class="tick" x="1150.0" y="538" text-anchor="middle">8x</text>
+    <text class="tick" x="752.5" y="558" text-anchor="middle">par2cmdline-turbo faster</text>
+    <text class="tick" x="1017.5" y="558" text-anchor="middle">arm faster</text>
+  </g>
+  <g aria-label="a-4m create rows">
+    <text class="machine" x="48" y="152">Alder Lake</text><text class="timing" x="148" y="152">linux / amd64, 16 logical CPUs, rarpar par3 at 16 workers, 7 run(s) per arm</text>
+    <text class="workload" x="64" y="176">par2-rs</text>
+    <text class="timing" x="360" y="176">2.06 s wall  ·  4.69 s CPU  ·  524 MiB</text>
+    <rect class="slower" x="870.6" y="165" width="14.4" height="12" rx="2"/>
+    <text class="ratio" x="862.6" y="176" text-anchor="end">1.1x</text>
+    <text class="workload" x="64" y="200">par2cmdline-turbo</text>
+    <text class="timing" x="360" y="200">1.84 s wall  ·  4.03 s CPU  ·  213 MiB</text>
+    <text class="ratio" x="893.0" y="200">baseline</text>
+    <text class="workload" x="64" y="224">par3cmdline (Cauchy)</text>
+    <text class="timing" x="360" y="224">9.24 s wall  ·  9.24 s CPU  ·  213 MiB</text>
+    <rect class="slower" x="679.4" y="213" width="205.6" height="12" rx="2"/>
+    <text class="ratio" x="671.4" y="224" text-anchor="end">5.0x</text>
+    <text class="workload" x="64" y="248">par3cmdline (FFT)</text>
+    <text class="timing" x="360" y="248">2.55 s wall  ·  2.55 s CPU  ·  1293 MiB</text>
+    <rect class="slower" x="843.6" y="237" width="41.4" height="12" rx="2"/>
+    <text class="ratio" x="835.6" y="248" text-anchor="end">1.4x</text>
+    <text class="workload" x="64" y="272">rarpar par3 (Cauchy)</text>
+    <text class="timing" x="360" y="272">0.65 s wall  ·  4.52 s CPU  ·  213 MiB</text>
+    <rect class="cpu" x="885.0" y="261" width="132.0" height="12" rx="2"/>
+    <text class="ratio" x="1025.0" y="272">2.8x</text>
+    <text class="workload" x="64" y="296">rarpar par3 (FFT)</text>
+    <text class="timing" x="360" y="296">0.56 s wall  ·  2.47 s CPU  ·  213 MiB</text>
+    <rect class="cpu" x="885.0" y="285" width="151.4" height="12" rx="2"/>
+    <text class="ratio" x="1044.4" y="296">3.3x</text>
+    <line class="rule" x1="48" y1="309" x2="1150" y2="309"/>
+    <text class="machine" x="48" y="334">Denverton</text><text class="timing" x="139" y="334">linux / amd64, 4 logical CPUs, rarpar par3 at 4 workers, 7 run(s) per arm</text>
+    <text class="workload" x="64" y="358">par2-rs</text>
+    <text class="timing" x="360" y="358">6.03 s wall  ·  17.30 s CPU  ·  494 MiB</text>
+    <rect class="cpu" x="885.0" y="347" width="28.1" height="12" rx="2"/>
+    <text class="ratio" x="921.1" y="358">1.2x</text>
+    <text class="workload" x="64" y="382">par2cmdline-turbo</text>
+    <text class="timing" x="360" y="382">7.51 s wall  ·  13.62 s CPU  ·  211 MiB</text>
+    <text class="ratio" x="893.0" y="382">baseline</text>
+    <text class="workload" x="64" y="406">par3cmdline (Cauchy)</text>
+    <text class="timing" x="360" y="406">48.57 s wall  ·  47.87 s CPU  ·  211 MiB</text>
+    <rect class="slower" x="647.1" y="395" width="237.9" height="12" rx="2"/>
+    <text class="ratio" x="639.1" y="406" text-anchor="end">6.5x</text>
+    <text class="workload" x="64" y="430">par3cmdline (FFT)</text>
+    <text class="timing" x="360" y="430">10.79 s wall  ·  10.64 s CPU  ·  1290 MiB</text>
+    <rect class="slower" x="838.8" y="419" width="46.2" height="12" rx="2"/>
+    <text class="ratio" x="830.8" y="430" text-anchor="end">1.4x</text>
+    <text class="workload" x="64" y="454">rarpar par3 (Cauchy)</text>
+    <text class="timing" x="360" y="454">7.44 s wall  ·  21.29 s CPU  ·  211 MiB</text>
+    <rect class="cpu" x="885.0" y="443" width="1.3" height="12" rx="2"/>
+    <text class="ratio" x="894.3" y="454">1.0x</text>
+    <text class="workload" x="64" y="478">rarpar par3 (FFT)</text>
+    <text class="timing" x="360" y="478">3.32 s wall  ·  8.24 s CPU  ·  211 MiB</text>
+    <rect class="cpu" x="885.0" y="467" width="103.9" height="12" rx="2"/>
+    <text class="ratio" x="996.9" y="478">2.3x</text>
+    <line class="rule" x1="48" y1="491" x2="1150" y2="491"/>
+  </g>
+</svg>

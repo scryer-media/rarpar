@@ -71,16 +71,16 @@ hardware, so the Linux rows are, if anything, conservative.
 - *Windows CPU time.* The Windows machine's CPU-time counter is quantized to
   roughly 15.6 ms, so short cases report zero CPU seconds there. Every figure
   on this page is wall-clock and is unaffected.
-- *Shapes that lose.* On the seven machines re-measured in this round, RAR4
-  PPMd is now ahead of the reference decoder as a class on every one
+- *Shapes that lose.* On the nine machines measured on `rarpar 0.8.x`, RAR4
+  PPMd is ahead of the reference decoder as a class on every one
   (1.17×–1.62×), and PAR2 generation is ahead of `par2cmdline-turbo` on every
-  one (1.37×–2.22×). What still trails is small: on the three Intel machines,
-  PAR2 verification and the missing-volume repair run 0.87×–0.99×, and the
-  dense compressible source-text archives sit at 0.98×–1.01×. The four rows
-  carried from the previous publication (marked † below) still show its
-  picture: PPMd below parity on Alder Lake, Zen 2 and Denverton, and PAR2
-  generation below parity on Alder Lake, Zen 2 and Denverton. PAR2 generation
-  is charted per machine but is not part of the heavy-repair class.
+  one (1.19×–2.22×). What still trails is small: on the three Intel cloud
+  machines and Alder Lake, PAR2 verification and the missing-volume repair run
+  0.87×–0.99×; the dense compressible source-text archives sit at 0.87×–1.04×
+  across the nine; and on Denverton the four plain stored-media cases run
+  0.81×–0.92×. The rows carried from the previous publication (marked † below)
+  still show its picture: PPMd and PAR2 generation below parity on Zen 2. PAR2
+  generation is charted per machine but is not part of the heavy-repair class.
 
 ### Workload classes
 
@@ -91,7 +91,7 @@ hardware, so the Linux rows are, if anything, conservative.
 | **par2 (heavy)** | `par2-heavy-damage-28` + `par2-heavy-damage-250` | 2 |
 
 `unrar (text)` **includes PPMd.** PPMd is an archaic RAR4 mode; it is now
-ahead of the reference decoder on all seven re-measured machines, and it is
+ahead of the reference decoder on all nine current machines, and it is
 counted in the class either way.
 
 Six of the 43 cases sit outside these three classes. They are charted but not
@@ -109,28 +109,29 @@ refresh.
 
 | Component | Version |
 |---|---|
-| `rarpar` CLI | 0.8.0, tag `rarpar-v0.8.0` (workspace commit `ed50c1e`), the published release assets |
-| `par2-rs` | 0.10.9 |
-| `unrar-rs` | 0.11.0 |
+| `rarpar` CLI | 0.8.0, tag `rarpar-v0.8.0` (workspace commit `ed50c1e`), and 0.8.1, tag `rarpar-v0.8.1` (workspace commit `909fa03`), the published release assets |
+| `par2-rs` | 0.10.9 (0.10.10 in `rarpar 0.8.1`) |
+| `unrar-rs` | 0.11.0 (0.11.1 in `rarpar 0.8.1`) |
 | `par3-rs` | 0.7.0 |
 | `reedsolomon-rs` | 0.4.11 |
 | Rust toolchain | 1.97.1 |
 | Corpus | `rarpar-bench`, 43 cases, digest `59f46fa58f65…` |
 | RAR plan / PAR2 plan | `plan-e4222071b3f06c00` / `plan-900b3c52bca9463e` (Metal lane `plan-e9c4aa7366c941c8`) |
 
-**Seven rows were re-measured on `rarpar 0.8.0`** with the corpus, plans,
-protocol and reference binaries on this page: the seven cloud machines (Zen 4,
-Sapphire Rapids, Skylake-SP, Haswell, Cortex-A72, Neoverse N1, Neoverse V2),
-each running the published static-musl release binary for its architecture,
-verified against the release's `SHA256SUMS`. Their charts are regenerated from
-this run.
+**Nine rows are current.** Seven were measured on `rarpar 0.8.0`: the seven
+cloud machines (Zen 4, Sapphire Rapids, Skylake-SP, Haswell, Cortex-A72,
+Neoverse N1, Neoverse V2). Two were measured on `rarpar 0.8.1`: Alder Lake and
+Denverton, which also produced the [PAR3](#par3) sections. Every one ran the
+published static-musl release binary for its architecture, verified against
+the release's `SHA256SUMS`, with the corpus, plans, protocol and reference
+binaries on this page. Their charts are regenerated from those runs.
 
-**Four rows are carried from the previous publication, pending a re-measure,
-and are marked † wherever they appear:** Alder Lake, Zen 2, Denverton, and both
-Apple M5 Max lanes. Those rows measured `rarpar 0.3.3` (workspace commit
-`0ac98f7`, with `par2-rs` 0.5.0, `unrar-rs` 0.5.4 and `reedsolomon-rs` 0.4.2)
-on the same corpus and plans. The notes below about the Apple rows and the
-Windows settled-state pass describe that earlier run.
+**Two rows are carried from the previous publication, pending a re-measure,
+and are marked † wherever they appear:** Zen 2 and both Apple M5 Max lanes.
+Those rows measured `rarpar 0.3.3` (workspace commit `0ac98f7`, with `par2-rs`
+0.5.0, `unrar-rs` 0.5.4 and `reedsolomon-rs` 0.4.2) on the same corpus and
+plans. The notes below about the Apple rows and the Windows settled-state pass
+describe that earlier run.
 
 The Apple rows were measured under ordinary desktop load rather than on an idle
 machine; their per-sample spread is correspondingly wider than the other rows'.
@@ -160,13 +161,16 @@ Reference tools, with the binary identity recorded by each run:
 | `par2cmdline-turbo 1.4.0` | Linux arm64 | `df2884ca…` |
 | `par2cmdline-turbo 1.4.0` | Windows | `43779727…` |
 | `par2cmdline-turbo 1.4.0` | macOS arm64 | `32ab46c2…` |
-| `par3cmdline 0.0.1` (source build) | Linux x86-64 | `c0541701…` |
+| `par3cmdline 0.0.1` (source build) | Linux x86-64 | `c0541701…`, `a44cb662…` |
+| `par3cmdline 0.0.1` (static source build) | Linux x86-64, Denverton | `517bba34…` |
 | `par3cmdline 0.0.1` (source build) | Linux arm64 | `4413cc07…` |
 
-The two Linux x86-64 `par2cmdline-turbo` digests are the same released
-version provisioned by two paths; both are recorded rather than merged. The
-seven re-measured rows all used `9e65a4bb…`; `2c3ba0c5…` belongs to the
-carried Alder Lake and Denverton rows.
+Every Linux x86-64 row in this publication used `par2cmdline-turbo`
+`9e65a4bb…`. The two Linux x86-64 `par3cmdline` source builds are the same
+pinned commit built on different hosts: `c0541701…` on the seven cloud
+machines, `a44cb662…` on Alder Lake. Denverton's DSM userland has no
+toolchain, so it runs a statically linked build of the same pin, made on the
+Alder Lake machine.
 
 The harness, corpus generation, plan creation, and chart rendering are
 documented in [benchmarking.md](benchmarking.md).
@@ -179,11 +183,11 @@ Geometric mean per class, one decimal. Per-class breakouts follow each machine.
 |---|---|---|---:|---:|---:|
 | AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 2.5× | 1.8× | 3.3× |
 | Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 2.0× | 1.5× | 2.5× |
-| Intel Core i5-1240P (Alder Lake) † | x86-64 | GFNI + AVX2 | 1.6× | 1.3× | 2.2× |
+| Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 1.6× | 1.4× | 3.0× |
 | Intel Xeon Platinum 8124M (Skylake-SP) | x86-64 | AVX-512 | 1.6× | 1.3× | 2.3× |
 | AMD Ryzen 5 3600 (Zen 2) † | x86-64 | AVX2 | 1.6× | 1.5× | 1.6× |
 | Intel Xeon E5-2666 v3 (Haswell) | x86-64 | AVX2 | 1.6× | 1.3× | 2.3× |
-| Intel Atom C3538 (Denverton) † | x86-64 | SSSE3 (no AVX) | 1.2× | 1.3× | 1.4× |
+| Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.2× | 1.4× | 1.6× |
 | Apple M5 Max † | arm64 | NEON | 1.3× | 1.5× | 7.8× |
 | Arm Cortex-A72 | arm64 | NEON | 2.0× | 1.6× | 1.3× |
 | Arm Neoverse N1 | arm64 | NEON | 2.9× | 1.7× | 1.8× |
@@ -256,17 +260,20 @@ absorb that, and the movement is host-side.
 
 GFNI without AVX-512: the same affine-transform multiply, 256 bits wide.
 
-### Intel Core i5-1240P (Alder Lake) †
-
-† Carried from the `rarpar 0.3.3` publication, pending a re-measure.
+### Intel Core i5-1240P (Alder Lake)
 
 12 cores / 16 threads · Ubuntu 26.04, Linux 7.0 · dispatch tier GFNI + AVX2 ·
-candidate `rarpar 0.3.2`, static-musl x86-64 build `5340a251…` · references
-`UnRAR 7.23` (`926d3a00…`) and `par2cmdline-turbo 1.4.0` (`2c3ba0c5…`).
+candidate `rarpar 0.8.1`, published static-musl x86-64 build `93a71095…` ·
+references `UnRAR 7.23` (`926d3a00…`) and `par2cmdline-turbo 1.4.0`
+(`9e65a4bb…`).
 
 | Store, plain | Store, encrypted | Compressed LZ | Compressed encrypted | Compressed PPMd | PAR2 heavy |
 |---:|---:|---:|---:|---:|---:|
-| 1.47× | 2.24× | 1.14× | 1.93× | 0.86× | 2.24× |
+| 1.49× | 2.21× | 1.12× | 1.91× | 1.49× | 2.97× |
+
+Against the `rarpar 0.3.2` row this replaces, PPMd moved 0.86× → 1.49×, PAR2
+heavy repair 2.24× → 2.97×, and PAR2 generation is now ahead at 1.19×. The
+other classes are within 2%.
 
 [![RAR workloads on Intel Core i5-1240P, Alder Lake, GFNI + AVX2](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64.svg)
 
@@ -343,27 +350,52 @@ decoder at 1.02×.
 
 ## SSSE3 (no AVX)
 
-### Intel Atom C3538 (Denverton) †
+### Intel Atom C3538 (Denverton)
 
-† Carried from the `rarpar 0.3.3` publication, pending a re-measure.
-
-4 cores · Linux 4.4 · dispatch tier SSSE3 · candidate `rarpar 0.3.2`,
-static-musl x86-64 build `947787d4…` · references `UnRAR 7.23` (`926d3a00…`)
-and `par2cmdline-turbo 1.4.0` (`2c3ba0c5…`).
+4 cores · Linux 4.4 · dispatch tier SSSE3 · candidate `rarpar 0.8.1`,
+published static-musl x86-64 build `93a71095…` · references `UnRAR 7.23`
+(`926d3a00…`) and `par2cmdline-turbo 1.4.0` (`9e65a4bb…`).
 
 | Store, plain | Store, encrypted | Compressed LZ | Compressed encrypted | Compressed PPMd | PAR2 heavy |
 |---:|---:|---:|---:|---:|---:|
-| 0.98× | 2.02× | 1.03× | 2.81× | 0.75× | 1.40× |
+| 1.02× | 2.05× | 1.03× | 2.81× | 1.25× | 1.60× |
 
-This is the slowest machine in the set and the only one with no AVX at all. It
-moved least: PPMd +5.1% and PAR2 generation +5.4% (0.71× → 0.74×, still the
-lowest generation figure on the board), everything else inside 2%.
+This is the slowest machine in the set and the only one with no AVX at all.
+Against the `rarpar 0.3.2` row this replaces, PPMd moved 0.75× → 1.25×, PAR2
+heavy repair 1.40× → 1.60×, and PAR2 generation 0.74× → 2.04×, from the
+lowest generation figure on the board to one of the highest.
 
-Plain store-mode sits just under parity on this tier and plain compressed
-extraction just over it — the one rung where `rarpar`'s wider kernels have
-nothing to work with. The
-encrypted classes still win by a wide margin, because AES runs through AWS-LC
-against the reference's own AES path.
+Both rounds ran the same plan and corpus against the same `UnRAR 7.23` binary,
+whose medians moved by 1.2% as a geomean across the 37 RAR cases, so the change
+is `rarpar`'s. The RAR geomean went from 1.36× to 1.45×, and the cases behind
+the reference went from 16 to 8. All of the large moves are PPMd:
+
+| RAR case | `rarpar 0.3.2` | `rarpar 0.8.1` | `rarpar` wall |
+|---|---:|---:|---:|
+| `rar4-ppmd-restart` | 0.64× | 1.30× | 1410 → 698 ms |
+| `rar4-ppmd-classic-multivolume` | 0.79× | 1.39× | 234 → 129 ms |
+| `rar4-ppmd-order16-32m` | 0.82× | 1.19× | 36.1 → 24.8 s |
+| `rar4-ppmd-solid-multi-member` | 0.78× | 1.13× | 1046 → 723 ms |
+| `real-mixed-normal-v7` | 0.89× | 1.09× | 312 → 264 ms |
+
+The RAR3 and RAR4 LZ cases and `rar5-v5-solid-multivolume` move from just
+below parity to 1.00×–1.02×. Two small cases fell because the reference got
+faster, not `rarpar` slower: `real-source-normal-v7` (1.05× → 0.91×, UnRAR
+47 → 39 ms) and `rar5-v5-normal-single` (1.09× → 1.00×, UnRAR 47 → 44 ms).
+The RAR5 header-encrypted cases are about 3 ms
+slower (53 → 56 ms) and stay at 4.5×–4.6×. The recovery-volume medians rose
+from 113 to 124 ms, but their fastest runs match the old ones and their
+spread grew from about 3 ms to 13 ms, so that is not a measured regression.
+The eight cases still behind are the four plain stored-media cases and the
+three `real-source` cases (0.87×–0.94×), plus `rar5-v5-normal-single` at
+1.00×.
+
+Plain store-mode sits at parity on this tier: the four plain stored-media
+cases run 0.81×–0.92×, and the RAR3 and RAR5 store cases carry the class to
+1.02×. Plain compressed extraction is just over parity. This is the one rung
+where `rarpar`'s wider kernels have nothing to work with. The encrypted
+classes still win by a wide margin, because AES runs through AWS-LC against
+the reference's own AES path.
 
 [![RAR workloads on Intel Atom C3538, Denverton, SSSE3](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64-noavx.svg)](../crates/unrar-rs/docs/rarpar-rar-benchmark-linux-x86_64-noavx.svg)
 
@@ -486,205 +518,205 @@ faster. PAR2 generation is 2.22×.
 # PAR3
 
 `rarpar par3` against `par3cmdline 0.0.1`, the reference implementation, on
-generated data. This runs on the seven cloud machines that were re-measured in
-this round (4 vCPU each), under its own harness (`rarpar-bench par3`), with the
-same published `rarpar 0.8.0` binaries as the RAR and PAR2 rows. `par3cmdline`
-publishes no Linux binary, so each machine builds it from the pinned source;
-the reference digests are in the [Versions tested](#versions-tested-in-this-publication) table.
+generated data shaped after the usenet census. This runs on two machines,
+Alder Lake (16 threads) and Denverton (4 cores), under its own harness
+(`rarpar-bench par3`, fleet profile), with the same published `rarpar 0.8.1`
+binaries as those machines' RAR and PAR2 rows. `par3cmdline` publishes no
+Linux binary; the reference digests are in the
+[Versions tested](#versions-tested-in-this-publication) table.
 
-**Sets.** Six plain sets cover both codecs at three sizes, and a seventh
-protects a ZIP in place:
+**Sets.** Four census shapes, each with a Cauchy set and an FFT set, and a
+ninth set that protects a ZIP in place. Every block size is the one the census
+found posted, not a round number picked for the bench:
 
-| Set | Data | Blocks | Codec | Damage repaired |
+| Shape | Data | Blocks | Damage repaired | Why this shape |
 |---|---|---|---|---|
-| `b-gf16` | 10 × 30 MiB | 300 input + 30 recovery, 1 MiB | Cauchy | 10 blocks across 5 files |
-| `b-fft` | 10 × 30 MiB | 300 + 30, 1 MiB | FFT (reference `-e8`) | 10 blocks across 5 files |
-| `m-gf16` | 4 × 128 MiB | 512 + 52, 1 MiB | Cauchy | 24 blocks across 4 files |
-| `m-fft` | 4 × 128 MiB | 512 + 52, 1 MiB | FFT | 24 blocks across 4 files |
-| `a-gf16` | 1 GiB | 1024 + 103, 1 MiB | Cauchy | 50 blocks |
-| `c-fft` | 1.5 GiB | 49152 + 4916, 32 KiB | FFT | 2000 blocks |
-| ZIP-inside | 4 × 64 MiB stored in one ZIP | 1025 + 103, 256 KiB, chosen by the reference's insert | Cauchy | 40 blocks inside the ZIP |
+| `b-1536k` | 10 × 30 MiB | 200 input + 20 recovery, 1.5 MiB (10%) | 10 blocks across 5 files | census median block size for releases under 1 GiB, in 30 MiB volumes |
+| `a-10mb` | 1 GiB, one file | 108 + 22, 10,000,000 bytes (20%) | 11 blocks | the `par2cmdline-turbo` cluster of 10 MB blocks at 20% |
+| `a-4m` | 1 GiB, one file | 256 + 26, 4 MiB (10%) | 13 blocks | census median block size and redundancy |
+| `a-512k` | 1 GiB, one file | 2048 + 41, 512 KiB (2%) | 20 blocks | the `par2cmdline` cluster of about 2000 blocks at 2% |
+| ZIP-inside | 4 × 64 MiB stored in one ZIP | 1025 + 103, 256 KiB, chosen by the reference's insert | 40 blocks inside the ZIP | PAR-inside self-repair |
 
-`c-fft` is over PAR2's 32768-block limit, so it has no PAR2 equivalent, and the
-reference's Cauchy codec is quadratic at that size. The ZIP-inside set is
-protected once by the reference's insert, untimed; both tools then verify it
-and repair it in place.
+Each shape's Cauchy set is named for its field (`-gf16`, or `-gf8` for
+`a-10mb`, whose 130 blocks fit GF(2⁸)); its FFT set (`-fft`) runs the
+reference with `-e8`. The ZIP-inside set is protected once by the reference's
+insert, untimed; both tools then verify it and repair it in place.
 
-**Protocol.** One warmup and seven measured runs per row (three on `a-gf16`
-and `c-fft`, to keep the slowest machine inside its session cap), with the
-order alternated each repeat. The reference is single-threaded; `rarpar` runs
-with 1 and with 4 workers. Every ratio is `reference median wall time / rarpar
-median wall time`, as on the rest of this page. `rarpar` writes buffered and
-never passes `--fsync`; the reference never syncs either.
+**Protocol.** One warmup and seven measured runs per row, with the order
+alternated each repeat. The reference is single-threaded; `rarpar` runs with 1
+worker and with every thread (16 on Alder Lake, 4 on Denverton; "most
+workers" below). In the tables each cell is `rarpar`'s median wall time in
+seconds, then `reference median wall time / rarpar median wall time` in
+parentheses, as on the rest of this page. `rarpar` writes buffered and never
+passes `--fsync`; the reference never syncs either. On Denverton every set
+lives in RAM-backed `/dev/shm`, so its I/O costs little.
 
 **Repair, like for like.** `par3cmdline` keeps a numbered `.1` backup of every
 file it repairs, which copies the whole file. `rarpar par3 repair` repairs in
-place by default and keeps no backup; with `--backup` it keeps the same `.1`
-backups. The **Repair** columns below compare the `--backup` runs,
-which write the same bytes as the reference. The **Repair in place** column is
-`rarpar`'s default, and most of the gap between the two columns is the cost of
-copying the backups.
+place by default and keeps no backup; with `--backup` it retains the original
+file as the same `.1`. The **Repair retaining files** columns compare the
+`--backup` runs, which write the same bytes as the reference. The **Repair in
+place** column is `rarpar`'s default.
 
-**Output.** On every set and machine, every recovery block's payload that
-`rarpar` wrote is byte-identical to the reference's, under the same InputSetID.
-The sets differ only in packet metadata: the Creator packet names the tool,
-and the packets are laid out differently across the volumes. Every repair is checked byte for
-byte against the generated inputs.
+**Output.** On seven of the eight plain sets, on both machines, every recovery
+block's payload that `rarpar` wrote is byte-identical to the reference's,
+under the same InputSetID; the sets differ only in packet metadata (the
+Creator packet names the tool). The exception is `b-1536k-gf16`: for 200 + 20
+blocks `par3cmdline` picks GF(2¹⁶) and `rarpar 0.8.1` picks GF(2⁸), so the two
+create rows on that set compute different codes and are not like for like.
+Its verify and repair rows are, because both tools verify and repair the
+reference's set. Every repair is checked byte for byte against the generated
+inputs.
 
 ## PAR3 summary
 
-Geometric mean over the six plain sets per operation, plus the ZIP-inside set.
-Above 1 means `rarpar` is faster.
+Geometric mean of the reference ÷ `rarpar` wall-time ratio over the eight
+plain sets per operation, plus the ZIP-inside set. Above 1 means `rarpar` is
+faster.
 
-| CPU | Create, 1 worker | Create, 4 workers | Verify, 1 worker | Verify, 4 workers | Repair, 1 worker | Repair, 4 workers | Repair in place, 4 workers | ZIP-inside verify | ZIP-inside repair |
+| Machine | Create, 1 worker | Create, most workers | Verify, 1 worker | Verify, most workers | Repair retaining files, 1 worker | Repair retaining files, most workers | Repair in place, most workers | `zip-inside` verify | `zip-inside` repair |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| AMD EPYC 9R14 (Zen 4) | 5.76× | 10.71× | 4.00× | 7.83× | 1.95× | 1.62× | 18.04× | 4.11× | 2.61× |
-| Intel Xeon Platinum 8488C (Sapphire Rapids) | 4.88× | 7.30× | 3.50× | 5.40× | 2.42× | 2.17× | 12.41× | 3.53× | 2.69× |
-| Intel Xeon Platinum 8124M (Skylake-SP) | 4.48× | 7.65× | 3.63× | 5.57× | 2.43× | 2.63× | 12.37× | 3.77× | 2.95× |
-| Intel Xeon E5-2666 v3 (Haswell) | 3.49× | 5.95× | 3.33× | 5.57× | 1.78× | 1.90× | 11.19× | 3.94× | 2.14× |
-| Arm Cortex-A72 | 2.17× | 5.20× | 3.38× | 8.14× | 2.52× | 4.32× | 7.05× | 4.30× | 3.06× |
-| Arm Neoverse N1 | 2.44× | 7.13× | 3.80× | 9.21× | 2.42× | 3.50× | 9.24× | 3.87× | 3.30× |
-| Arm Neoverse V2 | 3.26× | 8.93× | 4.22× | 11.12× | 2.07× | 2.08× | 11.65× | 6.37× | 2.74× |
+| Alder Lake | 4.2× | 7.6× | 4.4× | 5.2× | 6.2× | 8.6× | 11× | 3.3× | 5.3× |
+| Denverton | 2.1× | 4.6× | 2.8× | 5.8× | 3.4× | 6.3× | 6.1× | 2.9× | 3.4× |
 
-`rarpar` is ahead on every operation and every machine as a class. Single-worker
-rows are the like-for-like engine comparison against the single-threaded
-reference. The ZIP-inside rows go through `rarpar`'s `par3cmdline`-compatible
-front end (`vs`/`rs`), which syncs the rebuilt carrier and keeps a `.1` of it,
-as the reference does.
+`rarpar` is ahead on every operation, every set and both machines. The
+single-worker columns are the like-for-like engine comparison against the
+single-threaded reference. The ZIP-inside columns go through `rarpar`'s
+`par3cmdline`-compatible front end (`vs`/`rs`), which syncs the rebuilt
+carrier and keeps a `.1` of it, as the reference does.
 
-The one result below parity is repair with backups on `m-fft`: 0.92× on Zen 4
-and Haswell (0.94× and 0.95× with 1 worker). The same repair in place runs
-18.10× and 11.68× there, so the loss is in copying the backups (512 MiB on
-this set), not in the codec.
+## PAR3 per set, most workers
 
-## PAR3 per set, 4 workers
+**Create, most workers**
 
-**Create, 4 workers**
+| Set | Alder Lake | Denverton |
+|---|---:|---:|
+| `b-1536k-gf16` | 0.2 (12×) | 1.7 (6.8×) |
+| `b-1536k-fft` | 0.2 (3.6×) | 1.0 (2.9×) |
+| `a-10mb-gf8` | 0.7 (15×) | 6.3 (7.6×) |
+| `a-10mb-fft` | 0.7 (3.9×) | 4.0 (2.7×) |
+| `a-4m-gf16` | 0.7 (14×) | 7.4 (6.5×) |
+| `a-4m-fft` | 0.6 (4.5×) | 3.3 (3.2×) |
+| `a-512k-gf16` | 0.8 (17×) | 9.6 (7.2×) |
+| `a-512k-fft` | 0.5 (4.3×) | 3.3 (3.0×) |
 
-| Set | Zen 4 | Sapphire Rapids | Skylake-SP | Haswell | Cortex-A72 | Neoverse N1 | Neoverse V2 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| `b-gf16` | 16.66× | 11.40× | 12.76× | 8.71× | 6.70× | 10.46× | 12.58× |
-| `b-fft` | 5.43× | 3.81× | 4.10× | 3.82× | 4.26× | 4.93× | 5.84× |
-| `m-gf16` | 23.57× | 15.02× | 16.05× | 10.32× | 5.96× | 11.35× | 14.66× |
-| `m-fft` | 5.79× | 4.15× | 4.42× | 4.14× | 4.52× | 5.37× | 6.11× |
-| `a-gf16` | 33.51× | 18.64× | 18.64× | 11.54× | 7.68× | 11.07× | 16.86× |
-| `c-fft` | 3.64× | 3.00× | 2.89× | 2.72× | 3.35× | 3.79× | 4.55× |
+**Verify, most workers**
 
-**Verify, 4 workers**
+| Set | Alder Lake | Denverton |
+|---|---:|---:|
+| `b-1536k-gf16` | 0.04 (12×) | 0.3 (7.0×) |
+| `b-1536k-fft` | 0.04 (11×) | 0.3 (7.1×) |
+| `a-10mb-gf8` | 0.7 (2.8×) | 1.5 (5.5×) |
+| `a-10mb-fft` | 0.2 (8.5×) | 1.5 (5.6×) |
+| `a-4m-gf16` | 0.7 (2.2×) | 1.2 (5.7×) |
+| `a-4m-fft` | 0.2 (7.4×) | 1.3 (5.5×) |
+| `a-512k-gf16` | 0.7 (1.7×) | 1.1 (5.2×) |
+| `a-512k-fft` | 0.2 (6.3×) | 1.1 (5.3×) |
 
-| Set | Zen 4 | Sapphire Rapids | Skylake-SP | Haswell | Cortex-A72 | Neoverse N1 | Neoverse V2 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| `b-gf16` | 10.37× | 6.72× | 7.21× | 7.03× | 8.48× | 10.33× | 11.55× |
-| `b-fft` | 10.34× | 7.23× | 7.24× | 6.20× | 8.50× | 10.33× | 11.57× |
-| `m-gf16` | 10.87× | 6.76× | 6.84× | 7.00× | 9.33× | 11.51× | 12.87× |
-| `m-fft` | 10.79× | 6.91× | 6.85× | 6.99× | 9.34× | 11.50× | 12.87× |
-| `a-gf16` | 4.92× | 3.88× | 4.04× | 4.31× | 7.78× | 7.48× | 10.92× |
-| `c-fft` | 3.71× | 2.81× | 3.02× | 3.24× | 5.96× | 5.80× | 7.82× |
+**Repair retaining files, most workers**
 
-**Repair with backups, 4 workers**
+| Set | Alder Lake | Denverton |
+|---|---:|---:|
+| `b-1536k-gf16` | 0.2 (13×) | 1.4 (7.5×) |
+| `b-1536k-fft` | 0.3 (8.1×) | 1.2 (6.1×) |
+| `a-10mb-gf8` | 1.2 (12×) | 6.0 (9.0×) |
+| `a-10mb-fft` | 1.6 (7.8×) | 6.7 (6.4×) |
+| `a-4m-gf16` | 1.0 (10×) | 6.1 (7.0×) |
+| `a-4m-fft` | 1.3 (6.8×) | 5.8 (5.5×) |
+| `a-512k-gf16` | 1.1 (8.3×) | 7.8 (5.7×) |
+| `a-512k-fft` | 1.2 (5.2×) | 5.9 (4.2×) |
 
-| Set | Zen 4 | Sapphire Rapids | Skylake-SP | Haswell | Cortex-A72 | Neoverse N1 | Neoverse V2 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| `b-gf16` | 2.74× | 3.70× | 7.23× | 3.49× | 5.51× | 7.40× | 4.08× |
-| `b-fft` | 2.86× | 3.69× | 5.44× | 3.20× | 5.66× | 5.60× | 3.49× |
-| `m-gf16` | 1.25× | 1.49× | 1.76× | 1.31× | 4.58× | 3.18× | 1.69× |
-| `m-fft` | 0.92× | 1.17× | 1.27× | 0.92× | 2.78× | 1.65× | 1.16× |
-| `a-gf16` | 1.68× | 1.97× | 2.45× | 1.80× | 5.10× | 4.53× | 2.15× |
-| `c-fft` | 1.18× | 2.25× | 1.52× | 1.93× | 3.23× | 1.87× | 1.36× |
+**Repair in place, most workers**
 
-**Repair in place, 4 workers**
-
-| Set | Zen 4 | Sapphire Rapids | Skylake-SP | Haswell | Cortex-A72 | Neoverse N1 | Neoverse V2 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| `b-gf16` | 17.11× | 11.94× | 13.42× | 10.59× | 6.46× | 9.57× | 12.01× |
-| `b-fft` | 14.26× | 9.41× | 9.94× | 9.35× | 6.56× | 8.18× | 9.25× |
-| `m-gf16` | 25.42× | 14.26× | 16.58× | 11.66× | 8.13× | 11.41× | 14.87× |
-| `m-fft` | 18.10× | 11.15× | 11.84× | 11.68× | 7.86× | 9.86× | 11.55× |
-| `a-gf16` | 24.98× | 14.74× | 16.70× | 11.49× | 8.18× | 10.87× | 15.59× |
-| `c-fft` | 12.28× | 13.85× | 8.20× | 12.66× | 5.55× | 6.51× | 8.40× |
+| Set | Alder Lake | Denverton |
+|---|---:|---:|
+| `b-1536k-gf16` | 0.2 (17×) | 1.4 (7.5×) |
+| `b-1536k-fft` | 0.2 (9.1×) | 1.3 (5.9×) |
+| `a-10mb-gf8` | 0.9 (17×) | 6.1 (8.7×) |
+| `a-10mb-fft` | 1.3 (9.8×) | 6.8 (6.2×) |
+| `a-4m-gf16` | 0.7 (14×) | 6.3 (6.7×) |
+| `a-4m-fft` | 1.0 (8.7×) | 6.1 (5.2×) |
+| `a-512k-gf16` | 0.8 (11×) | 8.3 (5.4×) |
+| `a-512k-fft` | 0.9 (6.8×) | 6.3 (4.0×) |
 
 ## PAR3 peak memory
 
-Peak resident set in MiB, 4 workers, as the range across the seven machines
-(`a-gf16` excludes Neoverse V2; see below). Create and repair are shown;
-verify peaks are not resolved in this run (see the note under the table).
+Peak resident set in MiB, most workers, as the range across the two machines.
 
 | Set | Create, rarpar | Create, reference | Repair, rarpar | Repair, reference |
 |---|---:|---:|---:|---:|
-| `b-gf16` | 54–58 | ≤ 43–46 | 44–47 | ≤ 43–46 |
-| `b-fft` | 54–55 | 376–377 | ≤ 43–46 | 827–828 |
-| `m-gf16` | 78–82 | ≤ 65–67 | 72–78 | ≤ 65–67 |
-| `m-fft` | 80–81 | 652–653 | ≤ 65–68 | 1551–1552 |
-| `a-gf16` | 134–138 | ≤ 115–118 | 133–138 | ≤ 115–118 |
-| `c-fft` | 239–241 | 2072–2073 | 275–282 | 3612–3613 |
+| `b-1536k-gf16` | 40–47 | 35–44 | 42–61 | 36–44 |
+| `b-1536k-fft` | 42–49 | 406–409 | 36–45 | 698–702 |
+| `a-10mb-gf8` | 219–227 | 221–224 | 220–239 | ≤ 211–213 |
+| `a-10mb-fft` | 222–230 | 1650–1653 | ≤ 211–213 | 3510–3513 |
+| `a-4m-gf16` | ≤ 211–213 | ≤ 211–213 | ≤ 211–213 | ≤ 211–213 |
+| `a-4m-fft` | ≤ 211–213 | 1290–1293 | ≤ 211–213 | 3094–3097 |
+| `a-512k-gf16` | ≤ 211–213 | ≤ 211–213 | ≤ 211–213 | ≤ 211–213 |
+| `a-512k-fft` | ≤ 211–213 | 1098–1102 | ≤ 211–213 | 3084–3087 |
 
 On the FFT sets the reference's peak grows with the set and `rarpar`'s stays
-small: `c-fft` repair peaks at 3.5 GiB in the reference against 275–282 MiB in
-`rarpar`. On the Cauchy sets the reference's peaks sit under the floor
-described below, so the two tools cannot be compared there; `rarpar`'s are
-44–138 MiB.
+flat: `a-10mb-fft` repair peaks at 3.4 GiB in the reference, while `rarpar`'s
+peak sits at or under the harness floor described below. Most Cauchy cells
+sit at that floor for both tools, so the two cannot be compared there; on
+`a-10mb-gf8`, whose 10 MB blocks lift `rarpar` above it, `rarpar` peaks at
+219–239 MiB.
 
 A figure marked ≤ is not the tool's own peak. On Linux, a child process's
 recorded peak never drops below the measuring harness's own resident set at
-the moment it launches the child, and the harness grows as it generates each
-set. Those cells read the same value for both tools at that floor (43–46 MiB on
-the `b` sets, 65–68 on the `m` sets, 115–118 on `a-gf16`), so the tool's true
-peak is that figure or lower. This is why every verify peak and every
-reference Cauchy peak is unresolved. On Neoverse V2 the floor on `a-gf16` was
-139 MiB, which hides both tools there. The FFT reference peaks and every
-`rarpar` create and repair peak sit above the floor and are real measurements.
+the moment it launches the child, and the harness holds about 211 MiB after
+generating a 1 GiB set. Those cells read that floor for both tools, so the
+tool's true peak is that figure or lower. The `b-1536k` Cauchy figures sit
+near the harness's 35–47 MiB footprint for that set and may be bounded the
+same way.
 
 ## PAR2 against PAR3
 
-`rarpar-bench par3 versus` protects and repairs the same generated inputs with
-PAR2 and PAR3 at one block size, one recovery count and one damage pattern for
-every arm: `rarpar par` (`par2-rs`), `par2cmdline-turbo 1.4.0`, and `rarpar
-par3` with the Cauchy and FFT codecs. It ran with the published `rarpar 0.8.1`
-binaries on nine machines: the seven cloud machines above (4 vCPU each; the
-Skylake-SP slot landed on an Intel Xeon Platinum 8275CL, Cascade Lake, this
-round), the Alder Lake laptop (16 threads) and the Zen 2 desktop under Windows
-(12 threads). One warmup and seven measured runs per arm; every arm runs at its
-default thread count, and every repair is checked against the inputs' SHA-256.
+The same suite run carries PAR2 rows on each shape's Cauchy set: `rarpar par`
+(`par2-rs`) and `par2cmdline-turbo 1.4.0` create, verify and repair the same
+inputs at the same block size, recovery count and damage. Nothing is run
+separately for these charts; they are a second view of the PAR3 suite's
+results. Each chart draws, per machine:
 
-| Comparison | Data | Blocks | Arms |
-|---|---|---|---|
-| `vs-a-equal` | 1 GiB | 1024 + 103, 1 MiB | all four |
-| `vs-b-equal` | 10 × 30 MiB | 300 + 30, 1 MiB | all four |
-| `vs-a-fft10` | 1 GiB | 16384 + 1639, 64 KiB | PAR2 arms and `par3-fft` |
-| `vs-a-fft30` | 1 GiB | 16384 + 4916, 64 KiB | PAR2 arms and `par3-fft` |
+1. `par2-rs`
+2. `par2cmdline-turbo` (the baseline)
+3. `par3cmdline`, Cauchy and FFT
+4. `rarpar par3`, Cauchy and FFT, at every thread
 
-Each chart draws every arm against `par2cmdline-turbo` on the same scale as
-the rest of this page: its median wall time divided by the arm's. At repair,
-`par2cmdline-turbo` keeps a numbered `.1` of every file it repairs, so the
-rows marked **keeps .1** (`rarpar par3 repair --backup`) write the same bytes
-it does; rows marked **in place** write no backup, and are like for like with
-`par2-rs`, which also repairs in place.
+Every bar is `par2cmdline-turbo`'s median wall time divided by the arm's. At
+repair, `par2cmdline-turbo` and `par3cmdline` keep a numbered `.1` of every
+file they repair, so the rows marked **retains file** (`rarpar par3 repair
+--backup`) write the same bytes they do; rows marked **in place** keep no
+backup, and are like for like with `par2-rs`, which also repairs in place.
 
-- **Create.** `par3-fft` is ahead on every machine: 2.5–5.3× on set A and
-  1.7–3.6× on set B at 1 MiB blocks, 7–31× at 64 KiB blocks and 10% recovery,
-  and 18–66× at 30%. `par3-cauchy` ranges from 0.62× (Cortex-A72) to 2.5×
-  (Zen 4). At 64 KiB blocks `par2-rs` is itself 2.1–12× ahead of
-  `par2cmdline-turbo`.
-- **Repair in place.** 1.2–14× ahead of `par2cmdline-turbo` across the
-  equal-count rows, and 3.0–24× on the FFT-only rows.
-- **Repair keeping `.1`, like for like.** On the seven cloud machines this is
-  behind `par2cmdline-turbo` on the equal-count sets, except Cortex-A72's FFT
-  row on set A: 0.55–1.16× on set A and 0.23–0.66× on set B. The same sets repaired in place run 1.2–14× ahead there,
-  so the loss is in keeping the backups, not in the codec. On Alder Lake it is
-  0.74–2.2×, and on Zen 2 under Windows 2.2–3.3×.
+- **Create.** `rarpar par3` with FFT is ahead of `par2cmdline-turbo` on every
+  shape: 2.3–3.3× on Alder Lake and 1.6–2.3× on Denverton. With Cauchy it is
+  2.0–3.0× ahead on Alder Lake; on Denverton it runs 0.65×–1.23×, behind on
+  `a-512k` and `b-1536k`. `par3cmdline` is behind on every shape: 0.09×–0.21×
+  with Cauchy and 0.53×–0.72× with FFT. `par2-rs` runs 0.70×–0.89× on Alder
+  Lake and 0.93×–1.25× on Denverton.
+- **Repair retaining files, like for like.** `rarpar par3` is 2.6–5.0× ahead
+  of `par2cmdline-turbo` on Alder Lake and 1.7–3.0× on Denverton, with either
+  codec.
+- **Repair in place.** `rarpar par3` is 2.9–7.0× ahead on Alder Lake and
+  1.7–2.9× on Denverton; `par2-rs` is 1.5–3.5× ahead. `par3cmdline` is behind
+  on every shape, 0.23×–0.66×.
 
-[![vs-a-equal create on nine machines](par3-versus/rarpar-par3-versus-vs-a-equal-create.svg)](par3-versus/rarpar-par3-versus-vs-a-equal-create.svg)
+The `b-1536k` create chart carries the field difference described under
+[PAR3](#par3): its `rarpar par3 (Cauchy)` bar is a GF(2⁸) code against a
+GF(2¹⁶) reference.
 
-[![vs-a-equal repair on nine machines](par3-versus/rarpar-par3-versus-vs-a-equal-repair.svg)](par3-versus/rarpar-par3-versus-vs-a-equal-repair.svg)
+[![a-4m create on two machines](par3-versus/rarpar-par3-versus-a-4m-create.svg)](par3-versus/rarpar-par3-versus-a-4m-create.svg)
 
-[![vs-b-equal create on nine machines](par3-versus/rarpar-par3-versus-vs-b-equal-create.svg)](par3-versus/rarpar-par3-versus-vs-b-equal-create.svg)
+[![a-4m repair on two machines](par3-versus/rarpar-par3-versus-a-4m-repair.svg)](par3-versus/rarpar-par3-versus-a-4m-repair.svg)
 
-[![vs-b-equal repair on nine machines](par3-versus/rarpar-par3-versus-vs-b-equal-repair.svg)](par3-versus/rarpar-par3-versus-vs-b-equal-repair.svg)
+[![a-10mb create on two machines](par3-versus/rarpar-par3-versus-a-10mb-create.svg)](par3-versus/rarpar-par3-versus-a-10mb-create.svg)
 
-[![vs-a-fft10 create on nine machines](par3-versus/rarpar-par3-versus-vs-a-fft10-create.svg)](par3-versus/rarpar-par3-versus-vs-a-fft10-create.svg)
+[![a-10mb repair on two machines](par3-versus/rarpar-par3-versus-a-10mb-repair.svg)](par3-versus/rarpar-par3-versus-a-10mb-repair.svg)
 
-[![vs-a-fft10 repair on nine machines](par3-versus/rarpar-par3-versus-vs-a-fft10-repair.svg)](par3-versus/rarpar-par3-versus-vs-a-fft10-repair.svg)
+[![a-512k create on two machines](par3-versus/rarpar-par3-versus-a-512k-create.svg)](par3-versus/rarpar-par3-versus-a-512k-create.svg)
 
-[![vs-a-fft30 create on nine machines](par3-versus/rarpar-par3-versus-vs-a-fft30-create.svg)](par3-versus/rarpar-par3-versus-vs-a-fft30-create.svg)
+[![a-512k repair on two machines](par3-versus/rarpar-par3-versus-a-512k-repair.svg)](par3-versus/rarpar-par3-versus-a-512k-repair.svg)
 
-[![vs-a-fft30 repair on nine machines](par3-versus/rarpar-par3-versus-vs-a-fft30-repair.svg)](par3-versus/rarpar-par3-versus-vs-a-fft30-repair.svg)
+[![b-1536k create on two machines](par3-versus/rarpar-par3-versus-b-1536k-create.svg)](par3-versus/rarpar-par3-versus-b-1536k-create.svg)
+
+[![b-1536k repair on two machines](par3-versus/rarpar-par3-versus-b-1536k-repair.svg)](par3-versus/rarpar-par3-versus-b-1536k-repair.svg)

@@ -34,13 +34,18 @@ documented in each crate's own changelog so those notes ship with the crate.
   removed. No version impact.
 - `rarpar-bench par3 tables` prints the benchmark page's PAR3 tables, each
   per-set cell as rarpar's median wall seconds and then the reference ÷
-  rarpar ratio, `4.4 (14×)`. No version impact.
+  rarpar ratio, `4.4 (14×)`, with two decimals below 0.1 s. No version
+  impact.
 
 ### Documentation only
 
-- The benchmark page gains a PAR2-against-PAR3 section from the `rarpar
-  0.8.1` fleet round on nine machines, with its eight charts under
-  `docs/par3-versus/`. No version impact.
+- The benchmark page's PAR3 sections and its PAR2-against-PAR3 section come
+  from a `rarpar 0.8.1` round on Alder Lake and Denverton over the census
+  shapes, with eight charts under `docs/par3-versus/`; the same round
+  re-measures both machines' RAR and PAR2 rows, which were carried from
+  `rarpar 0.3.3`. The page records that `par3cmdline` protects 200 + 20
+  Cauchy blocks with GF(2^16) where `rarpar 0.8.1` picks GF(2^8). No version
+  impact.
 
 ## rarpar 0.8.1
 

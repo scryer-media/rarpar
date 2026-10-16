@@ -155,6 +155,7 @@ func TestRenderTablesPutsTimeBeforeTheRatio(t *testing.T) {
 		"smoke-gf16/create/reference": 61.6, "smoke-gf16/create/rarpar-w4": 4.4, "smoke-gf16/create/rarpar-w1": 8.8,
 		"smoke-fft/create/reference": 9, "smoke-fft/create/rarpar-w4": 2, "smoke-fft/create/rarpar-w1": 4,
 		"smoke-gf16/repair/reference": 10, "smoke-gf16/repair/rarpar-w4-backup": 5, "smoke-gf16/repair/rarpar-w4": 1,
+		"smoke-gf16/verify/reference": 1, "smoke-gf16/verify/rarpar-w4": 0.04,
 	}
 	inputs := []VersusChartInput{{Name: "Zen 4", Results: versusSuiteFixture("zen4", true, walls)}, {Name: "N1", Results: versusSuiteFixture("n1", true, walls)}}
 	tables, err := RenderTables(inputs, 4)
@@ -162,7 +163,7 @@ func TestRenderTablesPutsTimeBeforeTheRatio(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{"| Set | Zen 4 | N1 |", "| `smoke-gf16` | 4.4 (14×) | 4.4 (14×) |", "| `smoke-fft` | 2.0 (4.5×) |",
-		"**Repair retaining files, 4 workers.**", "| `smoke-gf16` | 5.0 (2.0×) |", "| `smoke-gf16` | 1.0 (10×) |", "Create, 1 worker", "| Zen 4 | 4.0× | 7.9× |"} {
+		"**Repair retaining files, 4 workers.**", "| `smoke-gf16` | 5.0 (2.0×) |", "| `smoke-gf16` | 1.0 (10×) |", "Create, 1 worker", "| Zen 4 | 4.0× | 7.9× |", "| `smoke-gf16` | 0.04 (25×) |"} {
 		if !strings.Contains(tables, want) {
 			t.Fatalf("tables lack %q:\n%s", want, tables)
 		}
