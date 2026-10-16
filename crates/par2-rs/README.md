@@ -73,23 +73,31 @@ source with no file paths at all.
 
 MD5 has two interchangeable backends, chosen at compile time.
 
-- `crypto-aws-lc` *(default)*: AWS-LC's MD5. Building it compiles `aws-lc-sys`,
-  which needs a C toolchain, and it is the configuration the performance
-  figures below were measured with.
-- `crypto-rust`: the portable RustCrypto `md-5` implementation. No C or
-  assembly dependency, and the only backend available on `wasm`. Expect slower
-  hashing; the digests are of course identical.
+- `crypto-native` *(default)*: the crate's own assembly on x86-64 and
+  little-endian AArch64, AWS-LC's MD5 block functions carried into `asm!`.
+  No C toolchain and no crypto library, and it is the configuration the
+  performance figures below were measured with. Every other target uses
+  RustCrypto `md-5`.
+- `crypto-rust`: the portable RustCrypto `md-5` implementation on every
+  target. Expect slower hashing on x86-64; the digests are of course
+  identical.
 
-To opt out of AWS-LC:
+The assembly is here because RustCrypto `md-5` dropped its assembly after
+0.10.0, and its pure-Rust MD5 is about 25% slower on x86-64, where MD5 is the
+serial floor of verify, scan and create. Linking `aws-lc-sys` for one block
+function was heavy, and its version-keyed `links` gave consumers a second
+AWS-LC build whenever their own `aws-lc-rs` linked another version.
+
+To use RustCrypto everywhere:
 
 ```toml
 par2-rs = { version = "0.10", default-features = false, features = ["crypto-rust"] }
 ```
 
-`native-crypto` stays as an alias for `crypto-aws-lc`, so dependency
-declarations written against the old name keep resolving to the same backend.
-On a native target, enabling neither backend is a compile error rather than a
-silent choice.
+`crypto-aws-lc` and `native-crypto` stay as aliases for `crypto-native`, so
+dependency declarations written against the old names keep resolving to the
+fast backend. On x86-64 and AArch64, enabling neither backend is a compile
+error rather than a silent choice.
 
 ## Feature flags
 

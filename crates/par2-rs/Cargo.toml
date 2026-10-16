@@ -5,38 +5,35 @@ readme = "README.md"
 version = "0.10.11"
 edition.workspace = true
 rust-version.workspace = true
-license = "GPL-3.0-or-later"
+license = "GPL-3.0-or-later AND Apache-2.0"
 repository.workspace = true
 exclude = ["tests/fixtures/**", "fuzz/**"]
 
 # Crypto backend selection.
 #
-# The MD5 seam in `crate::checksum` has two backends. `crypto-aws-lc` (default)
-# binds AWS-LC's MD5 directly; `crypto-rust` selects the portable RustCrypto
-# `md-5` implementation. On native targets the AWS-LC backend wins whenever
-# `crypto-aws-lc` is enabled, even when `crypto-rust` is also on — both stay
-# compiled so the backend differential test can compare them. On `wasm` the
-# AWS-LC dependency vanishes through a target gate, so `crypto-rust` is the
-# only backend there. Enabling neither backend on a native target is a compile
-# error (see `lib.rs`).
+# The MD5 seam in `crate::checksum` has two backends. `crypto-native`
+# (default) is the crate's own assembly on x86-64 and little-endian AArch64
+# (`src/md5_asm.rs`, AWS-LC's MD5 carried into `asm!`), so it needs no C
+# toolchain and no crypto library. `crypto-rust` selects the portable
+# RustCrypto `md-5` implementation. Where both are compiled the assembly wins;
+# both stay compiled so the backend differential test can compare them. Every
+# other target (wasm included) has only RustCrypto, and takes it without being
+# asked. On x86-64 or AArch64, enabling neither backend is a compile error
+# (see `lib.rs`). `build.rs` turns this into the `par2_md5_asm` and
+# `par2_md5_rustcrypto` cfgs.
 #
-# On native targets `md-5` is reachable only through `crypto-rust`, so a
-# default build links neither the RustCrypto backend nor its crate. On `wasm`
-# it is unconditional (see the wasm dependency table): RustCrypto is the only
-# backend that exists there, and a featureless wasm build keeps selecting it
-# without being asked, as it always has. The test suite still needs an
-# independent MD5 to check the AWS-LC binding against, which is why `md-5`
-# also appears under `[dev-dependencies]`: consumers never see that edge.
+# On the assembly targets `md-5` is reachable only through `crypto-rust`, so a
+# default build links no RustCrypto backend. The test suite still needs an
+# independent MD5 to check the assembly against, which is why `md-5` also
+# appears under `[dev-dependencies]`: consumers never see that edge.
 [features]
-# `native-crypto` stays in the default list: it was the default feature before
-# the backends were named, and a consumer that reached the AWS-LC backend
-# through the defaults must keep seeing it enabled.
-default = ["crypto-aws-lc", "native-crypto"]
-crypto-aws-lc = ["dep:aws-lc-sys"]
+default = ["crypto-native"]
+crypto-native = []
 crypto-rust = ["dep:md-5"]
-# Back-compat alias for dependency declarations written before the backends
-# were named; selects the AWS-LC backend.
-native-crypto = ["crypto-aws-lc"]
+# Back-compat aliases for dependency declarations written before the assembly
+# backend replaced the AWS-LC binding; both select `crypto-native`.
+crypto-aws-lc = ["crypto-native"]
+native-crypto = ["crypto-native"]
 slow-tests = []
 # Opt-in Apple-GPU (Metal) acceleration for repair and creation. Off by
 # default: repair may fall back to CPU, while creation follows its explicit
@@ -65,19 +62,17 @@ libc = { workspace = true }
 # `memmap2` backs the mmap scanner in `repairer.rs`; wasip1 has no `mmap`, so
 # the scanner takes a compile-time buffered `std::fs` fallback there (see
 # `MappedFile` in `repairer.rs`) and the crate must not even link memmap2 on
-# wasm. `aws-lc-sys` (the `crypto-aws-lc` MD5 backend) is unavailable on wasm
-# and is only reachable through that feature, which is off for wasm builds
-# (`--no-default-features --features crypto-rust` selects the RustCrypto `md-5`
-# backend); the target gate keeps it out even if the feature is force-enabled
-# on a wasm build.
+# wasm.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 memmap2 = { workspace = true, default-features = false }
-aws-lc-sys = { workspace = true, optional = true }
+
+# Where the assembly MD5 exists, RustCrypto is opt-in through `crypto-rust`.
+[target.'cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", target_endian = "little")))'.dependencies]
 md-5 = { workspace = true, optional = true }
 
-# The RustCrypto MD5 is the only backend wasm can have, so it is not optional
-# there: a wasm consumer that names no feature still gets a working crate.
-[target.'cfg(target_family = "wasm")'.dependencies]
+# Everywhere else (wasm included) RustCrypto is the only MD5, so it is not
+# optional: a consumer that names no feature still gets a working crate.
+[target.'cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", target_endian = "little"))))'.dependencies]
 md-5 = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]

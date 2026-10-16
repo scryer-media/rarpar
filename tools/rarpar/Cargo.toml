@@ -38,12 +38,13 @@ runtime = [
 # forwards neither: a build that asks for the runtime without naming a backend
 # must fail in `par2-rs`/`unrar-rs` rather than quietly resolve to one. Every
 # shipped artifact is built with `crypto-aws-lc`, which the release feature
-# audit enforces.
+# audit enforces. For par2-rs it selects the in-crate assembly MD5
+# (`crypto-native`), which links no AWS-LC.
 #
 # The `dep?/feature` form keeps these features inert when the libraries are not
 # linked at all, so naming a backend never drags the runtime in by itself.
 crypto-aws-lc = [
-    "par2-rs?/crypto-aws-lc",
+    "par2-rs?/crypto-native",
     "unrar-rs?/crypto-aws-lc",
     "sevenz-turbo?/aws-lc-crypto",
     "lzma-turbo?/crypto",

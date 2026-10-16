@@ -1996,7 +1996,6 @@ dependencies = [
 name = "par2-rs"
 version = "0.10.11"
 dependencies = [
- "aws-lc-sys",
  "bytes",
  "cap-std",
  "crc-fast",
@@ -2995,7 +2994,6 @@ version = "0.12.0"
 dependencies = [
  "aes",
  "aws-lc-rs",
- "aws-lc-sys",
  "blake2s_simd",
  "cbc",
  "crc-fast",
