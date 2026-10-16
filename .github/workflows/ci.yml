@@ -2336,14 +2336,15 @@ jobs:
             changed: unrar
             # The LZ window and bit readers (unaligned loads and stores), the
             # parallel RAR5 decoder, BLAKE2sp/AES/CRC SIMD, the hash
-            # pipeline threads and the member metadata FFI (umask, owners,
-            # extended attributes).
-            filter: test(/^(decompress::|crypto::|crc_simd::|hash_pipeline::|archive::member::)/)
+            # pipeline threads, the member metadata FFI (umask, owners,
+            # extended attributes) and RAR4's mktime call.
+            filter: test(/^(decompress::|crypto::|crc_simd::|hash_pipeline::|archive::member::|rar4::)/)
           - crate: par2-rs
             changed: par2
             # The repair controller's interleaved output, the MD5/CRC SIMD
-            # kernels, the repair transform and the openat-based disk layer.
-            filter: test(/^(repair::|md5_simd::|crc_simd::|repair_transform::|matrix::|disk::|checksum::)/)
+            # kernels, the repair transform, the openat-based disk layer, and
+            # create's aligned encode buffers, JIT calls and output-file FFI.
+            filter: test(/^(repair::|md5_simd::|crc_simd::|repair_transform::|matrix::|disk::|checksum::|create::encode::|create::output::)/)
           - crate: par3-rs
             changed: par3
             # statfs and the clone/copy FFI, the hashing and FFT pools.
@@ -2351,8 +2352,6 @@ jobs:
     env:
       CRATE: ${{ matrix.crate }}
       FILTER: ${{ matrix.filter }}
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: valgrind --quiet --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect
-      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: valgrind --quiet --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect
     steps:
       - name: Gate on the crate being affected
         id: gate
@@ -2387,8 +2386,13 @@ jobs:
       - name: Run the crate's unsafe-bearing lib tests under Memcheck
         # Default features: AWS-LC's assembly and the native SIMD kernels are
         # what Memcheck can see and the sanitizers cannot. Memcheck's CPUID
-        # hides AVX-512, so the x86 lane runs the AVX2 tier and below.
+        # hides AVX-512, so the x86 lane runs the AVX2 tier and below. The
+        # runner is set on this step alone, so xtask and build scripts run
+        # natively.
         if: steps.gate.outputs.run == 'true'
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: valgrind --quiet --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: valgrind --quiet --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect
         run: cargo nextest run --locked --no-fail-fast -p "$CRATE" --lib -E "$FILTER"
 
   unsafe-sanitizer:
@@ -2429,12 +2433,12 @@ jobs:
             # RustCrypto, so the AES and BLAKE2sp under the decoder are Rust
             # the sanitizer instruments.
             features: --no-default-features --features crypto-rust
-            address: test(/^(decompress::|crypto::|crc_simd::|hash_pipeline::|archive::member::)/)
+            address: test(/^(decompress::|crypto::|crc_simd::|hash_pipeline::|archive::member::|rar4::)/)
             thread: test(/^(decompress::lz::parallel::|decompress::lz::tests::|hash_pipeline::|recovery::)/)
           - crate: par2-rs
             changed: par2
             features: --no-default-features --features crypto-rust
-            address: test(/^(repair::|md5_simd::|crc_simd::|repair_transform::|matrix::|disk::|checksum::)/)
+            address: test(/^(repair::|md5_simd::|crc_simd::|repair_transform::|matrix::|disk::|checksum::|create::encode::|create::output::)/)
           - crate: par3-rs
             changed: par3
             features: ""
