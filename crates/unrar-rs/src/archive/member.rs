@@ -7988,9 +7988,7 @@ mod tests {
     // conversion; one that carries a `RarError` becomes that error.
     #[test]
     fn read_errors_keep_their_typed_cause() {
-        let RarError::Io(error) =
-            RarError::from(std::io::Error::from_raw_os_error(24))
-        else {
+        let RarError::Io(error) = RarError::from(std::io::Error::from_raw_os_error(24)) else {
             panic!("an OS error stays an I/O error");
         };
         assert_eq!(error.raw_os_error(), Some(24));

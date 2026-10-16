@@ -1692,17 +1692,6 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "lzma-turbo"
-version = "0.9.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16b072b4a72bfa529b4132259cd7c530b6827305844395f65ffdf333f26db9ab"
-dependencies = [
- "aws-lc-rs",
- "crc-fast",
- "sha2 0.11.0",
-]
-
-[[package]]
-name = "lzma-turbo"
 version = "0.10.0"
 source = "git+https://github.com/scryer-media/lzma-turbo?rev=9692dc792998041d70ef470dcc5fd6a6fa3dc4c5#9692dc792998041d70ef470dcc5fd6a6fa3dc4c5"
 dependencies = [
@@ -2162,12 +2151,6 @@ dependencies = [
 
 [[package]]
 name = "ppmd-turbo"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d772f4b18e5af5cf5186a3661d5fc451c7366b2ce59da997179ed192bf12512b"
-
-[[package]]
-name = "ppmd-turbo"
 version = "0.2.0"
 source = "git+https://github.com/scryer-media/ppmd-turbo?rev=a2cfd2f7e8a14c2396472cfcbec6233f38fc337f#a2cfd2f7e8a14c2396472cfcbec6233f38fc337f"
 
@@ -2262,7 +2245,7 @@ dependencies = [
  "crc-fast",
  "filetime",
  "libc",
- "lzma-turbo 0.10.0",
+ "lzma-turbo",
  "mimalloc",
  "par2-rs",
  "par3-rs",
@@ -2599,9 +2582,8 @@ dependencies = [
 
 [[package]]
 name = "sevenz-turbo"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a481130a6f913ccb75deb9105b1eafdfbbe78d654cd41fff2407c2ff226562de"
+version = "0.29.0"
+source = "git+https://github.com/scryer-media/sevenz-turbo?rev=16c2283e8b9de76f48e77ecb26c90a62c583c23f#16c2283e8b9de76f48e77ecb26c90a62c583c23f"
 dependencies = [
  "aes",
  "aws-lc-rs",
@@ -2610,8 +2592,8 @@ dependencies = [
  "flate2",
  "getrandom 0.4.3",
  "js-sys",
- "lzma-turbo 0.9.2",
- "ppmd-turbo 0.1.1",
+ "lzma-turbo",
+ "ppmd-turbo",
  "wasm-bindgen",
  "zeroize",
 ]
@@ -3022,7 +3004,7 @@ dependencies = [
  "hmac",
  "libc",
  "memchr",
- "ppmd-turbo 0.2.0",
+ "ppmd-turbo",
  "rayon",
  "reedsolomon-rs",
  "rmp-serde",
