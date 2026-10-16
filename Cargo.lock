@@ -1693,7 +1693,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 [[package]]
 name = "lzma-turbo"
 version = "0.10.0"
-source = "git+https://github.com/scryer-media/lzma-turbo?rev=7ee55ac33214ba7091b23c07596fcd2c28bf1e84#7ee55ac33214ba7091b23c07596fcd2c28bf1e84"
+source = "git+https://github.com/scryer-media/lzma-turbo?rev=1b1f763b282889e365bc35d63d19e8ef74a0e940#1b1f763b282889e365bc35d63d19e8ef74a0e940"
 dependencies = [
  "aws-lc-rs",
  "crc-fast",
@@ -2583,7 +2583,7 @@ dependencies = [
 [[package]]
 name = "sevenz-turbo"
 version = "0.29.0"
-source = "git+https://github.com/scryer-media/sevenz-turbo?rev=9850effa673e605ec2bd868c7adc9dd3f375bfff#9850effa673e605ec2bd868c7adc9dd3f375bfff"
+source = "git+https://github.com/scryer-media/sevenz-turbo?rev=561bf24a7ad9310962b62f053572ad74c94f71fa#561bf24a7ad9310962b62f053572ad74c94f71fa"
 dependencies = [
  "aes",
  "aws-lc-rs",
