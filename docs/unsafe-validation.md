@@ -3,8 +3,10 @@
 The memory-safety lanes in `.github/workflows/ci.yml` (`unsafe-valgrind`,
 `unsafe-sanitizer`, `unsafe-miri-plan`/`unsafe-miri`, joined by
 `unsafe-complete`) cover the unsafe-bearing code of the four library crates:
-`reedsolomon-rs`, `unrar-rs`, `par2-rs` and `par3-rs`. The `rarpar` CLI and
-`xtask` hold no unsafe code of their own and are not in these lanes.
+`reedsolomon-rs`, `unrar-rs`, `par2-rs` and `par3-rs`. The `rarpar` CLI holds
+unsafe code of its own but is not in these lanes (see
+[Not instrumented](#not-instrumented)); `xtask`'s only unsafe code is
+`std::env::set_var`/`remove_var` in its tests.
 
 Every lane selects library unit tests by module with a nextest `-E` filter,
 so that each job runs the tests that reach the unsafe code rather than the
@@ -20,14 +22,14 @@ crate.
 | --- | --- |
 | `reedsolomon-rs` | GF(2^8)/GF(2^16) SIMD kernels (`gf_simd`, `gf8`, `gf_pmul`, `sve2`: SSSE3/AVX2/AVX-512/GFNI, NEON, SVE2); the FFT's shared row banks and raw row views (`fft`); the tiled inversion's byte views (`matrix_tiled`); the x86-64 XOR JIT (`xor_jit`: W^X mappings and an `asm!` trampoline); the Metal and wgpu backends (opt-in features) |
 | `unrar-rs` | The LZ window and bit readers' unaligned loads and stores (`decompress::lz::window`, `block_reader`); the parallel RAR5 decoder's fast symbol path (`decompress::lz::parallel`); BLAKE2sp, AES and CRC SIMD (`crypto::`, `crc_simd`); the AWS-LC backend's FFI; member metadata FFI (`archive::member`: umask, owners, extended attributes, Windows security); `mktime` in `rar4` |
-| `par2-rs` | The repair controller's interleaved output pointers and packed checksums (`repair`); MD5 and CRC SIMD (`md5_simd`, `crc_simd`); the repair transform and matrix byte views; `openat`/`unlinkat` (`disk`); create's aligned encode buffers and JIT calls (`create::encode`); output-file FFI (`create::output`); the repairer's `MappedFile` mmap wrapper (`repairer`) |
+| `par2-rs` | The repair controller's interleaved output pointers and packed checksums (`repair`); MD5 and CRC SIMD (`md5_simd`, `crc_simd`); the repair transform and matrix byte views; `openat`/`unlinkat` (`disk`); create's aligned encode buffers and JIT calls (`create::encode`); output-file FFI (`create::output`); the repairer's `MappedFile` mmap wrapper (`repairer`); `posix_fadvise` on Linux for sources of 64 MiB or more (`file_cache`) |
 | `par3-rs` | Only OS FFI: `statfs`/`GetVolumePathNameW` (`mount`), `fclonefileat`/`FICLONE`/`copy_file_range` (`repair_tree_clone`), Windows file identity (`repair_tree_windows`). Its threading (hash, FFT, repair and creation pools) has no unsafe code but is where a race would come from |
 
 ## Lanes per crate
 
 | Lane | `reedsolomon-rs` | `unrar-rs` | `par2-rs` | `par3-rs` |
 | --- | --- | --- | --- | --- |
-| `unsafe-valgrind` (Memcheck, Linux x86-64 and ARM64, default features) | `gf_simd`, `gf8`, `gf_pmul`, `fft`, `matrix_tiled`, `sve2`, `decode_apply`, `threading`, `xor_jit` | `decompress::`, `crypto::`, `crc_simd`, `hash_pipeline`, `archive::member`, `rar4` (AWS-LC) | `repair`, `md5_simd`, `crc_simd`, `repair_transform`, `matrix`, `disk`, `checksum`, `create::encode`, `create::output`, the `repairer` tests that map a file (AWS-LC) | `mount`, `repair_tree`, `session_repair`, `hash`, `fft`, `runtime`, `gf` |
+| `unsafe-valgrind` (Memcheck, Linux x86-64 and ARM64, default features) | `gf_simd`, `gf8`, `gf_pmul`, `fft`, `matrix_tiled`, `sve2`, `decode_apply`, `threading`, `xor_jit` | `decompress::`, `crypto::`, `crc_simd`, `hash_pipeline`, `archive::member`, `rar4` (AWS-LC) | `repair`, `md5_simd`, `crc_simd`, `repair_transform`, `matrix`, `disk`, `checksum`, `create::encode`, `create::output`, the `repairer` tests that map a file or copy from a 64 MiB source, the latter reaching `file_cache`'s `posix_fadvise` (AWS-LC) | `mount`, `repair_tree`, `session_repair`, `hash`, `fft`, `runtime`, `gf` |
 | `unsafe-sanitizer` AddressSanitizer (Linux x86-64 and ARM64, `-Zbuild-std`) | as Memcheck | as Memcheck, RustCrypto | as Memcheck, RustCrypto | as Memcheck |
 | `unsafe-sanitizer` ThreadSanitizer (same) | — | `decompress::lz::parallel`, `decompress::lz::tests`, `hash_pipeline`, `recovery`, RustCrypto | — | `hash`, `fft`, `runtime`, `session_repair`, `session`, `evidence`, `creation` |
 | `unsafe-miri` (one job per discovered test, `-Zmiri-strict-provenance`) | `fft::tests`: the row-bank, known-zero-step and transform round-trip tests | `decompress::lz::window::tests`, `decompress::lz::block_reader::tests` except the exhaustive `copy_matrix_matches_reference_*` sweeps, RustCrypto | — | — |
@@ -98,6 +100,11 @@ What no lane above runs, so that a pass is not read as more than it is:
   `create::output`) are Linux-invisible; the lanes are Linux only. So is the
   WASI-only `pread`/`pwrite` FFI in `repairer` (`read_file_at`,
   `write_file_at` under `cfg(target_os = "wasi")`).
+- The `rarpar` CLI's own unsafe code (`libc` FFI in `compat_7z`,
+  `compat_par3`, `discovery`, `error` and `par3`: terminal state,
+  directory-relative `openat`/`renameat`/`unlinkat` and friends, time
+  conversion, `posix_fadvise`) is outside these lanes, which instrument the
+  library crates only.
 - Integration tests (`tests/`) and the fixture corpora are not under any
   instrument; only library unit tests are selected. The fuzz targets run
   under AddressSanitizer in ClusterFuzzLite (`cflite-pr.yml`,

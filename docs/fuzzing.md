@@ -17,7 +17,7 @@ drive, which is where the arithmetic lives.
 | `rar_extract` | `unrar-rs` | Decompression — RAR4 and RAR5 LZ, PPMd, the filter VM, stored and solid layouts. Bounded to 32 members per input so one pathological archive cannot spend the run. |
 | `rar_recovery_restore` | `unrar-rs` | `restore_volumes_from_paths`: reconstructing missing volumes from `.rev` parity. This is the path that aborted an embedder with a stack overflow before 0.5.3 — well-formed headers, wrong arithmetic behind them. |
 | `par2_packets` | `par2-rs` | `scan_packets_from_path`: the packet scanner. |
-| `par3_packets` | `par3-rs` | `scan_packets`: the PAR3 packet scanner — magic hunting, header and hash checks, typing File and Explicit Matrix packets by their set's Start packet, and the `ScanLimits` retention bounds. Guided by `par3.dict`; built with blake3's `pure` feature so its hashing is Rust ASan instruments. No seed corpus: PAR3 bytes come only from official `par3cmdline` runs, which live in the signed test corpus, not in the repository. |
+| `par3_packets` | `par3-rs` | `scan_packets`: the PAR3 packet scanner — magic hunting, header and hash checks, typing File and Explicit Matrix packets by their set's Start packet, and the `ScanLimits` retention bounds. Guided by `par3.dict`; built with blake3's `pure` feature so its hashing is Rust ASan instruments. Seeded with five PAR3 files from official `par3cmdline` runs, copied byte for byte from the test corpus and never hand-assembled, so mutation starts past the header hash check. |
 | `par2_verify_repair` | `par2-rs` | Slice verification against real files plus repair *planning* — exponents, slice counts and memory reservations computed from attacker-controlled numbers. Repair is not executed: its cost is set by those same numbers, so a fuzzer would spend the run reconstructing one input. |
 
 `rar_recovery_restore` and `par2_verify_repair` need a *set* of files rather
@@ -34,9 +34,9 @@ whose lengths have to agree — so a mutator starting from nothing spends its
 whole budget failing the first check. Every target therefore ships:
 
 - **A seed corpus**, committed under `crates/<crate>/fuzz/corpus/<target>/`.
-  These are real archives produced by the pinned RARLAB writers and
-  par2cmdline-turbo, copied from the test corpus; they are seeds, not fixtures,
-  and they are not in `test-corpus/sources.json`. `cargo fuzz run <target>`
+  These are real archives produced by the pinned RARLAB writers,
+  par2cmdline-turbo and par3cmdline, copied from the test corpus; they are
+  seeds, not fixtures, and they are not in `test-corpus/sources.json`. `cargo fuzz run <target>`
   picks the same directory up locally, so a developer reproducing a CI finding
   starts where CI started.
 - **A dictionary** (`crates/<crate>/fuzz/*.dict`) of format tokens: signatures,
