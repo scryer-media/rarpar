@@ -10075,6 +10075,159 @@ mod tests {
         assert!(matches!(err, RarError::Io(_)), "{err}");
     }
 
+    const STAGED_AES_KEY: [u8; 32] = [
+        0x6b, 0x1f, 0x93, 0x02, 0xd4, 0x5e, 0xa7, 0x38, 0xc1, 0x0d, 0x76, 0xe9, 0x24, 0xb8, 0x4f,
+        0x91, 0x3a, 0xec, 0x05, 0x7d, 0xb2, 0x68, 0xf1, 0x16, 0x8c, 0x47, 0xd9, 0x2b, 0x60, 0xae,
+        0x13, 0xf5,
+    ];
+    const STAGED_AES_IV: [u8; 16] = [
+        0x9e, 0x31, 0x5c, 0xa8, 0x07, 0xd2, 0x64, 0xbb, 0x1e, 0x83, 0xf9, 0x40, 0x2d, 0xc6, 0x75,
+        0x0a,
+    ];
+    const STAGED_LEGACY_PASSWORD: &str = "staged-store";
+
+    /// The decryptors a staged encrypted store copy runs: AES-256 (RAR5) in
+    /// the block-aligned mode, the RAR 2.0 cipher as the block-aligned legacy
+    /// one, and the RAR 1.5 cipher in the streaming mode.
+    #[derive(Clone, Copy, Debug)]
+    enum StagedCipher {
+        Rar5Aes,
+        Rar20,
+        Rar15,
+    }
+
+    impl StagedCipher {
+        const ALL: [Self; 3] = [Self::Rar5Aes, Self::Rar20, Self::Rar15];
+
+        /// The granularity the decrypting reader hands plaintext back in.
+        fn block(self) -> usize {
+            match self {
+                Self::Rar5Aes | Self::Rar20 => crate::crypto::AES_BLOCK,
+                Self::Rar15 => 1,
+            }
+        }
+
+        /// The member's packed bytes: `plain`, zero-padded to a whole block,
+        /// encrypted.
+        fn encrypt(self, plain: &[u8]) -> Vec<u8> {
+            let mut padded = plain.to_vec();
+            padded.resize(plain.len().next_multiple_of(self.block()), 0);
+            match self {
+                Self::Rar5Aes => crate::crypto::encrypt_aes256_cbc_for_test(
+                    &STAGED_AES_KEY,
+                    &STAGED_AES_IV,
+                    &padded,
+                ),
+                Self::Rar20 => {
+                    crate::crypto::encrypt_rar20_for_test(STAGED_LEGACY_PASSWORD, &mut padded);
+                    padded
+                }
+                Self::Rar15 => {
+                    // The RAR 1.5 cipher XORs a keystream, so decrypting the
+                    // plaintext encrypts it.
+                    let mut ciphertext = Vec::with_capacity(padded.len());
+                    self.decrypt(Box::new(Cursor::new(padded)))
+                        .expect("RAR 1.5 reader")
+                        .read_to_end(&mut ciphertext)
+                        .expect("RAR 1.5 keystream");
+                    ciphertext
+                }
+            }
+        }
+
+        fn decrypt<'r>(
+            self,
+            source: Box<dyn Read + Send + 'r>,
+        ) -> RarResult<Box<dyn Read + Send + 'r>> {
+            use crate::rar4::types::Rar4EncryptionMethod;
+            Ok(match self {
+                Self::Rar5Aes => Box::new(crate::crypto::DecryptingReader::new_rar5(
+                    source,
+                    &STAGED_AES_KEY,
+                    &STAGED_AES_IV,
+                )),
+                Self::Rar20 => Box::new(crate::crypto::DecryptingReader::new_rar4_legacy(
+                    source,
+                    Rar4EncryptionMethod::Rar20,
+                    STAGED_LEGACY_PASSWORD,
+                )),
+                Self::Rar15 => Box::new(crate::crypto::DecryptingReader::new_rar4_legacy(
+                    source,
+                    Rar4EncryptionMethod::Rar15,
+                    STAGED_LEGACY_PASSWORD,
+                )),
+            })
+        }
+    }
+
+    /// Past the pipeline threshold, with a tail that is not a whole block.
+    fn real_cipher_store_len() -> usize {
+        crate::hash_pipeline::PIPELINE_MIN_BYTES as usize + 12_345
+    }
+
+    /// The staged encrypted copy, with a real decrypting reader on its
+    /// decrypt thread, writes and hashes the plaintext.
+    #[test]
+    fn staged_encrypted_store_copy_decrypts_with_real_ciphers() {
+        let plain = stored_payload(real_cipher_store_len());
+        let mut blake = Blake2spHasher::new();
+        blake.update(&plain);
+        let expected_blake = blake.finalize();
+        for cipher in StagedCipher::ALL {
+            let ciphertext = cipher.encrypt(&plain);
+            let stream_hash = pipelined_store_hash(plain.len());
+            let mut output = Vec::new();
+            let written = RarArchive::copy_encrypted_reader_hashed(
+                scripted_store_reader(&ciphertext, None),
+                |source| cipher.decrypt(source),
+                &mut output,
+                &stream_hash,
+                StoreCopyLimit::Exact(plain.len() as u64),
+                "member.bin",
+            )
+            .unwrap_or_else(|err| panic!("{cipher:?} staged copy: {err}"));
+            assert_eq!(written, plain.len() as u64, "{cipher:?}");
+            assert!(output == plain, "{cipher:?} output differs from the source");
+            let hashes = stream_hash.finalize().expect("hashes");
+            assert_eq!(hashes.crc32, Some(crate::crc::hash(&plain)), "{cipher:?}");
+            assert_eq!(hashes.blake2sp, Some(expected_blake), "{cipher:?}");
+        }
+    }
+
+    /// A volume read that fails mid-stream reaches the caller through the
+    /// real decrypting reader, after every whole block read before it was
+    /// written.
+    #[test]
+    fn staged_encrypted_store_copy_with_real_ciphers_stops_at_a_read_error() {
+        let plain = stored_payload(real_cipher_store_len());
+        let fail_at = 5 * STORE_HASHED_CHUNK_BYTES + 1_234;
+        for cipher in StagedCipher::ALL {
+            let ciphertext = cipher.encrypt(&plain);
+            let stream_hash = pipelined_store_hash(plain.len());
+            let mut output = Vec::new();
+            let err = RarArchive::copy_encrypted_reader_hashed(
+                scripted_store_reader(&ciphertext, Some(fail_at)),
+                |source| cipher.decrypt(source),
+                &mut output,
+                &stream_hash,
+                StoreCopyLimit::Exact(plain.len() as u64),
+                "member.bin",
+            )
+            .expect_err("read error must fail the copy");
+            assert!(
+                format!("{err}").contains("scripted read failure"),
+                "{cipher:?}: {err}"
+            );
+            let decrypted = fail_at - fail_at % cipher.block();
+            assert!(
+                output == plain[..decrypted],
+                "{cipher:?}: output must hold the {decrypted} bytes before the failed read, \
+                 got {}",
+                output.len()
+            );
+        }
+    }
+
     /// A write error returns that error and does not leave the reader thread
     /// blocked on a full queue.
     #[test]
