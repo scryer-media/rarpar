@@ -3,6 +3,7 @@ package fleet
 import (
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"time"
 
@@ -444,8 +445,9 @@ func par3PerfStep(machine Machine) string {
 		par3bench.PerfPassRuns(profile, variants, perf), par3bench.PerfIncompleteFile)
 }
 
-// par3PAR2Step names the PAR2 rows macro-par3 runs, or "" when no selected
-// set asks for them.
+// par3PAR2Step names the PAR2 rows macro-par3 runs and the selected ops they
+// run, or "" when no selected set asks for them or no selected op has a PAR2
+// row.
 func par3PAR2Step(machine Machine) string {
 	profile, err := par3bench.LookupProfile(machine.PAR3.Profile)
 	if err == nil {
@@ -460,15 +462,30 @@ func par3PAR2Step(machine Machine) string {
 			sets = append(sets, config.ID)
 		}
 	}
-	if len(sets) == 0 {
+	// PAR2 rows run create, verify and repair; never verify-damaged.
+	selected := machine.PAR3.Ops
+	if len(selected) == 0 {
+		selected = par3bench.DefaultOps
+	}
+	var ops []string
+	for _, op := range par3bench.KnownOps {
+		if op != par3bench.OpVerifyDamaged && slices.Contains(selected, op) {
+			ops = append(ops, op)
+		}
+	}
+	if len(sets) == 0 || len(ops) == 0 {
 		return ""
 	}
 	rows := "par2-rs (rarpar par)"
 	if _, ok := machine.Oracles["par2"]; ok {
 		rows += " and par2cmdline-turbo (the par2 oracle)"
 	}
-	return fmt.Sprintf("on host: inside macro-par3, PAR2 rows %s create, verify and repair at the same block size, recovery and damage on %s",
-		rows, strings.Join(sets, ","))
+	opText := ops[0]
+	if len(ops) > 1 {
+		opText = strings.Join(ops[:len(ops)-1], ", ") + " and " + ops[len(ops)-1]
+	}
+	return fmt.Sprintf("on host: inside macro-par3, PAR2 rows %s %s at the same block size, recovery and damage on %s",
+		rows, opText, strings.Join(sets, ","))
 }
 
 // perfStep is the run script's perf section: the corpus suites' perf pass,

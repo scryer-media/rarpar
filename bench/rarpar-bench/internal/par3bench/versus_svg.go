@@ -62,7 +62,7 @@ func RenderVersusSVGs(inputs []VersusChartInput, out string) ([]string, error) {
 			if !ok {
 				continue
 			}
-			path := filepath.Join(out, "rarpar-par3-versus-"+shape+"-"+op+".svg")
+			path := filepath.Join(out, versusChartName(shape, op))
 			if err := os.WriteFile(path, content, 0o644); err != nil {
 				return paths, err
 			}
@@ -72,8 +72,31 @@ func RenderVersusSVGs(inputs []VersusChartInput, out string) ([]string, error) {
 	return paths, nil
 }
 
+// versusChartName is a chart's file name. The shape ID comes from the
+// results file, so versusChartShapes admits only IDs that stay one plain
+// file name inside the output directory.
+func versusChartName(shape, op string) string {
+	return "rarpar-par3-versus-" + shape + "-" + op + ".svg"
+}
+
+// validShapeID reports whether a shape ID is letters, digits, '-', '_' and
+// '.' only: no path separator, so the chart it names stays in its directory.
+func validShapeID(id string) bool {
+	if id == "" {
+		return false
+	}
+	for _, r := range id {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
+			return false
+		}
+	}
+	return true
+}
+
 // versusChartShapes is every shape in the inputs, in first-seen order, after
-// checking each one has the same definition everywhere it ran.
+// checking each one has the same definition everywhere it ran, and that every
+// input measured the same rarpar version: a chart puts the machines' rows on
+// one scale, so they must be one comparison.
 func versusChartShapes(inputs []VersusChartInput) ([]string, error) {
 	type seen struct {
 		set  *ConfigSummary
@@ -85,7 +108,13 @@ func versusChartShapes(inputs []VersusChartInput) ([]string, error) {
 		if input.Results == nil {
 			return nil, fmt.Errorf("input %q has no results", input.Name)
 		}
+		if first := inputs[0].Results; first != nil && first.Candidate.Version != input.Results.Candidate.Version {
+			return nil, fmt.Errorf("%s ran rarpar %q and %s ran %q; render them separately", versusInputName(inputs[0]), first.Candidate.Version, versusInputName(input), input.Results.Candidate.Version)
+		}
 		for _, shape := range VersusShapes(input.Results) {
+			if !validShapeID(shape.ID) {
+				return nil, fmt.Errorf("%s names shape %q: a shape ID is letters, digits, '-', '_' and '.' only", versusInputName(input), shape.ID)
+			}
 			previous, ok := byID[shape.ID]
 			if !ok {
 				byID[shape.ID] = seen{set: shape.Set(), name: versusInputName(input)}
@@ -131,24 +160,27 @@ func renderVersusSVG(inputs []VersusChartInput, rows [][]Row, id, op string) ([]
 	var armLists [][]VersusArm
 	var set *ConfigSummary
 	measured := false
+	for _, input := range inputs {
+		if shape, ok := versusShape(input.Results, id); ok {
+			set = shape.Set()
+			break
+		}
+	}
 	for i, input := range inputs {
 		shape, ok := versusShape(input.Results, id)
 		if !ok {
 			continue
 		}
-		if set == nil {
-			set = shape.Set()
-		}
 		arms := VersusArms(input.Results, rows[i], shape, op)
 		for _, arm := range arms {
 			measured = measured || arm.Measured()
 		}
-		_, _, workers := versusRarparRows(input.Results)
+		_, _, workers, _ := versusRarparRows(input.Results)
 		results := input.Results
 		groups = append(groups, versusChartGroup{
 			name: versusInputName(input),
 			subtitle: fmt.Sprintf("%s / %s, %d logical CPUs, rarpar par3 at %d workers, %d run(s) per arm",
-				results.Machine.OS, results.Machine.Architecture, results.Machine.CPUCount, workers, set.MeasuredRepeats),
+				results.Machine.OS, results.Machine.Architecture, results.Machine.CPUCount, workers, shape.Set().MeasuredRepeats) + versusShortArms(arms, op),
 			arms: arms,
 		})
 		armLists = append(armLists, arms)
@@ -266,6 +298,22 @@ func versusTimingLine(arm VersusArm) string {
 		return "-"
 	}
 	return fmt.Sprintf("%.2f s wall  ·  %.2f s CPU  ·  %.0f MiB", arm.Row.Wall.Median, arm.Row.CPU.Median, arm.Row.RSS.Median/(1<<20))
+}
+
+// versusShortArms is "; succeeded: par2-rs 5/7" for the measured arms whose
+// median rests on fewer runs than their set asked for, so a group's
+// runs-per-arm figure never overstates one; "" when every arm ran in full.
+func versusShortArms(arms []VersusArm, op string) string {
+	var short []string
+	for _, arm := range arms {
+		if arm.Measured() && arm.Row.Wall.N < arm.Repeats {
+			short = append(short, fmt.Sprintf("%s %d/%d", arm.Label(op), arm.Row.Wall.N, arm.Repeats))
+		}
+	}
+	if len(short) == 0 {
+		return ""
+	}
+	return "; succeeded: " + strings.Join(short, "; ")
 }
 
 // versusRatioText keeps two significant figures below 10x and none above,

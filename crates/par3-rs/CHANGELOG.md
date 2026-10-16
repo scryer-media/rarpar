@@ -14,6 +14,13 @@
   name. Both repair paths (`Par3RepairSession` and the one-shot repair) now
   share this one install, so the one-shot repair also refuses a destination
   that is not a regular file, as the session already did.
+- The backup name and the vacated name are claimed with a no-replace rename:
+  `renameat2(RENAME_NOREPLACE)` on Linux and `renameatx_np(RENAME_EXCL)` on
+  macOS. Elsewhere, and where the filesystem refuses the flag, the name is
+  checked free just before the rename. A file another process creates at
+  either name during the repair now fails the install with `AlreadyExists`
+  instead of being replaced; a file appearing at the backup name moves the
+  backup on to the next number.
 
 ## 0.7.0
 

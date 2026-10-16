@@ -34,11 +34,12 @@ func RenderTables(inputs []VersusChartInput, workers int) (string, error) {
 	tables := make([]tableRows, len(inputs))
 	for i, input := range inputs {
 		tables[i] = newTableRows(Summarize(input.Results))
+		for _, count := range input.Results.Workers {
+			tables[i].largest = max(tables[i].largest, count)
+		}
 		tables[i].most = workers
 		if workers == 0 {
-			for _, count := range input.Results.Workers {
-				tables[i].most = max(tables[i].most, count)
-			}
+			tables[i].most = tables[i].largest
 		}
 	}
 	many := fmt.Sprintf("%d workers", workers)
@@ -100,9 +101,11 @@ func RenderTables(inputs []VersusChartInput, workers int) (string, error) {
 			}
 			cells = append(cells, geomeanText(ratios, len(plain)))
 		}
+		// A PAR-inside set runs its one rarpar row at the run's largest
+		// worker count (see carrierRuns), whatever --workers reads.
 		for _, config := range carriers {
 			for _, op := range []string{OpVerify, OpRepair} {
-				ratio, ok := tables[i].ratio(config.ID, op, workers, false)
+				ratio, ok := tables[i].ratio(config.ID, op, tables[i].largest, false)
 				if !ok {
 					cells = append(cells, "–")
 					continue
@@ -168,10 +171,12 @@ func opTitle(op string) string {
 }
 
 // tableRows indexes one machine's summarized rows for the tables; most is
-// the worker count the "most workers" columns read.
+// the worker count the "most workers" columns read, largest the run's
+// largest worker count.
 type tableRows struct {
-	rows []Row
-	most int
+	rows    []Row
+	most    int
+	largest int
 }
 
 func newTableRows(rows []Row) tableRows { return tableRows{rows: rows} }

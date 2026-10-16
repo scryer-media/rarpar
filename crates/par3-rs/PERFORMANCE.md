@@ -330,27 +330,22 @@ The engine's charged peak (`reserved_peak`) at w8 in MB: the default, the capaci
 
 ### PAR2 against PAR3
 
-This comparison has not been run yet; the fleet benchmark will run it once
-this release is published.
+The comparison now runs inside the PAR3 suite and is published on the
+[benchmark page](../../docs/benchmark.md#par2-against-par3). There is no
+separate run. In the `rarpar-bench` fleet profile, each posting shape is a
+Cauchy set and an FFT set over the same generated inputs, block size,
+recovery count and damage. The Cauchy set also carries the PAR2 rows:
+- PAR2 through `rarpar par` (`par2-rs`);
+- par2cmdline-turbo, where the host has it (`--par2`).
 
-The `rarpar-bench` harness has a `par3 versus` profile for it. Every arm
-uses the same generated inputs, block size, recovery count and damage. The
-arms are:
-- PAR2 through `rarpar par`;
-- par2cmdline-turbo, where the host has it;
-- PAR3 Cauchy through `rarpar par3`;
-- PAR3 FFT through `rarpar par3`.
-
-Each arm creates its own set and repairs it over the same damaged copy of
-the inputs. Every repair is checked against the inputs' SHA-256. The scale is
-**par2 ÷ par3** median wall time, so a figure above 1 means the PAR3 arm was
-faster. Peak RSS is reported raw for every arm.
-
-The rows are:
-- every arm at one recovery count on the Cauchy-class sets A (1 GiB, 1 MiB
-  blocks) and B (10 × 30 MiB, 1 MiB blocks), at 10% recovery;
-- FFT-only rows against both PAR2 arms on set A at 64 KiB blocks, at 10% and
-  30% recovery.
+Both PAR2 rows create, verify and repair that set, and every repair is
+checked against the inputs' SHA-256. `rarpar-bench par3 versus-render` draws
+one chart per shape and op from one or more machines' suite `results.json`.
+Each chart puts par2-rs, par2cmdline-turbo, par3cmdline and `rarpar par3`,
+each codec, on one scale: par2cmdline-turbo's median wall time divided by
+each arm's, so a figure above 1 means the arm was faster. Peak RSS and CPU
+time are reported raw for every arm. `docs/benchmarking.md` gives the
+commands.
 
 ### Open
 

@@ -169,3 +169,108 @@ func TestRenderTablesPutsTimeBeforeTheRatio(t *testing.T) {
 		}
 	}
 }
+
+// A repair arm with no successful run still says which repair mode its row
+// selects, so the rarpar in-place and backup rows stay apart on the chart.
+func TestVersusArmsLabelUnmeasuredRepairRowsByMode(t *testing.T) {
+	results := versusSuiteFixture("x", true, map[string]float64{"smoke-gf16/repair/reference": 8})
+	var labels []string
+	for _, arm := range VersusArms(results, Summarize(results), VersusShapes(results)[0], OpRepair) {
+		if strings.HasPrefix(arm.Name, "rarpar") {
+			labels = append(labels, arm.Label(OpRepair))
+		}
+	}
+	want := "rarpar par3 (Cauchy), in place|rarpar par3 (Cauchy), retains file|rarpar par3 (FFT), in place|rarpar par3 (FFT), retains file"
+	if strings.Join(labels, "|") != want {
+		t.Fatalf("labels %s", strings.Join(labels, "|"))
+	}
+}
+
+// A multi-target run names every row NAME@TARGET; every arm, not only the
+// rarpar ones, reads the first target's rows.
+func TestVersusArmsReadEveryToolOnTheFirstTarget(t *testing.T) {
+	walls := map[string]float64{"smoke-gf16/create/par2-rs@fast": 2, "smoke-gf16/create/par2cmdline-turbo@fast": 2,
+		"smoke-gf16/create/reference@fast": 16, "smoke-fft/create/reference@fast": 8, "smoke-gf16/create/rarpar-w4@fast": 1,
+		"smoke-fft/create/rarpar-w4@fast": 0.5, "smoke-gf16/create/par2cmdline-turbo@slow": 9}
+	results := versusSuiteFixture("x", true, nil)
+	results.Variants = MatrixRows([]int{1, 4}, nil, nil, nil, []string{ToolReference, ToolCandidate, ToolPAR2, ToolPAR2Turbo},
+		[]Target{{Name: "fast"}, {Name: "slow"}})
+	for key, wall := range walls {
+		parts := strings.SplitN(key, "/", 3)
+		run := RunRecord{Config: parts[0], Op: parts[1], Variant: parts[2], Status: StatusOK, Measurement: Measurement{WallSeconds: wall}}
+		for _, variant := range results.Variants {
+			if variant.Name == run.Variant {
+				run.Tool, run.Target = variant.Tool, variant.Target
+			}
+		}
+		results.Runs = append(results.Runs, run)
+	}
+	for _, arm := range VersusArms(results, Summarize(results), VersusShapes(results)[0], OpCreate) {
+		if !arm.Measured() {
+			t.Errorf("%s has no run on the first target", arm.Name)
+		} else if arm.Name == ArmPAR2Turbo && arm.Row.Wall.Median != 2 {
+			t.Errorf("par2cmdline-turbo read the %s row", arm.Row.Target)
+		}
+	}
+}
+
+// A group says how many runs its arms asked for from its own run, and names
+// any arm whose median rests on fewer.
+func TestRenderVersusSVGsCountsRunsPerMachine(t *testing.T) {
+	walls := map[string]float64{"smoke-gf16/create/par2-rs": 2, "smoke-gf16/create/rarpar-w4": 1}
+	short := versusSuiteFixture("b", false, walls)
+	for i := range short.Configs {
+		short.Configs[i].MeasuredRepeats = 3
+	}
+	paths, err := RenderVersusSVGs([]VersusChartInput{{Results: versusSuiteFixture("a", false, walls)}, {Results: short}}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	chart, _ := os.ReadFile(paths[0])
+	for _, want := range []string{"4 workers, 1 run(s) per arm</text>", "4 workers, 3 run(s) per arm; succeeded: par2-rs 1/3; rarpar par3 (Cauchy) 1/3</text>"} {
+		if !strings.Contains(string(chart), want) {
+			t.Fatalf("chart lacks %q:\n%s", want, chart)
+		}
+	}
+}
+
+func TestRenderVersusSVGsRefusesMixedComparisons(t *testing.T) {
+	walls := map[string]float64{"smoke-gf16/create/par2-rs": 1, "smoke-gf16/create/rarpar-w4": 1}
+	for name, change := range map[string]func(*Results){
+		"damage file": func(r *Results) {
+			r.Configs[0].Damage.Targets = append([]DamageTarget(nil), r.Configs[0].Damage.Targets...)
+			r.Configs[0].Damage.Targets[0].File, r.Configs[0].Damage.Targets[1].File = r.Configs[0].Damage.Targets[1].File, r.Configs[0].Damage.Targets[0].File
+			r.Configs[0].Damage.Targets[0].Blocks++
+			r.Configs[0].Damage.Targets[1].Blocks--
+		},
+		"layout":  func(r *Results) { r.Configs[0].PAR2SourceBlocks++ },
+		"version": func(r *Results) { r.Candidate.Version = "rarpar 0.9.0" },
+		"shape":   func(r *Results) { r.Configs[0].Shape, r.Configs[1].Shape = "../smoke", "../smoke" },
+	} {
+		other := versusSuiteFixture("b", false, walls)
+		change(other)
+		parent := t.TempDir()
+		if _, err := RenderVersusSVGs([]VersusChartInput{{Results: versusSuiteFixture("a", false, walls)}, {Results: other}}, filepath.Join(parent, "out")); err == nil {
+			t.Errorf("%s: rendered a mixed comparison", name)
+		}
+		if entries, _ := os.ReadDir(parent); len(entries) != 0 {
+			t.Errorf("%s: wrote %d entries", name, len(entries))
+		}
+	}
+}
+
+// A PAR-inside set has one rarpar row, at the run's largest worker count, so
+// its summary cells read that row whatever worker count the tables show.
+func TestRenderTablesReadsCarrierRowsAtTheirWorkerCount(t *testing.T) {
+	walls := map[string]float64{"smoke-gf16/create/reference": 4, "smoke-gf16/create/rarpar-w1": 2,
+		"zip/verify/reference": 6, "zip/verify/rarpar-w4": 2, "zip/repair/reference": 8, "zip/repair/rarpar-w4": 2}
+	results := versusSuiteFixture("x", false, walls)
+	results.Configs = append(results.Configs, ConfigSummary{Config: Config{ID: "zip", Dataset: "smoke", Carrier: CarrierZIP}})
+	tables, err := RenderTables([]VersusChartInput{{Name: "Zen 4", Results: results}}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(tables, "| 3.0× | 4.0× |\n") {
+		t.Fatalf("carrier cells:\n%s", tables)
+	}
+}

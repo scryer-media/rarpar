@@ -533,3 +533,22 @@ func TestPAR3PerfConfigValidation(t *testing.T) {
 		})
 	}
 }
+
+// The PAR2 plan step names only the selected ops PAR2 rows run.
+func TestPAR3PAR2StepFollowsTheSelectedOps(t *testing.T) {
+	for ops, want := range map[string]string{
+		"":                      "PAR2 rows par2-rs (rarpar par) create, verify and repair at",
+		"create":                "PAR2 rows par2-rs (rarpar par) create at",
+		"verify-damaged,repair": "PAR2 rows par2-rs (rarpar par) repair at",
+		"verify-damaged":        "",
+	} {
+		machine := Machine{PAR3: PAR3Plan{Profile: "smoke"}}
+		if ops != "" {
+			machine.PAR3.Ops = strings.Split(ops, ",")
+		}
+		step := par3PAR2Step(machine)
+		if (want == "") != (step == "") || !strings.Contains(step, want) {
+			t.Errorf("ops %q: step %q", ops, step)
+		}
+	}
+}
