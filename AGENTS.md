@@ -42,8 +42,14 @@ and PAR2 workflows.
 
 - `unrar-rs` is read/extract/recovery-only.
 - Do not add archive writer, archive builder, compressor, or modify-RAR APIs.
-- Standard crypto must use `aws-lc-rs` or `aws-lc-sys` directly in the
-  default feature set of every crate and in every shipped `rarpar` artifact.
+- Standard crypto must use `aws-lc-rs` in the default feature set of every
+  crate and in every shipped `rarpar` artifact. No crate depends on
+  `aws-lc-sys` directly: its `links` key is versioned, so a direct
+  requirement that differs from what a consumer's `aws-lc-rs` links puts a
+  second AWS-LC in their graph. The one exception is `par2-rs` MD5, which
+  `aws-lc-rs` does not offer: it is AWS-LC's MD5 assembly carried into `asm!`
+  in `par2-rs` (`md5_asm.rs`) on x86-64 and AArch64, and RustCrypto `md-5`
+  elsewhere.
   The `crypto-rust` feature is the supported opt-out for library consumers
   that cannot carry a C or assembly dependency; it must never be the default,
   never be selected by the release matrix, and never change the AWS-LC code

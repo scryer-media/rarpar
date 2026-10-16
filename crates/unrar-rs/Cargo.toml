@@ -22,7 +22,7 @@ exclude = ["tests/fixtures/**", "fuzz/**", "tests/fuzz_corpus_regressions.rs"]
 # (on a target where AWS-LC is unavailable) is a compile error.
 [features]
 default = ["crypto-aws-lc"]
-crypto-aws-lc = ["dep:aws-lc-rs", "dep:aws-lc-sys"]
+crypto-aws-lc = ["dep:aws-lc-rs"]
 crypto-rust = ["dep:hmac", "dep:aes", "dep:cbc"]
 # Delegate the bulk AES-CBC decrypt to an embedder-installed hook (see the
 # `hooks` module) while reusing the RustCrypto KDF primitives in-guest; it
@@ -75,7 +75,6 @@ libc = { workspace = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 aws-lc-rs = { workspace = true, optional = true }
-aws-lc-sys = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

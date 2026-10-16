@@ -809,12 +809,12 @@ fn cargo_metadata(options: &FeatureAuditOptions) -> Result<CargoMetadata> {
 fn audit_feature_metadata(metadata: &CargoMetadata, options: &FeatureAuditOptions) -> Result<()> {
     require_feature(metadata, "rarpar", "runtime")?;
     // The libraries resolve a crypto backend from the feature list the build
-    // actually carries. A shipped artifact must resolve AWS-LC on both of
-    // them, and must say so explicitly: `runtime` no longer implies it, so a
-    // matrix entry that drops `crypto-aws-lc` would otherwise fall back to the
-    // RustCrypto backend without a word.
+    // actually carries. A shipped artifact must resolve AWS-LC in unrar-rs and
+    // the in-crate assembly MD5 in par2-rs, and must say so explicitly:
+    // `runtime` no longer implies either, so a matrix entry that drops
+    // `crypto-aws-lc` would otherwise fall back to RustCrypto without a word.
     require_feature(metadata, "rarpar", "crypto-aws-lc")?;
-    require_feature(metadata, "par2-rs", "crypto-aws-lc")?;
+    require_feature(metadata, "par2-rs", "crypto-native")?;
     require_feature(metadata, "unrar-rs", "crypto-aws-lc")?;
     // `par3 archive`, PAR-inside and the 7-Zip facade live behind `sevenz`,
     // which release builds name explicitly (they pass --no-default-features).
@@ -1866,7 +1866,7 @@ mod tests {
             },
             CargoNode {
                 id: "par2-rs".to_owned(),
-                features: vec!["crypto-aws-lc".to_owned()],
+                features: vec!["crypto-native".to_owned()],
                 deps: deps(&["reedsolomon-rs"]),
             },
             CargoNode {

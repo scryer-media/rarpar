@@ -35,9 +35,12 @@
   full length, so only a newly allocated one is ever zeroed.
 - The Unix owner and mode helpers are compiled only on Unix, so Windows
   builds, tests included, have no dead-code warnings. No behaviour change.
-- The `crypto-aws-lc` backend requires `aws-lc-rs` 1.18.2 and `aws-lc-sys`
-  0.46 (was 1.18 and 0.45), the pair current `aws-lc-rs` links, so a
-  consumer builds one copy of AWS-LC instead of two. No behaviour change.
+- The `crypto-aws-lc` backend uses only `aws-lc-rs` (`cipher` for AES-CBC,
+  `hmac` for the MAC conversion) and no longer depends on `aws-lc-sys`
+  directly, so it always shares the one AWS-LC a consumer's own `aws-lc-rs`
+  links. The requirement is `aws-lc-rs` 1.18 (any 1.18.x). The CRC32 and
+  BLAKE2sp MAC conversions take about 0.1–0.2 µs longer per member; the
+  bulk AES-CBC rate is unchanged.
 
 ## 0.11.1
 
