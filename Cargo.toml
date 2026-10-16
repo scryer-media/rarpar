@@ -97,6 +97,6 @@ opt-level = 3
 # ppmd-turbo 0.2.0, lzma-turbo 0.10.0 and sevenz-turbo 0.29.0 are not published yet: these point
 # at their release commits until they are, and are removed then.
 [patch.crates-io]
-ppmd-turbo = { git = "https://github.com/scryer-media/ppmd-turbo", rev = "a2cfd2f7e8a14c2396472cfcbec6233f38fc337f" }
-lzma-turbo = { git = "https://github.com/scryer-media/lzma-turbo", rev = "9692dc792998041d70ef470dcc5fd6a6fa3dc4c5" }
-sevenz-turbo = { git = "https://github.com/scryer-media/sevenz-turbo", rev = "16c2283e8b9de76f48e77ecb26c90a62c583c23f" }
+ppmd-turbo = { git = "https://github.com/scryer-media/ppmd-turbo", rev = "352df40194fc9dcdf0015f8030e4f9cfeef278f5" }
+lzma-turbo = { git = "https://github.com/scryer-media/lzma-turbo", rev = "7ee55ac33214ba7091b23c07596fcd2c28bf1e84" }
+sevenz-turbo = { git = "https://github.com/scryer-media/sevenz-turbo", rev = "9850effa673e605ec2bd868c7adc9dd3f375bfff" }

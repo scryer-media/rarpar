@@ -41,13 +41,20 @@ documented in each crate's own changelog so those notes ship with the crate.
 - The Windows build compiles without warnings: the 7z metadata code imports
   the Unix mode flag only where it applies it, and the terminal-echo test is
   Unix-only. No behaviour change.
-- The 7z codec moves to sevenz-turbo 0.28.0, whose lzma-turbo requirement is
-  a caret one, and `rarpar xz` to lzma-turbo 0.9.2, so the binary links one
-  lzma-turbo; sevenz-turbo 0.27.0 pinned lzma-turbo to exactly 0.9.0.
+- The 7z codec moves to sevenz-turbo 0.29.0, whose lzma-turbo requirement is
+  a caret one, and `rarpar xz` to lzma-turbo 0.10.0, so the binary links one
+  lzma-turbo; sevenz-turbo 0.27.0 pinned lzma-turbo to exactly 0.9.0. The
+  RAR codec moves to unrar-rs 0.12.0, and its PPMd to ppmd-turbo 0.2.0.
   AWS-LC is `aws-lc-rs` 1.18.2 over `aws-lc-sys` 0.46 throughout. The sibling
   libraries are named by caret version floors instead of exact pins (par2-rs
-  0.10.11, par3-rs 0.7.1, unrar-rs 0.11.2), so their patch releases unify with
+  0.10.11, par3-rs 0.7.1, unrar-rs 0.12.0), so their patch releases unify with
   a consumer's.
+- Failures are read from those libraries' typed errors instead of their
+  messages. A RAR member above a resource limit, or one whose dictionary or
+  PPMd model the allocator refuses, exits with `EXIT_RESOURCE`. `rarpar xz`
+  reports lzma-turbo's memory limit as a resource limit. The 7z facade takes
+  "Unexpected end of data" from a block error's I/O kind rather than from a
+  search of its message.
 
 ### Benchmark harness only
 

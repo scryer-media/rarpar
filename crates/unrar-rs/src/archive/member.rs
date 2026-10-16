@@ -3757,11 +3757,14 @@ impl RarArchive {
     }
 
     fn enforce_unknown_lz_output_limit(&self, fh: &FileHeader, written: u64) -> RarResult<()> {
-        if fh.unpacked_size.is_none() && written >= self.limits.max_unpacked_size {
+        let limit = self.limits.max_unpacked_size;
+        if fh.unpacked_size.is_none() && written >= limit {
+            // The decoder stops at the limit, so a member that reached it asked
+            // for at least one byte more.
             return Err(Self::resource_limit_error(
                 &fh.name,
-                written,
-                self.limits.max_unpacked_size,
+                written.max(limit.saturating_add(1)),
+                limit,
             ));
         }
 
@@ -9838,6 +9841,55 @@ mod tests {
         };
 
         assert_eq!(RarArchive::effective_member_dict_size(&fh), 0x40000);
+    }
+
+    #[test]
+    fn an_unknown_size_member_at_the_limit_reports_a_size_above_it() {
+        let mut archive = empty_rar5_archive();
+        archive.limits.max_unpacked_size = 4;
+        let fh = FileHeader {
+            name: "unknown-size.bin".into(),
+            name_raw: Some(b"unknown-size.bin".to_vec()),
+            unpacked_size: None,
+            attributes: FileAttributes(0),
+            mtime: None,
+            ctime: None,
+            atime: None,
+            data_crc32: None,
+            data_hash: None,
+            compression: CompressionInfo {
+                format: ArchiveFormat::Rar5,
+                version: 0,
+                solid: false,
+                method: CompressionMethod::Normal,
+                dict_size: 128 * 1024,
+            },
+            host_os: HostOs::Unix,
+            is_directory: false,
+            file_flags: 0,
+            data_size: 0,
+            split_before: false,
+            split_after: false,
+            data_offset: 0,
+            is_encrypted: false,
+            version: None,
+            service_subdata: None,
+        };
+
+        assert!(archive.enforce_unknown_lz_output_limit(&fh, 3).is_ok());
+        let err = archive.enforce_unknown_lz_output_limit(&fh, 4).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RarError::ResourceLimit {
+                    kind: crate::error::LimitKind::UnpackedSize,
+                    requested: 5,
+                    max: 4,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
