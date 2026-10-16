@@ -38,6 +38,9 @@ documented in each crate's own changelog so those notes ship with the crate.
   The exception is RAR4 PPMd with a 32 MiB model, which runs about 6% slower
   (6.2 → 6.6 s). `MIMALLOC_ALLOW_THP=1` restores the old behaviour. The glibc,
   macOS and Windows binaries use the system allocator and are unchanged.
+- The Windows build compiles without warnings: the 7z metadata code imports
+  the Unix mode flag only where it applies it, and the terminal-echo test is
+  Unix-only. No behaviour change.
 
 ### Benchmark harness only
 
