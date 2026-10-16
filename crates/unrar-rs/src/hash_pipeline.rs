@@ -33,6 +33,7 @@ use std::thread::JoinHandle;
 
 #[cfg(target_arch = "aarch64")]
 use crate::crypto::GROUP_LEAVES;
+use crate::error::RarError;
 use blake2s_simd::Params as Blake2sParams;
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")))]
 use blake2s_simd::State as Blake2sState;
@@ -150,7 +151,7 @@ impl HashPipeline {
             .as_ref()
             .expect("hash pipeline already finalized")
             .send(ChunkMsg::Data(chunk))
-            .map_err(|_| io::Error::other("hash pipeline worker terminated early"))
+            .map_err(|_| RarError::internal("hash pipeline worker terminated early").into_io())
     }
 
     /// Copy `data` into a pooled buffer and submit it. Convenience for
@@ -176,7 +177,7 @@ impl HashPipeline {
             .take()
             .expect("hash pipeline already finalized")
             .join()
-            .map_err(|_| io::Error::other("hash pipeline coordinator panicked"))??;
+            .map_err(|_| RarError::internal("hash pipeline coordinator panicked").into_io())??;
         debug_assert_eq!(result.crc32.is_some(), self.compute_crc);
         debug_assert_eq!(result.blake2sp.is_some(), self.compute_blake);
         Ok(HashPipelineOutputs {
@@ -329,7 +330,7 @@ impl CrcLanes {
         let lane = (seq as usize) % self.txs.len();
         self.txs[lane]
             .send((seq, chunk))
-            .map_err(|_| io::Error::other("CRC worker terminated early"))?;
+            .map_err(|_| RarError::internal("CRC worker terminated early").into_io())?;
         self.next_seq += 1;
         if self.next_seq - self.next_fold >= MAX_IN_FLIGHT as u64 {
             self.fold_next()?;
@@ -341,13 +342,11 @@ impl CrcLanes {
         // Each lane is FIFO. Waiting for the next lane bounds reordering and
         // outstanding work even if that worker is slower than all its peers.
         let lane = self.next_fold as usize % self.results.len();
-        let entry = self.results[lane]
-            .recv()
-            .map_err(|_| io::Error::other("CRC worker terminated before returning its result"))?;
+        let entry = self.results[lane].recv().map_err(|_| {
+            RarError::internal("CRC worker terminated before returning its result").into_io()
+        })?;
         if entry.seq != self.next_fold {
-            return Err(io::Error::other(
-                "CRC worker returned an out-of-order result",
-            ));
+            return Err(RarError::internal("CRC worker returned an out-of-order result").into_io());
         }
         if !self.ops.iter().any(|(len, _)| *len == entry.len) {
             if self.ops.len() == MAX_IN_FLIGHT {
@@ -369,7 +368,7 @@ impl CrcLanes {
         while let Some(handle) = self.handles.pop() {
             handle
                 .join()
-                .map_err(|_| io::Error::other("CRC worker panicked"))?;
+                .map_err(|_| RarError::internal("CRC worker panicked").into_io())?;
         }
         Ok(self.crc)
     }
@@ -594,7 +593,7 @@ impl BlakeLanes {
                 chunk: Arc::clone(chunk),
                 stream_offset,
             })
-            .map_err(|_| io::Error::other("BLAKE2sp worker terminated early"))?;
+            .map_err(|_| RarError::internal("BLAKE2sp worker terminated early").into_io())?;
         }
         Ok(())
     }
@@ -606,7 +605,7 @@ impl BlakeLanes {
         self.lane_handles
             .remove(0)
             .join()
-            .map_err(|_| io::Error::other("BLAKE2sp worker panicked"))
+            .map_err(|_| RarError::internal("BLAKE2sp worker panicked").into_io())
     }
 
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
@@ -620,7 +619,7 @@ impl BlakeLanes {
             let handle = self.lane_handles.remove(0);
             let digests = handle
                 .join()
-                .map_err(|_| io::Error::other("BLAKE2sp worker panicked"))?;
+                .map_err(|_| RarError::internal("BLAKE2sp worker panicked").into_io())?;
             for digest in digests {
                 root.update(&digest);
             }
@@ -866,7 +865,9 @@ impl SharedHashStream {
                 }
                 Ok(())
             }
-            StreamState::Finished => Err(io::Error::other("hash stream already finalized")),
+            StreamState::Finished => {
+                Err(RarError::internal("hash stream already finalized").into_io())
+            }
         }
     }
 
@@ -916,7 +917,9 @@ impl SharedHashStream {
                 Ok(())
             }
             StreamState::Pipelined { pipeline, .. } => pipeline.submit(chunk),
-            StreamState::Finished => Err(io::Error::other("hash stream already finalized")),
+            StreamState::Finished => {
+                Err(RarError::internal("hash stream already finalized").into_io())
+            }
         }
     }
 
@@ -942,7 +945,9 @@ impl SharedHashStream {
                     blake2sp: outputs.blake2sp,
                 })
             }
-            StreamState::Finished => Err(io::Error::other("hash stream already finalized")),
+            StreamState::Finished => {
+                Err(RarError::internal("hash stream already finalized").into_io())
+            }
         }
     }
 }

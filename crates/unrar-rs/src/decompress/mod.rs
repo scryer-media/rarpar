@@ -25,7 +25,7 @@ pub mod store;
 
 use std::io::Write;
 
-use crate::error::{RarError, RarResult};
+use crate::error::{LimitKind, RarError, RarResult};
 use crate::limits::Limits;
 use crate::types::{ArchiveFormat, CompressionInfo, CompressionMethod};
 
@@ -111,11 +111,12 @@ fn enforce_direct_input_limit(input_len: usize, limits: &Limits) -> RarResult<()
     let input_len = input_len as u64;
     let max_data_segment = limits.max_data_segment;
     if input_len > max_data_segment {
-        return Err(RarError::ResourceLimit {
-            detail: format!(
-                "direct decompression input size {input_len} exceeds limit {max_data_segment}"
-            ),
-        });
+        return Err(RarError::resource_limit(
+            LimitKind::DataSegment,
+            input_len,
+            max_data_segment,
+            None,
+        ));
     }
 
     Ok(())
@@ -124,11 +125,12 @@ fn enforce_direct_input_limit(input_len: usize, limits: &Limits) -> RarResult<()
 fn enforce_direct_output_limit(unpacked_size: u64, limits: &Limits) -> RarResult<()> {
     let max_unpacked_size = limits.max_unpacked_size;
     if unpacked_size > max_unpacked_size {
-        return Err(RarError::ResourceLimit {
-            detail: format!(
-                "direct decompression output size {unpacked_size} exceeds limit {max_unpacked_size}"
-            ),
-        });
+        return Err(RarError::resource_limit(
+            LimitKind::UnpackedSize,
+            unpacked_size,
+            max_unpacked_size,
+            None,
+        ));
     }
 
     Ok(())
@@ -138,11 +140,12 @@ fn enforce_direct_store_output_limit(input_len: usize, limits: &Limits) -> RarRe
     let output_len = input_len as u64;
     let max_unpacked_size = limits.max_unpacked_size;
     if output_len > max_unpacked_size {
-        return Err(RarError::ResourceLimit {
-            detail: format!(
-                "direct stored output size {output_len} exceeds limit {max_unpacked_size}"
-            ),
-        });
+        return Err(RarError::resource_limit(
+            LimitKind::UnpackedSize,
+            output_len,
+            max_unpacked_size,
+            None,
+        ));
     }
 
     Ok(())

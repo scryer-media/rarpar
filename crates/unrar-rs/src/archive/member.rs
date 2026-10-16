@@ -245,19 +245,17 @@ impl RarArchive {
             detail: format!("RAR service {} has unknown unpacked size", fh.name),
         })?;
         if unpacked_size > MAX_COMMENT_BYTES {
-            return Err(RarError::ResourceLimit {
-                detail: format!(
-                    "RAR service {} is {} bytes, exceeding comment memory limit {}",
-                    fh.name, unpacked_size, MAX_COMMENT_BYTES
-                ),
-            });
+            return Err(RarError::resource_limit(
+                crate::error::LimitKind::Comment,
+                unpacked_size,
+                MAX_COMMENT_BYTES,
+                Some(fh.name.to_string()),
+            ));
         }
         let packed_len = service.segments.iter().try_fold(0u64, |total, segment| {
-            total
-                .checked_add(segment.data_size)
-                .ok_or_else(|| RarError::ResourceLimit {
-                    detail: format!("RAR service {} packed size overflows u64", fh.name),
-                })
+            total.checked_add(segment.data_size).ok_or_else(|| {
+                RarError::corrupt(format!("RAR service {} packed size overflows u64", fh.name))
+            })
         })?;
         if packed_len == 0 && !fh.split_after {
             return Ok(Vec::new());
@@ -352,21 +350,22 @@ impl RarArchive {
                 (output, written, actual_crc, actual_blake)
             } else {
                 if packed_len > self.limits.max_data_segment {
-                    return Err(RarError::ResourceLimit {
-                        detail: format!(
-                            "RAR service {} packed size {} exceeds limit {}",
-                            fh.name, packed_len, self.limits.max_data_segment
-                        ),
-                    });
+                    return Err(RarError::resource_limit(
+                        crate::error::LimitKind::DataSegment,
+                        packed_len,
+                        self.limits.max_data_segment,
+                        Some(fh.name.to_string()),
+                    ));
                 }
 
-                let packed_capacity =
-                    usize::try_from(packed_len).map_err(|_| RarError::ResourceLimit {
-                        detail: format!(
-                            "RAR service {} packed size {} cannot fit in memory on this platform",
-                            fh.name, packed_len
-                        ),
-                    })?;
+                let packed_capacity = usize::try_from(packed_len).map_err(|_| {
+                    RarError::resource_limit(
+                        crate::error::LimitKind::AddressSpace,
+                        packed_len,
+                        usize::MAX as u64,
+                        Some(fh.name.to_string()),
+                    )
+                })?;
                 let mut packed = Vec::with_capacity(packed_capacity);
                 let mut reader = reader;
                 reader
@@ -933,11 +932,9 @@ impl RarArchive {
             detail: format!("RAR service {} has unknown unpacked size", fh.name),
         })?;
         let packed_len = service.segments.iter().try_fold(0u64, |total, segment| {
-            total
-                .checked_add(segment.data_size)
-                .ok_or_else(|| RarError::ResourceLimit {
-                    detail: format!("RAR service {} packed size overflows u64", fh.name),
-                })
+            total.checked_add(segment.data_size).ok_or_else(|| {
+                RarError::corrupt(format!("RAR service {} packed size overflows u64", fh.name))
+            })
         })?;
         if packed_len == 0 && !fh.split_after {
             return Ok(0);
@@ -1160,12 +1157,12 @@ impl RarArchive {
         // (`limits.max_unpacked_size`, megabytes) and only meet MAXPATHSIZE
         // once it was already materialized.
         if fh.data_size > MAX_LINK_TARGET_BYTES as u64 {
-            return Err(RarError::ResourceLimit {
-                detail: format!(
-                    "RAR3 Unix symlink target for {} is {} bytes, exceeding MAXPATHSIZE {}",
-                    fh.name, fh.data_size, MAX_LINK_TARGET_BYTES
-                ),
-            });
+            return Err(RarError::resource_limit(
+                crate::error::LimitKind::LinkTarget,
+                fh.data_size,
+                MAX_LINK_TARGET_BYTES as u64,
+                Some(fh.name.to_string()),
+            ));
         }
 
         // A link payload with no declared expanded size fails closed. Every
@@ -1185,13 +1182,12 @@ impl RarArchive {
             });
         };
         if declared_unpacked_size > MAX_LINK_TARGET_BYTES as u64 {
-            return Err(RarError::ResourceLimit {
-                detail: format!(
-                    "RAR3 Unix symlink target for {} declares an expanded size of {} bytes, \
-                     exceeding MAXPATHSIZE {}",
-                    fh.name, declared_unpacked_size, MAX_LINK_TARGET_BYTES
-                ),
-            });
+            return Err(RarError::resource_limit(
+                crate::error::LimitKind::LinkTarget,
+                declared_unpacked_size,
+                MAX_LINK_TARGET_BYTES as u64,
+                Some(fh.name.to_string()),
+            ));
         }
 
         let link_options = ExtractOptions {
@@ -1230,12 +1226,12 @@ impl RarArchive {
     /// in depth against a future variant whose `len()` and contents disagree.
     fn ensure_link_payload_within_limit(fh: &FileHeader, len: usize) -> RarResult<()> {
         if len > MAX_LINK_TARGET_BYTES {
-            return Err(RarError::ResourceLimit {
-                detail: format!(
-                    "RAR3 Unix symlink target for {} is {} bytes, exceeding MAXPATHSIZE {}",
-                    fh.name, len, MAX_LINK_TARGET_BYTES
-                ),
-            });
+            return Err(RarError::resource_limit(
+                crate::error::LimitKind::LinkTarget,
+                len as u64,
+                MAX_LINK_TARGET_BYTES as u64,
+                Some(fh.name.to_string()),
+            ));
         }
         Ok(())
     }
@@ -2838,9 +2834,7 @@ impl RarArchive {
             .as_secs()
             .checked_mul(10_000_000)
             .and_then(|value| value.checked_add(u64::from(duration.subsec_nanos() / 100)))
-            .ok_or_else(|| RarError::ResourceLimit {
-                detail: "RAR timestamp overflows Windows FILETIME".into(),
-            })
+            .ok_or_else(|| RarError::corrupt("RAR timestamp overflows Windows FILETIME"))
     }
 
     fn apply_unix_permissions(fh: &FileHeader, out_path: &std::path::Path) -> RarResult<()> {
@@ -3646,23 +3640,23 @@ impl RarArchive {
 
     fn enforce_archive_member_limits(&self, fh: &FileHeader) -> RarResult<()> {
         if fh.data_size > self.limits.max_data_segment {
-            return Err(RarError::ResourceLimit {
-                detail: format!(
-                    "member {} compressed data size {} exceeds maximum {}",
-                    fh.name, fh.data_size, self.limits.max_data_segment
-                ),
-            });
+            return Err(RarError::resource_limit(
+                crate::error::LimitKind::DataSegment,
+                fh.data_size,
+                self.limits.max_data_segment,
+                Some(fh.name.to_string()),
+            ));
         }
 
         if let Some(unpacked_size) = fh.unpacked_size
             && unpacked_size > self.limits.max_unpacked_size
         {
-            return Err(RarError::ResourceLimit {
-                detail: format!(
-                    "member {} unpacked size {} exceeds maximum {}",
-                    fh.name, unpacked_size, self.limits.max_unpacked_size
-                ),
-            });
+            return Err(RarError::resource_limit(
+                crate::error::LimitKind::UnpackedSize,
+                unpacked_size,
+                self.limits.max_unpacked_size,
+                Some(fh.name.to_string()),
+            ));
         }
 
         let dict_size = Self::effective_member_dict_size(fh);
@@ -3734,11 +3728,12 @@ impl RarArchive {
     }
 
     fn resource_limit_error(member_name: &str, written: u64, limit: u64) -> RarError {
-        RarError::ResourceLimit {
-            detail: format!(
-                "member {member_name} output size exceeded maximum {limit} bytes after writing {written} bytes"
-            ),
-        }
+        RarError::resource_limit(
+            crate::error::LimitKind::UnpackedSize,
+            written,
+            limit,
+            Some(member_name.to_string()),
+        )
     }
 
     fn enforce_store_ceiling_not_exceeded<R: Read>(
@@ -3987,15 +3982,7 @@ impl RarArchive {
     // kept whole, OS error code and payload included, so callers can match on
     // its kind and cause instead of its wording.
     fn read_error_to_rar(error: std::io::Error) -> RarError {
-        if !error.get_ref().is_some_and(|inner| inner.is::<RarError>()) {
-            return RarError::Io(error);
-        }
-        let kind = error.kind();
-        match error.into_inner().map(|inner| inner.downcast::<RarError>()) {
-            Some(Ok(error)) => *error,
-            Some(Err(inner)) => RarError::Io(std::io::Error::new(kind, inner)),
-            None => RarError::Io(kind.into()),
-        }
+        error.downcast::<RarError>().unwrap_or_else(RarError::Io)
     }
 
     fn copy_reader_to_writer<R: Read, W: Write>(
@@ -4081,9 +4068,9 @@ impl RarArchive {
                     Self::read_store_chunks(reader, stream_hash, limit, member_name, |chunk| {
                         // A closed channel means the writer failed; its error
                         // is the one returned.
-                        chunk_tx.send(chunk).map_err(|_| {
-                            RarError::Io(std::io::Error::other("store copy writer stopped"))
-                        })
+                        chunk_tx
+                            .send(chunk)
+                            .map_err(|_| RarError::internal("store copy writer stopped"))
                     })
                 })
                 .map_err(RarError::Io)?;
@@ -7406,22 +7393,24 @@ impl SegmentPackedHashVerifier {
                     actual = crate::crypto::convert_crc32_to_mac(
                         actual,
                         self.hash_key.as_ref().ok_or_else(|| {
-                            packed_hash_io_error(RarError::CorruptArchive {
+                            RarError::CorruptArchive {
                                 detail: format!(
                                     "packed segment for {} in volume {} is missing a RAR5 hash key",
                                     self.member_name, self.volume_index
                                 ),
-                            })
+                            }
+                            .into_io()
                         })?,
                     );
                 }
                 if actual != expected {
-                    return Err(packed_hash_io_error(RarError::PackedDataCrcMismatch {
+                    return Err(RarError::PackedDataCrcMismatch {
                         member: self.member_name,
                         volume: self.volume_index,
                         expected,
                         actual,
-                    }));
+                    }
+                    .into_io());
                 }
             }
             (PackedDataHash::Blake2sp(expected), SegmentPackedHashState::Blake2sp(hasher)) => {
@@ -7430,29 +7419,32 @@ impl SegmentPackedHashVerifier {
                     actual = crate::crypto::convert_blake2_to_mac(
                         actual,
                         self.hash_key.as_ref().ok_or_else(|| {
-                            packed_hash_io_error(RarError::CorruptArchive {
+                            RarError::CorruptArchive {
                                 detail: format!(
                                     "packed segment for {} in volume {} is missing a RAR5 hash key",
                                     self.member_name, self.volume_index
                                 ),
-                            })
+                            }
+                            .into_io()
                         })?,
                     );
                 }
                 if actual != expected {
-                    return Err(packed_hash_io_error(RarError::PackedDataBlake2Mismatch {
+                    return Err(RarError::PackedDataBlake2Mismatch {
                         member: self.member_name,
                         volume: self.volume_index,
-                    }));
+                    }
+                    .into_io());
                 }
             }
             _ => {
-                return Err(packed_hash_io_error(RarError::CorruptArchive {
+                return Err(RarError::CorruptArchive {
                     detail: format!(
                         "packed segment for {} in volume {} used mismatched hash state",
                         self.member_name, self.volume_index
                     ),
-                }));
+                }
+                .into_io());
             }
         }
         Ok(())
@@ -7464,10 +7456,6 @@ impl SegmentPackedHashVerifier {
 // failed open, and read the OS error code of the latter.
 fn volume_provider_io_error(error: crate::volume::VolumeProviderError) -> std::io::Error {
     std::io::Error::other(error)
-}
-
-fn packed_hash_io_error(error: RarError) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
 }
 
 /// Metadata captured from continuation headers discovered during streaming.
@@ -7583,10 +7571,13 @@ impl<'a> ArchiveSegmentReader<'a> {
 
         let seg = &self.segments[self.current_seg];
         if seg.data_size > self.limits.max_data_segment {
-            return Err(std::io::Error::other(format!(
-                "data segment size {} exceeds limit {}",
-                seg.data_size, self.limits.max_data_segment
-            )));
+            return Err(RarError::resource_limit(
+                crate::error::LimitKind::DataSegment,
+                seg.data_size,
+                self.limits.max_data_segment,
+                Some(self.member_name.clone()),
+            )
+            .into_io());
         }
 
         let vol = self
@@ -7594,10 +7585,11 @@ impl<'a> ArchiveSegmentReader<'a> {
             .get_mut(seg.volume_index)
             .and_then(|v| v.as_mut())
             .ok_or_else(|| {
-                std::io::Error::other(format!(
-                    "missing volume {} for member {}",
-                    seg.volume_index, self.member_name
-                ))
+                RarError::MissingVolume {
+                    volume: seg.volume_index,
+                    member: self.member_name.clone(),
+                }
+                .into_io()
             })?;
 
         vol.reader.seek(SeekFrom::Start(seg.data_offset))?;
@@ -7625,10 +7617,11 @@ impl Read for ArchiveSegmentReader<'_> {
                     .get_mut(seg.volume_index)
                     .and_then(|v| v.as_mut())
                     .ok_or_else(|| {
-                        std::io::Error::other(format!(
-                            "missing volume {} for member {}",
-                            seg.volume_index, self.member_name
-                        ))
+                        RarError::MissingVolume {
+                            volume: seg.volume_index,
+                            member: self.member_name.clone(),
+                        }
+                        .into_io()
                     })?;
                 let to_read = buf.len().min(self.remaining_in_segment as usize);
                 let n = vol.reader.read(&mut buf[..to_read])?;
@@ -7746,10 +7739,13 @@ impl<'a> ChainedSegmentReader<'a> {
 
         let seg = &self.segments[self.current_seg];
         if seg.data_size > self.max_data_segment {
-            return Err(std::io::Error::other(format!(
-                "data segment size {} exceeds limit {}",
-                seg.data_size, self.max_data_segment
-            )));
+            return Err(RarError::resource_limit(
+                crate::error::LimitKind::DataSegment,
+                seg.data_size,
+                self.max_data_segment,
+                Some(self.member_name.clone()),
+            )
+            .into_io());
         }
         if let Some(ref tracker) = self.volume_tracker {
             tracker.store(seg.volume_index, Ordering::Release);
@@ -7758,9 +7754,7 @@ impl<'a> ChainedSegmentReader<'a> {
             .provider
             .get_volume(seg.volume_index)
             .map_err(volume_provider_io_error)?;
-        reader
-            .seek(SeekFrom::Start(seg.data_offset))
-            .map_err(std::io::Error::other)?;
+        reader.seek(SeekFrom::Start(seg.data_offset))?;
         self.current_reader = Some(reader);
         self.remaining_in_segment = seg.data_size;
         self.current_packed_hash =
@@ -7780,16 +7774,11 @@ impl<'a> ChainedSegmentReader<'a> {
             .get_volume(vol_idx)
             .map_err(volume_provider_io_error)?;
 
-        reader
-            .seek(SeekFrom::Start(0))
-            .map_err(std::io::Error::other)?;
-        let format =
-            crate::signature::read_signature(&mut reader).map_err(std::io::Error::other)?;
+        reader.seek(SeekFrom::Start(0))?;
+        let format = crate::signature::read_signature(&mut reader).map_err(RarError::into_io)?;
 
         if format != self.format {
-            return Err(std::io::Error::other(
-                "RAR continuation changed archive format",
-            ));
+            return Err(RarError::corrupt("RAR continuation changed archive format").into_io());
         }
         let scan = crate::short_read::HeaderScan::ThroughFile(std::num::NonZeroUsize::MIN);
 
@@ -7802,7 +7791,7 @@ impl<'a> ChainedSegmentReader<'a> {
                 scan,
                 &mut None,
             )
-            .map_err(std::io::Error::other)?;
+            .map_err(RarError::into_io)?;
             // Find the first file with split_before (continuation).
             for fh in &parsed.files {
                 if fh.split_before
@@ -7811,10 +7800,13 @@ impl<'a> ChainedSegmentReader<'a> {
                         || fh.name == self.member_name)
                 {
                     if fh.packed_size > self.max_data_segment {
-                        return Err(std::io::Error::other(format!(
-                            "data segment size {} exceeds limit {}",
-                            fh.packed_size, self.max_data_segment
-                        )));
+                        return Err(RarError::resource_limit(
+                            crate::error::LimitKind::DataSegment,
+                            fh.packed_size,
+                            self.max_data_segment,
+                            Some(self.member_name.clone()),
+                        )
+                        .into_io());
                     }
                     let file_header =
                         RarArchive::rar4_to_file_header(fh, parsed.archive_header.is_solid);
@@ -7847,7 +7839,7 @@ impl<'a> ChainedSegmentReader<'a> {
                 },
                 scan,
             )
-            .map_err(std::io::Error::other)?;
+            .map_err(RarError::into_io)?;
             // Find the first file header with split_before.
             for pf in &parsed.files {
                 if pf.header.split_before
@@ -7856,10 +7848,13 @@ impl<'a> ChainedSegmentReader<'a> {
                         || pf.header.name == self.member_name)
                 {
                     if pf.header.data_size > self.max_data_segment {
-                        return Err(std::io::Error::other(format!(
-                            "data segment size {} exceeds limit {}",
-                            pf.header.data_size, self.max_data_segment
-                        )));
+                        return Err(RarError::resource_limit(
+                            crate::error::LimitKind::DataSegment,
+                            pf.header.data_size,
+                            self.max_data_segment,
+                            Some(self.member_name.clone()),
+                        )
+                        .into_io());
                     }
                     let packed_hashes =
                         RarArchive::packed_hashes_for_split_segment(&pf.header, pf.hash.as_ref());
@@ -7892,13 +7887,11 @@ impl<'a> ChainedSegmentReader<'a> {
             }
         }
 
-        Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "volume {vol_idx} is missing the continuation of {}",
-                self.member_name
-            ),
+        Err(RarError::corrupt(format!(
+            "volume {vol_idx} is missing the continuation of {}",
+            self.member_name
         ))
+        .into_io())
     }
 }
 
@@ -9448,7 +9441,19 @@ mod tests {
 
         let mut buf = [0u8; 1];
         let err = reader.read(&mut buf).unwrap_err();
-        assert!(err.to_string().contains("exceeds limit 8"));
+        let err = err.downcast::<RarError>().expect("the crate's own error");
+        assert!(
+            matches!(
+                err,
+                RarError::ResourceLimit {
+                    kind: crate::error::LimitKind::DataSegment,
+                    requested: 9,
+                    max: 8,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -9527,7 +9532,13 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(err, RarError::ResourceLimit { ref detail } if detail.contains("MAXPATHSIZE")),
+            matches!(
+                err,
+                RarError::ResourceLimit {
+                    kind: crate::error::LimitKind::LinkTarget,
+                    ..
+                }
+            ),
             "expected ResourceLimit, got {err}"
         );
     }
@@ -9555,9 +9566,12 @@ mod tests {
         assert!(
             matches!(
                 err,
-                RarError::ResourceLimit { ref detail }
-                    if detail.contains("declares an expanded size")
-                        && detail.contains("MAXPATHSIZE")
+                RarError::ResourceLimit {
+                    kind: crate::error::LimitKind::LinkTarget,
+                    requested,
+                    max,
+                    ..
+                } if requested > max
             ),
             "expected an expanded-size ResourceLimit, got {err}"
         );
@@ -9624,7 +9638,13 @@ mod tests {
         let err = RarArchive::ensure_link_payload_within_limit(&fh, extracted.len()).unwrap_err();
 
         assert!(
-            matches!(err, RarError::ResourceLimit { ref detail } if detail.contains("MAXPATHSIZE")),
+            matches!(
+                err,
+                RarError::ResourceLimit {
+                    kind: crate::error::LimitKind::LinkTarget,
+                    ..
+                }
+            ),
             "expected ResourceLimit, got {err}"
         );
         assert!(
@@ -9654,7 +9674,13 @@ mod tests {
         let err = RarArchive::ensure_link_payload_within_limit(&fh, extracted.len()).unwrap_err();
 
         assert!(
-            matches!(err, RarError::ResourceLimit { ref detail } if detail.contains("MAXPATHSIZE")),
+            matches!(
+                err,
+                RarError::ResourceLimit {
+                    kind: crate::error::LimitKind::LinkTarget,
+                    ..
+                }
+            ),
             "expected ResourceLimit, got {err}"
         );
         // Still on disk and never materialized: the guard ran on `len()` alone.

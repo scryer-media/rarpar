@@ -25,7 +25,7 @@ use std::io::{Read, Seek};
 
 use tracing::{debug, warn};
 
-use crate::error::{RarError, RarResult};
+use crate::error::{LimitKind, RarError, RarResult};
 use crate::short_read::{HeaderScan, ShortRead, absorb_short_read, next_needed};
 use crate::types::{
     CompressionInfo, CompressionMethod, HostOs, MemberInfo, UnixOwnerInfo, VolumeSpan,
@@ -198,12 +198,12 @@ impl ScanGuard {
     fn advanced<R: Seek>(&mut self, reader: &mut R) -> RarResult<()> {
         self.headers += 1;
         if self.headers > crate::limits::MAX_HEADERS_PER_VOLUME {
-            return Err(RarError::ResourceLimit {
-                detail: format!(
-                    "RAR4 volume declares more than {} headers",
-                    crate::limits::MAX_HEADERS_PER_VOLUME
-                ),
-            });
+            return Err(RarError::resource_limit(
+                LimitKind::HeadersPerVolume,
+                self.headers as u64,
+                crate::limits::MAX_HEADERS_PER_VOLUME as u64,
+                None,
+            ));
         }
         let position = reader.stream_position().map_err(RarError::Io)?;
         if position <= self.position {

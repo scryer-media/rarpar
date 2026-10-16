@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime};
 use tracing::warn;
 
 use super::types::*;
-use crate::error::{RarError, RarResult};
+use crate::error::{LimitKind, RarError, RarResult};
 
 /// Minimum header size: CRC(2) + type(1) + flags(2) + size(2) = 7 bytes.
 const MIN_HEADER_SIZE: usize = 7;
@@ -234,9 +234,12 @@ pub fn read_raw_header<R: Read + Seek>(reader: &mut R) -> RarResult<Option<RawRa
     }
 
     if header_size as usize > MAX_HEADER_SIZE {
-        return Err(RarError::ResourceLimit {
-            detail: format!("RAR4 header size {} exceeds maximum", header_size),
-        });
+        return Err(RarError::resource_limit(
+            LimitKind::HeaderSize,
+            u64::from(header_size),
+            MAX_HEADER_SIZE as u64,
+            None,
+        ));
     }
 
     // Read the full header.
@@ -912,9 +915,12 @@ pub fn read_raw_header_encrypted<R: Read>(
     }
 
     if header_size as usize > MAX_HEADER_SIZE {
-        return Err(RarError::ResourceLimit {
-            detail: format!("RAR4 encrypted header size {} exceeds maximum", header_size),
-        });
+        return Err(RarError::resource_limit(
+            LimitKind::HeaderSize,
+            u64::from(header_size),
+            MAX_HEADER_SIZE as u64,
+            None,
+        ));
     }
 
     // Total encrypted bytes = header_size rounded up to 16-byte boundary.

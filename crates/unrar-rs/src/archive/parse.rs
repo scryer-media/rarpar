@@ -340,9 +340,12 @@ impl RarArchive {
                 detail: "RAR prefix header count overflow".into(),
             })?;
         if file_headers > crate::limits::MAX_HEADERS_PER_VOLUME {
-            return Err(RarError::ResourceLimit {
-                detail: "RAR prefix exceeds the per-volume file header limit".into(),
-            });
+            return Err(RarError::resource_limit(
+                crate::error::LimitKind::HeadersPerVolume,
+                file_headers as u64,
+                crate::limits::MAX_HEADERS_PER_VOLUME as u64,
+                None,
+            ));
         }
         Ok(Some(PrefixCursor {
             volume: previous.map_or(volume, |cursor| cursor.volume),

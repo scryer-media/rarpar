@@ -26,6 +26,29 @@
   the same. A caller that matched this failure as `CorruptArchive` must
   match the new variant. The variant is `#[non_exhaustive]`, so it is
   matched with `..`.
+- `RarError::ResourceLimit` is `ResourceLimit { kind, requested, max,
+  member }` in place of `ResourceLimit { detail }`. `kind` is the new
+  `LimitKind`, which names the limit: a `Limits` field, a limit built into
+  the crate, or the platform's address space. `requested` and `max` are the
+  sizes, and `member` is the member when the limit belongs to one. The
+  variant is `#[non_exhaustive]`; `RarError::resource_limit` builds one.
+- The allocator refusing a dictionary or a PPMd model is the new
+  `RarError::AllocationFailed { bytes }`, not a `ResourceLimit`. A PPMd
+  model above `max_ppmd_arena_size` is `ResourceLimit` of kind `PpmdArena`.
+- A hash or copy worker that panicked or stopped early, or a hash stream
+  used after it was finished, is the new `RarError::Internal { detail }`.
+  These were I/O errors carrying only text.
+- The decoder's window overruns, AES ciphertext not a whole number of
+  blocks, and a continuation volume that changed format or lacks the
+  member's continuation are `RarError::CorruptArchive`. A segment above
+  `max_data_segment` is `ResourceLimit`, and a volume the segment readers
+  lack is `MissingVolume`. These all used to be I/O errors carrying only
+  text. On a `Read` path each one travels inside the `io::Error` as itself,
+  with a kind that matches it (`InvalidData` for corruption, `NotFound` for
+  a missing volume, `OutOfMemory` for an allocation), and comes back out
+  with `io::Error::downcast`.
+- A member that overflows a packed size or a timestamp beyond FILETIME is
+  `CorruptArchive`, not a `ResourceLimit`.
 - These changes of variant are why this is 0.12.0 rather than a patch.
 
 ## 0.11.2

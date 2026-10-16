@@ -2884,10 +2884,9 @@ impl<R: Read> DecryptingReader<R> {
         if total < AES_BLOCK {
             self.pending[..total].copy_from_slice(&self.plain[..total]);
             self.pending_len = total;
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "encrypted data not aligned to AES block size",
-            ));
+            return Err(
+                RarError::corrupt("encrypted data not aligned to AES block size").into_io(),
+            );
         }
 
         self.decryptor.decrypt(&mut self.plain[..]);
@@ -3026,10 +3025,9 @@ impl<R: Read> Read for DecryptingReader<R> {
         if complete == 0 {
             // The fill loop stops below one block only at end of stream.
             if leftover > 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "encrypted data not aligned to AES block size",
-                ));
+                return Err(
+                    RarError::corrupt("encrypted data not aligned to AES block size").into_io(),
+                );
             }
             return Ok(0);
         }

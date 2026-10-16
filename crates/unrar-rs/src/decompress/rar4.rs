@@ -20,7 +20,7 @@ use super::lz::bitstream::{BitRead, BitReader, LzSpan, StreamingBitReader};
 use super::lz::block_reader::{BitCursor, cursor_read_bits, cursor_refill};
 use super::lz::huffman::HuffmanTable;
 use super::lz::window::Window;
-use crate::error::{RarError, RarResult};
+use crate::error::{LimitKind, RarError, RarResult};
 use ppmd_turbo::{
     ErrorKind as PpmErrorKind, Params as PpmParams, RarPpmd, RarStatus, Symbol as PpmSymbol,
 };
@@ -128,11 +128,10 @@ fn ppm_fault(ppm: &RarPpmd, err: ppmd_turbo::Error, output_size: u64) -> RarResu
 #[cold]
 fn ppm_error(err: ppmd_turbo::Error) -> RarError {
     match err.kind {
-        PpmErrorKind::MemoryLimit { .. } | PpmErrorKind::AllocationFailed { .. } => {
-            RarError::ResourceLimit {
-                detail: format!("RAR4: {err}"),
-            }
+        PpmErrorKind::MemoryLimit { required, limit } => {
+            RarError::resource_limit(LimitKind::PpmdArena, required, limit, None)
         }
+        PpmErrorKind::AllocationFailed { bytes } => RarError::AllocationFailed { bytes },
         _ => RarError::CorruptArchive {
             detail: format!("RAR4: {err}"),
         },
@@ -2138,13 +2137,10 @@ impl Rar4LzDecoder {
                 // span wider than the dictionary means the ring has already
                 // overwritten output nobody has read.
                 if total_written - written_border > self.window.dict_size() as u64 {
-                    return Err(RarError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "window overrun: {} unflushed bytes exceeds dictionary size {}",
-                            total_written - written_border,
-                            self.window.dict_size()
-                        ),
+                    return Err(RarError::corrupt(format!(
+                        "window overrun: {} unflushed bytes exceeds dictionary size {}",
+                        total_written - written_border,
+                        self.window.dict_size()
                     )));
                 }
                 self.write_raw_span(total_written, writer)?;
@@ -3799,7 +3795,7 @@ impl Rar4LzDecoder {
                 // Checked before `start_block`, which is where the arena is
                 // allocated. Drop the model, as a failed restart poisons
                 // `RarPpmd`, so that no later block continues it.
-                return Err(self.reject_ppm_arena("block declares", arena));
+                return Err(self.reject_ppm_arena(arena));
             }
             self.ppm_arena_declared = arena;
             Some(PpmParams::rar(order as u32, mem_mb as u32).map_err(ppm_error)?)
@@ -3814,17 +3810,11 @@ impl Rar4LzDecoder {
 
     /// Drop the PPMd model, so that no later block continues it, and build
     /// the limit error for a `arena`-byte model arena.
-    fn reject_ppm_arena(&mut self, what: &str, arena: u64) -> RarError {
+    fn reject_ppm_arena(&mut self, arena: u64) -> RarError {
         self.ppm.forget();
         self.ppm_arena_declared = 0;
         self.ppm_resume = false;
-        RarError::ResourceLimit {
-            detail: format!(
-                "RAR4: PPMd {what} a {arena}-byte model arena, above the \
-                 {}-byte max_ppmd_arena_size limit",
-                self.ppm_arena_limit
-            ),
-        }
+        RarError::resource_limit(LimitKind::PpmdArena, arena, self.ppm_arena_limit, None)
     }
 
     /// Decode PPMd symbols until block switch, EOF, or output complete.
@@ -3857,7 +3847,7 @@ impl Rar4LzDecoder {
         // without the reset flag. Either way the model decodes nothing until
         // here, so the limit in force for this member bounds it here.
         if self.ppm_arena_declared > self.ppm_arena_limit {
-            return Err(self.reject_ppm_arena("model continued with", self.ppm_arena_declared));
+            return Err(self.reject_ppm_arena(self.ppm_arena_declared));
         }
         // A solid member boundary can fall inside a PPMd block; the decoder
         // keeps its coder registers across members, so the next member
@@ -4658,8 +4648,13 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(&err, RarError::ResourceLimit { detail }
-                if detail.contains("max_ppmd_arena_size")),
+            matches!(
+                &err,
+                RarError::ResourceLimit {
+                    kind: crate::error::LimitKind::PpmdArena,
+                    ..
+                }
+            ),
             "{err:?}"
         );
         assert!(!decoder.ppm.has_model());
@@ -4712,8 +4707,13 @@ mod tests {
 
         let (decoder, result) = continued(1 << 20);
         assert!(
-            matches!(&result, Err(RarError::ResourceLimit { detail })
-                if detail.contains("max_ppmd_arena_size")),
+            matches!(
+                &result,
+                Err(RarError::ResourceLimit {
+                    kind: crate::error::LimitKind::PpmdArena,
+                    ..
+                })
+            ),
             "{result:?}"
         );
         assert!(!decoder.ppm.has_model());
@@ -4750,8 +4750,13 @@ mod tests {
             decoder.decode_ppm_symbols(&mut BitReader::new(&input), 1, 0, None, &mut output);
 
         assert!(
-            matches!(&result, Err(RarError::ResourceLimit { detail })
-                if detail.contains("max_ppmd_arena_size")),
+            matches!(
+                &result,
+                Err(RarError::ResourceLimit {
+                    kind: crate::error::LimitKind::PpmdArena,
+                    ..
+                })
+            ),
             "{result:?}"
         );
         assert!(!decoder.ppm.has_model());
