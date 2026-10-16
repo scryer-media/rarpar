@@ -1,0 +1,26 @@
+[package]
+name = "par3-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+par3-rs = { path = ".." }
+# Not used directly: `pure` unifies into par3-rs's blake3 and swaps its C and
+# assembly kernels for Rust ones, which ASan instruments and the C ones it
+# would not. Keeps every fuzzed crate pure Rust (docs/fuzzing.md).
+blake3 = { version = "1.8", default-features = false, features = ["pure"] }
+
+[[bin]]
+name = "par3_packets"
+path = "fuzz_targets/par3_packets.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = []

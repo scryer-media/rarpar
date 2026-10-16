@@ -10,8 +10,9 @@ name: ClusterFuzzLite batch fuzzing
 # breakage sat undetected for six days at a time, which is how the last one was
 # found.
 #
-# One sanitizer, deliberately. Both fuzzed crates are pure Rust — no build.rs,
-# no C, no assembly, RustCrypto and blake2s_simd all the way down — and Rust
+# One sanitizer, deliberately. The fuzzed crates are pure Rust — no C, no
+# assembly, RustCrypto, blake2s_simd and blake3's `pure` kernels all the way
+# down — and Rust
 # has no -Zsanitizer=undefined, so a UBSan lane would instrument nothing while
 # looking like coverage (its first run proved it: cargo-fuzz builds ASan
 # regardless of the job's sanitizer, and the bad-build check rejected every
@@ -41,7 +42,7 @@ jobs:
   batch-fuzzing:
     name: batch (address)
     runs-on: ubuntu-24.04
-    # The two-hour budget is fuzzing time only: the sanitizer build of five
+    # The two-hour budget is fuzzing time only: the sanitizer build of six
     # targets comes first, and a job killed at its timeout discards the corpus
     # it just grew. An hour of headroom is cheap insurance for that.
     timeout-minutes: 180

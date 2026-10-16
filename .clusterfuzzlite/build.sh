@@ -65,3 +65,5 @@ build_target unrar-rs rar_recovery_restore rar.dict
 
 build_target par2-rs par2_packets par2.dict
 build_target par2-rs par2_verify_repair par2.dict
+
+build_target par3-rs par3_packets par3.dict

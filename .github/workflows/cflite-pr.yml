@@ -5,6 +5,8 @@ on:
     paths:
       - 'crates/unrar-rs/**'
       - 'crates/par2-rs/**'
+      - 'crates/par3-rs/**'
+      - 'crates/reedsolomon-rs/**'
       - '.clusterfuzzlite/**'
       - '.github/workflows/cflite-pr.yml'
       - '.github/workflows/cflite-batch.yml'
@@ -36,7 +38,7 @@ jobs:
         uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          # Five targets share this budget, and a pull request lane is a
+          # Six targets share this budget, and a pull request lane is a
           # smoke test for regressions the change itself introduced — the deep
           # search is the nightly batch job's work.
           fuzz-seconds: 600

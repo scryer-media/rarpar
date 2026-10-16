@@ -99,7 +99,7 @@ What no lane above runs, so that a pass is not read as more than it is:
 - Integration tests (`tests/`) and the fixture corpora are not under any
   instrument; only library unit tests are selected. The fuzz targets run
   under AddressSanitizer in ClusterFuzzLite (`cflite-pr.yml`,
-  `cflite-batch.yml`) for `unrar-rs` and `par2-rs`.
+  `cflite-batch.yml`) for `unrar-rs`, `par2-rs` and `par3-rs`.
 
 `unsafe-complete` fails if any Valgrind, sanitizer, discovery or Miri job is
 failed, cancelled or skipped while crates are affected; the Miri shards alone

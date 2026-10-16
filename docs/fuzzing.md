@@ -1,13 +1,13 @@
 # Fuzzing
 
-Two crates parse attacker-supplied containers — `unrar-rs` reads RAR, `par2-rs`
-reads PAR2 — and both are reached by ordinary users pointing the tool at a file
+Three crates parse attacker-supplied containers — `unrar-rs` reads RAR, `par2-rs`
+reads PAR2, `par3-rs` reads PAR3 — and all three are reached by ordinary users pointing the tool at a file
 someone else made. That is the whole threat model, and it is why fuzzing here is
 a standing job rather than something run before a release.
 
 ## Targets
 
-Five, split by what fails rather than by crate. A parser target proves the
+Six, split by what fails rather than by crate. A parser target proves the
 headers cannot crash the reader; it says nothing about what those headers then
 drive, which is where the arithmetic lives.
 
@@ -17,6 +17,7 @@ drive, which is where the arithmetic lives.
 | `rar_extract` | `unrar-rs` | Decompression — RAR4 and RAR5 LZ, PPMd, the filter VM, stored and solid layouts. Bounded to 32 members per input so one pathological archive cannot spend the run. |
 | `rar_recovery_restore` | `unrar-rs` | `restore_volumes_from_paths`: reconstructing missing volumes from `.rev` parity. This is the path that aborted an embedder with a stack overflow before 0.5.3 — well-formed headers, wrong arithmetic behind them. |
 | `par2_packets` | `par2-rs` | `scan_packets_from_path`: the packet scanner. |
+| `par3_packets` | `par3-rs` | `scan_packets`: the PAR3 packet scanner — magic hunting, header and hash checks, typing File and Explicit Matrix packets by their set's Start packet, and the `ScanLimits` retention bounds. Guided by `par3.dict`; built with blake3's `pure` feature so its hashing is Rust ASan instruments. No seed corpus: PAR3 bytes come only from official `par3cmdline` runs, which live in the signed test corpus, not in the repository. |
 | `par2_verify_repair` | `par2-rs` | Slice verification against real files plus repair *planning* — exponents, slice counts and memory reservations computed from attacker-controlled numbers. Repair is not executed: its cost is set by those same numbers, so a fuzzer would spend the run reconstructing one input. |
 
 `rar_recovery_restore` and `par2_verify_repair` need a *set* of files rather
@@ -57,8 +58,8 @@ whole budget failing the first check. Every target therefore ships:
 The pull-request lane is a regression check on the change itself. The deep
 search is the nightly job.
 
-**Why one sanitizer.** Both fuzzed crates are pure Rust — no `build.rs`, no C,
-no assembly — and Rust has no `-Zsanitizer=undefined`, so a UBSan lane would
+**Why one sanitizer.** The fuzzed crates are pure Rust — no C, no assembly;
+`par3_packets` turns on blake3's `pure` feature to keep it that way — and Rust has no `-Zsanitizer=undefined`, so a UBSan lane would
 instrument nothing in this link while looking like coverage; its first run
 proved the point mechanically (cargo-fuzz builds ASan regardless, and the
 bad-build check rejected every target). The arithmetic class UBSan covers in
@@ -110,5 +111,6 @@ cargo +nightly fuzz run rar_extract fuzz/artifacts/rar_extract/crash-<hash>
 cargo +nightly fuzz tmin rar_extract fuzz/artifacts/rar_extract/crash-<hash>
 ```
 
-Run from the crate directory (`crates/unrar-rs` or `crates/par2-rs`), not the
+Run from the crate directory (`crates/unrar-rs`, `crates/par2-rs` or
+`crates/par3-rs`), not the
 workspace root — each crate's `fuzz/` is its own workspace.
