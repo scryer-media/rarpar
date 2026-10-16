@@ -265,9 +265,17 @@ impl RepairTree {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        if let Err(error) = std::fs::rename(self.stage.join(stage_name), &target) {
+        // WASI has no no-replace rename: with `backup` the vacated name is
+        // checked free just before each rename into it, as the native tree
+        // does where the filesystem refuses one.
+        let moved = if backup {
+            rename_checked(&self.stage.join(stage_name), &target)
+        } else {
+            std::fs::rename(self.stage.join(stage_name), &target)
+        };
+        if let Err(error) = moved {
             if let Some(backup_path) = &saved {
-                std::fs::rename(backup_path, &target)?;
+                rename_checked(backup_path, &target)?;
             }
             return Err(error);
         }
@@ -310,6 +318,19 @@ impl Drop for RepairTree {
 }
 
 pub(crate) const MIN_REPAIR_HANDLES: usize = 2;
+
+/// Rename `from` to `to` only when `to` is free, failing with
+/// `AlreadyExists` instead of replacing a file there.
+fn rename_checked(from: &Path, to: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(to) {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "rename destination exists",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => std::fs::rename(from, to),
+        Err(error) => Err(error),
+    }
+}
 
 pub(crate) fn normalization_key(path: &str) -> String {
     path.nfc().collect()

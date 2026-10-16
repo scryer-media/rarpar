@@ -607,17 +607,25 @@ followed by its `rarpar-wN-backup` twin. Each row carries the median wall,
 CPU and peak RSS and a bar on the same log scale as the other charts: the
 baseline's median wall time divided by the row's. The baseline is
 `par2cmdline-turbo`, or `par2-rs` for the whole chart when any machine has no
-`par2cmdline-turbo` run. A repair row is marked **retains file** when it left a
-numbered `.1` of every file it repaired, as `par2cmdline-turbo` and the
-reference do, or **in place** when it left none; only rows with the same mark
-write the same bytes. A shape must have the same dataset, block size,
-recovery count and damage on every input, or the render fails.
+`par2cmdline-turbo` run. Every row is read from the first target's rows. A
+repair row is marked **retains file** when it left a numbered `.1` of every
+file it repaired, as `par2cmdline-turbo` and the reference do, or **in
+place** when it left none; only rows with the same mark write the same bytes.
+A rarpar repair row with no successful run takes the mark of the row it is
+(`rarpar-wN` or `rarpar-wN-backup`). Each machine's heading gives that run's
+measured runs per row, and names any row whose median rests on fewer. The
+render fails when:
+- the inputs ran different rarpar versions;
+- a shape differs between inputs in dataset, file layout, block size,
+  recovery count or damage targets;
+- a shape ID is anything but letters, digits, `-`, `_` and `.`.
 
 `par3 tables` prints Markdown: a summary of the geometric mean of the
 reference ÷ rarpar wall-time ratio over the plain sets per op and worker
 count, then per set at `--workers` (default: the largest worker count run)
 each op's rarpar median wall seconds with that ratio after it, as `4.4 (14×)`,
-and the peak RSS range across the machines.
+and the peak RSS range across the machines. A PAR-inside set's summary cells
+always read its one rarpar row, which runs at the largest worker count.
 
 In the fleet, a machine with a PAR2 oracle passes it to `par3 run` as
 `--par2`.

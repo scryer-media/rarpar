@@ -1195,14 +1195,14 @@ func (r *runner) runConfig(ctx context.Context, config Config, dataset Dataset, 
 		return err
 	}
 	summary.CanonicalSource = source
-	par2Rows := r.par2Rows(config)
-	if par2Rows {
+	par2Seeded := r.par2Seeded(config)
+	if par2Seeded {
 		if summary.PAR2CanonicalSource, err = r.seedPAR2(ctx, config, dataset, first); err != nil {
 			return err
 		}
 	}
 	for _, state := range states {
-		if par2Rows {
+		if par2Seeded {
 			defer os.RemoveAll(state.par2)
 		}
 		if state == first {
@@ -1211,7 +1211,7 @@ func (r *runner) runConfig(ctx context.Context, config Config, dataset Dataset, 
 		if err := copyDir(first.canonical, state.canonical); err != nil {
 			return fmt.Errorf("copying the canonical carriers: %w", err)
 		}
-		if par2Rows {
+		if par2Seeded {
 			if err := copyDir(first.par2, state.par2); err != nil {
 				return fmt.Errorf("copying the PAR2 set: %w", err)
 			}
@@ -1537,8 +1537,9 @@ func (r *runner) createCommand(config Config, dataset Dataset, dataDir, outDir s
 	block, count := strconv.FormatInt(config.BlockSize, 10), strconv.FormatInt(config.Recovery, 10)
 	switch variant.Tool {
 	case ToolPAR2:
-		args := append([]string{"--quiet", "par", "create", "--base-path", dataDir, "--block-size", block,
-			"--recovery-count", count, filepath.Join(outDir, par2Name)}, names...)
+		args := append(r.par2Globals(), "par", "create", "--base-path", dataDir, "--block-size", block,
+			"--recovery-count", count, filepath.Join(outDir, par2Name))
+		args = append(args, names...)
 		return Command{Path: r.options.Candidate, Args: args, Dir: dataDir, PinCPUs: r.pin(), Timeout: r.timeoutFor(variant.Tool)}
 	case ToolPAR2Turbo:
 		args := append([]string{"c", "-q", "-s" + block, "-c" + count, "-B" + dataDir, filepath.Join(outDir, par2Name)}, names...)
@@ -1581,6 +1582,12 @@ func (r *runner) candidateGlobals(variant Variant) []string {
 	return append(args, r.options.CandidateArgs...)
 }
 
+// par2Globals are the global arguments of a par2-rs row: rarpar's, with
+// every --candidate-arg, and no PAR3 worker count.
+func (r *runner) par2Globals() []string {
+	return append([]string{"--quiet"}, r.options.CandidateArgs...)
+}
+
 func (r *runner) pin() string {
 	if r.results.PinApplied {
 		return r.options.PinCPUs
@@ -1612,7 +1619,8 @@ func (r *runner) checkCommand(op string, stage string, variant Variant, config C
 	case ToolReference:
 		return Command{Path: r.options.Reference, Args: []string{letter, "-q", carrierName}, Dir: stage, PinCPUs: r.pin(), Timeout: r.timeoutFor(ToolReference)}
 	case ToolPAR2:
-		return Command{Path: r.options.Candidate, Args: []string{"--quiet", "par", sub, filepath.Join(stage, par2Name)}, Dir: stage, PinCPUs: r.pin(), Timeout: r.timeoutFor(variant.Tool)}
+		args := append(r.par2Globals(), "par", sub, filepath.Join(stage, par2Name))
+		return Command{Path: r.options.Candidate, Args: args, Dir: stage, PinCPUs: r.pin(), Timeout: r.timeoutFor(variant.Tool)}
 	case ToolPAR2Turbo:
 		return Command{Path: r.options.PAR2Turbo, Args: []string{letter, "-q", par2Name}, Dir: stage, PinCPUs: r.pin(), Timeout: r.timeoutFor(variant.Tool)}
 	}
@@ -2283,9 +2291,11 @@ func stageCarrier(dir, canonical string, config Config, op string) error {
 	return ApplyDamage(dir, carrierDamageDataset(config.CarrierOriginalBytes), config.BlockSize, config.Damage)
 }
 
-// par2Rows reports whether any PAR2 row runs on the set.
-func (r *runner) par2Rows(config Config) bool {
-	if !config.PAR2 || config.Carrier != "" {
+// par2Seeded reports whether any PAR2 row reads the seeded PAR2 set: a PAR2
+// row runs on the set and verify or repair is selected. A PAR2 create row
+// writes its own set, and no PAR2 row runs verify-damaged.
+func (r *runner) par2Seeded(config Config) bool {
+	if !config.PAR2 || config.Carrier != "" || !(contains(r.options.Ops, OpVerify) || contains(r.options.Ops, OpRepair)) {
 		return false
 	}
 	for _, variant := range r.results.Variants {

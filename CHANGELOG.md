@@ -3,7 +3,7 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
-## rarpar 0.8.2 (unreleased)
+## rarpar 0.8.2
 
 ### Changed
 
@@ -14,7 +14,10 @@ documented in each crate's own changelog so those notes ship with the crate.
   command returns. That is the likely main cost behind a repair keeping
   backups running at 0.23–0.77× of `par2cmdline-turbo`'s on cloud block
   volumes in the 0.8.1 PAR2-against-PAR3 comparison; not yet re-measured.
-  Repair without `--backup` is unchanged.
+  The rebuilt file claims the name with a no-replace rename (Linux and
+  macOS), so a file another process creates there meanwhile fails the
+  repair instead of being replaced. Repair without `--backup` is
+  unchanged.
 - `t` (test) decodes each file into a sink instead of extracting the
   archive into a temporary directory, so testing writes nothing; a 50 GiB
   stored release no longer needs 50 GiB free in `$TMPDIR`. A set holding
@@ -56,6 +59,20 @@ documented in each crate's own changelog so those notes ship with the crate.
   per-set cell as rarpar's median wall seconds and then the reference ÷
   rarpar ratio, `4.4 (14×)`, with two decimals below 0.1 s. No version
   impact.
+- PR review fixes, no version impact:
+  - `--candidate-arg` reaches the `par2-rs` rows.
+  - The untimed PAR2 seed runs only when `verify` or `repair` is selected.
+  - The fleet plan names only the selected ops for the PAR2 rows.
+  - `par3 versus-render` reads every arm from the first `--target`.
+  - An unmeasured repair row keeps its retains-file or in-place mark.
+  - Each machine's group states its own runs per arm and names any arm
+    with fewer successful runs.
+  - Inputs from different rarpar versions, or whose shape differs in file
+    layout or damage targets, are refused.
+  - A shape ID that is not a plain file-name component is refused.
+  - `par3 tables` reads PAR-inside cells at the carrier row's worker count
+    whatever `--workers` says.
+  - The published charts render byte-identical.
 
 ### Documentation only
 

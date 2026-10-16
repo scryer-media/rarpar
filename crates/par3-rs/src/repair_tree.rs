@@ -602,9 +602,12 @@ impl RepairTree {
     /// never renames over a file there: on ext4 a rename over an existing file
     /// writes the whole new file back to disk inside the rename
     /// (`auto_da_alloc`), so a kept backup would cost a full flush before the
-    /// repair returns. Without `backup`, the stage replaces the destination in
-    /// one rename. If the stage cannot be moved, the original goes back under
-    /// its name.
+    /// repair returns. The stage claims the name with a no-replace rename (see
+    /// `rename_noreplace`), so a file another process creates there meanwhile
+    /// fails the install instead of being replaced. Without `backup`, the
+    /// stage replaces the destination in one rename. If the stage cannot be
+    /// moved, the original goes back under its name, again without replacing
+    /// a file there.
     pub(crate) fn install(
         &self,
         stage_name: &OsStr,
@@ -631,19 +634,32 @@ impl RepairTree {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        if let Err(error) = self.move_stage(stage_name, &parent, &filename) {
+        if let Err(error) = self.move_stage(stage_name, &parent, &filename, !backup) {
             if let Some((backup_name, _)) = &saved {
-                parent.rename(backup_name, &parent, &filename)?;
+                rename_noreplace(&parent, backup_name, &parent, &filename)?;
             }
             return Err(error);
         }
         Ok(saved.map(|(_, display)| display))
     }
 
-    fn move_stage(&self, name: &OsStr, parent: &BudgetedDir, filename: &OsStr) -> io::Result<()> {
-        match self.stage().rename(name, parent, filename) {
+    // `replace` lets the stage rename over a file at the destination;
+    // without it the name is claimed with `rename_noreplace`.
+    fn move_stage(
+        &self,
+        name: &OsStr,
+        parent: &BudgetedDir,
+        filename: &OsStr,
+        replace: bool,
+    ) -> io::Result<()> {
+        let moved = if replace {
+            self.stage().rename(name, parent, filename)
+        } else {
+            rename_noreplace(self.stage(), name, parent, filename)
+        };
+        match moved {
             Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
-                self.copy_stage(name, parent, filename)
+                self.copy_stage(name, parent, filename, replace)
             }
             outcome => outcome,
         }
@@ -653,7 +669,13 @@ impl RepairTree {
     // The staged file was verified before installation began, and every byte
     // read from it here is handed to `write_all`, which fails rather than
     // writing less, so the copy is not read back.
-    fn copy_stage(&self, name: &OsStr, parent: &BudgetedDir, filename: &OsStr) -> io::Result<()> {
+    fn copy_stage(
+        &self,
+        name: &OsStr,
+        parent: &BudgetedDir,
+        filename: &OsStr,
+        replace: bool,
+    ) -> io::Result<()> {
         use std::io::{Read, Write};
         let local = PrivateInstall::new(parent, filename)?;
         let options = self.root.options.clone().unwrap_or_default();
@@ -689,7 +711,11 @@ impl RepairTree {
         // original before installation so a cleanup error cannot hide an
         // already-installed output from the repair report.
         self.stage().remove_file(name)?;
-        local.dir().rename("output", parent, filename)
+        if replace {
+            local.dir().rename("output", parent, filename)
+        } else {
+            rename_noreplace(local.dir(), OsStr::new("output"), parent, filename)
+        }
     }
 
     pub(crate) fn paths_alias(&self, first: &str, second: &str) -> io::Result<bool> {
@@ -915,8 +941,8 @@ fn relative_parent(
 /// Move `filename` in `parent` to the first free numbered backup name,
 /// `filename.1` to `filename.99999`, and return the number. The name is
 /// claimed with a hard link, which never replaces a file, and the original
-/// name released after it; a filesystem without hard links gets a rename into
-/// a name found free instead.
+/// name released after it; a filesystem without hard links gets a no-replace
+/// rename into it instead (see `rename_noreplace`).
 fn move_to_backup(parent: &Dir, filename: &OsStr) -> io::Result<u32> {
     for index in 1..100_000u32 {
         let mut backup_name = filename.to_os_string();
@@ -930,12 +956,9 @@ fn move_to_backup(parent: &Dir, filename: &OsStr) -> io::Result<u32> {
                 return Ok(index);
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(_) => match parent.symlink_metadata(&backup_name) {
-                Ok(_) => continue,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    parent.rename(filename, parent, &backup_name)?;
-                    return Ok(index);
-                }
+            Err(_) => match rename_noreplace(parent, filename, parent, &backup_name) {
+                Ok(()) => return Ok(index),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error),
             },
         }
@@ -943,6 +966,29 @@ fn move_to_backup(parent: &Dir, filename: &OsStr) -> io::Result<u32> {
     Err(io::Error::other(EngineError::resource_limit(
         "backup names",
     )))
+}
+
+/// Rename `from` in `from_dir` to `to` in `to_dir`, failing with
+/// `AlreadyExists` instead of replacing a file at `to`. Linux
+/// (`renameat2(RENAME_NOREPLACE)`) and macOS (`renameatx_np(RENAME_EXCL)`)
+/// claim the name in the rename itself. Elsewhere, and on a filesystem that
+/// refuses the flag, the name is checked free just before an ordinary rename,
+/// which narrows the window in which another process could create it but
+/// does not close it.
+fn rename_noreplace(from_dir: &Dir, from: &OsStr, to_dir: &Dir, to: &OsStr) -> io::Result<()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    match clone::rename_noreplace(from_dir, from, to_dir, to) {
+        Err(error) if clone::noreplace_unsupported(&error) => {}
+        outcome => return outcome,
+    }
+    match to_dir.symlink_metadata(to) {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "rename destination exists",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => from_dir.rename(from, to_dir, to),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -1182,6 +1228,42 @@ mod tests {
     }
 
     #[test]
+    fn a_no_replace_rename_never_replaces_a_file() {
+        let root = TestRoot::new("noreplace");
+        std::fs::write(root.path().join("from"), b"moved").unwrap();
+        std::fs::write(root.path().join("taken"), b"kept").unwrap();
+        let dir = Dir::open_ambient_dir(root.path(), ambient_authority()).unwrap();
+        let error =
+            rename_noreplace(&dir, OsStr::new("from"), &dir, OsStr::new("taken")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(root.path().join("taken")).unwrap(), b"kept");
+        assert_eq!(std::fs::read(root.path().join("from")).unwrap(), b"moved");
+        rename_noreplace(&dir, OsStr::new("from"), &dir, OsStr::new("free")).unwrap();
+        assert_eq!(std::fs::read(root.path().join("free")).unwrap(), b"moved");
+        assert!(!root.path().join("from").exists());
+    }
+
+    #[test]
+    fn a_no_replace_local_copy_keeps_a_file_that_appeared_at_the_destination() {
+        let root = TestRoot::new("local-copy-noreplace");
+        let tree = RepairTree::new(root.path(), ["nested/file.bin"]).unwrap();
+        let destination = tree.destination("nested/file.bin").unwrap();
+        let options = ExecutionOptions::default();
+        let (name, path) = tree.create_stage(0, 4, &options).unwrap();
+        std::fs::write(&path, b"made").unwrap();
+        let (parent, filename) = tree
+            .destination_parent(&destination.relative, true)
+            .unwrap();
+        std::fs::write(&destination.display, b"theirs").unwrap();
+        let error = tree
+            .copy_stage(&name, &parent, &filename, false)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&destination.display).unwrap(), b"theirs");
+        assert_eq!(parent.entries().unwrap().count(), 1);
+    }
+
+    #[test]
     fn destination_local_copy_is_installed_without_leaving_staging() {
         let root = TestRoot::new("local-copy");
         let options = ExecutionOptions {
@@ -1197,7 +1279,7 @@ mod tests {
         let (parent, filename) = tree
             .destination_parent(&destination.relative, true)
             .unwrap();
-        tree.copy_stage(&name, &parent, &filename).unwrap();
+        tree.copy_stage(&name, &parent, &filename, true).unwrap();
         assert_eq!(std::fs::read(&destination.display).unwrap(), bytes);
         assert!(!path.exists());
         assert_eq!(parent.entries().unwrap().count(), 1);
@@ -1221,7 +1303,7 @@ mod tests {
         let (parent, filename) = tree
             .destination_parent(&destination.relative, true)
             .unwrap();
-        assert!(tree.copy_stage(&name, &parent, &filename).is_err());
+        assert!(tree.copy_stage(&name, &parent, &filename, true).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"safe");
         assert_eq!(parent.entries().unwrap().count(), 0);
         assert_eq!(options.handles.used(), 3);

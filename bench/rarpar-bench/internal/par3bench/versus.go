@@ -7,7 +7,10 @@ package par3bench
 // one suite row on one of those sets, so the comparison needs no run of its
 // own: PAR2 and both PAR3 tools, each codec, on one scale.
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+)
 
 const (
 	// PAR2 limits shared by both PAR2 tools.
@@ -79,10 +82,15 @@ func VersusShapes(results *Results) []VersusShape {
 }
 
 // VersusArm is one bar: a label and the suite row behind it. Row is nil when
-// the row never ran; a row with no successful run has Wall.N == 0.
+// the row never ran; a row with no successful run has Wall.N == 0. Repeats
+// is the measured runs its set asked for. Mode is the repair mode the row's
+// variant selects ("retains file" or "in place"), where the variant fixes
+// one; it labels a repair arm that has no runs to read the mode from.
 type VersusArm struct {
-	Name string
-	Row  *Row
+	Name    string
+	Row     *Row
+	Repeats int
+	Mode    string
 }
 
 // Measured reports whether the arm has a median to draw.
@@ -93,8 +101,14 @@ func (a VersusArm) Measured() bool { return a.Row != nil && a.Row.Wall.N > 0 }
 // place". A row that retains files kept a numbered .1 of every file it
 // repaired, so only arms with the same mark write the same bytes.
 func (a VersusArm) Label(op string) string {
-	if op != OpRepair || !a.Measured() {
+	if op != OpRepair {
 		return a.Name
+	}
+	if !a.Measured() {
+		if a.Mode == "" {
+			return a.Name
+		}
+		return a.Name + ", " + a.Mode
 	}
 	switch a.Row.LeftBackup {
 	case "true":
@@ -108,9 +122,10 @@ func (a VersusArm) Label(op string) string {
 
 // versusRarparRows names the rarpar rows a versus chart draws: the plain
 // in-place row and its backup twin at the run's largest worker count, on the
-// first storage target, with no kernel override.
-func versusRarparRows(results *Results) (inPlace, backup string, workers int) {
-	target, seen := "", false
+// first storage target, with no kernel override. target is that storage
+// target's name, empty for a run with no named targets.
+func versusRarparRows(results *Results) (inPlace, backup string, workers int, target string) {
+	seen := false
 	for _, variant := range results.Variants {
 		if variant.Tool != ToolCandidate || variant.Kernel != "" {
 			continue
@@ -131,12 +146,14 @@ func versusRarparRows(results *Results) (inPlace, backup string, workers int) {
 			inPlace = variant.Name
 		}
 	}
-	return inPlace, backup, workers
+	return inPlace, backup, workers, target
 }
 
 // VersusArms lists the arms of one shape and op, in chart order, from the
-// run's summarized rows. par2cmdline-turbo is left out of a run without it.
+// run's summarized rows, every arm on the storage target the rarpar rows are
+// read from. par2cmdline-turbo is left out of a run without it.
 func VersusArms(results *Results, rows []Row, shape VersusShape, op string) []VersusArm {
+	inPlace, backup, _, target := versusRarparRows(results)
 	find := func(config *ConfigSummary, variant string) *Row {
 		if config == nil || variant == "" {
 			return nil
@@ -148,30 +165,37 @@ func VersusArms(results *Results, rows []Row, shape VersusShape, op string) []Ve
 		}
 		return nil
 	}
-	inPlace, backup, _ := versusRarparRows(results)
+	// MatrixRows names every row of a multi-target run NAME@TARGET; the
+	// rarpar names above already carry it.
+	onTarget := func(variant string) string {
+		if target == "" {
+			return variant
+		}
+		return variant + "@" + target
+	}
 	var arms []VersusArm
-	add := func(name string, config *ConfigSummary, variant string) {
+	add := func(name string, config *ConfigSummary, variant, mode string) {
 		if config != nil {
-			arms = append(arms, VersusArm{Name: name, Row: find(config, variant)})
+			arms = append(arms, VersusArm{Name: name, Row: find(config, variant), Repeats: config.MeasuredRepeats, Mode: mode})
 		}
 	}
 	if shape.Cauchy != nil && shape.Cauchy.PAR2 {
-		add(ArmPAR2, shape.Cauchy, ToolPAR2)
+		add(ArmPAR2, shape.Cauchy, onTarget(ToolPAR2), "")
 		if results.PAR2Turbo != nil {
-			add(ArmPAR2Turbo, shape.Cauchy, ToolPAR2Turbo)
+			add(ArmPAR2Turbo, shape.Cauchy, onTarget(ToolPAR2Turbo), "")
 		}
 	}
-	add(ArmReference, shape.Cauchy, "reference")
-	add(ArmReferenceFFT, shape.FFT, "reference")
+	add(ArmReference, shape.Cauchy, onTarget(ToolReference), "")
+	add(ArmReferenceFFT, shape.FFT, onTarget(ToolReference), "")
 	for _, set := range []struct {
 		name   string
 		config *ConfigSummary
 	}{{ArmRarparCauchy, shape.Cauchy}, {ArmRarparFFT, shape.FFT}} {
 		if op != OpRepair || !results.InPlaceUnsupported {
-			add(set.name, set.config, inPlace)
+			add(set.name, set.config, inPlace, "in place")
 		}
 		if op == OpRepair {
-			add(set.name, set.config, backup)
+			add(set.name, set.config, backup, "retains file")
 		}
 	}
 	return arms
@@ -198,15 +222,20 @@ func versusBaseline(groups [][]VersusArm) string {
 }
 
 // sameShape reports whether two runs' sets of one shape mean the same
-// comparison: dataset, block size, recovery and damage.
+// comparison: dataset, block size, recovery and damage. The dataset's file
+// layout is compared through its block counts at the set's block size (PAR3
+// packs file tails, PAR2 gives every file its own last block), and the
+// damage block by block, file and count.
 func sameShape(a, b *ConfigSummary) error {
 	switch {
 	case a.Dataset != b.Dataset || a.DatasetBytes != b.DatasetBytes:
 		return fmt.Errorf("dataset %s (%d bytes) against %s (%d bytes)", a.Dataset, a.DatasetBytes, b.Dataset, b.DatasetBytes)
 	case a.BlockSize != b.BlockSize || a.Recovery != b.Recovery:
 		return fmt.Errorf("%d-byte blocks + %d against %d-byte blocks + %d", a.BlockSize, a.Recovery, b.BlockSize, b.Recovery)
-	case a.Damage.Name != b.Damage.Name || a.Damage.LostBlocks() != b.Damage.LostBlocks():
-		return fmt.Errorf("damage %s against %s", a.Damage.Name, b.Damage.Name)
+	case a.InputBlocks != b.InputBlocks || a.PAR2SourceBlocks != b.PAR2SourceBlocks:
+		return fmt.Errorf("dataset %s laid out as %d input blocks (%d for PAR2) against %d (%d for PAR2)", a.Dataset, a.InputBlocks, a.PAR2SourceBlocks, b.InputBlocks, b.PAR2SourceBlocks)
+	case a.Damage.Name != b.Damage.Name || !slices.Equal(a.Damage.Targets, b.Damage.Targets):
+		return fmt.Errorf("damage %s %v against %s %v", a.Damage.Name, a.Damage.Targets, b.Damage.Name, b.Damage.Targets)
 	}
 	return nil
 }
