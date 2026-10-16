@@ -2305,6 +2305,312 @@ jobs:
             ${{ github.workspace }}/target-wasm/wasip1-simd128
           key: ${{ steps.wasm-cache-restore.outputs.cache-primary-key }}
 
+  # Memory-safety lanes for the four library crates. docs/unsafe-validation.md
+  # says what each lane covers per crate and what stays uninstrumented; keep
+  # it in step with the filters here. Each crate's step runs only when the
+  # `changes` job marks that crate affected, so an unaffected crate costs a
+  # skipped step rather than a skipped job, and `unsafe-complete` can demand
+  # success from every job it needs.
+  unsafe-valgrind:
+    name: unsafe-valgrind-${{ matrix.platform }}-${{ matrix.crate }}
+    needs: [changes, fmt, clippy, unit-tests]
+    if: needs.changes.outputs.crates == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux-x86_64, linux-aarch64]
+        crate: [reedsolomon-rs, unrar-rs, par2-rs, par3-rs]
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - crate: reedsolomon-rs
+            changed: reedsolomon
+            # GF(2^8)/GF(2^16) SIMD kernels (SSSE3/AVX2/GFNI, NEON, SVE2),
+            # the FFT's shared row banks and the tiled matrix inversion.
+            filter: test(/^(gf_simd|gf8|gf_pmul|fft|matrix_tiled|sve2|decode_apply|threading|xor_jit)::/)
+          - crate: unrar-rs
+            changed: unrar
+            # The LZ window and bit readers (unaligned loads and stores), the
+            # parallel RAR5 decoder, BLAKE2sp/AES/CRC SIMD, the hash
+            # pipeline threads and the member metadata FFI (umask, owners,
+            # extended attributes).
+            filter: test(/^(decompress::|crypto::|crc_simd::|hash_pipeline::|archive::member::)/)
+          - crate: par2-rs
+            changed: par2
+            # The repair controller's interleaved output, the MD5/CRC SIMD
+            # kernels, the repair transform and the openat-based disk layer.
+            filter: test(/^(repair::|md5_simd::|crc_simd::|repair_transform::|matrix::|disk::|checksum::)/)
+          - crate: par3-rs
+            changed: par3
+            # statfs and the clone/copy FFI, the hashing and FFT pools.
+            filter: test(/^(mount::|repair_tree::|session_repair::|hash::|fft::|runtime::|gf::)/)
+    env:
+      CRATE: ${{ matrix.crate }}
+      FILTER: ${{ matrix.filter }}
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: valgrind --quiet --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: valgrind --quiet --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect
+    steps:
+      - name: Gate on the crate being affected
+        id: gate
+        env:
+          OUTPUTS: ${{ toJSON(needs.changes.outputs) }}
+          KEY: ${{ matrix.changed }}
+        run: >-
+          python3 -c 'import json, os; print("run=" + json.loads(os.environ["OUTPUTS"]).get(os.environ["KEY"], "false"))'
+          >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.run == 'true'
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        if: steps.gate.outputs.run == 'true'
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        if: steps.gate.outputs.run == 'true'
+        with:
+          tool: cargo-nextest@0.9.143
+      - name: Install Valgrind and native build dependencies
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends valgrind nasm
+      - name: Hydrate the test corpus (unit)
+        # The par3-rs lib tests install into PAR-inside containers; see the
+        # unit-tests lane.
+        if: steps.gate.outputs.run == 'true'
+        run: cargo run --locked -p xtask -- test-corpus hydrate --profile unit --profile par3
+      - name: Run the crate's unsafe-bearing lib tests under Memcheck
+        # Default features: AWS-LC's assembly and the native SIMD kernels are
+        # what Memcheck can see and the sanitizers cannot. Memcheck's CPUID
+        # hides AVX-512, so the x86 lane runs the AVX2 tier and below.
+        if: steps.gate.outputs.run == 'true'
+        run: cargo nextest run --locked --no-fail-fast -p "$CRATE" --lib -E "$FILTER"
+
+  unsafe-sanitizer:
+    name: unsafe-${{ matrix.sanitizer }}-${{ matrix.platform }}-${{ matrix.crate }}
+    needs: [changes, fmt, clippy, unit-tests]
+    if: needs.changes.outputs.crates == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux-x86_64, linux-aarch64]
+        sanitizer: [address, thread]
+        crate: [reedsolomon-rs, unrar-rs, par2-rs, par3-rs]
+        exclude:
+          # ThreadSanitizer is for the crates whose own code runs threads it
+          # coordinates: unrar-rs's parallel decoder and hash pipeline, and
+          # par3-rs's hashing, FFT and repair pools. reedsolomon-rs and par2-rs
+          # thread through rayon over disjoint slices; see
+          # docs/unsafe-validation.md.
+          - sanitizer: thread
+            crate: reedsolomon-rs
+          - sanitizer: thread
+            crate: par2-rs
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - crate: reedsolomon-rs
+            changed: reedsolomon
+            features: ""
+            address: test(/^(gf_simd|gf8|gf_pmul|fft|matrix_tiled|sve2|decode_apply|threading|xor_jit)::/)
+          - crate: unrar-rs
+            changed: unrar
+            # RustCrypto, so the AES and BLAKE2sp under the decoder are Rust
+            # the sanitizer instruments.
+            features: --no-default-features --features crypto-rust
+            address: test(/^(decompress::|crypto::|crc_simd::|hash_pipeline::|archive::member::)/)
+            thread: test(/^(decompress::lz::parallel::|decompress::lz::tests::|hash_pipeline::|recovery::)/)
+          - crate: par2-rs
+            changed: par2
+            features: --no-default-features --features crypto-rust
+            address: test(/^(repair::|md5_simd::|crc_simd::|repair_transform::|matrix::|disk::|checksum::)/)
+          - crate: par3-rs
+            changed: par3
+            features: ""
+            address: test(/^(mount::|repair_tree::|session_repair::|hash::|fft::|runtime::|gf::)/)
+            thread: test(/^(hash::|fft::|runtime::|session_repair::|session::|evidence::|creation::)/)
+    env:
+      CRATE: ${{ matrix.crate }}
+      FEATURES: ${{ matrix.features }}
+      FILTER: ${{ matrix.sanitizer == 'thread' && matrix.thread || matrix.address }}
+      TARGET: ${{ matrix.target }}
+      RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      TSAN_OPTIONS: halt_on_error=1
+    steps:
+      - name: Gate on the crate being affected
+        id: gate
+        env:
+          OUTPUTS: ${{ toJSON(needs.changes.outputs) }}
+          KEY: ${{ matrix.changed }}
+        run: >-
+          python3 -c 'import json, os; print("run=" + json.loads(os.environ["OUTPUTS"]).get(os.environ["KEY"], "false"))'
+          >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.run == 'true'
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        if: steps.gate.outputs.run == 'true'
+        with:
+          toolchain: nightly-2026-09-01
+          components: rust-src
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        if: steps.gate.outputs.run == 'true'
+        with:
+          tool: cargo-nextest@0.9.143
+      - name: Install native build dependencies
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nasm
+      - name: Hydrate the test corpus (unit)
+        # The hydrate tool is built without the sanitizer flags.
+        if: steps.gate.outputs.run == 'true'
+        env:
+          RUSTFLAGS: ""
+        run: cargo +nightly-2026-09-01 run --locked -p xtask -- test-corpus hydrate --profile unit --profile par3
+      - name: Instrument the crate's unsafe-bearing lib tests
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          read -ra features <<<"$FEATURES"
+          cargo +nightly-2026-09-01 nextest run -Zbuild-std --target "$TARGET" \
+            --locked --no-fail-fast -p "$CRATE" ${features[@]+"${features[@]}"} --lib -E "$FILTER"
+
+  unsafe-miri-plan:
+    name: unsafe-miri-plan
+    needs: [changes]
+    if: needs.changes.outputs.crates == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: nightly-2026-09-01
+          components: miri, rust-src
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
+      - name: Discover the portable unsafe tests under cfg(miri)
+        id: plan
+        env:
+          UNRAR: ${{ needs.changes.outputs.unrar }}
+          REEDSOLOMON: ${{ needs.changes.outputs.reedsolomon }}
+        run: |
+          set -euo pipefail
+          listings=()
+          if [ "$UNRAR" = true ]; then
+            # RustCrypto: no C backend is built for an interpreter that could
+            # not call it anyway.
+            # The exhaustive copy-matrix sweeps are left to Memcheck and ASan:
+            # interpreted, each runs well past ten minutes.
+            cargo +nightly-2026-09-01 miri nextest list --locked -p unrar-rs --lib \
+              --no-default-features --features crypto-rust --message-format json \
+              -E 'test(/^decompress::lz::(window|block_reader)::tests::/) & !test(/copy_matrix_matches_reference/)' \
+              > "$RUNNER_TEMP/miri-unrar.json"
+            listings+=("unrar-rs=$RUNNER_TEMP/miri-unrar.json")
+          fi
+          if [ "$REEDSOLOMON" = true ]; then
+            # Only the FFT row banks: every test that reaches the rayon pool
+            # stops in crossbeam-epoch's integer-to-pointer casts, which strict
+            # provenance refuses, and so does matrix_tiled's own inversion.
+            cargo +nightly-2026-09-01 miri nextest list --locked -p reedsolomon-rs --lib \
+              --message-format json \
+              -E 'test(/^fft::tests::(row_banks_are_zeroed_aligned_rows|known_zero_steps_at_par3_shapes|transforms_match_direct_polynomial_evaluation_and_round_trip)$/)' \
+              > "$RUNNER_TEMP/miri-reedsolomon.json"
+            listings+=("reedsolomon-rs=$RUNNER_TEMP/miri-reedsolomon.json")
+          fi
+          if [ "${#listings[@]}" -eq 0 ]; then
+            echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            echo "no Miri-covered crate is affected"
+            exit 0
+          fi
+          python3 .github/scripts/miri-matrix.py "$GITHUB_OUTPUT" "${listings[@]}"
+
+  unsafe-miri:
+    name: unsafe-miri-${{ matrix.package }}-${{ matrix.test }}
+    needs: unsafe-miri-plan
+    if: needs.unsafe-miri-plan.outputs.count != '0'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.unsafe-miri-plan.outputs.matrix) }}
+    env:
+      MIRI_PACKAGE: ${{ matrix.package }}
+      MIRI_TEST: ${{ matrix.test }}
+      MIRIFLAGS: -Zmiri-strict-provenance
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: nightly-2026-09-01
+          components: miri, rust-src
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
+      - name: Check one portable unsafe invariant
+        run: |
+          set -euo pipefail
+          features=()
+          if [ "$MIRI_PACKAGE" = unrar-rs ]; then
+            features=(--no-default-features --features crypto-rust)
+          fi
+          cargo +nightly-2026-09-01 miri nextest run --locked -p "$MIRI_PACKAGE" --lib \
+            ${features[@]+"${features[@]}"} --no-fail-fast -- --exact "$MIRI_TEST"
+
+  # Green iff every memory-safety job that had work succeeded. Miri may be
+  # skipped only when discovery found no Miri-covered crate affected.
+  unsafe-complete:
+    name: unsafe-complete
+    if: ${{ always() && needs.changes.outputs.crates == 'true' }}
+    needs: [changes, unsafe-valgrind, unsafe-sanitizer, unsafe-miri-plan, unsafe-miri]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every native and Miri safety job
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+          MIRI_COUNT: ${{ needs.unsafe-miri-plan.outputs.count }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          results = json.loads(os.environ["RESULTS"])
+          miri_idle = os.environ.get("MIRI_COUNT") == "0"
+          bad = {
+              name: job["result"]
+              for name, job in results.items()
+              if job["result"] != "success"
+              and not (name == "unsafe-miri" and miri_idle and job["result"] == "skipped")
+          }
+          if bad:
+              raise SystemExit(f"memory-safety jobs did not succeed: {bad}")
+          print("every memory-safety job succeeded")
+          PY
+
   ci-complete:
     name: ci-complete
     runs-on: ubuntu-24.04
@@ -2333,6 +2639,7 @@ jobs:
       - wasm-par2-harness
       - wasm-par3-harness
       - wasm-unrar-harness
+      - unsafe-complete
     steps:
       - name: Check CI result
         run: |
