@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.12.0
+
+### Changed
+
+- A reader error that does not carry a `RarError` reaches `RarError::Io`
+  whole, so its kind, OS error code and payload are the reader's own. It
+  used to be rebuilt from its rendered message, which kept only the text.
+- A volume provider's refusal and a header or signature error on a
+  continuation volume travel inside the segment readers' `io::Error` as
+  themselves (`VolumeProviderError` and `RarError`), instead of as their
+  rendered text, so a caller can downcast them.
+- `VolumeProviderError` reports its I/O error through
+  `std::error::Error::source`.
+- A RAR5 compressed block whose header checksum does not match is the new
+  `RarError::BlockHeaderChecksumMismatch { expected, actual }` instead of
+  `RarError::CorruptArchive`. Its message is the one it had, so logs read
+  the same. A caller that matched this failure as `CorruptArchive` must
+  match the new variant; that change of variant is why this is 0.12.0
+  rather than a patch.
+
 ## 0.11.2
 
 ### Changed
