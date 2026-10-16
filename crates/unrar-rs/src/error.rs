@@ -4,11 +4,17 @@ use std::io;
 ///
 /// The set of variants grows with the formats and failure modes the crate
 /// recognises, so a `match` over it needs a wildcard arm.
+///
+/// No variant has a [`source`]: `Io` renders its I/O error, the way
+/// `io::Error` renders the error it carries, so a reporter that walks the
+/// chain prints it once. A caller reaches the I/O error by matching `Io`.
+///
+/// [`source`]: std::error::Error::source
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RarError {
     #[error("I/O error: {0}")]
-    Io(#[from] io::Error),
+    Io(io::Error),
 
     #[error("not a RAR archive (bad signature)")]
     InvalidSignature,
@@ -21,6 +27,7 @@ pub enum RarError {
 
     // The display keeps the wording this failure had while it was reported as
     // `CorruptArchive`, so logs read the same.
+    #[non_exhaustive]
     #[error(
         "corrupt archive: RAR5 block header checksum mismatch: expected {expected:#04x}, got {actual:#04x}"
     )]
@@ -125,4 +132,41 @@ pub enum RarError {
     SolidStatePoisoned { member: String, detail: String },
 }
 
+// Written out rather than `#[from]`, which would also make the I/O error the
+// variant's source and so render it twice along the chain.
+impl From<io::Error> for RarError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
 pub type RarResult<T> = Result<T, RarError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Every error renders a cause it carries or returns it, never both, so a
+    // chain reporter prints each cause once.
+    #[test]
+    fn an_io_error_is_rendered_once_along_the_chain() {
+        let provider = crate::volume::VolumeProviderError::Io {
+            volume: 3,
+            error: io::Error::from_raw_os_error(2),
+        };
+        let error = RarError::from(io::Error::other(provider));
+        let mut chain = vec![error.to_string()];
+        let mut next = std::error::Error::source(&error);
+        while let Some(cause) = next {
+            chain.push(cause.to_string());
+            next = cause.source();
+        }
+        assert_eq!(
+            chain,
+            [format!(
+                "I/O error: volume 3 I/O error: {}",
+                io::Error::from_raw_os_error(2)
+            )]
+        );
+    }
+}

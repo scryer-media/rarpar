@@ -146,12 +146,20 @@ impl Default for VolumeSet {
 // ---------------------------------------------------------------------------
 
 /// Error returned by a [`VolumeProvider`].
+///
+/// Each variant names the volume index the provider was asked for. The
+/// rendering includes the I/O error, so [`source`] returns none.
+///
+/// [`source`]: std::error::Error::source
 #[derive(Debug)]
 pub enum VolumeProviderError {
     /// Volume will never become available.
     Unavailable { volume: usize, reason: String },
     /// I/O error opening the volume file.
-    Io(std::io::Error),
+    Io {
+        volume: usize,
+        error: std::io::Error,
+    },
 }
 
 impl fmt::Display for VolumeProviderError {
@@ -160,19 +168,12 @@ impl fmt::Display for VolumeProviderError {
             Self::Unavailable { volume, reason } => {
                 write!(f, "volume {volume} unavailable: {reason}")
             }
-            Self::Io(e) => write!(f, "volume I/O error: {e}"),
+            Self::Io { volume, error } => write!(f, "volume {volume} I/O error: {error}"),
         }
     }
 }
 
-impl std::error::Error for VolumeProviderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Unavailable { .. } => None,
-            Self::Io(error) => Some(error),
-        }
-    }
-}
+impl std::error::Error for VolumeProviderError {}
 
 /// Provides volume readers on demand for streaming extraction.
 ///
@@ -208,7 +209,10 @@ impl VolumeProvider for StaticVolumeProvider {
                 volume: index,
                 reason: "not registered".into(),
             })?;
-        let file = std::fs::File::open(path).map_err(VolumeProviderError::Io)?;
+        let file = std::fs::File::open(path).map_err(|error| VolumeProviderError::Io {
+            volume: index,
+            error,
+        })?;
         Ok(Box::new(file))
     }
 }

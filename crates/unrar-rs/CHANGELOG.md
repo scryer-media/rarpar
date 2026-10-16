@@ -11,14 +11,22 @@
   continuation volume travel inside the segment readers' `io::Error` as
   themselves (`VolumeProviderError` and `RarError`), instead of as their
   rendered text, so a caller can downcast them.
-- `VolumeProviderError` reports its I/O error through
-  `std::error::Error::source`.
+- `VolumeProviderError::Io` is `Io { volume, error }`: it names the volume
+  index the provider was asked for, as `Unavailable` does, and renders
+  "volume {volume} I/O error: {error}". A provider builds it with the index
+  it was given. The segment readers used to add the volume number to the
+  rendered text; now the error carries it.
+- `RarError::Io` no longer returns its I/O error from
+  `std::error::Error::source`, because its message already renders it and a
+  reporter walking the chain printed it twice. `From<io::Error>` is
+  unchanged. No `RarError` or `VolumeProviderError` has a source.
 - A RAR5 compressed block whose header checksum does not match is the new
   `RarError::BlockHeaderChecksumMismatch { expected, actual }` instead of
   `RarError::CorruptArchive`. Its message is the one it had, so logs read
   the same. A caller that matched this failure as `CorruptArchive` must
-  match the new variant; that change of variant is why this is 0.12.0
-  rather than a patch.
+  match the new variant. The variant is `#[non_exhaustive]`, so it is
+  matched with `..`.
+- These changes of variant are why this is 0.12.0 rather than a patch.
 
 ## 0.11.2
 

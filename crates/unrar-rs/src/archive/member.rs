@@ -8025,13 +8025,17 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
         assert!(error.get_ref().is_none(), "the short read gains no payload");
 
-        let provider = volume_provider_io_error(crate::volume::VolumeProviderError::Io(
-            std::io::Error::from_raw_os_error(24),
-        ));
+        let provider = volume_provider_io_error(crate::volume::VolumeProviderError::Io {
+            volume: 2,
+            error: std::io::Error::from_raw_os_error(24),
+        });
         let RarError::Io(error) = RarArchive::read_error_to_rar(provider) else {
             panic!("a provider failure stays an I/O error");
         };
-        let Some(crate::volume::VolumeProviderError::Io(inner)) = error
+        let Some(crate::volume::VolumeProviderError::Io {
+            volume: 2,
+            error: inner,
+        }) = error
             .get_ref()
             .and_then(|inner| inner.downcast_ref::<crate::volume::VolumeProviderError>())
         else {
