@@ -93,3 +93,9 @@ opt-level = 3
 # unrar-rs stays at opt-level 0: its hot dependency ppmd-turbo is optimised above, and
 # optimising unrar-rs itself would also build its test binaries optimised in every
 # unrar-tests shard (a cold unrar-rs test build is 587 CPU-s instead of 69).
+
+# ppmd-turbo 0.2.0 and lzma-turbo 0.10.0 are not published yet: these point
+# at their release commits until they are, and are removed then.
+[patch.crates-io]
+ppmd-turbo = { git = "https://github.com/scryer-media/ppmd-turbo", rev = "a2cfd2f7e8a14c2396472cfcbec6233f38fc337f" }
+lzma-turbo = { git = "https://github.com/scryer-media/lzma-turbo", rev = "81024decc63b3a39d91ce30620661785148ad280" }

@@ -54,6 +54,8 @@
   with `io::Error::downcast`.
 - A member that overflows a packed size or a timestamp beyond FILETIME is
   `CorruptArchive`, not a `ResourceLimit`.
+- Requires `ppmd-turbo` 0.2.0. A fault inside the PPMd codec itself, which
+  0.2.0 reports apart from a corrupt stream, is `RarError::Internal`.
 - These changes of variant are why this is 0.12.0 rather than a patch.
 
 ## 0.11.2

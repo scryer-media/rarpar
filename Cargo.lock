@@ -1702,6 +1702,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lzma-turbo"
+version = "0.10.0"
+source = "git+https://github.com/scryer-media/lzma-turbo?rev=81024decc63b3a39d91ce30620661785148ad280#81024decc63b3a39d91ce30620661785148ad280"
+dependencies = [
+ "aws-lc-rs",
+ "crc-fast",
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "mach2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2157,6 +2167,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d772f4b18e5af5cf5186a3661d5fc451c7366b2ce59da997179ed192bf12512b"
 
 [[package]]
+name = "ppmd-turbo"
+version = "0.2.0"
+source = "git+https://github.com/scryer-media/ppmd-turbo?rev=a2cfd2f7e8a14c2396472cfcbec6233f38fc337f#a2cfd2f7e8a14c2396472cfcbec6233f38fc337f"
+
+[[package]]
 name = "presser"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2247,7 +2262,7 @@ dependencies = [
  "crc-fast",
  "filetime",
  "libc",
- "lzma-turbo",
+ "lzma-turbo 0.10.0",
  "mimalloc",
  "par2-rs",
  "par3-rs",
@@ -2595,8 +2610,8 @@ dependencies = [
  "flate2",
  "getrandom 0.4.3",
  "js-sys",
- "lzma-turbo",
- "ppmd-turbo",
+ "lzma-turbo 0.9.2",
+ "ppmd-turbo 0.1.1",
  "wasm-bindgen",
  "zeroize",
 ]
@@ -3007,7 +3022,7 @@ dependencies = [
  "hmac",
  "libc",
  "memchr",
- "ppmd-turbo",
+ "ppmd-turbo 0.2.0",
  "rayon",
  "reedsolomon-rs",
  "rmp-serde",

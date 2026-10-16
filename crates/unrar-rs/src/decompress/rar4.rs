@@ -122,16 +122,18 @@ fn ppm_fault(ppm: &RarPpmd, err: ppmd_turbo::Error, output_size: u64) -> RarResu
     })
 }
 
-/// A PPMd model refused for its memory is a resource limit; any other model
-/// or coder fault is a corrupt archive. Converted here rather than through
+/// A PPMd model refused for its memory is a resource limit, and one the
+/// allocator refused an allocation failure. A fault inside the codec itself
+/// is internal; any other model or coder fault is a corrupt archive. Converted here rather than through
 /// `From`, so `ppmd-turbo` stays out of the public API.
 #[cold]
 fn ppm_error(err: ppmd_turbo::Error) -> RarError {
     match err.kind {
-        PpmErrorKind::MemoryLimit { required, limit } => {
-            RarError::resource_limit(LimitKind::PpmdArena, required, limit, None)
-        }
-        PpmErrorKind::AllocationFailed { bytes } => RarError::AllocationFailed { bytes },
+        PpmErrorKind::MemoryLimit {
+            required, limit, ..
+        } => RarError::resource_limit(LimitKind::PpmdArena, required, limit, None),
+        PpmErrorKind::AllocationFailed { bytes, .. } => RarError::AllocationFailed { bytes },
+        PpmErrorKind::Internal(_) => RarError::internal(format!("RAR4: {err}")),
         _ => RarError::CorruptArchive {
             detail: format!("RAR4: {err}"),
         },

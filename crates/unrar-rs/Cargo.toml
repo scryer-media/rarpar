@@ -49,7 +49,7 @@ slow-tests = []
 unstable-internals = []
 
 [dependencies]
-ppmd-turbo = "0.1.1"
+ppmd-turbo = "0.2.0"
 reedsolomon-rs = { path = "../reedsolomon-rs", version = "0.4.10", default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }

@@ -225,7 +225,7 @@ fn decompressed_name(input: &Path) -> Result<PathBuf, RarparError> {
 fn codec_error(error: io::Error) -> RarparError {
     if let Some(xz) = error.get_ref().and_then(|e| e.downcast_ref::<XzError>()) {
         return match xz.kind {
-            XzErrorKind::MemoryLimit { needed, limit } => RarparError::Resource(format!(
+            XzErrorKind::MemoryLimit { needed, limit, .. } => RarparError::Resource(format!(
                 "the stream needs {} MiB of memory and --memory-mib allows {} MiB ({xz})",
                 needed.div_ceil(MIB),
                 limit / MIB
@@ -241,6 +241,11 @@ fn codec_error(error: io::Error) -> RarparError {
             lzma_turbo::Error::Alloc => {
                 RarparError::Resource("the encoder could not allocate its state".into())
             }
+            lzma_turbo::Error::MemoryLimit { needed, limit, .. } => RarparError::Resource(format!(
+                "the codec needs {} MiB of memory and is allowed {} MiB",
+                needed.div_ceil(MIB),
+                limit / MIB
+            )),
             lzma_turbo::Error::Param => {
                 RarparError::Usage("the encoder refused these settings".into())
             }
@@ -648,10 +653,10 @@ impl<R: Read> StreamDecoder<R> {
                 return Ok(());
             }
             return Err(io::Error::from(XzError::at(
-                XzErrorKind::MemoryLimit {
-                    needed: self.decoder.in_flight_bytes() + (self.end - self.start) as u64,
-                    limit: self.read_ahead,
-                },
+                XzErrorKind::memory_limit(
+                    self.decoder.in_flight_bytes() + (self.end - self.start) as u64,
+                    self.read_ahead,
+                ),
                 0,
                 0,
             )));
