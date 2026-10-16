@@ -20,14 +20,14 @@ crate.
 | --- | --- |
 | `reedsolomon-rs` | GF(2^8)/GF(2^16) SIMD kernels (`gf_simd`, `gf8`, `gf_pmul`, `sve2`: SSSE3/AVX2/AVX-512/GFNI, NEON, SVE2); the FFT's shared row banks and raw row views (`fft`); the tiled inversion's byte views (`matrix_tiled`); the x86-64 XOR JIT (`xor_jit`: W^X mappings and an `asm!` trampoline); the Metal and wgpu backends (opt-in features) |
 | `unrar-rs` | The LZ window and bit readers' unaligned loads and stores (`decompress::lz::window`, `block_reader`); the parallel RAR5 decoder's fast symbol path (`decompress::lz::parallel`); BLAKE2sp, AES and CRC SIMD (`crypto::`, `crc_simd`); the AWS-LC backend's FFI; member metadata FFI (`archive::member`: umask, owners, extended attributes, Windows security); `mktime` in `rar4` |
-| `par2-rs` | The repair controller's interleaved output pointers and packed checksums (`repair`); MD5 and CRC SIMD (`md5_simd`, `crc_simd`); the repair transform and matrix byte views; `openat`/`unlinkat` (`disk`); create's aligned encode buffers and JIT calls (`create::encode`); output-file FFI (`create::output`) |
+| `par2-rs` | The repair controller's interleaved output pointers and packed checksums (`repair`); MD5 and CRC SIMD (`md5_simd`, `crc_simd`); the repair transform and matrix byte views; `openat`/`unlinkat` (`disk`); create's aligned encode buffers and JIT calls (`create::encode`); output-file FFI (`create::output`); the repairer's `MappedFile` mmap wrapper (`repairer`) |
 | `par3-rs` | Only OS FFI: `statfs`/`GetVolumePathNameW` (`mount`), `fclonefileat`/`FICLONE`/`copy_file_range` (`repair_tree_clone`), Windows file identity (`repair_tree_windows`). Its threading (hash, FFT, repair and creation pools) has no unsafe code but is where a race would come from |
 
 ## Lanes per crate
 
 | Lane | `reedsolomon-rs` | `unrar-rs` | `par2-rs` | `par3-rs` |
 | --- | --- | --- | --- | --- |
-| `unsafe-valgrind` (Memcheck, Linux x86-64 and ARM64, default features) | `gf_simd`, `gf8`, `gf_pmul`, `fft`, `matrix_tiled`, `sve2`, `decode_apply`, `threading`, `xor_jit` | `decompress::`, `crypto::`, `crc_simd`, `hash_pipeline`, `archive::member`, `rar4` (AWS-LC) | `repair`, `md5_simd`, `crc_simd`, `repair_transform`, `matrix`, `disk`, `checksum`, `create::encode`, `create::output` (AWS-LC) | `mount`, `repair_tree`, `session_repair`, `hash`, `fft`, `runtime`, `gf` |
+| `unsafe-valgrind` (Memcheck, Linux x86-64 and ARM64, default features) | `gf_simd`, `gf8`, `gf_pmul`, `fft`, `matrix_tiled`, `sve2`, `decode_apply`, `threading`, `xor_jit` | `decompress::`, `crypto::`, `crc_simd`, `hash_pipeline`, `archive::member`, `rar4` (AWS-LC) | `repair`, `md5_simd`, `crc_simd`, `repair_transform`, `matrix`, `disk`, `checksum`, `create::encode`, `create::output`, the `repairer` tests that map a file (AWS-LC) | `mount`, `repair_tree`, `session_repair`, `hash`, `fft`, `runtime`, `gf` |
 | `unsafe-sanitizer` AddressSanitizer (Linux x86-64 and ARM64, `-Zbuild-std`) | as Memcheck | as Memcheck, RustCrypto | as Memcheck, RustCrypto | as Memcheck |
 | `unsafe-sanitizer` ThreadSanitizer (same) | — | `decompress::lz::parallel`, `decompress::lz::tests`, `hash_pipeline`, `recovery`, RustCrypto | — | `hash`, `fft`, `runtime`, `session_repair`, `session`, `evidence`, `creation` |
 | `unsafe-miri` (one job per discovered test, `-Zmiri-strict-provenance`) | `fft::tests`: the row-bank, known-zero-step and transform round-trip tests | `decompress::lz::window::tests`, `decompress::lz::block_reader::tests` except the exhaustive `copy_matrix_matches_reference_*` sweeps, RustCrypto | — | — |
@@ -95,7 +95,9 @@ What no lane above runs, so that a pass is not read as more than it is:
   only where the ARM64 runner has it.
 - The Metal and wgpu GF(2^16) backends (opt-in features) and the Windows FFI
   (`repair_tree_windows`, Windows branches of `archive::member` and
-  `create::output`) are Linux-invisible; the lanes are Linux only.
+  `create::output`) are Linux-invisible; the lanes are Linux only. So is the
+  WASI-only `pread`/`pwrite` FFI in `repairer` (`read_file_at`,
+  `write_file_at` under `cfg(target_os = "wasi")`).
 - Integration tests (`tests/`) and the fixture corpora are not under any
   instrument; only library unit tests are selected. The fuzz targets run
   under AddressSanitizer in ClusterFuzzLite (`cflite-pr.yml`,
