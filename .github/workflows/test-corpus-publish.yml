@@ -65,7 +65,7 @@ jobs:
   # job's first step.
   guard:
     name: guard
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - name: Refuse anything but a confirmed run from main
@@ -89,7 +89,7 @@ jobs:
   plan:
     name: plan
     needs: [guard]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     outputs:
       generators: ${{ steps.units.outputs.generators }}
@@ -142,7 +142,7 @@ jobs:
   generate-inputs:
     name: generate (inputs)
     needs: [plan]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     env:
       # Read-only mirror base for the toolchain source archives, when the
@@ -181,7 +181,7 @@ jobs:
         with:
           cosign-release: ${{ env.COSIGN_VERSION }}
 
-      # Docker is preinstalled on ubuntu-24.04. Only the images these two units
+      # Docker is preinstalled on ubuntu-26.04. Only the images these two units
       # drive are built: the writers `edge_cases` invokes, and nothing else.
       - name: Build the toolchain images these generators need
         run: |
@@ -224,7 +224,7 @@ jobs:
   generate-imports:
     name: generate (imports)
     needs: [plan]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -274,7 +274,7 @@ jobs:
   generate:
     name: generate (${{ matrix.group }})
     needs: [plan, generate-inputs]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     strategy:
       # One broken recipe should not hide the state of the other twelve.
@@ -370,7 +370,7 @@ jobs:
   assemble:
     name: assemble
     needs: [generate, generate-inputs, generate-imports]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -481,7 +481,7 @@ jobs:
   validate:
     name: validate (${{ matrix.lane }}${{ matrix.shard && format(' {0}/3', matrix.shard) || '' }})
     needs: [assemble]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -618,7 +618,7 @@ jobs:
   publish:
     name: publish
     needs: [validate]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     # The protected environment holds the R2 secrets and gates the run on its
     # reviewers; the corpus variables live beside it.

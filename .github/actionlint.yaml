@@ -1,0 +1,8 @@
+# actionlint 1.7.12, the latest release, predates GitHub's ubuntu-26.04 hosted
+# runners and reports their labels as unknown. They are GitHub-hosted, not
+# self-hosted; this list only tells actionlint to accept them. Drop it once an
+# actionlint release knows the 26.04 labels.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04
+    - ubuntu-26.04-arm

@@ -22,7 +22,7 @@ jobs:
   # policy and allowed-signers mechanism as the sibling repositories.
   release-trust:
     name: verify-release-tag-trust
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -66,7 +66,7 @@ jobs:
   preflight:
     name: preflight
     needs: [release-trust]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     env:
       RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=. -C link-arg=-fuse-ld=mold
@@ -278,7 +278,7 @@ jobs:
             features: runtime,crypto-aws-lc,sevenz
             package_root: true
           - platform: linux-x86_64-musl-direct
-            runs_on: ubuntu-24.04
+            runs_on: ubuntu-26.04
             target: x86_64-unknown-linux-musl
             archive_ext: tar.gz
             features: runtime,crypto-aws-lc,sevenz,musl-allocator
@@ -290,7 +290,7 @@ jobs:
             features: runtime,crypto-aws-lc,sevenz
             package_root: true
           - platform: linux-arm64-musl-direct
-            runs_on: ubuntu-24.04-arm
+            runs_on: ubuntu-26.04-arm
             target: aarch64-unknown-linux-musl
             archive_ext: tar.gz
             features: runtime,crypto-aws-lc,sevenz,musl-allocator
@@ -558,7 +558,7 @@ jobs:
   collect:
     name: collect-and-sign-archives
     needs: [build-linux, build-macos, build-windows]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -626,7 +626,7 @@ jobs:
   deploy:
     name: verify-and-finalize-binary-release
     needs: [collect, archive-provenance]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
       contents: write
