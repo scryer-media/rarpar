@@ -148,11 +148,6 @@ fn current_umask() -> u32 {
     })
 }
 
-#[cfg(all(not(unix), test))]
-fn current_umask() -> u32 {
-    0
-}
-
 struct Rar5ReaderCrypto {
     key: [u8; 32],
     hash_key: [u8; 32],
@@ -2985,43 +2980,24 @@ impl RarArchive {
         follow_links || cfg!(target_vendor = "apple")
     }
 
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     fn unix_followed_mode(out_path: &std::path::Path) -> Option<u32> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt;
 
-            std::fs::metadata(out_path)
-                .ok()
-                .map(|metadata| metadata.permissions().mode())
-        }
-
-        #[cfg(not(unix))]
-        {
-            let _ = out_path;
-            None
-        }
+        std::fs::metadata(out_path)
+            .ok()
+            .map(|metadata| metadata.permissions().mode())
     }
 
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     fn restore_unix_followed_mode(out_path: &std::path::Path, mode: u32) -> RarResult<()> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt;
 
-            let mut permissions = std::fs::metadata(out_path)
-                .map_err(RarError::Io)?
-                .permissions();
-            permissions.set_mode(mode);
-            std::fs::set_permissions(out_path, permissions).map_err(RarError::Io)
-        }
-
-        #[cfg(not(unix))]
-        {
-            let _ = out_path;
-            let _ = mode;
-            Ok(())
-        }
+        let mut permissions = std::fs::metadata(out_path)
+            .map_err(RarError::Io)?
+            .permissions();
+        permissions.set_mode(mode);
+        std::fs::set_permissions(out_path, permissions).map_err(RarError::Io)
     }
 
     #[cfg(unix)]

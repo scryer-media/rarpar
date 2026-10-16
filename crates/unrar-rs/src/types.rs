@@ -157,7 +157,7 @@ pub struct UnixOwnerInfo {
     pub gid: Option<u64>,
 }
 
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 impl UnixOwnerInfo {
     pub(crate) fn user_name_bytes(&self) -> Option<&[u8]> {
         self.user_name_raw

@@ -539,6 +539,7 @@ impl RepairTree {
     }
 
     /// Remove a staged file nothing will use, as a refused stage is removed.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn discard_stage(&self, name: &OsStr, display: &Path, outputs: &mut Vec<PathBuf>) {
         if self.stage().remove_file(name).is_ok() {
             outputs.retain(|path| path != display);
