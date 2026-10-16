@@ -1,0 +1,22 @@
+# Memcheck suppressions for the ARM64 unsafe-valgrind lanes only; the x86-64
+# runner does not load this file. See docs/unsafe-validation.md.
+#
+# 2026-10-16: reedsolomon_rs::fft::add_tile::<u16>, called from
+# transform_tiles_alone / transform_sum, reports "Conditional jump or move
+# depends on uninitialised value(s)" on ARM64 in
+# fft::tests::tiled_transforms_match_whole_row_sweeps (reedsolomon-rs) and
+# fft::lane_tests::the_four_step_gate_does_not_change_a_byte and
+# fft::lane_tests::the_byte_lane_matches_the_word_lane_bit_for_bit (par3-rs).
+# Everything add_tile reads is initialised: `after` is a Vec<bool> cloned from
+# a collected vector in sweep_flags, and the tile views and `sum` are rows of
+# RowBank::zeroed (alloc_zeroed or a zeroed anonymous mapping) or collected
+# Vecs; neither crate's FFT uses set_len, MaybeUninit or a read of
+# with_capacity spare space. The same tests pass under x86-64 Memcheck and
+# under AddressSanitizer on both architectures, so this is Memcheck's ARM64
+# definedness tracking, not an uninitialised read. Remove this entry when a
+# newer Valgrind passes those tests without it.
+{
+   reedsolomon-fft-add-tile-aarch64-cond
+   Memcheck:Cond
+   fun:*add_tile*
+}

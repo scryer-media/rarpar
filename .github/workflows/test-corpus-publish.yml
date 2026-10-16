@@ -155,7 +155,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
@@ -231,7 +231,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
@@ -289,7 +289,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
@@ -377,7 +377,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
@@ -521,7 +521,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
@@ -534,7 +534,7 @@ jobs:
       # from main, where those caches were filled by the same compilation.
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-corpus-${{ matrix.lane }}-${{ github.run_id }}
@@ -572,7 +572,6 @@ jobs:
           cp "$RUNNER_TEMP/build/test-corpus/sources.json" test-corpus/sources.json
 
       - name: Install cargo-nextest
-        if: ${{ matrix.lane == 'unrar' }}
         uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
         with:
           tool: cargo-nextest@0.9.143
@@ -582,7 +581,9 @@ jobs:
           set -euo pipefail
           case "$LANE" in
             workspace)
-              cargo test --locked --workspace --no-fail-fast
+              cargo nextest run --locked --workspace --no-fail-fast
+              # nextest does not run doctests.
+              cargo test --locked --workspace --doc --no-fail-fast
               ;;
             unrar)
               cargo nextest run --locked -p unrar-rs --features slow-tests \
@@ -594,7 +595,8 @@ jobs:
               fi
               ;;
             par2)
-              cargo test --locked -p par2-rs --features slow-tests --no-fail-fast
+              cargo nextest run --locked -p par2-rs --features slow-tests --no-fail-fast
+              cargo test --locked -p par2-rs --features slow-tests --doc --no-fail-fast
               ;;
             *)
               echo "::error::unknown validation lane $LANE"
@@ -608,7 +610,7 @@ jobs:
 
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (matrix.lane != 'unrar' || matrix.shard == 1) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -671,7 +673,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 

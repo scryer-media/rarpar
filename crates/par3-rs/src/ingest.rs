@@ -68,6 +68,7 @@ impl std::fmt::Debug for PayloadRef {
 
 impl PayloadRef {
     /// Whether this payload is read from `source` of `access`.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn reads_from(&self, access: &Arc<dyn SourceAccess>, source: SourceId) -> bool {
         Arc::ptr_eq(&self.access, access) && self.source == source
     }

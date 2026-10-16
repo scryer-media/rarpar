@@ -2,7 +2,7 @@
 name = "par2-rs"
 description = "PAR2 parity verification and repair"
 readme = "README.md"
-version = "0.10.10"
+version = "0.10.11"
 edition.workspace = true
 rust-version.workspace = true
 license = "GPL-3.0-or-later"

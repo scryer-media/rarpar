@@ -33,6 +33,11 @@
   from 12.2 to 15.5 MiB, because the decrypt thread copies each span out of
   the read-ahead buffer. The reading thread reuses those buffers at their
   full length, so only a newly allocated one is ever zeroed.
+- The Unix owner and mode helpers are compiled only on Unix, so Windows
+  builds, tests included, have no dead-code warnings. No behaviour change.
+- The `crypto-aws-lc` backend requires `aws-lc-rs` 1.18.2 and `aws-lc-sys`
+  0.46 (was 1.18 and 0.45), the pair current `aws-lc-rs` links, so a
+  consumer builds one copy of AWS-LC instead of two. No behaviour change.
 
 ## 0.11.1
 

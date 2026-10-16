@@ -80,6 +80,7 @@ struct StagedFile {
 /// source does. After it, only the read-back vouches for the file.
 #[derive(Clone)]
 struct InPlace {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     identity: crate::repair_tree::FileIdentity,
     source: crate::source::SourceId,
     snapshot: crate::source::SourceSnapshot,
@@ -185,6 +186,7 @@ fn clone_source<'a>(
 /// A patch interrupted part way leaves the file with some damaged extents
 /// already rewritten and every intact extent as it was: it verifies as
 /// damaged, and repairs, exactly as before.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn in_place_source(
     session: &Par3RepairSession,
     evidence: &crate::evidence::FileEvidence,

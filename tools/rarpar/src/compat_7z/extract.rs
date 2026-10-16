@@ -12,8 +12,7 @@ use sevenz_turbo::{ArchiveEntry, ArchiveReader, BlockErrorKind, Error as SevenZE
 
 use super::censor::{Censor, split_path};
 use super::format::{
-    ATTRIB_READONLY, ATTRIB_UNIX_EXTENSION, block_is_encrypted, filetime_string, smart_size,
-    unix_time_string,
+    ATTRIB_READONLY, block_is_encrypted, filetime_string, smart_size, unix_time_string,
 };
 use super::volume::Opened;
 use super::{Session, errno_text, filetime_of};
@@ -661,6 +660,7 @@ fn folder_io(error: FolderError) -> io::Error {
 /// fails is returned.
 #[cfg(unix)]
 fn apply_metadata(file: &File, item: &Item) -> Result<(), MetadataError> {
+    use super::format::ATTRIB_UNIX_EXTENSION;
     use std::os::unix::fs::PermissionsExt;
     let mut first = None;
     if let Some(ticks) = item.mtime {

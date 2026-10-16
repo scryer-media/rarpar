@@ -1235,7 +1235,7 @@ fn run_extract(session: &mut Session, options: Options, archives: Vec<(String, u
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

@@ -21,6 +21,9 @@
   either name during the repair now fails the install with `AlreadyExists`
   instead of being replaced; a file appearing at the backup name moves the
   backup on to the next number.
+- The in-place repair helpers are compiled only on macOS and Linux, where
+  in-place repair runs, so Windows builds have no dead-code warnings. No
+  behaviour change.
 
 ## 0.7.0
 

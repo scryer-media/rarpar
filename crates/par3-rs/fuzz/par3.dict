@@ -1,0 +1,25 @@
+# libFuzzer dictionary for the PAR3 packet scanner.
+#
+# Every packet starts with an 8-byte magic and carries an 8-byte type; with no
+# seed corpus (PAR3 bytes come only from official par3cmdline runs, kept in
+# the signed test corpus) these tokens are what gets the mutator past the
+# first header. Values mirror src/packet/header.rs.
+
+packet_magic="PAR3\x00PKT"
+type_creator="PAR CRE\x00"
+type_comment="PAR COM\x00"
+type_start="PAR STA\x00"
+type_data="PAR DAT\x00"
+type_external_data="PAR EXT\x00"
+type_cauchy="PAR CAU\x00"
+type_sparse="PAR SPA\x00"
+type_explicit="PAR EXP\x00"
+type_fft="PAR FFT\x00"
+type_recovery_data="PAR REC\x00"
+type_recovery_external="PAR ERD\x00"
+type_file="PAR FIL\x00"
+type_directory="PAR DIR\x00"
+type_root="PAR ROO\x00"
+type_link="PAR LNK\x00"
+type_unix_permissions="PAR UNX\x00"
+type_fat_permissions="PAR FAT\x00"

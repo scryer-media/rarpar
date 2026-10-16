@@ -66,7 +66,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - id: detect
@@ -211,7 +211,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
@@ -236,7 +236,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
@@ -246,7 +246,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends mold nasm
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-clippy-${{ github.run_id }}
@@ -275,7 +275,7 @@ jobs:
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -298,7 +298,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install native build dependencies
@@ -307,7 +307,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends mold nasm
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-unit-${{ github.run_id }}
@@ -326,16 +326,22 @@ jobs:
         # predates them, so the `par3` profile rides along until a corpus
         # revision carrying the widened `unit` profile is pinned.
         run: cargo run --locked -p xtask -- test-corpus hydrate --profile unit --profile par3
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - name: Run no-fixture Rust tests
         # `--features unrar-rs/unstable-internals`: see the clippy lane. Without
         # it the `probe_volumes` example is skipped rather than compiled.
-        run: cargo test --locked --workspace --lib --bins --examples --no-fail-fast --features unrar-rs/unstable-internals
+        # `--lib --bins --examples` never selected doctests, so nextest, which
+        # does not run them, loses nothing here.
+        run: cargo nextest run --locked --workspace --lib --bins --examples --no-fail-fast --features unrar-rs/unstable-internals
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -361,7 +367,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
@@ -372,7 +378,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends mold nasm
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-crypto-rust-${{ github.run_id }}
@@ -413,27 +419,32 @@ jobs:
               exit 1
             fi
           done
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - name: Test unrar-rs on the RustCrypto backend
         # The crypto module (KDF, AES-CBC seam, BLAKE2sp) and the encrypted
-        # archives that run through it end to end.
+        # archives that run through it end to end. The trailing names are
+        # nextest substring filters, as they were cargo test filters.
         run: |
           set -euo pipefail
-          cargo test --locked -p unrar-rs --lib --no-default-features --features crypto-rust crypto::
-          cargo test --locked -p unrar-rs --test integration --no-default-features --features crypto-rust encrypted
+          cargo nextest run --locked --no-fail-fast -p unrar-rs --lib --no-default-features --features crypto-rust crypto::
+          cargo nextest run --locked --no-fail-fast -p unrar-rs --test integration --no-default-features --features crypto-rust encrypted
       - name: Test par2-rs on the RustCrypto backend
         # The MD5/CRC seam, and a verify/repair pass that runs on top of it.
         run: |
           set -euo pipefail
-          cargo test --locked -p par2-rs --lib --no-default-features --features crypto-rust checksum::
-          cargo test --locked -p par2-rs --test checksum --no-default-features --features crypto-rust
-          cargo test --locked -p par2-rs --test stateful_session --no-default-features --features crypto-rust
+          cargo nextest run --locked --no-fail-fast -p par2-rs --lib --no-default-features --features crypto-rust checksum::
+          cargo nextest run --locked --no-fail-fast -p par2-rs --test checksum --no-default-features --features crypto-rust
+          cargo nextest run --locked --no-fail-fast -p par2-rs --test stateful_session --no-default-features --features crypto-rust
       - name: Test the libraries with both backends enabled
         # Enabling both must keep AWS-LC active and compile the pure-Rust
         # backend beside it, which is what the differential tests compare.
         run: |
           set -euo pipefail
-          cargo test --locked -p unrar-rs --lib --features crypto-rust crypto::
-          cargo test --locked -p par2-rs --lib --features crypto-rust checksum::
+          cargo nextest run --locked --no-fail-fast -p unrar-rs --lib --features crypto-rust crypto::
+          cargo nextest run --locked --no-fail-fast -p par2-rs --lib --features crypto-rust checksum::
       - name: Check rarpar on the RustCrypto backend
         run: cargo check --locked -p rarpar --no-default-features --features runtime,crypto-rust
       - name: Run clippy on the RustCrypto backend
@@ -446,7 +457,7 @@ jobs:
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -471,7 +482,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
@@ -481,7 +492,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends mold
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-clippy-arm-${{ github.run_id }}
@@ -504,7 +515,7 @@ jobs:
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -529,7 +540,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: wasm32-wasip1
@@ -539,7 +550,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends mold nasm
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-fixtures-${{ github.run_id }}
@@ -562,6 +573,10 @@ jobs:
           cosign-release: ${{ env.COSIGN_VERSION }}
       - name: Verify the corpus against its ledger, lock and signature
         run: cargo run --locked -p xtask -- test-corpus verify --all-present --require-signature
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - name: Run the workspace fixture tests outside the per-crate lanes
         run: |
           set -euo pipefail
@@ -595,7 +610,13 @@ jobs:
               exit 1
             fi
           done
-          cargo test --locked --workspace --no-fail-fast \
+          cargo nextest run --locked --workspace --no-fail-fast \
+            --exclude unrar-rs \
+            --exclude par2-rs \
+            --exclude par3-rs
+          # nextest does not run doctests; this keeps the ones the old
+          # `cargo test --workspace` pass ran.
+          cargo test --locked --workspace --doc --no-fail-fast \
             --exclude unrar-rs \
             --exclude par2-rs \
             --exclude par3-rs
@@ -604,7 +625,7 @@ jobs:
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -627,7 +648,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install native build dependencies
@@ -636,7 +657,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends mold nasm
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-par2-${{ github.run_id }}
@@ -651,11 +672,16 @@ jobs:
           sccache --zero-stats || true
       - name: Hydrate the test corpus (par2)
         run: cargo run --locked -p xtask -- test-corpus hydrate --profile par2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - name: Run the par2-rs suite
         run: |
           set -euo pipefail
 
-          # The whole crate, once: lib, every `tests/` target, and doctests.
+          # The whole crate, once: lib and every `tests/` target under
+          # nextest, then the doctests, which nextest does not run.
           # `fixture-tests` excludes par2-rs, so nothing here is a repeat.
           # `--features slow-tests` brings the gated coverage along in the same
           # build and the same pass — the three fully-gated targets
@@ -664,13 +690,14 @@ jobs:
           # `src/repairer.rs` — instead of a second, separately-compiled lane.
           # A feature name that stops existing is a hard cargo error, not a
           # silent zero.
-          cargo test --locked -p par2-rs --features slow-tests --no-fail-fast
+          cargo nextest run --locked -p par2-rs --features slow-tests --no-fail-fast
+          cargo test --locked -p par2-rs --features slow-tests --doc --no-fail-fast
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -690,14 +717,22 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: wasm32-wasip1
       - name: Hydrate the test corpus (par3)
         run: cargo run --locked -p xtask -- test-corpus hydrate --profile par3
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - name: Run the par3-rs suite
-        run: cargo test --locked -p par3-rs --no-fail-fast
+        # nextest does not run doctests; the second command keeps them.
+        run: |
+          set -euo pipefail
+          cargo nextest run --locked -p par3-rs --no-fail-fast
+          cargo test --locked -p par3-rs --doc --no-fail-fast
       - name: Check the wasm32-wasip1 build
         run: cargo check --locked -p par3-rs --target wasm32-wasip1
 
@@ -759,7 +794,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: wasm32-wasip1
@@ -800,7 +835,7 @@ jobs:
           } >> "$GITHUB_ENV"
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-unrar-${{ github.run_id }}
@@ -863,7 +898,7 @@ jobs:
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && matrix.shard == 1 && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -913,7 +948,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install build dependencies
@@ -922,7 +957,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends mold
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-${{ matrix.platform }}-${{ github.run_id }}
@@ -944,15 +979,20 @@ jobs:
         # predates them, so the `par3` profile rides along until a corpus
         # revision carrying the widened `unit` profile is pinned.
         run: cargo run --locked -p xtask -- test-corpus hydrate --profile unit --profile par3
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - name: Run platform unit tests
-        run: cargo test --locked --workspace --lib --bins --no-fail-fast
+        # `--lib --bins` never selected doctests, so nextest loses none.
+        run: cargo nextest run --locked --workspace --lib --bins --no-fail-fast
       - name: Show sccache stats
         if: always()
         shell: bash
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -982,7 +1022,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install NASM
@@ -991,7 +1031,7 @@ jobs:
         run: .github/scripts/ci/install-nasm-macos.sh
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-${{ matrix.platform }}-${{ github.run_id }}
@@ -1013,15 +1053,20 @@ jobs:
         # predates them, so the `par3` profile rides along until a corpus
         # revision carrying the widened `unit` profile is pinned.
         run: cargo run --locked -p xtask -- test-corpus hydrate --profile unit --profile par3
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - name: Run platform unit tests
-        run: cargo test --locked --workspace --lib --bins --no-fail-fast
+        # `--lib --bins` never selected doctests, so nextest loses none.
+        run: cargo nextest run --locked --workspace --lib --bins --no-fail-fast
       - name: Show sccache stats
         if: always()
         shell: bash
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -1056,7 +1101,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install NASM
@@ -1066,7 +1111,7 @@ jobs:
         run: ./.github/scripts/ci/install-nasm.ps1
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-${{ matrix.platform }}-${{ github.run_id }}
@@ -1093,15 +1138,20 @@ jobs:
         # predates them, so the `par3` profile rides along until a corpus
         # revision carrying the widened `unit` profile is pinned.
         run: cargo run --locked -p xtask -- test-corpus hydrate --profile unit --profile par3
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - name: Run platform unit tests
-        run: cargo test --locked --workspace --lib --bins --no-fail-fast
+        # `--lib --bins` never selected doctests, so nextest loses none.
+        run: cargo nextest run --locked --workspace --lib --bins --no-fail-fast
       - name: Show sccache stats
         if: always()
         shell: bash
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -1141,7 +1191,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
@@ -1151,7 +1201,7 @@ jobs:
         run: .github/scripts/ci/target-checks-install-build-dependencies-linux.sh
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-${{ matrix.platform }}-${{ github.run_id }}
@@ -1214,7 +1264,7 @@ jobs:
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -1248,7 +1298,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
@@ -1258,7 +1308,7 @@ jobs:
         run: .github/scripts/ci/install-nasm-macos.sh
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-${{ matrix.platform }}-${{ github.run_id }}
@@ -1315,7 +1365,7 @@ jobs:
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -1354,7 +1404,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
@@ -1365,7 +1415,7 @@ jobs:
         run: ./.github/scripts/ci/install-nasm.ps1
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-${{ matrix.platform }}-${{ github.run_id }}
@@ -1429,7 +1479,7 @@ jobs:
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -1452,7 +1502,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install native build dependencies
@@ -1461,7 +1511,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends mold nasm
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-package-${{ github.run_id }}
@@ -1600,7 +1650,7 @@ jobs:
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -1623,7 +1673,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install native build dependencies
@@ -1632,7 +1682,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends mold nasm mandoc
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-docs-package-${{ github.run_id }}
@@ -1676,7 +1726,7 @@ jobs:
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -1721,7 +1771,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install native build dependencies
@@ -1730,7 +1780,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends mold nasm
       - name: Restore sccache directory
         id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-smoke-${{ github.run_id }}
@@ -1767,7 +1817,7 @@ jobs:
         run: sccache --show-stats || true
       - name: Save sccache directory
         if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
@@ -1794,7 +1844,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: wasm32-wasip1
@@ -1811,7 +1861,7 @@ jobs:
         run: cargo run --locked -p xtask -- test-corpus hydrate --profile par2
       - name: Restore wasm lane target directories
         id: wasm-cache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           # Only the wasm lanes are cached. The native reference build pulls in
           # this crate's native-only dev-dependencies and is an order of
@@ -1948,7 +1998,7 @@ jobs:
           fi
       - name: Save wasm lane target directories
         if: ${{ always() && steps.wasm-cache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ${{ github.workspace }}/target-wasm/wasip1-portable
@@ -1985,7 +2035,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: wasm32-wasip1
@@ -1993,7 +2043,7 @@ jobs:
         run: cargo run --locked -p xtask -- test-corpus hydrate --profile par3
       - name: Restore wasm lane target directories
         id: wasm-cache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           # Only the wasm lanes are cached; the native reference build shares
           # nothing with them.
@@ -2115,7 +2165,7 @@ jobs:
           fi
       - name: Save wasm lane target directories
         if: ${{ always() && steps.wasm-cache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ${{ github.workspace }}/target-wasm/wasip1-portable
@@ -2135,7 +2185,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # commit dated 2026-08-05
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: wasm32-wasip1
@@ -2143,7 +2193,7 @@ jobs:
         run: cargo run --locked -p xtask -- test-corpus hydrate --profile wasm-unrar
       - name: Restore wasm lane target directories
         id: wasm-cache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ${{ github.workspace }}/target-wasm/wasip1-portable
@@ -2248,12 +2298,327 @@ jobs:
           fi
       - name: Save wasm lane target directories
         if: ${{ always() && steps.wasm-cache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ${{ github.workspace }}/target-wasm/wasip1-portable
             ${{ github.workspace }}/target-wasm/wasip1-simd128
           key: ${{ steps.wasm-cache-restore.outputs.cache-primary-key }}
+
+  # Memory-safety lanes for the four library crates. docs/unsafe-validation.md
+  # says what each lane covers per crate and what stays uninstrumented; keep
+  # it in step with the filters here. Each crate's step runs only when the
+  # `changes` job marks that crate affected, so an unaffected crate costs a
+  # skipped step rather than a skipped job, and `unsafe-complete` can demand
+  # success from every job it needs.
+  unsafe-valgrind:
+    name: unsafe-valgrind-${{ matrix.platform }}-${{ matrix.crate }}
+    needs: [changes, fmt, clippy, unit-tests]
+    if: needs.changes.outputs.crates == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux-x86_64, linux-aarch64]
+        crate: [reedsolomon-rs, unrar-rs, par2-rs, par3-rs]
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - crate: reedsolomon-rs
+            changed: reedsolomon
+            # GF(2^8)/GF(2^16) SIMD kernels (SSSE3/AVX2/GFNI, NEON, SVE2),
+            # the FFT's shared row banks and the tiled matrix inversion.
+            filter: test(/^(gf_simd|gf8|gf_pmul|fft|matrix_tiled|sve2|decode_apply|threading|xor_jit)::/)
+          - crate: unrar-rs
+            changed: unrar
+            # The LZ window and bit readers (unaligned loads and stores), the
+            # parallel RAR5 decoder, BLAKE2sp/AES/CRC SIMD, the hash
+            # pipeline threads, the member metadata FFI (umask, owners,
+            # extended attributes) and RAR4's mktime call.
+            filter: test(/^(decompress::|crypto::|crc_simd::|hash_pipeline::|archive::member::|rar4::)/)
+          - crate: par2-rs
+            changed: par2
+            # The repair controller's interleaved output, the MD5/CRC SIMD
+            # kernels, the repair transform, the openat-based disk layer,
+            # create's aligned encode buffers, JIT calls and output-file FFI,
+            # the repairer's mmap scans and file_cache's posix_fadvise: only
+            # the repairer tests that reach them, since the full repairs would
+            # not fit the budget.
+            filter: test(/^(repair::|md5_simd::|crc_simd::|repair_transform::|matrix::|disk::|checksum::|create::encode::|create::output::)/) | test(/^repairer::tests::(buffered_scan_matches_mmap_for_damaged_partial_matches|copy_range_preserves_small_range_from_large_source|buffered_scan_matches_mmap_for_intact_full_blocks|large_slice_scanner_uses_mmap_fallback_and_remains_correct|mapped_walk_matches_the_ring|mmap_scan_stops_when_cancellation_lands_mid_scan|ordered_canonical_scan_checks_every_byte_through_long_miss_runs|ordered_canonical_scan_matches_generic_locations_for_shifted_damage|ordered_canonical_scan_preserves_mixed_block_harvesting|ordered_parallel_scan_matches_serial_for_deleted_full_block|ordered_parallel_scan_stays_misaligned_through_unaligned_tail|ordered_scan_keeps_its_jumps_when_the_ring_is_unaffordable|serial_walk_stops_when_cancellation_lands_mid_walk|shifted_large_short_block_scans_without_large_heap_buffer|shifted_short_block_checks_match_mmap_and_buffered|the_candidate_scan_phase_defers_the_relocation_search)$/)
+          - crate: par3-rs
+            changed: par3
+            # statfs and the clone/copy FFI, the hashing and FFT pools.
+            filter: test(/^(mount::|repair_tree::|session_repair::|hash::|fft::|runtime::|gf::)/)
+    env:
+      CRATE: ${{ matrix.crate }}
+      FILTER: ${{ matrix.filter }}
+    steps:
+      - name: Gate on the crate being affected
+        id: gate
+        env:
+          OUTPUTS: ${{ toJSON(needs.changes.outputs) }}
+          KEY: ${{ matrix.changed }}
+        run: >-
+          python3 -c 'import json, os; print("run=" + json.loads(os.environ["OUTPUTS"]).get(os.environ["KEY"], "false"))'
+          >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.run == 'true'
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        if: steps.gate.outputs.run == 'true'
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        if: steps.gate.outputs.run == 'true'
+        with:
+          tool: cargo-nextest@0.9.143
+      - name: Install Valgrind and native build dependencies
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends valgrind nasm
+      - name: Hydrate the test corpus (unit)
+        # The par3-rs lib tests install into PAR-inside containers; see the
+        # unit-tests lane.
+        if: steps.gate.outputs.run == 'true'
+        run: cargo run --locked -p xtask -- test-corpus hydrate --profile unit --profile par3
+      - name: Run the crate's unsafe-bearing lib tests under Memcheck
+        # Default features: AWS-LC's assembly and the native SIMD kernels are
+        # what Memcheck can see and the sanitizers cannot. Memcheck's CPUID
+        # hides AVX-512, so the x86 lane runs the AVX2 tier and below. The
+        # runner is set on this step alone, so xtask and build scripts run
+        # natively.
+        if: steps.gate.outputs.run == 'true'
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: valgrind --quiet --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect
+          # ARM64 alone loads one documented suppression; see
+          # .github/valgrind/aarch64-memcheck.supp.
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: valgrind --quiet --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect --suppressions=${{ github.workspace }}/.github/valgrind/aarch64-memcheck.supp
+        run: cargo nextest run --locked --no-fail-fast -p "$CRATE" --lib -E "$FILTER"
+
+  unsafe-sanitizer:
+    name: unsafe-${{ matrix.sanitizer }}-${{ matrix.platform }}-${{ matrix.crate }}
+    needs: [changes, fmt, clippy, unit-tests]
+    if: needs.changes.outputs.crates == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux-x86_64, linux-aarch64]
+        sanitizer: [address, thread]
+        crate: [reedsolomon-rs, unrar-rs, par2-rs, par3-rs]
+        exclude:
+          # ThreadSanitizer is for the crates whose own code runs threads it
+          # coordinates: unrar-rs's parallel decoder and hash pipeline, and
+          # par3-rs's hashing, FFT and repair pools. reedsolomon-rs and par2-rs
+          # thread through rayon over disjoint slices; see
+          # docs/unsafe-validation.md.
+          - sanitizer: thread
+            crate: reedsolomon-rs
+          - sanitizer: thread
+            crate: par2-rs
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - crate: reedsolomon-rs
+            changed: reedsolomon
+            features: ""
+            address: test(/^(gf_simd|gf8|gf_pmul|fft|matrix_tiled|sve2|decode_apply|threading|xor_jit)::/)
+          - crate: unrar-rs
+            changed: unrar
+            # RustCrypto, so the AES and BLAKE2sp under the decoder are Rust
+            # the sanitizer instruments.
+            features: --no-default-features --features crypto-rust
+            address: test(/^(decompress::|crypto::|crc_simd::|hash_pipeline::|archive::member::|rar4::)/)
+            thread: test(/^(decompress::lz::parallel::|decompress::lz::tests::|hash_pipeline::|recovery::)/)
+          - crate: par2-rs
+            changed: par2
+            features: --no-default-features --features crypto-rust
+            address: test(/^(repair::|md5_simd::|crc_simd::|repair_transform::|matrix::|disk::|checksum::|create::encode::|create::output::)/) | test(/^repairer::tests::(buffered_scan_matches_mmap_for_damaged_partial_matches|copy_range_preserves_small_range_from_large_source|buffered_scan_matches_mmap_for_intact_full_blocks|large_slice_scanner_uses_mmap_fallback_and_remains_correct|mapped_walk_matches_the_ring|mmap_scan_stops_when_cancellation_lands_mid_scan|ordered_canonical_scan_checks_every_byte_through_long_miss_runs|ordered_canonical_scan_matches_generic_locations_for_shifted_damage|ordered_canonical_scan_preserves_mixed_block_harvesting|ordered_parallel_scan_matches_serial_for_deleted_full_block|ordered_parallel_scan_stays_misaligned_through_unaligned_tail|ordered_scan_keeps_its_jumps_when_the_ring_is_unaffordable|serial_walk_stops_when_cancellation_lands_mid_walk|shifted_large_short_block_scans_without_large_heap_buffer|shifted_short_block_checks_match_mmap_and_buffered|the_candidate_scan_phase_defers_the_relocation_search)$/)
+          - crate: par3-rs
+            changed: par3
+            features: ""
+            address: test(/^(mount::|repair_tree::|session_repair::|hash::|fft::|runtime::|gf::)/)
+            thread: test(/^(hash::|fft::|runtime::|session_repair::|session::|evidence::|creation::)/)
+    env:
+      CRATE: ${{ matrix.crate }}
+      FEATURES: ${{ matrix.features }}
+      FILTER: ${{ matrix.sanitizer == 'thread' && matrix.thread || matrix.address }}
+      TARGET: ${{ matrix.target }}
+      RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      TSAN_OPTIONS: halt_on_error=1
+    steps:
+      - name: Gate on the crate being affected
+        id: gate
+        env:
+          OUTPUTS: ${{ toJSON(needs.changes.outputs) }}
+          KEY: ${{ matrix.changed }}
+        run: >-
+          python3 -c 'import json, os; print("run=" + json.loads(os.environ["OUTPUTS"]).get(os.environ["KEY"], "false"))'
+          >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.run == 'true'
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        if: steps.gate.outputs.run == 'true'
+        with:
+          toolchain: nightly-2026-09-01
+          components: rust-src
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        if: steps.gate.outputs.run == 'true'
+        with:
+          tool: cargo-nextest@0.9.143
+      - name: Install native build dependencies
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nasm
+      - name: Hydrate the test corpus (unit)
+        # The hydrate tool is built without the sanitizer flags.
+        if: steps.gate.outputs.run == 'true'
+        env:
+          RUSTFLAGS: ""
+        run: cargo +nightly-2026-09-01 run --locked -p xtask -- test-corpus hydrate --profile unit --profile par3
+      - name: Instrument the crate's unsafe-bearing lib tests
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          read -ra features <<<"$FEATURES"
+          cargo +nightly-2026-09-01 nextest run -Zbuild-std --target "$TARGET" \
+            --locked --no-fail-fast -p "$CRATE" ${features[@]+"${features[@]}"} --lib -E "$FILTER"
+
+  unsafe-miri-plan:
+    name: unsafe-miri-plan
+    needs: [changes]
+    if: needs.changes.outputs.crates == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: nightly-2026-09-01
+          components: miri, rust-src
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
+      - name: Discover the portable unsafe tests under cfg(miri)
+        id: plan
+        env:
+          UNRAR: ${{ needs.changes.outputs.unrar }}
+          REEDSOLOMON: ${{ needs.changes.outputs.reedsolomon }}
+        run: |
+          set -euo pipefail
+          listings=()
+          if [ "$UNRAR" = true ]; then
+            # RustCrypto: no C backend is built for an interpreter that could
+            # not call it anyway.
+            # The exhaustive copy-matrix sweeps are left to Memcheck and ASan:
+            # interpreted, each runs well past ten minutes.
+            cargo +nightly-2026-09-01 miri nextest list --locked -p unrar-rs --lib \
+              --no-default-features --features crypto-rust --message-format json \
+              -E 'test(/^decompress::lz::(window|block_reader)::tests::/) & !test(/copy_matrix_matches_reference/)' \
+              > "$RUNNER_TEMP/miri-unrar.json"
+            listings+=("unrar-rs=$RUNNER_TEMP/miri-unrar.json")
+          fi
+          if [ "$REEDSOLOMON" = true ]; then
+            # Only the FFT row banks: every test that reaches the rayon pool
+            # stops in crossbeam-epoch's integer-to-pointer casts, which strict
+            # provenance refuses, and so does matrix_tiled's own inversion.
+            cargo +nightly-2026-09-01 miri nextest list --locked -p reedsolomon-rs --lib \
+              --message-format json \
+              -E 'test(/^fft::tests::(row_banks_are_zeroed_aligned_rows|known_zero_steps_at_par3_shapes|transforms_match_direct_polynomial_evaluation_and_round_trip)$/)' \
+              > "$RUNNER_TEMP/miri-reedsolomon.json"
+            listings+=("reedsolomon-rs=$RUNNER_TEMP/miri-reedsolomon.json")
+          fi
+          if [ "${#listings[@]}" -eq 0 ]; then
+            echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            echo "no Miri-covered crate is affected"
+            exit 0
+          fi
+          python3 .github/scripts/miri-matrix.py "$GITHUB_OUTPUT" "${listings[@]}"
+
+  unsafe-miri:
+    name: unsafe-miri-${{ matrix.package }}-${{ matrix.test }}
+    needs: unsafe-miri-plan
+    if: needs.unsafe-miri-plan.outputs.count != '0'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.unsafe-miri-plan.outputs.matrix) }}
+    env:
+      MIRI_PACKAGE: ${{ matrix.package }}
+      MIRI_TEST: ${{ matrix.test }}
+      MIRIFLAGS: -Zmiri-strict-provenance
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: nightly-2026-09-01
+          components: miri, rust-src
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
+      - name: Check one portable unsafe invariant
+        run: |
+          set -euo pipefail
+          features=()
+          if [ "$MIRI_PACKAGE" = unrar-rs ]; then
+            features=(--no-default-features --features crypto-rust)
+          fi
+          cargo +nightly-2026-09-01 miri nextest run --locked -p "$MIRI_PACKAGE" --lib \
+            ${features[@]+"${features[@]}"} --no-fail-fast -- --exact "$MIRI_TEST"
+
+  # Green iff every memory-safety job that had work succeeded. Miri may be
+  # skipped only when discovery found no Miri-covered crate affected.
+  unsafe-complete:
+    name: unsafe-complete
+    if: ${{ always() && needs.changes.outputs.crates == 'true' }}
+    needs: [changes, unsafe-valgrind, unsafe-sanitizer, unsafe-miri-plan, unsafe-miri]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every native and Miri safety job
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+          MIRI_COUNT: ${{ needs.unsafe-miri-plan.outputs.count }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          results = json.loads(os.environ["RESULTS"])
+          miri_idle = os.environ.get("MIRI_COUNT") == "0"
+          bad = {
+              name: job["result"]
+              for name, job in results.items()
+              if job["result"] != "success"
+              and not (name == "unsafe-miri" and miri_idle and job["result"] == "skipped")
+          }
+          if bad:
+              raise SystemExit(f"memory-safety jobs did not succeed: {bad}")
+          print("every memory-safety job succeeded")
+          PY
 
   ci-complete:
     name: ci-complete
@@ -2283,6 +2648,7 @@ jobs:
       - wasm-par2-harness
       - wasm-par3-harness
       - wasm-unrar-harness
+      - unsafe-complete
     steps:
       - name: Check CI result
         run: |
