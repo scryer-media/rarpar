@@ -344,7 +344,7 @@ impl RarArchive {
                         &fh.name,
                     )?
                 };
-                hash_writer.flush().map_err(RarError::Io)?;
+                hash_writer.flush().map_err(RarError::from)?;
                 let actual_crc = expected_crc.map(|_| hash_writer.finalize_crc());
                 let actual_blake = expected_blake.map(|_| hash_writer.finalize_blake2());
                 (output, written, actual_crc, actual_blake)
@@ -368,9 +368,7 @@ impl RarArchive {
                 })?;
                 let mut packed = Vec::with_capacity(packed_capacity);
                 let mut reader = reader;
-                reader
-                    .read_to_end(&mut packed)
-                    .map_err(Self::read_error_to_rar)?;
+                reader.read_to_end(&mut packed).map_err(RarError::from)?;
                 if packed.len() as u64 != packed_len {
                     return Err(RarError::CorruptArchive {
                         detail: format!(
@@ -771,10 +769,10 @@ impl RarArchive {
 
         let stream_path = Self::ntfs_stream_output_path(out_path, stream_name);
         let write_result = (|| {
-            let file = std::fs::File::create(stream_path).map_err(RarError::Io)?;
+            let file = std::fs::File::create(stream_path).map_err(RarError::from)?;
             let mut writer = BufWriter::new(file);
             self.write_service_subdata_to_writer(service, options, &mut writer)?;
-            writer.flush().map_err(RarError::Io)
+            writer.flush().map_err(RarError::from)
         })();
         let restore_result = Self::restore_windows_host_metadata(out_path, &host_metadata);
         write_result?;
@@ -790,7 +788,7 @@ impl RarArchive {
             return Ok(None);
         }
 
-        let metadata = std::fs::metadata(out_path).map_err(RarError::Io)?;
+        let metadata = std::fs::metadata(out_path).map_err(RarError::from)?;
         Ok(Some(WindowsHostMetadata {
             attributes,
             mtime: metadata.modified().ok(),
@@ -830,11 +828,11 @@ impl RarArchive {
 
         if let Some(mtime) = metadata.mtime {
             filetime::set_file_mtime(out_path, filetime::FileTime::from_system_time(mtime))
-                .map_err(RarError::Io)?;
+                .map_err(RarError::from)?;
         }
         if let Some(atime) = metadata.atime {
             filetime::set_file_atime(out_path, filetime::FileTime::from_system_time(atime))
-                .map_err(RarError::Io)?;
+                .map_err(RarError::from)?;
         }
         Self::apply_creation_time(metadata.ctime, out_path)?;
         Self::set_windows_file_attributes(out_path, metadata.attributes)
@@ -1049,7 +1047,7 @@ impl RarArchive {
                 },
             });
         };
-        hash_writer.flush().map_err(RarError::Io)?;
+        hash_writer.flush().map_err(RarError::from)?;
 
         if written != unpacked_size {
             return Err(RarError::CorruptArchive {
@@ -1370,7 +1368,7 @@ impl RarArchive {
                 Self::remove_output_file(out_path)?;
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(RarError::Io(err)),
+            Err(err) => return Err(RarError::from(err)),
         }
         Ok(())
     }
@@ -1383,7 +1381,7 @@ impl RarArchive {
             }
             Ok(_) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(RarError::Io(err)),
+            Err(err) => return Err(RarError::from(err)),
         }
         Ok(())
     }
@@ -1418,7 +1416,7 @@ impl RarArchive {
 
         #[cfg(not(windows))]
         {
-            std::fs::remove_file(out_path).map_err(RarError::Io)
+            std::fs::remove_file(out_path).map_err(RarError::from)
         }
     }
 
@@ -1481,7 +1479,7 @@ impl RarArchive {
                 }
                 let err = std::io::Error::last_os_error();
                 if Self::windows_output_path_exists(out_path) {
-                    return Err(RarError::Io(err));
+                    return Err(RarError::from(err));
                 }
             }
 
@@ -1508,7 +1506,7 @@ impl RarArchive {
 
         #[cfg(not(windows))]
         {
-            std::fs::create_dir(out_path).map_err(RarError::Io)
+            std::fs::create_dir(out_path).map_err(RarError::from)
         }
     }
 
@@ -1542,7 +1540,7 @@ impl RarArchive {
 
         #[cfg(not(windows))]
         {
-            std::fs::create_dir_all(out_path).map_err(RarError::Io)
+            std::fs::create_dir_all(out_path).map_err(RarError::from)
         }
     }
 
@@ -1617,7 +1615,7 @@ impl RarArchive {
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                     Self::create_output_dir(&current)?;
                 }
-                Err(err) => return Err(RarError::Io(err)),
+                Err(err) => return Err(RarError::from(err)),
             }
         }
 
@@ -1648,7 +1646,7 @@ impl RarArchive {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 Self::create_output_dir(out_path)?;
             }
-            Err(err) => return Err(RarError::Io(err)),
+            Err(err) => return Err(RarError::from(err)),
         }
         Ok(())
     }
@@ -1771,7 +1769,7 @@ impl RarArchive {
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(RarError::Io(err)),
+                Err(err) => return Err(RarError::from(err)),
             }
             current = path.parent();
         }
@@ -1873,7 +1871,7 @@ impl RarArchive {
         Self::ensure_output_parent_dir_for_member(member_name, out_path)?;
         Self::remove_existing_regular_output_symlink(out_path)?;
         Self::clear_windows_readonly_before_overwrite(out_path)?;
-        std::fs::File::create(out_path).map_err(RarError::Io)
+        std::fs::File::create(out_path).map_err(RarError::from)
     }
 
     fn create_regular_output_file_for_member(
@@ -1992,7 +1990,7 @@ impl RarArchive {
             let target = target_raw
                 .map(std::ffi::OsStr::from_bytes)
                 .unwrap_or_else(|| std::ffi::OsStr::new(target));
-            std::os::unix::fs::symlink(target, out_path).map_err(RarError::Io)?;
+            std::os::unix::fs::symlink(target, out_path).map_err(RarError::from)?;
             Self::apply_symlink_times(fh, out_path)?;
             if options.restore_owners {
                 Self::apply_unix_owner(owner, out_path, false)?;
@@ -2068,7 +2066,7 @@ impl RarArchive {
         {
             let _ = reparse_target;
             let target = std::ffi::OsStr::new(safety_target);
-            std::os::unix::fs::symlink(target, out_path).map_err(RarError::Io)?;
+            std::os::unix::fs::symlink(target, out_path).map_err(RarError::from)?;
             Self::apply_symlink_times(fh, out_path)?;
             if options.restore_owners {
                 Self::apply_unix_owner(owner, out_path, false)?;
@@ -2159,7 +2157,7 @@ impl RarArchive {
         if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
             let err = std::io::Error::last_os_error();
             Self::remove_failed_windows_reparse_placeholder(out_path, is_directory);
-            return Err(RarError::Io(err));
+            return Err(RarError::from(err));
         }
 
         struct Handle(windows_sys::Win32::Foundation::HANDLE);
@@ -2189,7 +2187,7 @@ impl RarArchive {
             let err = std::io::Error::last_os_error();
             drop(handle);
             Self::remove_failed_windows_reparse_placeholder(out_path, is_directory);
-            return Err(RarError::Io(err));
+            return Err(RarError::from(err));
         }
 
         Ok(())
@@ -2565,7 +2563,7 @@ impl RarArchive {
             use std::os::unix::ffi::OsStrExt;
 
             let raw_target = std::ffi::OsStr::from_bytes(&target.raw);
-            std::os::unix::fs::symlink(raw_target, out_path).map_err(RarError::Io)?;
+            std::os::unix::fs::symlink(raw_target, out_path).map_err(RarError::from)?;
             Self::apply_symlink_times(fh, out_path)?;
             if options.restore_owners {
                 Self::apply_unix_owner(owner, out_path, false)?;
@@ -2702,14 +2700,14 @@ impl RarArchive {
                     filetime::FileTime::from_system_time(atime),
                     filetime::FileTime::from_system_time(mtime),
                 )
-                .map_err(RarError::Io),
+                .map_err(RarError::from),
                 (Some(mtime), None) => {
                     filetime::set_file_mtime(out_path, filetime::FileTime::from_system_time(mtime))
-                        .map_err(RarError::Io)
+                        .map_err(RarError::from)
                 }
                 (None, Some(atime)) => {
                     filetime::set_file_atime(out_path, filetime::FileTime::from_system_time(atime))
-                        .map_err(RarError::Io)
+                        .map_err(RarError::from)
                 }
                 (None, None) => Ok(()),
             };
@@ -2844,10 +2842,10 @@ impl RarArchive {
                 use std::os::unix::fs::PermissionsExt;
 
                 let mut permissions = std::fs::metadata(out_path)
-                    .map_err(RarError::Io)?
+                    .map_err(RarError::from)?
                     .permissions();
                 permissions.set_mode(mode);
-                std::fs::set_permissions(out_path, permissions).map_err(RarError::Io)?;
+                std::fs::set_permissions(out_path, permissions).map_err(RarError::from)?;
             }
         }
 
@@ -2988,10 +2986,10 @@ impl RarArchive {
         use std::os::unix::fs::PermissionsExt;
 
         let mut permissions = std::fs::metadata(out_path)
-            .map_err(RarError::Io)?
+            .map_err(RarError::from)?
             .permissions();
         permissions.set_mode(mode);
-        std::fs::set_permissions(out_path, permissions).map_err(RarError::Io)
+        std::fs::set_permissions(out_path, permissions).map_err(RarError::from)
     }
 
     #[cfg(unix)]
@@ -3076,9 +3074,9 @@ impl RarArchive {
         use std::os::unix::fs::MetadataExt;
 
         let metadata = if follow_links {
-            std::fs::metadata(out_path).map_err(RarError::Io)?
+            std::fs::metadata(out_path).map_err(RarError::from)?
         } else {
-            std::fs::symlink_metadata(out_path).map_err(RarError::Io)?
+            std::fs::symlink_metadata(out_path).map_err(RarError::from)?
         };
         let uid_matches = uid.is_none_or(|uid| u64::from(metadata.uid()) == uid as u64);
         let gid_matches = gid.is_none_or(|gid| u64::from(metadata.gid()) == gid as u64);
@@ -3141,7 +3139,7 @@ impl RarArchive {
         Self::ensure_safe_link_target(member_name, target, raw_member_name, out_path)?;
         Self::remove_existing_link_output(out_path)?;
         let target_path = Self::redirection_target_path(member_name, target, out_path);
-        std::fs::hard_link(&target_path, out_path).map_err(RarError::Io)?;
+        std::fs::hard_link(&target_path, out_path).map_err(RarError::from)?;
         // Set attributes for hardlinks after creation because deleting or
         // replacing the output link can affect the shared target metadata.
         Self::apply_unix_permissions(fh, out_path)?;
@@ -3153,7 +3151,7 @@ impl RarArchive {
         source_path: &std::path::Path,
         out_path: &std::path::Path,
     ) -> RarResult<u64> {
-        let metadata = std::fs::metadata(source_path).map_err(RarError::Io)?;
+        let metadata = std::fs::metadata(source_path).map_err(RarError::from)?;
         if !metadata.is_file() {
             return Err(RarError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -3163,7 +3161,7 @@ impl RarArchive {
                 ),
             )));
         }
-        std::fs::copy(source_path, out_path).map_err(RarError::Io)
+        std::fs::copy(source_path, out_path).map_err(RarError::from)
     }
 
     fn unique_filecopy_temp_path(out_path: &std::path::Path, index: usize) -> std::path::PathBuf {
@@ -3746,7 +3744,7 @@ impl RarArchive {
         }
 
         let mut probe = [0u8; 1];
-        let read = reader.read(&mut probe).map_err(Self::read_error_to_rar)?;
+        let read = reader.read(&mut probe).map_err(RarError::from)?;
         if read == 0 {
             return Ok(());
         }
@@ -3978,13 +3976,6 @@ impl RarArchive {
         Ok(())
     }
 
-    // A reader error that carries a `RarError` is that error; any other one is
-    // kept whole, OS error code and payload included, so callers can match on
-    // its kind and cause instead of its wording.
-    fn read_error_to_rar(error: std::io::Error) -> RarError {
-        error.downcast::<RarError>().unwrap_or_else(RarError::Io)
-    }
-
     fn copy_reader_to_writer<R: Read, W: Write>(
         mut reader: R,
         writer: &mut W,
@@ -4003,7 +3994,7 @@ impl RarArchive {
 
             let read = reader
                 .read(&mut buffer[..to_read])
-                .map_err(Self::read_error_to_rar)?;
+                .map_err(RarError::from)?;
             if read == 0 {
                 if limit.is_exact() {
                     return Err(RarError::Io(std::io::Error::new(
@@ -4013,7 +4004,7 @@ impl RarArchive {
                 }
                 break;
             }
-            writer.write_all(&buffer[..read]).map_err(RarError::Io)?;
+            writer.write_all(&buffer[..read]).map_err(RarError::from)?;
             written += read as u64;
         }
 
@@ -4048,8 +4039,8 @@ impl RarArchive {
             );
         }
         Self::read_store_chunks(reader, stream_hash, limit, member_name, |chunk| {
-            writer.write_all(&chunk).map_err(RarError::Io)?;
-            stream_hash.submit(chunk).map_err(RarError::Io)
+            writer.write_all(&chunk).map_err(RarError::from)?;
+            stream_hash.submit(chunk).map_err(RarError::from)
         })
     }
 
@@ -4073,14 +4064,14 @@ impl RarArchive {
                             .map_err(|_| RarError::internal("store copy writer stopped"))
                     })
                 })
-                .map_err(RarError::Io)?;
+                .map_err(RarError::from)?;
 
             let mut write_result = Ok(());
             for chunk in &chunk_rx {
                 write_result = writer
                     .write_all(&chunk)
                     .and_then(|()| stream_hash.submit(chunk))
-                    .map_err(RarError::Io);
+                    .map_err(RarError::from);
                 if write_result.is_err() {
                     break;
                 }
@@ -4160,7 +4151,7 @@ impl RarArchive {
                         }
                     }
                 })
-                .map_err(RarError::Io)?;
+                .map_err(RarError::from)?;
             // The overlapped copy's reader thread is the decrypt stage. It owns
             // the decrypting reader, so when it stops, for any reason, the
             // channel closes and the fetch thread stops with it.
@@ -4197,9 +4188,7 @@ impl RarArchive {
             }
 
             let mut chunk = stream_hash.take_buffer_len(to_read);
-            let read = reader
-                .read(&mut chunk[..to_read])
-                .map_err(Self::read_error_to_rar)?;
+            let read = reader.read(&mut chunk[..to_read]).map_err(RarError::from)?;
             if read == 0 {
                 if limit.is_exact() {
                     return Err(RarError::Io(std::io::Error::new(
@@ -4240,7 +4229,7 @@ impl RarArchive {
             let observed_volume = volume_tracker.load(Ordering::Acquire);
             if observed_volume != current_volume {
                 if let Some(mut writer) = current_writer.take() {
-                    writer.flush().map_err(RarError::Io)?;
+                    writer.flush().map_err(RarError::from)?;
                 }
                 chunks.push((current_volume, current_written));
                 current_volume = observed_volume;
@@ -4256,7 +4245,7 @@ impl RarArchive {
 
             let read = reader
                 .read(&mut buffer[..to_read])
-                .map_err(Self::read_error_to_rar)?;
+                .map_err(RarError::from)?;
             if read == 0 {
                 if limit.is_exact() {
                     return Err(RarError::Io(std::io::Error::new(
@@ -4268,14 +4257,14 @@ impl RarArchive {
             }
 
             if let Some(writer) = current_writer.as_mut() {
-                writer.write_all(&buffer[..read]).map_err(RarError::Io)?;
+                writer.write_all(&buffer[..read]).map_err(RarError::from)?;
             }
             current_written += read as u64;
             total_written += read as u64;
         }
 
         if let Some(mut writer) = current_writer {
-            writer.flush().map_err(RarError::Io)?;
+            writer.flush().map_err(RarError::from)?;
             if current_written > 0 || chunks.is_empty() {
                 chunks.push((current_volume, current_written));
             }
@@ -4415,7 +4404,7 @@ impl RarArchive {
                     )?
                 };
 
-                let outputs = stream_hash.finalize().map_err(RarError::Io)?;
+                let outputs = stream_hash.finalize().map_err(RarError::from)?;
                 (
                     written,
                     expected_crc.map(|_| outputs.crc32.unwrap_or(0)),
@@ -4515,7 +4504,7 @@ impl RarArchive {
                 };
                 self.enforce_unknown_lz_output_limit(&fh, written)?;
 
-                hash_writer.flush().map_err(RarError::Io)?;
+                hash_writer.flush().map_err(RarError::from)?;
                 (
                     expected_crc.map(|_| hash_writer.finalize_crc()),
                     expected_blake.map(|_| hash_writer.finalize_blake2()),
@@ -4656,8 +4645,8 @@ impl RarArchive {
                     }
                 };
                 self.enforce_unknown_lz_output_limit(&fh, written)?;
-                hash_writer.flush().map_err(RarError::Io)?;
-                let outputs = stream_hash.finalize().map_err(RarError::Io)?;
+                hash_writer.flush().map_err(RarError::from)?;
+                let outputs = stream_hash.finalize().map_err(RarError::from)?;
                 (
                     expected_crc.map(|_| outputs.crc32.unwrap_or(0)),
                     expected_data_hash.map(|expected| match expected {
@@ -4776,7 +4765,7 @@ impl RarArchive {
                     )?;
                     self.enforce_unknown_lz_output_limit(&fh, written)?;
                 }
-                hash_writer.flush().map_err(RarError::Io)?;
+                hash_writer.flush().map_err(RarError::from)?;
                 (
                     expected_crc.map(|_| hash_writer.finalize_crc()),
                     expected_blake.map(|_| hash_writer.finalize_blake2()),
@@ -5048,7 +5037,7 @@ impl RarArchive {
                     )?
                 };
 
-                let outputs = stream_hash.finalize().map_err(RarError::Io)?;
+                let outputs = stream_hash.finalize().map_err(RarError::from)?;
                 (
                     written,
                     expected_crc.map(|_| outputs.crc32.unwrap_or(0)),
@@ -5086,7 +5075,7 @@ impl RarArchive {
                 rar5_crypto.as_ref().map(|crypto| &crypto.hash_key),
             )?;
 
-            writer.flush().map_err(RarError::Io)?;
+            writer.flush().map_err(RarError::from)?;
             return Ok(written);
         }
 
@@ -5142,7 +5131,7 @@ impl RarArchive {
                         &mut hash_writer,
                     )?
                 };
-                hash_writer.flush().map_err(RarError::Io)?;
+                hash_writer.flush().map_err(RarError::from)?;
                 (expected_crc.map(|_| hash_writer.finalize_crc()), written)
             };
             self.enforce_unknown_lz_output_limit(&fh, written)?;
@@ -5229,8 +5218,8 @@ impl RarArchive {
                     )?
                 };
                 self.enforce_unknown_lz_output_limit(&fh, written)?;
-                hash_writer.flush().map_err(RarError::Io)?;
-                let outputs = stream_hash.finalize().map_err(RarError::Io)?;
+                hash_writer.flush().map_err(RarError::from)?;
+                let outputs = stream_hash.finalize().map_err(RarError::from)?;
                 let actual_crc = expected_crc.map(|_| outputs.crc32.unwrap_or(0));
                 let actual_data_hash = expected_data_hash.map(|expected| match expected {
                     crate::types::DataHash::Crc32(_) => {
@@ -5243,7 +5232,7 @@ impl RarArchive {
                 let actual_blake = expected_blake.map(|_| outputs.blake2sp.unwrap_or([0; 32]));
                 (written, actual_crc, actual_data_hash, actual_blake)
             };
-            writer.flush().map_err(RarError::Io)?;
+            writer.flush().map_err(RarError::from)?;
 
             Self::verify_member_crc32(&fh.name, expected_crc, actual_crc, false, None)?;
             Self::verify_member_data_hash(
@@ -5619,7 +5608,7 @@ impl RarArchive {
 
         self.advance_solid_cursor_to(index, &fh, options.password.as_deref())?;
         if fh.is_directory {
-            writer.flush().map_err(RarError::Io)?;
+            writer.flush().map_err(RarError::from)?;
             self.solid_next_index = index + 1;
             return Ok(0);
         }
@@ -5675,8 +5664,8 @@ impl RarArchive {
             let (written, actual_crc, actual_data_hash, actual_blake) = {
                 let written =
                     Self::copy_reader_hashed(reader, writer, &stream_hash, store_limit, &fh.name)?;
-                writer.flush().map_err(RarError::Io)?;
-                let outputs = stream_hash.finalize().map_err(RarError::Io)?;
+                writer.flush().map_err(RarError::from)?;
+                let outputs = stream_hash.finalize().map_err(RarError::from)?;
                 let actual_crc = expected_crc.map(|_| outputs.crc32.unwrap_or(0));
                 let actual_data_hash = expected_data_hash.map(|expected| match expected {
                     crate::types::DataHash::Crc32(_) => {
@@ -5738,7 +5727,7 @@ impl RarArchive {
                 &mut hash_writer,
             )?;
             self.enforce_unknown_lz_output_limit(&fh, written)?;
-            hash_writer.flush().map_err(RarError::Io)?;
+            hash_writer.flush().map_err(RarError::from)?;
             (
                 written,
                 expected_crc.map(|_| hash_writer.finalize_crc()),
@@ -6330,19 +6319,17 @@ impl RarArchive {
                 break;
             }
             let mut chunk = stream_hash.take_buffer_len(to_read);
-            let n = reader
-                .read(&mut chunk[..to_read])
-                .map_err(Self::read_error_to_rar)?;
+            let n = reader.read(&mut chunk[..to_read]).map_err(RarError::from)?;
             if n == 0 {
                 break;
             }
             chunk.truncate(n);
-            writer.write_all(&chunk).map_err(RarError::Io)?;
+            writer.write_all(&chunk).map_err(RarError::from)?;
             written += n as u64;
-            stream_hash.submit(chunk).map_err(RarError::Io)?;
+            stream_hash.submit(chunk).map_err(RarError::from)?;
         }
 
-        writer.flush().map_err(RarError::Io)?;
+        writer.flush().map_err(RarError::from)?;
 
         // Use final volume's CRC and HMAC flag if continuations were discovered.
         let final_meta = cont_meta.borrow();
@@ -6358,7 +6345,7 @@ impl RarArchive {
         let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac;
         drop(final_meta);
 
-        let stream_outputs = stream_hash.finalize().map_err(RarError::Io)?;
+        let stream_outputs = stream_hash.finalize().map_err(RarError::from)?;
         let actual_crc = stream_outputs.crc32;
         let actual_blake = stream_outputs.blake2sp;
         Self::verify_member_crc32(
@@ -6492,7 +6479,7 @@ impl RarArchive {
         };
         self.enforce_unknown_lz_output_limit(fh, written)?;
 
-        hash_writer.flush().map_err(RarError::Io)?;
+        hash_writer.flush().map_err(RarError::from)?;
 
         // Use final volume's CRC and HMAC flag if continuations were discovered.
         let final_meta = cont_meta.borrow();
@@ -6753,9 +6740,7 @@ impl RarArchive {
                 break;
             }
             let mut chunk = stream_hash.take_buffer_len(to_read);
-            let n = reader
-                .read(&mut chunk[..to_read])
-                .map_err(Self::read_error_to_rar)?;
+            let n = reader.read(&mut chunk[..to_read]).map_err(RarError::from)?;
             if n == 0 {
                 break;
             }
@@ -6764,20 +6749,20 @@ impl RarArchive {
             // Check for volume transition.
             let new_vol = volume_tracker.load(Ordering::Acquire);
             if new_vol != current_vol {
-                current_writer.flush().map_err(RarError::Io)?;
+                current_writer.flush().map_err(RarError::from)?;
                 chunks.push((current_vol, chunk_bytes));
                 current_vol = new_vol;
                 current_writer = writer_factory(current_vol)?;
                 chunk_bytes = 0;
             }
 
-            current_writer.write_all(&chunk).map_err(RarError::Io)?;
+            current_writer.write_all(&chunk).map_err(RarError::from)?;
             chunk_bytes += n as u64;
             total_written += n as u64;
-            stream_hash.submit(chunk).map_err(RarError::Io)?;
+            stream_hash.submit(chunk).map_err(RarError::from)?;
         }
 
-        current_writer.flush().map_err(RarError::Io)?;
+        current_writer.flush().map_err(RarError::from)?;
         if chunk_bytes > 0 || chunks.is_empty() {
             chunks.push((current_vol, chunk_bytes));
         }
@@ -6796,7 +6781,7 @@ impl RarArchive {
         let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac;
         drop(final_meta);
 
-        let stream_outputs = stream_hash.finalize().map_err(RarError::Io)?;
+        let stream_outputs = stream_hash.finalize().map_err(RarError::from)?;
         let actual_crc = stream_outputs.crc32;
         let actual_blake = stream_outputs.blake2sp;
         Self::verify_member_crc32(
@@ -7338,7 +7323,7 @@ fn finalize_shared_hash(
     match shared {
         None => Ok((None, None)),
         Some(hash) => {
-            let outputs = hash.finalize().map_err(RarError::Io)?;
+            let outputs = hash.finalize().map_err(RarError::from)?;
             Ok((outputs.crc32, outputs.blake2sp))
         }
     }
@@ -8004,7 +7989,7 @@ mod tests {
     #[test]
     fn read_errors_keep_their_typed_cause() {
         let RarError::Io(error) =
-            RarArchive::read_error_to_rar(std::io::Error::from_raw_os_error(24))
+            RarError::from(std::io::Error::from_raw_os_error(24))
         else {
             panic!("an OS error stays an I/O error");
         };
@@ -8012,7 +7997,7 @@ mod tests {
 
         let short = std::io::Read::read_exact(&mut Cursor::new([0u8; 1]), &mut [0u8; 2])
             .expect_err("a short read fails");
-        let RarError::Io(error) = RarArchive::read_error_to_rar(short) else {
+        let RarError::Io(error) = RarError::from(short) else {
             panic!("a short read stays an I/O error");
         };
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
@@ -8022,7 +8007,7 @@ mod tests {
             volume: 2,
             error: std::io::Error::from_raw_os_error(24),
         });
-        let RarError::Io(error) = RarArchive::read_error_to_rar(provider) else {
+        let RarError::Io(error) = RarError::from(provider) else {
             panic!("a provider failure stays an I/O error");
         };
         let Some(crate::volume::VolumeProviderError::Io {
@@ -8056,7 +8041,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            RarArchive::read_error_to_rar(wrapped),
+            RarError::from(wrapped),
             RarError::HeaderCrcMismatch {
                 expected: 1,
                 actual: 2

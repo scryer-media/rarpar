@@ -18,8 +18,13 @@
   rendered text; now the error carries it.
 - `RarError::Io` no longer returns its I/O error from
   `std::error::Error::source`, because its message already renders it and a
-  reporter walking the chain printed it twice. `From<io::Error>` is
-  unchanged. No `RarError` or `VolumeProviderError` has a source.
+  reporter walking the chain printed it twice. No `RarError` or
+  `VolumeProviderError` has a source.
+- `From<io::Error> for RarError` returns the `RarError` an I/O error
+  carries, and wraps any other I/O error in `Io` whole. Every reader, writer
+  and decoder boundary in the crate converts through it, so an error raised
+  on a `Read` or `Write` path reaches the caller as its own variant rather
+  than as `Io` around it.
 - A RAR5 compressed block whose header checksum does not match is the new
   `RarError::BlockHeaderChecksumMismatch { expected, actual }` instead of
   `RarError::CorruptArchive`. Its message is the one it had, so logs read

@@ -446,7 +446,7 @@ fn walk_headers_from<R: Read + Seek>(
 ) -> RarResult<HeaderWalk> {
     // Parse plaintext headers until we hit an encryption header or end.
     loop {
-        let header_start = reader.stream_position().map_err(RarError::Io)?;
+        let header_start = reader.stream_position().map_err(RarError::from)?;
         // The least the next header can occupy: its CRC32, a header-size vint
         // and a one-byte body.
         let floor = header_start + MIN_RAR5_HEADER_BYTES;
@@ -560,7 +560,7 @@ fn parse_encrypted_headers<R: Read + Seek>(
     short: &mut Option<ShortRead>,
 ) -> RarResult<()> {
     loop {
-        let header_start = reader.stream_position().map_err(RarError::Io)?;
+        let header_start = reader.stream_position().map_err(RarError::from)?;
         // Nothing short of the IV plus one cipher block can carry the next
         // header, so that is the least a re-read could learn anything from.
         let floor = header_start + MIN_RAR5_ENCRYPTED_HEADER_BYTES;
@@ -574,13 +574,13 @@ fn parse_encrypted_headers<R: Read + Seek>(
                 *short = Some(ShortRead::at_boundary(floor));
                 break;
             }
-            Err(e) => return Err(RarError::Io(e)),
+            Err(e) => return Err(RarError::from(e)),
         }
 
         // Read and decrypt first AES block (16 bytes) to determine header size.
         let mut block0 = [0u8; 16];
         let Some(()) = absorb_short_read(
-            reader.read_exact(&mut block0).map_err(RarError::Io),
+            reader.read_exact(&mut block0).map_err(RarError::from),
             scan,
             reader,
             floor,
@@ -628,7 +628,7 @@ fn parse_encrypted_headers<R: Read + Seek>(
             let remaining = aligned - 16;
             let mut more = vec![0u8; remaining];
             let Some(()) = absorb_short_read(
-                reader.read_exact(&mut more).map_err(RarError::Io),
+                reader.read_exact(&mut more).map_err(RarError::from),
                 scan,
                 reader,
                 floor,
@@ -777,12 +777,12 @@ fn try_parse_quick_open_headers<R: Read + Seek>(
         return Ok(None);
     };
 
-    let restore_pos = reader.stream_position().map_err(RarError::Io)?;
+    let restore_pos = reader.stream_position().map_err(RarError::from)?;
     let attempt =
         parse_quick_open_headers_at(reader, quick_open_offset, main.clone(), password, kdf_cache);
     reader
         .seek(SeekFrom::Start(restore_pos))
-        .map_err(RarError::Io)?;
+        .map_err(RarError::from)?;
 
     match attempt {
         Ok(parsed) => Ok(parsed),
@@ -805,7 +805,7 @@ fn parse_quick_open_headers_at<R: Read + Seek>(
 ) -> RarResult<Option<ParsedHeaders>> {
     reader
         .seek(SeekFrom::Start(quick_open_offset))
-        .map_err(RarError::Io)?;
+        .map_err(RarError::from)?;
     let Some(qopen_raw) = common::read_raw_header(reader)? else {
         return Ok(None);
     };
@@ -1066,7 +1066,7 @@ fn read_quick_open_exact<R: Read>(
                 detail: "truncated RAR5 QuickOpen payload".into(),
             }
         } else {
-            RarError::Io(error)
+            RarError::from(error)
         }
     })?;
     *remaining -= len;

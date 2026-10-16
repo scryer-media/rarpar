@@ -379,10 +379,10 @@ impl ExtractedMember {
             }
             Self::TempFile { file, len } => {
                 enforce_memory_materialization_limit("tempfile-backed member", *len)?;
-                let mut reopened = file.reopen().map_err(RarError::Io)?;
-                reopened.seek(SeekFrom::Start(0)).map_err(RarError::Io)?;
+                let mut reopened = file.reopen().map_err(RarError::from)?;
+                reopened.seek(SeekFrom::Start(0)).map_err(RarError::from)?;
                 let mut data = Vec::with_capacity(*len);
-                reopened.read_to_end(&mut data).map_err(RarError::Io)?;
+                reopened.read_to_end(&mut data).map_err(RarError::from)?;
                 Ok(data)
             }
         }
@@ -393,10 +393,10 @@ impl ExtractedMember {
             Self::InMemory(data) => Ok(data),
             Self::TempFile { file, len } => {
                 enforce_memory_materialization_limit("tempfile-backed member", len)?;
-                let mut reopened = file.reopen().map_err(RarError::Io)?;
-                reopened.seek(SeekFrom::Start(0)).map_err(RarError::Io)?;
+                let mut reopened = file.reopen().map_err(RarError::from)?;
+                reopened.seek(SeekFrom::Start(0)).map_err(RarError::from)?;
                 let mut data = Vec::with_capacity(len);
-                reopened.read_to_end(&mut data).map_err(RarError::Io)?;
+                reopened.read_to_end(&mut data).map_err(RarError::from)?;
                 Ok(data)
             }
         }
@@ -412,8 +412,8 @@ impl ExtractedMember {
         match self {
             Self::InMemory(data) => Ok(ExtractedMemberReader::Memory(Cursor::new(data))),
             Self::TempFile { file, len: _ } => {
-                let mut reopened = file.reopen().map_err(RarError::Io)?;
-                reopened.seek(SeekFrom::Start(0)).map_err(RarError::Io)?;
+                let mut reopened = file.reopen().map_err(RarError::from)?;
+                reopened.seek(SeekFrom::Start(0)).map_err(RarError::from)?;
                 Ok(ExtractedMemberReader::File(reopened))
             }
         }
@@ -499,7 +499,7 @@ impl ExtractedMemberSink {
         // in memory (still bounded by the 512 MiB materialization limit checked
         // elsewhere).
         let storage = if !cfg!(target_family = "wasm") && capacity_hint > threshold {
-            ExtractedMemberSinkStorage::TempFile(NamedTempFile::new().map_err(RarError::Io)?)
+            ExtractedMemberSinkStorage::TempFile(NamedTempFile::new().map_err(RarError::from)?)
         } else {
             ExtractedMemberSinkStorage::Memory(Vec::with_capacity(capacity_hint))
         };
@@ -650,7 +650,7 @@ where
     // Seek to the data offset
     reader
         .seek(SeekFrom::Start(file_header.data_offset))
-        .map_err(RarError::Io)?;
+        .map_err(RarError::from)?;
 
     let data_size = file_header.data_size;
     let mut remaining = data_size;
@@ -672,7 +672,7 @@ where
                     offset: file_header.data_offset + total_written,
                 }
             } else {
-                RarError::Io(e)
+                RarError::from(e)
             }
         })?;
 
@@ -682,7 +682,7 @@ where
             });
         }
 
-        writer.write_all(&buf[..n]).map_err(RarError::Io)?;
+        writer.write_all(&buf[..n]).map_err(RarError::from)?;
 
         if let Some(ref mut hasher) = crc_hasher {
             hasher.update(&buf[..n]);
@@ -763,7 +763,7 @@ pub fn extract_member_with_limits<R: Read + Seek>(
     // Seek to the data area.
     reader
         .seek(SeekFrom::Start(file_header.data_offset))
-        .map_err(RarError::Io)?;
+        .map_err(RarError::from)?;
 
     // Determine unpacked size.
     let unpacked_size = file_header.unpacked_size.unwrap_or(0);
@@ -810,7 +810,7 @@ pub fn extract_member_with_limits<R: Read + Seek>(
                     .by_ref()
                     .take(data_size as u64)
                     .read_to_end(&mut compressed)
-                    .map_err(RarError::Io)?;
+                    .map_err(RarError::from)?;
                 if read < data_size {
                     return Err(RarError::TruncatedData {
                         offset: file_header.data_offset,
@@ -901,12 +901,12 @@ pub fn verify_blake2_member(data: &ExtractedMember, expected: &[u8; 32]) -> RarR
     match data {
         ExtractedMember::InMemory(bytes) => Ok(verify_blake2(bytes, expected)),
         ExtractedMember::TempFile { file, .. } => {
-            let mut reopened = file.reopen().map_err(RarError::Io)?;
-            reopened.seek(SeekFrom::Start(0)).map_err(RarError::Io)?;
+            let mut reopened = file.reopen().map_err(RarError::from)?;
+            reopened.seek(SeekFrom::Start(0)).map_err(RarError::from)?;
             let mut hasher = crate::crypto::Blake2spHasher::new();
             let mut buf = vec![0u8; COPY_BUF_SIZE];
             loop {
-                let n = reopened.read(&mut buf).map_err(RarError::Io)?;
+                let n = reopened.read(&mut buf).map_err(RarError::from)?;
                 if n == 0 {
                     break;
                 }

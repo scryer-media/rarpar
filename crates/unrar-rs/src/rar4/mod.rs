@@ -91,7 +91,7 @@ struct ScanGuard {
 
 impl ScanGuard {
     fn new<R: Seek>(reader: &mut R, scan: HeaderScan) -> RarResult<Self> {
-        let position = reader.stream_position().map_err(RarError::Io)?;
+        let position = reader.stream_position().map_err(RarError::from)?;
         let stream_len = match reader.seek(std::io::SeekFrom::End(0)) {
             Ok(len) => Some(len),
             Err(error)
@@ -100,11 +100,11 @@ impl ScanGuard {
             {
                 None
             }
-            Err(error) => return Err(RarError::Io(error)),
+            Err(error) => return Err(RarError::from(error)),
         };
         reader
             .seek(std::io::SeekFrom::Start(position))
-            .map_err(RarError::Io)?;
+            .map_err(RarError::from)?;
         Ok(Self {
             scan,
             position,
@@ -205,7 +205,7 @@ impl ScanGuard {
                 None,
             ));
         }
-        let position = reader.stream_position().map_err(RarError::Io)?;
+        let position = reader.stream_position().map_err(RarError::from)?;
         if position <= self.position {
             return Err(RarError::CorruptArchive {
                 detail: format!(
@@ -244,13 +244,13 @@ fn parse_rar14_headers_with<R: Read + Seek>(
     scan: HeaderScan,
     short: &mut Option<ShortRead>,
 ) -> RarResult<Rar4ParsedVolume> {
-    let main_offset = reader.stream_position().map_err(RarError::Io)?;
+    let main_offset = reader.stream_position().map_err(RarError::from)?;
     let mut main = [0u8; 7];
     reader.read_exact(&mut main).map_err(|e| {
         if e.kind() == std::io::ErrorKind::UnexpectedEof {
             RarError::InvalidSignature
         } else {
-            RarError::Io(e)
+            RarError::from(e)
         }
     })?;
 
@@ -258,7 +258,7 @@ fn parse_rar14_headers_with<R: Read + Seek>(
     let mut comments = Vec::new();
     if main_size > 7 {
         let mut main_body = vec![0u8; usize::from(main_size - 7)];
-        reader.read_exact(&mut main_body).map_err(RarError::Io)?;
+        reader.read_exact(&mut main_body).map_err(RarError::from)?;
         if let Some(comment) =
             header::parse_rar14_main_comment(&main_body, main_offset, archive_header.flags)?
         {
@@ -269,7 +269,7 @@ fn parse_rar14_headers_with<R: Read + Seek>(
     let mut files = Vec::new();
     let mut guard = ScanGuard::new(reader, scan)?;
     loop {
-        let offset = reader.stream_position().map_err(RarError::Io)?;
+        let offset = reader.stream_position().map_err(RarError::from)?;
         // The least the next header can occupy: its fixed 21-byte block.
         let floor = offset + 21;
         let mut fixed = [0u8; 21];
@@ -279,7 +279,7 @@ fn parse_rar14_headers_with<R: Read + Seek>(
                 *short = Some(ShortRead::at_boundary(floor));
                 break;
             }
-            Err(e) => return Err(RarError::Io(e)),
+            Err(e) => return Err(RarError::from(e)),
         }
 
         let head_size = u16::from_le_bytes([fixed[10], fixed[11]]);
@@ -297,7 +297,7 @@ fn parse_rar14_headers_with<R: Read + Seek>(
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
                     RarError::TruncatedHeader { offset }
                 } else {
-                    RarError::Io(e)
+                    RarError::from(e)
                 }
             });
             if absorb_short_read(read, scan, reader, floor, short)?.is_none() {
@@ -447,7 +447,7 @@ pub(crate) fn resume_rar4_headers<R: Read + Seek>(
     }
     if !resume_encrypted {
         loop {
-            let header_start = reader.stream_position().map_err(RarError::Io)?;
+            let header_start = reader.stream_position().map_err(RarError::from)?;
             // The least the next header can occupy: the fixed seven-byte common
             // block.
             let floor = header_start + MIN_RAR4_HEADER_BYTES;
@@ -693,7 +693,7 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
 ) -> RarResult<()> {
     let mut guard = ScanGuard::new(reader, scan)?;
     loop {
-        let header_start = reader.stream_position().map_err(RarError::Io)?;
+        let header_start = reader.stream_position().map_err(RarError::from)?;
         // The least the next header can occupy: its salt and one cipher block.
         let floor = header_start + MIN_RAR4_ENCRYPTED_HEADER_BYTES;
         // Each encrypted header is preceded by its own 8-byte salt.
@@ -705,7 +705,7 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
                 *short = Some(ShortRead::at_boundary(floor));
                 break;
             }
-            Err(e) => return Err(RarError::Io(e)),
+            Err(e) => return Err(RarError::from(e)),
         }
 
         let (key, iv) = kdf_cache.derive_key_rar4(password, Some(&salt));
@@ -744,7 +744,7 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
                 // For encrypted headers, raw.offset is meaningless. The stream
                 // is positioned right after the aligned encrypted header block,
                 // which is where the file data starts.
-                fh.data_offset = reader.stream_position().map_err(RarError::Io)?;
+                fh.data_offset = reader.stream_position().map_err(RarError::from)?;
                 debug!(
                     "RAR4 encrypted file: name={:?} packed={} unpacked={:?} method={:?}",
                     fh.name, fh.packed_size, fh.unpacked_size, fh.method
@@ -769,7 +769,7 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
             }
             Rar4HeaderType::NewSub => {
                 let mut service = header::parse_file_header(&raw)?;
-                service.data_offset = reader.stream_position().map_err(RarError::Io)?;
+                service.data_offset = reader.stream_position().map_err(RarError::from)?;
                 debug!(
                     "RAR4 encrypted service: name={:?} packed={} unpacked={:?} method={:?}",
                     service.name, service.packed_size, service.unpacked_size, service.method

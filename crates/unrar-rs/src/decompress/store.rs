@@ -49,7 +49,7 @@ pub fn decompress_store_to_writer<W: Write>(
     const CHUNK: usize = 256 * 1024;
     let mut written = 0u64;
     for chunk in input.chunks(CHUNK) {
-        writer.write_all(chunk).map_err(RarError::Io)?;
+        writer.write_all(chunk).map_err(RarError::from)?;
         if let Some(ref mut h) = hasher {
             h.update(chunk);
         }

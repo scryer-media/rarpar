@@ -47,7 +47,7 @@ pub fn read_vint_from<R: Read>(reader: &mut R) -> RarResult<(u64, usize)> {
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
                 RarError::TruncatedHeader { offset: 0 }
             } else {
-                RarError::Io(e)
+                RarError::from(e)
             }
         })?;
 

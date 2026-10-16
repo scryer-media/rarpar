@@ -60,7 +60,7 @@ pub struct VolumeProbe {
 ///
 /// Returns `Err(InvalidSignature)` if the reader doesn't contain a RAR archive.
 pub fn probe_volume<R: Read + Seek>(reader: &mut R) -> RarResult<VolumeProbe> {
-    reader.seek(SeekFrom::Start(0)).map_err(RarError::Io)?;
+    reader.seek(SeekFrom::Start(0)).map_err(RarError::from)?;
     let format = signature::read_signature(reader)?;
 
     match format {

@@ -263,11 +263,14 @@ impl RarError {
     }
 }
 
-// Written out rather than `#[from]`, which would also make the I/O error the
-// variant's source and so render it twice along the chain.
+// An I/O error that carries a `RarError`, as one from a `Read` or `Write`
+// path does, is that error; any other is kept whole as `Io`, its kind, OS
+// error code and payload included. Written out rather than `#[from]`, which
+// would also make the I/O error the variant's source and so render it twice
+// along the chain.
 impl From<io::Error> for RarError {
     fn from(error: io::Error) -> Self {
-        Self::Io(error)
+        error.downcast::<Self>().unwrap_or_else(Self::Io)
     }
 }
 
@@ -298,6 +301,14 @@ mod tests {
             error.to_string(),
             "resource limit exceeded: packed data segment size 9 is above the limit of 4 for a.bin"
         );
+        assert!(matches!(
+            RarError::from(RarError::internal("worker stopped").into_io()),
+            RarError::Internal { .. }
+        ));
+        assert!(matches!(
+            RarError::from(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            RarError::Io(_)
+        ));
         assert_eq!(
             RarError::corrupt("x").into_io().kind(),
             io::ErrorKind::InvalidData

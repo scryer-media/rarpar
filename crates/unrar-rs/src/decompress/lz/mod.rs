@@ -354,7 +354,7 @@ impl LzDecoder {
             if space.is_empty() {
                 break;
             }
-            let read = input.read(space).map_err(RarError::Io)?;
+            let read = input.read(space).map_err(RarError::from)?;
             if read == 0 {
                 break;
             }
@@ -401,7 +401,7 @@ impl LzDecoder {
             let emitted = self
                 .window
                 .flush_visible_until(border.saturating_add(span.min(left)), writer)
-                .map_err(RarError::Io)?;
+                .map_err(RarError::from)?;
             self.current_file_emitted = self.current_file_emitted.saturating_add(emitted);
             self.current_file_written_size = self.current_file_written_size.saturating_add(span);
         }
@@ -1792,7 +1792,7 @@ impl LzDecoder {
                 // adds all of it to `WrittenFileSize` (unpack50.cpp:355-360),
                 // so a filtered block is emitted in full even when it carries
                 // the member past its declared size.
-                writer.write_all(&buf).map_err(RarError::Io)?;
+                writer.write_all(&buf).map_err(RarError::from)?;
                 self.current_file_emitted = self
                     .current_file_emitted
                     .saturating_add(block_length as u64);

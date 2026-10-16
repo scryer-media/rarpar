@@ -914,7 +914,7 @@ impl<R: Read> StreamingBitReader<R> {
         let n = self
             .inner
             .read(&mut self.buf[..limit])
-            .map_err(RarError::Io)?;
+            .map_err(RarError::from)?;
         self.buf_pos = 0;
         self.buf_len = n;
         if n == 0 {
@@ -1074,7 +1074,7 @@ impl<R: Read> StreamingBitReader<R> {
             let n = self
                 .inner
                 .read(&mut self.buf[self.buf_len..end])
-                .map_err(RarError::Io)?;
+                .map_err(RarError::from)?;
             self.buf_len += n;
             if n == 0 {
                 self.eof = true;

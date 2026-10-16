@@ -638,12 +638,16 @@ impl Rar20Decoder {
                 break;
             }
             if self.window.unflushed_bytes() as usize >= flush_threshold {
-                self.window.flush_to_writer(writer).map_err(RarError::Io)?;
+                self.window
+                    .flush_to_writer(writer)
+                    .map_err(RarError::from)?;
             }
         }
 
         self.read_last_tables(reader)?;
-        self.window.flush_to_writer(writer).map_err(RarError::Io)?;
+        self.window
+            .flush_to_writer(writer)
+            .map_err(RarError::from)?;
         Ok(output_size)
     }
 
@@ -760,7 +764,7 @@ impl Rar20Decoder {
             {
                 self.window
                     .flush_to_writer(&mut current_writer)
-                    .map_err(RarError::Io)?;
+                    .map_err(RarError::from)?;
             }
 
             if let Some(next_vol) = pending_boundary_volume.take() {
@@ -774,7 +778,7 @@ impl Rar20Decoder {
         self.read_last_tables(reader)?;
         self.window
             .flush_to_writer(&mut current_writer)
-            .map_err(RarError::Io)?;
+            .map_err(RarError::from)?;
         if chunk_bytes > 0 || chunks.is_empty() {
             chunks.push((current_vol, chunk_bytes));
         }
@@ -1318,11 +1322,15 @@ impl Rar15Decoder {
 
             output_size = self.decode_next(reader, output_size, unpacked_size)?;
             if self.window.unflushed_bytes() as usize >= flush_threshold {
-                self.window.flush_to_writer(writer).map_err(RarError::Io)?;
+                self.window
+                    .flush_to_writer(writer)
+                    .map_err(RarError::from)?;
             }
         }
 
-        self.window.flush_to_writer(writer).map_err(RarError::Io)?;
+        self.window
+            .flush_to_writer(writer)
+            .map_err(RarError::from)?;
         Ok(output_size)
     }
 
@@ -1433,7 +1441,7 @@ impl Rar15Decoder {
             {
                 self.window
                     .flush_to_writer(&mut current_writer)
-                    .map_err(RarError::Io)?;
+                    .map_err(RarError::from)?;
             }
 
             if let Some(next_vol) = pending_boundary_volume.take() {
@@ -1446,7 +1454,7 @@ impl Rar15Decoder {
 
         self.window
             .flush_to_writer(&mut current_writer)
-            .map_err(RarError::Io)?;
+            .map_err(RarError::from)?;
         if chunk_bytes > 0 || chunks.is_empty() {
             chunks.push((current_vol, chunk_bytes));
         }

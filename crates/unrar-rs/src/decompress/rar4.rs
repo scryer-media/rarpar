@@ -1499,7 +1499,7 @@ impl Rar4LzDecoder {
             let emitted = self
                 .window
                 .flush_visible_until(border.saturating_add(span.min(left)), writer)
-                .map_err(RarError::Io)?;
+                .map_err(RarError::from)?;
             self.current_file_emitted = self.current_file_emitted.saturating_add(emitted);
             self.current_file_written_size = self.current_file_written_size.saturating_add(span);
         }
@@ -2267,7 +2267,7 @@ impl Rar4LzDecoder {
             // even when it carries the member past its declared size.
             writer
                 .write_all(&self.filter_scratch)
-                .map_err(RarError::Io)?;
+                .map_err(RarError::from)?;
             self.current_file_emitted = self
                 .current_file_emitted
                 .saturating_add(self.filter_scratch.len() as u64);
