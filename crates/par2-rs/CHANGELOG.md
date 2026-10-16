@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.11
+
+### Changed
+
+- The `crypto-aws-lc` backend requires `aws-lc-sys` 0.46, the version
+  `aws-lc-rs` 1.18.2 links, so a consumer on current `aws-lc-rs` builds one
+  copy of AWS-LC instead of two. No behaviour change.
+
 ## 0.10.10
 
 ### Changed

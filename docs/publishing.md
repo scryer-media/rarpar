@@ -27,8 +27,11 @@ For the advanced PAR3 engine, the current versions are `reedsolomon-rs` 0.4.5,
 `par2-rs` 0.10.3. PAR3 requires arithmetic 0.4.5 and the CLI requires PAR3
 0.4.2. The CLI names each sibling library by workspace path together with
 that version floor, so the binary is always built from the tree being tagged
-while the floor still records the published release it corresponds to. Keep
-the two in step: raising a floor without publishing that version leaves a
+while the floor still records the published release it corresponds to. A
+floor is a caret requirement (`version = "0.7.1"`), never an exact `=` pin,
+so a later patch release of the library unifies with it in a consumer's
+graph instead of forcing a second copy; the same goes for every external
+dependency. Keep the two in step: raising a floor without publishing that version leaves a
 manifest that only the workspace can satisfy. Cargo verifies the sibling
 library archives with `cargo package --locked -p reedsolomon-rs -p par3-rs`;
 that validates the packages together, not their availability in the public
