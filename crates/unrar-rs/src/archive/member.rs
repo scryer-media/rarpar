@@ -25,12 +25,13 @@ const STORE_HASHED_CHUNK_BYTES: usize = crate::hash_pipeline::PENDING_FLUSH_BYTE
 /// writer. Two keep both kernel copies busy; more only adds resident buffers.
 const STORE_READ_AHEAD_CHUNKS: usize = 2;
 /// Output buffer for member extraction, deliberately smaller than the spans the
-/// producers hand down (store copies at [`STREAMING_STORE_CHUNK_BUFFER_BYTES`],
-/// LZ window flushes at up to 4 MiB). `BufWriter` bypasses its buffer only for
-/// a single write at or above capacity, so a capacity above the flush span
-/// would memcpy every output byte for no reduction in syscalls; below it, large
-/// spans go straight to `write` and only the small ones (per-filter subranges)
-/// are coalesced.
+/// producers hand down (unhashed store copies at
+/// [`STREAMING_STORE_CHUNK_BUFFER_BYTES`], hashed ones at
+/// [`STORE_HASHED_CHUNK_BYTES`], LZ window flushes at up to 4 MiB). `BufWriter`
+/// bypasses its buffer only for a single write at or above capacity, so a
+/// capacity above the flush span would memcpy every output byte for no
+/// reduction in syscalls; below it, large spans go straight to `write` and
+/// only the small ones (per-filter subranges) are coalesced.
 const OUTPUT_WRITE_BUFFER_BYTES: usize = 512 * 1024;
 /// Input buffer for the volume-chained decode streams, the read-side twin of
 /// [`OUTPUT_WRITE_BUFFER_BYTES`] and deliberately smaller than the spans the
@@ -57,28 +58,44 @@ const WINDOWS_FILE_ATTRIBUTE_READONLY: u32 = 0x1;
 /// thread read, served as one ordered byte stream to the decrypting reader.
 /// Spent spans go back to the fetch thread for reuse.
 struct StagedCiphertext {
-    chunks: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    chunks: std::sync::mpsc::Receiver<std::io::Result<StagedSpan>>,
     spare: std::sync::mpsc::Sender<Vec<u8>>,
-    current: Vec<u8>,
+    current: StagedSpan,
     pos: usize,
     finished: bool,
+    /// The fetch error, kept so that every read after it fails too. The
+    /// fetch thread stops at its error, so without this a retry would see
+    /// the closed channel and answer a clean end of stream.
+    failed: Option<(std::io::ErrorKind, String)>,
+}
+
+/// One span the fetch thread read: a buffer kept at its full length, so the
+/// next read into it after recycling needs no resize and no zeroing, and the
+/// count of bytes the read put at its start.
+#[derive(Default)]
+struct StagedSpan {
+    bytes: Vec<u8>,
+    filled: usize,
 }
 
 impl Read for StagedCiphertext {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        while self.pos == self.current.len() {
+        while self.pos == self.current.filled {
+            if let Some((kind, message)) = &self.failed {
+                return Err(std::io::Error::new(*kind, message.clone()));
+            }
             if self.finished || buf.is_empty() {
                 return Ok(0);
             }
             let spent = std::mem::take(&mut self.current);
-            if spent.capacity() > 0 {
-                let _ = self.spare.send(spent);
+            if !spent.bytes.is_empty() {
+                let _ = self.spare.send(spent.bytes);
             }
             self.pos = 0;
             match self.chunks.recv() {
                 Ok(Ok(chunk)) => self.current = chunk,
                 Ok(Err(error)) => {
-                    self.finished = true;
+                    self.failed = Some((error.kind(), error.to_string()));
                     return Err(error);
                 }
                 Err(_) => {
@@ -87,8 +104,8 @@ impl Read for StagedCiphertext {
                 }
             }
         }
-        let n = (self.current.len() - self.pos).min(buf.len());
-        buf[..n].copy_from_slice(&self.current[self.pos..self.pos + n]);
+        let n = (self.current.filled - self.pos).min(buf.len());
+        buf[..n].copy_from_slice(&self.current.bytes[self.pos..self.pos + n]);
         self.pos += n;
         Ok(n)
     }
@@ -4140,27 +4157,30 @@ impl RarArchive {
         let reader = decrypt(Box::new(StagedCiphertext {
             chunks: raw_rx,
             spare: spare_tx,
-            current: Vec::new(),
+            current: StagedSpan::default(),
             pos: 0,
             finished: false,
+            failed: None,
         }))?;
         std::thread::scope(|scope| {
             let fetch_thread = std::thread::Builder::new()
                 .name("weaver-rar-fetch".into())
                 .spawn_scoped(scope, move || {
                     let mut ciphertext = ciphertext;
+                    // A buffer an interrupted read left unused.
+                    let mut unused: Option<Vec<u8>> = None;
                     loop {
-                        let mut chunk = spare_rx
-                            .try_recv()
-                            .unwrap_or_else(|_| vec![0u8; STORE_HASHED_CHUNK_BYTES]);
-                        chunk.resize(STORE_HASHED_CHUNK_BYTES, 0);
-                        let sent = match ciphertext.read(&mut chunk) {
+                        // Recycled buffers come back at their full length, so
+                        // only a fresh allocation is ever zeroed.
+                        let mut bytes = unused
+                            .take()
+                            .or_else(|| spare_rx.try_recv().ok())
+                            .unwrap_or_else(|| vec![0u8; STORE_HASHED_CHUNK_BYTES]);
+                        let sent = match ciphertext.read(&mut bytes) {
                             Ok(0) => break,
-                            Ok(read) => {
-                                chunk.truncate(read);
-                                raw_tx.send(Ok(chunk))
-                            }
+                            Ok(filled) => raw_tx.send(Ok(StagedSpan { bytes, filled })),
                             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                                unused = Some(bytes);
                                 continue;
                             }
                             Err(error) => {
@@ -10073,6 +10093,240 @@ mod tests {
         )
         .expect_err("write error must fail the copy");
         assert!(matches!(err, RarError::Io(_)), "{err}");
+    }
+
+    const STAGED_AES_KEY: [u8; 32] = [
+        0x6b, 0x1f, 0x93, 0x02, 0xd4, 0x5e, 0xa7, 0x38, 0xc1, 0x0d, 0x76, 0xe9, 0x24, 0xb8, 0x4f,
+        0x91, 0x3a, 0xec, 0x05, 0x7d, 0xb2, 0x68, 0xf1, 0x16, 0x8c, 0x47, 0xd9, 0x2b, 0x60, 0xae,
+        0x13, 0xf5,
+    ];
+    const STAGED_AES_IV: [u8; 16] = [
+        0x9e, 0x31, 0x5c, 0xa8, 0x07, 0xd2, 0x64, 0xbb, 0x1e, 0x83, 0xf9, 0x40, 0x2d, 0xc6, 0x75,
+        0x0a,
+    ];
+    const STAGED_LEGACY_PASSWORD: &str = "staged-store";
+
+    /// The decryptors a staged encrypted store copy runs: AES-256 (RAR5) in
+    /// the block-aligned mode, the RAR 2.0 cipher as the block-aligned legacy
+    /// one, and the RAR 1.5 cipher in the streaming mode.
+    #[derive(Clone, Copy, Debug)]
+    enum StagedCipher {
+        Rar5Aes,
+        Rar20,
+        Rar15,
+    }
+
+    impl StagedCipher {
+        const ALL: [Self; 3] = [Self::Rar5Aes, Self::Rar20, Self::Rar15];
+
+        /// The granularity the decrypting reader hands plaintext back in.
+        fn block(self) -> usize {
+            match self {
+                Self::Rar5Aes | Self::Rar20 => crate::crypto::AES_BLOCK,
+                Self::Rar15 => 1,
+            }
+        }
+
+        /// The member's packed bytes: `plain`, zero-padded to a whole block,
+        /// encrypted.
+        fn encrypt(self, plain: &[u8]) -> Vec<u8> {
+            let mut padded = plain.to_vec();
+            padded.resize(plain.len().next_multiple_of(self.block()), 0);
+            match self {
+                Self::Rar5Aes => crate::crypto::encrypt_aes256_cbc_for_test(
+                    &STAGED_AES_KEY,
+                    &STAGED_AES_IV,
+                    &padded,
+                ),
+                Self::Rar20 => {
+                    crate::crypto::encrypt_rar20_for_test(STAGED_LEGACY_PASSWORD, &mut padded);
+                    padded
+                }
+                Self::Rar15 => {
+                    // The RAR 1.5 cipher XORs a keystream, so decrypting the
+                    // plaintext encrypts it.
+                    let mut ciphertext = Vec::with_capacity(padded.len());
+                    self.decrypt(Box::new(Cursor::new(padded)))
+                        .expect("RAR 1.5 reader")
+                        .read_to_end(&mut ciphertext)
+                        .expect("RAR 1.5 keystream");
+                    ciphertext
+                }
+            }
+        }
+
+        fn decrypt<'r>(
+            self,
+            source: Box<dyn Read + Send + 'r>,
+        ) -> RarResult<Box<dyn Read + Send + 'r>> {
+            use crate::rar4::types::Rar4EncryptionMethod;
+            Ok(match self {
+                Self::Rar5Aes => Box::new(crate::crypto::DecryptingReader::new_rar5(
+                    source,
+                    &STAGED_AES_KEY,
+                    &STAGED_AES_IV,
+                )),
+                Self::Rar20 => Box::new(crate::crypto::DecryptingReader::new_rar4_legacy(
+                    source,
+                    Rar4EncryptionMethod::Rar20,
+                    STAGED_LEGACY_PASSWORD,
+                )),
+                Self::Rar15 => Box::new(crate::crypto::DecryptingReader::new_rar4_legacy(
+                    source,
+                    Rar4EncryptionMethod::Rar15,
+                    STAGED_LEGACY_PASSWORD,
+                )),
+            })
+        }
+    }
+
+    /// Past the pipeline threshold, with a tail that is not a whole block.
+    fn real_cipher_store_len() -> usize {
+        crate::hash_pipeline::PIPELINE_MIN_BYTES as usize + 12_345
+    }
+
+    /// The staged encrypted copy, with a real decrypting reader on its
+    /// decrypt thread, writes and hashes the plaintext.
+    #[test]
+    fn staged_encrypted_store_copy_decrypts_with_real_ciphers() {
+        let plain = stored_payload(real_cipher_store_len());
+        let mut blake = Blake2spHasher::new();
+        blake.update(&plain);
+        let expected_blake = blake.finalize();
+        for cipher in StagedCipher::ALL {
+            let ciphertext = cipher.encrypt(&plain);
+            let stream_hash = pipelined_store_hash(plain.len());
+            let mut output = Vec::new();
+            let written = RarArchive::copy_encrypted_reader_hashed(
+                scripted_store_reader(&ciphertext, None),
+                |source| cipher.decrypt(source),
+                &mut output,
+                &stream_hash,
+                StoreCopyLimit::Exact(plain.len() as u64),
+                "member.bin",
+            )
+            .unwrap_or_else(|err| panic!("{cipher:?} staged copy: {err}"));
+            assert_eq!(written, plain.len() as u64, "{cipher:?}");
+            assert!(output == plain, "{cipher:?} output differs from the source");
+            let hashes = stream_hash.finalize().expect("hashes");
+            assert_eq!(hashes.crc32, Some(crate::crc::hash(&plain)), "{cipher:?}");
+            assert_eq!(hashes.blake2sp, Some(expected_blake), "{cipher:?}");
+        }
+    }
+
+    /// A volume read that fails mid-stream reaches the caller through the
+    /// real decrypting reader, after every whole block read before it was
+    /// written.
+    #[test]
+    fn staged_encrypted_store_copy_with_real_ciphers_stops_at_a_read_error() {
+        let plain = stored_payload(real_cipher_store_len());
+        let fail_at = 5 * STORE_HASHED_CHUNK_BYTES + 1_234;
+        for cipher in StagedCipher::ALL {
+            let ciphertext = cipher.encrypt(&plain);
+            let stream_hash = pipelined_store_hash(plain.len());
+            let mut output = Vec::new();
+            let err = RarArchive::copy_encrypted_reader_hashed(
+                scripted_store_reader(&ciphertext, Some(fail_at)),
+                |source| cipher.decrypt(source),
+                &mut output,
+                &stream_hash,
+                StoreCopyLimit::Exact(plain.len() as u64),
+                "member.bin",
+            )
+            .expect_err("read error must fail the copy");
+            assert!(
+                format!("{err}").contains("scripted read failure"),
+                "{cipher:?}: {err}"
+            );
+            let decrypted = fail_at - fail_at % cipher.block();
+            assert!(
+                output == plain[..decrypted],
+                "{cipher:?}: output must hold the {decrypted} bytes before the failed read, \
+                 got {}",
+                output.len()
+            );
+        }
+    }
+
+    /// Once the fetch thread has reported an error, every later read of the
+    /// staged ciphertext fails with it again; none answers end of stream.
+    #[test]
+    fn staged_ciphertext_repeats_a_fetch_error() {
+        let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel(4);
+        let (spare_tx, _spare_rx) = std::sync::mpsc::channel();
+        chunk_tx
+            .send(Ok(StagedSpan {
+                bytes: vec![1, 2, 3],
+                filled: 3,
+            }))
+            .expect("queue span");
+        chunk_tx
+            .send(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "volume fetch failed",
+            )))
+            .expect("queue error");
+        // The fetch thread stops after its error.
+        drop(chunk_tx);
+        let mut staged = StagedCiphertext {
+            chunks: chunk_rx,
+            spare: spare_tx,
+            current: StagedSpan::default(),
+            pos: 0,
+            finished: false,
+            failed: None,
+        };
+
+        let mut buf = [0u8; 8];
+        assert_eq!(staged.read(&mut buf).expect("first span"), 3);
+        assert_eq!(buf[..3], [1, 2, 3]);
+        for attempt in 0..3 {
+            let err = staged
+                .read(&mut buf)
+                .expect_err("a read after the fetch error must fail");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionReset,
+                "attempt {attempt}"
+            );
+            assert!(
+                err.to_string().contains("volume fetch failed"),
+                "attempt {attempt}: {err}"
+            );
+        }
+    }
+
+    /// The staged ciphertext serves only the filled part of each span and
+    /// hands the buffer back at its full length, so the fetch thread can read
+    /// into it again without resizing or zeroing it.
+    #[test]
+    fn staged_ciphertext_serves_filled_bytes_and_recycles_whole_buffers() {
+        let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel(4);
+        let (spare_tx, spare_rx) = std::sync::mpsc::channel();
+        let mut first = vec![0xEE; 16];
+        first[..5].copy_from_slice(&[1, 2, 3, 4, 5]);
+        let mut second = vec![0xEE; 16];
+        second[..2].copy_from_slice(&[6, 7]);
+        for (bytes, filled) in [(first, 5), (second, 2)] {
+            chunk_tx
+                .send(Ok(StagedSpan { bytes, filled }))
+                .expect("queue span");
+        }
+        drop(chunk_tx);
+        let mut staged = StagedCiphertext {
+            chunks: chunk_rx,
+            spare: spare_tx,
+            current: StagedSpan::default(),
+            pos: 0,
+            finished: false,
+            failed: None,
+        };
+
+        let mut stream = Vec::new();
+        staged.read_to_end(&mut stream).expect("staged stream");
+        assert_eq!(stream, [1, 2, 3, 4, 5, 6, 7]);
+        let recycled: Vec<usize> = spare_rx.try_iter().map(|buffer| buffer.len()).collect();
+        assert_eq!(recycled, [16, 16], "spent spans come back whole");
     }
 
     /// A write error returns that error and does not leave the reader thread

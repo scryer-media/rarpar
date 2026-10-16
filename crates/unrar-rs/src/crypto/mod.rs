@@ -993,6 +993,19 @@ impl Drop for Rar20Decryptor {
     }
 }
 
+/// Encrypt block-aligned `data` in place with the RAR 2.0 cipher under
+/// `password`: the inverse of `DecryptingReader::new_rar4_legacy` with
+/// [`Rar4EncryptionMethod::Rar20`]. Not part of the RAR read path; tests use
+/// it to build ciphertext the decrypting reader is run over.
+#[cfg(test)]
+pub(crate) fn encrypt_rar20_for_test(password: &str, data: &mut [u8]) {
+    assert_eq!(data.len() % AES_BLOCK, 0, "RAR 2.0 encrypts whole blocks");
+    let mut cipher = Rar20Decryptor::new(password);
+    for block in data.chunks_exact_mut(AES_BLOCK) {
+        cipher.encrypt_block(block);
+    }
+}
+
 /// RAR4 key derivation iteration count.
 const RAR4_KDF_ITERATIONS: u32 = 0x40000; // 262144
 
