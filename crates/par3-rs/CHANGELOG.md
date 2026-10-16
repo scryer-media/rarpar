@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.1 (unreleased)
+## 0.7.1
 
 - A repair that keeps a backup (`RepairOptions::with_backup(true)`, or
   `backup: true` to `Par3RepairSession::repair`) no longer renames the
