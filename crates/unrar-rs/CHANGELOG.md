@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.11.2 (unreleased)
+
+### Changed
+
+- A stored member with a CRC32 or BLAKE2sp check, extracted to a file, a
+  writer or memory, reads each span straight into the buffer the hash
+  workers receive, instead of copying every byte into a second buffer for
+  them. The span is 1 MiB, down from 4 MiB. On a 4-core Atom C3538,
+  extracting 248 MiB of stored multi-volume media takes 350 ms instead of
+  460 ms (UnRAR 7.23: 400 ms), and peak RSS falls from 14.5 to 9.5 MiB.
+- Hash worker buffers are allocated at the 1 MiB they are filled to,
+  instead of 4 MiB.
+
 ## 0.11.1
 
 ### Changed

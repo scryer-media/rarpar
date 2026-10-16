@@ -15,6 +15,12 @@ use crate::hash_pipeline::SharedHashStream;
 use crate::volume::VolumeProvider;
 
 const STREAMING_STORE_CHUNK_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+/// Span of a hashed store copy: the read buffer is the chunk the hash lanes
+/// receive, so it is sized to the pipeline's flush span (1 MiB). That keeps
+/// each span inside a small core's L2 between the read and the write, and
+/// stays at or above [`OUTPUT_WRITE_BUFFER_BYTES`] so writes bypass the
+/// `BufWriter`.
+const STORE_HASHED_CHUNK_BYTES: usize = crate::hash_pipeline::PENDING_FLUSH_BYTES;
 /// Output buffer for member extraction, deliberately smaller than the spans the
 /// producers hand down (store copies at [`STREAMING_STORE_CHUNK_BUFFER_BYTES`],
 /// LZ window flushes at up to 4 MiB). `BufWriter` bypasses its buffer only for
@@ -3987,6 +3993,48 @@ impl RarArchive {
         Ok(written)
     }
 
+    /// [`copy_reader_to_writer`](Self::copy_reader_to_writer) for a hashed
+    /// store copy: each span is read straight into a buffer from
+    /// `stream_hash`'s pool, written, and then handed to the hash lanes, so no
+    /// byte is copied a second time on the way to the hasher.
+    fn copy_reader_hashed<R: Read, W: Write + ?Sized>(
+        mut reader: R,
+        writer: &mut W,
+        stream_hash: &SharedHashStream,
+        limit: StoreCopyLimit,
+        member_name: &str,
+    ) -> RarResult<u64> {
+        let mut written = 0u64;
+
+        loop {
+            let to_read = limit.next_read_len(written, STORE_HASHED_CHUNK_BYTES);
+            if to_read == 0 {
+                Self::enforce_store_ceiling_not_exceeded(&mut reader, limit, member_name)?;
+                break;
+            }
+
+            let mut chunk = stream_hash.take_buffer_len(to_read);
+            let read = reader
+                .read(&mut chunk[..to_read])
+                .map_err(Self::read_error_to_rar)?;
+            if read == 0 {
+                if limit.is_exact() {
+                    return Err(RarError::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "unexpected EOF while copying member data",
+                    )));
+                }
+                break;
+            }
+            chunk.truncate(read);
+            writer.write_all(&chunk).map_err(RarError::Io)?;
+            written += read as u64;
+            stream_hash.submit(chunk).map_err(RarError::Io)?;
+        }
+
+        Ok(written)
+    }
+
     fn copy_reader_to_writer_chunked<R: Read, F, W>(
         mut reader: R,
         volume_tracker: Arc<AtomicUsize>,
@@ -4143,10 +4191,6 @@ impl RarArchive {
                 let base_reader =
                     ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
                         .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
-                let mut hash_writer = HashTrackingWriter {
-                    inner: &mut output,
-                    hash: Some(stream_hash.clone()),
-                };
 
                 let written = if let Some(ref pwd) = member_password {
                     if archive_format.is_rar4_family() {
@@ -4157,9 +4201,10 @@ impl RarArchive {
                             pwd,
                             rar4_salt,
                         )?;
-                        Self::copy_reader_to_writer(
+                        Self::copy_reader_hashed(
                             reader,
-                            &mut hash_writer,
+                            &mut output,
+                            &stream_hash,
                             store_limit,
                             &fh.name,
                         )?
@@ -4178,17 +4223,19 @@ impl RarArchive {
                             &crypto.key,
                             &crypto.iv,
                         );
-                        Self::copy_reader_to_writer(
+                        Self::copy_reader_hashed(
                             reader,
-                            &mut hash_writer,
+                            &mut output,
+                            &stream_hash,
                             store_limit,
                             &fh.name,
                         )?
                     }
                 } else {
-                    Self::copy_reader_to_writer(
+                    Self::copy_reader_hashed(
                         base_reader,
-                        &mut hash_writer,
+                        &mut output,
+                        &stream_hash,
                         store_limit,
                         &fh.name,
                     )?
@@ -4785,10 +4832,6 @@ impl RarArchive {
                 let base_reader =
                     ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
                         .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
-                let mut hash_writer = HashTrackingWriter {
-                    inner: &mut writer,
-                    hash: Some(stream_hash.clone()),
-                };
 
                 let written = if let Some(ref pwd) = member_password {
                     if archive_format.is_rar4_family() {
@@ -4799,9 +4842,10 @@ impl RarArchive {
                             pwd,
                             rar4_salt,
                         )?;
-                        Self::copy_reader_to_writer(
+                        Self::copy_reader_hashed(
                             reader,
-                            &mut hash_writer,
+                            &mut writer,
+                            &stream_hash,
                             store_limit,
                             &fh.name,
                         )?
@@ -4820,17 +4864,19 @@ impl RarArchive {
                             &crypto.key,
                             &crypto.iv,
                         );
-                        Self::copy_reader_to_writer(
+                        Self::copy_reader_hashed(
                             reader,
-                            &mut hash_writer,
+                            &mut writer,
+                            &stream_hash,
                             store_limit,
                             &fh.name,
                         )?
                     }
                 } else {
-                    Self::copy_reader_to_writer(
+                    Self::copy_reader_hashed(
                         base_reader,
-                        &mut hash_writer,
+                        &mut writer,
+                        &stream_hash,
                         store_limit,
                         &fh.name,
                     )?
@@ -5461,13 +5507,9 @@ impl RarArchive {
                 unpacked_size,
             );
             let (written, actual_crc, actual_data_hash, actual_blake) = {
-                let mut hash_writer = HashTrackingWriter {
-                    inner: writer,
-                    hash: Some(stream_hash.clone()),
-                };
                 let written =
-                    Self::copy_reader_to_writer(reader, &mut hash_writer, store_limit, &fh.name)?;
-                hash_writer.flush().map_err(RarError::Io)?;
+                    Self::copy_reader_hashed(reader, writer, &stream_hash, store_limit, &fh.name)?;
+                writer.flush().map_err(RarError::Io)?;
                 let outputs = stream_hash.finalize().map_err(RarError::Io)?;
                 let actual_crc = expected_crc.map(|_| outputs.crc32.unwrap_or(0));
                 let actual_data_hash = expected_data_hash.map(|expected| match expected {
@@ -6116,7 +6158,7 @@ impl RarArchive {
         };
 
         loop {
-            let to_read = store_limit.next_read_len(written, STREAMING_STORE_CHUNK_BUFFER_BYTES);
+            let to_read = store_limit.next_read_len(written, STORE_HASHED_CHUNK_BYTES);
             if to_read == 0 {
                 Self::enforce_store_ceiling_not_exceeded(&mut reader, store_limit, &fh.name)?;
                 break;
@@ -6539,8 +6581,7 @@ impl RarArchive {
         let mut total_written = 0u64;
 
         loop {
-            let to_read =
-                store_limit.next_read_len(total_written, STREAMING_STORE_CHUNK_BUFFER_BYTES);
+            let to_read = store_limit.next_read_len(total_written, STORE_HASHED_CHUNK_BYTES);
             if to_read == 0 {
                 Self::enforce_store_ceiling_not_exceeded(&mut reader, store_limit, &fh.name)?;
                 break;

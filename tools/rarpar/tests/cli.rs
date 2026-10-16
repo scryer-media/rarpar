@@ -1679,6 +1679,54 @@ fn compat_unrar_e_flattens_member_paths() {
 }
 
 #[test]
+fn compat_unrar_test_writes_nothing_for_plain_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    for name in ["rar5_multifile_store.rar", "rar5_symlink.rar"] {
+        let archive = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar5", name]);
+        let test = Command::new(bin())
+            .env("TMPDIR", tmp.path())
+            .args([OsStr::new("t"), archive.as_os_str()])
+            .output()
+            .unwrap();
+        assert!(
+            test.status.success(),
+            "compat test of {name} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&test.stdout),
+            String::from_utf8_lossy(&test.stderr)
+        );
+        assert!(String::from_utf8_lossy(&test.stdout).contains("All OK"));
+        // The scratch tree a link set needs is removed when the run ends;
+        // a set of plain files never creates one.
+        assert_eq!(
+            std::fs::read_dir(tmp.path()).unwrap().count(),
+            0,
+            "{name} left files in TMPDIR"
+        );
+    }
+    let store = fixture(&[
+        "crates",
+        "unrar-rs",
+        "tests",
+        "fixtures",
+        "rar5",
+        "rar5_multifile_store.rar",
+    ]);
+    let stdout = String::from_utf8_lossy(
+        &Command::new(bin())
+            .env("TMPDIR", "/nonexistent-rarpar-test-tmpdir")
+            .args([OsStr::new("t"), store.as_os_str()])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .into_owned();
+    assert!(
+        stdout.contains("All OK"),
+        "plain files needed a scratch tree: {stdout}"
+    );
+}
+
+#[test]
 fn compat_unrar_test_and_list_cover_operational_commands() {
     let archive = fixture(&[
         "crates",

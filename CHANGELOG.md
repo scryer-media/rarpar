@@ -15,6 +15,16 @@ documented in each crate's own changelog so those notes ship with the crate.
   backups running at 0.23–0.77× of `par2cmdline-turbo`'s on cloud block
   volumes in the 0.8.1 PAR2-against-PAR3 comparison; not yet re-measured.
   Repair without `--backup` is unchanged.
+- `t` (test) decodes each file into a sink instead of extracting the
+  archive into a temporary directory, so testing writes nothing; a 50 GiB
+  stored release no longer needs 50 GiB free in `$TMPDIR`. A set holding
+  symlinks, hard links or file copies still extracts into a temporary
+  directory, because those members are checked against their targets.
+  Each tested file prints `Testing  <name> OK`. On a 4-core Atom C3538,
+  testing 248 MiB of stored media takes 0.20 s instead of 0.50 s.
+- Stored members extract without a second copy of every byte for hashing
+  (unrar-rs 0.11.2). On a 4-core Atom C3538 the stored-media cases move from
+  0.85–0.92× of UnRAR 7.23 to 1.08–1.22×.
 
 ### Benchmark harness only
 
