@@ -93,9 +93,8 @@ opt-level = 3
 # optimising unrar-rs itself would also build its test binaries optimised in every
 # unrar-tests shard (a cold unrar-rs test build is 587 CPU-s instead of 69).
 
-# ppmd-turbo 0.2.0, lzma-turbo 0.10.0 and sevenz-turbo 0.29.0 are not published yet: these point
-# at their release commits until they are, and are removed then.
+# lzma-turbo 0.10.0 and sevenz-turbo 0.29.0 are not published yet: these point at their
+# release commits until they are, and are removed then.
 [patch.crates-io]
-ppmd-turbo = { git = "https://github.com/scryer-media/ppmd-turbo", rev = "352df40194fc9dcdf0015f8030e4f9cfeef278f5" }
 lzma-turbo = { git = "https://github.com/scryer-media/lzma-turbo", rev = "1b1f763b282889e365bc35d63d19e8ef74a0e940" }
 sevenz-turbo = { git = "https://github.com/scryer-media/sevenz-turbo", rev = "561bf24a7ad9310962b62f053572ad74c94f71fa" }

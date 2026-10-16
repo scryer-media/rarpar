@@ -2151,7 +2151,8 @@ dependencies = [
 [[package]]
 name = "ppmd-turbo"
 version = "0.2.0"
-source = "git+https://github.com/scryer-media/ppmd-turbo?rev=352df40194fc9dcdf0015f8030e4f9cfeef278f5#352df40194fc9dcdf0015f8030e4f9cfeef278f5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f79f9e9a62828a7cefa4885bc3223b2f3f3ac8cb4b4de2cab4835982dcb6194"
 
 [[package]]
 name = "presser"
