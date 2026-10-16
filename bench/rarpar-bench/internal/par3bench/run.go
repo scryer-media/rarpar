@@ -26,8 +26,11 @@ const (
 	// the rarpar repair rows in two: rarpar-wN repairs in place and keeps no
 	// backup, rarpar-wN-backup keeps a numbered `.1` backup of every file it
 	// repairs, as the reference does (see Results.BackupArgs). A v2
-	// rarpar-wN repair row kept that backup.
-	ResultsSchema = "rarpar-par3-bench-v3"
+	// rarpar-wN repair row kept that backup. v4 added the PAR2 rows
+	// (par2-rs, par2cmdline-turbo) on the sets that ask for them (Config.PAR2)
+	// and each set's posting shape; a v3 file reads the same, with no PAR2 rows.
+	ResultsSchema   = "rarpar-par3-bench-v4"
+	resultsSchemaV3 = "rarpar-par3-bench-v3"
 
 	OpCreate        = "create"
 	OpVerify        = "verify"
@@ -36,6 +39,12 @@ const (
 
 	ToolReference = "reference"
 	ToolCandidate = "rarpar"
+	// ToolPAR2 is rarpar's PAR2 engine (`rarpar par`) and ToolPAR2Turbo is
+	// par2cmdline-turbo (only with Options.PAR2Turbo). Each is one row, named
+	// as its tool, at the tool's default thread count, on the sets that ask
+	// for PAR2 rows (Config.PAR2).
+	ToolPAR2      = "par2-rs"
+	ToolPAR2Turbo = "par2cmdline-turbo"
 
 	// StatusOK, StatusFailed and StatusDNF are the run statuses. DNF ("did not
 	// finish") is only ever given to the reference: a reference that exits
@@ -56,7 +65,11 @@ const (
 	DefaultTimeout = 20 * time.Minute
 
 	carrierName = "set.par3"
+	par2Name    = "set.par2"
 )
+
+// isPAR2Tool reports whether a row is one of the PAR2 rows.
+func isPAR2Tool(tool string) bool { return tool == ToolPAR2 || tool == ToolPAR2Turbo }
 
 // KnownOps lists every operation in run order.
 var KnownOps = []string{OpCreate, OpVerify, OpVerifyDamaged, OpRepair}
@@ -95,8 +108,10 @@ func ParseKernelVariant(text string) (KernelVariant, error) {
 
 // Options configures one suite run.
 type Options struct {
-	Reference      string
-	Candidate      string
+	Reference string
+	Candidate string
+	// PAR2Turbo is par2cmdline-turbo; empty leaves its PAR2 row out.
+	PAR2Turbo      string
 	EnginePerf     string
 	Work           string
 	Out            string
@@ -163,8 +178,13 @@ func (v Variant) RunsOp(op string) bool {
 // dirName is the variant's short stage-directory name. Stage paths are kept
 // short on purpose: see ReferencePathBudget.
 func (v Variant) dirName() string {
-	if v.Tool == ToolReference {
+	switch v.Tool {
+	case ToolReference:
 		return "ref"
+	case ToolPAR2:
+		return "p2"
+	case ToolPAR2Turbo:
+		return "p2t"
 	}
 	name, _, _ := strings.Cut(v.Name, "@")
 	return strings.TrimPrefix(name, "rarpar-")
@@ -198,6 +218,12 @@ func Variants(workers []int, kernels []KernelVariant) []Variant {
 	return variants
 }
 
+// PAR2Rows are the PAR2 rows; they run only on the sets that ask for them
+// (Config.PAR2).
+func PAR2Rows() []Variant {
+	return []Variant{{Name: ToolPAR2, Tool: ToolPAR2}, {Name: ToolPAR2Turbo, Tool: ToolPAR2Turbo}}
+}
+
 // EngineRows lists the timed engine_perf rows: one per worker count, then one
 // per env variant, named like the rarpar rows. They run buffered too (see
 // engineCommand).
@@ -215,14 +241,16 @@ func EngineRows(workers []int, variants []KernelVariant) []Variant {
 	return rows
 }
 
-// MatrixRows is every timed row of a run: the CLI rows and the engine rows,
-// filtered to the selected kinds, then once per named target ("NAME@TARGET").
+// MatrixRows is every timed row of a run: the CLI rows, the PAR2 rows and
+// the engine rows, filtered to the selected kinds, then once per named target
+// ("NAME@TARGET"). No kinds selects every kind but the PAR2 rows, which run
+// only when named.
 func MatrixRows(workers []int, kernels []KernelVariant,
 	engineWorkers []int, engineVariants []KernelVariant, kinds []string, targets []Target) []Variant {
-	all := append(Variants(workers, kernels), EngineRows(engineWorkers, engineVariants)...)
+	all := append(append(Variants(workers, kernels), PAR2Rows()...), EngineRows(engineWorkers, engineVariants)...)
 	var rows []Variant
 	for _, row := range all {
-		if len(kinds) == 0 || contains(kinds, row.Tool) {
+		if (len(kinds) == 0 && !isPAR2Tool(row.Tool)) || contains(kinds, row.Tool) {
 			rows = append(rows, row)
 		}
 	}
@@ -383,8 +411,11 @@ type ConfigSummary struct {
 	CapacityLog2 int   `json:"capacity_log2,omitempty"`
 	// CanonicalSource is the tool whose create produced the carriers every
 	// verify and repair read: "reference" normally, "rarpar" when the
-	// reference's seed create did not finish.
-	CanonicalSource string `json:"canonical_source,omitempty"`
+	// reference's seed create did not finish. PAR2CanonicalSource is the
+	// tool whose untimed create wrote the PAR2 set every PAR2 verify and
+	// repair read: par2cmdline-turbo when the run has it, else par2-rs.
+	CanonicalSource     string `json:"canonical_source,omitempty"`
+	PAR2CanonicalSource string `json:"par2_canonical_source,omitempty"`
 	// The shape, recorded so rows can be joined with other suites' rows of
 	// the same payload bytes, block size and lost blocks: LostBlocks is the
 	// damage's block count, PAR2SourceBlocks the blocks PAR2 would need at
@@ -464,6 +495,7 @@ type Results struct {
 	ReferenceTimeoutSeconds float64   `json:"reference_timeout_seconds,omitempty"`
 	Reference               Binary    `json:"reference"`
 	Candidate               Binary    `json:"candidate"`
+	PAR2Turbo               *Binary   `json:"par2cmdline_turbo,omitempty"`
 	EnginePerf              *Binary   `json:"engine_perf,omitempty"`
 	Variants                []Variant `json:"variants"`
 	// Targets describes each storage target's mount; DropCaches records
@@ -514,6 +546,8 @@ type targetState struct {
 	// damaged holds a damaged copy of the dataset that read-only damaged
 	// stages hard-link from, so they need no private copy per run.
 	damaged string
+	// par2 holds the PAR2 set the PAR2 rows' verify and repair read.
+	par2 string
 }
 
 func (r *runner) logf(format string, args ...any) {
@@ -590,6 +624,13 @@ func RunSuite(ctx context.Context, options Options) (*Results, error) {
 	}
 	if results.Candidate, err = r.identify(ctx, options.Candidate, "--version"); err != nil {
 		return nil, err
+	}
+	if options.PAR2Turbo != "" {
+		binary, err := r.identify(ctx, options.PAR2Turbo, "-V")
+		if err != nil {
+			return nil, err
+		}
+		results.PAR2Turbo = &binary
 	}
 	if options.EnginePerf != "" {
 		binary, err := r.identify(ctx, options.EnginePerf, "")
@@ -723,7 +764,10 @@ func validateOptions(options *Options) error {
 		return err
 	}
 	if len(options.Rows) == 0 {
-		options.Rows = []string{ToolReference, ToolCandidate}
+		options.Rows = []string{ToolReference, ToolCandidate, ToolPAR2}
+		if options.PAR2Turbo != "" {
+			options.Rows = append(options.Rows, ToolPAR2Turbo)
+		}
 		if len(options.EngineWorkers) > 0 {
 			options.Rows = append(options.Rows, ToolEngine)
 		}
@@ -732,6 +776,9 @@ func validateOptions(options *Options) error {
 		if !contains(KnownRowKinds, kind) {
 			return fmt.Errorf("unknown row kind %q (known: %s)", kind, strings.Join(KnownRowKinds, ", "))
 		}
+	}
+	if contains(options.Rows, ToolPAR2Turbo) && options.PAR2Turbo == "" {
+		return errors.New("the par2cmdline-turbo row needs --par2")
 	}
 	if contains(options.Rows, ToolEngine) {
 		if options.EnginePerf == "" || len(options.EngineWorkers) == 0 {
@@ -781,7 +828,7 @@ func validateOptions(options *Options) error {
 	if err := CheckVariantNames(rows); err != nil {
 		return err
 	}
-	for _, path := range []*string{&options.Reference, &options.Candidate, &options.EnginePerf, &options.Work, &options.Out} {
+	for _, path := range []*string{&options.Reference, &options.Candidate, &options.PAR2Turbo, &options.EnginePerf, &options.Work, &options.Out} {
 		if *path == "" {
 			continue
 		}
@@ -791,7 +838,7 @@ func validateOptions(options *Options) error {
 		}
 		*path = absolute
 	}
-	for _, path := range []string{options.Reference, options.Candidate, options.EnginePerf} {
+	for _, path := range []string{options.Reference, options.Candidate, options.PAR2Turbo, options.EnginePerf} {
 		if path == "" {
 			continue
 		}
@@ -1113,6 +1160,7 @@ func (r *runner) runConfig(ctx context.Context, config Config, dataset Dataset, 
 			dataDir:   filepath.Join(target.Work, "data", dataset.ID),
 			canonical: filepath.Join(target.Work, "k", config.ID),
 			stageRoot: filepath.Join(target.Work, "s", config.ID),
+			par2:      filepath.Join(target.Work, "k2", config.ID),
 		}
 		var err error
 		if manifest, err = EnsureDataset(state.dataDir, dataset, r.logf); err != nil {
@@ -1147,12 +1195,26 @@ func (r *runner) runConfig(ctx context.Context, config Config, dataset Dataset, 
 		return err
 	}
 	summary.CanonicalSource = source
+	par2Rows := r.par2Rows(config)
+	if par2Rows {
+		if summary.PAR2CanonicalSource, err = r.seedPAR2(ctx, config, dataset, first); err != nil {
+			return err
+		}
+	}
 	for _, state := range states {
+		if par2Rows {
+			defer os.RemoveAll(state.par2)
+		}
 		if state == first {
 			continue
 		}
 		if err := copyDir(first.canonical, state.canonical); err != nil {
 			return fmt.Errorf("copying the canonical carriers: %w", err)
+		}
+		if par2Rows {
+			if err := copyDir(first.par2, state.par2); err != nil {
+				return fmt.Errorf("copying the PAR2 set: %w", err)
+			}
 		}
 	}
 	if contains(r.options.Ops, OpVerifyDamaged) && config.Carrier == "" {
@@ -1224,7 +1286,7 @@ func (r *runner) runConfig(ctx context.Context, config Config, dataset Dataset, 
 		// The untimed passes run once, on the first target.
 		if r.options.IOCount && config.Carrier == "" {
 			for _, variant := range variants {
-				if variant.Tool != ToolEngine && variant.Target == r.options.Targets[0].Name {
+				if variant.Tool != ToolEngine && !isPAR2Tool(variant.Tool) && variant.Target == r.options.Targets[0].Name {
 					r.countIO(ctx, op, config, dataset, manifest, first.dataDir, first.canonical, first.stageRoot, variant)
 				}
 			}
@@ -1350,7 +1412,7 @@ func settleRow(record *RunRecord) bool {
 		// way.
 		return true
 	}
-	return record.Tool == ToolCandidate && record.Failure == "timeout"
+	return (record.Tool == ToolCandidate || isPAR2Tool(record.Tool)) && record.Failure == "timeout"
 }
 
 // IsDNFFailure reports whether a reference failure class means "did not
@@ -1472,6 +1534,16 @@ func (r *runner) createCommand(config Config, dataset Dataset, dataDir, outDir s
 	for _, file := range dataset.Files {
 		names = append(names, file.Name)
 	}
+	block, count := strconv.FormatInt(config.BlockSize, 10), strconv.FormatInt(config.Recovery, 10)
+	switch variant.Tool {
+	case ToolPAR2:
+		args := append([]string{"--quiet", "par", "create", "--base-path", dataDir, "--block-size", block,
+			"--recovery-count", count, filepath.Join(outDir, par2Name)}, names...)
+		return Command{Path: r.options.Candidate, Args: args, Dir: dataDir, PinCPUs: r.pin(), Timeout: r.timeoutFor(variant.Tool)}
+	case ToolPAR2Turbo:
+		args := append([]string{"c", "-q", "-s" + block, "-c" + count, "-B" + dataDir, filepath.Join(outDir, par2Name)}, names...)
+		return Command{Path: r.options.PAR2Turbo, Args: args, Dir: dataDir, PinCPUs: r.pin(), Timeout: r.timeoutFor(variant.Tool)}
+	}
 	output := filepath.Join(outDir, carrierName)
 	if variant.Tool == ToolReference {
 		args := []string{"c", "-q", "-s" + strconv.FormatInt(config.BlockSize, 10), "-c" + strconv.FormatInt(config.Recovery, 10)}
@@ -1532,16 +1604,17 @@ func (r *runner) checkCommand(op string, stage string, variant Variant, config C
 		}
 		return Command{Path: r.options.Candidate, Args: args, Dir: stage, Env: variant.Env, PinCPUs: r.pin(), Timeout: r.timeoutFor(ToolCandidate)}
 	}
-	if variant.Tool == ToolReference {
-		letter := "v"
-		if op == OpRepair {
-			letter = "r"
-		}
-		return Command{Path: r.options.Reference, Args: []string{letter, "-q", carrierName}, Dir: stage, PinCPUs: r.pin(), Timeout: r.timeoutFor(ToolReference)}
-	}
-	sub := "verify"
+	sub, letter := "verify", "v"
 	if op == OpRepair {
-		sub = "repair"
+		sub, letter = "repair", "r"
+	}
+	switch variant.Tool {
+	case ToolReference:
+		return Command{Path: r.options.Reference, Args: []string{letter, "-q", carrierName}, Dir: stage, PinCPUs: r.pin(), Timeout: r.timeoutFor(ToolReference)}
+	case ToolPAR2:
+		return Command{Path: r.options.Candidate, Args: []string{"--quiet", "par", sub, filepath.Join(stage, par2Name)}, Dir: stage, PinCPUs: r.pin(), Timeout: r.timeoutFor(variant.Tool)}
+	case ToolPAR2Turbo:
+		return Command{Path: r.options.PAR2Turbo, Args: []string{letter, "-q", par2Name}, Dir: stage, PinCPUs: r.pin(), Timeout: r.timeoutFor(variant.Tool)}
 	}
 	args := append(r.candidateGlobals(variant), "par3", sub, carrierName)
 	if op == OpRepair {
@@ -1644,7 +1717,11 @@ func (r *runner) runOne(ctx context.Context, op string, config Config, dataset D
 			command = r.createCommand(config, dataset, state.dataDir, dir, variant)
 		}
 	} else {
-		if err := stageFrom(dir, dataset, state.dataDir, state.canonical, config, op, state.damaged); err != nil {
+		canonical := state.canonical
+		if isPAR2Tool(variant.Tool) {
+			canonical = state.par2
+		}
+		if err := stageFrom(dir, dataset, state.dataDir, canonical, config, op, state.damaged); err != nil {
 			return record, err
 		}
 		if variant.Tool == ToolEngine {
@@ -1725,6 +1802,31 @@ func (r *runner) runOne(ctx context.Context, op string, config Config, dataset D
 			record.Error = problem
 			return record, nil
 		}
+	}
+	if isPAR2Tool(variant.Tool) {
+		// A PAR2 row writes and reads a PAR2 set, so none of the PAR3
+		// carrier checks apply: its create must leave a set, its repair must
+		// hash back to the inputs. What a repair leaves beside the files
+		// (par2cmdline-turbo keeps a numbered .1, par2-rs repairs in place)
+		// is recorded, not enforced.
+		switch op {
+		case OpCreate:
+			if problem := par2OutputProblem(dir); problem != "" {
+				record.Status, record.Failure, record.Error = StatusFailed, "no-par2-set", problem
+				record.StderrTail, record.StderrLine = result.Stderr, lastLine(result)
+			}
+		case OpRepair:
+			check, err := checkRepair(dir, manifest, state.par2)
+			if err != nil {
+				return record, err
+			}
+			record.Repair = &check
+			if !check.Match {
+				record.Status, record.Failure = StatusFailed, "repair-mismatch"
+				record.StderrTail, record.StderrLine = result.Stderr, lastLine(result)
+			}
+		}
+		return record, nil
 	}
 	switch op {
 	case OpCreate:
@@ -1999,7 +2101,7 @@ func ReadResults(path string) (*Results, error) {
 	if err := json.Unmarshal(data, &results); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	if results.Schema != ResultsSchema {
+	if results.Schema != ResultsSchema && results.Schema != resultsSchemaV3 {
 		hint := ""
 		switch results.Schema {
 		case "rarpar-par3-bench-v1":
@@ -2071,6 +2173,9 @@ func CollectMachine(ctx context.Context, label string) bench.Machine {
 // (Results.InPlaceUnsupported) only the backup rows run a plain set's
 // repair.
 func (r *runner) rowRuns(config Config, variant Variant, op string) bool {
+	if isPAR2Tool(variant.Tool) {
+		return config.PAR2 && config.Carrier == "" && (op == OpCreate || op == OpVerify || op == OpRepair)
+	}
 	if !variant.RunsOp(op) || !r.carrierRuns(config, variant) {
 		return false
 	}
@@ -2176,4 +2281,66 @@ func stageCarrier(dir, canonical string, config Config, op string) error {
 		return err
 	}
 	return ApplyDamage(dir, carrierDamageDataset(config.CarrierOriginalBytes), config.BlockSize, config.Damage)
+}
+
+// par2Rows reports whether any PAR2 row runs on the set.
+func (r *runner) par2Rows(config Config) bool {
+	if !config.PAR2 || config.Carrier != "" {
+		return false
+	}
+	for _, variant := range r.results.Variants {
+		if isPAR2Tool(variant.Tool) {
+			return true
+		}
+	}
+	return false
+}
+
+// seedPAR2 writes, untimed, the PAR2 set every PAR2 verify and repair reads,
+// as the reference's untimed create seeds the PAR3 carriers: both PAR2 rows
+// then work from the same recovery set. par2cmdline-turbo writes it when the
+// run has it, else par2-rs. It returns the tool that wrote it.
+func (r *runner) seedPAR2(ctx context.Context, config Config, dataset Dataset, first *targetState) (string, error) {
+	seed := Variant{Name: ToolPAR2, Tool: ToolPAR2}
+	if r.options.PAR2Turbo != "" {
+		seed = Variant{Name: ToolPAR2Turbo, Tool: ToolPAR2Turbo}
+	}
+	if err := resetDir(first.par2); err != nil {
+		return "", err
+	}
+	command := r.createCommand(config, dataset, first.dataDir, first.par2, seed)
+	result := Run(ctx, command)
+	if result.Failure == "binary-quarantined" {
+		return "", r.quarantined(ctx, command.Path, "refused to start")
+	}
+	if result.Failure != "" || result.ExitCode != 0 {
+		return "", fmt.Errorf("the untimed %s create of the PAR2 set failed (exit %d %s): %s", seed.Tool, result.ExitCode, result.Failure, lastLine(result))
+	}
+	if problem := par2OutputProblem(first.par2); problem != "" {
+		return "", fmt.Errorf("the untimed %s create of the PAR2 set: %s", seed.Tool, problem)
+	}
+	return seed.Tool, nil
+}
+
+// par2OutputProblem says why a PAR2 create's directory holds no set, or ""
+// when it has its index file and at least one recovery volume.
+func par2OutputProblem(dir string) string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err.Error()
+	}
+	var index, volumes int
+	for _, entry := range entries {
+		name := entry.Name()
+		switch {
+		case name == par2Name:
+			index++
+		case strings.HasSuffix(name, ".par2") && strings.Contains(name, ".vol"):
+			volumes++
+		}
+	}
+	if index == 0 || volumes == 0 {
+		return fmt.Sprintf("the create exited 0 but left %d index and %d recovery files", index, volumes)
+	}
+	return ""
 }

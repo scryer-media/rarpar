@@ -282,7 +282,7 @@ func (r *runner) perfPass(ctx context.Context, op string, config Config, dataset
 	}
 	record := contains(perf.RecordSets, config.ID)
 	for _, variant := range variants {
-		if variant.Tool == ToolEngine || variant.Target != r.options.Targets[0].Name {
+		if variant.Tool == ToolEngine || isPAR2Tool(variant.Tool) || variant.Target != r.options.Targets[0].Name {
 			continue
 		}
 		recorded := record && variant.Tool == ToolCandidate
@@ -324,7 +324,7 @@ func PerfPassRuns(profile Profile, variants []Variant, perf PerfOptions) int {
 		record := contains(perf.RecordSets, config.ID)
 		for _, op := range perf.Ops {
 			for _, variant := range variants {
-				if variant.Tool == ToolEngine || !variant.RunsOp(op) {
+				if variant.Tool == ToolEngine || isPAR2Tool(variant.Tool) || !variant.RunsOp(op) {
 					continue
 				}
 				total += measuredRepeats(config, perf.StatRepeats)

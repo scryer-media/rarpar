@@ -474,7 +474,7 @@ func TestPeakRSSIsARequiredRowField(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, err := ReadResults(old)
-		if err == nil || !strings.Contains(err.Error(), `want "rarpar-par3-bench-v3"`) ||
+		if err == nil || !strings.Contains(err.Error(), `want "rarpar-par3-bench-v4"`) ||
 			!strings.Contains(err.Error(), why) || !strings.Contains(err.Error(), "read it with the harness that wrote it") {
 			t.Fatalf("a %s results file: %v", schema, err)
 		}
@@ -950,9 +950,9 @@ func TestReportNamesTheLikeForLikeRepairRow(t *testing.T) {
 	}
 	for _, want := range []string{
 		"u / rarpar-w1 — in place, no backup",
-		"u / rarpar-w1-backup — keeps .1 like the reference: like for like",
-		"c / rarpar-w1 — compatible rs, keeps .1 like the reference: like for like",
-		"par3cmdline keeps a numbered .1 backup of every file it repairs.",
+		"u / rarpar-w1-backup — retains file like the reference: like for like",
+		"c / rarpar-w1 — compatible rs, retains file like the reference: like for like",
+		"par3cmdline retains a numbered .1 copy of every file it repairs.",
 	} {
 		if !strings.Contains(string(chart), want) {
 			t.Fatalf("repair chart lacks %q:\n%s", want, chart)

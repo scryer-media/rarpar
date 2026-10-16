@@ -363,10 +363,6 @@ func machineSteps(machine Machine, layout RemoteLayout) []string {
 		if step := par3PerfStep(machine); step != "" {
 			steps = append(steps, step)
 		}
-		if machine.PAR3.Versus != "" {
-			steps = append(steps, fmt.Sprintf("on host: par3 versus, profile %s: PAR2 (rarpar par, plus the par2 oracle when present) against PAR3 Cauchy and FFT, each PAR3 repair in place and as a -backup twin that keeps a .1, par2 ÷ par3, every repair SHA-256 checked",
-				machine.PAR3.Versus))
-		}
 	}
 	if machine.hasTurbo() {
 		steps = append(steps,

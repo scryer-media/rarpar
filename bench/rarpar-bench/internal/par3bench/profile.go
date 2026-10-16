@@ -12,6 +12,7 @@ package par3bench
 import (
 	"fmt"
 	"math/bits"
+	"reflect"
 	"sort"
 	"strings"
 )
@@ -100,6 +101,14 @@ type Config struct {
 	// CarrierOriginalBytes is the original ZIP's size, before the
 	// reference's insert; set at run time.
 	CarrierOriginalBytes int64 `json:"carrier_original_bytes,omitempty"`
+	// Shape names the posting shape a set measures: sets that share one
+	// share the dataset, block size, recovery count and damage, and differ
+	// only in codec, so the PAR2-against-PAR3 view can put them side by side.
+	Shape string `json:"shape,omitempty"`
+	// PAR2 adds the PAR2 rows (par2-rs, and par2cmdline-turbo when the run
+	// has it) to the set: the same inputs, block size, recovery count and
+	// damage protected and repaired as PAR2. At most one set per shape has it.
+	PAR2 bool `json:"par2,omitempty"`
 }
 
 // CarrierZIP is the PAR-inside ZIP carrier kind.
@@ -212,12 +221,14 @@ func smokeProfile() Profile {
 				Codec: "cauchy", ExpectedField: "gf16",
 				Damage: spread("lost-30x16k-3files", []int{0, 1, 2}, 10),
 				Note:   "514 input + 52 recovery blocks: GF(2^16)",
+				Shape:  "smoke", PAR2: true,
 			},
 			{
 				ID: "smoke-fft", Dataset: "smoke", BlockSize: 16 * KiB, Recovery: 52,
 				Codec: "fft", ExpectedField: "fft-gf16",
 				Damage: spread("lost-30x16k-3files", []int{0, 1, 2}, 10),
 				Note:   "reference -e8, one cohort, capacity 64",
+				Shape:  "smoke",
 			},
 		},
 	}
@@ -278,72 +289,59 @@ func fullProfile() Profile {
 	return profile
 }
 
-// fleetProfile is the cross-machine PAR3 round: create, verify and repair at
-// three sizes with Cauchy and FFT side by side, a shape over PAR2's 32768
-// input-block limit, and a PAR-inside ZIP. Sets A, B and C are the full
-// profile's datasets and shapes, so the numbers compare with earlier rounds.
-// Every FFT row is forced on both sides: the reference's explicit -e8 codec
-// switch and rarpar's --codec fft with the same one-cohort capacity; neither
-// tool picks FFT by size. The order keeps each size's Cauchy and FFT rows
-// together.
+// fleetProfile is the cross-machine round. Its plain sets follow the usenet
+// posting census of 546 releases (2026-10-13): one shape per posting cluster,
+// at that cluster's block size and redundancy, each run with Cauchy and FFT
+// side by side, the Cauchy set also carrying the PAR2 rows. The census median
+// payload is one file of about 2 GiB with 4 MiB blocks at 10%; the commonest
+// tool clusters are par2cmdline's 2000 blocks at 2% and par2cmdline-turbo's
+// 10 MB blocks at 20%, and releases under 1 GiB median 1.5 MiB blocks. A
+// PAR-inside ZIP rounds it off. Every FFT row is forced on both sides: the
+// reference's explicit -e8 codec switch and rarpar's --codec fft with the same
+// one-cohort capacity; neither tool picks FFT by size.
 func fleetProfile() Profile {
 	full := fullProfile()
 	a, _ := full.Dataset("a")
 	b, _ := full.Dataset("b")
-	c, _ := full.Dataset("c")
-	mFiles := make([]FileSpec, 4)
-	for i := range mFiles {
-		mFiles[i] = FileSpec{Name: fmt.Sprintf("m%d.bin", i), Size: 128 * MiB}
-	}
-	m := Dataset{ID: "m", Files: mFiles}
 	zFiles := make([]FileSpec, 4)
 	for i := range zFiles {
 		zFiles[i] = FileSpec{Name: fmt.Sprintf("z%d.bin", i), Size: 64 * MiB}
 	}
 	z := Dataset{ID: "z", Files: zFiles}
-	byID := map[string]Config{}
-	for _, config := range full.Configs {
-		byID[config.ID] = config
+	shapes := []struct {
+		id, dataset     string
+		block, recovery int64
+		damage          Damage
+		gf, fft         string
+		note            string
+	}{
+		{"b-1536k", "b", 1536 * KiB, 20, spread("lost-10x1536k-5of10files", []int{0, 2, 4, 6, 8}, 2), "gf16", "fft-gf8",
+			"10 x 30 MiB, 1.5 MiB blocks, 10% (200 + 20): the census median block size for releases under 1 GiB, in 30 MiB volumes as anime archive posts use"},
+		{"a-10mb", "a", 10_000_000, 22, spread("lost-11x10mb", []int{0}, 11), "gf8", "fft-gf8",
+			"1 GiB in one file, 10,000,000-byte blocks, 20% (108 + 22): the par2cmdline-turbo cluster of 10 MB blocks at 20%"},
+		{"a-4m", "a", 4 * MiB, 26, spread("lost-13x4m", []int{0}, 13), "gf16", "fft-gf16",
+			"1 GiB in one file, 4 MiB blocks, 10% (256 + 26): the census median block size and redundancy"},
+		{"a-512k", "a", 512 * KiB, 41, spread("lost-20x512k", []int{0}, 20), "gf16", "fft-gf16",
+			"1 GiB in one file, 512 KiB blocks, 2% (2048 + 41): the par2cmdline cluster of about 2000 blocks at 2%"},
 	}
-	bFFT := byID["b-gf16"]
-	bFFT.ID, bFFT.Codec, bFFT.ExpectedField = "b-fft", "fft", "fft-gf16"
-	bFFT.Note = "set B with the FFT codec on both sides (reference -e8, one cohort, capacity 32): the small FFT shape"
-	aGF16 := byID["a-gf16"]
-	aGF16.MaxRepeats = 3
-	cFFT := byID["c-fft"]
-	cFFT.MaxRepeats = 3
-	cFFT.Note = "set C, over PAR2's cap: 49152 input blocks where PAR2 allows 32768, so there is no PAR2 equivalent; FFT on both sides (reference -e8, one cohort, capacity 8192); the reference's Cauchy is quadratic here"
-	return Profile{
-		Name:     "fleet",
-		Datasets: []Dataset{b, m, a, c, z},
-		Configs: []Config{
-			byID["b-gf16"],
-			bFFT,
-			{
-				ID: "m-gf16", Dataset: "m", BlockSize: 1 * MiB, Recovery: 52,
-				Codec: "cauchy", ExpectedField: "gf16",
-				Damage: spread("lost-24x1m-4files", []int{0, 1, 2, 3}, 6),
-				Note:   "set M: 4 x 128 MiB, 1 MiB blocks, 10% (512 + 52 blocks): the medium Cauchy shape",
-			},
-			{
-				ID: "m-fft", Dataset: "m", BlockSize: 1 * MiB, Recovery: 52,
-				Codec: "fft", ExpectedField: "fft-gf16",
-				Damage: spread("lost-24x1m-4files", []int{0, 1, 2, 3}, 6),
-				Note:   "set M with the FFT codec on both sides (reference -e8, one cohort, capacity 64): the medium FFT shape",
-			},
-			aGF16,
-			cFFT,
-			{
-				ID: "zip-inside", Dataset: "z", Codec: "cauchy", ExpectedField: "gf16",
-				Carrier: CarrierZIP, InsertRedundancy: 10,
-				Damage: spread("lost-40-blocks-in-zip", []int{0}, 40),
-				Note:   "PAR-inside ZIP: 4 x 64 MiB stored in one ZIP, protected in place by the reference's insert (-r10, Cauchy; the reference picks the block size), self-repaired by both sides",
-			},
-		},
+	var configs []Config
+	for _, shape := range shapes {
+		cauchy := Config{ID: shape.id + "-" + shape.gf, Dataset: shape.dataset, BlockSize: shape.block, Recovery: shape.recovery,
+			Codec: "cauchy", ExpectedField: shape.gf, Damage: shape.damage, Note: shape.note, Shape: shape.id, PAR2: true}
+		fft := cauchy
+		fft.ID, fft.Codec, fft.ExpectedField, fft.PAR2 = shape.id+"-fft", "fft", shape.fft, false
+		fft.Note = shape.note + "; FFT on both sides (reference -e8, one cohort)"
+		configs = append(configs, cauchy, fft)
 	}
+	configs = append(configs, Config{
+		ID: "zip-inside", Dataset: "z", Codec: "cauchy", ExpectedField: "gf16",
+		Carrier: CarrierZIP, InsertRedundancy: 10,
+		Damage: spread("lost-40-blocks-in-zip", []int{0}, 40),
+		Note:   "PAR-inside ZIP: 4 x 64 MiB stored in one ZIP, protected in place by the reference's insert (-r10, Cauchy; the reference picks the block size), self-repaired by both sides",
+	})
+	return Profile{Name: "fleet", Datasets: []Dataset{b, a, z}, Configs: configs}
 }
 
-// Profiles lists every built-in profile by name.
 func Profiles() map[string]Profile {
 	return map[string]Profile{"smoke": smokeProfile(), "full": fullProfile(), "fleet": fleetProfile()}
 }
@@ -419,6 +417,9 @@ func (p Profile) Validate() error {
 			return fmt.Errorf("set %s: max_repeats must not be negative", config.ID)
 		}
 		if config.Carrier != "" {
+			if config.PAR2 || config.Shape != "" {
+				return fmt.Errorf("set %s: a PAR-inside set has no PAR2 equivalent, so it takes no shape and no PAR2 rows", config.ID)
+			}
 			if err := validateCarrier(config, dataset); err != nil {
 				return err
 			}
@@ -426,6 +427,14 @@ func (p Profile) Validate() error {
 		}
 		if config.BlockSize <= 0 || config.Recovery <= 0 {
 			return fmt.Errorf("set %s: block size and recovery count must be positive", config.ID)
+		}
+		if config.PAR2 {
+			if config.BlockSize%4 != 0 {
+				return fmt.Errorf("set %s: PAR2 rows need a block size that is a multiple of 4", config.ID)
+			}
+			if blocks := par2SourceBlocks(dataset, config.BlockSize); blocks > par2MaxSourceBlocks || config.Recovery > par2MaxRecoveryBlocks {
+				return fmt.Errorf("set %s: %d PAR2 source and %d recovery blocks exceed PAR2's %d", config.ID, blocks, config.Recovery, par2MaxSourceBlocks)
+			}
 		}
 		switch config.Codec {
 		case "cauchy", "fft":
@@ -452,6 +461,40 @@ func (p Profile) Validate() error {
 			if int64(target.Blocks) > fileBlocks {
 				return fmt.Errorf("set %s: damage wants %d blocks of a %d-block file", config.ID, target.Blocks, fileBlocks)
 			}
+		}
+	}
+	return p.validateShapes()
+}
+
+// validateShapes checks that the sets sharing a shape measure one thing: the
+// same dataset, block size, recovery count and damage, one set per codec,
+// and at most one set carrying the PAR2 rows.
+func (p Profile) validateShapes() error {
+	first := map[string]Config{}
+	codecs := map[string]bool{}
+	par2 := map[string]string{}
+	for _, config := range p.Configs {
+		if config.Shape == "" {
+			continue
+		}
+		if codecs[config.Shape+"/"+config.Codec] {
+			return fmt.Errorf("shape %s has two %s sets", config.Shape, config.Codec)
+		}
+		codecs[config.Shape+"/"+config.Codec] = true
+		if config.PAR2 {
+			if other, ok := par2[config.Shape]; ok {
+				return fmt.Errorf("shape %s: both %s and %s carry the PAR2 rows", config.Shape, other, config.ID)
+			}
+			par2[config.Shape] = config.ID
+		}
+		previous, ok := first[config.Shape]
+		if !ok {
+			first[config.Shape] = config
+			continue
+		}
+		if previous.Dataset != config.Dataset || previous.BlockSize != config.BlockSize || previous.Recovery != config.Recovery ||
+			!reflect.DeepEqual(previous.Damage, config.Damage) {
+			return fmt.Errorf("shape %s: %s and %s differ in more than the codec", config.Shape, previous.ID, config.ID)
 		}
 	}
 	return nil

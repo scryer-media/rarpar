@@ -92,7 +92,7 @@ func renderOpSVG(results *Results, rows []Row, op string) ([]byte, bool) {
 	title := "rarpar PAR3 " + op + " against par3cmdline"
 	description := fmt.Sprintf("PAR3 %s on %s. Relative speed is par3cmdline median wall time divided by rarpar median wall time; each row also lists CPU time and peak RSS for both.", op, results.Machine.Label)
 	if op == OpRepair {
-		description += " par3cmdline keeps a numbered .1 backup of every file it repairs. Rows marked like for like keep one too, so they write the same bytes as the reference; rows marked in place repair in place and write no backup."
+		description += " par3cmdline retains a numbered .1 copy of every file it repairs. Rows marked retains file do too, so they write the same bytes as the reference; rows marked in place repair in place and write no copy."
 	}
 	var document bytes.Buffer
 	fmt.Fprintf(&document, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%d\" height=\"%d\" viewBox=\"0 0 %d %d\" role=\"img\" aria-labelledby=\"title desc\">\n", par3ChartWidth, height, par3ChartWidth, height)
@@ -156,11 +156,11 @@ func renderOpSVG(results *Results, rows []Row, op string) ([]byte, bool) {
 func repairModeLabel(row Row, carrier bool) string {
 	switch {
 	case carrier && row.LeftBackup == "true":
-		return " — compatible rs, keeps .1 like the reference: like for like"
+		return " — compatible rs, retains file like the reference: like for like"
 	case carrier:
 		return " — compatible rs"
 	case row.Backup:
-		return " — keeps .1 like the reference: like for like"
+		return " — retains file like the reference: like for like"
 	default:
 		return " — in place, no backup"
 	}

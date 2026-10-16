@@ -17,43 +17,43 @@ func TestFleetProfileCoversTheRequestedShapes(t *testing.T) {
 	if err := profile.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"b-gf16", "b-fft", "m-gf16", "m-fft", "a-gf16", "c-fft", "zip-inside"}
+	want := []string{"b-1536k-gf16", "b-1536k-fft", "a-10mb-gf8", "a-10mb-fft", "a-4m-gf16", "a-4m-fft", "a-512k-gf16", "a-512k-fft", "zip-inside"}
 	if got := strings.Join(profile.ConfigIDs(), ","); got != strings.Join(want, ",") {
-		t.Fatalf("fleet sets %s, want %s (Cauchy and FFT of one size adjacent)", got, strings.Join(want, ","))
+		t.Fatalf("fleet sets %s, want %s (Cauchy and FFT of one shape adjacent)", got, strings.Join(want, ","))
 	}
-	full, _ := LookupProfile("full")
-	for _, id := range []string{"b-gf16", "a-gf16", "c-fft"} {
-		var fleetConfig, fullConfig Config
-		for _, config := range profile.Configs {
-			if config.ID == id {
-				fleetConfig = config
-			}
-		}
-		for _, config := range full.Configs {
-			if config.ID == id {
-				fullConfig = config
-			}
-		}
-		if fleetConfig.BlockSize != fullConfig.BlockSize || fleetConfig.Recovery != fullConfig.Recovery ||
-			fleetConfig.Codec != fullConfig.Codec || fleetConfig.Damage.LostBlocks() != fullConfig.Damage.LostBlocks() {
-			t.Fatalf("%s drifted from the full profile's shape, so it no longer compares with earlier rounds", id)
-		}
+	// The census block sizes and redundancies (Cauchy set of each shape).
+	census := map[string]struct {
+		block    int64
+		recovery int64
+		field    string
+	}{
+		"b-1536k": {1536 * KiB, 20, "gf16"}, "a-10mb": {10_000_000, 22, "gf8"}, "a-4m": {4 * MiB, 26, "gf16"}, "a-512k": {512 * KiB, 41, "gf16"},
 	}
-	for _, pair := range [][2]string{{"b-gf16", "b-fft"}, {"m-gf16", "m-fft"}} {
-		var cauchy, fft Config
-		for _, config := range profile.Configs {
-			switch config.ID {
-			case pair[0]:
-				cauchy = config
-			case pair[1]:
-				fft = config
-			}
+	for _, shape := range VersusShapes(&Results{Configs: summaries(profile)}) {
+		want, ok := census[shape.ID]
+		if !ok || shape.Cauchy == nil || shape.FFT == nil {
+			t.Fatalf("shape %s: %+v", shape.ID, shape)
+		}
+		cauchy, fft := shape.Cauchy, shape.FFT
+		if cauchy.BlockSize != want.block || cauchy.Recovery != want.recovery || cauchy.ExpectedField != want.field || !cauchy.PAR2 {
+			t.Fatalf("%s drifted from the census shape: %+v", cauchy.ID, cauchy.Config)
 		}
 		if cauchy.Dataset != fft.Dataset || cauchy.BlockSize != fft.BlockSize || cauchy.Recovery != fft.Recovery ||
-			cauchy.Damage.LostBlocks() != fft.Damage.LostBlocks() || cauchy.Codec != "cauchy" || fft.Codec != "fft" {
-			t.Fatalf("%s and %s are not a matched Cauchy/FFT pair", pair[0], pair[1])
+			cauchy.Damage.LostBlocks() != fft.Damage.LostBlocks() || cauchy.Codec != "cauchy" || fft.Codec != "fft" || fft.PAR2 {
+			t.Fatalf("%s and %s are not a matched Cauchy/FFT pair", cauchy.ID, fft.ID)
+		}
+		if cauchy.BlockSize%64 != 0 {
+			t.Fatalf("%s: the reference's FFT needs a block size that is a multiple of 64", cauchy.ID)
 		}
 	}
+}
+
+func summaries(profile Profile) []ConfigSummary {
+	var out []ConfigSummary
+	for _, config := range profile.Configs {
+		out = append(out, ConfigSummary{Config: config})
+	}
+	return out
 }
 
 func TestFleetShapesRecordPAR2Equivalence(t *testing.T) {
@@ -62,13 +62,33 @@ func TestFleetShapesRecordPAR2Equivalence(t *testing.T) {
 		dataset, _ := profile.Dataset(config.Dataset)
 		summary := ConfigSummary{Config: config}
 		summary.fillShape(dataset)
-		wantEquivalent := config.ID != "c-fft" && config.ID != "zip-inside"
+		wantEquivalent := config.ID != "zip-inside"
 		if summary.PAR2Equivalent != wantEquivalent {
 			t.Fatalf("%s: par2_equivalent %t, want %t", config.ID, summary.PAR2Equivalent, wantEquivalent)
 		}
 		if summary.LostBlocks != config.Damage.LostBlocks() {
 			t.Fatalf("%s: lost_blocks %d", config.ID, summary.LostBlocks)
 		}
+	}
+}
+
+func TestValidateRefusesMismatchedShapes(t *testing.T) {
+	profile, _ := LookupProfile("smoke")
+	for name, mutate := range map[string]func([]Config){
+		"different recovery": func(c []Config) { c[2].Recovery++ },
+		"two cauchy sets":    func(c []Config) { c[0].Shape = "smoke" },
+		"par2 on fft":        func(c []Config) { c[2].PAR2 = true },
+		"unaligned par2":     func(c []Config) { c[1].BlockSize, c[2].BlockSize = 16*KiB+2, 16*KiB+2 },
+	} {
+		broken := profile
+		broken.Configs = append([]Config(nil), profile.Configs...)
+		mutate(broken.Configs)
+		if err := broken.Validate(); err == nil {
+			t.Fatalf("%s: accepted", name)
+		}
+	}
+	if err := profile.Validate(); err != nil {
+		t.Fatal(err)
 	}
 }
 

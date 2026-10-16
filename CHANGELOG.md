@@ -18,13 +18,23 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ### Benchmark harness only
 
-- `rarpar-bench par3 versus-render` charts the PAR2-against-PAR3 comparison:
-  one SVG per comparison and op, with every machine given as `--input` as a
-  group of rows, one per arm (`par2-rs`, `par2cmdline-turbo`, `par3-cauchy`,
-  `par3-fft`, and at repair the `.1`-keeping twins), each against
-  `par2cmdline-turbo` on the shared log scale, with median wall, CPU and peak
-  RSS, and at repair whether the arm kept a `.1` or repaired in place. No
-  version impact.
+- The PAR3 suite's `fleet` profile follows the usenet posting census: four
+  posting shapes (1.5 MiB blocks at 10% over 10 x 30 MiB; 10 MB blocks at
+  20%, 4 MiB blocks at 10% and 512 KiB blocks at 2% over 1 GiB), each as a
+  Cauchy and an FFT set, plus the ZIP-inside set. No version impact.
+- `rarpar-bench par3 run` runs PAR2 rows on each shape's Cauchy set:
+  `par2-rs`, and `par2cmdline-turbo` with `--par2`, creating, verifying and
+  repairing at the same block size, recovery count and damage. Results
+  schema `rarpar-par3-bench-v4`; v3 files still read. No version impact.
+- The separate `par3 versus` run and `par3 versus-report` are gone:
+  `par3 versus-render` draws the PAR2-against-PAR3 charts from suite results,
+  one SVG per shape and op with `par2-rs`, `par2cmdline-turbo`,
+  `par3cmdline` and `rarpar par3`, each codec, against `par2cmdline-turbo`.
+  Repair rows say **retains file** or **in place**. The fleet `versus` key is
+  removed. No version impact.
+- `rarpar-bench par3 tables` prints the benchmark page's PAR3 tables, each
+  per-set cell as rarpar's median wall seconds and then the reference ÷
+  rarpar ratio, `4.4 (14×)`. No version impact.
 
 ### Documentation only
 
