@@ -1760,6 +1760,119 @@ fn compat_unrar_test_and_list_cover_operational_commands() {
     }
 }
 
+/// CRC-32 (IEEE), bitwise: enough to reseal one tampered RAR5 header.
+fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+fn read_rar5_vint(data: &[u8], pos: &mut usize) -> u64 {
+    let mut value = 0u64;
+    let mut shift = 0;
+    loop {
+        let byte = data[*pos];
+        *pos += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return value;
+        }
+        shift += 7;
+    }
+}
+
+/// Flip one byte of the first file header's data CRC32 in a RAR5 archive
+/// and reseal that header's own CRC, so the header still parses and only
+/// the member's checksum is wrong.
+fn tamper_rar5_data_crc(archive: &mut [u8]) {
+    const SIGNATURE: &[u8] = b"Rar!\x1a\x07\x01\x00";
+    const FILE_HEADER: u64 = 2;
+    const END_OF_ARCHIVE: u64 = 5;
+    assert!(archive.starts_with(SIGNATURE), "not a RAR5 archive");
+    let mut block = SIGNATURE.len();
+    while block < archive.len() {
+        let mut pos = block + 4;
+        let header_size = read_rar5_vint(archive, &mut pos) as usize;
+        let header_end = pos + header_size;
+        let kind = read_rar5_vint(archive, &mut pos);
+        let flags = read_rar5_vint(archive, &mut pos);
+        if flags & 0x1 != 0 {
+            read_rar5_vint(archive, &mut pos); // extra area size
+        }
+        let data_size = if flags & 0x2 != 0 {
+            read_rar5_vint(archive, &mut pos) as usize
+        } else {
+            0
+        };
+        if kind == FILE_HEADER {
+            let file_flags = read_rar5_vint(archive, &mut pos);
+            read_rar5_vint(archive, &mut pos); // unpacked size
+            read_rar5_vint(archive, &mut pos); // attributes
+            if file_flags & 0x2 != 0 {
+                pos += 4; // mtime
+            }
+            assert!(file_flags & 0x4 != 0, "fixture member carries no CRC32");
+            archive[pos] ^= 0xff;
+            let header_crc = crc32_ieee(&archive[block + 4..header_end]);
+            archive[block..block + 4].copy_from_slice(&header_crc.to_le_bytes());
+            return;
+        }
+        assert_ne!(kind, END_OF_ARCHIVE, "no file header before the end");
+        block = header_end + data_size;
+    }
+    panic!("no file header in the archive");
+}
+
+/// `t` still verifies a stored member's checksum on the sink path: a member
+/// whose recorded CRC32 does not match its data fails the test.
+#[test]
+fn compat_unrar_test_reports_a_tampered_crc() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = fixture(&[
+        "crates",
+        "unrar-rs",
+        "tests",
+        "fixtures",
+        "rar5",
+        "rar5_store.rar",
+    ]);
+    let mut bytes = std::fs::read(&source).unwrap();
+    tamper_rar5_data_crc(&mut bytes);
+    let archive = temp.path().join("tampered.rar");
+    std::fs::write(&archive, &bytes).unwrap();
+
+    let intact = run(&[OsStr::new("t"), source.as_os_str()]);
+    assert!(
+        intact.status.success(),
+        "untampered fixture failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&intact.stdout),
+        String::from_utf8_lossy(&intact.stderr)
+    );
+
+    let test = run(&[OsStr::new("t"), archive.as_os_str()]);
+    let stdout = String::from_utf8_lossy(&test.stdout);
+    assert_eq!(
+        test.status.code(),
+        Some(3),
+        "tampered CRC must fail the test: stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&test.stderr)
+    );
+    assert!(
+        stdout.contains("small.txt - CRC failed"),
+        "missing CRC failure: {stdout}"
+    );
+    assert!(!stdout.contains("All OK"), "reported success: {stdout}");
+}
+
 #[test]
 fn compat_unrar_auto_rename_and_suppression_switches_are_honored() {
     let temp = tempfile::tempdir().unwrap();

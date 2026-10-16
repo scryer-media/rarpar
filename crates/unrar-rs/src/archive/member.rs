@@ -25,12 +25,13 @@ const STORE_HASHED_CHUNK_BYTES: usize = crate::hash_pipeline::PENDING_FLUSH_BYTE
 /// writer. Two keep both kernel copies busy; more only adds resident buffers.
 const STORE_READ_AHEAD_CHUNKS: usize = 2;
 /// Output buffer for member extraction, deliberately smaller than the spans the
-/// producers hand down (store copies at [`STREAMING_STORE_CHUNK_BUFFER_BYTES`],
-/// LZ window flushes at up to 4 MiB). `BufWriter` bypasses its buffer only for
-/// a single write at or above capacity, so a capacity above the flush span
-/// would memcpy every output byte for no reduction in syscalls; below it, large
-/// spans go straight to `write` and only the small ones (per-filter subranges)
-/// are coalesced.
+/// producers hand down (unhashed store copies at
+/// [`STREAMING_STORE_CHUNK_BUFFER_BYTES`], hashed ones at
+/// [`STORE_HASHED_CHUNK_BYTES`], LZ window flushes at up to 4 MiB). `BufWriter`
+/// bypasses its buffer only for a single write at or above capacity, so a
+/// capacity above the flush span would memcpy every output byte for no
+/// reduction in syscalls; below it, large spans go straight to `write` and
+/// only the small ones (per-filter subranges) are coalesced.
 const OUTPUT_WRITE_BUFFER_BYTES: usize = 512 * 1024;
 /// Input buffer for the volume-chained decode streams, the read-side twin of
 /// [`OUTPUT_WRITE_BUFFER_BYTES`] and deliberately smaller than the spans the
