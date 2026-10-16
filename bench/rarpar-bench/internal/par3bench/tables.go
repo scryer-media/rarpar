@@ -12,7 +12,7 @@ import (
 // worker count, plus any PAR-inside set), then per set at the given worker
 // count each op's rarpar median wall time with that ratio after it, as
 // "4.4 (14×)", then the peak RSS range across the machines. Every input must
-// carry the same sets.
+// carry the same sets. Workers 0 takes each machine's largest worker count.
 func RenderTables(inputs []VersusChartInput, workers int) (string, error) {
 	if len(inputs) == 0 {
 		return "", fmt.Errorf("no suite results to tabulate")
@@ -34,6 +34,16 @@ func RenderTables(inputs []VersusChartInput, workers int) (string, error) {
 	tables := make([]tableRows, len(inputs))
 	for i, input := range inputs {
 		tables[i] = newTableRows(Summarize(input.Results))
+		tables[i].most = workers
+		if workers == 0 {
+			for _, count := range input.Results.Workers {
+				tables[i].most = max(tables[i].most, count)
+			}
+		}
+	}
+	many := fmt.Sprintf("%d workers", workers)
+	if workers == 0 {
+		many = "most workers"
 	}
 	names := make([]string, len(inputs))
 	for i, input := range inputs {
@@ -60,16 +70,14 @@ func RenderTables(inputs []VersusChartInput, workers int) (string, error) {
 	var columns []column
 	for _, op := range []string{OpCreate, OpVerify} {
 		for _, count := range []int{1, workers} {
-			columns = append(columns, column{fmt.Sprintf("%s, %s", opTitle(op), plural(count, "1 worker", fmt.Sprintf("%d workers", count))), op, count, false})
+			columns = append(columns, column{fmt.Sprintf("%s, %s", opTitle(op), workerTitle(count, many)), op, count, false})
 		}
 	}
 	for _, count := range []int{1, workers} {
-		columns = append(columns, column{fmt.Sprintf("Repair retaining files, %s", plural(count, "1 worker", fmt.Sprintf("%d workers", count))), OpRepair, count, true})
+		columns = append(columns, column{fmt.Sprintf("Repair retaining files, %s", workerTitle(count, many)), OpRepair, count, true})
 	}
-	columns = append(columns, column{fmt.Sprintf("Repair in place, %d workers", workers), OpRepair, workers, false})
-	if workers == 1 {
-		columns = dedupeColumns(columns, func(c column) string { return c.title })
-	}
+	columns = append(columns, column{"Repair in place, " + many, OpRepair, workers, false})
+	columns = dedupeColumns(columns, func(c column) string { return c.title })
 	b.WriteString("**Summary.** Geometric mean of the reference ÷ rarpar wall-time ratio over the plain sets; above 1 means rarpar is faster.\n\n")
 	titles := []string{"Machine"}
 	for _, c := range columns {
@@ -106,7 +114,7 @@ func RenderTables(inputs []VersusChartInput, workers int) (string, error) {
 	}
 	for _, c := range []column{{"Create", OpCreate, workers, false}, {"Verify", OpVerify, workers, false},
 		{"Repair retaining files", OpRepair, workers, true}, {"Repair in place", OpRepair, workers, false}} {
-		fmt.Fprintf(&b, "\n**%s, %s.** rarpar median wall seconds (reference ÷ rarpar).\n\n", c.title, plural(workers, "1 worker", fmt.Sprintf("%d workers", workers)))
+		fmt.Fprintf(&b, "\n**%s, %s.** rarpar median wall seconds (reference ÷ rarpar).\n\n", c.title, workerTitle(workers, many))
 		header("Set")
 		for _, config := range plain {
 			cells := []string{"`" + config.ID + "`"}
@@ -116,7 +124,7 @@ func RenderTables(inputs []VersusChartInput, workers int) (string, error) {
 			fmt.Fprintf(&b, "| %s |\n", strings.Join(cells, " | "))
 		}
 	}
-	fmt.Fprintf(&b, "\n**Peak memory.** Peak RSS in MiB, %s, as the range across the machines.\n\n", plural(workers, "1 worker", fmt.Sprintf("%d workers", workers)))
+	fmt.Fprintf(&b, "\n**Peak memory.** Peak RSS in MiB, %s, as the range across the machines.\n\n", workerTitle(workers, many))
 	b.WriteString("| Set | Create, rarpar | Create, reference | Repair, rarpar | Repair, reference |\n|---|---:|---:|---:|---:|\n")
 	for _, config := range plain {
 		cells := []string{"`" + config.ID + "`"}
@@ -159,10 +167,22 @@ func opTitle(op string) string {
 	return strings.ToUpper(op[:1]) + op[1:]
 }
 
-// tableRows indexes one machine's summarized rows for the tables.
-type tableRows struct{ rows []Row }
+// tableRows indexes one machine's summarized rows for the tables; most is
+// the worker count the "most workers" columns read.
+type tableRows struct {
+	rows []Row
+	most int
+}
 
-func newTableRows(rows []Row) tableRows { return tableRows{rows} }
+func newTableRows(rows []Row) tableRows { return tableRows{rows: rows} }
+
+// workerTitle is "1 worker" for one, else the many-workers title.
+func workerTitle(count int, many string) string {
+	if count == 1 {
+		return "1 worker"
+	}
+	return many
+}
 
 // reference is the reference row of a set and op, on the first target.
 func (t tableRows) reference(config, op string) *Row {
@@ -178,6 +198,9 @@ func (t tableRows) reference(config, op string) *Row {
 // rarpar is the plain rarpar row (no kernel) of a set, op, worker count and
 // repair mode, on the reference's target.
 func (t tableRows) rarpar(config, op string, workers int, backup bool) *Row {
+	if workers == 0 {
+		workers = t.most
+	}
 	reference := t.reference(config, op)
 	for i := range t.rows {
 		row := &t.rows[i]

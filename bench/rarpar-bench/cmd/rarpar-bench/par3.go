@@ -69,7 +69,7 @@ machine's row name): par2-rs, par2cmdline-turbo, par3cmdline and rarpar par3,
 each codec, against par2cmdline-turbo, or par2-rs when any machine has none.
 par3 tables prints the benchmark page's PAR3 tables from the same inputs: each
 cell is rarpar's median wall seconds and the reference ÷ rarpar ratio, as
-"4.4 (14×)", at --workers (default: the largest worker count run).
+"4.4 (14×)", at --workers (default: each machine's largest worker count).
 `
 
 func runPAR3(ctx context.Context, args []string, stdout io.Writer) error {
@@ -456,7 +456,7 @@ func runPAR3Tables(args []string, stdout io.Writer) error {
 	flags := flag.NewFlagSet("par3 tables", flag.ContinueOnError)
 	var inputs stringList
 	flags.Var(&inputs, "input", "[NAME=]results.json from par3 run (repeatable, in column order)")
-	workers := flags.Int("workers", 0, "rarpar worker count for the per-set tables (default: the largest run)")
+	workers := flags.Int("workers", 0, "rarpar worker count for the per-set tables (default: each machine's largest)")
 	out := flags.String("out", "", "write the Markdown here instead of stdout")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -471,13 +471,7 @@ func runPAR3Tables(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	count := *workers
-	if count == 0 {
-		for _, value := range suites[0].Results.Workers {
-			count = max(count, value)
-		}
-	}
-	tables, err := par3bench.RenderTables(suites, count)
+	tables, err := par3bench.RenderTables(suites, *workers)
 	if err != nil {
 		return err
 	}

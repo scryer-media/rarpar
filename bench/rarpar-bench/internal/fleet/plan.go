@@ -360,6 +360,9 @@ func machineSteps(machine Machine, layout RemoteLayout) []string {
 		steps = append(steps, fmt.Sprintf("on host: macro-par3, profile %s, workers %v, buffered rarpar rows only (never --fsync): per worker count rarpar-wN for every op, repairing in place with no backup, and the repair row rarpar-wN-backup, which keeps a numbered .1 as the reference does (like for like on bytes written); warmups=%d repeats=%d, %s, reference failures are DNF, work %s",
 			machine.PAR3.Profile, machine.PAR3.Workers, machine.PAR3.Warmups, machine.PAR3.Repeats,
 			timeout, PAR3Work(machine, layout)))
+		if step := par3PAR2Step(machine); step != "" {
+			steps = append(steps, step)
+		}
 		if step := par3PerfStep(machine); step != "" {
 			steps = append(steps, step)
 		}
@@ -439,6 +442,33 @@ func par3PerfStep(machine Machine) string {
 	perf := par3bench.PerfOptions{StatRepeats: machine.Perf.StatRepeats, Ops: ops, RecordSets: machine.Perf.PAR3RecordSets}
 	return step + fmt.Sprintf("; up to %d untimed runs; evidence under results/perf/par3, and %s plus a par3-perf-incomplete warning when the pass falls short",
 		par3bench.PerfPassRuns(profile, variants, perf), par3bench.PerfIncompleteFile)
+}
+
+// par3PAR2Step names the PAR2 rows macro-par3 runs, or "" when no selected
+// set asks for them.
+func par3PAR2Step(machine Machine) string {
+	profile, err := par3bench.LookupProfile(machine.PAR3.Profile)
+	if err == nil {
+		profile, err = profile.Select(machine.PAR3.Sets)
+	}
+	if err != nil {
+		return ""
+	}
+	var sets []string
+	for _, config := range profile.Configs {
+		if config.PAR2 && config.Carrier == "" {
+			sets = append(sets, config.ID)
+		}
+	}
+	if len(sets) == 0 {
+		return ""
+	}
+	rows := "par2-rs (rarpar par)"
+	if _, ok := machine.Oracles["par2"]; ok {
+		rows += " and par2cmdline-turbo (the par2 oracle)"
+	}
+	return fmt.Sprintf("on host: inside macro-par3, PAR2 rows %s create, verify and repair at the same block size, recovery and damage on %s",
+		rows, strings.Join(sets, ","))
 }
 
 // perfStep is the run script's perf section: the corpus suites' perf pass,
