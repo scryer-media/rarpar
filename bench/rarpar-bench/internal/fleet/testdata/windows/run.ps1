@@ -65,6 +65,7 @@ $p3Work = 'C:\p3'
 if (Test-Path -LiteralPath $OraclePar3) {
   Gate 'macro-par3'
   $p3Args = @('par3','run','--reference',$OraclePar3,'--candidate',$Candidate,'--work',$p3Work,'--out',(Join-Path $R 'par3'),'--machine',$Machine,'--profile','full','--workers','1,8','--warmups','1','--repeats','5','--timeout','20m')
+  if ($OraclePar2) { $p3Args += @('--par2', $OraclePar2) }
   & $Bench @p3Args *> (Join-Path $R 'par3-run.log')
   Check 'macro-par3'
 } else { Fail 'par3-reference-missing' }

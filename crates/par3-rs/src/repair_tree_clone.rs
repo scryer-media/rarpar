@@ -164,3 +164,57 @@ pub(crate) fn copy_unsupported(error: &io::Error) -> bool {
             || code == libc::ETXTBSY
     })
 }
+
+/// Rename `from` in `from_dir` to `to` in `to_dir` without replacing a file
+/// already at `to`: the kernel claims the name in the rename itself, and an
+/// occupied name fails with `AlreadyExists`.
+pub(super) fn rename_noreplace(
+    from_dir: &impl AsFd,
+    from: &std::ffi::OsStr,
+    to_dir: &impl AsFd,
+    to: &std::ffi::OsStr,
+) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let from = std::ffi::CString::new(from.as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let to = std::ffi::CString::new(to.as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: both directory descriptors are borrowed for the duration of the
+    // call, and both names are NUL-terminated strings that outlive it.
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            from_dir.as_fd().as_raw_fd(),
+            from.as_ptr(),
+            to_dir.as_fd().as_raw_fd(),
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    // SAFETY: as above.
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        libc::renameatx_np(
+            from_dir.as_fd().as_raw_fd(),
+            from.as_ptr(),
+            to_dir.as_fd().as_raw_fd(),
+            to.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Whether a refused no-replace rename means only that this kernel or
+/// filesystem has no such rename, so the caller checks the name instead.
+pub(super) fn noreplace_unsupported(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(code) if code == libc::EINVAL
+        || code == libc::ENOSYS
+        || code == libc::ENOTSUP
+        || code == libc::EOPNOTSUPP)
+}

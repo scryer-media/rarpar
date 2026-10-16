@@ -238,32 +238,46 @@ The same inputs and damage are produced on every host:
 
 ### Fleet profile
 
-`--profile fleet` is the set list the `macro-par3` fleet suite runs. It is
-ordered so that each size's Cauchy and FFT rows sit next to each other:
+`--profile fleet` is the set list the `macro-par3` fleet suite runs. Its plain
+sets follow the usenet posting census of 546 releases: one posting shape per
+cluster, at that cluster's block size and redundancy, each run as a Cauchy set
+and an FFT set side by side:
 
-| set | data | block | input / recovery | codec | damage | covers |
+| shape | data | block | input / recovery | Cauchy field | damage | census cluster |
 |---|---|---|---|---|---|---|
-| `b-gf16` | 300 MiB, many files | 1 MiB | 300 / 30 | Cauchy GF(2^16) | 10 lost blocks | small Cauchy |
-| `b-fft` | 300 MiB, many files | 1 MiB | 300 / 30 | FFT | 10 lost blocks | small FFT |
-| `m-gf16` | 4 x 128 MiB | 1 MiB | 512 / 52 | Cauchy GF(2^16) | 24 lost blocks, 6 per file | medium Cauchy |
-| `m-fft` | 4 x 128 MiB | 1 MiB | 512 / 52 | FFT | 24 lost blocks, 6 per file | medium FFT |
-| `a-gf16` | 1 GiB | 1 MiB | 1024 / 103 | Cauchy GF(2^16) | 50 lost blocks | large Cauchy |
-| `c-fft` | 1.5 GiB | 32 KiB | 49152 / 4916 | FFT | 2000 lost blocks | over the PAR2 cap |
-| `zip-inside` | 4 x 64 MiB in one stored ZIP | chosen by the reference | chosen by the reference, `-r10` | Cauchy | 40 lost blocks in the ZIP | PAR-inside repair |
+| `b-1536k` | 10 x 30 MiB | 1.5 MiB | 200 / 20 (10%) | GF(2^16) | 10 lost blocks across 5 files | median block size of releases under 1 GiB, in anime-archive 30 MiB volumes |
+| `a-10mb` | 1 GiB, one file | 10,000,000 bytes | 108 / 22 (20%) | GF(2^8) | 11 lost blocks | par2cmdline-turbo's 10 MB blocks at 20% |
+| `a-4m` | 1 GiB, one file | 4 MiB | 256 / 26 (10%) | GF(2^16) | 13 lost blocks | the census median block size and redundancy |
+| `a-512k` | 1 GiB, one file | 512 KiB | 2048 / 41 (2%) | GF(2^16) | 20 lost blocks | par2cmdline's about 2000 blocks at 2% |
+| `zip-inside` | 4 x 64 MiB in one stored ZIP | chosen by the reference | chosen by the reference, `-r10` | GF(2^16) | 40 lost blocks in the ZIP | PAR-inside repair |
 
-FFT is forced on both sides, never chosen by size: the reference gets its
-explicit `-e8` switch and `rarpar` gets `--codec fft` with
-`--capacity-log2` of the next power of two at or above the recovery count.
-Neither tool refuses FFT at these sizes, so the small and medium FFT rows
-measure the same shapes as their Cauchy neighbours. `a-gf16` and `c-fft` cap
-their measured repeats at 3 (`max_repeats` in `results.json`) so the slowest
-hosts finish within the fleet's time budget; the report notes the cap.
+Each shape's sets are `<shape>-<field>` (Cauchy) and `<shape>-fft`. They share
+the dataset, block size, recovery count and damage, and record the shape in
+`results.json` (`shape`), so `par3 versus-render` can draw them together. FFT
+is forced on both sides, never chosen by size: the reference gets its
+explicit `-e8` switch and `rarpar` gets `--codec fft` with `--capacity-log2`
+of the next power of two at or above the recovery count. Every block size is a
+multiple of 64, which the reference's FFT needs.
 
-Each set's shape is recorded in `results.json` for joining with PAR2 rows
-later: payload bytes, block size, input and recovery blocks, lost blocks, the
-codec and field, the PAR2 source-block count for the same payload and block
-size, and `par2_equivalent`, which is false for `c-fft` (49152 input blocks,
-where PAR2 allows 32768) and for the ZIP carrier.
+The Cauchy set of each shape also runs the PAR2 rows (`par2: true`): `par2-rs`
+(`rarpar par create`, `verify` and `repair`) and, with `--par2 PATH`,
+`par2cmdline-turbo`, each at the same block size, recovery count and damage.
+Each creates its own PAR2 set, timed; their verify and repair read one PAR2
+set written untimed before the timed runs, by `par2cmdline-turbo` when given,
+else `par2-rs` (`par2_canonical_source`). A PAR2 repair is checked against
+the inputs' SHA-256 like every other; what it leaves beside the files
+(`par2cmdline-turbo` keeps a numbered `.1`, `par2-rs` repairs in place) is
+recorded, not enforced. Both run at their default thread count. `--rows`
+names them `par2-rs` and `par2cmdline-turbo`; the default rows include
+`par2-rs`, and `par2cmdline-turbo` when `--par2` is given. The `smoke` profile
+makes `smoke-gf16` and `smoke-fft` one shape with PAR2 rows, so a smoke run
+covers them.
+
+Each set's shape is also recorded for joining with other suites' PAR2 rows:
+payload bytes, block size, input and recovery blocks, lost blocks, the codec
+and field, the PAR2 source-block count for the same payload and block size,
+and `par2_equivalent`, which is false for the ZIP carrier and for any set
+over PAR2's 32768-block limit.
 
 `zip-inside` builds a deterministic stored ZIP of the four files (no
 timestamps, no data descriptors), then runs the reference's untimed
@@ -479,7 +493,7 @@ Defender settings, and none may.
 ### Output
 
 `--out` receives `results.json`, `runs.jsonl` (one line per process, warmups
-included) and `report.md`. The results schema is `rarpar-par3-bench-v3`.
+included) and `report.md`. The results schema is `rarpar-par3-bench-v4`.
 Fields added without changing an existing one keep the schema name, as the
 DNF, timeout and canonical-source fields did under v1 and the perf pass's
 `perf` and `perf_runs` do under v3. v2 removed v1's durability fields
@@ -488,8 +502,10 @@ per-variant, per-run and engine_perf `durability`) and added `buffered_args`
 and `buffered_unsupported`. v3 split the repair rows: a v2 `rarpar-wN`
 repair row kept a numbered backup, where a v3 one repairs in place. It added
 `backup_args`, `in_place_unsupported`, the variants' `backup` flag and each
-repair's `backups`. A v1 `rarpar-wN` row may be a durable run and a v2 one a
-backup repair, so the v3 harness refuses both (`par3 report`, `par3 render`
+repair's `backups`. v4 added the PAR2 rows, the sets' `shape` and `par2`,
+`par2cmdline_turbo` and `par2_canonical_source`; a v3 file reads as one with
+no PAR2 rows. A v1 `rarpar-wN` row may be a durable run and a v2 one a
+backup repair, so the harness refuses both (`par3 report`, `par3 render`
 and the fleet collector alike); read them with the harness that wrote them.
 Generated datasets and the reference's canonical sets are cached under
 `--work`; delete it to reclaim the space. `--keep-stages` keeps the per-run
@@ -563,75 +579,56 @@ reference ratio.
 
 ### PAR2 against PAR3
 
-`rarpar-bench par3 versus` runs PAR2 and PAR3 over the same inputs:
+The PAR2-against-PAR3 charts are a lens over suite results, not a run of
+their own: each posting shape's Cauchy set (with its PAR2 rows) and FFT set
+already measured every tool on the same inputs.
 
 ```sh
-# Smoke, seconds: every row kind on a 4 MiB set.
-target/rarpar-bench par3 versus --profile versus-smoke \
-  --candidate target/release/rarpar --par2 /path/to/par2 \
-  --work target/vs --out target/par3-versus-smoke
+# Chart one or more machines' suite results, one SVG per shape and op.
+target/rarpar-bench par3 versus-render --out target/vs-charts \
+  --input "Zen 4=zen4/par3/results.json" \
+  --input "Neoverse N1=n1/par3/results.json"
 
-# Re-render the Markdown from a saved results.json.
-target/rarpar-bench par3 versus-report --input target/par3-versus-smoke/results.json
+# The benchmark page's PAR3 tables from the same inputs.
+target/rarpar-bench par3 tables --workers 4 \
+  --input "Zen 4=zen4/par3/results.json" \
+  --input "Neoverse N1=n1/par3/results.json"
 ```
 
-The arms are:
+`par3 versus-render` writes `rarpar-par3-versus-<shape>-<op>.svg` for create
+and repair of every shape in its inputs. Each `--input` is one machine's
+`results.json`, drawn in the order given; `NAME=` sets the name its rows
+carry, and without it the machine label from the results is used. Each
+machine is a group of rows, in this order: `par2-rs`, `par2cmdline-turbo`,
+`par3cmdline (Cauchy)`, `par3cmdline (FFT)`, `rarpar par3 (Cauchy)` and
+`rarpar par3 (FFT)`. The rarpar rows are the plain `rarpar-wN` rows at the
+run's largest worker count on the first target, and at repair each is
+followed by its `rarpar-wN-backup` twin. Each row carries the median wall,
+CPU and peak RSS and a bar on the same log scale as the other charts: the
+baseline's median wall time divided by the row's. The baseline is
+`par2cmdline-turbo`, or `par2-rs` for the whole chart when any machine has no
+`par2cmdline-turbo` run. Every row is read from the first target's rows. A
+repair row is marked **retains file** when it left a numbered `.1` of every
+file it repaired, as `par2cmdline-turbo` and the reference do, or **in
+place** when it left none; only rows with the same mark write the same bytes.
+A rarpar repair row with no successful run takes the mark of the row it is
+(`rarpar-wN` or `rarpar-wN-backup`). Each machine's heading gives that run's
+measured runs per row, and names any row whose median rests on fewer. The
+render fails when:
+- the inputs ran different rarpar versions;
+- a shape differs between inputs in dataset, file layout, block size,
+  recovery count or damage targets;
+- a shape ID is anything but letters, digits, `-`, `_` and `.`.
 
-- `par2-rs`: `rarpar par create` and `rarpar par repair`.
-- `par2cmdline-turbo`: the `--par2` binary. Without `--par2`, this arm is
-  skipped and the report says so.
-- `par3-cauchy`: `rarpar par3 create` with the default codec.
-- `par3-fft`: `rarpar par3 create --codec fft`.
+`par3 tables` prints Markdown: a summary of the geometric mean of the
+reference ÷ rarpar wall-time ratio over the plain sets per op and worker
+count, then per set at `--workers` (default: the largest worker count run)
+each op's rarpar median wall seconds with that ratio after it, as `4.4 (14×)`,
+and the peak RSS range across the machines. A PAR-inside set's summary cells
+always read its one rarpar row, which runs at the largest worker count.
 
-At repair each PAR3 arm repairs in place with no backup, and is followed by
-a `-backup` twin (`par3-cauchy-backup`, `par3-fft-backup`) that repairs the
-same set keeping a numbered `.1` of every file it repairs, the compatible
-behaviour. Both take their arguments from the same `par3 repair --help`
-probe as the PAR3 suite's repair rows; on a candidate that lists neither
-switch only the twins run repair. A PAR3 repair whose numbered backups
-contradict its arm fails as `backup-mismatch`.
-
-Each row fixes one block size, one recovery count and one damage pattern for
-every arm. Each arm creates its own set, then repairs the same damaged copy of
-the inputs together with its own recovery files. Every repaired file is checked
-against the SHA-256 recorded when the inputs were generated; a mismatch, a
-non-zero exit or a missing peak RSS fails the run.
-
-There are two kinds of row:
-
-- An equal-count row runs every arm.
-- An FFT-only row runs the two PAR2 arms against `par3-fft` at 10% and 30%
-  recovery, where Cauchy is not the codec anyone would choose.
-
-The `versus` profile reuses sets A and B from `full`:
-
-- `vs-a-equal` and `vs-b-equal` use 1 MiB blocks at 10% recovery.
-- `vs-a-fft10` and `vs-a-fft30` use 64 KiB blocks.
-
-`versus-smoke` has one row of each kind on a small generated set.
-
-The report gives, per row:
-
-- median wall and CPU time and raw peak RSS for every arm, with the range,
-  and what each repair left beside the repaired inputs;
-- a ratio table on one scale, **par2 ÷ par3** median wall time, where a figure
-  above 1 means the PAR3 arm was faster, which also says whether each pair is
-  like for like on bytes written: both kept a numbered backup, or neither did.
-
-Every arm runs at its default thread count, because `rarpar par` has no thread
-flag, so the arms are not thread-matched. The PAR3 arms run buffered, as the
-PAR3 suite's rows do: the same `--help` probe adds `--buffered` where an older
-candidate lists it, and `--fsync` is never passed. `--out` receives
-`results.json` and `report.md`. The schema is `rarpar-par3-versus-v2`. v1
-gained `buffered_args` and `buffered_unsupported` without changing an
-existing field; v2 added the in-place PAR3 repair arms and their `-backup`
-twins, `backup_args`, `in_place_unsupported` and each repair's `backups`. A
-v1 PAR3 arm may have run durable and kept a backup, so `par3 versus-report`
-refuses a v1 file; read it with the harness that wrote it.
-
-In the fleet, `versus = "versus"` (or `"versus-smoke"`) under
-`[machines.par3]` adds the run after the PAR3 suite. It passes the machine's
-PAR2 oracle as `--par2` when the machine has one.
+In the fleet, a machine with a PAR2 oracle passes it to `par3 run` as
+`--par2`.
 
 ### Network-mount rig
 

@@ -132,9 +132,10 @@ pub struct RepairOptions {
     ///
     /// Off by default: the rebuilt file is renamed over the damaged one, which
     /// on POSIX replaces it in one step, and the damaged bytes are simply not
-    /// kept; nothing else is ever deleted. On, the damaged file is kept as
+    /// kept; nothing else is ever deleted. On, the damaged file moves to
     /// `<name>.1`, or `.2`, and so on up to the first free number, the way the
-    /// reference implementation does it.
+    /// reference implementation keeps it, and the rebuilt file moves into the
+    /// name it vacated.
     pub backup: bool,
     /// What this repair may allocate.
     pub limits: RepairLimits,

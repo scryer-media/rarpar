@@ -54,7 +54,6 @@ func TestPAR3ConfigValidation(t *testing.T) {
 			"par3.durability is no longer accepted: the PAR3 bench runs buffered rarpar rows only"},
 		{"duplicate worker count", `workers = [1, 8]                         # rarpar rows; the reference is single-threaded`, `workers = [8, 8]`, "appears twice"},
 		{"pin list", `pin_cpus = "0-7"`, `pin_cpus = "0,2"`, "par3.pin_cpus"},
-		{"unknown versus profile", `versus = "versus"`, `versus = "versus-huge"`, "par3.versus"},
 		{"missing par3 oracle", "[machines.oracles.par3]\npolicy = \"source-build\"\nreason = \"par3cmdline publishes no release and no Linux binary; the tree ships only windows/par3.exe\"\nrecipe = \"par3cmdline-onhost\"\nversion",
 			"[machines.oracles.par3x]\npolicy = \"source-build\"\nreason = \"x\"\nrecipe = \"par3cmdline-onhost\"\nversion", "needs [machines.oracles.par3]"},
 		{"onhost recipe takes no url", `recipe = "par3cmdline-onhost"
@@ -100,10 +99,7 @@ func TestPAR3RunScriptSection(t *testing.T) {
 		"'--profile' 'full' '--workers' '1,8' '--warmups' '1' '--repeats' '5' '--timeout' '20m' '--pin-cpus' '0-7'",
 		"gate macro-par3",
 		"fail par3-reference-missing",
-		"gate macro-par3-versus",
-		`set -- par3 versus --candidate "$CANDIDATE" --work "$P3_WORK/vs" --out "$R/par3-versus" --machine "$MACHINE" '--profile' 'versus' '--warmups' '1' '--repeats' '5' '--timeout' '20m' '--pin-cpus' '0-7'`,
-		`[ -n "$ORACLE_PAR2" ] && set -- "$@" --par2 "$ORACLE_PAR2"`,
-		"fail macro-par3-versus",
+		`${ORACLE_PAR2:+--par2 "$ORACLE_PAR2"} > "$R/par3-run.stdout.log"`,
 	} {
 		if !strings.Contains(script, expected) {
 			t.Fatalf("run script is missing %q", expected)
@@ -134,10 +130,9 @@ func TestPAR3WindowsUsesTheOfficialBinaryAndHostPaths(t *testing.T) {
 	if got := plan.Machines[0].Oracles["par3"].RemotePath; got != `C:\bench\fleet-stage\fleet-testrun\bin\par3.exe` {
 		t.Fatalf("Windows oracle path = %s", got)
 	}
-	machine.PAR3.Versus = "versus"
 	script := WindowsRunScript(machine, config.Fleet.Defaults, "fleet-testrun", layout, map[string]string{"par3": `C:\x\par3.exe`})
 	for _, expected := range []string{"$OraclePar3 = 'C:\\x\\par3.exe'", "Gate 'macro-par3'", "'par3','run','--reference',$OraclePar3", "$p3Work = 'C:\\p3'",
-		"Gate 'macro-par3-versus'", "'par3','versus','--candidate',$Candidate", "if ($OraclePar2) { $vsArgs += @('--par2', $OraclePar2) }", "Check 'macro-par3-versus'"} {
+		"if ($OraclePar2) { $p3Args += @('--par2', $OraclePar2) }"} {
 		if !strings.Contains(script, expected) {
 			t.Fatalf("Windows run script is missing %q", expected)
 		}
@@ -403,7 +398,7 @@ func TestPAR3PerfPassReachesTheRunScript(t *testing.T) {
 		`  "$BENCH" par3 run --reference "$P3_REFERENCE" --candidate "$CANDIDATE" --work "$P3_WORK" \` + "\n" +
 			`    --out "$R/par3" --machine "$MACHINE" '--profile' 'full' '--workers' '1,8' '--warmups' '1' '--repeats' '5' '--timeout' '20m' '--pin-cpus' '0-7' \` + "\n" +
 			`    --perf-out "$R/perf/par3" '--perf-stat' '3' '--perf-ops' 'repair' '--perf-freq' '499' '--perf-record' 'a-gf16' \` + "\n" +
-			`    > "$R/par3-run.stdout.log" 2> "$R/par3-run.stderr.log"`,
+			`    ${ORACLE_PAR2:+--par2 "$ORACLE_PAR2"} > "$R/par3-run.stdout.log" 2> "$R/par3-run.stderr.log"`,
 		`  if [ -f "$R/perf/par3/INCOMPLETE.txt" ] || [ -z "$(ls -A "$R/perf/par3" 2>/dev/null)" ]; then warn par3-perf-incomplete; fi`,
 		`  perf --version > "$R/perf/perf-version.txt" 2>&1`,
 	} {
@@ -475,7 +470,7 @@ func TestPAR3PerfPassDefaults(t *testing.T) {
 		t.Fatalf("defaults: %+v", machine.Perf)
 	}
 	script := RunScript(machine, config.Fleet.Defaults, "fleet-testrun", LayoutFor(machine, "fleet-testrun"), nil)
-	if !strings.Contains(script, `    --perf-out "$R/perf/par3" '--perf-stat' '3' '--perf-ops' 'repair' \`+"\n"+`    > "$R/par3-run.stdout.log"`) ||
+	if !strings.Contains(script, `    --perf-out "$R/perf/par3" '--perf-stat' '3' '--perf-ops' 'repair' \`+"\n"+`    ${ORACLE_PAR2:+--par2 "$ORACLE_PAR2"} > "$R/par3-run.stdout.log"`) ||
 		strings.Contains(script, "'--perf-record'") {
 		t.Fatalf("an SSM macro-par3 host's run script must carry the default perf pass and no record:\n%s", script)
 	}
@@ -536,5 +531,24 @@ func TestPAR3PerfConfigValidation(t *testing.T) {
 				t.Fatalf("want an error containing %q, got %v", testCase.want, err)
 			}
 		})
+	}
+}
+
+// The PAR2 plan step names only the selected ops PAR2 rows run.
+func TestPAR3PAR2StepFollowsTheSelectedOps(t *testing.T) {
+	for ops, want := range map[string]string{
+		"":                      "PAR2 rows par2-rs (rarpar par) create, verify and repair at",
+		"create":                "PAR2 rows par2-rs (rarpar par) create at",
+		"verify-damaged,repair": "PAR2 rows par2-rs (rarpar par) repair at",
+		"verify-damaged":        "",
+	} {
+		machine := Machine{PAR3: PAR3Plan{Profile: "smoke"}}
+		if ops != "" {
+			machine.PAR3.Ops = strings.Split(ops, ",")
+		}
+		step := par3PAR2Step(machine)
+		if (want == "") != (step == "") || !strings.Contains(step, want) {
+			t.Errorf("ops %q: step %q", ops, step)
+		}
 	}
 }

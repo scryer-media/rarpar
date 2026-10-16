@@ -499,22 +499,6 @@ func par3PerfArgs(machine Machine) []string {
 	return args
 }
 
-// par3VersusArgs is the `rarpar-bench par3 versus` argument list after the
-// paths, or nil when the machine runs no comparison. It shares the PAR3
-// plan's warmups, repeats, pin and timeout.
-func par3VersusArgs(machine Machine) []string {
-	plan := machine.PAR3
-	if plan.Versus == "" {
-		return nil
-	}
-	args := []string{"--profile", plan.Versus, "--warmups", fmt.Sprint(plan.Warmups), "--repeats", fmt.Sprint(plan.Repeats),
-		"--timeout", fmt.Sprintf("%dm", plan.TimeoutMinutes)}
-	if plan.PinCPUs != "" {
-		args = append(args, "--pin-cpus", plan.PinCPUs)
-	}
-	return args
-}
-
 func par3Section(machine Machine, layout RemoteLayout, reference string) string {
 	var script strings.Builder
 	write := func(format string, args ...any) { fmt.Fprintf(&script, format+"\n", args...) }
@@ -540,6 +524,8 @@ func par3Section(machine Machine, layout RemoteLayout, reference string) string 
 		write("  # covered op's timed runs: perf stat on every reference and rarpar row,")
 		write("  # perf record on the rarpar rows of the record sets.")
 	}
+	write("  # The posting-shape sets also run PAR2: par2-rs, and par2cmdline-turbo")
+	write("  # when the machine has the par2 oracle.")
 	write("  \"$BENCH\" par3 run --reference \"$P3_REFERENCE\" --candidate \"$CANDIDATE\" --work \"$P3_WORK\" \\")
 	write("    --out \"$R/par3\" --machine \"$MACHINE\" %s \\", strings.Join(quoted, " "))
 	if perfArgs != nil {
@@ -549,7 +535,7 @@ func par3Section(machine Machine, layout RemoteLayout, reference string) string 
 		}
 		write("    --perf-out \"$R/perf/par3\" %s \\", strings.Join(quotedPerf, " "))
 	}
-	write("    > \"$R/par3-run.stdout.log\" 2> \"$R/par3-run.stderr.log\"")
+	write("    ${ORACLE_PAR2:+--par2 \"$ORACLE_PAR2\"} > \"$R/par3-run.stdout.log\" 2> \"$R/par3-run.stderr.log\"")
 	write("  rc=$?")
 	write("  log \"macro-par3 rc=$rc\"")
 	write("  [ \"$rc\" -eq 0 ] || fail macro-par3")
@@ -561,20 +547,6 @@ func par3Section(machine Machine, layout RemoteLayout, reference string) string 
 	write("else")
 	write("  fail par3-reference-missing")
 	write("fi")
-	if versus := par3VersusArgs(machine); versus != nil {
-		quotedVersus := make([]string, 0, len(versus))
-		for _, arg := range versus {
-			quotedVersus = append(quotedVersus, shellQuote(arg))
-		}
-		write("# PAR2 against PAR3 (par2 ÷ par3, above 1 = PAR3 faster); needs no PAR3 reference.")
-		write("gate macro-par3-versus")
-		write("set -- par3 versus --candidate \"$CANDIDATE\" --work \"$P3_WORK/vs\" --out \"$R/par3-versus\" --machine \"$MACHINE\" %s", strings.Join(quotedVersus, " "))
-		write("[ -n \"$ORACLE_PAR2\" ] && set -- \"$@\" --par2 \"$ORACLE_PAR2\"")
-		write("\"$BENCH\" \"$@\" > \"$R/par3-versus.stdout.log\" 2> \"$R/par3-versus.stderr.log\"")
-		write("rc=$?")
-		write("log \"macro-par3-versus rc=$rc\"")
-		write("[ \"$rc\" -eq 0 ] || fail macro-par3-versus")
-	}
 	write("rm -rf \"$P3_WORK\"")
 	write("")
 	return script.String()

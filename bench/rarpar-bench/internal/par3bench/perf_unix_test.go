@@ -395,7 +395,7 @@ func TestValidatePerfOptions(t *testing.T) {
 		{PerfOptions{StatRepeats: 1, Ops: []string{OpVerifyDamaged}}, "--perf-ops: verify-damaged is not one of the run's ops"},
 		{PerfOptions{RecordSets: []string{"z-gf99"}}, `--perf-record: "z-gf99" is not a set of the selected fleet profile`},
 		{PerfOptions{RecordSets: []string{"zip-inside"}}, `--perf-record: "zip-inside" is a PAR-inside set`},
-		{PerfOptions{RecordSets: []string{"b-gf16", "b-gf16"}}, `--perf-record: set "b-gf16" is listed more than once`},
+		{PerfOptions{RecordSets: []string{"a-4m-gf16", "a-4m-gf16"}}, `--perf-record: set "a-4m-gf16" is listed more than once`},
 		{PerfOptions{StatRepeats: 1, Frequency: -5}, "--perf-freq must be positive"},
 	} {
 		if err := validatePerf(base(tc.perf)); err == nil || !strings.Contains(err.Error(), tc.want) {

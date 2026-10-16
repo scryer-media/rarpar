@@ -417,6 +417,26 @@ class NativeCodeTests(unittest.TestCase):
         self.assertEqual(len(native.check_binary(b"mimalloc: warning: ", "x86_64-unknown-linux-musl")), 1)
 
 
+    def test_mimalloc_must_be_built_without_huge_pages(self):
+        source = ("/opt/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libmimalloc-sys-0.1.49/"
+                  "c_src/mimalloc/v3/src/static.c")
+
+        def output(*flags):
+            words = " ".join(f'"{flag}"' for flag in ("musl-gcc", "-O3", *flags, "-o", "/out/static.o", "-c", source))
+            return f"running: {words}\n"
+
+        self.assertEqual(native.check_mimalloc_build(output("-DMI_DEFAULT_ALLOW_THP=0")), [])
+        # A later define wins, as it does for the compiler.
+        self.assertEqual(native.check_mimalloc_build(output("-DMI_DEFAULT_ALLOW_THP=1",
+                                                            "-DMI_DEFAULT_ALLOW_THP=0")), [])
+        for flags, value in ((("-DNDEBUG",), "not set"), (("-DMI_DEFAULT_ALLOW_THP=0", "-DMI_DEFAULT_ALLOW_THP=1"), "1")):
+            with self.subTest(flags):
+                errors = native.check_mimalloc_build(output(*flags))
+                self.assertEqual(len(errors), 1, errors)
+                self.assertIn(f"last value: {value}", errors[0])
+        self.assertIn("records no compile", native.check_mimalloc_build("cargo:rustc-link-lib=static=mimalloc\n")[0])
+
+
 class WorkflowTests(unittest.TestCase):
     def test_release_policy(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()

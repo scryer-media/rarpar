@@ -52,18 +52,18 @@ time.
 |---|---|---|---:|---:|---:|
 | AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 2.5× | 1.8× | 3.3× |
 | Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 2.0× | 1.5× | 2.5× |
-| Intel Core i5-1240P (Alder Lake) † | x86-64 | GFNI + AVX2 | 1.6× | 1.3× | 2.2× |
+| Intel Core i5-1240P (Alder Lake) ‡ | x86-64 | GFNI + AVX2 | 1.6× | 1.4× | 3.0× |
 | Intel Xeon Platinum 8124M (Skylake-SP) | x86-64 | AVX-512 | 1.6× | 1.3× | 2.3× |
 | AMD Ryzen 5 3600 (Zen 2) † | x86-64 | AVX2 | 1.6× | 1.5× | 1.6× |
 | Intel Xeon E5-2666 v3 (Haswell) | x86-64 | AVX2 | 1.6× | 1.3× | 2.3× |
-| Intel Atom C3538 (Denverton) † | x86-64 | SSSE3 (no AVX) | 1.2× | 1.3× | 1.4× |
+| Intel Atom C3538 (Denverton) ‡ | x86-64 | SSSE3 (no AVX) | 1.2× | 1.4× | 1.6× |
 | Apple M5 Max † | arm64 | NEON | 1.3× | 1.5× | 7.8× |
 | Arm Cortex-A72 | arm64 | NEON | 2.0× | 1.6× | 1.3× |
 | Arm Neoverse N1 | arm64 | NEON | 2.9× | 1.7× | 1.8× |
 | Arm Neoverse V2 | arm64 | NEON | 3.1× | 1.8× | 2.0× |
 
-Rows without a mark measure `rarpar 0.8.0`. † Carried from the `rarpar 0.3.3`
-publication, pending a re-measure.
+Rows without a mark measure `rarpar 0.8.0`; ‡ rows measure `rarpar 0.8.1`.
+† Carried from the `rarpar 0.3.3` publication, pending a re-measure.
 
 **unrar (binary)** is store-mode extraction — uncompressible media payloads,
 including the encrypted and BLAKE2sp variants; this is the dominant
@@ -85,23 +85,25 @@ One caveat travels with this table: the macOS PAR2 figure is measured against
 upstream's published macOS arm64 reference binary, which is much slower than
 the same version's Linux and Windows builds. The deep dive explains it.
 
-Known weaker shapes remain. On the three Intel cloud machines, PAR2
-verification and the missing-volume repair run 0.87×–0.99× and dense
-compressible source-text archives sit at about parity. PAR2 generation is now
-ahead of `par2cmdline-turbo` on every re-measured machine (1.37×–2.22×); the
-carried rows still show the earlier picture, with PPMd and PAR2 generation
-below parity on Alder Lake, Zen 2 and Denverton. `rarpar 0.8.0` is also
+Known weaker shapes remain. On the three Intel cloud machines and Alder Lake,
+PAR2 verification and the missing-volume repair run 0.87×–0.99×; dense
+compressible source-text archives sit at about parity; and on Denverton plain
+stored media runs 0.81×–0.92×. PAR2 generation is now ahead of
+`par2cmdline-turbo` on every re-measured machine (1.19×–2.22×); the carried
+rows still show the earlier picture, with PPMd and PAR2 generation below
+parity on Zen 2. `rarpar 0.8.0` is also
 slower than the previous release in store-mode extraction on Zen 4 and the
 Neoverse cores (8–17% in `rarpar`'s own time); the deep dive has the numbers.
 `rarpar` verifies repaired and extracted output rather than trusting
 timing-only success.
 
-**PAR3.** Against `par3cmdline 0.0.1` on generated data, on the same seven
-cloud machines, `rarpar par3` creates 5.2×–10.7× faster, verifies 5.4×–11.1×
-faster and repairs 1.6×–4.3× faster with 4 workers. The repair figure counts
-the numbered backups the reference writes; `rarpar`'s default in-place repair
-runs 7.1×–18.0× faster. Its recovery data is byte-identical to the
-reference's.
+**PAR3.** Against `par3cmdline 0.0.1` on generated sets shaped after the
+block sizes and redundancy found in a usenet census, on Alder Lake and
+Denverton with every thread, `rarpar par3` creates 4.6×–7.6× faster, verifies
+5.2×–5.8× faster and repairs 6.3×–8.6× faster while retaining the original
+files as the reference does; in place it repairs 6.1×–11× faster. Against
+`par2cmdline-turbo` on the same shapes it repairs 1.7×–5.0× faster, retaining
+files. The deep dive has the per-set tables and the PAR2-against-PAR3 charts.
 
 Release builds use AWS-LC-backed native crypto and CPU execution only, which
 keeps startup behavior consistent across supported platforms; `rarpar`

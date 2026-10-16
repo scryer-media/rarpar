@@ -15,13 +15,23 @@ use crate::hash_pipeline::SharedHashStream;
 use crate::volume::VolumeProvider;
 
 const STREAMING_STORE_CHUNK_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+/// Span of a hashed store copy: the read buffer is the chunk the hash lanes
+/// receive, so it is sized to the pipeline's flush span (1 MiB). That keeps
+/// each span inside a small core's L2 between the read and the write, and
+/// stays at or above [`OUTPUT_WRITE_BUFFER_BYTES`] so writes bypass the
+/// `BufWriter`.
+const STORE_HASHED_CHUNK_BYTES: usize = crate::hash_pipeline::PENDING_FLUSH_BYTES;
+/// Spans an overlapped store copy's reader thread may queue ahead of the
+/// writer. Two keep both kernel copies busy; more only adds resident buffers.
+const STORE_READ_AHEAD_CHUNKS: usize = 2;
 /// Output buffer for member extraction, deliberately smaller than the spans the
-/// producers hand down (store copies at [`STREAMING_STORE_CHUNK_BUFFER_BYTES`],
-/// LZ window flushes at up to 4 MiB). `BufWriter` bypasses its buffer only for
-/// a single write at or above capacity, so a capacity above the flush span
-/// would memcpy every output byte for no reduction in syscalls; below it, large
-/// spans go straight to `write` and only the small ones (per-filter subranges)
-/// are coalesced.
+/// producers hand down (unhashed store copies at
+/// [`STREAMING_STORE_CHUNK_BUFFER_BYTES`], hashed ones at
+/// [`STORE_HASHED_CHUNK_BYTES`], LZ window flushes at up to 4 MiB). `BufWriter`
+/// bypasses its buffer only for a single write at or above capacity, so a
+/// capacity above the flush span would memcpy every output byte for no
+/// reduction in syscalls; below it, large spans go straight to `write` and
+/// only the small ones (per-filter subranges) are coalesced.
 const OUTPUT_WRITE_BUFFER_BYTES: usize = 512 * 1024;
 /// Input buffer for the volume-chained decode streams, the read-side twin of
 /// [`OUTPUT_WRITE_BUFFER_BYTES`] and deliberately smaller than the spans the
@@ -44,6 +54,63 @@ const WINDOWS_IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 const WINDOWS_SYMLINK_FLAG_RELATIVE: u32 = 1;
 #[cfg(any(windows, test))]
 const WINDOWS_FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+/// The ciphertext side of a staged encrypted store copy: the spans the fetch
+/// thread read, served as one ordered byte stream to the decrypting reader.
+/// Spent spans go back to the fetch thread for reuse.
+struct StagedCiphertext {
+    chunks: std::sync::mpsc::Receiver<std::io::Result<StagedSpan>>,
+    spare: std::sync::mpsc::Sender<Vec<u8>>,
+    current: StagedSpan,
+    pos: usize,
+    finished: bool,
+    /// The fetch error, kept so that every read after it fails too. The
+    /// fetch thread stops at its error, so without this a retry would see
+    /// the closed channel and answer a clean end of stream.
+    failed: Option<(std::io::ErrorKind, String)>,
+}
+
+/// One span the fetch thread read: a buffer kept at its full length, so the
+/// next read into it after recycling needs no resize and no zeroing, and the
+/// count of bytes the read put at its start.
+#[derive(Default)]
+struct StagedSpan {
+    bytes: Vec<u8>,
+    filled: usize,
+}
+
+impl Read for StagedCiphertext {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while self.pos == self.current.filled {
+            if let Some((kind, message)) = &self.failed {
+                return Err(std::io::Error::new(*kind, message.clone()));
+            }
+            if self.finished || buf.is_empty() {
+                return Ok(0);
+            }
+            let spent = std::mem::take(&mut self.current);
+            if !spent.bytes.is_empty() {
+                let _ = self.spare.send(spent.bytes);
+            }
+            self.pos = 0;
+            match self.chunks.recv() {
+                Ok(Ok(chunk)) => self.current = chunk,
+                Ok(Err(error)) => {
+                    self.failed = Some((error.kind(), error.to_string()));
+                    return Err(error);
+                }
+                Err(_) => {
+                    self.finished = true;
+                    return Ok(0);
+                }
+            }
+        }
+        let n = (self.current.filled - self.pos).min(buf.len());
+        buf[..n].copy_from_slice(&self.current.bytes[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
 #[cfg(test)]
 const WINDOWS_FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
 #[cfg(any(windows, test))]
@@ -3987,6 +4054,203 @@ impl RarArchive {
         Ok(written)
     }
 
+    /// [`copy_reader_to_writer`](Self::copy_reader_to_writer) for a hashed
+    /// store copy: each span is read straight into a buffer from
+    /// `stream_hash`'s pool, written, and then handed to the hash lanes, so no
+    /// byte is copied a second time on the way to the hasher.
+    ///
+    /// When the stream hashes on worker threads (a large member on a native
+    /// target), the reads run on a scoped thread ahead of the writes, so the
+    /// kernel's copy out of the volume and its copy into the output overlap
+    /// instead of taking turns. Chunks still reach the writer and the hasher in
+    /// order, a read error surfaces after every span read before it is
+    /// written, as in the serial loop, and the I/O calls are the same ones.
+    fn copy_reader_hashed<R: Read + Send, W: Write + ?Sized>(
+        reader: R,
+        writer: &mut W,
+        stream_hash: &SharedHashStream,
+        limit: StoreCopyLimit,
+        member_name: &str,
+    ) -> RarResult<u64> {
+        if stream_hash.is_pipelined() && !crate::decompress::policy::serial() {
+            return Self::copy_reader_hashed_overlapped(
+                reader,
+                writer,
+                stream_hash,
+                limit,
+                member_name,
+            );
+        }
+        Self::read_store_chunks(reader, stream_hash, limit, member_name, |chunk| {
+            writer.write_all(&chunk).map_err(RarError::Io)?;
+            stream_hash.submit(chunk).map_err(RarError::Io)
+        })
+    }
+
+    fn copy_reader_hashed_overlapped<R: Read + Send, W: Write + ?Sized>(
+        reader: R,
+        writer: &mut W,
+        stream_hash: &SharedHashStream,
+        limit: StoreCopyLimit,
+        member_name: &str,
+    ) -> RarResult<u64> {
+        let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel(STORE_READ_AHEAD_CHUNKS);
+        std::thread::scope(|scope| {
+            let read_thread = std::thread::Builder::new()
+                .name("weaver-rar-read".into())
+                .spawn_scoped(scope, move || {
+                    Self::read_store_chunks(reader, stream_hash, limit, member_name, |chunk| {
+                        // A closed channel means the writer failed; its error
+                        // is the one returned.
+                        chunk_tx.send(chunk).map_err(|_| {
+                            RarError::Io(std::io::Error::other("store copy writer stopped"))
+                        })
+                    })
+                })
+                .map_err(RarError::Io)?;
+
+            let mut write_result = Ok(());
+            for chunk in &chunk_rx {
+                write_result = writer
+                    .write_all(&chunk)
+                    .and_then(|()| stream_hash.submit(chunk))
+                    .map_err(RarError::Io);
+                if write_result.is_err() {
+                    break;
+                }
+            }
+            // Unblocks a reader waiting on a full channel after a write error.
+            drop(chunk_rx);
+            let read_result = read_thread
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            write_result?;
+            read_result
+        })
+    }
+
+    /// [`Self::copy_reader_hashed`] for an encrypted member. `decrypt` wraps
+    /// the member's ciphertext in its decrypting reader.
+    ///
+    /// When the copy overlaps (see [`Self::copy_reader_hashed`]), the
+    /// ciphertext reads move to a thread of their own, ahead of the thread
+    /// that decrypts, so the kernel's copy out of the volume, the decryption
+    /// and the kernel's copy into the output each run on their own core. The
+    /// decrypting reader still sees one ordered byte stream, so its
+    /// block carry, the copy limit and every error behave as in the serial
+    /// loop; a read error reaches it after every byte read before it.
+    fn copy_encrypted_reader_hashed<'r, R: Read + Send + 'r, W: Write + ?Sized>(
+        ciphertext: R,
+        decrypt: impl FnOnce(Box<dyn Read + Send + 'r>) -> RarResult<Box<dyn Read + Send + 'r>>,
+        writer: &mut W,
+        stream_hash: &SharedHashStream,
+        limit: StoreCopyLimit,
+        member_name: &str,
+    ) -> RarResult<u64> {
+        if !stream_hash.is_pipelined() || crate::decompress::policy::serial() {
+            let reader = decrypt(Box::new(ciphertext))?;
+            return Self::copy_reader_hashed(reader, writer, stream_hash, limit, member_name);
+        }
+
+        let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel(STORE_READ_AHEAD_CHUNKS);
+        let (spare_tx, spare_rx) = std::sync::mpsc::channel();
+        let reader = decrypt(Box::new(StagedCiphertext {
+            chunks: raw_rx,
+            spare: spare_tx,
+            current: StagedSpan::default(),
+            pos: 0,
+            finished: false,
+            failed: None,
+        }))?;
+        std::thread::scope(|scope| {
+            let fetch_thread = std::thread::Builder::new()
+                .name("weaver-rar-fetch".into())
+                .spawn_scoped(scope, move || {
+                    let mut ciphertext = ciphertext;
+                    // A buffer an interrupted read left unused.
+                    let mut unused: Option<Vec<u8>> = None;
+                    loop {
+                        // Recycled buffers come back at their full length, so
+                        // only a fresh allocation is ever zeroed.
+                        let mut bytes = unused
+                            .take()
+                            .or_else(|| spare_rx.try_recv().ok())
+                            .unwrap_or_else(|| vec![0u8; STORE_HASHED_CHUNK_BYTES]);
+                        let sent = match ciphertext.read(&mut bytes) {
+                            Ok(0) => break,
+                            Ok(filled) => raw_tx.send(Ok(StagedSpan { bytes, filled })),
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                                unused = Some(bytes);
+                                continue;
+                            }
+                            Err(error) => {
+                                let _ = raw_tx.send(Err(error));
+                                break;
+                            }
+                        };
+                        // A closed channel means the decrypt stage is done.
+                        if sent.is_err() {
+                            break;
+                        }
+                    }
+                })
+                .map_err(RarError::Io)?;
+            // The overlapped copy's reader thread is the decrypt stage. It owns
+            // the decrypting reader, so when it stops, for any reason, the
+            // channel closes and the fetch thread stops with it.
+            let result = Self::copy_reader_hashed_overlapped(
+                reader,
+                writer,
+                stream_hash,
+                limit,
+                member_name,
+            );
+            fetch_thread
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            result
+        })
+    }
+
+    /// The hashed store copy's read loop: fills pooled spans up to `limit`
+    /// and passes each to `sink` in order. Returns the bytes read.
+    fn read_store_chunks<R: Read>(
+        mut reader: R,
+        stream_hash: &SharedHashStream,
+        limit: StoreCopyLimit,
+        member_name: &str,
+        mut sink: impl FnMut(Vec<u8>) -> RarResult<()>,
+    ) -> RarResult<u64> {
+        let mut written = 0u64;
+
+        loop {
+            let to_read = limit.next_read_len(written, STORE_HASHED_CHUNK_BYTES);
+            if to_read == 0 {
+                Self::enforce_store_ceiling_not_exceeded(&mut reader, limit, member_name)?;
+                break;
+            }
+
+            let mut chunk = stream_hash.take_buffer_len(to_read);
+            let read = reader
+                .read(&mut chunk[..to_read])
+                .map_err(Self::read_error_to_rar)?;
+            if read == 0 {
+                if limit.is_exact() {
+                    return Err(RarError::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "unexpected EOF while copying member data",
+                    )));
+                }
+                break;
+            }
+            chunk.truncate(read);
+            written += read as u64;
+            sink(chunk)?;
+        }
+
+        Ok(written)
+    }
+
     fn copy_reader_to_writer_chunked<R: Read, F, W>(
         mut reader: R,
         volume_tracker: Arc<AtomicUsize>,
@@ -4143,52 +4407,43 @@ impl RarArchive {
                 let base_reader =
                     ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
                         .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
-                let mut hash_writer = HashTrackingWriter {
-                    inner: &mut output,
-                    hash: Some(stream_hash.clone()),
-                };
 
                 let written = if let Some(ref pwd) = member_password {
-                    if archive_format.is_rar4_family() {
-                        let reader = Self::wrap_rar4_encrypted_reader(
-                            &self.kdf_cache,
-                            base_reader,
-                            &fh,
-                            pwd,
-                            rar4_salt,
-                        )?;
-                        Self::copy_reader_to_writer(
-                            reader,
-                            &mut hash_writer,
-                            store_limit,
-                            &fh.name,
-                        )?
-                    } else {
-                        let crypto =
-                            rar5_crypto
-                                .as_ref()
-                                .ok_or_else(|| RarError::CorruptArchive {
-                                    detail: format!(
-                                        "member {} is missing RAR5 crypto material",
-                                        fh.name
-                                    ),
-                                })?;
-                        let reader = crate::crypto::DecryptingReader::new_rar5(
-                            base_reader,
-                            &crypto.key,
-                            &crypto.iv,
-                        );
-                        Self::copy_reader_to_writer(
-                            reader,
-                            &mut hash_writer,
-                            store_limit,
-                            &fh.name,
-                        )?
-                    }
-                } else {
-                    Self::copy_reader_to_writer(
+                    let kdf_cache = &self.kdf_cache;
+                    let fh_ref = &fh;
+                    let rar5_crypto = rar5_crypto.as_ref();
+                    Self::copy_encrypted_reader_hashed(
                         base_reader,
-                        &mut hash_writer,
+                        |source| -> RarResult<Box<dyn Read + Send + '_>> {
+                            if archive_format.is_rar4_family() {
+                                Ok(Box::new(Self::wrap_rar4_encrypted_reader(
+                                    kdf_cache, source, fh_ref, pwd, rar4_salt,
+                                )?))
+                            } else {
+                                let crypto =
+                                    rar5_crypto.ok_or_else(|| RarError::CorruptArchive {
+                                        detail: format!(
+                                            "member {} is missing RAR5 crypto material",
+                                            fh_ref.name
+                                        ),
+                                    })?;
+                                Ok(Box::new(crate::crypto::DecryptingReader::new_rar5(
+                                    source,
+                                    &crypto.key,
+                                    &crypto.iv,
+                                )))
+                            }
+                        },
+                        &mut output,
+                        &stream_hash,
+                        store_limit,
+                        &fh.name,
+                    )?
+                } else {
+                    Self::copy_reader_hashed(
+                        base_reader,
+                        &mut output,
+                        &stream_hash,
                         store_limit,
                         &fh.name,
                     )?
@@ -4785,52 +5040,43 @@ impl RarArchive {
                 let base_reader =
                     ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
                         .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
-                let mut hash_writer = HashTrackingWriter {
-                    inner: &mut writer,
-                    hash: Some(stream_hash.clone()),
-                };
 
                 let written = if let Some(ref pwd) = member_password {
-                    if archive_format.is_rar4_family() {
-                        let reader = Self::wrap_rar4_encrypted_reader(
-                            &self.kdf_cache,
-                            base_reader,
-                            &fh,
-                            pwd,
-                            rar4_salt,
-                        )?;
-                        Self::copy_reader_to_writer(
-                            reader,
-                            &mut hash_writer,
-                            store_limit,
-                            &fh.name,
-                        )?
-                    } else {
-                        let crypto =
-                            rar5_crypto
-                                .as_ref()
-                                .ok_or_else(|| RarError::CorruptArchive {
-                                    detail: format!(
-                                        "member {} is missing RAR5 crypto material",
-                                        fh.name
-                                    ),
-                                })?;
-                        let reader = crate::crypto::DecryptingReader::new_rar5(
-                            base_reader,
-                            &crypto.key,
-                            &crypto.iv,
-                        );
-                        Self::copy_reader_to_writer(
-                            reader,
-                            &mut hash_writer,
-                            store_limit,
-                            &fh.name,
-                        )?
-                    }
-                } else {
-                    Self::copy_reader_to_writer(
+                    let kdf_cache = &self.kdf_cache;
+                    let fh_ref = &fh;
+                    let rar5_crypto = rar5_crypto.as_ref();
+                    Self::copy_encrypted_reader_hashed(
                         base_reader,
-                        &mut hash_writer,
+                        |source| -> RarResult<Box<dyn Read + Send + '_>> {
+                            if archive_format.is_rar4_family() {
+                                Ok(Box::new(Self::wrap_rar4_encrypted_reader(
+                                    kdf_cache, source, fh_ref, pwd, rar4_salt,
+                                )?))
+                            } else {
+                                let crypto =
+                                    rar5_crypto.ok_or_else(|| RarError::CorruptArchive {
+                                        detail: format!(
+                                            "member {} is missing RAR5 crypto material",
+                                            fh_ref.name
+                                        ),
+                                    })?;
+                                Ok(Box::new(crate::crypto::DecryptingReader::new_rar5(
+                                    source,
+                                    &crypto.key,
+                                    &crypto.iv,
+                                )))
+                            }
+                        },
+                        &mut writer,
+                        &stream_hash,
+                        store_limit,
+                        &fh.name,
+                    )?
+                } else {
+                    Self::copy_reader_hashed(
+                        base_reader,
+                        &mut writer,
+                        &stream_hash,
                         store_limit,
                         &fh.name,
                     )?
@@ -5415,31 +5661,31 @@ impl RarArchive {
         let base_reader =
             ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &entry.segments, &fh.name)
                 .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
-        let reader: Box<dyn std::io::Read + '_> = if let Some(password) = member_password.as_deref()
-        {
-            if archive_format.is_rar4_family() {
-                Box::new(Self::wrap_rar4_encrypted_reader(
-                    &self.kdf_cache,
-                    base_reader,
-                    &fh,
-                    password,
-                    rar4_salt,
-                )?)
+        let reader: Box<dyn std::io::Read + Send + '_> =
+            if let Some(password) = member_password.as_deref() {
+                if archive_format.is_rar4_family() {
+                    Box::new(Self::wrap_rar4_encrypted_reader(
+                        &self.kdf_cache,
+                        base_reader,
+                        &fh,
+                        password,
+                        rar4_salt,
+                    )?)
+                } else {
+                    let crypto = rar5_crypto
+                        .as_ref()
+                        .ok_or_else(|| RarError::CorruptArchive {
+                            detail: format!("member {} is missing RAR5 crypto material", fh.name),
+                        })?;
+                    Box::new(crate::crypto::DecryptingReader::new_rar5(
+                        base_reader,
+                        &crypto.key,
+                        &crypto.iv,
+                    ))
+                }
             } else {
-                let crypto = rar5_crypto
-                    .as_ref()
-                    .ok_or_else(|| RarError::CorruptArchive {
-                        detail: format!("member {} is missing RAR5 crypto material", fh.name),
-                    })?;
-                Box::new(crate::crypto::DecryptingReader::new_rar5(
-                    base_reader,
-                    &crypto.key,
-                    &crypto.iv,
-                ))
-            }
-        } else {
-            Box::new(base_reader)
-        };
+                Box::new(base_reader)
+            };
 
         if fh.compression.method == CompressionMethod::Store {
             let expected_crc = if options.verify { fh.data_crc32 } else { None };
@@ -5461,13 +5707,9 @@ impl RarArchive {
                 unpacked_size,
             );
             let (written, actual_crc, actual_data_hash, actual_blake) = {
-                let mut hash_writer = HashTrackingWriter {
-                    inner: writer,
-                    hash: Some(stream_hash.clone()),
-                };
                 let written =
-                    Self::copy_reader_to_writer(reader, &mut hash_writer, store_limit, &fh.name)?;
-                hash_writer.flush().map_err(RarError::Io)?;
+                    Self::copy_reader_hashed(reader, writer, &stream_hash, store_limit, &fh.name)?;
+                writer.flush().map_err(RarError::Io)?;
                 let outputs = stream_hash.finalize().map_err(RarError::Io)?;
                 let actual_crc = expected_crc.map(|_| outputs.crc32.unwrap_or(0));
                 let actual_data_hash = expected_data_hash.map(|expected| match expected {
@@ -6116,7 +6358,7 @@ impl RarArchive {
         };
 
         loop {
-            let to_read = store_limit.next_read_len(written, STREAMING_STORE_CHUNK_BUFFER_BYTES);
+            let to_read = store_limit.next_read_len(written, STORE_HASHED_CHUNK_BYTES);
             if to_read == 0 {
                 Self::enforce_store_ceiling_not_exceeded(&mut reader, store_limit, &fh.name)?;
                 break;
@@ -6539,8 +6781,7 @@ impl RarArchive {
         let mut total_written = 0u64;
 
         loop {
-            let to_read =
-                store_limit.next_read_len(total_written, STREAMING_STORE_CHUNK_BUFFER_BYTES);
+            let to_read = store_limit.next_read_len(total_written, STORE_HASHED_CHUNK_BYTES);
             if to_read == 0 {
                 Self::enforce_store_ceiling_not_exceeded(&mut reader, store_limit, &fh.name)?;
                 break;
@@ -9621,5 +9862,510 @@ mod tests {
             Err(err) => panic!("expected unsupported encryption KDF count, got {err}"),
             Ok(_) => panic!("expected unsupported encryption KDF count, got success"),
         }
+    }
+
+    /// Hands out at most `step` bytes per read and, with `fail_at`, fails
+    /// every read once that many bytes are out.
+    struct ScriptedStoreReader {
+        data: Vec<u8>,
+        pos: usize,
+        step: usize,
+        fail_at: Option<usize>,
+    }
+
+    impl Read for ScriptedStoreReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.fail_at.is_some_and(|at| self.pos >= at) {
+                return Err(std::io::Error::other("scripted read failure"));
+            }
+            let mut end = self.data.len().min(self.pos + self.step.min(buf.len()));
+            if let Some(at) = self.fail_at {
+                end = end.min(at);
+            }
+            let read = end - self.pos;
+            buf[..read].copy_from_slice(&self.data[self.pos..end]);
+            self.pos = end;
+            Ok(read)
+        }
+    }
+
+    fn scripted_store_reader(data: &[u8], fail_at: Option<usize>) -> ScriptedStoreReader {
+        // An odd step makes reads end inside spans, as volume boundaries do.
+        ScriptedStoreReader {
+            data: data.to_vec(),
+            pos: 0,
+            step: 300_001,
+            fail_at,
+        }
+    }
+
+    /// Accepts `capacity` bytes, then fails every write.
+    struct FailingStoreWriter {
+        accepted: Vec<u8>,
+        capacity: usize,
+    }
+
+    impl Write for FailingStoreWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let take = buf.len().min(self.capacity - self.accepted.len());
+            if take == 0 {
+                return Err(std::io::Error::other("scripted write failure"));
+            }
+            self.accepted.extend_from_slice(&buf[..take]);
+            Ok(take)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn stored_payload(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i.wrapping_mul(31) ^ (i >> 7)) as u8)
+            .collect()
+    }
+
+    fn overlapped_store_len() -> usize {
+        crate::hash_pipeline::PIPELINE_MIN_BYTES as usize + 3 * STORE_HASHED_CHUNK_BYTES + 777
+    }
+
+    fn pipelined_store_hash(len: usize) -> Arc<SharedHashStream> {
+        let stream = SharedHashStream::new(true, false, true, len as u64);
+        assert!(stream.is_pipelined(), "expected the worker hash path");
+        stream
+    }
+
+    fn overlapped_store_copy<R: Read + Send, W: Write + ?Sized>(
+        reader: R,
+        writer: &mut W,
+        stream_hash: &SharedHashStream,
+        limit: StoreCopyLimit,
+    ) -> RarResult<u64> {
+        RarArchive::copy_reader_hashed_overlapped(reader, writer, stream_hash, limit, "member.bin")
+    }
+
+    /// The overlapped store copy writes and hashes exactly what the serial
+    /// loop does, with reads that end inside spans.
+    #[test]
+    fn overlapped_store_copy_matches_serial_copy() {
+        let data = stored_payload(overlapped_store_len());
+        let limit = StoreCopyLimit::Exact(data.len() as u64);
+
+        let overlapped_hash = pipelined_store_hash(data.len());
+        let mut overlapped = Vec::new();
+        let written = overlapped_store_copy(
+            scripted_store_reader(&data, None),
+            &mut overlapped,
+            &overlapped_hash,
+            limit,
+        )
+        .expect("overlapped copy");
+        let overlapped_outputs = overlapped_hash.finalize().expect("overlapped hashes");
+
+        let serial_hash = SharedHashStream::new(true, false, true, 0);
+        assert!(!serial_hash.is_pipelined());
+        let mut serial = Vec::new();
+        RarArchive::copy_reader_hashed(
+            scripted_store_reader(&data, None),
+            &mut serial,
+            &serial_hash,
+            limit,
+            "member.bin",
+        )
+        .expect("serial copy");
+        let serial_outputs = serial_hash.finalize().expect("serial hashes");
+
+        assert_eq!(written, data.len() as u64);
+        assert!(
+            overlapped == data,
+            "overlapped output differs from the source"
+        );
+        assert!(serial == data, "serial output differs from the source");
+        assert_eq!(overlapped_outputs.crc32, Some(crate::crc::hash(&data)));
+        assert_eq!(overlapped_outputs.crc32, serial_outputs.crc32);
+        assert_eq!(overlapped_outputs.blake2sp, serial_outputs.blake2sp);
+        assert!(overlapped_outputs.blake2sp.is_some());
+    }
+
+    /// A member that ends early is still an error, after everything read
+    /// before the end was written.
+    #[test]
+    fn overlapped_store_copy_reports_early_eof_after_writing_what_was_read() {
+        let data = stored_payload(overlapped_store_len());
+        let short = &data[..data.len() - 1000];
+        let stream_hash = pipelined_store_hash(data.len());
+        let mut output = Vec::new();
+        let err = overlapped_store_copy(
+            scripted_store_reader(short, None),
+            &mut output,
+            &stream_hash,
+            StoreCopyLimit::Exact(data.len() as u64),
+        )
+        .expect_err("short member must fail");
+        assert!(
+            matches!(&err, RarError::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof),
+            "unexpected error: {err}"
+        );
+        assert!(output == short, "output must hold every byte read");
+    }
+
+    /// A read error ends the copy at the same byte the serial loop would.
+    #[test]
+    fn overlapped_store_copy_stops_at_a_read_error() {
+        let data = stored_payload(overlapped_store_len());
+        let fail_at = 5 * STORE_HASHED_CHUNK_BYTES + 3;
+        let stream_hash = pipelined_store_hash(data.len());
+        let mut output = Vec::new();
+        let err = overlapped_store_copy(
+            scripted_store_reader(&data, Some(fail_at)),
+            &mut output,
+            &stream_hash,
+            StoreCopyLimit::Exact(data.len() as u64),
+        )
+        .expect_err("read error must fail the copy");
+        assert!(format!("{err}").contains("scripted read failure"), "{err}");
+        assert!(
+            output == data[..fail_at],
+            "output must stop at the failed read"
+        );
+    }
+
+    /// The staged encrypted copy hands its decrypting reader the ciphertext
+    /// as one ordered stream: with a pass-through "decryption" the output is
+    /// the input, and a read error ends it at the same byte.
+    #[test]
+    fn staged_encrypted_store_copy_preserves_the_stream_and_its_errors() {
+        let data = stored_payload(overlapped_store_len());
+        let stream_hash = pipelined_store_hash(data.len());
+        let mut output = Vec::new();
+        let written = RarArchive::copy_encrypted_reader_hashed(
+            scripted_store_reader(&data, None),
+            Ok,
+            &mut output,
+            &stream_hash,
+            StoreCopyLimit::Exact(data.len() as u64),
+            "member.bin",
+        )
+        .expect("staged copy");
+        assert_eq!(written, data.len() as u64);
+        assert!(output == data, "staged output differs from the source");
+        assert_eq!(
+            stream_hash.finalize().expect("hashes").crc32,
+            Some(crate::crc::hash(&data))
+        );
+
+        let fail_at = 5 * STORE_HASHED_CHUNK_BYTES + 3;
+        let stream_hash = pipelined_store_hash(data.len());
+        let mut output = Vec::new();
+        let err = RarArchive::copy_encrypted_reader_hashed(
+            scripted_store_reader(&data, Some(fail_at)),
+            Ok,
+            &mut output,
+            &stream_hash,
+            StoreCopyLimit::Exact(data.len() as u64),
+            "member.bin",
+        )
+        .expect_err("read error must fail the copy");
+        assert!(format!("{err}").contains("scripted read failure"), "{err}");
+        assert!(
+            output == data[..fail_at],
+            "output must stop at the failed read"
+        );
+    }
+
+    /// A write error stops all three stages without leaving a thread blocked.
+    #[test]
+    fn staged_encrypted_store_copy_returns_the_write_error() {
+        let data = stored_payload(overlapped_store_len());
+        let stream_hash = pipelined_store_hash(data.len());
+        let mut writer = FailingStoreWriter {
+            accepted: Vec::new(),
+            capacity: 2 * STORE_HASHED_CHUNK_BYTES + 5,
+        };
+        let err = RarArchive::copy_encrypted_reader_hashed(
+            scripted_store_reader(&data, None),
+            Ok,
+            &mut writer,
+            &stream_hash,
+            StoreCopyLimit::Exact(data.len() as u64),
+            "member.bin",
+        )
+        .expect_err("write error must fail the copy");
+        assert!(matches!(err, RarError::Io(_)), "{err}");
+    }
+
+    const STAGED_AES_KEY: [u8; 32] = [
+        0x6b, 0x1f, 0x93, 0x02, 0xd4, 0x5e, 0xa7, 0x38, 0xc1, 0x0d, 0x76, 0xe9, 0x24, 0xb8, 0x4f,
+        0x91, 0x3a, 0xec, 0x05, 0x7d, 0xb2, 0x68, 0xf1, 0x16, 0x8c, 0x47, 0xd9, 0x2b, 0x60, 0xae,
+        0x13, 0xf5,
+    ];
+    const STAGED_AES_IV: [u8; 16] = [
+        0x9e, 0x31, 0x5c, 0xa8, 0x07, 0xd2, 0x64, 0xbb, 0x1e, 0x83, 0xf9, 0x40, 0x2d, 0xc6, 0x75,
+        0x0a,
+    ];
+    const STAGED_LEGACY_PASSWORD: &str = "staged-store";
+
+    /// The decryptors a staged encrypted store copy runs: AES-256 (RAR5) in
+    /// the block-aligned mode, the RAR 2.0 cipher as the block-aligned legacy
+    /// one, and the RAR 1.5 cipher in the streaming mode.
+    #[derive(Clone, Copy, Debug)]
+    enum StagedCipher {
+        Rar5Aes,
+        Rar20,
+        Rar15,
+    }
+
+    impl StagedCipher {
+        const ALL: [Self; 3] = [Self::Rar5Aes, Self::Rar20, Self::Rar15];
+
+        /// The granularity the decrypting reader hands plaintext back in.
+        fn block(self) -> usize {
+            match self {
+                Self::Rar5Aes | Self::Rar20 => crate::crypto::AES_BLOCK,
+                Self::Rar15 => 1,
+            }
+        }
+
+        /// The member's packed bytes: `plain`, zero-padded to a whole block,
+        /// encrypted.
+        fn encrypt(self, plain: &[u8]) -> Vec<u8> {
+            let mut padded = plain.to_vec();
+            padded.resize(plain.len().next_multiple_of(self.block()), 0);
+            match self {
+                Self::Rar5Aes => crate::crypto::encrypt_aes256_cbc_for_test(
+                    &STAGED_AES_KEY,
+                    &STAGED_AES_IV,
+                    &padded,
+                ),
+                Self::Rar20 => {
+                    crate::crypto::encrypt_rar20_for_test(STAGED_LEGACY_PASSWORD, &mut padded);
+                    padded
+                }
+                Self::Rar15 => {
+                    // The RAR 1.5 cipher XORs a keystream, so decrypting the
+                    // plaintext encrypts it.
+                    let mut ciphertext = Vec::with_capacity(padded.len());
+                    self.decrypt(Box::new(Cursor::new(padded)))
+                        .expect("RAR 1.5 reader")
+                        .read_to_end(&mut ciphertext)
+                        .expect("RAR 1.5 keystream");
+                    ciphertext
+                }
+            }
+        }
+
+        fn decrypt<'r>(
+            self,
+            source: Box<dyn Read + Send + 'r>,
+        ) -> RarResult<Box<dyn Read + Send + 'r>> {
+            use crate::rar4::types::Rar4EncryptionMethod;
+            Ok(match self {
+                Self::Rar5Aes => Box::new(crate::crypto::DecryptingReader::new_rar5(
+                    source,
+                    &STAGED_AES_KEY,
+                    &STAGED_AES_IV,
+                )),
+                Self::Rar20 => Box::new(crate::crypto::DecryptingReader::new_rar4_legacy(
+                    source,
+                    Rar4EncryptionMethod::Rar20,
+                    STAGED_LEGACY_PASSWORD,
+                )),
+                Self::Rar15 => Box::new(crate::crypto::DecryptingReader::new_rar4_legacy(
+                    source,
+                    Rar4EncryptionMethod::Rar15,
+                    STAGED_LEGACY_PASSWORD,
+                )),
+            })
+        }
+    }
+
+    /// Past the pipeline threshold, with a tail that is not a whole block.
+    fn real_cipher_store_len() -> usize {
+        crate::hash_pipeline::PIPELINE_MIN_BYTES as usize + 12_345
+    }
+
+    /// The staged encrypted copy, with a real decrypting reader on its
+    /// decrypt thread, writes and hashes the plaintext.
+    #[test]
+    fn staged_encrypted_store_copy_decrypts_with_real_ciphers() {
+        let plain = stored_payload(real_cipher_store_len());
+        let mut blake = Blake2spHasher::new();
+        blake.update(&plain);
+        let expected_blake = blake.finalize();
+        for cipher in StagedCipher::ALL {
+            let ciphertext = cipher.encrypt(&plain);
+            let stream_hash = pipelined_store_hash(plain.len());
+            let mut output = Vec::new();
+            let written = RarArchive::copy_encrypted_reader_hashed(
+                scripted_store_reader(&ciphertext, None),
+                |source| cipher.decrypt(source),
+                &mut output,
+                &stream_hash,
+                StoreCopyLimit::Exact(plain.len() as u64),
+                "member.bin",
+            )
+            .unwrap_or_else(|err| panic!("{cipher:?} staged copy: {err}"));
+            assert_eq!(written, plain.len() as u64, "{cipher:?}");
+            assert!(output == plain, "{cipher:?} output differs from the source");
+            let hashes = stream_hash.finalize().expect("hashes");
+            assert_eq!(hashes.crc32, Some(crate::crc::hash(&plain)), "{cipher:?}");
+            assert_eq!(hashes.blake2sp, Some(expected_blake), "{cipher:?}");
+        }
+    }
+
+    /// A volume read that fails mid-stream reaches the caller through the
+    /// real decrypting reader, after every whole block read before it was
+    /// written.
+    #[test]
+    fn staged_encrypted_store_copy_with_real_ciphers_stops_at_a_read_error() {
+        let plain = stored_payload(real_cipher_store_len());
+        let fail_at = 5 * STORE_HASHED_CHUNK_BYTES + 1_234;
+        for cipher in StagedCipher::ALL {
+            let ciphertext = cipher.encrypt(&plain);
+            let stream_hash = pipelined_store_hash(plain.len());
+            let mut output = Vec::new();
+            let err = RarArchive::copy_encrypted_reader_hashed(
+                scripted_store_reader(&ciphertext, Some(fail_at)),
+                |source| cipher.decrypt(source),
+                &mut output,
+                &stream_hash,
+                StoreCopyLimit::Exact(plain.len() as u64),
+                "member.bin",
+            )
+            .expect_err("read error must fail the copy");
+            assert!(
+                format!("{err}").contains("scripted read failure"),
+                "{cipher:?}: {err}"
+            );
+            let decrypted = fail_at - fail_at % cipher.block();
+            assert!(
+                output == plain[..decrypted],
+                "{cipher:?}: output must hold the {decrypted} bytes before the failed read, \
+                 got {}",
+                output.len()
+            );
+        }
+    }
+
+    /// Once the fetch thread has reported an error, every later read of the
+    /// staged ciphertext fails with it again; none answers end of stream.
+    #[test]
+    fn staged_ciphertext_repeats_a_fetch_error() {
+        let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel(4);
+        let (spare_tx, _spare_rx) = std::sync::mpsc::channel();
+        chunk_tx
+            .send(Ok(StagedSpan {
+                bytes: vec![1, 2, 3],
+                filled: 3,
+            }))
+            .expect("queue span");
+        chunk_tx
+            .send(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "volume fetch failed",
+            )))
+            .expect("queue error");
+        // The fetch thread stops after its error.
+        drop(chunk_tx);
+        let mut staged = StagedCiphertext {
+            chunks: chunk_rx,
+            spare: spare_tx,
+            current: StagedSpan::default(),
+            pos: 0,
+            finished: false,
+            failed: None,
+        };
+
+        let mut buf = [0u8; 8];
+        assert_eq!(staged.read(&mut buf).expect("first span"), 3);
+        assert_eq!(buf[..3], [1, 2, 3]);
+        for attempt in 0..3 {
+            let err = staged
+                .read(&mut buf)
+                .expect_err("a read after the fetch error must fail");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionReset,
+                "attempt {attempt}"
+            );
+            assert!(
+                err.to_string().contains("volume fetch failed"),
+                "attempt {attempt}: {err}"
+            );
+        }
+    }
+
+    /// The staged ciphertext serves only the filled part of each span and
+    /// hands the buffer back at its full length, so the fetch thread can read
+    /// into it again without resizing or zeroing it.
+    #[test]
+    fn staged_ciphertext_serves_filled_bytes_and_recycles_whole_buffers() {
+        let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel(4);
+        let (spare_tx, spare_rx) = std::sync::mpsc::channel();
+        let mut first = vec![0xEE; 16];
+        first[..5].copy_from_slice(&[1, 2, 3, 4, 5]);
+        let mut second = vec![0xEE; 16];
+        second[..2].copy_from_slice(&[6, 7]);
+        for (bytes, filled) in [(first, 5), (second, 2)] {
+            chunk_tx
+                .send(Ok(StagedSpan { bytes, filled }))
+                .expect("queue span");
+        }
+        drop(chunk_tx);
+        let mut staged = StagedCiphertext {
+            chunks: chunk_rx,
+            spare: spare_tx,
+            current: StagedSpan::default(),
+            pos: 0,
+            finished: false,
+            failed: None,
+        };
+
+        let mut stream = Vec::new();
+        staged.read_to_end(&mut stream).expect("staged stream");
+        assert_eq!(stream, [1, 2, 3, 4, 5, 6, 7]);
+        let recycled: Vec<usize> = spare_rx.try_iter().map(|buffer| buffer.len()).collect();
+        assert_eq!(recycled, [16, 16], "spent spans come back whole");
+    }
+
+    /// A write error returns that error and does not leave the reader thread
+    /// blocked on a full queue.
+    #[test]
+    fn overlapped_store_copy_returns_the_write_error() {
+        let data = stored_payload(overlapped_store_len());
+        let stream_hash = pipelined_store_hash(data.len());
+        let mut writer = FailingStoreWriter {
+            accepted: Vec::new(),
+            capacity: 2 * STORE_HASHED_CHUNK_BYTES + 5,
+        };
+        let err = overlapped_store_copy(
+            scripted_store_reader(&data, None),
+            &mut writer,
+            &stream_hash,
+            StoreCopyLimit::Exact(data.len() as u64),
+        )
+        .expect_err("write error must fail the copy");
+        assert!(format!("{err}").contains("scripted write failure"), "{err}");
+        assert!(writer.accepted == data[..writer.capacity]);
+    }
+
+    /// A member longer than its ceiling still fails the ceiling check.
+    #[test]
+    fn overlapped_store_copy_enforces_the_ceiling() {
+        let data = stored_payload(overlapped_store_len());
+        let stream_hash = pipelined_store_hash(data.len());
+        let mut output = Vec::new();
+        let err = overlapped_store_copy(
+            scripted_store_reader(&data, None),
+            &mut output,
+            &stream_hash,
+            StoreCopyLimit::AtMost(data.len() as u64 - 10),
+        )
+        .expect_err("oversized member must fail");
+        assert!(
+            matches!(err, RarError::ResourceLimit { .. }),
+            "unexpected error: {err}"
+        );
     }
 }

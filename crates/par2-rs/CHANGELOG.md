@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.10.10 (unreleased)
+## 0.10.10
 
 ### Changed
 

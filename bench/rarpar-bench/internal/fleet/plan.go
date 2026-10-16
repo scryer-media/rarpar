@@ -3,6 +3,7 @@ package fleet
 import (
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"time"
 
@@ -360,12 +361,11 @@ func machineSteps(machine Machine, layout RemoteLayout) []string {
 		steps = append(steps, fmt.Sprintf("on host: macro-par3, profile %s, workers %v, buffered rarpar rows only (never --fsync): per worker count rarpar-wN for every op, repairing in place with no backup, and the repair row rarpar-wN-backup, which keeps a numbered .1 as the reference does (like for like on bytes written); warmups=%d repeats=%d, %s, reference failures are DNF, work %s",
 			machine.PAR3.Profile, machine.PAR3.Workers, machine.PAR3.Warmups, machine.PAR3.Repeats,
 			timeout, PAR3Work(machine, layout)))
-		if step := par3PerfStep(machine); step != "" {
+		if step := par3PAR2Step(machine); step != "" {
 			steps = append(steps, step)
 		}
-		if machine.PAR3.Versus != "" {
-			steps = append(steps, fmt.Sprintf("on host: par3 versus, profile %s: PAR2 (rarpar par, plus the par2 oracle when present) against PAR3 Cauchy and FFT, each PAR3 repair in place and as a -backup twin that keeps a .1, par2 ÷ par3, every repair SHA-256 checked",
-				machine.PAR3.Versus))
+		if step := par3PerfStep(machine); step != "" {
+			steps = append(steps, step)
 		}
 	}
 	if machine.hasTurbo() {
@@ -443,6 +443,49 @@ func par3PerfStep(machine Machine) string {
 	perf := par3bench.PerfOptions{StatRepeats: machine.Perf.StatRepeats, Ops: ops, RecordSets: machine.Perf.PAR3RecordSets}
 	return step + fmt.Sprintf("; up to %d untimed runs; evidence under results/perf/par3, and %s plus a par3-perf-incomplete warning when the pass falls short",
 		par3bench.PerfPassRuns(profile, variants, perf), par3bench.PerfIncompleteFile)
+}
+
+// par3PAR2Step names the PAR2 rows macro-par3 runs and the selected ops they
+// run, or "" when no selected set asks for them or no selected op has a PAR2
+// row.
+func par3PAR2Step(machine Machine) string {
+	profile, err := par3bench.LookupProfile(machine.PAR3.Profile)
+	if err == nil {
+		profile, err = profile.Select(machine.PAR3.Sets)
+	}
+	if err != nil {
+		return ""
+	}
+	var sets []string
+	for _, config := range profile.Configs {
+		if config.PAR2 && config.Carrier == "" {
+			sets = append(sets, config.ID)
+		}
+	}
+	// PAR2 rows run create, verify and repair; never verify-damaged.
+	selected := machine.PAR3.Ops
+	if len(selected) == 0 {
+		selected = par3bench.DefaultOps
+	}
+	var ops []string
+	for _, op := range par3bench.KnownOps {
+		if op != par3bench.OpVerifyDamaged && slices.Contains(selected, op) {
+			ops = append(ops, op)
+		}
+	}
+	if len(sets) == 0 || len(ops) == 0 {
+		return ""
+	}
+	rows := "par2-rs (rarpar par)"
+	if _, ok := machine.Oracles["par2"]; ok {
+		rows += " and par2cmdline-turbo (the par2 oracle)"
+	}
+	opText := ops[0]
+	if len(ops) > 1 {
+		opText = strings.Join(ops[:len(ops)-1], ", ") + " and " + ops[len(ops)-1]
+	}
+	return fmt.Sprintf("on host: inside macro-par3, PAR2 rows %s %s at the same block size, recovery and damage on %s",
+		rows, opText, strings.Join(sets, ","))
 }
 
 // perfStep is the run script's perf section: the corpus suites' perf pass,

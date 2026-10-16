@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.7.1
+
+- A repair that keeps a backup (`RepairOptions::with_backup(true)`, or
+  `backup: true` to `Par3RepairSession::repair`) no longer renames the
+  rebuilt file over the damaged one. The damaged file moves to the first free
+  `<name>.N`, claimed with a hard link and then released (a rename into a
+  name found free where the filesystem has no hard links), and the rebuilt
+  file moves into the name it vacated. On ext4 a rename over an existing file
+  writes the whole new file back to disk inside the rename, so a kept backup
+  used to cost a full flush of the rebuilt file before the repair returned.
+  If the rebuilt file cannot be moved, the damaged file goes back under its
+  name. Both repair paths (`Par3RepairSession` and the one-shot repair) now
+  share this one install, so the one-shot repair also refuses a destination
+  that is not a regular file, as the session already did.
+- The backup name and the vacated name are claimed with a no-replace rename:
+  `renameat2(RENAME_NOREPLACE)` on Linux and `renameatx_np(RENAME_EXCL)` on
+  macOS. Elsewhere, and where the filesystem refuses the flag, the name is
+  checked free just before the rename. A file another process creates at
+  either name during the repair now fails the install with `AlreadyExists`
+  instead of being replaced; a file appearing at the backup name moves the
+  backup on to the next number.
+
 ## 0.7.0
 
 Breaking: repair keeps no backup of a damaged file by default.

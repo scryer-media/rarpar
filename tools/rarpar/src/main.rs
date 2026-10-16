@@ -34,6 +34,10 @@ use rarpar::cli::{Cli, Command, RarCommand};
 // `cfg(target_env = "musl")` targets, and the `cfg` below repeats the
 // condition so a mis-specified feature flag cannot swap the allocator on
 // glibc, macOS or Windows. Those distributions keep the system allocator.
+// The release and CI musl builds compile mimalloc with
+// -DMI_DEFAULT_ALLOW_THP=0 in CFLAGS (confirm_native_code.py checks it):
+// mimalloc's own default madvises huge pages, which roughly doubles peak RSS
+// on THP kernels for no measured speed. MIMALLOC_ALLOW_THP=1 turns it back on.
 #[cfg(all(feature = "musl-allocator", target_env = "musl"))]
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;

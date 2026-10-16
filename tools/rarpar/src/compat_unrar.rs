@@ -454,27 +454,42 @@ fn run_test(invocation: &Invocation) -> Result<(), CompatFailure> {
     if sets.is_empty() {
         return Err(CompatFailure::stdout(EXIT_NO_FILES, "No files to test"));
     }
-    let temp = tempfile::tempdir()
-        .map_err(|error| CompatFailure::stdout(EXIT_CREATE, format!("Cannot create: {error}")))?;
-    let test_invocation = Invocation {
-        output_dir: temp.path().to_path_buf(),
-        incremental: false,
-        ..invocation.clone()
-    };
+    // Only a set holding links or file copies needs a scratch tree: a hard
+    // link or file copy is checked against its target on disk. Everything
+    // else is decoded into a sink, so testing writes nothing.
+    let mut scratch: Option<tempfile::TempDir> = None;
 
     for set in sets {
-        let password = password_candidate(&test_invocation.password);
+        let password = password_candidate(&invocation.password);
         let mut archive = open_set(&set, password.as_deref())?;
-        if test_invocation.suppression.shows_status_lines() {
+        if invocation.suppression.shows_status_lines() {
             for path in ordered_volume_paths(&set) {
                 println!("Testing from {}", path.display());
             }
         }
-        let mut extracted = BTreeSet::new();
-        let members = extract_all_ready(&test_invocation, &mut archive, &mut extracted)?;
-        ensure_all_members_done(&archive, &members, &extracted)?;
+        let mut tested = BTreeSet::new();
+        let members = if set_needs_scratch_tree(&archive) {
+            if scratch.is_none() {
+                scratch = Some(tempfile::tempdir().map_err(|error| {
+                    CompatFailure::stdout(EXIT_CREATE, format!("Cannot create: {error}"))
+                })?);
+            }
+            let scratch_invocation = Invocation {
+                output_dir: scratch
+                    .as_ref()
+                    .expect("created above")
+                    .path()
+                    .to_path_buf(),
+                incremental: false,
+                ..invocation.clone()
+            };
+            extract_all_ready(&scratch_invocation, &mut archive, &mut tested)?
+        } else {
+            test_all_ready(invocation, &mut archive, &mut tested)?
+        };
+        ensure_all_members_done(&archive, &members, &tested)?;
     }
-    if test_invocation.suppression.shows_status_lines() {
+    if invocation.suppression.shows_status_lines() {
         println!("All OK");
     }
     Ok(())
@@ -494,6 +509,50 @@ fn run_list(invocation: &Invocation) -> Result<(), CompatFailure> {
         }
     }
     Ok(())
+}
+
+fn set_needs_scratch_tree(archive: &unrar_rs::RarArchive) -> bool {
+    archive
+        .indexed_member_infos()
+        .iter()
+        .any(|member| member.info.is_symlink || member.info.is_hardlink || member.info.is_file_copy)
+}
+
+/// Test everything whose volumes are present by decoding each file into a
+/// sink: data hashes are checked as extraction checks them, and no byte is
+/// written. Returns the member list, as [`extract_all_ready`] does.
+fn test_all_ready(
+    invocation: &Invocation,
+    archive: &mut unrar_rs::RarArchive,
+    tested: &mut BTreeSet<usize>,
+) -> Result<Vec<unrar_rs::types::IndexedMemberInfo>, CompatFailure> {
+    let members = archive.indexed_member_infos();
+    if members.is_empty() {
+        return Err(CompatFailure::stdout(EXIT_NO_FILES, "No files to extract"));
+    }
+    if let Some(password) = password_candidate(&invocation.password) {
+        archive.set_password(password);
+    }
+
+    for member in &members {
+        if tested.contains(&member.index) {
+            continue;
+        }
+        if !member.extractable {
+            break;
+        }
+        if !member.info.is_directory {
+            archive
+                .by_index(member.index)
+                .and_then(|entry| entry.copy_to(&mut io::sink()))
+                .map_err(map_rar_error)?;
+            if invocation.suppression.shows_member_lines() {
+                println!("Testing  {} OK", member.info.name);
+            }
+        }
+        tested.insert(member.index);
+    }
+    Ok(members)
 }
 
 /// Extract everything whose volumes are present, and return the member list

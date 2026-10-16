@@ -4,7 +4,7 @@
 release.yml runs this after "Build rarpar" in every build job, through
 confirm-native-code.sh or confirm-native-code.ps1, and ci.yml's
 target-checks lanes run it after building the same feature list from the
-workspace. It reads three records of one build and fails on the first that
+workspace. It reads up to four records of one build and fails on the first that
 disagrees with the release policy:
 
 1. The dependency graph of the exact feature list (`cargo tree`). AWS-LC must
@@ -22,13 +22,18 @@ disagrees with the release policy:
    __OPTIMIZE__, and the cc crate appends CFLAGS after the build script's own
    flags, so an optimisation flag in CFLAGS would override that -O0. On
    Windows the compiler must be clang-cl.
-3. The stripped binary. It must carry AWS-LC's assembly, recognised by the
+3. On musl targets, the libmimalloc-sys build-script output. mimalloc must
+   have been compiled with -DMI_DEFAULT_ALLOW_THP=0, which the build jobs pass
+   in CFLAGS. Its default asks the kernel for transparent huge pages, and on a
+   kernel with THP set to madvise or always that roughly doubles peak RSS with
+   no measured speed gain.
+4. The stripped binary. It must carry AWS-LC's assembly, recognised by the
    CRYPTOGAMS credit string that every perlasm module AWS-LC ships embeds in
    its code section, and on musl targets mimalloc, recognised by the prefix
    of its warning messages. Both are data next to code the binary calls, so
    stripping symbols does not remove them.
 
-Copies of the dependency graph and of the aws-lc-sys build output are written
+Copies of the dependency graph and of the build-script outputs are written
 next to the build logs (`--log-prefix`). Uses only the Python standard library
 and runs on Python 3.10, the Ubuntu 22.04 runners' version.
 
@@ -63,6 +68,8 @@ CRATE_DIR = r"/(?:aws-lc-sys-[^/]+|[^/]*~[0-9][^/]*)/aws-lc/"
 LIBRARY_SOURCE = re.compile(CRATE_DIR + r"(?!tests/)")
 JITTER_SOURCE = re.compile(CRATE_DIR + r"third_party/jitterentropy/")
 MINIMUM_C_SOURCES = 100
+MIMALLOC_SOURCE = re.compile(r"/libmimalloc-sys-[^/]+/c_src/mimalloc/[^/]+/src/static\.c$")
+ALLOW_THP_DEFINE = re.compile(r"-DMI_DEFAULT_ALLOW_THP(?:=(.*))?")
 
 
 def is_musl(target):
@@ -190,6 +197,22 @@ def check_aws_lc_build(build_output, target):
     return errors, summary
 
 
+def check_mimalloc_build(build_output):
+    """Check the libmimalloc-sys build-script output. Returns a list of errors."""
+    compiles = [arguments for _, source, arguments in compile_commands(build_output)
+                if MIMALLOC_SOURCE.search(source)]
+    if not compiles:
+        return ["the libmimalloc-sys build output records no compile of mimalloc's static.c; "
+                "the build must run with CC_ENABLE_DEBUG_OUTPUT=1"]
+    errors = []
+    for arguments in compiles:
+        values = [m.group(1) for m in map(ALLOW_THP_DEFINE.fullmatch, arguments) if m]
+        if not values or values[-1] != "0":
+            errors.append("mimalloc was compiled without -DMI_DEFAULT_ALLOW_THP=0 (last value: "
+                          f"{values[-1] if values else 'not set'}); the musl CFLAGS lost it")
+    return errors
+
+
 def check_binary(binary, target):
     errors = []
     if AWS_LC_MARKER not in binary:
@@ -199,12 +222,12 @@ def check_binary(binary, target):
     return errors
 
 
-def aws_lc_build_output(target_dir, target):
+def build_script_output(target_dir, target, crate):
     pattern = os.path.join(glob.escape(str(target_dir)), target, "release", "build",
-                           "aws-lc-sys-*", "output")
+                           f"{crate}-*", "output")
     outputs = sorted(glob.glob(pattern))
     if len(outputs) != 1:
-        raise SystemExit(f"::error::expected one aws-lc-sys build output at {pattern}, "
+        raise SystemExit(f"::error::expected one {crate} build output at {pattern}, "
                          f"found {len(outputs)}")
     return Path(outputs[0])
 
@@ -227,11 +250,16 @@ def main(argv=None):
     Path(f"{args.log_prefix}-tree.log").write_text(tree, encoding="utf-8")
     errors = check_dependency_graph(tree, args.target)
 
-    output = aws_lc_build_output(args.target_dir, args.target)
+    output = build_script_output(args.target_dir, args.target, "aws-lc-sys")
     shutil.copyfile(output, f"{args.log_prefix}-aws-lc-sys-build.log")
     build_errors, summary = check_aws_lc_build(
         output.read_text(encoding="utf-8", errors="replace"), args.target)
     errors += build_errors
+
+    if is_musl(args.target):
+        output = build_script_output(args.target_dir, args.target, "libmimalloc-sys")
+        shutil.copyfile(output, f"{args.log_prefix}-libmimalloc-sys-build.log")
+        errors += check_mimalloc_build(output.read_text(encoding="utf-8", errors="replace"))
 
     exe = "rarpar.exe" if is_windows(args.target) else "rarpar"
     binary = args.target_dir / args.target / "release" / exe

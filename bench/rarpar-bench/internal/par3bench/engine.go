@@ -17,7 +17,7 @@ import (
 const ToolEngine = "engine"
 
 // Row kinds selectable with Options.Rows.
-var KnownRowKinds = []string{ToolReference, ToolCandidate, ToolEngine}
+var KnownRowKinds = []string{ToolReference, ToolCandidate, ToolPAR2, ToolPAR2Turbo, ToolEngine}
 
 // EngineCounters is what engine_perf reports about the work it asked of the
 // disk: par3-rs ExecutionDiagnostics, cumulative for the whole process.

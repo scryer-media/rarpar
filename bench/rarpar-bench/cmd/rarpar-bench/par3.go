@@ -24,14 +24,14 @@ const par3Usage = `Usage:
         [--ops create,verify,repair] [--warmups N] [--repeats N] [--workers 1,8] [--pin-cpus 0-7]
         [--kernel-variant NAME:VAR=V[,VAR=V]]... [--iocount] [--engine-perf PATH]
         [--candidate-arg ARG]... [--machine LABEL] [--timeout 20m] [--reference-timeout DURATION] [--keep-stages]
-        [--target NAME=DIR]... [--target-meta NAME:KEY=V[,KEY=V]]... [--rows reference,rarpar,engine]
+        [--target NAME=DIR]... [--target-meta NAME:KEY=V[,KEY=V]]... [--par2 PATH]
+        [--rows reference,rarpar,par2-rs,par2cmdline-turbo,engine]
         [--engine-workers 8] [--engine-variant NAME:VAR=V[,VAR=V]]... [--drop-caches]
         [--perf-stat N] [--perf-ops repair] [--perf-record SET]... [--perf-freq 499] [--perf-out DIR]
   rarpar-bench par3 report --input results.json [--out report.md]
   rarpar-bench par3 render --input results.json --out DIR
-  rarpar-bench par3 versus --candidate PATH --work DIR --out DIR [--par2 PATH] [--profile versus-smoke|versus]
-        [--set ID]... [--warmups N] [--repeats N] [--pin-cpus 0-7] [--machine LABEL] [--timeout 20m]
-  rarpar-bench par3 versus-report --input results.json [--out report.md]
+  rarpar-bench par3 versus-render --input [NAME=]results.json... --out DIR
+  rarpar-bench par3 tables --input [NAME=]results.json... [--workers N] [--out tables.md]
 
 The PAR3 suite benchmarks the shipped rarpar CLI against the pinned par3cmdline
 reference on deterministic generated inputs. See docs/benchmarking.md. Every
@@ -58,17 +58,24 @@ script text and folded stacks. Files go under --perf-out (default OUT/perf);
 a host without Linux perf skips the pass, and the results say so. A pass that
 was skipped, had a perf run fail, or ran nothing also writes INCOMPLETE.txt
 there, one problem per line.
-par3 versus compares PAR2 (rarpar par, and par2cmdline-turbo with --par2) with
-PAR3 Cauchy and FFT at one block size, recovery count and damage pattern, on the
-scale par2 ÷ par3 (above 1 = PAR3 faster), with every repair SHA-256 checked.
-Each PAR3 arm's repair runs in place, and its -backup twin keeps a .1; the
-report says which PAR2 arm each is like for like with on bytes written.
+The fleet profile's posting-shape sets (Config.Shape) also run PAR2: a par2-rs
+row (rarpar par) and, with --par2, a par2cmdline-turbo row, each creating,
+verifying and repairing a PAR2 set at the same block size, recovery count and
+damage, every repair SHA-256 checked. Their verify and repair read one PAR2
+set, written untimed by par2cmdline-turbo when given, else par2-rs.
+par3 versus-render draws one SVG per posting shape and op from one or more
+machines' suite results.json (repeat --input, in chart order; NAME= sets the
+machine's row name): par2-rs, par2cmdline-turbo, par3cmdline and rarpar par3,
+each codec, against par2cmdline-turbo, or par2-rs when any machine has none.
+par3 tables prints the benchmark page's PAR3 tables from the same inputs: each
+cell is rarpar's median wall seconds and the reference ÷ rarpar ratio, as
+"4.4 (14×)", at --workers (default: each machine's largest worker count).
 `
 
 func runPAR3(ctx context.Context, args []string, stdout io.Writer) error {
 	if len(args) == 0 {
 		fmt.Fprint(os.Stderr, par3Usage)
-		return fmt.Errorf("par3 requires matrix, build-reference, run, report, render, versus, or versus-report")
+		return fmt.Errorf("par3 requires matrix, build-reference, run, report, render, versus-render, or tables")
 	}
 	switch args[0] {
 	case "matrix":
@@ -81,10 +88,10 @@ func runPAR3(ctx context.Context, args []string, stdout io.Writer) error {
 		return runPAR3Report(args[1:], stdout)
 	case "render":
 		return runPAR3Render(args[1:], stdout)
-	case "versus":
-		return runPAR3Versus(ctx, args[1:], stdout)
-	case "versus-report":
-		return runPAR3VersusReport(args[1:], stdout)
+	case "versus-render":
+		return runPAR3VersusRender(args[1:], stdout)
+	case "tables":
+		return runPAR3Tables(args[1:], stdout)
 	case "-h", "--help", "help":
 		fmt.Fprint(stdout, par3Usage)
 		return nil
@@ -246,6 +253,7 @@ func runPAR3Suite(ctx context.Context, args []string, stdout io.Writer) error {
 	flags := flag.NewFlagSet("par3 run", flag.ContinueOnError)
 	reference := flags.String("reference", "", "par3cmdline binary")
 	candidate := flags.String("candidate", "", "rarpar binary")
+	par2Turbo := flags.String("par2", "", "optional par2cmdline-turbo binary for the par2cmdline-turbo row on the posting-shape sets")
 	enginePerf := flags.String("engine-perf", "", "optional par3-rs engine_perf example binary for an untimed stage pass")
 	work := flags.String("work", "", "work directory: generated datasets, canonical carriers, stages")
 	out := flags.String("out", "", "evidence directory: results.json, runs.jsonl, report.md")
@@ -262,7 +270,7 @@ func runPAR3Suite(ctx context.Context, args []string, stdout io.Writer) error {
 	referenceTimeout := flags.Duration("reference-timeout", 0, "per-run timeout for reference processes (default: --timeout)")
 	keep := flags.Bool("keep-stages", false, "keep per-run stage directories")
 	engineWorkers := flags.String("engine-workers", "", "add timed engine_perf rows at these worker counts (needs --engine-perf)")
-	rows := flags.String("rows", "", "timed row kinds: "+strings.Join(par3bench.KnownRowKinds, ",")+" (default: reference,rarpar, plus engine with --engine-workers)")
+	rows := flags.String("rows", "", "timed row kinds: "+strings.Join(par3bench.KnownRowKinds, ",")+" (default: reference,rarpar,par2-rs, plus par2cmdline-turbo with --par2 and engine with --engine-workers)")
 	dropCaches := flags.Bool("drop-caches", false, "drop the page cache before every timed run (Linux, root)")
 	perfStat := flags.Int("perf-stat", 0, "untimed perf stat runs of every reference and rarpar row per --perf-ops op, after its timed runs (Linux; 0 = none)")
 	perfOps := flags.String("perf-ops", strings.Join(par3bench.DefaultPerfOps, ","), "operations the perf pass covers")
@@ -331,7 +339,7 @@ func runPAR3Suite(ctx context.Context, args []string, stdout io.Writer) error {
 		stop()
 	}()
 	results, err := par3bench.RunSuite(ctx, par3bench.Options{
-		Reference: workspacePath(*reference), Candidate: workspacePath(*candidate), EnginePerf: workspacePath(*enginePerf),
+		Reference: workspacePath(*reference), Candidate: workspacePath(*candidate), PAR2Turbo: workspacePath(*par2Turbo), EnginePerf: workspacePath(*enginePerf),
 		Work: workspacePath(*work), Out: workspacePath(*out), Profile: profile, Ops: splitList(*ops),
 		Warmups: *warmups, Repeats: *repeats, Workers: workerList, PinCPUs: *pin, KernelVariants: variants,
 		IOCount: *iocount, MachineLabel: *machine, CandidateArgs: candidateArgs, EnginePerfMemoryMiB: *memory,
@@ -375,78 +383,6 @@ func runPAR3Report(args []string, stdout io.Writer) error {
 	return os.WriteFile(workspacePath(*out), []byte(report), 0o644)
 }
 
-func runPAR3Versus(ctx context.Context, args []string, stdout io.Writer) error {
-	flags := flag.NewFlagSet("par3 versus", flag.ContinueOnError)
-	candidate := flags.String("candidate", "", "rarpar binary (runs both par and par3)")
-	par2 := flags.String("par2", "", "optional par2cmdline-turbo binary; its arm is skipped without one")
-	work := flags.String("work", "", "work directory: generated datasets and stages")
-	out := flags.String("out", "", "evidence directory: results.json, report.md")
-	profileName := flags.String("profile", "versus-smoke", "profile: versus-smoke or versus")
-	warmups := flags.Int("warmups", 1, "warmup runs per arm (recorded, not summarised)")
-	repeats := flags.Int("repeats", 5, "measured runs per arm")
-	machine := flags.String("machine", "", "machine label recorded in the results")
-	pin := flags.String("pin-cpus", "", "confine every timed process to an inclusive CPU range, e.g. 0-7")
-	timeout := flags.Duration("timeout", par3bench.DefaultTimeout, "per-run timeout for every timed process")
-	var sets stringList
-	flags.Var(&sets, "set", "restrict to a set ID (repeatable)")
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
-	}
-	profile, err := par3bench.LookupVersusProfile(*profileName)
-	if err != nil {
-		return err
-	}
-	if profile, err = profile.Select(sets); err != nil {
-		return err
-	}
-	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	go func() {
-		<-ctx.Done()
-		stop()
-	}()
-	results, err := par3bench.RunVersus(ctx, par3bench.VersusOptions{
-		Candidate: workspacePath(*candidate), PAR2Turbo: workspacePath(*par2), Work: workspacePath(*work),
-		Out: workspacePath(*out), Profile: profile, Warmups: *warmups, Repeats: *repeats, MachineLabel: *machine,
-		PinCPUs: *pin, Timeout: *timeout, Log: func(format string, args ...any) { fmt.Fprintf(os.Stderr, "par3 versus: "+format+"\n", args...) },
-	})
-	if err != nil {
-		return err
-	}
-	if _, err := fmt.Fprint(stdout, par3bench.RenderVersusReport(results)); err != nil {
-		return err
-	}
-	if results.Status != "ok" {
-		return fmt.Errorf("PAR2/PAR3 comparison finished with failures: %s", strings.Join(results.Failures, "; "))
-	}
-	return nil
-}
-
-func runPAR3VersusReport(args []string, stdout io.Writer) error {
-	flags := flag.NewFlagSet("par3 versus-report", flag.ContinueOnError)
-	input := flags.String("input", "", "results.json from par3 versus")
-	out := flags.String("out", "", "write the Markdown here instead of stdout")
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
-	if *input == "" {
-		return fmt.Errorf("--input is required")
-	}
-	results, err := par3bench.ReadVersusResults(workspacePath(*input))
-	if err != nil {
-		return err
-	}
-	report := par3bench.RenderVersusReport(results)
-	if *out == "" {
-		_, err = fmt.Fprint(stdout, report)
-		return err
-	}
-	return os.WriteFile(workspacePath(*out), []byte(report), 0o644)
-}
-
 func runPAR3Render(args []string, stdout io.Writer) error {
 	flags := flag.NewFlagSet("par3 render", flag.ContinueOnError)
 	input := flags.String("input", "", "results.json from par3 run")
@@ -469,4 +405,79 @@ func runPAR3Render(args []string, stdout io.Writer) error {
 		fmt.Fprintln(stdout, path)
 	}
 	return nil
+}
+
+// suiteInputs reads repeated [NAME=]results.json flags, in order.
+func suiteInputs(inputs []string) ([]par3bench.VersusChartInput, error) {
+	var out []par3bench.VersusChartInput
+	for _, input := range inputs {
+		name, path := "", input
+		if before, after, ok := strings.Cut(input, "="); ok {
+			name, path = before, after
+		}
+		results, err := par3bench.ReadResults(workspacePath(path))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, par3bench.VersusChartInput{Name: name, Results: results})
+	}
+	return out, nil
+}
+
+func runPAR3VersusRender(args []string, stdout io.Writer) error {
+	flags := flag.NewFlagSet("par3 versus-render", flag.ContinueOnError)
+	var inputs stringList
+	flags.Var(&inputs, "input", "[NAME=]results.json from par3 run (repeatable, in chart order)")
+	out := flags.String("out", "", "directory for the per-shape SVGs")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	if len(inputs) == 0 || *out == "" {
+		return fmt.Errorf("--input and --out are required")
+	}
+	charts, err := suiteInputs(inputs)
+	if err != nil {
+		return err
+	}
+	paths, err := par3bench.RenderVersusSVGs(charts, workspacePath(*out))
+	if err != nil {
+		return err
+	}
+	for _, path := range paths {
+		fmt.Fprintln(stdout, path)
+	}
+	return nil
+}
+
+func runPAR3Tables(args []string, stdout io.Writer) error {
+	flags := flag.NewFlagSet("par3 tables", flag.ContinueOnError)
+	var inputs stringList
+	flags.Var(&inputs, "input", "[NAME=]results.json from par3 run (repeatable, in column order)")
+	workers := flags.Int("workers", 0, "rarpar worker count for the per-set tables (default: each machine's largest)")
+	out := flags.String("out", "", "write the Markdown here instead of stdout")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	if len(inputs) == 0 {
+		return fmt.Errorf("--input is required")
+	}
+	suites, err := suiteInputs(inputs)
+	if err != nil {
+		return err
+	}
+	tables, err := par3bench.RenderTables(suites, *workers)
+	if err != nil {
+		return err
+	}
+	if *out == "" {
+		_, err = fmt.Fprint(stdout, tables)
+		return err
+	}
+	return os.WriteFile(workspacePath(*out), []byte(tables), 0o644)
 }

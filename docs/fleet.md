@@ -423,6 +423,11 @@ timeout_minutes = 20              # per run, rarpar rows too; a reference over i
   reference does (like for like on bytes written)" and gives the per-run
   timeout, and the machine's `par3` block lists the variants and the rows
   each op produces; `--json` carries the same rows under `par3.rows`.
+- **PAR2 rows.** The fleet profile's posting-shape Cauchy sets also run
+  `par2-rs`, and `par2cmdline-turbo` when the machine has the `par2` oracle,
+  which the run script passes to `par3 run` as `--par2`; see
+  [benchmarking.md](benchmarking.md#fleet-profile). The PAR2-against-PAR3
+  charts are drawn from these suite results by `par3 versus-render`.
 - **Perf pass.** On a `linux-perf` machine, `par3 run` runs the untimed
   [perf pass](benchmarking.md#linux-perf-pass) itself, after each covered
   op's timed runs: `stat_repeats` perf stat runs of every reference and

@@ -3,7 +3,88 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
-## rarpar 0.8.1 (unreleased)
+## rarpar 0.8.2
+
+### Changed
+
+- `par3 repair --backup` keeps the damaged file by moving it to `<name>.1`
+  (or the next free number) and moving the rebuilt file into its name,
+  instead of renaming the rebuilt file over it (par3-rs 0.7.1). On ext4 the
+  rename over a file flushes the whole rebuilt file to disk before the
+  command returns. That is the likely main cost behind a repair keeping
+  backups running at 0.23–0.77× of `par2cmdline-turbo`'s on cloud block
+  volumes in the 0.8.1 PAR2-against-PAR3 comparison; not yet re-measured.
+  The rebuilt file claims the name with a no-replace rename (Linux and
+  macOS), so a file another process creates there meanwhile fails the
+  repair instead of being replaced. Repair without `--backup` is
+  unchanged.
+- `t` (test) decodes each file into a sink instead of extracting the
+  archive into a temporary directory, so testing writes nothing; a 50 GiB
+  stored release no longer needs 50 GiB free in `$TMPDIR`. A set holding
+  symlinks, hard links or file copies still extracts into a temporary
+  directory, because those members are checked against their targets.
+  Each tested file prints `Testing  <name> OK`. On a 4-core Atom C3538,
+  testing 248 MiB of stored media takes 0.20 s instead of 0.50 s.
+- Stored members extract without a second copy of every byte for hashing,
+  and large ones read ahead of the writes on a second thread, with
+  decryption on a third (unrar-rs 0.11.2). On a 4-core Atom C3538 the
+  stored-media cases move from 0.85–0.92× of UnRAR 7.23 to 1.17–1.57×, and
+  encrypted stored media from 1.79× to 3.09×.
+- The Linux musl binaries build mimalloc with transparent huge pages off by
+  default (`MI_DEFAULT_ALLOW_THP=0`), so mimalloc no longer asks the kernel
+  for huge pages. On a kernel with THP set to `madvise` or `always`, peak RSS
+  roughly halves at the same wall time: on a 16-core Alder Lake, 67 → 20 MiB
+  for an 820 KiB RAR5 archive and 105 → 49 MiB for a compressed binary set.
+  The exception is RAR4 PPMd with a 32 MiB model, which runs about 6% slower
+  (6.2 → 6.6 s). `MIMALLOC_ALLOW_THP=1` restores the old behaviour. The glibc,
+  macOS and Windows binaries use the system allocator and are unchanged.
+
+### Benchmark harness only
+
+- The PAR3 suite's `fleet` profile follows the usenet posting census: four
+  posting shapes (1.5 MiB blocks at 10% over 10 x 30 MiB; 10 MB blocks at
+  20%, 4 MiB blocks at 10% and 512 KiB blocks at 2% over 1 GiB), each as a
+  Cauchy and an FFT set, plus the ZIP-inside set. No version impact.
+- `rarpar-bench par3 run` runs PAR2 rows on each shape's Cauchy set:
+  `par2-rs`, and `par2cmdline-turbo` with `--par2`, creating, verifying and
+  repairing at the same block size, recovery count and damage. Results
+  schema `rarpar-par3-bench-v4`; v3 files still read. No version impact.
+- The separate `par3 versus` run and `par3 versus-report` are gone:
+  `par3 versus-render` draws the PAR2-against-PAR3 charts from suite results,
+  one SVG per shape and op with `par2-rs`, `par2cmdline-turbo`,
+  `par3cmdline` and `rarpar par3`, each codec, against `par2cmdline-turbo`.
+  Repair rows say **retains file** or **in place**. The fleet `versus` key is
+  removed. No version impact.
+- `rarpar-bench par3 tables` prints the benchmark page's PAR3 tables, each
+  per-set cell as rarpar's median wall seconds and then the reference ÷
+  rarpar ratio, `4.4 (14×)`, with two decimals below 0.1 s. No version
+  impact.
+- PR review fixes, no version impact:
+  - `--candidate-arg` reaches the `par2-rs` rows.
+  - The untimed PAR2 seed runs only when `verify` or `repair` is selected.
+  - The fleet plan names only the selected ops for the PAR2 rows.
+  - `par3 versus-render` reads every arm from the first `--target`.
+  - An unmeasured repair row keeps its retains-file or in-place mark.
+  - Each machine's group states its own runs per arm and names any arm
+    with fewer successful runs.
+  - Inputs from different rarpar versions, or whose shape differs in file
+    layout or damage targets, are refused.
+  - A shape ID that is not a plain file-name component is refused.
+  - `par3 tables` reads PAR-inside cells at the carrier row's worker count
+    whatever `--workers` says.
+  - The published charts render byte-identical.
+
+### Documentation only
+
+- The benchmark page's PAR3 sections and its PAR2-against-PAR3 section come
+  from a `rarpar 0.8.1` round on Alder Lake and Denverton over the census
+  shapes, with eight charts under `docs/par3-versus/`; the same round
+  re-measures both machines' RAR and PAR2 rows, which were carried from
+  `rarpar 0.3.3`. The page records that `par3cmdline` protects 200 + 20
+  Cauchy blocks with GF(2^16) where `rarpar 0.8.1` picks GF(2^8). No version
+  impact.
+
+## rarpar 0.8.1
 
 ### Changed
 

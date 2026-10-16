@@ -474,7 +474,7 @@ func TestPeakRSSIsARequiredRowField(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, err := ReadResults(old)
-		if err == nil || !strings.Contains(err.Error(), `want "rarpar-par3-bench-v3"`) ||
+		if err == nil || !strings.Contains(err.Error(), `want "rarpar-par3-bench-v4"`) ||
 			!strings.Contains(err.Error(), why) || !strings.Contains(err.Error(), "read it with the harness that wrote it") {
 			t.Fatalf("a %s results file: %v", schema, err)
 		}
@@ -950,9 +950,9 @@ func TestReportNamesTheLikeForLikeRepairRow(t *testing.T) {
 	}
 	for _, want := range []string{
 		"u / rarpar-w1 — in place, no backup",
-		"u / rarpar-w1-backup — keeps .1 like the reference: like for like",
-		"c / rarpar-w1 — compatible rs, keeps .1 like the reference: like for like",
-		"par3cmdline keeps a numbered .1 backup of every file it repairs.",
+		"u / rarpar-w1-backup — retains file like the reference: like for like",
+		"c / rarpar-w1 — compatible rs, retains file like the reference: like for like",
+		"par3cmdline retains a numbered .1 copy of every file it repairs.",
 	} {
 		if !strings.Contains(string(chart), want) {
 			t.Fatalf("repair chart lacks %q:\n%s", want, chart)
@@ -965,5 +965,33 @@ func TestReportNamesTheLikeForLikeRepairRow(t *testing.T) {
 	if !strings.Contains(report, "every rarpar row runs buffered and the bench never passes `--fsync`") ||
 		strings.Contains(report, "PAR-inside") {
 		t.Fatalf("plain-set report:\n%s", report)
+	}
+}
+
+// --candidate-arg reaches every candidate run, the par2-rs rows included.
+func TestPAR2RSCommandsCarryCandidateArgs(t *testing.T) {
+	config := Config{ID: "u", BlockSize: MiB, Recovery: 3, Codec: "cauchy", PAR2: true}
+	dataset := Dataset{Files: []FileSpec{{Name: "a.bin", Size: 4}}}
+	row := Variant{Name: ToolPAR2, Tool: ToolPAR2}
+	r := &runner{options: Options{Candidate: "/bin/rarpar", CandidateArgs: []string{"--x", "y"}}, results: &Results{}}
+	for _, args := range [][]string{
+		r.createCommand(config, dataset, "/d", "/o", row).Args,
+		r.checkCommand(OpVerify, "/s", row, config).Args,
+		r.checkCommand(OpRepair, "/s", row, config).Args,
+	} {
+		if line := strings.Join(args, " "); !strings.HasPrefix(line, "--quiet --x y par ") {
+			t.Errorf("par2-rs command %q", line)
+		}
+	}
+}
+
+// The untimed PAR2 seed is written only when a PAR2 verify or repair reads it.
+func TestPAR2SeedOnlyForVerifyOrRepair(t *testing.T) {
+	config := Config{ID: "u", PAR2: true}
+	for ops, want := range map[string]bool{"create": false, "verify-damaged": false, "create,verify-damaged": false, "verify": true, "create,repair": true} {
+		r := &runner{options: Options{Ops: strings.Split(ops, ",")}, results: &Results{Variants: PAR2Rows()}}
+		if got := r.par2Seeded(config); got != want {
+			t.Errorf("ops %s: seeded %v", ops, got)
+		}
 	}
 }

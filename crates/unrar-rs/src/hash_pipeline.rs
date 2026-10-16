@@ -37,8 +37,10 @@ use blake2s_simd::Params as Blake2sParams;
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")))]
 use blake2s_simd::State as Blake2sState;
 
-/// Chunk buffers cycled between the submitter and the hash workers.
-const CHUNK_CAPACITY: usize = 4 * 1024 * 1024;
+/// Chunk buffers cycled between the submitter and the hash workers, sized to
+/// the largest span any submitter fills ([`PENDING_FLUSH_BYTES`]): a larger
+/// capacity is never written, so it only reserves memory.
+const CHUNK_CAPACITY: usize = PENDING_FLUSH_BYTES;
 /// Bounded in-flight chunks: caps memory and applies backpressure when the
 /// hash side falls behind the reader.
 const MAX_IN_FLIGHT: usize = 4;
@@ -747,7 +749,7 @@ fn blake2sp_root_params() -> Blake2sParams {
 /// Threshold at which accumulated writer-path bytes are flushed to the
 /// pipeline (keeps channel traffic coarse when the producer writes small
 /// spans, as the solid apply phase does).
-const PENDING_FLUSH_BYTES: usize = 1024 * 1024;
+pub(crate) const PENDING_FLUSH_BYTES: usize = 1024 * 1024;
 
 /// Final digests from a [`SharedHashStream`]. Fields are `Some` iff the
 /// corresponding hash was requested at construction.
@@ -826,6 +828,12 @@ impl SharedHashStream {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Whether chunks are hashed on worker threads: a large member on a
+    /// native target. The store copy overlaps its reads and writes only then.
+    pub(crate) fn is_pipelined(&self) -> bool {
+        matches!(*self.lock(), StreamState::Pipelined { .. })
     }
 
     /// Borrow-slice update (writer wrappers). May copy into an internal
@@ -1363,7 +1371,8 @@ mod scheduling_tests {
 
     #[test]
     fn oversized_writer_update_is_split_and_matches_reference() {
-        let data = vec![0xA7; 2 * CHUNK_CAPACITY + 97];
+        let len = (PIPELINE_MIN_BYTES as usize).max(2 * CHUNK_CAPACITY) + 97;
+        let data = vec![0xA7; len];
         let stream = SharedHashStream::new(true, false, true, data.len() as u64);
         stream.update(&data).unwrap();
         {

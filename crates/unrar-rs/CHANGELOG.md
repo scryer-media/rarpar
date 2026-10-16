@@ -1,6 +1,40 @@
 # Changelog
 
-## 0.11.1 (unreleased)
+## 0.11.2
+
+### Changed
+
+- A stored member with a CRC32 or BLAKE2sp check, extracted to a file, a
+  writer or memory, reads each span straight into the buffer the hash
+  workers receive, instead of copying every byte into a second buffer for
+  them. The span is 1 MiB, down from 4 MiB. On a 4-core Atom C3538,
+  extracting 248 MiB of stored multi-volume media takes 350 ms instead of
+  460 ms (UnRAR 7.23: 400 ms), and peak RSS falls from 14.5 to 9.5 MiB.
+- Hash worker buffers are allocated at the 1 MiB they are filled to,
+  instead of 4 MiB.
+- When the hash runs on worker threads (a member of 8 MiB or more on a
+  native target), a stored member's reads run on their own thread, up to two
+  spans ahead of the writes, so reading the volume and writing the output
+  overlap instead of taking turns. Spans still reach the output and the hash
+  in order; a read error is reported after every span read before it has been
+  written; the reads and writes are the same calls. `DecodeMode::Serial`
+  keeps the reads on the calling thread. On the Atom C3538 the 248 MiB set takes 260 ms instead of
+  350 ms, and the other stored cases are 8–29% faster; peak RSS on that set
+  rises from 9.8 to 13.6 MiB.
+- An encrypted stored member copied that way also decrypts on a thread of
+  its own: one thread reads the ciphertext, the next decrypts it, and the
+  calling thread writes, so reading, decrypting and writing each have a
+  core. The decrypting reader still sees the member as one ordered stream,
+  so errors and size limits behave as before; a read error is returned again
+  to every later read of that stream, never followed by an end of stream that
+  a retry could take for a short member. On the Atom C3538, 62 MiB of
+  encrypted stored media extracts in 110 ms instead of 140 ms, with or
+  without encrypted headers; CPU time rises from 190 to 230 ms and peak RSS
+  from 12.2 to 15.5 MiB, because the decrypt thread copies each span out of
+  the read-ahead buffer. The reading thread reuses those buffers at their
+  full length, so only a newly allocated one is ever zeroed.
+
+## 0.11.1
 
 ### Changed
 
