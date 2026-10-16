@@ -25,7 +25,9 @@
   its own: one thread reads the ciphertext, the next decrypts it, and the
   calling thread writes, so reading, decrypting and writing each have a
   core. The decrypting reader still sees the member as one ordered stream,
-  so errors and size limits behave as before. On the Atom C3538, 62 MiB of
+  so errors and size limits behave as before; a read error is returned again
+  to every later read of that stream, never followed by an end of stream that
+  a retry could take for a short member. On the Atom C3538, 62 MiB of
   encrypted stored media extracts in 110 ms instead of 140 ms, with or
   without encrypted headers; CPU time rises from 190 to 230 ms and peak RSS
   from 12.2 to 15.5 MiB, because the decrypt thread copies each span out of

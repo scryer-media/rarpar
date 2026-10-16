@@ -62,11 +62,18 @@ struct StagedCiphertext {
     current: Vec<u8>,
     pos: usize,
     finished: bool,
+    /// The fetch error, kept so that every read after it fails too. The
+    /// fetch thread stops at its error, so without this a retry would see
+    /// the closed channel and answer a clean end of stream.
+    failed: Option<(std::io::ErrorKind, String)>,
 }
 
 impl Read for StagedCiphertext {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         while self.pos == self.current.len() {
+            if let Some((kind, message)) = &self.failed {
+                return Err(std::io::Error::new(*kind, message.clone()));
+            }
             if self.finished || buf.is_empty() {
                 return Ok(0);
             }
@@ -78,7 +85,7 @@ impl Read for StagedCiphertext {
             match self.chunks.recv() {
                 Ok(Ok(chunk)) => self.current = chunk,
                 Ok(Err(error)) => {
-                    self.finished = true;
+                    self.failed = Some((error.kind(), error.to_string()));
                     return Err(error);
                 }
                 Err(_) => {
@@ -4143,6 +4150,7 @@ impl RarArchive {
             current: Vec::new(),
             pos: 0,
             finished: false,
+            failed: None,
         }))?;
         std::thread::scope(|scope| {
             let fetch_thread = std::thread::Builder::new()
@@ -10224,6 +10232,49 @@ mod tests {
                 "{cipher:?}: output must hold the {decrypted} bytes before the failed read, \
                  got {}",
                 output.len()
+            );
+        }
+    }
+
+    /// Once the fetch thread has reported an error, every later read of the
+    /// staged ciphertext fails with it again; none answers end of stream.
+    #[test]
+    fn staged_ciphertext_repeats_a_fetch_error() {
+        let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel(4);
+        let (spare_tx, _spare_rx) = std::sync::mpsc::channel();
+        chunk_tx.send(Ok(vec![1, 2, 3])).expect("queue span");
+        chunk_tx
+            .send(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "volume fetch failed",
+            )))
+            .expect("queue error");
+        // The fetch thread stops after its error.
+        drop(chunk_tx);
+        let mut staged = StagedCiphertext {
+            chunks: chunk_rx,
+            spare: spare_tx,
+            current: Vec::new(),
+            pos: 0,
+            finished: false,
+            failed: None,
+        };
+
+        let mut buf = [0u8; 8];
+        assert_eq!(staged.read(&mut buf).expect("first span"), 3);
+        assert_eq!(buf[..3], [1, 2, 3]);
+        for attempt in 0..3 {
+            let err = staged
+                .read(&mut buf)
+                .expect_err("a read after the fetch error must fail");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionReset,
+                "attempt {attempt}"
+            );
+            assert!(
+                err.to_string().contains("volume fetch failed"),
+                "attempt {attempt}: {err}"
             );
         }
     }
