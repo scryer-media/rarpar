@@ -92,8 +92,3 @@ opt-level = 3
 # unrar-rs stays at opt-level 0: its hot dependency ppmd-turbo is optimised above, and
 # optimising unrar-rs itself would also build its test binaries optimised in every
 # unrar-tests shard (a cold unrar-rs test build is 587 CPU-s instead of 69).
-
-# sevenz-turbo 0.29.0 is not published yet: this points at its release commit
-# until it is, and is removed then.
-[patch.crates-io]
-sevenz-turbo = { git = "https://github.com/scryer-media/sevenz-turbo", rev = "561bf24a7ad9310962b62f053572ad74c94f71fa" }
