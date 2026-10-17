@@ -226,9 +226,12 @@ Required repository configuration:
   publish the GHCR image under `ghcr.io/scryer-media/rarpar`.
 - Release workflow access to the standard GitHub-hosted runner labels in
   `.github/workflows/release.yml`.
-- GitHub Actions cache access for `sccache` lanes. Cache saves are restricted
-  to trusted repository events for pull-request CI and to release/publish jobs
-  running in this repository.
+- The organisation's `SCCACHE_ENDPOINT`, `SCCACHE_S3_ACCESS_ID` and
+  `SCCACHE_S3_SECRET` secrets: `ci.yml`'s `sccache` lanes share the
+  `release-sccache` R2 bucket under `rarpar/trusted-ci/`, one prefix per
+  compiler target, on pushes and this repository's own pull requests; a fork's
+  pull request keeps the local disk cache. The release and publish jobs, and
+  the wasm lanes' target directories, use the GitHub Actions cache.
 
 Publish note: downstream crates can depend on same-version workspace crates that
 are not in the public registry yet. CI still runs the full workspace build/test
