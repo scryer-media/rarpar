@@ -8,7 +8,7 @@ use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use tempfile::NamedTempFile;
 
 use crate::decompress;
-use crate::error::{RarError, RarResult};
+use crate::error::{LimitKind, RarError, RarResult};
 use crate::header::file::FileHeader;
 use crate::limits::Limits;
 use crate::progress::ProgressHandler;
@@ -117,23 +117,23 @@ fn spool_threshold_bytes() -> usize {
 
 fn enforce_memory_extract_member_buffer_limit(file_header: &FileHeader) -> RarResult<()> {
     if file_header.data_size > MEMORY_EXTRACT_MEMBER_MAX_BUFFERED_BYTES as u64 {
-        return Err(RarError::ResourceLimit {
-            detail: format!(
-                "member {} compressed data size {} exceeds memory extraction limit {}",
-                file_header.name, file_header.data_size, MEMORY_EXTRACT_MEMBER_MAX_BUFFERED_BYTES
-            ),
-        });
+        return Err(RarError::resource_limit(
+            LimitKind::MemoryExtraction,
+            file_header.data_size,
+            MEMORY_EXTRACT_MEMBER_MAX_BUFFERED_BYTES as u64,
+            Some(file_header.name.to_string()),
+        ));
     }
 
     if let Some(unpacked_size) = file_header.unpacked_size
         && unpacked_size > MEMORY_EXTRACT_MEMBER_MAX_BUFFERED_BYTES as u64
     {
-        return Err(RarError::ResourceLimit {
-            detail: format!(
-                "member {} unpacked size {} exceeds memory extraction limit {}",
-                file_header.name, unpacked_size, MEMORY_EXTRACT_MEMBER_MAX_BUFFERED_BYTES
-            ),
-        });
+        return Err(RarError::resource_limit(
+            LimitKind::MemoryExtraction,
+            unpacked_size,
+            MEMORY_EXTRACT_MEMBER_MAX_BUFFERED_BYTES as u64,
+            Some(file_header.name.to_string()),
+        ));
     }
 
     Ok(())
@@ -141,12 +141,12 @@ fn enforce_memory_extract_member_buffer_limit(file_header: &FileHeader) -> RarRe
 
 fn enforce_memory_materialization_limit(member_name: &str, len: usize) -> RarResult<()> {
     if len > MEMORY_EXTRACT_MEMBER_MAX_BUFFERED_BYTES {
-        return Err(RarError::ResourceLimit {
-            detail: format!(
-                "member {member_name} extracted size {len} exceeds memory materialization limit {}",
-                MEMORY_EXTRACT_MEMBER_MAX_BUFFERED_BYTES
-            ),
-        });
+        return Err(RarError::resource_limit(
+            LimitKind::MemoryExtraction,
+            len as u64,
+            MEMORY_EXTRACT_MEMBER_MAX_BUFFERED_BYTES as u64,
+            Some(member_name.to_string()),
+        ));
     }
 
     Ok(())
@@ -162,23 +162,23 @@ fn output_capacity_hint(file_header: &FileHeader, limits: &Limits) -> usize {
 
 fn enforce_member_limits(file_header: &FileHeader, limits: &Limits) -> RarResult<()> {
     if file_header.data_size > limits.max_data_segment {
-        return Err(RarError::ResourceLimit {
-            detail: format!(
-                "member {} compressed data size {} exceeds maximum {}",
-                file_header.name, file_header.data_size, limits.max_data_segment
-            ),
-        });
+        return Err(RarError::resource_limit(
+            LimitKind::DataSegment,
+            file_header.data_size,
+            limits.max_data_segment,
+            Some(file_header.name.to_string()),
+        ));
     }
 
     if let Some(unpacked_size) = file_header.unpacked_size
         && unpacked_size > limits.max_unpacked_size
     {
-        return Err(RarError::ResourceLimit {
-            detail: format!(
-                "member {} unpacked size {} exceeds maximum {}",
-                file_header.name, unpacked_size, limits.max_unpacked_size
-            ),
-        });
+        return Err(RarError::resource_limit(
+            LimitKind::UnpackedSize,
+            unpacked_size,
+            limits.max_unpacked_size,
+            Some(file_header.name.to_string()),
+        ));
     }
 
     let dict_size = effective_member_dict_size(file_header);
@@ -336,13 +336,13 @@ impl<W: Write> Write for BoundedWriter<'_, W> {
         // member and the ceiling, never any payload byte.
         let projected = self.written.saturating_add(buf.len() as u64);
         if projected > self.ceiling {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "member {} produced more than {} bytes of link target payload",
-                    self.member, self.ceiling
-                ),
-            ));
+            return Err(RarError::resource_limit(
+                LimitKind::LinkTarget,
+                projected,
+                self.ceiling,
+                Some(self.member.to_string()),
+            )
+            .into_io());
         }
         let written = self.inner.write(buf)?;
         self.written = self.written.saturating_add(written as u64);
@@ -379,10 +379,10 @@ impl ExtractedMember {
             }
             Self::TempFile { file, len } => {
                 enforce_memory_materialization_limit("tempfile-backed member", *len)?;
-                let mut reopened = file.reopen().map_err(RarError::Io)?;
-                reopened.seek(SeekFrom::Start(0)).map_err(RarError::Io)?;
+                let mut reopened = file.reopen().map_err(RarError::from)?;
+                reopened.seek(SeekFrom::Start(0)).map_err(RarError::from)?;
                 let mut data = Vec::with_capacity(*len);
-                reopened.read_to_end(&mut data).map_err(RarError::Io)?;
+                reopened.read_to_end(&mut data).map_err(RarError::from)?;
                 Ok(data)
             }
         }
@@ -393,10 +393,10 @@ impl ExtractedMember {
             Self::InMemory(data) => Ok(data),
             Self::TempFile { file, len } => {
                 enforce_memory_materialization_limit("tempfile-backed member", len)?;
-                let mut reopened = file.reopen().map_err(RarError::Io)?;
-                reopened.seek(SeekFrom::Start(0)).map_err(RarError::Io)?;
+                let mut reopened = file.reopen().map_err(RarError::from)?;
+                reopened.seek(SeekFrom::Start(0)).map_err(RarError::from)?;
                 let mut data = Vec::with_capacity(len);
-                reopened.read_to_end(&mut data).map_err(RarError::Io)?;
+                reopened.read_to_end(&mut data).map_err(RarError::from)?;
                 Ok(data)
             }
         }
@@ -412,8 +412,8 @@ impl ExtractedMember {
         match self {
             Self::InMemory(data) => Ok(ExtractedMemberReader::Memory(Cursor::new(data))),
             Self::TempFile { file, len: _ } => {
-                let mut reopened = file.reopen().map_err(RarError::Io)?;
-                reopened.seek(SeekFrom::Start(0)).map_err(RarError::Io)?;
+                let mut reopened = file.reopen().map_err(RarError::from)?;
+                reopened.seek(SeekFrom::Start(0)).map_err(RarError::from)?;
                 Ok(ExtractedMemberReader::File(reopened))
             }
         }
@@ -499,7 +499,7 @@ impl ExtractedMemberSink {
         // in memory (still bounded by the 512 MiB materialization limit checked
         // elsewhere).
         let storage = if !cfg!(target_family = "wasm") && capacity_hint > threshold {
-            ExtractedMemberSinkStorage::TempFile(NamedTempFile::new().map_err(RarError::Io)?)
+            ExtractedMemberSinkStorage::TempFile(NamedTempFile::new().map_err(RarError::from)?)
         } else {
             ExtractedMemberSinkStorage::Memory(Vec::with_capacity(capacity_hint))
         };
@@ -650,7 +650,7 @@ where
     // Seek to the data offset
     reader
         .seek(SeekFrom::Start(file_header.data_offset))
-        .map_err(RarError::Io)?;
+        .map_err(RarError::from)?;
 
     let data_size = file_header.data_size;
     let mut remaining = data_size;
@@ -672,7 +672,7 @@ where
                     offset: file_header.data_offset + total_written,
                 }
             } else {
-                RarError::Io(e)
+                RarError::from(e)
             }
         })?;
 
@@ -682,7 +682,7 @@ where
             });
         }
 
-        writer.write_all(&buf[..n]).map_err(RarError::Io)?;
+        writer.write_all(&buf[..n]).map_err(RarError::from)?;
 
         if let Some(ref mut hasher) = crc_hasher {
             hasher.update(&buf[..n]);
@@ -763,7 +763,7 @@ pub fn extract_member_with_limits<R: Read + Seek>(
     // Seek to the data area.
     reader
         .seek(SeekFrom::Start(file_header.data_offset))
-        .map_err(RarError::Io)?;
+        .map_err(RarError::from)?;
 
     // Determine unpacked size.
     let unpacked_size = file_header.unpacked_size.unwrap_or(0);
@@ -793,13 +793,14 @@ pub fn extract_member_with_limits<R: Read + Seek>(
         }
         _ => {
             enforce_memory_extract_member_buffer_limit(file_header)?;
-            let data_size =
-                usize::try_from(file_header.data_size).map_err(|_| RarError::ResourceLimit {
-                    detail: format!(
-                        "member {} compressed data size {} exceeds platform capacity",
-                        file_header.name, file_header.data_size
-                    ),
-                })?;
+            let data_size = usize::try_from(file_header.data_size).map_err(|_| {
+                RarError::resource_limit(
+                    LimitKind::AddressSpace,
+                    file_header.data_size,
+                    usize::MAX as u64,
+                    Some(file_header.name.to_string()),
+                )
+            })?;
             // read_to_end fills the reserved spare capacity directly, so the
             // member-sized buffer is never memset first (vec![0; n] would
             // zero it just to be immediately overwritten).
@@ -809,7 +810,7 @@ pub fn extract_member_with_limits<R: Read + Seek>(
                     .by_ref()
                     .take(data_size as u64)
                     .read_to_end(&mut compressed)
-                    .map_err(RarError::Io)?;
+                    .map_err(RarError::from)?;
                 if read < data_size {
                     return Err(RarError::TruncatedData {
                         offset: file_header.data_offset,
@@ -900,12 +901,12 @@ pub fn verify_blake2_member(data: &ExtractedMember, expected: &[u8; 32]) -> RarR
     match data {
         ExtractedMember::InMemory(bytes) => Ok(verify_blake2(bytes, expected)),
         ExtractedMember::TempFile { file, .. } => {
-            let mut reopened = file.reopen().map_err(RarError::Io)?;
-            reopened.seek(SeekFrom::Start(0)).map_err(RarError::Io)?;
+            let mut reopened = file.reopen().map_err(RarError::from)?;
+            reopened.seek(SeekFrom::Start(0)).map_err(RarError::from)?;
             let mut hasher = crate::crypto::Blake2spHasher::new();
             let mut buf = vec![0u8; COPY_BUF_SIZE];
             loop {
-                let n = reopened.read(&mut buf).map_err(RarError::Io)?;
+                let n = reopened.read(&mut buf).map_err(RarError::from)?;
                 if n == 0 {
                     break;
                 }
@@ -964,11 +965,18 @@ mod tests {
         assert_eq!(bounded.write(b"678").unwrap(), 3);
         let err = bounded.write(b"9").unwrap_err();
 
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        let message = err.to_string();
+        let err = err.downcast::<RarError>().expect("the crate's own error");
         assert!(
-            message.contains("link") && message.contains('8'),
-            "the error names the member and the ceiling: {message}"
+            matches!(
+                err,
+                RarError::ResourceLimit {
+                    kind: LimitKind::LinkTarget,
+                    requested: 9,
+                    max: 8,
+                    ref member,
+                } if member.as_deref() == Some("link")
+            ),
+            "the error names the member and the ceiling: {err:?}"
         );
         // Nothing past the ceiling reached the inner writer, and nothing
         // before it was lost or clipped.

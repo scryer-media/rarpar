@@ -3,11 +3,53 @@
 
 #![cfg(feature = "sevenz")]
 
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use serde_json::Value;
+
+/// The first `len` bytes of a file: a ZIP64 archive as written, before the
+/// set `--inside` appends. The zip crate takes the end records copied past
+/// the set for a self-extractor's, and searches only the file's tail for the
+/// originals, so it cannot open the whole file.
+struct Head {
+    file: std::fs::File,
+    len: u64,
+    pos: u64,
+}
+
+impl Head {
+    fn open(path: &Path, len: u64) -> zip::ZipArchive<Self> {
+        let file = std::fs::File::open(path).unwrap();
+        zip::ZipArchive::new(Self { file, len, pos: 0 }).unwrap()
+    }
+}
+
+impl Read for Head {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let room = usize::try_from(self.len.saturating_sub(self.pos)).unwrap_or(usize::MAX);
+        let take = buf.len().min(room);
+        let read = self.file.read(&mut buf[..take])?;
+        self.pos += read as u64;
+        Ok(read)
+    }
+}
+
+impl Seek for Head {
+    fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+        let pos = match from {
+            SeekFrom::Start(pos) => Some(pos),
+            SeekFrom::End(delta) => self.len.checked_add_signed(delta),
+            SeekFrom::Current(delta) => self.pos.checked_add_signed(delta),
+        }
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek before start")
+        })?;
+        self.pos = self.file.seek(SeekFrom::Start(pos))?;
+        Ok(self.pos)
+    }
+}
 
 fn rarpar(root: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_rarpar"))
@@ -77,7 +119,7 @@ fn assert_extracts(root: &Path, archive: &str) {
     let mut seen = std::collections::BTreeSet::new();
     for index in 0..reader.len() {
         let mut entry = reader.by_index(index).unwrap();
-        let name = entry.name().to_owned();
+        let name = entry.name().unwrap().into_owned();
         let source = root.join("in").join(name.trim_end_matches('/'));
         if entry.is_dir() {
             assert!(source.is_dir(), "{name}");
@@ -310,7 +352,7 @@ fn many_small_files_take_zip64_end_records_and_repair() {
     let footer = &original[protected - 98..protected];
     assert_eq!(footer[..4], [0x50, 0x4b, 0x06, 0x06]);
     assert_eq!(original[original.len() - 98..], *footer);
-    let reader = zip::ZipArchive::new(std::fs::File::open(&archive).unwrap()).unwrap();
+    let reader = Head::open(&archive, protected as u64);
     assert_eq!(reader.len(), 66_067);
     drop(reader);
 
@@ -354,7 +396,7 @@ fn a_member_over_four_gib_takes_zip64() {
     let archive = root.join("out/vast.zip");
     let protected = report["protected_bytes"].as_u64().unwrap();
     assert!(protected > size);
-    let mut reader = zip::ZipArchive::new(std::fs::File::open(&archive).unwrap()).unwrap();
+    let mut reader = Head::open(&archive, protected);
     assert_eq!(reader.by_name("vast.bin").unwrap().size(), size);
     let mut tail = String::new();
     reader
@@ -587,8 +629,9 @@ fn special_permission_bits_survive_in_the_zip() {
     for index in 0..reader.len() {
         let entry = reader.by_index(index).unwrap();
         modes.insert(
-            entry.name().trim_end_matches('/').to_owned(),
-            entry.unix_mode().unwrap() & 0o7777,
+            entry.name().unwrap().trim_end_matches('/').to_owned(),
+            // unix_mode() clears these bits on read, so read the raw field.
+            (entry.external_attributes() >> 16) & 0o7777,
         );
     }
     assert_eq!(modes["lever.sh"], 0o4755, "{modes:?}");

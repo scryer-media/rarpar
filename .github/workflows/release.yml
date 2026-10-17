@@ -790,10 +790,6 @@ jobs:
               end
               pkgshare.install "README.md" if File.exist?("README.md")
               pkgshare.install "LICENSE" if File.exist?("LICENSE")
-              if File.exist?("LICENSE.GPL-3.0-or-later")
-                pkgshare.install "LICENSE.GPL-3.0-or-later"
-              end
-              pkgshare.install "LICENSE.unrar-rs" if File.exist?("LICENSE.unrar-rs")
             end
 
             test do

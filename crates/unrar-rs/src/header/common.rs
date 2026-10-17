@@ -118,14 +118,14 @@ impl RawHeader {
 ///
 /// Returns `None` at EOF (no more headers).
 pub fn read_raw_header<R: Read + Seek>(reader: &mut R) -> RarResult<Option<RawHeader>> {
-    let offset = reader.stream_position().map_err(RarError::Io)?;
+    let offset = reader.stream_position().map_err(RarError::from)?;
 
     // Read CRC32 (4 bytes little-endian)
     let mut crc_buf = [0u8; 4];
     match reader.read_exact(&mut crc_buf) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(RarError::Io(e)),
+        Err(e) => return Err(RarError::from(e)),
     }
     let stored_crc = u32::from_le_bytes(crc_buf);
 
@@ -141,7 +141,7 @@ pub fn read_raw_header<R: Read + Seek>(reader: &mut R) -> RarResult<Option<RawHe
         if e.kind() == std::io::ErrorKind::UnexpectedEof {
             RarError::TruncatedHeader { offset }
         } else {
-            RarError::Io(e)
+            RarError::from(e)
         }
     })?;
 
@@ -214,7 +214,7 @@ pub fn skip_data_area<R: Read + Seek>(reader: &mut R, raw: &RawHeader) -> RarRes
         }
         reader
             .seek(SeekFrom::Current(raw.data_area_size as i64))
-            .map_err(RarError::Io)?;
+            .map_err(RarError::from)?;
     }
     Ok(())
 }

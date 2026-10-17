@@ -79,7 +79,7 @@ fn scan_for_signature_range<R: Read + Seek>(
 ) -> RarResult<Option<u64>> {
     reader
         .seek(SeekFrom::Start(scan_start))
-        .map_err(RarError::Io)?;
+        .map_err(RarError::from)?;
     // The longest signature is RAR5 at 8 bytes. We need an overlap of 7 bytes
     // (signature length minus one) to catch signatures straddling chunk boundaries.
     let overlap = RAR5_SIGNATURE.len() - 1; // 7
@@ -99,7 +99,7 @@ fn scan_for_signature_range<R: Read + Seek>(
         let to_read = remaining.min(SCAN_CHUNK_SIZE);
         let read_buf = &mut buf[carry..carry + to_read];
 
-        let n = reader.read(read_buf).map_err(RarError::Io)?;
+        let n = reader.read(read_buf).map_err(RarError::from)?;
         if n == 0 {
             return Ok(None);
         }
@@ -191,14 +191,14 @@ fn rar14_sfx_candidate_allowed(
 /// SFX (self-extracting) archives where an executable stub precedes the RAR
 /// data. On success the reader is positioned immediately after the signature.
 pub fn read_signature<R: Read + Seek>(reader: &mut R) -> RarResult<ArchiveFormat> {
-    let start = reader.stream_position().map_err(RarError::Io)?;
+    let start = reader.stream_position().map_err(RarError::from)?;
 
     let mut buf = [0u8; 8];
     let direct_result = reader.read_exact(&mut buf).map_err(|e| {
         if e.kind() == std::io::ErrorKind::UnexpectedEof {
             RarError::InvalidSignature
         } else {
-            RarError::Io(e)
+            RarError::from(e)
         }
     });
 
@@ -206,12 +206,14 @@ pub fn read_signature<R: Read + Seek>(reader: &mut R) -> RarResult<ArchiveFormat
         match detect_format(&buf) {
             Ok(ArchiveFormat::Rar4) => {
                 // RAR4 signature is 7 bytes but we read 8; seek back 1 byte.
-                reader.seek(SeekFrom::Current(-1)).map_err(RarError::Io)?;
+                reader.seek(SeekFrom::Current(-1)).map_err(RarError::from)?;
                 return Ok(ArchiveFormat::Rar4);
             }
             Ok(ArchiveFormat::Rar14) => {
                 // RAR14's RE~^ marker is part of the 7-byte main header.
-                reader.seek(SeekFrom::Start(start)).map_err(RarError::Io)?;
+                reader
+                    .seek(SeekFrom::Start(start))
+                    .map_err(RarError::from)?;
                 return Ok(ArchiveFormat::Rar14);
             }
             Ok(fmt) => return Ok(fmt),
@@ -230,24 +232,28 @@ pub fn read_signature<R: Read + Seek>(reader: &mut R) -> RarResult<ArchiveFormat
     match scan_for_sfx_signature(reader, start, DEFAULT_SFX_MAX_SCAN)? {
         Some(offset) => {
             // Seek to the offset and read the signature to determine format.
-            reader.seek(SeekFrom::Start(offset)).map_err(RarError::Io)?;
+            reader
+                .seek(SeekFrom::Start(offset))
+                .map_err(RarError::from)?;
             let mut sig_buf = [0u8; 8];
             reader.read_exact(&mut sig_buf).map_err(|e| {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
                     RarError::InvalidSignature
                 } else {
-                    RarError::Io(e)
+                    RarError::from(e)
                 }
             })?;
             let fmt = detect_format(&sig_buf)?;
             match fmt {
                 ArchiveFormat::Rar4 => {
                     // RAR4 signature is 7 bytes but we read 8; seek back 1 byte.
-                    reader.seek(SeekFrom::Current(-1)).map_err(RarError::Io)?;
+                    reader.seek(SeekFrom::Current(-1)).map_err(RarError::from)?;
                 }
                 ArchiveFormat::Rar14 => {
                     // RAR14 parsing starts at the RE~^ marker.
-                    reader.seek(SeekFrom::Start(offset)).map_err(RarError::Io)?;
+                    reader
+                        .seek(SeekFrom::Start(offset))
+                        .map_err(RarError::from)?;
                 }
                 ArchiveFormat::Rar5 => {}
             }

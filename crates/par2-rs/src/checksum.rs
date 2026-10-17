@@ -1,11 +1,9 @@
 use crate::crc_simd;
-#[cfg(feature = "crypto-aws-lc")]
-use aws_lc_sys::{MD5_CTX, MD5_Final, MD5_Init, MD5_Update};
+#[cfg(par2_md5_asm)]
+use crate::md5_asm::Md5 as NativeMd5;
 use crc_fast::{CrcAlgorithm, Digest as FastCrcDigest};
-#[cfg(any(feature = "crypto-rust", target_family = "wasm"))]
+#[cfg(par2_md5_rustcrypto)]
 use md5::{Digest as Md5Digest, Md5 as RustCryptoMd5};
-#[cfg(feature = "crypto-aws-lc")]
-use std::mem::MaybeUninit;
 
 const ZERO_PAD_CHUNK: [u8; 8192] = [0u8; 8192];
 
@@ -77,67 +75,41 @@ impl Crc32Hasher {
     }
 }
 
-// With both backends compiled, only AWS-LC is ever selected outside the tests,
-// so the RustCrypto arm is dead in a non-test build of that configuration.
-#[cfg_attr(
-    all(feature = "crypto-aws-lc", feature = "crypto-rust"),
-    allow(dead_code)
-)]
+// MD5 backends. The assembly one (`md5_asm`) exists because RustCrypto `md-5`
+// dropped its assembly after 0.10.0 and the pure-Rust code is too slow for
+// PAR2's serial hashing on x86-64, while linking `aws-lc-sys` for one block
+// function was too heavy and split consumers' dependency graphs; see
+// `md5_asm.rs` for the full reasoning.
+//
+// With both backends compiled, only the assembly one is ever selected outside
+// the tests, so the RustCrypto arm is dead in a non-test build of that
+// configuration.
+#[cfg_attr(all(par2_md5_asm, par2_md5_rustcrypto), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Par2Md5Backend {
-    #[cfg(any(feature = "crypto-rust", target_family = "wasm"))]
+    #[cfg(par2_md5_rustcrypto)]
     RustCrypto,
-    #[cfg(feature = "crypto-aws-lc")]
-    NativeAwsLc,
+    #[cfg(par2_md5_asm)]
+    Native,
 }
 
 const fn default_md5_backend() -> Par2Md5Backend {
-    #[cfg(feature = "crypto-aws-lc")]
+    #[cfg(par2_md5_asm)]
     {
-        Par2Md5Backend::NativeAwsLc
+        Par2Md5Backend::Native
     }
-    #[cfg(not(feature = "crypto-aws-lc"))]
+    #[cfg(not(par2_md5_asm))]
     {
         Par2Md5Backend::RustCrypto
     }
 }
 
-#[cfg(feature = "crypto-aws-lc")]
-#[derive(Clone)]
-struct AwsLcMd5State {
-    ctx: MD5_CTX,
-}
-
-#[cfg(feature = "crypto-aws-lc")]
-impl AwsLcMd5State {
-    fn new() -> Self {
-        let mut ctx = MaybeUninit::<MD5_CTX>::uninit();
-        let result = unsafe { MD5_Init(ctx.as_mut_ptr()) };
-        assert_eq!(result, 1, "aws-lc MD5_Init must succeed");
-        Self {
-            ctx: unsafe { ctx.assume_init() },
-        }
-    }
-
-    fn update(&mut self, data: &[u8]) {
-        let result = unsafe { MD5_Update(&mut self.ctx, data.as_ptr().cast(), data.len()) };
-        assert_eq!(result, 1, "aws-lc MD5_Update must succeed");
-    }
-
-    fn finalize(mut self) -> [u8; 16] {
-        let mut out = [0u8; 16];
-        let result = unsafe { MD5_Final(out.as_mut_ptr(), &mut self.ctx) };
-        assert_eq!(result, 1, "aws-lc MD5_Final must succeed");
-        out
-    }
-}
-
 #[derive(Clone)]
 enum Md5StateInner {
-    #[cfg(any(feature = "crypto-rust", target_family = "wasm"))]
+    #[cfg(par2_md5_rustcrypto)]
     RustCrypto(RustCryptoMd5),
-    #[cfg(feature = "crypto-aws-lc")]
-    NativeAwsLc(AwsLcMd5State),
+    #[cfg(par2_md5_asm)]
+    Native(NativeMd5),
 }
 
 #[derive(Clone)]
@@ -152,29 +124,29 @@ impl Md5State {
 
     fn new_with_backend(backend: Par2Md5Backend) -> Self {
         let inner = match backend {
-            #[cfg(any(feature = "crypto-rust", target_family = "wasm"))]
+            #[cfg(par2_md5_rustcrypto)]
             Par2Md5Backend::RustCrypto => Md5StateInner::RustCrypto(RustCryptoMd5::new()),
-            #[cfg(feature = "crypto-aws-lc")]
-            Par2Md5Backend::NativeAwsLc => Md5StateInner::NativeAwsLc(AwsLcMd5State::new()),
+            #[cfg(par2_md5_asm)]
+            Par2Md5Backend::Native => Md5StateInner::Native(NativeMd5::new()),
         };
         Self { inner }
     }
 
     pub(crate) fn update(&mut self, data: &[u8]) {
         match &mut self.inner {
-            #[cfg(any(feature = "crypto-rust", target_family = "wasm"))]
+            #[cfg(par2_md5_rustcrypto)]
             Md5StateInner::RustCrypto(state) => state.update(data),
-            #[cfg(feature = "crypto-aws-lc")]
-            Md5StateInner::NativeAwsLc(state) => state.update(data),
+            #[cfg(par2_md5_asm)]
+            Md5StateInner::Native(state) => state.update(data),
         }
     }
 
     pub(crate) fn finalize(self) -> [u8; 16] {
         match self.inner {
-            #[cfg(any(feature = "crypto-rust", target_family = "wasm"))]
+            #[cfg(par2_md5_rustcrypto)]
             Md5StateInner::RustCrypto(state) => state.finalize().into(),
-            #[cfg(feature = "crypto-aws-lc")]
-            Md5StateInner::NativeAwsLc(state) => state.finalize(),
+            #[cfg(par2_md5_asm)]
+            Md5StateInner::Native(state) => state.finalize(),
         }
     }
 }
@@ -488,25 +460,58 @@ mod tests {
         assert_eq!(hex(&md5(b"abc")), "900150983cd24fb0d6963f7d28e17f72");
     }
 
-    /// The AWS-LC binding against an MD5 the build did not select: the
+    /// The assembly backend against an MD5 the build did not select: the
     /// reference comes from the dev-dependency, so this runs on a default
     /// build that links no RustCrypto backend at all.
-    #[cfg(feature = "crypto-aws-lc")]
+    #[cfg(par2_md5_asm)]
     #[test]
     fn md5_native_backend_matches_independent_reference() {
         use md5::Digest as _;
         let sample = b"par2-md5-native-vs-reference";
-        let native = md5_with_backend(Par2Md5Backend::NativeAwsLc, sample);
+        let native = md5_with_backend(Par2Md5Backend::Native, sample);
         let reference: [u8; 16] = md5::Md5::digest(sample).into();
         assert_eq!(native, reference);
     }
 
-    #[cfg(all(feature = "crypto-aws-lc", feature = "crypto-rust"))]
+    /// Every length through five blocks (each padding case, one- and
+    /// two-block tails), fed whole and in random pieces, plus multi-block
+    /// updates that start part-way into a buffered block.
+    #[cfg(par2_md5_asm)]
+    #[test]
+    fn md5_native_backend_matches_reference_at_every_length_and_split() {
+        use md5::Digest as _;
+        let mut seed = 0x6d64_355f_6173_6d21u64;
+        let mut data = vec![0u8; 70_000];
+        fill_pseudorandom(&mut data, &mut seed);
+        let lengths = (0..=320).chain([4095, 4096, 4097, 65_535, 65_536, 70_000]);
+        for len in lengths {
+            let sample = &data[..len];
+            let reference: [u8; 16] = md5::Md5::digest(sample).into();
+            assert_eq!(
+                md5_with_backend(Par2Md5Backend::Native, sample),
+                reference,
+                "len={len}"
+            );
+            for _ in 0..4 {
+                let mut state = Md5State::new_with_backend(Par2Md5Backend::Native);
+                let mut offset = 0;
+                while offset < len {
+                    let take =
+                        1 + (next_pseudorandom(&mut seed) as usize % (len - offset).min(200));
+                    state.update(&sample[offset..offset + take]);
+                    offset += take;
+                }
+                assert_eq!(state.finalize(), reference, "len={len} split");
+            }
+        }
+    }
+
+    #[cfg(all(par2_md5_asm, par2_md5_rustcrypto))]
     #[test]
     fn md5_native_backend_matches_rustcrypto_backend() {
         let sample = b"par2-md5-native-vs-rustcrypto";
         let rustcrypto = md5_with_backend(Par2Md5Backend::RustCrypto, sample);
-        let native = md5_with_backend(Par2Md5Backend::NativeAwsLc, sample);
+        let native = md5_with_backend(Par2Md5Backend::Native, sample);
         assert_eq!(native, rustcrypto);
     }
 

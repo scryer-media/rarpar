@@ -1713,8 +1713,6 @@ jobs:
           test -x target/dist/package-root/usr/bin/rarpar
           test -f target/dist/package-root/usr/share/man/man1/rarpar.1
           test -f target/dist/package-root/usr/share/licenses/rarpar/LICENSE
-          test -f target/dist/package-root/usr/share/licenses/rarpar/LICENSE.GPL-3.0-or-later
-          test -f target/dist/package-root/usr/share/licenses/rarpar/LICENSE.unrar-rs
           top_levels="$(find target/dist/package-root -mindepth 1 -maxdepth 1 -printf '%f\n')"
           test "$top_levels" = "usr"
           if grep -R -n 'tests/fixtures' target/dist/docs target/dist/package-root; then
@@ -2391,14 +2389,15 @@ jobs:
         # what Memcheck can see and the sanitizers cannot. Memcheck's CPUID
         # hides AVX-512, so the x86 lane runs the AVX2 tier and below. The
         # runner is set on this step alone, so xtask and build scripts run
-        # natively.
+        # natively. The `memcheck` profile builds the tests optimised; see
+        # Cargo.toml.
         if: steps.gate.outputs.run == 'true'
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: valgrind --quiet --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect
           # ARM64 alone loads one documented suppression; see
           # .github/valgrind/aarch64-memcheck.supp.
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: valgrind --quiet --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect --suppressions=${{ github.workspace }}/.github/valgrind/aarch64-memcheck.supp
-        run: cargo nextest run --locked --no-fail-fast -p "$CRATE" --lib -E "$FILTER"
+        run: cargo nextest run --locked --cargo-profile memcheck --no-fail-fast -p "$CRATE" --lib -E "$FILTER"
 
   unsafe-sanitizer:
     name: unsafe-${{ matrix.sanitizer }}-${{ matrix.platform }}-${{ matrix.crate }}

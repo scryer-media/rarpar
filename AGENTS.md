@@ -24,10 +24,12 @@ and PAR2 workflows.
   version. Record the version impact explicitly for documentation/CI-only PRs.
   Preparing these PR changes is authorized; publication, tags, and deployment
   still require a separate explicit operator instruction.
-- `reedsolomon-rs` and `par3-rs` source are Apache-2.0.
-- `par2-rs` and `rarpar` source are GPL-3.0-or-later. `par2-rs` stays GPL
-  while its test suite carries cases adapted from par2cmdline's
-  GPL-2.0-or-later unit tests.
+- `reedsolomon-rs`, `par2-rs` and `par3-rs` source are Apache-2.0.
+- `rarpar` source is GPL-3.0-or-later.
+- The `par2-rs` tests adapted from par2cmdline's GPL-2.0-or-later unit tests
+  (`tests/par2cmdline_turbo_*.rs` and `tests/support/par2cmdline_turbo_support.rs`)
+  stay GPL-3.0-or-later and are excluded from the published package. Never
+  move code from them into `par2-rs/src`.
 - `unrar-rs` is Apache-2.0 plus the unRAR restriction; its RAR engine is
   developed from RARLAB's unRAR source code, which remains governed by the
   unRAR license restriction documented in `crates/unrar-rs/LICENSE`. The
@@ -42,8 +44,14 @@ and PAR2 workflows.
 
 - `unrar-rs` is read/extract/recovery-only.
 - Do not add archive writer, archive builder, compressor, or modify-RAR APIs.
-- Standard crypto must use `aws-lc-rs` or `aws-lc-sys` directly in the
-  default feature set of every crate and in every shipped `rarpar` artifact.
+- Standard crypto must use `aws-lc-rs` in the default feature set of every
+  crate and in every shipped `rarpar` artifact. No crate depends on
+  `aws-lc-sys` directly: its `links` key is versioned, so a direct
+  requirement that differs from what a consumer's `aws-lc-rs` links puts a
+  second AWS-LC in their graph. The one exception is `par2-rs` MD5, which
+  `aws-lc-rs` does not offer: it is AWS-LC's MD5 assembly carried into `asm!`
+  in `par2-rs` (`md5_asm.rs`) on x86-64 and AArch64, and RustCrypto `md-5`
+  elsewhere.
   The `crypto-rust` feature is the supported opt-out for library consumers
   that cannot carry a C or assembly dependency; it must never be the default,
   never be selected by the release matrix, and never change the AWS-LC code

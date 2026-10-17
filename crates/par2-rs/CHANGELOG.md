@@ -4,9 +4,20 @@
 
 ### Changed
 
-- The `crypto-aws-lc` backend requires `aws-lc-sys` 0.46, the version
-  `aws-lc-rs` 1.18.2 links, so a consumer on current `aws-lc-rs` builds one
-  copy of AWS-LC instead of two. No behaviour change.
+- Relicensed from GPL-3.0-or-later to Apache-2.0. Releases up to 0.10.10
+  stay under GPL-3.0-or-later. The tests adapted from par2cmdline's
+  GPL-2.0-or-later suite stay GPL-3.0-or-later and are left out of the
+  published package.
+- Single-stream MD5 runs on the crate's own assembly on x86-64 and
+  little-endian AArch64: AWS-LC's MD5 block functions carried into `asm!`
+  (x86-64 public domain, AArch64 Apache-2.0). par2-rs
+  no longer depends on `aws-lc-sys`, so it adds no C build and no AWS-LC
+  version requirement to a consumer's graph. Every other target uses
+  RustCrypto `md-5`, which no longer needs naming there.
+- New default feature `crypto-native` selects the assembly backend.
+  `crypto-aws-lc` and `native-crypto` stay as aliases for it, and
+  `crypto-rust` still selects RustCrypto everywhere. On x86-64 and AArch64,
+  enabling neither is still a compile error. Digests are unchanged.
 
 ## 0.10.10
 

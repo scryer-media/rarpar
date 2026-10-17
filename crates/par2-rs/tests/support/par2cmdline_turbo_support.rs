@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Adapted from par2cmdline's GPL-2.0-or-later test suite, so this file stays
+// GPL-3.0-or-later (see the repository's LICENSE). It is not part of the
+// published par2-rs crate, which is Apache-2.0.
+
 #![allow(dead_code)]
 
 use std::collections::HashMap;

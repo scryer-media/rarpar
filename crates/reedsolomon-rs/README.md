@@ -3,18 +3,18 @@
 [![crates.io](https://img.shields.io/crates/v/reedsolomon-rs.svg)](https://crates.io/crates/reedsolomon-rs)
 [![docs.rs](https://docs.rs/reedsolomon-rs/badge.svg)](https://docs.rs/reedsolomon-rs)
 
-GF(2⁸), GF(2¹⁶), and additive Cantor-transform kernels for PAR2, PAR3, and RAR
-recovery. Field representations and codec geometry must match the caller's format.
+The arithmetic under PAR2, PAR3 and RAR recovery data, fast, in Rust: the
+Galois-field math (GF(2⁸) and GF(2¹⁶)) and the transforms that create and
+repair recovery blocks.
 
 ```toml
 [dependencies]
 reedsolomon-rs = "0.4"
 ```
 
-This crate provides arithmetic kernels and RAR-specific recovery coders; it
-does not scan or repair PAR archive sets. Use [`par2-rs`] or
-[`par3-rs`](https://crates.io/crates/par3-rs) for those workflows. Packet layout,
-matrix selection, resource budgets, and job policy belong to callers.
+This crate does the math only. To verify or repair files, use
+[`par2-rs`] or [`par3-rs`](https://crates.io/crates/par3-rs). Packet formats,
+which matrix to use, memory limits and threading decisions are the caller's.
 
 ## Usage
 
@@ -29,46 +29,38 @@ assert_eq!(gf::add(gf::add(0x1234, 0x89ab), 0x89ab), 0x1234);
 assert_eq!(gf::mul(0x89ab, gf::inv(0x89ab)), 1);
 ```
 
-## Contents
+## What is in it
 
-See [Cantor transform measurements](https://github.com/scryer-media/rarpar/blob/main/crates/reedsolomon-rs/FFT_BENCHMARKS.md) for the reproducible
-CPU comparison harness and the limits of the exploratory native results.
+- `gf`: GF(2¹⁶) arithmetic, as PAR2 and RAR5 use it.
+- `gf8`: GF(2⁸) arithmetic.
+- `gf_simd`: the bulk multiply-and-add loops that do most of the work, for
+  one or many inputs and outputs.
+- `fft`: the transforms behind PAR3's FFT recovery, over GF(2⁸) and
+  GF(2¹⁶). `transform_in_pool` spreads one transform over a Rayon pool you
+  supply.
+- `matrix` and `vandermonde_solve`: building and solving PAR2's repair
+  equations.
+- `xor_jit`: generated code for GF(2¹⁶) multiplication on x86-64 CPUs
+  without GFNI.
+- `rar3` and `rar5`: RAR's own recovery coders, kept separate so the PAR2
+  math is untouched.
 
-- `gf`: scalar GF(2¹⁶) arithmetic shared by PAR2 and RAR5.
-- `gf8`: GF(2⁸) arithmetic with reusable multiplication plans and runtime
-  NEON, AVX2, or SSSE3 dispatch, with a scalar fallback.
-- `fft`: clean-room additive transforms and erasure locator factors over
-  GF(2⁸) and GF(2¹⁶) in Cantor representation. Butterfly multiplication uses
-  Cantor-derived SIMD maps with an explicit scalar oracle. Codec geometry,
-  interleaving, allocation budgets, and worker policy belong to callers.
-  `transform_in_pool` distributes butterfly pairs inside an explicitly supplied
-  Rayon pool, with cancellation and synchronous execution for small stripes.
-- `gf_simd`: multiply-accumulate kernels, including `mul_acc_region` for one
-  source and destination, `mul_acc_multi_region` for one source and multiple
-  destinations, and `mul_acc_input_batch` for multiple sources and one
-  destination. `LinearMap16` also applies caller-defined binary maps using
-  NEON/AVX2/SSSE3 shuffles and representation-independent scalar tails.
-- `xor_jit`: JIT-generated bit-plane XOR GF(2¹⁶) multiplication on x86-64
-  systems without GFNI.
-- RAR-specific coders in separate modules, kept apart so PAR2 matrix semantics
-  stay unchanged.
+On x86-64 the fastest kernels the CPU supports (SSSE3, AVX2, AVX-512, GFNI)
+are chosen at run time. AArch64 uses NEON. WebAssembly uses SIMD when the
+build enables it. Scalar versions are kept as the fallback and as the
+reference the SIMD kernels are tested against.
 
-CPU dispatch is target-specific. x86-64 builds detect supported instructions at
-runtime and select among the implemented kernels. AArch64 builds use NEON,
-while WebAssembly SIMD is selected through compile-time target features.
+[FFT_BENCHMARKS.md](https://github.com/scryer-media/rarpar/blob/main/crates/reedsolomon-rs/FFT_BENCHMARKS.md)
+has the transform measurements and how to repeat them.
 
-## GPU backends
+## GPU
 
-Optional `metal` and `wgpu` features expose GPU GF(2¹⁶) session backends; this
-crate does not choose a repair workflow. The Metal backend is available only on
-Apple Silicon macOS. The `wgpu` backend uses a suitable adapter exposed by
-`wgpu`.
+The `metal` (Apple Silicon macOS only) and `wgpu` features add GPU sessions
+for GF(2¹⁶) work. A session can turn a job down (too small, unsupported
+shape, no suitable device, not enough memory), and callers such as
+[`par2-rs`] then stay on the CPU.
 
-Session admission may reject work because of workload size, configuration,
-adapter, shape, or allocation constraints. Higher-level callers such as
-[`par2-rs`] can use that result to stay on CPU.
-
-Versioned API and migration notes are in [CHANGELOG.md](https://github.com/scryer-media/rarpar/blob/main/crates/reedsolomon-rs/CHANGELOG.md).
+Changes by version are in [CHANGELOG.md](https://github.com/scryer-media/rarpar/blob/main/crates/reedsolomon-rs/CHANGELOG.md).
 
 ## License
 

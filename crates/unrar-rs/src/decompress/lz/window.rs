@@ -302,9 +302,9 @@ impl Window {
 
         let buf = match WindowStorage::try_contiguous(dict_size) {
             Ok(buf) => buf,
-            Err(err) => {
-                return Err(RarError::ResourceLimit {
-                    detail: format!("failed to allocate {dict_size} byte RAR dictionary: {err}"),
+            Err(_) => {
+                return Err(RarError::AllocationFailed {
+                    bytes: dict_size as u64,
                 });
             }
         };
@@ -337,11 +337,9 @@ impl Window {
         if dict_size > self.buf.len() {
             match WindowStorage::try_contiguous(dict_size) {
                 Ok(buf) => self.buf = buf,
-                Err(err) => {
-                    return Err(RarError::ResourceLimit {
-                        detail: format!(
-                            "failed to allocate {dict_size} byte RAR dictionary: {err}"
-                        ),
+                Err(_) => {
+                    return Err(RarError::AllocationFailed {
+                        bytes: dict_size as u64,
                     });
                 }
             }
@@ -999,12 +997,10 @@ impl Window {
 
         let dict_size = self.dict_size;
         if unflushed > dict_size as u64 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "window overrun: {unflushed} unflushed bytes exceeds dictionary size {dict_size}"
-                ),
-            ));
+            return Err(RarError::corrupt(format!(
+                "window overrun: {unflushed} unflushed bytes exceeds dictionary size {dict_size}"
+            ))
+            .into_io());
         }
         self.write_visible_span(self.total_flushed, self.total_written, writer)?;
         self.total_flushed = self.total_written;
@@ -1096,34 +1092,28 @@ impl Window {
         }
 
         let dict_size = self.dict_size;
-        let end_total = start_total.checked_add(len as u64).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "range overflow")
-        })?;
+        let end_total = start_total
+            .checked_add(len as u64)
+            .ok_or_else(|| RarError::corrupt("range overflow").into_io())?;
         if end_total > self.total_written {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "requested range [{start_total}, {end_total}) exceeds total written {}",
-                    self.total_written
-                ),
-            ));
+            return Err(RarError::corrupt(format!(
+                "requested range [{start_total}, {end_total}) exceeds total written {}",
+                self.total_written
+            ))
+            .into_io());
         }
         let distance_from_end = self.total_written.checked_sub(start_total).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "requested range start {start_total} exceeds total written {}",
-                    self.total_written
-                ),
-            )
+            RarError::corrupt(format!(
+                "requested range start {start_total} exceeds total written {}",
+                self.total_written
+            ))
+            .into_io()
         })?;
         if distance_from_end > dict_size as u64 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "requested range start {start_total} is older than window capacity {dict_size}"
-                ),
-            ));
+            return Err(RarError::corrupt(format!(
+                "requested range start {start_total} is older than window capacity {dict_size}"
+            ))
+            .into_io());
         }
 
         let distance = distance_from_end as usize;
@@ -1584,11 +1574,14 @@ mod tests {
     }
 
     #[test]
-    fn try_new_reports_capacity_overflow_as_resource_limit() {
+    fn try_new_reports_capacity_overflow_as_an_allocation_failure() {
         let Err(err) = Window::try_new(usize::MAX) else {
             panic!("usize::MAX dictionary unexpectedly succeeded");
         };
-        assert!(matches!(err, RarError::ResourceLimit { .. }));
+        assert!(
+            matches!(err, RarError::AllocationFailed { bytes } if bytes == usize::MAX as u64),
+            "{err:?}"
+        );
     }
 
     #[test]

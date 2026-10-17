@@ -300,11 +300,9 @@ fn scan_next_block(
     }
 
     if xor_sum != checksum {
-        return Err(RarError::CorruptArchive {
-            detail: format!(
-                "RAR5 block header checksum mismatch: expected {:#04x}, got {:#04x}",
-                checksum, xor_sum
-            ),
+        return Err(RarError::BlockHeaderChecksumMismatch {
+            expected: checksum,
+            actual: xor_sum,
         });
     }
 

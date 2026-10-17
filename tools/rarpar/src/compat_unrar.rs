@@ -944,9 +944,6 @@ fn map_rar_error(error: unrar_rs::RarError) -> CompatFailure {
         unrar_rs::RarError::MissingVolume { volume, .. } => {
             CompatFailure::stdout(EXIT_FATAL, format!("Cannot find volume {volume}"))
         }
-        unrar_rs::RarError::ResourceLimit { detail } => {
-            CompatFailure::stdout(EXIT_FATAL, format!("ERROR: {detail}"))
-        }
         error => CompatFailure::stdout(EXIT_FATAL, format!("ERROR: {error}")),
     }
 }

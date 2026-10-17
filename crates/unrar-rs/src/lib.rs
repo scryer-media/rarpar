@@ -329,7 +329,7 @@ pub use crypto::{
 };
 pub use decompress::policy::DecodeMode;
 pub use early::{EncryptionStatus, detect_encryption};
-pub use error::{RarError, RarResult};
+pub use error::{LimitKind, RarError, RarResult};
 pub use extract::{ExtractOptions, ExtractedMember, ExtractedMemberReader};
 pub use limits::Limits;
 pub use path::sanitize_path;

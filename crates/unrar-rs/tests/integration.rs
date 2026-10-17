@@ -7282,8 +7282,10 @@ fn test_archive_limits_reject_ppmd_arena_above_limit() {
     assert!(
         matches!(
             &result,
-            Err(unrar_rs::RarError::ResourceLimit { detail })
-                if detail.contains("max_ppmd_arena_size")
+            Err(unrar_rs::RarError::ResourceLimit {
+                kind: unrar_rs::LimitKind::PpmdArena,
+                ..
+            })
         ),
         "{:?}",
         result.err()

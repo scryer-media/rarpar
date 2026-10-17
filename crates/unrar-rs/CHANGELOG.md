@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.12.0
+
+### Changed
+
+- `LICENSE` is shorter and plainer. The terms are unchanged: Apache-2.0,
+  plus the unRAR restriction on the RAR engine.
+- A reader error that does not carry a `RarError` reaches `RarError::Io`
+  whole, so its kind, OS error code and payload are the reader's own. It
+  used to be rebuilt from its rendered message, which kept only the text.
+- A volume provider's refusal and a header or signature error on a
+  continuation volume travel inside the segment readers' `io::Error` as
+  themselves (`VolumeProviderError` and `RarError`), instead of as their
+  rendered text, so a caller can downcast them.
+- `VolumeProviderError::Io` is `Io { volume, error }`: it names the volume
+  index the provider was asked for, as `Unavailable` does, and renders
+  "volume {volume} I/O error: {error}". A provider builds it with the index
+  it was given. The segment readers used to add the volume number to the
+  rendered text; now the error carries it.
+- `RarError::Io` no longer returns its I/O error from
+  `std::error::Error::source`, because its message already renders it and a
+  reporter walking the chain printed it twice. No `RarError` or
+  `VolumeProviderError` has a source.
+- `From<io::Error> for RarError` returns the `RarError` an I/O error
+  carries, and wraps any other I/O error in `Io` whole. Every reader, writer
+  and decoder boundary in the crate converts through it, so an error raised
+  on a `Read` or `Write` path reaches the caller as its own variant rather
+  than as `Io` around it.
+- A RAR5 compressed block whose header checksum does not match is the new
+  `RarError::BlockHeaderChecksumMismatch { expected, actual }` instead of
+  `RarError::CorruptArchive`. Its message is the one it had, so logs read
+  the same. A caller that matched this failure as `CorruptArchive` must
+  match the new variant. The variant is `#[non_exhaustive]`, so it is
+  matched with `..`.
+- `RarError::ResourceLimit` is `ResourceLimit { kind, requested, max,
+  member }` in place of `ResourceLimit { detail }`. `kind` is the new
+  `LimitKind`, which names the limit: a `Limits` field, a limit built into
+  the crate, or the platform's address space. `requested` and `max` are the
+  sizes, and `member` is the member when the limit belongs to one. The
+  variant is `#[non_exhaustive]`; `RarError::resource_limit` builds one.
+- The allocator refusing a dictionary or a PPMd model is the new
+  `RarError::AllocationFailed { bytes }`, not a `ResourceLimit`. A PPMd
+  model above `max_ppmd_arena_size` is `ResourceLimit` of kind `PpmdArena`.
+- A hash or copy worker that panicked or stopped early, or a hash stream
+  used after it was finished, is the new `RarError::Internal { detail }`.
+  These were I/O errors carrying only text.
+- The decoder's window overruns, AES ciphertext not a whole number of
+  blocks, and a continuation volume that changed format or lacks the
+  member's continuation are `RarError::CorruptArchive`. A segment above
+  `max_data_segment` is `ResourceLimit`, and a volume the segment readers
+  lack is `MissingVolume`. These all used to be I/O errors carrying only
+  text. On a `Read` path each one travels inside the `io::Error` as itself,
+  with a kind that matches it (`InvalidData` for corruption, `NotFound` for
+  a missing volume, `OutOfMemory` for an allocation), and comes back out
+  with `io::Error::downcast`.
+- A member that overflows a packed size or a timestamp beyond FILETIME is
+  `CorruptArchive`, not a `ResourceLimit`.
+- Requires `ppmd-turbo` 0.2.0. A fault inside the PPMd codec itself, which
+  0.2.0 reports apart from a corrupt stream, is `RarError::Internal`.
+- The `crypto-aws-lc` backend uses only `aws-lc-rs` (`cipher` for AES-CBC,
+  `hmac` for the MAC conversion) and no longer depends on `aws-lc-sys`
+  directly, so it always shares the one AWS-LC a consumer's own `aws-lc-rs`
+  links. The requirement is `aws-lc-rs` 1.18 (any 1.18.x). The CRC32 and
+  BLAKE2sp MAC conversions take about 0.1–0.2 µs longer per member; the
+  bulk AES-CBC rate is unchanged.
+- These changes of variant are why this is 0.12.0 rather than a patch.
+
 ## 0.11.2
 
 ### Changed
@@ -35,9 +101,6 @@
   full length, so only a newly allocated one is ever zeroed.
 - The Unix owner and mode helpers are compiled only on Unix, so Windows
   builds, tests included, have no dead-code warnings. No behaviour change.
-- The `crypto-aws-lc` backend requires `aws-lc-rs` 1.18.2 and `aws-lc-sys`
-  0.46 (was 1.18 and 0.45), the pair current `aws-lc-rs` links, so a
-  consumer builds one copy of AWS-LC instead of two. No behaviour change.
 
 ## 0.11.1
 
