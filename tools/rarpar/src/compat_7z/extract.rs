@@ -755,9 +755,12 @@ fn is_checksum_failure(error: &io::Error) -> bool {
 
 /// The text 7-Zip prints for a member its block could not deliver.
 fn decode_message(error: &SevenZError, encrypted: bool) -> &'static str {
-    let (kind, message) = match error {
-        SevenZError::BlockDecode { kind, message, .. } => (Some(*kind), message.as_str()),
-        _ => (None, ""),
+    let (kind, ended_early) = match error {
+        SevenZError::BlockDecode { kind, .. } => (
+            Some(*kind),
+            error.io_error().map(io::Error::kind) == Some(io::ErrorKind::UnexpectedEof),
+        ),
+        _ => (None, false),
     };
     match kind {
         Some(BlockErrorKind::UnsupportedMethod) => "Unsupported Method",
@@ -767,7 +770,7 @@ fn decode_message(error: &SevenZError, encrypted: bool) -> &'static str {
         Some(BlockErrorKind::ChecksumMismatch) => "CRC Failed",
         _ if encrypted => "Data Error in encrypted file. Wrong password?",
         Some(BlockErrorKind::Password) => "Wrong password",
-        _ if message.contains("UnexpectedEof") => "Unexpected end of data",
+        _ if ended_early => "Unexpected end of data",
         _ => "Data Error",
     }
 }

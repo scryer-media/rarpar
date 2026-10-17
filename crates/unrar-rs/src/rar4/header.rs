@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime};
 use tracing::warn;
 
 use super::types::*;
-use crate::error::{RarError, RarResult};
+use crate::error::{LimitKind, RarError, RarResult};
 
 /// Minimum header size: CRC(2) + type(1) + flags(2) + size(2) = 7 bytes.
 const MIN_HEADER_SIZE: usize = 7;
@@ -209,14 +209,14 @@ pub struct RawRar4Header {
 ///
 /// Returns None on EOF.
 pub fn read_raw_header<R: Read + Seek>(reader: &mut R) -> RarResult<Option<RawRar4Header>> {
-    let offset = reader.stream_position().map_err(RarError::Io)?;
+    let offset = reader.stream_position().map_err(RarError::from)?;
 
     // Read minimum header bytes.
     let mut buf = [0u8; MIN_HEADER_SIZE];
     match reader.read_exact(&mut buf) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(RarError::Io(e)),
+        Err(e) => return Err(RarError::from(e)),
     }
 
     let crc16 = read_u16(&buf, 0);
@@ -234,9 +234,12 @@ pub fn read_raw_header<R: Read + Seek>(reader: &mut R) -> RarResult<Option<RawRa
     }
 
     if header_size as usize > MAX_HEADER_SIZE {
-        return Err(RarError::ResourceLimit {
-            detail: format!("RAR4 header size {} exceeds maximum", header_size),
-        });
+        return Err(RarError::resource_limit(
+            LimitKind::HeaderSize,
+            u64::from(header_size),
+            MAX_HEADER_SIZE as u64,
+            None,
+        ));
     }
 
     // Read the full header.
@@ -245,7 +248,7 @@ pub fn read_raw_header<R: Read + Seek>(reader: &mut R) -> RarResult<Option<RawRa
     if header_size as usize > MIN_HEADER_SIZE {
         reader
             .read_exact(&mut data[MIN_HEADER_SIZE..])
-            .map_err(RarError::Io)?;
+            .map_err(RarError::from)?;
     }
 
     let actual_crc = rar4_header_crc16(&data);
@@ -893,7 +896,7 @@ pub fn read_raw_header_encrypted<R: Read>(
     match reader.read_exact(&mut block) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(RarError::Io(e)),
+        Err(e) => return Err(RarError::from(e)),
     }
     decryptor.decrypt_blocks(&mut block);
 
@@ -912,9 +915,12 @@ pub fn read_raw_header_encrypted<R: Read>(
     }
 
     if header_size as usize > MAX_HEADER_SIZE {
-        return Err(RarError::ResourceLimit {
-            detail: format!("RAR4 encrypted header size {} exceeds maximum", header_size),
-        });
+        return Err(RarError::resource_limit(
+            LimitKind::HeaderSize,
+            u64::from(header_size),
+            MAX_HEADER_SIZE as u64,
+            None,
+        ));
     }
 
     // Total encrypted bytes = header_size rounded up to 16-byte boundary.
@@ -927,7 +933,7 @@ pub fn read_raw_header_encrypted<R: Read>(
     if aligned_size > 16 {
         let remaining = aligned_size - 16;
         let mut more = vec![0u8; remaining];
-        reader.read_exact(&mut more).map_err(RarError::Io)?;
+        reader.read_exact(&mut more).map_err(RarError::from)?;
         decryptor.decrypt_blocks(&mut more);
         decrypted.extend_from_slice(&more);
     }
@@ -977,7 +983,7 @@ pub fn read_raw_header_encrypted<R: Read>(
 /// header parsing, not a decode loop, so the extra `stream_position` is free
 /// relative to the header read that precedes it.
 pub fn skip_forward<R: Seek>(reader: &mut R, bytes: u64) -> RarResult<u64> {
-    let pos = reader.stream_position().map_err(RarError::Io)?;
+    let pos = reader.stream_position().map_err(RarError::from)?;
     if bytes == 0 {
         return Ok(pos);
     }
@@ -989,7 +995,7 @@ pub fn skip_forward<R: Seek>(reader: &mut R, bytes: u64) -> RarResult<u64> {
                 "RAR4 header at offset {pos} declares a {bytes}-byte data area, past the end of the seekable range"
             ),
         })?;
-    reader.seek(SeekFrom::Start(target)).map_err(RarError::Io)
+    reader.seek(SeekFrom::Start(target)).map_err(RarError::from)
 }
 
 /// Skip the data area of a RAR4 header.

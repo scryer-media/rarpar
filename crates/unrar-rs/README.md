@@ -3,21 +3,21 @@
 [![crates.io](https://img.shields.io/crates/v/unrar-rs.svg)](https://crates.io/crates/unrar-rs)
 [![docs.rs](https://docs.rs/unrar-rs/badge.svg)](https://docs.rs/unrar-rs)
 
-RAR archive reading and extraction in pure Rust. No C bindings, no external
-`unrar` binary.
+Read and extract RAR archives in Rust, with no C bindings and no `unrar`
+program needed.
 
 ```toml
 [dependencies]
-unrar-rs = "0.10"
+unrar-rs = "0.12"
 ```
 
-This crate reads existing archives. It exposes no writer, builder, or
-archive-creation API, for the licensing reason given below.
+It only reads archives. It cannot create them, for the licensing reason
+given [below](#license).
 
 ## Listing
 
-Reading headers decompresses nothing, so listing a large set costs only its
-headers.
+Listing reads only the headers and decompresses nothing, so it is cheap even
+for a large set of volumes.
 
 ```rust
 use unrar_rs::RarArchive;
@@ -30,10 +30,10 @@ for member in archive.entries() {
 
 ## Extracting
 
-Take an `Entry` for the member you want, then say where its bytes go.
-`by_index` and `by_name` decode nothing on their own; the handle they return is
-consumed by exactly one of `copy_to`, `unpack_to`, `unpack_in`,
-`copy_to_volumes`, `skip`, or reading it as a `Read`.
+Pick a member with `by_index` or `by_name`, then say where its bytes go:
+`copy_to` a writer, `unpack_to` a path, `unpack_in` a directory, `skip` it,
+or read it as a `Read`. Picking a member decodes nothing until you do one of
+these.
 
 ```rust
 use unrar_rs::RarArchive;
@@ -46,27 +46,13 @@ for index in 0..archive.len() {
 }
 ```
 
-`copy_to` hands each span the decoder produces straight to the writer: nothing
-is buffered in memory or spooled to a temporary file on the way. When there is
-no writer to give, the entry is itself a `Read`, served from a spool it fills on
-the first read.
+`copy_to` passes the bytes straight to your writer as they are decoded,
+with no buffering in memory and no temporary file.
 
-Verification is on by default, so a member whose CRC32 or BLAKE2sp does not
-match is an error rather than a silently wrong result. `set_verify` turns it
-off; `set_password` and `set_restore_owners` are the other two settings an
-entry extracts under.
-
-For an archive whose input is still arriving, use
-`archive.set_decode_mode(unrar_rs::DecodeMode::Serial)` before consuming its
-entries. This decodes on the calling thread and avoids worker/replay overhead
-while waiting for input. Completed archives retain the default `DecodeMode::Auto`.
-The setting is local to the archive, can change between members without resetting
-a solid dictionary, and leaves checksum verification and hash workers enabled.
-
-To land a member on disk with the metadata the archive carries — times,
-permissions, Windows attributes, and symlinks and hardlinks as such — use
-`unpack_to`, or `unpack_in` to let the member's own sanitized name choose the
-file.
+`unpack_to` and `unpack_in` write the member to disk with what the archive
+records about it: times, permissions, Windows attributes, symlinks and
+hardlinks. `unpack_in` uses the member's own name, cleaned so it cannot
+escape the directory.
 
 ```rust
 use unrar_rs::RarArchive;
@@ -75,12 +61,21 @@ let mut archive = RarArchive::open(std::fs::File::open("release.rar")?)?;
 archive.by_name("movie.mkv")?.unpack_to("movie.mkv".as_ref())?;
 ```
 
+Every member is checked against its CRC32 or BLAKE2sp, so a damaged member
+is an error, not wrong output. `set_verify(false)` turns that off. A member
+split across volumes is also checked at each volume, so damage is found
+where it is rather than at the end.
+
+For an archive that is still downloading, call
+`archive.set_decode_mode(unrar_rs::DecodeMode::Serial)` first. It decodes on
+the calling thread, which suits waiting for input. Finished archives keep
+the default, `DecodeMode::Auto`.
+
 ### Volumes that are not files yet
 
-`by_index_via` reads a member's volumes from a `VolumeProvider` instead of from
-the archive's own, which is how a member is extracted while its volumes are
-still arriving, or from volumes that never exist as files at all.
-`StaticVolumeProvider` wraps a list of paths.
+`by_index_via` reads a member's volumes from a `VolumeProvider` you supply,
+so you can extract while volumes are still arriving, or from volumes that are
+never files at all. `StaticVolumeProvider` wraps a list of paths.
 
 ```rust
 use unrar_rs::{RarArchive, StaticVolumeProvider};
@@ -95,135 +90,110 @@ for index in 0..archive.len() {
 }
 ```
 
-`copy_to_volumes` takes that further and gives each volume its own writer, so a
-member spanning five volumes lands as five pieces attributed to the volumes they
-came from. The writer type is yours: it needs neither `Send` nor `'static`, so
-writers sharing one sink through a borrow are fine.
+Volumes are numbered as the set numbers them: a member that starts in volume
+5 asks the provider for volume 5.
+
+`copy_to_volumes` gives each volume its own writer, so a member spread over
+five volumes arrives as five pieces, each tagged with the volume it came
+from. The writers need not be `Send` or `'static`.
 
 ### Solid archives
 
-Every call above handles solid and non-solid archives alike. What solidity adds
-is an order: a solid archive compresses its members against one shared
-dictionary, so they are consumed in ascending index order. Reaching forward
-decodes the members in between for you; reaching backwards is refused. `skip`
-walks past a member you do not want without producing its bytes, and dropping an
-entry unconsumed costs nothing.
+Everything above works on solid archives too, with one rule: their members
+share one dictionary, so they must be read in order. Asking for a later
+member decodes the ones before it for you; going back is refused. `skip`
+passes a member without producing its bytes.
 
-If a solid member fails partway — a decode error, or a writer that returns one —
-the carried-over dictionary no longer lines up with any member boundary, so the
-archive is poisoned: later solid extractions are refused until
-`reset_solid_state` clears it and extraction restarts from the first member.
+If a solid member fails partway, the members after it cannot be decoded
+until `reset_solid_state` is called and extraction starts again from the
+first member.
 
-## Encrypted archives
+## Passwords
 
-Both file-data encryption (`rar -p`) and encrypted headers (`rar -hp`) are
-supported. Set the password with `set_password`, use `open_with_password` when
-the headers are encrypted, or override it for one member with `with_password`.
+Both kinds of RAR encryption work: encrypted file data (`rar -p`) and
+encrypted headers (`rar -hp`). Use `set_password`, `open_with_password` when
+the headers are encrypted, or `with_password` for a single member.
 
-For callers that route bytes rather than extract them, the `crypto` module can
-derive a member key from header facts, check a password before decryption, and
-decrypt or re-encrypt an arbitrary range. A password check can be `Verified`,
-`Wrong`, or `Unverifiable`; malformed stored check data must not be treated as
-verification.
+The `crypto` module is for programs that move encrypted bytes around rather
+than extract them: it derives a member's key, checks a password before
+decrypting (`Verified`, `Wrong` or `Unverifiable`), and decrypts or
+re-encrypts any range.
 
-## Capabilities
+## Errors
 
-- RAR5 and RAR4, including legacy RAR 1.5 / 2.0 / 2.9, and SFX archives.
-- All five RAR5 header types, vint decoding, header CRC32 validation.
-- Store, LZ (methods 1–5), and PPMd variant H decompression, plus the Delta,
-  E8, E8E9 and ARM filters.
-- AES decryption for file data (`-p`) and encrypted headers (`-hp`), with
-  RAR-compatible key derivation.
-- Multi-volume topology tracking and cross-volume member layout.
-- Metadata-only mode for inspection without extraction.
-- Path sanitisation against traversal, and header-declared limits that bound
-  allocation.
+Failures are typed (`RarError`), and the `io::Error` a reader returns carries
+the original error, so `io::Error::downcast` gives back the `RarError` or the
+`VolumeProviderError` behind it.
 
-## Crypto backend
+## What it reads
 
-The AES-CBC / HMAC-SHA256 seam has two interchangeable backends, chosen at
-compile time.
+- RAR5 and RAR4, including the older RAR 1.5, 2.0 and 2.9 formats, and
+  self-extracting archives.
+- Stored and compressed members, including PPMd.
+- RAR5's filters (delta, x86, ARM) and RAR4's (x86, Itanium, delta, RGB,
+  audio).
+- Encrypted data and headers.
+- Multi-volume sets, with members that span volumes.
+- Hostile archives: names that would escape the output directory are
+  cleaned, and sizes declared in headers are capped before anything is
+  allocated.
 
-- `crypto-aws-lc` *(default)*: AWS-LC-backed AES and hashing. Building it
-  compiles `aws-lc-rs` and `aws-lc-sys`, which need a C toolchain, and it is
-  the configuration the performance figures below were measured with.
-- `crypto-rust`: the pure-Rust `aes`, `cbc`, `sha2` and `hmac` backend. No C or
-  assembly dependency, and the backend for targets where AWS-LC does not build,
-  `wasm` among them. Expect slower decryption; extraction results are
-  unchanged.
+## Encryption backend
 
-To opt out of AWS-LC:
+- `crypto-aws-lc` (default): AWS-LC. It needs a C compiler, and it is what
+  the speed figures below were measured with.
+- `crypto-rust`: pure Rust. Use it where AWS-LC does not build, such as
+  WebAssembly. Decryption is slower; the output is the same.
 
 ```toml
-unrar-rs = { version = "0.10", default-features = false, features = ["crypto-rust"] }
+unrar-rs = { version = "0.12", default-features = false, features = ["crypto-rust"] }
 ```
 
-`native-crypto` stays as an alias for `crypto-aws-lc`, so dependency
-declarations written against the old name keep resolving to the same backend.
-On a native target, enabling neither backend is a compile error rather than a
-silent choice; enabling both keeps AWS-LC active and compiles the pure-Rust
-backend beside it for the differential tests.
+Turning on neither is a compile error. With both on, AWS-LC is used.
+`native-crypto` is an old name for `crypto-aws-lc`.
 
-## Feature flags
+On WebAssembly, `crypto-host` hands decryption, and `crc-host` the CRC-32
+checks, to the program that embeds the module. On other targets they do
+nothing.
 
-- `crypto-host`: on `wasm32`, delegates bulk AES-CBC decryption to an
-  embedder-installed hook; it implies `crypto-rust` for key derivation.
-- `crc-host`: on `wasm32`, delegates bulk member CRC-32 to an
-  embedder-installed hook.
-- `slow-tests`: opts in to long-running tests.
+## Speed
 
-## Volume numbering
+How many times faster than RARLAB's `unrar` a member is extracted (2.0× is
+half the time):
 
-Volumes are addressed in the set's own numbering throughout: a member whose
-first segment is in volume 5 requests volume 5. Do not re-key a provider to the
-member's first volume.
-
-## Verification
-
-Checks follow what the format provides. A member carries a whole-member CRC32 or
-BLAKE2sp. A member split across volumes also carries a packed checksum in every
-non-final part, so damage is caught at the part carrying it rather than at the
-end of the member. Note that `-htb` archives replace CRC32 with BLAKE2sp rather
-than adding it.
-
-## Performance
-
-`2.0×` means `rarpar` finished in half the time:
-
-| CPU | Arch | Instruction set | unrar (binary) | unrar (text) |
+| CPU | Arch | Instruction set | binary | text |
 |---|---|---|---:|---:|
-| AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 2.0× | 1.5× |
-| Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 1.9× | 1.4× |
-| Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 1.5× | 1.2× |
-| AMD Ryzen 5 3600 (Zen 2) | x86-64 | AVX2 | 1.6× | 1.5× |
-| Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.2× | 1.3× |
-| Apple M5 Max | arm64 | NEON | 1.4× | 1.5× |
-| Arm Cortex-A72 | arm64 | NEON | 2.1× | 1.4× |
-| Arm Neoverse N1 | arm64 | NEON | 2.6× | 1.5× |
-| Arm Neoverse V2 | arm64 | NEON | 3.1× | 1.6× |
+| AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 2.5× | 1.8× |
+| Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 2.0× | 1.5× |
+| Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 1.6× | 1.4× |
+| Intel Xeon Platinum 8124M (Skylake-SP) | x86-64 | AVX-512 | 1.6× | 1.3× |
+| AMD Ryzen 5 3600 (Zen 2) † | x86-64 | AVX2 | 1.6× | 1.5× |
+| Intel Xeon E5-2666 v3 (Haswell) | x86-64 | AVX2 | 1.6× | 1.3× |
+| Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.2× | 1.4× |
+| Apple M5 Max † | arm64 | NEON | 1.3× | 1.5× |
+| Arm Cortex-A72 | arm64 | NEON | 2.0× | 1.6× |
+| Arm Neoverse N1 | arm64 | NEON | 2.9× | 1.7× |
+| Arm Neoverse V2 | arm64 | NEON | 3.1× | 1.8× |
 
+† From an older release, awaiting a re-measure.
 
-`binary` is store-mode extraction of uncompressible media payloads, including
-encrypted and BLAKE2sp variants; `text` is compressed extraction across the LZ
-and PPMd paths. The text class includes RAR4 PPMd, an older mode deliberately
-left unoptimised.
+`binary` is stored, incompressible media, with and without encryption and
+BLAKE2sp. `text` is compressed data, LZ and PPMd. Both are measured through the
+`rarpar` command.
 
-Per-case charts for every machine, the full methodology, and the versions
-these numbers were measured with:
-[**rarpar benchmarks**](https://github.com/scryer-media/rarpar/blob/main/docs/benchmark.md).
+Every case on every machine, the method and the versions measured are in
+[the rarpar benchmarks](https://github.com/scryer-media/rarpar/blob/main/docs/benchmark.md).
 
 ## Provenance
 
-This is a Rust port of RARLAB's reference UnRAR implementation, with additional
-optimisations: runtime-dispatched SIMD, a streaming extraction path, and
-cross-volume layout assembly that the reference implementation does not provide.
-The PPMd variant H model and its range coder come from the
-[`ppmd-turbo`](https://github.com/scryer-media/ppmd-turbo) crate.
-
-The RAR format is documented in RARLAB's
+This is a Rust port of RARLAB's UnRAR, with additions of its own: SIMD
+chosen at run time, streaming extraction, and assembling members across
+volumes. PPMd comes from the
+[`ppmd-turbo`](https://github.com/scryer-media/ppmd-turbo) crate. The RAR
+format is described in RARLAB's
 [technical note](https://www.rarlab.com/technote.htm).
 
-Versioned API and behavior notes are in [CHANGELOG.md](https://github.com/scryer-media/rarpar/blob/main/crates/unrar-rs/CHANGELOG.md).
+Changes by version are in [CHANGELOG.md](https://github.com/scryer-media/rarpar/blob/main/crates/unrar-rs/CHANGELOG.md).
 
 ## License
 

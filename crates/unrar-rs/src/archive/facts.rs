@@ -816,9 +816,7 @@ impl RarArchive {
     ) -> RarResult<RarVolumeHeaderEncryption> {
         use std::io::{Seek, SeekFrom};
 
-        reader
-            .seek(SeekFrom::Start(0))
-            .map_err(crate::error::RarError::Io)?;
+        reader.seek(SeekFrom::Start(0))?;
         let format = signature::read_signature(&mut reader)?;
 
         if format.is_rar4_family() {
@@ -889,9 +887,7 @@ impl RarArchive {
     ) -> RarResult<FactsWalkOutcome> {
         use std::io::{Seek, SeekFrom};
 
-        reader
-            .seek(SeekFrom::Start(0))
-            .map_err(crate::error::RarError::Io)?;
+        reader.seek(SeekFrom::Start(0))?;
         let format = signature::read_signature(&mut reader)?;
         // Set by the walks below when the staged image ended underneath them;
         // left `None` when the walk stopped on an end-of-archive record.

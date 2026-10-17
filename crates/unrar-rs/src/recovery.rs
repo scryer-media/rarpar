@@ -153,10 +153,10 @@ fn expand_recovery_paths(paths: &[PathBuf]) -> RarResult<Vec<PathBuf>> {
         let entries = match std::fs::read_dir(parent) {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(RarError::Io(err)),
+            Err(err) => return Err(RarError::from(err)),
         };
         for entry in entries {
-            let entry = entry.map_err(RarError::Io)?;
+            let entry = entry.map_err(RarError::from)?;
             let candidate = entry.path();
             let Ok(file_type) = entry.file_type() else {
                 continue;
@@ -347,7 +347,7 @@ fn restore_rar5(
         let Some(path) = &slot.path else {
             return Ok(false);
         };
-        Ok(std::fs::metadata(path).map_err(RarError::Io)?.len() == slot.file_size)
+        Ok(std::fs::metadata(path).map_err(RarError::from)?.len() == slot.file_size)
     })
     .into_iter()
     .collect::<RarResult<Vec<_>>>();
@@ -389,7 +389,7 @@ fn restore_rar5(
                 let Some(path) = &slot.path else {
                     return Ok(false);
                 };
-                let metadata = std::fs::metadata(path).map_err(RarError::Io)?;
+                let metadata = std::fs::metadata(path).map_err(RarError::from)?;
                 Ok(metadata.len() == slot.file_size
                     && verify_file_crc32_region(path, 0, Some(slot.crc32))?)
             });
@@ -665,10 +665,10 @@ fn refuse_existing_restored(path: &Path) -> RarError {
 /// one extra copy of the volume on such filesystems but never a replaced file.
 fn install_partial(partial: &Path, target: &Path, overwrite_existing: bool) -> RarResult<()> {
     if overwrite_existing {
-        return std::fs::rename(partial, target).map_err(RarError::Io);
+        return std::fs::rename(partial, target).map_err(RarError::from);
     }
     match std::fs::hard_link(partial, target) {
-        Ok(()) => std::fs::remove_file(partial).map_err(RarError::Io),
+        Ok(()) => std::fs::remove_file(partial).map_err(RarError::from),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             Err(refuse_existing_restored(target))
         }
@@ -686,7 +686,7 @@ fn copy_partial_exclusively(partial: &Path, target: &Path) -> RarResult<()> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             return Err(refuse_existing_restored(target));
         }
-        Err(error) => return Err(RarError::Io(error)),
+        Err(error) => return Err(RarError::from(error)),
     };
     let copied = File::open(partial)
         .and_then(|mut input| std::io::copy(&mut input, &mut output))
@@ -694,9 +694,9 @@ fn copy_partial_exclusively(partial: &Path, target: &Path) -> RarResult<()> {
     drop(output);
     if let Err(error) = copied {
         let _ = std::fs::remove_file(target);
-        return Err(RarError::Io(error));
+        return Err(RarError::from(error));
     }
-    std::fs::remove_file(partial).map_err(RarError::Io)
+    std::fs::remove_file(partial).map_err(RarError::from)
 }
 
 /// How many names [`create_partial`] tries before it gives up.
@@ -706,7 +706,7 @@ const PARTIAL_CREATE_ATTEMPTS: usize = 16;
 /// write before it knows the restore stands, returning its path and the file.
 fn create_partial(output: &Path) -> RarResult<(PathBuf, File)> {
     if let Some(parent) = output.parent() {
-        std::fs::create_dir_all(parent).map_err(RarError::Io)?;
+        std::fs::create_dir_all(parent).map_err(RarError::from)?;
     }
     create_exclusive(|| partial_restore_path(output))
 }
@@ -723,7 +723,7 @@ fn create_exclusive(mut next_path: impl FnMut() -> PathBuf) -> RarResult<(PathBu
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 last_error = Some(error);
             }
-            Err(error) => return Err(RarError::Io(error)),
+            Err(error) => return Err(RarError::from(error)),
         }
     }
     Err(RarError::Io(last_error.unwrap_or_else(|| {
@@ -798,7 +798,7 @@ fn rename_invalid_data_volume(
     let bad_path = bad_volume_path(invalid_path);
     if bad_path.exists() {
         if options.overwrite_existing {
-            std::fs::remove_file(&bad_path).map_err(RarError::Io)?;
+            std::fs::remove_file(&bad_path).map_err(RarError::from)?;
         } else {
             return Err(RarError::Io(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
@@ -810,7 +810,7 @@ fn rename_invalid_data_volume(
         }
     }
 
-    std::fs::rename(invalid_path, bad_path).map_err(RarError::Io)?;
+    std::fs::rename(invalid_path, bad_path).map_err(RarError::from)?;
     Ok(true)
 }
 
@@ -818,12 +818,12 @@ fn same_existing_file(left: &Path, right: &Path) -> RarResult<bool> {
     let left = match std::fs::canonicalize(left) {
         Ok(path) => path,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(RarError::Io(err)),
+        Err(err) => return Err(RarError::from(err)),
     };
     let right = match std::fs::canonicalize(right) {
         Ok(path) => path,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(RarError::Io(err)),
+        Err(err) => return Err(RarError::from(err)),
     };
     Ok(left == right)
 }
@@ -890,7 +890,7 @@ fn reconstruct_rar5(
                 let path = slot.path.as_ref().ok_or_else(|| RarError::CorruptArchive {
                     detail: "valid RAR5 data slot is missing a path".into(),
                 })?;
-                File::open(path).map(Some).map_err(RarError::Io)
+                File::open(path).map(Some).map_err(RarError::from)
             } else {
                 Ok(None)
             }
@@ -904,9 +904,9 @@ fn reconstruct_rar5(
                 let path = slot.path.as_ref().ok_or_else(|| RarError::CorruptArchive {
                     detail: "valid RAR5 recovery slot is missing a path".into(),
                 })?;
-                let mut file = File::open(path).map_err(RarError::Io)?;
+                let mut file = File::open(path).map_err(RarError::from)?;
                 file.seek(SeekFrom::Start(slot.data_offset))
-                    .map_err(RarError::Io)?;
+                    .map_err(RarError::from)?;
                 Ok(Some(file))
             } else {
                 Ok(None)
@@ -922,7 +922,7 @@ fn reconstruct_rar5(
             let mut outputs = Vec::with_capacity(missing_count);
             for path in paths {
                 if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).map_err(RarError::Io)?;
+                    std::fs::create_dir_all(parent).map_err(RarError::from)?;
                 }
                 let file = OpenOptions::new()
                     .write(true)
@@ -930,7 +930,7 @@ fn reconstruct_rar5(
                     .truncate(overwrite_existing)
                     .create_new(!overwrite_existing)
                     .open(path)
-                    .map_err(RarError::Io)?;
+                    .map_err(RarError::from)?;
                 outputs.push(file);
             }
             (paths.to_vec(), outputs)
@@ -1037,7 +1037,9 @@ fn reconstruct_rar5(
                         .saturating_sub(processed)
                         .min(bytes_to_process as u64) as usize;
                     if write_len > 0 {
-                        output.write_all(&buf[..write_len]).map_err(RarError::Io)?;
+                        output
+                            .write_all(&buf[..write_len])
+                            .map_err(RarError::from)?;
                         hasher.update(&buf[..write_len]);
                     }
                     Ok(())
@@ -1053,7 +1055,7 @@ fn reconstruct_rar5(
     }
 
     for output in &mut outputs {
-        output.flush().map_err(RarError::Io)?;
+        output.flush().map_err(RarError::from)?;
     }
 
     Ok(Rar5Reconstruction {
@@ -1092,7 +1094,7 @@ where
 }
 
 fn read_rar5_rev_header(path: &Path) -> RarResult<Option<Rar5RevHeader>> {
-    let mut file = File::open(path).map_err(RarError::Io)?;
+    let mut file = File::open(path).map_err(RarError::from)?;
     let mut prefix = [0u8; REV5_PREFIX_LEN];
     if file.read_exact(&mut prefix).is_err() {
         return Ok(None);
@@ -1112,7 +1114,7 @@ fn read_rar5_rev_header(path: &Path) -> RarResult<Option<Rar5RevHeader>> {
         if err.kind() == std::io::ErrorKind::UnexpectedEof {
             return Ok(None);
         }
-        return Err(RarError::Io(err));
+        return Err(RarError::from(err));
     }
     let mut crc_input = Vec::with_capacity(4 + raw.len());
     crc_input.extend_from_slice(&prefix[REV5_SIGN.len() + 4..REV5_SIGN.len() + 8]);
@@ -1346,7 +1348,7 @@ fn restore_rar3(
 
     if options.verify_restored {
         for path in &restored_paths {
-            let mut file = File::open(path).map_err(RarError::Io)?;
+            let mut file = File::open(path).map_err(RarError::from)?;
             match probe_volume(&mut file) {
                 Ok(probe) if probe.format == ArchiveFormat::Rar4 => {}
                 Ok(probe) => {
@@ -1408,7 +1410,7 @@ fn rar3_data_volume_is_valid(path: &Path) -> RarResult<bool> {
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(RarError::Io(err)),
+        Err(err) => return Err(RarError::from(err)),
     };
     match probe_volume(&mut file) {
         Ok(probe) if probe.format.is_rar4_family() => rar3_data_volume_end_crc_valid(path),
@@ -1424,7 +1426,7 @@ fn rar3_data_volume_is_valid(path: &Path) -> RarResult<bool> {
 }
 
 fn rar3_data_volume_end_crc_valid(path: &Path) -> RarResult<bool> {
-    let mut file = File::open(path).map_err(RarError::Io)?;
+    let mut file = File::open(path).map_err(RarError::from)?;
     match crate::signature::read_signature(&mut file) {
         Ok(ArchiveFormat::Rar14) => return Ok(true),
         Ok(ArchiveFormat::Rar4) => {}
@@ -1485,7 +1487,7 @@ fn reconstruct_rar3(
         .iter()
         .map(|slot| {
             if let Some(path) = slot {
-                File::open(path).map(Some).map_err(RarError::Io)
+                File::open(path).map(Some).map_err(RarError::from)
             } else {
                 Ok(None)
             }
@@ -1495,7 +1497,7 @@ fn reconstruct_rar3(
     let mut outputs = Vec::with_capacity(restored_paths.len());
     for path in restored_paths {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(RarError::Io)?;
+            std::fs::create_dir_all(parent).map_err(RarError::from)?;
         }
         // Readable as well as writable: when the restored volume is the last
         // data volume, the padding trim in `finalize_rar3_restored_output`
@@ -1508,7 +1510,7 @@ fn reconstruct_rar3(
                 .truncate(options.overwrite_existing)
                 .create_new(!options.overwrite_existing)
                 .open(path)
-                .map_err(RarError::Io)?,
+                .map_err(RarError::from)?,
         );
     }
 
@@ -1575,7 +1577,9 @@ fn reconstruct_rar3(
         apply_decode_matrix_gf8(matrix, &input_refs, &mut output_refs);
 
         let writes = par_zip_mut(&mut outputs, &mut restored, |output, buffer| {
-            output.write_all(&buffer[..max_read]).map_err(RarError::Io)
+            output
+                .write_all(&buffer[..max_read])
+                .map_err(RarError::from)
         });
         writes.into_iter().collect::<RarResult<()>>()?;
     }
@@ -1614,18 +1618,18 @@ fn finalize_rar3_restored_output(
     new_style: bool,
     is_last_data_volume: bool,
 ) -> RarResult<()> {
-    output.flush().map_err(RarError::Io)?;
+    output.flush().map_err(RarError::from)?;
 
     // RAR 3.10+ recovery sets carry a synthetic 7-byte footer; old-style
     // name#_#_#.rev volumes do not.
     if new_style {
-        let len = output.seek(SeekFrom::End(0)).map_err(RarError::Io)?;
+        let len = output.seek(SeekFrom::End(0)).map_err(RarError::from)?;
         if len >= 7 {
             output
                 .seek(SeekFrom::Start(len - 7))
-                .map_err(RarError::Io)?;
-            output.write_all(&[0u8; 7]).map_err(RarError::Io)?;
-            output.flush().map_err(RarError::Io)?;
+                .map_err(RarError::from)?;
+            output.write_all(&[0u8; 7]).map_err(RarError::from)?;
+            output.flush().map_err(RarError::from)?;
         }
     }
 
@@ -1636,7 +1640,7 @@ fn finalize_rar3_restored_output(
 }
 
 fn truncate_rar3_last_volume_padding(output: &mut File) -> RarResult<()> {
-    output.seek(SeekFrom::Start(0)).map_err(RarError::Io)?;
+    output.seek(SeekFrom::Start(0)).map_err(RarError::from)?;
     match crate::signature::read_signature(output) {
         Ok(format) if format.is_rar4_family() => {}
         Ok(_) => return Ok(()),
@@ -1650,17 +1654,17 @@ fn truncate_rar3_last_volume_padding(output: &mut File) -> RarResult<()> {
             .saturating_add(u64::from(raw.header_size))
             .saturating_add(raw.data_area_size);
         if raw.header_type == crate::rar4::types::Rar4HeaderType::EndArchive {
-            let file_len = output.seek(SeekFrom::End(0)).map_err(RarError::Io)?;
+            let file_len = output.seek(SeekFrom::End(0)).map_err(RarError::from)?;
             if next_offset >= file_len {
                 return Ok(());
             }
             output
                 .seek(SeekFrom::Start(next_offset))
-                .map_err(RarError::Io)?;
+                .map_err(RarError::from)?;
             let mut probe = [0u8; 8192];
-            let read = output.read(&mut probe).map_err(RarError::Io)?;
+            let read = output.read(&mut probe).map_err(RarError::from)?;
             if read > 0 && probe[..read].iter().all(|&byte| byte == 0) {
-                output.set_len(next_offset).map_err(RarError::Io)?;
+                output.set_len(next_offset).map_err(RarError::from)?;
             }
             return Ok(());
         }
@@ -1668,7 +1672,7 @@ fn truncate_rar3_last_volume_padding(output: &mut File) -> RarResult<()> {
         if raw.data_area_size > 0 {
             output
                 .seek(SeekFrom::Start(next_offset))
-                .map_err(RarError::Io)?;
+                .map_err(RarError::from)?;
         }
     }
 
@@ -1676,7 +1680,7 @@ fn truncate_rar3_last_volume_padding(output: &mut File) -> RarResult<()> {
 }
 
 fn read_rar3_rev_header(path: &Path) -> RarResult<Option<Rar3RevHeader>> {
-    let mut file = File::open(path).map_err(RarError::Io)?;
+    let mut file = File::open(path).map_err(RarError::from)?;
     if !rar3_rev_uses_new_style_footer(path) {
         return Ok(
             parse_old_rar3_rev_name(path).map(|(data_count, rec_count, rec_position)| {
@@ -1693,14 +1697,15 @@ fn read_rar3_rev_header(path: &Path) -> RarResult<Option<Rar3RevHeader>> {
     // The footer is the last seven bytes: three set parameters, then the
     // CRC32 of everything before the CRC. The volume is streamed through
     // the CRC rather than read whole into memory.
-    let len = file.metadata().map_err(RarError::Io)?.len();
+    let len = file.metadata().map_err(RarError::from)?.len();
     if len < 7 {
         return Ok(None);
     }
     let actual_crc = crc32_stream(&mut file, len - 4)?;
     let mut footer = [0u8; 7];
-    file.seek(SeekFrom::Start(len - 7)).map_err(RarError::Io)?;
-    file.read_exact(&mut footer).map_err(RarError::Io)?;
+    file.seek(SeekFrom::Start(len - 7))
+        .map_err(RarError::from)?;
+    file.read_exact(&mut footer).map_err(RarError::from)?;
     if actual_crc != le_u32(&footer[3..]) {
         return Ok(None);
     }
@@ -1781,7 +1786,7 @@ fn probe_rar5_volume_number(path: &Path) -> RarResult<Option<usize>> {
     }
     let mut file = match File::open(path) {
         Ok(file) => file,
-        Err(e) => return Err(RarError::Io(e)),
+        Err(e) => return Err(RarError::from(e)),
     };
     match probe_volume(&mut file) {
         // A header-encrypted (`-hp`) volume states nothing the probe can read:
@@ -1812,11 +1817,11 @@ fn rar5_recovery_data_candidate_allowed(path: &Path) -> RarResult<bool> {
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(RarError::Io(err)),
+        Err(err) => return Err(RarError::from(err)),
     };
     match crate::signature::read_signature(&mut file) {
         Ok(ArchiveFormat::Rar5) => {
-            let pos = file.stream_position().map_err(RarError::Io)?;
+            let pos = file.stream_position().map_err(RarError::from)?;
             Ok(pos > crate::signature::RAR5_SIGNATURE_LEN as u64)
         }
         Ok(_) | Err(RarError::InvalidSignature) => Ok(false),
@@ -1888,7 +1893,7 @@ fn rar3_uses_old_numbering(paths: &[PathBuf]) -> RarResult<bool> {
         let mut file = match File::open(path) {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(RarError::Io(err)),
+            Err(err) => return Err(RarError::from(err)),
         };
         match probe_volume(&mut file) {
             Ok(probe) if probe.format == ArchiveFormat::Rar4 => {
@@ -2047,7 +2052,7 @@ fn first_embedded_recovery_record_path(
         let mut file = match File::open(path) {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(RarError::Io(err)),
+            Err(err) => return Err(RarError::from(err)),
         };
 
         match probe_volume(&mut file) {
@@ -2079,7 +2084,7 @@ fn read_padded(file: &mut File, buf: &mut [u8]) -> RarResult<usize> {
             Ok(0) => break,
             Ok(n) => total += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(RarError::Io(e)),
+            Err(e) => return Err(RarError::from(e)),
         }
     }
     if total < buf.len() {
@@ -2094,13 +2099,13 @@ fn verify_file_crc32_region(path: &Path, offset: u64, expected: Option<u32>) -> 
 }
 
 fn crc32_file_prefix(path: &Path, len: u64) -> RarResult<u32> {
-    let mut file = File::open(path).map_err(RarError::Io)?;
+    let mut file = File::open(path).map_err(RarError::from)?;
     crc32_stream(&mut file, len)
 }
 
 fn crc32_file_region(path: &Path, offset: u64) -> RarResult<u32> {
-    let mut file = File::open(path).map_err(RarError::Io)?;
-    file.seek(SeekFrom::Start(offset)).map_err(RarError::Io)?;
+    let mut file = File::open(path).map_err(RarError::from)?;
+    file.seek(SeekFrom::Start(offset)).map_err(RarError::from)?;
     crc32_stream(&mut file, u64::MAX)
 }
 
@@ -2121,7 +2126,7 @@ fn crc32_stream(file: &mut File, limit: u64) -> RarResult<u32> {
             Ok(0) => break,
             Ok(read) => read,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(RarError::Io(error)),
+            Err(error) => return Err(RarError::from(error)),
         };
         hasher.update(&buf[..read]);
         remaining -= read as u64;

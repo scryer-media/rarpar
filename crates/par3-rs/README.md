@@ -3,44 +3,43 @@
 [![crates.io](https://img.shields.io/crates/v/par3-rs.svg)](https://crates.io/crates/par3-rs)
 [![docs.rs](https://docs.rs/par3-rs/badge.svg)](https://docs.rs/par3-rs)
 
-Read, verify, create, and repair PAR3 recovery sets in Rust. Supports Cauchy and
-low-rate FFT recovery, virtual sources, incremental verification, and repair
-sessions that retain evidence as more data arrives.
-
-**Status:** a 0.x library with reference interoperability tests. Verification and
-repair exceed the reference's throughput aggregates in the measured
-[native x86-64 and ARM64 results](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/PERFORMANCE.md)
-with matched worker limits. Default ARM64 FFT creation still falls short.
-See [Scope](#scope) for supported formats and exclusions. This is independent,
-clean-room software, not official Parchive tooling.
+Read, verify, create and repair PAR3 recovery sets in Rust. It can also
+verify and repair while the data is still arriving, and work within a fixed
+memory budget.
 
 ```toml
 [dependencies]
-par3-rs = "0.5"
+par3-rs = "0.7"
 ```
 
-## Choose an API
+**Status:** a 0.x library, tested against the reference tool, par3cmdline.
+Verifying and repairing are faster than the reference in the
+[measured results](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/PERFORMANCE.md)
+on x86-64 and ARM64. Creating FFT sets on ARM64 is still slower. This is
+independent, clean-room software, not official Parchive tooling.
 
-- **Files on disk, default Cauchy sets:** use `scan_packets_from_path`,
-  `Par3Set`, `verify_set`, `create::create`, and `repair::repair_set`.
-- **Streaming or virtual input, FFT, or bounded memory:** use
-  `ingest::PacketScanner` and `Par3RepairSession`. Supply bytes through
-  `source::SourceAccess`; paths are optional.
-- **Advanced creation:** use `creation::CreationPlan` to select a codec,
-  interleaving, deduplication, Data packets, and recovery-volume layout.
-- **Recovery carriers or embedded protection:** use `carrier::CarrierPlan`
-  and `inside::{InsertionPlan, SelfRepairPlan}`; for RAR5 hosts,
-  `inside::rar5` (experimental).
+## Which API
 
-See the [API documentation](https://docs.rs/par3-rs/latest/par3_rs/) and
-[streaming engine contract](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/ENGINE.md).
-The engine APIs are synchronous and fit blocking workers; the host owns
-downloading, scheduling, persistence, and extraction policy.
+- **Files on disk:** `scan_packets_from_path`, `Par3Set`, `verify_set`,
+  `create::create` and `repair::repair_set`. The examples below use these.
+- **Data still arriving, data that is not in files, or a memory limit:**
+  `ingest::PacketScanner` and `Par3RepairSession`, reading through your own
+  `source::SourceAccess`.
+- **More control when creating** (codec, block layout, deduplication, volume
+  sizes): `creation::CreationPlan`.
+- **Protection embedded inside an archive:** `inside::{InsertionPlan,
+  SelfRepairPlan}`, and `inside::rar5` for RAR5 (experimental).
+
+Everything is synchronous and suits a blocking worker thread. Downloading,
+scheduling and storage are up to the caller. The
+[API documentation](https://docs.rs/par3-rs/latest/par3_rs/) has the
+details, and [ENGINE.md](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/ENGINE.md)
+describes the streaming engine.
 
 ## Verify files
 
-An index normally contains enough metadata to verify protected files. To repair,
-also load the available recovery volumes, as shown in the next example.
+The index file is usually enough to verify. To repair, load the recovery
+volumes too, as in the next example.
 
 ```rust,no_run
 use par3_rs::{
@@ -62,10 +61,10 @@ fn main() -> Result<()> {
 }
 ```
 
-## Repair a Cauchy set
+## Repair
 
-Supply the carriers that actually arrived. Filenames do not establish set
-membership or recovery availability; authenticated packets do.
+Pass the recovery files you actually have. File names do not matter; the
+packets inside them are checked.
 
 ```rust,no_run
 use par3_rs::{Par3Set, Result, scan_packets_from_path};
@@ -99,35 +98,20 @@ fn main() -> Result<()> {
 }
 ```
 
-Clean files are left alone. Rebuilt files are staged and verified before
-installation. No backup of a damaged file is kept by default;
-`RepairOptions::default().with_backup(true)` moves it to `<name>.1` (or the
-next free number) and the rebuilt file into the name it vacated. Inspect the
-report for incomplete repairs. `plan_repair` is available for a separate
-assessment, but `repair_set` performs its own analysis. Use a retained session
-to reuse evidence.
+- Good files are left alone. A rebuilt file is checked before it replaces
+  the damaged one.
+- The damaged file is not kept unless you ask:
+  `RepairOptions::default().with_backup(true)` renames it to `<name>.1`.
+- Repair will not write through a symbolic link, or to a name the filesystem
+  would confuse with another by case or Unicode form.
+- An interrupted repair leaves its unfinished files in a
+  `.par3-stage-<pid>-<n>` directory and lists them in
+  `EngineError::RepairInterrupted`. A successful repair cleans up after
+  itself.
+- `scan_packets_from_path` reads each recovery file into memory. For large
+  files or a strict memory limit, use the streaming API.
 
-On native targets, repair holds the output root open and performs rebuild reads
-and installs relative to that directory capability. It refuses symbolic links
-in destination paths and names that the destination filesystem merges by case
-or Unicode normalization. Verification retains normal host filesystem-link
-behavior, so existing source links continue to work. WASI relies on the
-runtime's preopened directories as its outer capability boundary.
-
-An interrupted repair reports unfinished files beneath a private
-`.par3-stage-<pid>-<sequence>` directory in `EngineError::RepairInterrupted`.
-After inspecting or removing every reported temporary, callers may remove its
-now-empty staging parent. Successful repairs clean up the empty staging
-directory automatically.
-
-The convenience scanner reads each carrier into memory, and the legacy codec
-retains whole recovery rows. Use the incremental engine for large carriers or
-strict allocation budgets.
-Its packet scanner reuses a bounded read-ahead stripe across packet boundaries;
-both scanner buffers are charged to the allocation budget, and source-generation
-checks still apply to cached bytes.
-
-## Create a Cauchy set
+## Create
 
 ```rust,no_run
 use par3_rs::create::{
@@ -151,320 +135,131 @@ fn main() -> Result<()> {
 }
 ```
 
-This convenience API chooses the block size when none is supplied, reads each
-input file once, and preserves the reference-compatible default output.
+`create` picks a block size if you give none, reads each file once, and
+writes what the reference would write. With `CreationPlan`,
+`requirements()` reports the block counts, output sizes and scratch space
+before anything is written.
 
-For advanced creation, inspect `CreationPlan::requirements()` before execution.
-It reports block counts, recovery geometry, output sizes, and scratch space.
-Output sizes include each carrier's repeated metadata copies.
-File and chunk hashes share one planning pass; sliding deduplication can read
-additional candidate windows. Encoding reads sources again. Destinations must
-be absent; execution uses a caller-selected scratch directory.
+**Durability.** par3-rs never calls `fsync`. A crash right after a create or
+repair can lose output that was reported as written. If you need it on disk,
+sync the output paths the call returns, and their directories.
 
-par3-rs flushes its application buffers but never fsyncs: no creation,
-insertion or repair path issues a storage barrier (`fsync`, `sync_all`,
-`sync_data` or `F_FULLFSYNC`). Staged outputs are still authenticated before
-installation, but acknowledged output can be lost after a crash, and no API
-promises atomic set installation across one. A caller that needs durability
-synchronizes the output paths the call returns (the paths from
-`CreationPlan::execute`, the installed files in a repair report, and so on),
-and their parent directories as well if it wants the installation renames
-themselves to survive a crash.
+## Memory and limits
 
-## Streaming and resource limits
+The streaming engine has default budgets:
 
-`PacketScanner` authenticates packets incrementally and keeps lazy references
-to recovery and Data payloads. `Par3RepairSession` retains layout, evidence,
-and assessment. Duplicate packets do not increase recovery availability.
+- **256 MiB** of memory, shared, including what sessions keep.
+- **64 MiB** kept per session.
+- **32** open file handles.
+- **1 TiB** of recovery files scanned in total.
 
-Feed positioned decoded bytes to `evidence::StreamingVerifier`, then admit its
-evidence to the session. Verified prefixes and unresolved file ranges support
-extraction readiness. Unchanged assessments and recovery-only merges reuse
-verification evidence. With read-free provider snapshots they perform no source
-reads; unpinned non-Unix disk snapshots still hash content. Recovery requirements
-identify the matrix, cohort, admissible indices, and deficit.
+When a request does not fit, the engine first narrows (fewer workers,
+smaller batches) and only then refuses, with
+`EngineError::ResourceLimit`. Its `cause()` says whether waiting can help:
+`PeerContention` will fit once other work releases memory, while
+`ExceedsLimit` and `Unmeasured` never will. `MemoryBudget::ledger()` shows
+what the memory is being used for, and is safe to read from another thread
+while a job runs.
 
-Source identities, generations, and published bytes must follow the
-`SourceAccess` contract. Holes are unavailable bytes, never implicit zeroes.
-Checkpoint replay also requires a digest preserved separately in trusted host
-metadata. A digest computed from the replay blob does not establish trust.
+The simpler APIs use their own limits (`ScanLimits`, `SetLimits`,
+`CodecLimits`, `CreateLimits`, `RepairLimits`), with defaults documented on
+each type. [ENGINE.md](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/ENGINE.md)
+covers the rest: per-stage memory, checkpoints, continuing after a
+shortfall, and how files are identified without rereading them.
 
-Default engine budgets:
+## What it supports
 
-- **256 MiB** shared allocation accounting, including retained state.
-- **64 MiB** retained state per session.
-- **32** open engine handles, with shared leases across cloned options.
-- **1 TiB** cumulative requested carrier-scanning bytes.
+- Cauchy recovery over GF(2⁸) and GF(2¹⁶), and low-rate FFT recovery,
+  including sets of more than 65,536 blocks.
+- Shared blocks, packed tails, repeated chunks, Data packets, and files that
+  are only partly protected.
+- Deduplication when creating.
+- Recovery volumes of variable, uniform or limited size.
+- Rebuilding a lost recovery file from a saved manifest.
+- Protection embedded in ZIP, ZIP64 and 7z archives, without changing the
+  archive's own members, and (experimental) in RAR5 archives and volume sets.
 
-Set worker limits explicitly when running concurrent jobs. Clone the same
-budgets to share ceilings, and use `DiskSourceAccess::with_options` to include
-disk-provider handles. Provider storage and allocator overhead are outside
-engine accounting; it is not a process-RSS limit. Out-of-order verification
-drops incomplete hash work when its budget is exhausted, leaving those extents
-unknown for later reading.
+Not supported:
 
-Every reservation names what it is for. `MemoryBudget::ledger()` returns a
-snapshot giving each `MemoryCategory` — carrier and packet storage, resolved
-metadata, layout and evidence, assessment state, caches, queued payloads, codec
-tables, codec scratch, source scratch, worker stacks and output staging — its
-current and peak reserved bytes and how many reservations it has taken. Reading
-the ledger allocates nothing and takes no lock, so a host may sample it from
-another thread while a job runs. Anything the engine reserves without naming a
-category is reported under `Uncategorized`; that count is zero on the verify,
-repair and creation paths.
+- Sparse matrices and high-rate FFT.
+- Parent-set backups, restoring permissions or links, and protection nested
+  inside protection.
+- Finding the source directory automatically.
+- Guessing missing set metadata or a recovery file's original byte order.
+- RAR4 hosts for embedded protection, and RAR5 volume sets with encrypted
+  headers.
 
-A refusal says whether it could ever have succeeded.
-`EngineError::ResourceLimit` carries `what`, `need`, `limit` and `available`,
-and `ResourceLimit::cause()` separates two outcomes a host must treat
-differently. `ExceedsLimit` means this request would still be refused if the
-session were alone on the budget with the same options, so no amount of waiting
-helps. `PeerContention` means that with the same options this exact request is
-admitted once other reservations release — those may belong to a peer session
-or to this session's own earlier reservations, and only the host knows which.
-`Unmeasured` covers refusals that were never expressed in bytes at all — no
-need and no ceiling — and is terminal like `ExceedsLimit`; a refusal measured
-against a ceiling of zero keeps its figures and classifies as `ExceedsLimit`. A host queues `PeerContention` and reports the other two as
-terminal. Refusals against a per-session ceiling — `retained_bytes` and the
-limits derived from it — report the session's total demand rather than the
-increment that tripped them, so they classify as terminal, which is what they
-are: nothing else draws on that ceiling.
+Ordinary repair never removes embedded protection; that takes the explicit
+`inside` APIs.
 
-Each stage of a repair holds a bounded set and releases what its consumer is
-finished with before the next stage charges its own. On a 16,384-block set the
-retained total across all categories is about 54 bytes per block: 24.3 for
-carrier and packet storage, 28.1 for resolved metadata, 0.8 for the layout and
-its verification evidence, and 0.4 for assessment state. Peak working memory is
-reported separately and reaches about 110 bytes per block on the same run, while
-metadata resolution holds the carriers and the set it is building at once.
-Assessment takes a scratch reservation while it accumulates coverage and
-per-cohort deficits, releases it at the handover, and retains only what the
-result's own containers measure — so what survives assessment follows files and
-losses, not the block count. The layout is charged from its containers'
-capacities and trued up to the built layout's measurement.
+## The rarpar command
 
-A contiguous protected chunk is stored as a run — file, first block, block
-count, byte offset — and extents are expanded on demand, so the layout no longer
-follows the block count. Described tails, inline tail bytes, unprotected ranges
-and blocks named by more than one extent are the exceptions, stored and charged
-individually. Whole-block extents report the set's authenticated checksums
-through shared ownership instead of copying a fingerprint and CRC64 per extent,
-and the set stores those checksums as sorted runs rather than an ordered-map
-node per block. Verdicts are packed two bits to an extent. Nothing about what a
-layout or a verdict means changed, and the evidence checkpoint format is
-unchanged and replays across the representation change. Carrier bytes and
-verification evidence deliberately outlive the stages that produced them,
-because carrier regeneration and reassessment read them and dropping them would
-buy memory with extra passes over the source; `ExecutionDiagnostics::amplification()`
-reports those passes, the bytes genuinely fetched twice and the reconstructed
-bytes, so that trade can never be made invisibly.
+The `rarpar` CLI in this workspace has `par3 create`, `par3 verify`,
+`par3 repair`, `par3 archive` (a 7z or ZIP archive protected in one pass),
+the experimental `par3 inside` for RAR5, and PAR3 handling in `auto` mode.
+Run as `par3`, it also accepts par3cmdline's command line for verifying,
+listing and repairing (`v`, `l`, `r`, `vs`, `rs`); par3cmdline's create,
+insert and delete commands are refused there.
 
-Parallel work is admitted, not assumed. Verification hashes one source across a
-private pool only when the source is at least 8 MiB, feeds that hash in updates
-of at least 1 MiB (combining adjacent protected extents into runs first), and
-holds the pool to at most four workers — measured on an 18-core host, four
-workers verify a 512 MiB source at 1.51x the serial wall time for 1.09x the CPU,
-while eighteen reach 1.23x for 4.0x. The verification buffer grows from 64 KiB
-to 1 MiB only when the budget admits the charge, under `SourceScratch`, and
-falls back rather than failing. Serial, parallel and constrained-memory
-verification produce identical evidence.
+## Compatibility with par3cmdline
 
-An FFT decode charges two banks of `capacity` rows to `CodecScratch` rather than
-a work area the width of the transform domain; with workers, on a direct lane
-over a domain wider than twice the capacity, a third bank lets the next fill
-overlap the current transform. Every transform runs in full: no stage is pruned.
-`ExecutionDiagnostics::codec()` reports transform calls, butterflies performed,
-multiply-accumulates, and the Cauchy code-matrix factors a repair computes —
-which measure at under half a percent of repair wall time on the corpus, so
-nothing caches them. Its `butterflies_skipped` count is always zero.
+Where the draft specification and par3cmdline disagree, this crate follows
+par3cmdline:
 
-Under pressure the engine narrows before it refuses — stripes, worker pools and
-verification batches are admitted at the width the budget actually has, and each
-narrowing is recorded in `ExecutionDiagnostics::waits()`. Widths are never found
-by halving a request until something fits. When even the minimum useful set does
-not fit, the stage returns one `ResourceLimit` and stops; there is no
-allocate-fail-wake loop, and the refusal is counted once by cause in
-`ExecutionDiagnostics::refusals()` at the session boundary the host sees.
+- **Field size:** one byte, not the draft's two.
+- **Start packet:** no leading random bytes. The older layout is still read.
+- **InputSetID:** derived as par3cmdline derives it, from the file names,
+  sizes, hashes, chunk layout and the Start packet. It cannot be recomputed
+  from the stored bytes.
+- **Metadata copies:** a recovery volume repeats its metadata packets as
+  par3cmdline does; the index file has one copy.
+- **File order and tail packing:** as par3cmdline does, for every
+  deduplication mode.
+- **Shared packets:** identical File or Directory packets are written once.
+- **Comment:** written only when you give comment text.
+- **File hash:** a 16-byte BLAKE3 hash of the protected chunks, which the
+  draft does not have.
+- **Chunks:** no per-chunk fingerprint.
+- **Cauchy matrix:** `x_I = I`.
+- **External Data:** full-size blocks only.
+- **FFT:** follows the pinned appendix; GF16 uses `0x1002D`, Cauchy
+  `0x1100B`. A set with one recovery block or a capacity of one records no
+  field size.
+- **ZIP64 embedding:** needs the ZIP size and offset sentinel fields set.
 
-A recovery deficit leaves a resumable continuation. `RecoveryRequirement` adds
-`in_flight`, `outstanding` and `next_indices` alongside its existing fields;
-`Par3RepairSession::note_recovery_in_flight` declares the indices a host is
-fetching and `forget_recovery_in_flight` retracts them, so a reassessment after
-a recovery-only merge advances the acquisition plan rather than asking for the
-same indices again.
+Two differences of its own:
 
-Cauchy repair produces recovered rows in tiles, scattering each tile before
-producing the next, so the output row bank costs `(m + t)` stripes rather than
-`2m`. The tile width comes from admitted worker capacity, is reported as
-`ExecutionDiagnostics::admission().output_tile`, and changes neither the output
-bytes nor the number of writes.
-
-Metadata resolution is charged for what it allocates rather than for the
-ceiling it might have needed: packet decode, description resolution and
-directory expansion each take their bytes as they go, and what survives is the
-resolved set's measured container capacity, which
-`Par3Set::retained_capacity_bytes()` reports. Directory graphs are still bounded
-— the same packet may hang under many parents, so expansion is charged per
-entry and refused by name rather than by exhaustion.
-
-Windows scanning pins a read-only carrier handle. Retained packets keep that
-handle alive; drop them before replacing or deleting carriers. Disk source
-generations come from the file's identity and change time — device, inode and
-ctime on Unix; volume serial number, 128-bit file id and ChangeTime on Windows —
-so a snapshot reads no file bytes. A writer holding FILE_WRITE_ATTRIBUTES can
-set a Windows ChangeTime back and so hide a same-length rewrite; Unix ctime
-cannot be set back. Where a filesystem lacks either, and on WASI, generations
-hash the file instead, consuming scan-work budget. Use `Par3RepairSession::validate_repair()` to check
-dry-run readiness, configured codec limits, and layouts requiring explicit
-self-repair before staging output.
-
-Cancellation, progress callbacks, stage timings, I/O counters, and typed
-resource/I/O outcomes are available through `runtime`. Convenience APIs instead
-use their own `ScanLimits`, `SetLimits`, `CodecLimits`, `CreateLimits`, and
-`RepairLimits`; their defaults are documented on those types.
-
-## Scope
-
-The incremental engine supports:
-
-- Cauchy over GF(2⁸) and GF(2¹⁶), and low-rate FFT with interleaved cohorts.
-  Interleaving permits more than 65,536 total blocks within per-cohort limits.
-- Shared blocks, packed and inline tails, repeated chunks, Data packets, and
-  protected/unprotected file extents.
-- Aligned or sliding deduplication during advanced creation, plus explicit
-  candidate placement using CRC64 and BLAKE3 confirmation.
-- Variable, uniform, or size-limited recovery volumes.
-- Recovery-carrier reconstruction from a captured manifest, or an explicitly
-  requested replacement when original packet order is unknown.
-- Cauchy PAR-inside insertion and self-repair for supported ZIP, ZIP64, and 7z
-  layouts, preserving existing archive member bytes and compression.
-- Experimental PAR-inside for RAR5 archives and volume sets (`inside::rar5`):
-  a region after the archive, or framed as a RAR5 block or service header
-  before the end header, with byte-exact self-repair and removal. RAR4 hosts,
-  a recovery-index base other than zero, and header-encrypted volume sets
-  (whose completeness cannot be checked) are refused.
-
-Packed tail blocks have no invented block checksum: each described tail is
-verified against its own fingerprint. CRC64 localizes candidates; BLAKE3
-establishes the required PAR3 integrity evidence.
-
-Still outside scope:
-
-- Sparse/explicit matrix execution and high-rate FFT.
-- Parent-set backups, permission/link restoration, and recursive PAR-inside.
-- Automatic source-directory discovery and arbitrary unprotected creation
-  layouts beyond supported container insertion.
-- Inferring an unknown carrier's original byte order or missing set metadata.
-- Storage barriers: outputs are flushed, never fsynced. Durability is the
-  caller's, by synchronizing the returned output paths.
-
-The workspace's `rarpar` CLI provides `par3 create`, `par3 verify`, `par3 repair`,
-`par3 archive` (a 7z or ZIP archive protected in the same pass), the
-experimental `par3 inside` for RAR5 hosts, and PAR3 discovery/repair in `auto`
-mode. Invoked as `par3`, or under its own name with a par3cmdline command line,
-it is also a par3cmdline-compatible facade for verification, listing and
-repair (`v`, `l`, `r` and the PAR-inside `vs`/`rs` forms); par3cmdline's
-creation, insertion and deletion commands are refused there. Install it from
-the workspace or use its binary distribution; this crate remains a library.
-The `par3rs` example demonstrates the older convenience APIs.
-
-Ordinary repair does not silently remove embedded protection. Use the explicit
-PAR-inside APIs; exact carrier restoration requires an authenticated manifest.
-The convenience verifier reports unprotected chunks as unverifiable.
-
-## Format compatibility
-
-Where the draft specification and reference disagree, this crate follows the
-reference. The deviations affecting interpretation are:
-
-- **Field size:** one byte, rather than the draft's two-byte field.
-- **Start packet:** no leading random bytes. The older layout is detected by
-  body length and preserved.
-- **InputSetID:** an opaque grouping key; it cannot be recomputed from stored
-  bytes as the draft describes. Both creation APIs derive it the way the
-  reference does, from the file names, sizes, hashes and chunk layout and
-  the Start packet body.
-- **Metadata repetition:** a recovery volume carries one copy of every
-  metadata packet up front and, as the reference writes it, `floor(log2(n))`
-  further copies of all but the Creator packet spread between its `n`
-  recovery rows; the index file carries one copy.
-- **Storage order:** both creation APIs store the inputs as the reference
-  does: longest file tail (size modulo block size) first, then largest file,
-  then by name. File packets follow the same order.
-- **Tail packing:** as the reference does, without deduplication (`-d0`) a
-  tail goes behind the first earlier tail, in placement order, that is still
-  the last in its block and has room; with aligned or sliding deduplication
-  (`-d1`, `-d2`) it goes into the first block, by block index, with room.
-  Either way it opens a new block only when nothing fits.
-- **Shared packets:** File or Directory packets with identical contents, such
-  as empty files of one name in two directories, are written once and listed
-  by every parent.
-- **Comment:** the reference writes a Comment packet only when given `-C`
-  text. The streaming engine writes none; `create` writes one only when given
-  comment text.
-- **Streaming-engine data volumes:** the reference cuts every tail block's
-  Data packet to the bytes in use and, for an interleaved set, splits data
-  volumes and spreads their metadata copies by rows of cohort blocks. The
-  engine stores whole blocks and counts data blocks singly. The index and
-  recovery volumes are unaffected.
-- **File hash:** a 16-byte BLAKE3 hash, absent from the draft, over protected
-  chunks concatenated in file order. Unprotected bytes are omitted.
-- **Chunks:** no per-chunk fingerprint from the draft layout.
-- **Cauchy matrix:** `x_I = I`, rather than interleaved `x` values.
-- **External Data:** full-size blocks only; packed tail blocks are omitted.
-- **FFT:** low-rate Cantor-field semantics follow the pinned appendix.
-  GF16 uses `0x1002D`, distinct from Cauchy's `0x1100B`.
-- **FFT field size zero:** the reference records no field for a set with one
-  recovery block or a capacity of one. The field still follows from the
-  geometry: only one input (a copy) or a capacity of one (XOR) needs no
-  transform tables.
-- **ZIP64 insertion:** the pinned reference requires ZIP size/offset sentinel
-  fields too; member count alone is insufficient. Corpus recipes normalize
-  those original ZIP fields before official insertion.
-- **Name rules (stricter than both):** the draft says nothing about reserved
-  device names, trailing spaces or dots, control bytes or a path length bound,
-  and the reference rewrites an unusable name in place and warns. This crate
-  refuses instead, at both ends. A name is refused if any `/`-separated
-  component is empty, `.`, `..`, longer than 255 bytes, contains `\\`, `:`, one
-  of the six characters Win32 forbids outright (`?`, `*`, `"`, `<`, `>`, `|`)
-  or an ASCII control byte, names a Windows character device (`CON`, `PRN`,
-  `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9` and the superscript ports
-  `COM¹`, `COM²`, `COM³`, `LPT¹`, `LPT²`, `LPT³`, case-insensitive, with or
-  without an extension) or ends in a space or a dot; if the whole path exceeds
-  4096 bytes; or if it is absolute, by a leading separator or a `X:` drive
-  prefix. Creation refuses such a name before producing the set, and repair
-  refuses such a destination before writing an output byte, with the same
-  verdict on every platform. A set produced elsewhere that carries such a name
-  still parses and still verifies; only writing it is refused.
+- **Streaming-engine data volumes** store whole blocks rather than trimming
+  each tail block. Index and recovery volumes are unaffected.
+- **File names** are checked more strictly than either. A name is refused if
+  any part is empty, `.` or `..`, or over 255 bytes; if it contains `\`,
+  `:`, `?`, `*`, `"`, `<`, `>`, `|` or a control byte; if it is a Windows
+  device name such as `CON`, `NUL` or `COM1`, with or without an extension;
+  if it ends in a space or a dot; if the path is over 4096 bytes; or if it is
+  absolute. Creating and repairing both refuse such a name, on every
+  platform. A set that already contains one still reads and verifies.
 
 The [interoperability record](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/INTEROPERABILITY.md)
-documents reference verification and repair, including both fields, uneven
-cohorts, more than 65,536 blocks, and embedded archive replacement.
+has the tests against par3cmdline.
 
-## Input handling and provenance
+## Safety and provenance
 
-Scanning skips corrupt packet candidates and resynchronizes. Malformed sets,
-contradictory metadata, resource exhaustion, and I/O failure remain errors.
-Parsed path components reject traversal names and separators, and set
-construction bounds directory expansion and rejects cycles. These checks do
-not replace control of the destination tree: callers must handle filesystem
-links and concurrent changes according to the selected API's contract.
+Scanning skips corrupt packets and keeps going. Malformed sets,
+contradictory metadata, running out of resources, and I/O failures are
+errors. Path components that would escape the output directory are refused.
 
-Unsafe Rust is confined to one Windows filesystem-security module, which
-creates owner-only staging directories through held handles and compares their
-identities, and reads file identities and change times. All other targets forbid unsafe Rust. Shared arithmetic dependencies
-use CPU-specific kernels. It is a clean-room implementation of the
+The only `unsafe` code is one Windows module that creates owner-only staging
+directories and reads file identities; every other target forbids `unsafe`.
+
+This is a clean-room implementation of the
 [PAR3 draft](https://parchive.github.io/doc/Parity_Volume_Set_Specification_v3.0.html)
-and format facts established by
-[par3cmdline](https://github.com/Parchive/par3cmdline). No reference code was
-copied into the implementation. Official fixture provenance and creation
-recipes are preserved in the repository; damage tests modify protected inputs
-or model unavailable carrier ranges. The FFT codec follows the additive
-transform and erasure decoder of Lin, Al-Naffouri, Han and Chung (2016) and
-the capacity-window decoder of Chen, Lin, Tang, Han and others (2026); the
-full references are in the repository's
+and of the format facts established by
+[par3cmdline](https://github.com/Parchive/par3cmdline); no reference code was
+copied. The FFT codec follows Lin, Al-Naffouri, Han and Chung (2016) and
+Chen, Lin, Tang, Han and others (2026); full references are in
 [ATTRIBUTION.md](https://github.com/scryer-media/rarpar/blob/main/ATTRIBUTION.md).
 
-[API and migration notes](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/CHANGELOG.md).
+Changes by version are in [CHANGELOG.md](https://github.com/scryer-media/rarpar/blob/main/crates/par3-rs/CHANGELOG.md).
 
 ## License
 

@@ -47,11 +47,12 @@ pub const MAX_HEADERS_PER_VOLUME: usize = 1 << 20;
 /// vint size a `Vec`.
 pub fn checked_volume_number(declared: u64) -> crate::error::RarResult<usize> {
     if declared > RAR_MAX_VOLUME_NUMBER {
-        return Err(crate::error::RarError::ResourceLimit {
-            detail: format!(
-                "archive declares volume number {declared}, above the {RAR_MAX_VOLUME_NUMBER} limit"
-            ),
-        });
+        return Err(crate::error::RarError::resource_limit(
+            crate::error::LimitKind::VolumeNumber,
+            declared,
+            RAR_MAX_VOLUME_NUMBER,
+            None,
+        ));
     }
     Ok(declared as usize)
 }

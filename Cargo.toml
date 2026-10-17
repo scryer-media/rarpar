@@ -17,8 +17,7 @@ repository = "https://github.com/scryer-media/rarpar"
 
 [workspace.dependencies]
 aes = { version = "0.9", features = ["zeroize"] }
-aws-lc-rs = { version = "1.18.2", default-features = false, features = ["non-fips"] }
-aws-lc-sys = { version = "0.46", default-features = false, features = ["all-bindings"] }
+aws-lc-rs = { version = "1.18", default-features = false, features = ["non-fips"] }
 blake2s_simd = { version = "1.0", default-features = false, features = ["std"] }
 blake3 = { version = "1.8", default-features = false, features = ["std"] }
 cbc = { version = "0.2", features = ["zeroize"] }
@@ -55,6 +54,16 @@ panic = "abort"
 debug = 0
 split-debuginfo = "off"
 incremental = false
+
+# The Memcheck lanes. Memcheck runs every instruction many times slower, so their
+# tests run optimised, keeping the debug assertions and overflow checks `test` has.
+# The crates optimised below keep their opt-level 3; this lifts unrar-rs and its
+# unoptimised dependencies, whose slowest lane tests take 0.6 s here instead of 7.6 s.
+[profile.memcheck]
+inherits = "test"
+opt-level = 2
+debug-assertions = true
+overflow-checks = true
 
 # Dev and test builds optimise only the crates that dominate test time. Each
 # comment gives the measured cost of leaving that crate at opt-level 0 with the

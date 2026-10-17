@@ -48,16 +48,16 @@ impl RarArchive {
         let format = if let Some(cursor) = &resume {
             reader
                 .seek(SeekFrom::Start(cursor.offset))
-                .map_err(RarError::Io)?;
+                .map_err(RarError::from)?;
             match cursor.metadata {
                 PrefixMetadata::Rar4(_) => ArchiveFormat::Rar4,
                 PrefixMetadata::Rar5 { .. } => ArchiveFormat::Rar5,
             }
         } else {
-            reader.seek(SeekFrom::Start(0)).map_err(RarError::Io)?;
+            reader.seek(SeekFrom::Start(0)).map_err(RarError::from)?;
             signature::read_signature(&mut reader)?
         };
-        let headers_start = reader.stream_position().map_err(RarError::Io)?;
+        let headers_start = reader.stream_position().map_err(RarError::from)?;
         tracing::debug!("detected format: {:?}", format);
 
         // Dispatch based on format.
@@ -331,7 +331,7 @@ impl RarArchive {
                     detail: "RAR prefix data boundary overflow".into(),
                 })?
         } else {
-            reader.stream_position().map_err(RarError::Io)?
+            reader.stream_position().map_err(RarError::from)?
         };
         let file_headers = previous
             .map_or(0, |cursor| cursor.file_headers)
@@ -340,9 +340,12 @@ impl RarArchive {
                 detail: "RAR prefix header count overflow".into(),
             })?;
         if file_headers > crate::limits::MAX_HEADERS_PER_VOLUME {
-            return Err(RarError::ResourceLimit {
-                detail: "RAR prefix exceeds the per-volume file header limit".into(),
-            });
+            return Err(RarError::resource_limit(
+                crate::error::LimitKind::HeadersPerVolume,
+                file_headers as u64,
+                crate::limits::MAX_HEADERS_PER_VOLUME as u64,
+                None,
+            ));
         }
         Ok(Some(PrefixCursor {
             volume: previous.map_or(volume, |cursor| cursor.volume),
@@ -560,7 +563,7 @@ impl RarArchive {
         reader: &mut Box<dyn ReadSeek>,
         offset: u64,
     ) -> RarResult<Option<crate::header::ParsedService>> {
-        let current = reader.stream_position().map_err(RarError::Io)?;
+        let current = reader.stream_position().map_err(RarError::from)?;
         let mut parsed = None;
 
         if reader.seek(SeekFrom::Start(offset)).is_ok() {
@@ -584,7 +587,7 @@ impl RarArchive {
 
         reader
             .seek(SeekFrom::Start(current))
-            .map_err(RarError::Io)?;
+            .map_err(RarError::from)?;
         Ok(parsed)
     }
 
@@ -592,7 +595,7 @@ impl RarArchive {
         reader: &mut Box<dyn ReadSeek>,
         headers_start: u64,
     ) -> RarResult<Option<crate::header::ParsedService>> {
-        let current = reader.stream_position().map_err(RarError::Io)?;
+        let current = reader.stream_position().map_err(RarError::from)?;
         let mut parsed = None;
 
         if reader.seek(SeekFrom::Start(headers_start)).is_ok() {
@@ -628,7 +631,7 @@ impl RarArchive {
 
         reader
             .seek(SeekFrom::Start(current))
-            .map_err(RarError::Io)?;
+            .map_err(RarError::from)?;
         Ok(parsed)
     }
 

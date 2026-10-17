@@ -42,7 +42,8 @@ impl RarparError {
             Self::Resource(_) => EXIT_RESOURCE,
             Self::Io(_) | Self::Json(_) | Self::Data(_) => EXIT_DATA_FAILURE,
             Self::Rar(error) => match error {
-                unrar_rs::RarError::ResourceLimit { .. } => EXIT_RESOURCE,
+                unrar_rs::RarError::ResourceLimit { .. }
+                | unrar_rs::RarError::AllocationFailed { .. } => EXIT_RESOURCE,
                 unrar_rs::RarError::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists => {
                     EXIT_UNSAFE
                 }

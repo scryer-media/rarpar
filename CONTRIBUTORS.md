@@ -89,8 +89,10 @@ affected Cargo tests.
 
 ## Licensing
 
-- `reedsolomon-rs` and `par3-rs` source are Apache-2.0.
-- `par2-rs` and `rarpar` source are GPL-3.0-or-later.
+- `reedsolomon-rs`, `par2-rs` and `par3-rs` source are Apache-2.0.
+- `rarpar` source is GPL-3.0-or-later.
+- The `par2-rs` tests adapted from par2cmdline stay GPL-3.0-or-later and are
+  not published with the crate.
 - `unrar-rs` is Apache-2.0 plus the UnRAR source-code restriction in
   `crates/unrar-rs/LICENSE`.
 - Distributed `rarpar` binaries link `unrar-rs` and carry its restriction.

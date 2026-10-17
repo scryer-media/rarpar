@@ -40,7 +40,7 @@ impl RarArchive {
         let mut reader = reader;
 
         // Seek to start and read signature.
-        reader.seek(SeekFrom::Start(0)).map_err(RarError::Io)?;
+        reader.seek(SeekFrom::Start(0)).map_err(RarError::from)?;
         let format = signature::read_signature(&mut reader)?;
 
         if format == ArchiveFormat::Rar14 {

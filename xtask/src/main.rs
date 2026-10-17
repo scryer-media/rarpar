@@ -809,12 +809,12 @@ fn cargo_metadata(options: &FeatureAuditOptions) -> Result<CargoMetadata> {
 fn audit_feature_metadata(metadata: &CargoMetadata, options: &FeatureAuditOptions) -> Result<()> {
     require_feature(metadata, "rarpar", "runtime")?;
     // The libraries resolve a crypto backend from the feature list the build
-    // actually carries. A shipped artifact must resolve AWS-LC on both of
-    // them, and must say so explicitly: `runtime` no longer implies it, so a
-    // matrix entry that drops `crypto-aws-lc` would otherwise fall back to the
-    // RustCrypto backend without a word.
+    // actually carries. A shipped artifact must resolve AWS-LC in unrar-rs and
+    // the in-crate assembly MD5 in par2-rs, and must say so explicitly:
+    // `runtime` no longer implies either, so a matrix entry that drops
+    // `crypto-aws-lc` would otherwise fall back to RustCrypto without a word.
     require_feature(metadata, "rarpar", "crypto-aws-lc")?;
-    require_feature(metadata, "par2-rs", "crypto-aws-lc")?;
+    require_feature(metadata, "par2-rs", "crypto-native")?;
     require_feature(metadata, "unrar-rs", "crypto-aws-lc")?;
     // `par3 archive`, PAR-inside and the 7-Zip facade live behind `sevenz`,
     // which release builds name explicitly (they pass --no-default-features).
@@ -1215,18 +1215,6 @@ fn stage_package_root(binary: &Path, docs: &Path, out: &Path, target: Option<&st
         &root.join("tools/rarpar/LICENSE"),
         0o644,
     )?;
-    copy_into_root(
-        out,
-        Path::new("usr/share/licenses/rarpar/LICENSE.GPL-3.0-or-later"),
-        &root.join("LICENSE"),
-        0o644,
-    )?;
-    copy_into_root(
-        out,
-        Path::new("usr/share/licenses/rarpar/LICENSE.unrar-rs"),
-        &root.join("crates/unrar-rs/LICENSE"),
-        0o644,
-    )?;
 
     validate_package_root(out)?;
     if let Some(target) = target {
@@ -1317,8 +1305,6 @@ fn validate_package_root(root: &Path) -> Result<()> {
         "usr/share/fish/vendor_completions.d/rarpar.fish",
         "usr/share/doc/rarpar/README.md",
         "usr/share/licenses/rarpar/LICENSE",
-        "usr/share/licenses/rarpar/LICENSE.GPL-3.0-or-later",
-        "usr/share/licenses/rarpar/LICENSE.unrar-rs",
     ] {
         let path = root.join(relative);
         if !path.is_file() {
@@ -1499,8 +1485,7 @@ Fish completion script.
 combine with \fBunrar-rs\fR. Normal binary builds link \fBunrar-rs\fR, so
 distributed \fBrarpar\fR binaries contain UnRAR-derived RAR extraction and
 recovery code that remains subject to the unRAR license restriction.
-Binary archives include \fBLICENSE\fR, \fBLICENSE.GPL-3.0-or-later\fR, and
-\fBLICENSE.unrar-rs\fR.
+Binary archives include one \fBLICENSE\fR file with the full terms.
 "#;
 
 #[cfg(test)]
@@ -1792,8 +1777,6 @@ mod tests {
             "usr/share/fish/vendor_completions.d/rarpar.fish",
             "usr/share/doc/rarpar/README.md",
             "usr/share/licenses/rarpar/LICENSE",
-            "usr/share/licenses/rarpar/LICENSE.GPL-3.0-or-later",
-            "usr/share/licenses/rarpar/LICENSE.unrar-rs",
         ] {
             assert!(out.join(relative).is_file(), "missing {relative}");
         }
@@ -1866,7 +1849,7 @@ mod tests {
             },
             CargoNode {
                 id: "par2-rs".to_owned(),
-                features: vec!["crypto-aws-lc".to_owned()],
+                features: vec!["crypto-native".to_owned()],
                 deps: deps(&["reedsolomon-rs"]),
             },
             CargoNode {

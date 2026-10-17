@@ -78,18 +78,18 @@
 //!
 //! # Feature flags
 //!
-//! - `crypto-aws-lc` *(default)*: AWS-LC-backed MD5. Needs a C toolchain to
-//!   build `aws-lc-sys`, and is the configuration the published performance
-//!   figures were measured with.
-//! - `crypto-rust`: the portable RustCrypto (`md-5`) MD5 backend, for builds
-//!   that must not carry a C/assembly dependency and for `wasm`, where AWS-LC
-//!   is unavailable. Select it with
-//!   `default-features = false, features = ["crypto-rust"]`. Expect slower
-//!   hashing; nothing else changes.
-//! - `native-crypto`: back-compat alias for `crypto-aws-lc`.
+//! - `crypto-native` *(default)*: single-stream MD5 in the crate's own
+//!   assembly on x86-64 and little-endian AArch64 (AWS-LC's MD5 carried into
+//!   `asm!`; see `md5_asm.rs` for its origin and licence). No C toolchain and
+//!   no crypto library. Every other target uses RustCrypto `md-5`.
+//! - `crypto-rust`: the portable RustCrypto (`md-5`) MD5 backend on every
+//!   target. Select it with `default-features = false, features =
+//!   ["crypto-rust"]`. Expect slower hashing on x86-64; nothing else changes.
+//! - `crypto-aws-lc`, `native-crypto`: back-compat aliases for
+//!   `crypto-native`.
 //!
-//!   Exactly one backend is active: on a native target AWS-LC wins whenever
-//!   `crypto-aws-lc` is on, and enabling neither backend is a compile error.
+//!   Exactly one backend is active: the assembly wins wherever it is compiled,
+//!   and on x86-64 or AArch64 enabling neither feature is a compile error.
 //! - `metal` / `wgpu`: GPU-accelerated repair through [`reedsolomon_rs`], with
 //!   repair fallback to CPU when no suitable device or driver is present. The
 //!   `metal` feature also enables policy-driven creation on native Apple
@@ -127,34 +127,13 @@
 //!
 //! The format is specified in the [Parity Volume Set Specification 2.0](https://parchive.sourceforge.net/docs/specifications/parity-volume-spec/article-spec.html).
 
-#[cfg(all(
-    feature = "crypto-aws-lc",
-    not(any(
-        all(target_arch = "x86_64", target_os = "macos"),
-        all(target_arch = "aarch64", target_os = "macos"),
-        all(target_arch = "x86_64", target_os = "linux", target_env = "gnu"),
-        all(target_arch = "aarch64", target_os = "linux", target_env = "gnu"),
-        all(target_arch = "x86_64", target_os = "linux", target_env = "musl"),
-        all(target_arch = "aarch64", target_os = "linux", target_env = "musl"),
-        all(target_arch = "x86_64", target_os = "windows", target_env = "msvc"),
-        all(target_arch = "aarch64", target_os = "windows", target_env = "msvc")
-    ))
-))]
+// A target the assembly covers must name a backend rather than silently
+// taking one. Every other target has only RustCrypto, and selects it without
+// being asked.
+#[cfg(not(any(par2_md5_asm, par2_md5_rustcrypto)))]
 compile_error!(
-    "par2-rs crypto-aws-lc only supports x86_64/aarch64 on macOS, Linux GNU/musl, and Windows MSVC"
-);
-
-// A native build must name a backend rather than silently taking one. On wasm
-// the AWS-LC dependency is target-gated away, so `crypto-rust` is the only
-// possibility and the crate selects it without being asked.
-#[cfg(all(
-    not(target_family = "wasm"),
-    not(feature = "crypto-aws-lc"),
-    not(feature = "crypto-rust")
-))]
-compile_error!(
-    "par2-rs needs a crypto backend: enable feature `crypto-aws-lc` (default) \
-     or `crypto-rust` (portable, no C toolchain)."
+    "par2-rs needs an MD5 backend: enable feature `crypto-native` (default) \
+     or `crypto-rust` (portable)."
 );
 
 pub mod checksum;
@@ -166,6 +145,8 @@ pub mod error;
 pub mod evidence;
 mod file_cache;
 pub mod matrix;
+#[cfg(par2_md5_asm)]
+mod md5_asm;
 pub mod md5_simd;
 pub mod packet;
 pub mod par2_set;
