@@ -40,7 +40,8 @@ standard library. They use the RustCrypto backend for `unrar-rs` and
 `par2-rs`, so that the AES, BLAKE2sp and MD5 under the code being tested are
 Rust the sanitizer instruments; Memcheck uses the default backends (AWS-LC
 in `unrar-rs`, the `md5_asm` assembly in `par2-rs`), because assembly is what
-Memcheck can see and the sanitizers cannot.
+Memcheck can see and the sanitizers cannot. Memcheck builds the tests with the
+`memcheck` profile: optimised, with debug assertions and overflow checks kept.
 
 Miri discovery runs `cargo miri nextest list` with the same filters the matrix
 script enforces, requires named tests to stay selected, and fails if a filter

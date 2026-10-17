@@ -55,6 +55,16 @@ debug = 0
 split-debuginfo = "off"
 incremental = false
 
+# The Memcheck lanes. Memcheck runs every instruction many times slower, so their
+# tests run optimised, keeping the debug assertions and overflow checks `test` has.
+# The crates optimised below keep their opt-level 3; this lifts unrar-rs and its
+# unoptimised dependencies, whose slowest lane tests take 0.6 s here instead of 7.6 s.
+[profile.memcheck]
+inherits = "test"
+opt-level = 2
+debug-assertions = true
+overflow-checks = true
+
 # Dev and test builds optimise only the crates that dominate test time. Each
 # comment gives the measured cost of leaving that crate at opt-level 0 with the
 # other overrides in place (local runs on an Apple M5 Max).
