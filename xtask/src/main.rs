@@ -1215,18 +1215,6 @@ fn stage_package_root(binary: &Path, docs: &Path, out: &Path, target: Option<&st
         &root.join("tools/rarpar/LICENSE"),
         0o644,
     )?;
-    copy_into_root(
-        out,
-        Path::new("usr/share/licenses/rarpar/LICENSE.GPL-3.0-or-later"),
-        &root.join("LICENSE"),
-        0o644,
-    )?;
-    copy_into_root(
-        out,
-        Path::new("usr/share/licenses/rarpar/LICENSE.unrar-rs"),
-        &root.join("crates/unrar-rs/LICENSE"),
-        0o644,
-    )?;
 
     validate_package_root(out)?;
     if let Some(target) = target {
@@ -1317,8 +1305,6 @@ fn validate_package_root(root: &Path) -> Result<()> {
         "usr/share/fish/vendor_completions.d/rarpar.fish",
         "usr/share/doc/rarpar/README.md",
         "usr/share/licenses/rarpar/LICENSE",
-        "usr/share/licenses/rarpar/LICENSE.GPL-3.0-or-later",
-        "usr/share/licenses/rarpar/LICENSE.unrar-rs",
     ] {
         let path = root.join(relative);
         if !path.is_file() {
@@ -1499,8 +1485,7 @@ Fish completion script.
 combine with \fBunrar-rs\fR. Normal binary builds link \fBunrar-rs\fR, so
 distributed \fBrarpar\fR binaries contain UnRAR-derived RAR extraction and
 recovery code that remains subject to the unRAR license restriction.
-Binary archives include \fBLICENSE\fR, \fBLICENSE.GPL-3.0-or-later\fR, and
-\fBLICENSE.unrar-rs\fR.
+Binary archives include one \fBLICENSE\fR file with the full terms.
 "#;
 
 #[cfg(test)]
@@ -1792,8 +1777,6 @@ mod tests {
             "usr/share/fish/vendor_completions.d/rarpar.fish",
             "usr/share/doc/rarpar/README.md",
             "usr/share/licenses/rarpar/LICENSE",
-            "usr/share/licenses/rarpar/LICENSE.GPL-3.0-or-later",
-            "usr/share/licenses/rarpar/LICENSE.unrar-rs",
         ] {
             assert!(out.join(relative).is_file(), "missing {relative}");
         }

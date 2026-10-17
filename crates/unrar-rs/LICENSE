@@ -1,26 +1,11 @@
-# unrar-rs License
+unrar-rs license
 
-## Licenses for the code in this crate
+unrar-rs is licensed under the Apache License, Version 2.0, with one further
+condition on its RAR engine.
 
-The licenses for the code in this crate are:
-
-1) The RAR archive reading, decompression, extraction, and recovery
-   engine — code developed using RARLAB's unRAR source code: the
-   Apache License, Version 2.0, with the "unRAR license restriction"
-   below.
-2) All other files: the Apache License, Version 2.0.
-
-Redistributions in binary form must reproduce related license
-information from this file.
-
-## unRAR license restriction
-
-The RAR decompression engine in this crate was developed using the
-source code of the unRAR program. All copyrights to the original unRAR
-code are owned by Alexander Roshal.
-
-The license for the original unRAR code has the following restriction,
-which continues to govern the unRAR-derived portions of this crate:
+The RAR engine was developed using the source code of the unRAR program. All
+copyrights to the original unRAR code are owned by Alexander Roshal, and its
+license restriction continues to govern that code:
 
 UnRAR source code may be used in any software to handle
 RAR archives without limitations free of charge, but cannot be
@@ -32,9 +17,9 @@ full text of this paragraph, starting from "UnRAR source code"
 words, is included in license, or in documentation if license
 is not available, and in source code comments of resulting package.
 
-## Apache License 2.0 Text
+A binary distribution must include this file.
 
-The complete Apache License, Version 2.0 text follows unchanged.
+The full Apache License, Version 2.0 text follows.
 
                                  Apache License
                            Version 2.0, January 2004

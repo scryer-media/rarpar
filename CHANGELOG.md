@@ -7,6 +7,10 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ### Changed
 
+- Release archives and the package layout carry one `LICENSE` file: the
+  rarpar terms, the unRAR restriction, and the full GPL-3.0 and Apache-2.0
+  texts. `LICENSE.GPL-3.0-or-later` and `LICENSE.unrar-rs` are gone; the
+  terms are unchanged.
 - `par3 repair --backup` keeps the damaged file by moving it to `<name>.1`
   (or the next free number) and moving the rebuilt file into its name,
   instead of renaming the rebuilt file over it (par3-rs 0.7.1). On ext4 the

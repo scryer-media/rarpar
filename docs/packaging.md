@@ -47,8 +47,6 @@ future distro packages:
 /usr/share/fish/vendor_completions.d/rarpar.fish
 /usr/share/doc/rarpar/README.md
 /usr/share/licenses/rarpar/LICENSE
-/usr/share/licenses/rarpar/LICENSE.GPL-3.0-or-later
-/usr/share/licenses/rarpar/LICENSE.unrar-rs
 ```
 
 Expected file modes:

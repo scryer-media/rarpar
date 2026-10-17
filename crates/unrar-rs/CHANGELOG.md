@@ -4,6 +4,8 @@
 
 ### Changed
 
+- `LICENSE` is shorter and plainer. The terms are unchanged: Apache-2.0,
+  plus the unRAR restriction on the RAR engine.
 - A reader error that does not carry a `RarError` reaches `RarError::Io`
   whole, so its kind, OS error code and payload are the reader's own. It
   used to be rebuilt from its rendered message, which kept only the text.

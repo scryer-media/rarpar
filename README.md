@@ -208,8 +208,8 @@ More in `docs/`: [publishing](docs/publishing.md),
 - `rarpar` is GPL-3.0-or-later, with a section 7 permission to combine it
   with `unrar-rs` ([tools/rarpar/LICENSE](tools/rarpar/LICENSE)). It includes
   `unrar-rs` by default, so an ordinary build, `cargo install` or release
-  archive carries the UnRAR restriction too. Release archives include
-  `LICENSE`, `LICENSE.GPL-3.0-or-later` and `LICENSE.unrar-rs`.
+  archive carries the UnRAR restriction too. Release archives include one
+  `LICENSE` file with the full terms.
 - `unrar-rs` is Apache-2.0 plus the UnRAR licence restriction, from 0.11.0 on.
   Its RAR engine was developed from RARLAB's UnRAR source, and the restriction
   still governs that code ([LICENSE](crates/unrar-rs/LICENSE)).
