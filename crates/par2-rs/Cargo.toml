@@ -29,13 +29,15 @@ exclude = ["tests/fixtures/**", "fuzz/**", "tests/par2cmdline_turbo_*.rs", "test
 # independent MD5 to check the assembly against, which is why `md-5` also
 # appears under `[dev-dependencies]`: consumers never see that edge.
 [features]
-default = ["crypto-native"]
+default = ["crypto-native", "crypto-aws-lc", "native-crypto"]
 crypto-native = []
 crypto-rust = ["dep:md-5"]
 # Back-compat aliases for dependency declarations written before the assembly
-# backend replaced the AWS-LC binding; both select `crypto-native`.
+# backend replaced the AWS-LC binding; both select `crypto-native`. They keep
+# the feature graph 0.10.10 published: default enables both, and
+# `native-crypto` enables `crypto-aws-lc`.
 crypto-aws-lc = ["crypto-native"]
-native-crypto = ["crypto-native"]
+native-crypto = ["crypto-aws-lc", "crypto-native"]
 slow-tests = []
 # Opt-in Apple-GPU (Metal) acceleration for repair and creation. Off by
 # default: repair may fall back to CPU, while creation follows its explicit

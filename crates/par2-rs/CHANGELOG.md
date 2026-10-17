@@ -15,9 +15,10 @@
   version requirement to a consumer's graph. Every other target uses
   RustCrypto `md-5`, which no longer needs naming there.
 - New default feature `crypto-native` selects the assembly backend.
-  `crypto-aws-lc` and `native-crypto` stay as aliases for it, and
-  `crypto-rust` still selects RustCrypto everywhere. On x86-64 and AArch64,
-  enabling neither is still a compile error. Digests are unchanged.
+  `crypto-aws-lc` and `native-crypto` stay as aliases for it and stay on by
+  default, as in 0.10.10, and `crypto-rust` still selects RustCrypto
+  everywhere. On x86-64 and AArch64, enabling neither is still a compile
+  error. Digests are unchanged.
 
 ## 0.10.10
 
