@@ -35,9 +35,3 @@ bench = false
 
 [workspace]
 members = []
-
-# ppmd-turbo 0.2.0 is not published yet. This is its own workspace, so the root
-# patch does not reach it: this points at the same release commit until the crate
-# is published, and is removed then.
-[patch.crates-io]
-ppmd-turbo = { git = "https://github.com/scryer-media/ppmd-turbo", rev = "352df40194fc9dcdf0015f8030e4f9cfeef278f5" }
