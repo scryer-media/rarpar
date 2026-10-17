@@ -1208,9 +1208,14 @@ jobs:
           --features ${{ matrix.features }}
       - name: Build the release binary
         # The release build jobs' C flags and cc debug output (release.yml),
-        # so the next step sees what the release's own confirm step will.
+        # so the next step sees what the release's own confirm step will. The
+        # binary is never run, so Rust builds at opt-level 1 with thin LTO;
+        # aws-lc-sys keeps opt-level 3, which its C flags follow and the
+        # confirm step requires.
         env:
           CC_ENABLE_DEBUG_OUTPUT: "1"
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: "1"
+          CARGO_PROFILE_RELEASE_LTO: thin
           CFLAGS_x86_64_unknown_linux_gnu: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
           CXXFLAGS_x86_64_unknown_linux_gnu: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
           CFLAGS_x86_64_unknown_linux_musl: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden -DMI_DEFAULT_ALLOW_THP=0"
@@ -1224,6 +1229,7 @@ jobs:
         run: >-
           cargo build --locked --release -p rarpar --no-default-features
           --features "$FEATURES" --target "$TARGET"
+          --config profile.release.package.aws-lc-sys.opt-level=3
       - name: Confirm AWS-LC and the allocator in the release binary
         env:
           TARGET: ${{ matrix.target }}
@@ -1328,10 +1334,15 @@ jobs:
           --features ${{ matrix.features }}
       - name: Build the release binary
         # The release build jobs' C flags and cc debug output (release.yml),
-        # so the next step sees what the release's own confirm step will.
+        # so the next step sees what the release's own confirm step will. The
+        # binary is never run, so Rust builds at opt-level 1 with thin LTO;
+        # aws-lc-sys keeps opt-level 3, which its C flags follow and the
+        # confirm step requires.
         if: matrix.part == 'release'
         env:
           CC_ENABLE_DEBUG_OUTPUT: "1"
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: "1"
+          CARGO_PROFILE_RELEASE_LTO: thin
           CFLAGS_aarch64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
           CXXFLAGS_aarch64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
           CFLAGS_x86_64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
@@ -1341,6 +1352,7 @@ jobs:
         run: >-
           cargo build --locked --release -p rarpar --no-default-features
           --features "$FEATURES" --target "$TARGET"
+          --config profile.release.package.aws-lc-sys.opt-level=3
       - name: Confirm AWS-LC and the allocator in the release binary
         if: matrix.part == 'release'
         env:
@@ -1440,10 +1452,15 @@ jobs:
           --features ${{ matrix.features }}
       - name: Build the release binary
         # The release build jobs' C flags and cc debug output (release.yml),
-        # so the next step sees what the release's own confirm step will.
+        # so the next step sees what the release's own confirm step will. The
+        # binary is never run, so Rust builds at opt-level 1 with thin LTO;
+        # aws-lc-sys keeps opt-level 3, which its C flags follow and the
+        # confirm step requires.
         shell: pwsh
         env:
           CC_ENABLE_DEBUG_OUTPUT: "1"
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: "1"
+          CARGO_PROFILE_RELEASE_LTO: thin
           CFLAGS_x86_64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
           CXXFLAGS_x86_64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
           CFLAGS_aarch64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
@@ -1453,6 +1470,7 @@ jobs:
         run: >-
           cargo build --locked --release -p rarpar --no-default-features
           --features $env:FEATURES --target $env:TARGET
+          --config profile.release.package.aws-lc-sys.opt-level=3
       - name: Confirm AWS-LC and the allocator in the release binary
         shell: pwsh
         env:
