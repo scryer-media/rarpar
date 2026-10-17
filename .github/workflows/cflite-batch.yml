@@ -41,7 +41,7 @@ permissions:
 jobs:
   batch-fuzzing:
     name: batch (address)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     # The two-hour budget is fuzzing time only: the sanitizer build of six
     # targets comes first, and a job killed at its timeout discards the corpus
     # it just grew. An hour of headroom is cheap insurance for that.
@@ -153,7 +153,7 @@ jobs:
   # responses.
   coverage:
     name: coverage
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     # Reads the corpus the batch jobs just extended, so it runs after them.
     needs: [batch-fuzzing]
@@ -194,7 +194,7 @@ jobs:
   # ground instead of re-executing thousands of redundant inputs.
   prune:
     name: prune corpus
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     needs: [coverage]
     if: ${{ !cancelled() }}

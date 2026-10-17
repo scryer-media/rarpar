@@ -37,7 +37,7 @@ env:
 jobs:
   changes:
     name: changes
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     # One boolean per workspace member, decided by `.github/scripts/ci_changes.py`
     # from the changed paths, the lockfile diff and the dependency graph: a
@@ -136,7 +136,7 @@ jobs:
 
   hygiene:
     name: hygiene
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -205,7 +205,7 @@ jobs:
     name: fmt
     needs: [changes]
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -222,7 +222,7 @@ jobs:
     name: clippy
     needs: [changes]
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       RUSTC_WRAPPER: sccache
@@ -284,7 +284,7 @@ jobs:
     name: unit-tests
     needs: [changes]
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       RUSTC_WRAPPER: sccache
@@ -353,7 +353,7 @@ jobs:
     name: crypto-rust-backend
     needs: [changes]
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     env:
       RUSTC_WRAPPER: sccache
@@ -468,7 +468,7 @@ jobs:
     name: clippy-aarch64
     needs: [changes]
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-26.04-arm
     timeout-minutes: 30
     env:
       RUSTC_WRAPPER: sccache
@@ -526,7 +526,7 @@ jobs:
     # Everything this lane tests is outside unrar-rs and par2-rs: reedsolomon-rs,
     # the rarpar CLI suite and xtask. Their own lanes cover the two heavy crates.
     if: needs.changes.outputs.reedsolomon == 'true' || needs.changes.outputs.rarpar == 'true' || needs.changes.outputs.xtask == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     env:
       RUSTC_WRAPPER: sccache
@@ -634,7 +634,7 @@ jobs:
     name: par2-tests
     needs: [changes, fmt, clippy, unit-tests]
     if: needs.changes.outputs.par2 == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     env:
       RUSTC_WRAPPER: sccache
@@ -709,7 +709,7 @@ jobs:
     name: par3-tests
     needs: [changes, fmt, clippy, unit-tests]
     if: needs.changes.outputs.par3 == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     env:
       RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=.
@@ -748,7 +748,7 @@ jobs:
     name: unrar-tests (${{ matrix.shard }}/3)
     needs: [changes, fmt, clippy, unit-tests]
     if: needs.changes.outputs.unrar == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     strategy:
       # One shard's failure is a third of the suite; the other two thirds are
@@ -910,7 +910,7 @@ jobs:
     name: unrar-tests
     needs: [changes, unrar-tests-shard]
     if: ${{ always() && needs.changes.outputs.unrar == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - name: Require every shard green
@@ -938,7 +938,7 @@ jobs:
       matrix:
         include:
           - platform: linux-arm64
-            runs_on: ubuntu-24.04-arm
+            runs_on: ubuntu-26.04-arm
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -1167,19 +1167,19 @@ jobs:
       matrix:
         include:
           - platform: linux-x86_64-gnu-direct
-            runs_on: ubuntu-24.04
+            runs_on: ubuntu-26.04
             target: x86_64-unknown-linux-gnu
             features: runtime,crypto-aws-lc,sevenz
           - platform: linux-x86_64-musl-direct
-            runs_on: ubuntu-24.04
+            runs_on: ubuntu-26.04
             target: x86_64-unknown-linux-musl
             features: runtime,crypto-aws-lc,sevenz,musl-allocator
           - platform: linux-arm64-gnu-direct
-            runs_on: ubuntu-24.04-arm
+            runs_on: ubuntu-26.04-arm
             target: aarch64-unknown-linux-gnu
             features: runtime,crypto-aws-lc,sevenz
           - platform: linux-arm64-musl-direct
-            runs_on: ubuntu-24.04-arm
+            runs_on: ubuntu-26.04-arm
             target: aarch64-unknown-linux-musl
             features: runtime,crypto-aws-lc,sevenz,musl-allocator
     env:
@@ -1488,7 +1488,7 @@ jobs:
     name: package
     needs: [changes, fmt, clippy, unit-tests]
     if: needs.changes.outputs.crates == 'true' || needs.changes.outputs.packaging == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       RUSTC_WRAPPER: sccache
@@ -1659,7 +1659,7 @@ jobs:
     name: docs-package
     needs: [changes, fmt, clippy, unit-tests]
     if: needs.changes.outputs.rarpar == 'true' || needs.changes.outputs.docs == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       RUSTC_WRAPPER: sccache
@@ -1733,7 +1733,7 @@ jobs:
     name: benchmark-harness
     needs: [changes]
     if: needs.changes.outputs.bench == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1755,7 +1755,7 @@ jobs:
     name: cli-smoke
     needs: [changes, unit-tests]
     if: needs.changes.outputs.rarpar == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       RUSTC_WRAPPER: sccache
@@ -1831,7 +1831,7 @@ jobs:
     name: wasm-par2-harness
     needs: [changes, fmt, clippy, unit-tests]
     if: needs.changes.outputs.par2 == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     env:
       # One CARGO_TARGET_DIR per (target, RUSTFLAGS) pair: cargo fingerprints
@@ -2022,7 +2022,7 @@ jobs:
     name: wasm-par3-harness
     needs: [changes, fmt, clippy, unit-tests]
     if: needs.changes.outputs.par3 == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     env:
       # One CARGO_TARGET_DIR per (target, RUSTFLAGS) pair: cargo fingerprints
@@ -2175,7 +2175,7 @@ jobs:
     name: wasm-unrar-harness
     needs: [changes, fmt, clippy, unit-tests]
     if: needs.changes.outputs.unrar == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     env:
       WASM_LANES: ${{ github.workspace }}/target-wasm
@@ -2322,9 +2322,9 @@ jobs:
         crate: [reedsolomon-rs, unrar-rs, par2-rs, par3-rs]
         include:
           - platform: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
           - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
           - crate: reedsolomon-rs
             changed: reedsolomon
             # GF(2^8)/GF(2^16) SIMD kernels (SSSE3/AVX2/GFNI, NEON, SVE2),
@@ -2423,10 +2423,10 @@ jobs:
             crate: par2-rs
         include:
           - platform: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
             target: x86_64-unknown-linux-gnu
           - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
             target: aarch64-unknown-linux-gnu
           - crate: reedsolomon-rs
             changed: reedsolomon
@@ -2501,7 +2501,7 @@ jobs:
     name: unsafe-miri-plan
     needs: [changes]
     if: needs.changes.outputs.crates == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
@@ -2558,7 +2558,7 @@ jobs:
     name: unsafe-miri-${{ matrix.package }}-${{ matrix.test }}
     needs: unsafe-miri-plan
     if: needs.unsafe-miri-plan.outputs.count != '0'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -2594,7 +2594,7 @@ jobs:
     name: unsafe-complete
     if: ${{ always() && needs.changes.outputs.crates == 'true' }}
     needs: [changes, unsafe-valgrind, unsafe-sanitizer, unsafe-miri-plan, unsafe-miri]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - name: Require every native and Miri safety job
@@ -2621,7 +2621,7 @@ jobs:
 
   ci-complete:
     name: ci-complete
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     if: always()
     needs:

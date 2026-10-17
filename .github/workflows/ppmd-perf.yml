@@ -24,7 +24,7 @@ jobs:
             unrar_url: https://www.rarlab.com/rar/rarmacos-arm-723.tar.gz
             unrar_sha256: 68b393c000758d477fde43c955ff7542f12f76f3f5e87cdda923152fc791bd4d
           - platform: linux-x86_64
-            runs_on: ubuntu-24.04
+            runs_on: ubuntu-26.04
             unrar_url: https://www.rarlab.com/rar/rarlinux-x64-723.tar.gz
             unrar_sha256: 759b4b6aa0d9f77131882162951193f3a0e54bf60e1d8dc4255aa308accab588
     env:
