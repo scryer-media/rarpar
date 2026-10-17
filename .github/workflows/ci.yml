@@ -17,7 +17,6 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_TOOLCHAIN: 1.97.1
-  SCCACHE_CACHE_VERSION: v1
   WASM_CACHE_VERSION: v2
   # Pinned: the wasm harness lanes are only comparable with each other if they
   # all executed on the same runtime. Bump deliberately, not incidentally.
@@ -244,17 +243,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mold nasm
-      - name: Restore sccache directory
-        id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-clippy-${{ github.run_id }}
-          restore-keys: |
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-clippy-
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted sccache
+        # Pushes and this repository's own pull requests share the R2 cache;
+        # a fork's pull request has no secrets and keeps the local disk cache.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -273,12 +275,6 @@ jobs:
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
-      - name: Save sccache directory
-        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
   unit-tests:
     name: unit-tests
@@ -305,17 +301,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mold nasm
-      - name: Restore sccache directory
-        id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-unit-${{ github.run_id }}
-          restore-keys: |
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-unit-
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted sccache
+        # Pushes and this repository's own pull requests share the R2 cache;
+        # a fork's pull request has no secrets and keeps the local disk cache.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -339,12 +338,6 @@ jobs:
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
-      - name: Save sccache directory
-        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
   # The RustCrypto backend is what a consumer who does not want a C dependency
   # builds. Nothing else in CI compiles it on a native target: the default
@@ -376,17 +369,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mold nasm
-      - name: Restore sccache directory
-        id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-crypto-rust-${{ github.run_id }}
-          restore-keys: |
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-crypto-rust-
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted sccache
+        # Pushes and this repository's own pull requests share the R2 cache;
+        # a fork's pull request has no secrets and keeps the local disk cache.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -455,12 +451,6 @@ jobs:
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
-      - name: Save sccache directory
-        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
   # The aarch64-only cfg surface (NEON kernels, the blake2 leaf-group API) is
   # invisible to the x86 clippy lane; -D warnings only gates what it compiles.
@@ -490,16 +480,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mold
-      - name: Restore sccache directory
-        id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-clippy-arm-${{ github.run_id }}
-          restore-keys: |
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-clippy-arm-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted sccache
+        # Pushes and this repository's own pull requests share the R2 cache;
+        # a fork's pull request has no secrets and keeps the local disk cache.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/aarch64-unknown-linux-gnu/
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -513,16 +507,10 @@ jobs:
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
-      - name: Save sccache directory
-        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
   fixture-tests:
     name: fixture-tests
-    needs: [changes, fmt, clippy, clippy-aarch64, unit-tests]
+    needs: [changes, fmt, clippy, clippy-aarch64]
     # Everything this lane tests is outside unrar-rs and par2-rs: reedsolomon-rs,
     # the rarpar CLI suite and xtask. Their own lanes cover the two heavy crates.
     if: needs.changes.outputs.reedsolomon == 'true' || needs.changes.outputs.rarpar == 'true' || needs.changes.outputs.xtask == 'true'
@@ -548,17 +536,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mold nasm
-      - name: Restore sccache directory
-        id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-fixtures-${{ github.run_id }}
-          restore-keys: |
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-fixtures-
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted sccache
+        # Pushes and this repository's own pull requests share the R2 cache;
+        # a fork's pull request has no secrets and keeps the local disk cache.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -623,16 +614,10 @@ jobs:
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
-      - name: Save sccache directory
-        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
   par2-tests:
     name: par2-tests
-    needs: [changes, fmt, clippy, unit-tests]
+    needs: [changes, fmt, clippy]
     if: needs.changes.outputs.par2 == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 90
@@ -655,17 +640,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mold nasm
-      - name: Restore sccache directory
-        id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-par2-${{ github.run_id }}
-          restore-keys: |
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-par2-
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted sccache
+        # Pushes and this repository's own pull requests share the R2 cache;
+        # a fork's pull request has no secrets and keeps the local disk cache.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -695,19 +683,13 @@ jobs:
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
-      - name: Save sccache directory
-        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
   # Run library, integration and documentation tests against the signed PAR3
   # corpus, including the required FFT, Data, deduplication and PAR-inside cases.
   # The publish workflow also validates freshly generated official fixtures.
   par3-tests:
     name: par3-tests
-    needs: [changes, fmt, clippy, unit-tests]
+    needs: [changes, fmt, clippy]
     if: needs.changes.outputs.par3 == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 20
@@ -746,7 +728,7 @@ jobs:
   # the lane's wall time is the slowest third rather than the sum.
   unrar-tests-shard:
     name: unrar-tests (${{ matrix.shard }}/3)
-    needs: [changes, fmt, clippy, unit-tests]
+    needs: [changes, fmt, clippy]
     if: needs.changes.outputs.unrar == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 60
@@ -833,17 +815,20 @@ jobs:
             # every oracle comparison.
             echo "WEAVER_REQUIRE_UNRAR_ORACLE=1"
           } >> "$GITHUB_ENV"
-      - name: Restore sccache directory
-        id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-unrar-${{ github.run_id }}
-          restore-keys: |
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-unrar-
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted sccache
+        # Pushes and this repository's own pull requests share the R2 cache;
+        # a fork's pull request has no secrets and keeps the local disk cache.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -896,12 +881,6 @@ jobs:
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
-      - name: Save sccache directory
-        if: ${{ always() && steps.sccache-restore.outcome == 'success' && matrix.shard == 1 && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
   # The check name `unrar-tests` is load-bearing: branch protection and the
   # publish-crates preflight both require it by exact name. This join is that
@@ -929,7 +908,7 @@ jobs:
   # line or two live in .github/scripts/ci/.
   platform-tests-linux:
     name: platform-tests-${{ matrix.platform }}
-    needs: [changes, fmt, clippy, unit-tests]
+    needs: [changes, fmt, clippy]
     if: needs.changes.outputs.crates == 'true'
     runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 60
@@ -939,6 +918,7 @@ jobs:
         include:
           - platform: linux-arm64
             runs_on: ubuntu-26.04-arm
+            target: aarch64-unknown-linux-gnu
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -955,17 +935,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mold
-      - name: Restore sccache directory
-        id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-${{ matrix.platform }}-${{ github.run_id }}
-          restore-keys: |
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-${{ matrix.platform }}-
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted sccache
+        # Pushes and this repository's own pull requests share the R2 cache;
+        # a fork's pull request has no secrets and keeps the local disk cache.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/${{ matrix.target }}/
       - name: Configure compiler flags
         run: .github/scripts/ci/platform-tests-configure-compiler-flags-linux.sh
       - name: Prime sccache server
@@ -990,16 +973,10 @@ jobs:
         if: always()
         shell: bash
         run: sccache --show-stats || true
-      - name: Save sccache directory
-        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
   platform-tests-macos:
     name: platform-tests-${{ matrix.platform }}
-    needs: [changes, fmt, clippy, unit-tests]
+    needs: [changes, fmt, clippy]
     if: needs.changes.outputs.crates == 'true'
     runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 60
@@ -1009,9 +986,11 @@ jobs:
         include:
           - platform: darwin-arm64
             runs_on: macos-26
+            target: aarch64-apple-darwin
             nasm: false
           - platform: darwin-x86_64
             runs_on: macos-26-intel
+            target: x86_64-apple-darwin
             nasm: true
     env:
       RUSTC_WRAPPER: sccache
@@ -1029,17 +1008,20 @@ jobs:
         env:
           NEEDS_NASM: ${{ matrix.nasm }}
         run: .github/scripts/ci/install-nasm-macos.sh
-      - name: Restore sccache directory
-        id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-${{ matrix.platform }}-${{ github.run_id }}
-          restore-keys: |
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-${{ matrix.platform }}-
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted sccache
+        # Pushes and this repository's own pull requests share the R2 cache;
+        # a fork's pull request has no secrets and keeps the local disk cache.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/${{ matrix.target }}/
       - name: Configure compiler flags
         run: .github/scripts/ci/configure-compiler-flags-macos.sh
       - name: Prime sccache server
@@ -1064,16 +1046,10 @@ jobs:
         if: always()
         shell: bash
         run: sccache --show-stats || true
-      - name: Save sccache directory
-        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
   platform-tests-windows:
     name: platform-tests-${{ matrix.platform }}
-    needs: [changes, fmt, clippy, unit-tests]
+    needs: [changes, fmt, clippy]
     if: needs.changes.outputs.crates == 'true'
     runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 60
@@ -1083,9 +1059,11 @@ jobs:
         include:
           - platform: windows-x86_64
             runs_on: windows-2025-vs2026
+            target: x86_64-pc-windows-msvc
             nasm: true
           - platform: windows-arm64
             runs_on: windows-11-arm
+            target: aarch64-pc-windows-msvc
             nasm: false
     env:
       RUSTC_WRAPPER: sccache
@@ -1109,17 +1087,20 @@ jobs:
         env:
           NEEDS_NASM: ${{ matrix.nasm }}
         run: ./.github/scripts/ci/install-nasm.ps1
-      - name: Restore sccache directory
-        id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-${{ matrix.platform }}-${{ github.run_id }}
-          restore-keys: |
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-${{ matrix.platform }}-
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-platform-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted sccache
+        # Pushes and this repository's own pull requests share the R2 cache;
+        # a fork's pull request has no secrets and keeps the local disk cache.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/${{ matrix.target }}/
       - name: Configure compiler flags
         # RUSTFLAGS replaces the [target.'cfg(all(windows, target_env = "msvc"))']
         # rustflags in .cargo/config.toml rather than adding to them, so the
@@ -1149,16 +1130,10 @@ jobs:
         if: always()
         shell: bash
         run: sccache --show-stats || true
-      - name: Save sccache directory
-        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
   target-checks-linux:
     name: target-checks-${{ matrix.platform }}
-    needs: [changes, fmt, clippy, unit-tests]
+    needs: [changes, fmt, clippy]
     if: needs.changes.outputs.crates == 'true' || needs.changes.outputs.rarpar == 'true'
     runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 90
@@ -1199,17 +1174,20 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: .github/scripts/ci/target-checks-install-build-dependencies-linux.sh
-      - name: Restore sccache directory
-        id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-${{ matrix.platform }}-${{ github.run_id }}
-          restore-keys: |
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-${{ matrix.platform }}-
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted sccache
+        # Pushes and this repository's own pull requests share the R2 cache;
+        # a fork's pull request has no secrets and keeps the local disk cache.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/${{ matrix.target }}/
       - name: Configure compiler flags
         env:
           TARGET: ${{ matrix.target }}
@@ -1230,9 +1208,14 @@ jobs:
           --features ${{ matrix.features }}
       - name: Build the release binary
         # The release build jobs' C flags and cc debug output (release.yml),
-        # so the next step sees what the release's own confirm step will.
+        # so the next step sees what the release's own confirm step will. The
+        # binary is never run, so Rust builds at opt-level 1 with thin LTO;
+        # aws-lc-sys keeps opt-level 3, which its C flags follow and the
+        # confirm step requires.
         env:
           CC_ENABLE_DEBUG_OUTPUT: "1"
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: "1"
+          CARGO_PROFILE_RELEASE_LTO: thin
           CFLAGS_x86_64_unknown_linux_gnu: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
           CXXFLAGS_x86_64_unknown_linux_gnu: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
           CFLAGS_x86_64_unknown_linux_musl: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden -DMI_DEFAULT_ALLOW_THP=0"
@@ -1246,6 +1229,7 @@ jobs:
         run: >-
           cargo build --locked --release -p rarpar --no-default-features
           --features "$FEATURES" --target "$TARGET"
+          --config profile.release.package.aws-lc-sys.opt-level=3
       - name: Confirm AWS-LC and the allocator in the release binary
         env:
           TARGET: ${{ matrix.target }}
@@ -1262,16 +1246,12 @@ jobs:
         if: always()
         shell: bash
         run: sccache --show-stats || true
-      - name: Save sccache directory
-        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
   target-checks-macos:
-    name: target-checks-${{ matrix.platform }}
-    needs: [changes, fmt, clippy, unit-tests]
+    # The release build's fat-LTO link alone is most of the Intel runner's
+    # time, so it runs beside the feature and workspace checks, not after them.
+    name: target-checks-${{ matrix.platform }}-${{ matrix.part }}
+    needs: [changes, fmt, clippy]
     if: needs.changes.outputs.crates == 'true' || needs.changes.outputs.rarpar == 'true'
     runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 90
@@ -1280,11 +1260,25 @@ jobs:
       matrix:
         include:
           - platform: darwin-arm64
+            part: check
+            runs_on: macos-26
+            target: aarch64-apple-darwin
+            features: runtime,crypto-aws-lc,sevenz
+            nasm: false
+          - platform: darwin-arm64
+            part: release
             runs_on: macos-26
             target: aarch64-apple-darwin
             features: runtime,crypto-aws-lc,sevenz
             nasm: false
           - platform: darwin-x86_64
+            part: check
+            runs_on: macos-26-intel
+            target: x86_64-apple-darwin
+            features: runtime,crypto-aws-lc,sevenz
+            nasm: true
+          - platform: darwin-x86_64
+            part: release
             runs_on: macos-26-intel
             target: x86_64-apple-darwin
             features: runtime,crypto-aws-lc,sevenz
@@ -1306,17 +1300,20 @@ jobs:
         env:
           NEEDS_NASM: ${{ matrix.nasm }}
         run: .github/scripts/ci/install-nasm-macos.sh
-      - name: Restore sccache directory
-        id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-${{ matrix.platform }}-${{ github.run_id }}
-          restore-keys: |
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-${{ matrix.platform }}-
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted sccache
+        # Pushes and this repository's own pull requests share the R2 cache;
+        # a fork's pull request has no secrets and keeps the local disk cache.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/${{ matrix.target }}/
       - name: Configure compiler flags
         run: .github/scripts/ci/configure-compiler-flags-macos.sh
       - name: Prime sccache server
@@ -1325,19 +1322,27 @@ jobs:
           sccache --start-server || true
           sccache --zero-stats || true
       - name: Check release target features
+        if: matrix.part == 'check'
         run: >-
           cargo check --locked -p rarpar --no-default-features
           --features ${{ matrix.features }} --target ${{ matrix.target }}
       - name: Audit release target features
+        if: matrix.part == 'check'
         run: >-
           cargo run --locked -p xtask -- feature-audit
           --manifest tools/rarpar/Cargo.toml --target ${{ matrix.target }}
           --features ${{ matrix.features }}
       - name: Build the release binary
         # The release build jobs' C flags and cc debug output (release.yml),
-        # so the next step sees what the release's own confirm step will.
+        # so the next step sees what the release's own confirm step will. The
+        # binary is never run, so Rust builds at opt-level 1 with thin LTO;
+        # aws-lc-sys keeps opt-level 3, which its C flags follow and the
+        # confirm step requires.
+        if: matrix.part == 'release'
         env:
           CC_ENABLE_DEBUG_OUTPUT: "1"
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: "1"
+          CARGO_PROFILE_RELEASE_LTO: thin
           CFLAGS_aarch64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
           CXXFLAGS_aarch64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
           CFLAGS_x86_64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
@@ -1347,7 +1352,9 @@ jobs:
         run: >-
           cargo build --locked --release -p rarpar --no-default-features
           --features "$FEATURES" --target "$TARGET"
+          --config profile.release.package.aws-lc-sys.opt-level=3
       - name: Confirm AWS-LC and the allocator in the release binary
+        if: matrix.part == 'release'
         env:
           TARGET: ${{ matrix.target }}
           FEATURES: ${{ matrix.features }}
@@ -1358,21 +1365,16 @@ jobs:
           --target "$TARGET" --target-dir target
           --log-prefix "target/confirm-native-code/rarpar-$PLATFORM"
       - name: Check workspace target
+        if: matrix.part == 'check'
         run: cargo check --locked --workspace --all-targets --target ${{ matrix.target }}
       - name: Show sccache stats
         if: always()
         shell: bash
         run: sccache --show-stats || true
-      - name: Save sccache directory
-        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
   target-checks-windows:
     name: target-checks-${{ matrix.platform }}
-    needs: [changes, fmt, clippy, unit-tests]
+    needs: [changes, fmt, clippy]
     if: needs.changes.outputs.crates == 'true' || needs.changes.outputs.rarpar == 'true'
     runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 90
@@ -1413,17 +1415,20 @@ jobs:
         env:
           NEEDS_NASM: ${{ matrix.nasm }}
         run: ./.github/scripts/ci/install-nasm.ps1
-      - name: Restore sccache directory
-        id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-${{ matrix.platform }}-${{ github.run_id }}
-          restore-keys: |
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-${{ matrix.platform }}-
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-target-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted sccache
+        # Pushes and this repository's own pull requests share the R2 cache;
+        # a fork's pull request has no secrets and keeps the local disk cache.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/${{ matrix.target }}/
       - name: Configure compiler flags
         # RUSTFLAGS replaces the [target.'cfg(all(windows, target_env = "msvc"))']
         # rustflags in .cargo/config.toml rather than adding to them, so the
@@ -1447,10 +1452,15 @@ jobs:
           --features ${{ matrix.features }}
       - name: Build the release binary
         # The release build jobs' C flags and cc debug output (release.yml),
-        # so the next step sees what the release's own confirm step will.
+        # so the next step sees what the release's own confirm step will. The
+        # binary is never run, so Rust builds at opt-level 1 with thin LTO;
+        # aws-lc-sys keeps opt-level 3, which its C flags follow and the
+        # confirm step requires.
         shell: pwsh
         env:
           CC_ENABLE_DEBUG_OUTPUT: "1"
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: "1"
+          CARGO_PROFILE_RELEASE_LTO: thin
           CFLAGS_x86_64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
           CXXFLAGS_x86_64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
           CFLAGS_aarch64_pc_windows_msvc: "/O2 /DNDEBUG /Gy /Gw"
@@ -1460,6 +1470,7 @@ jobs:
         run: >-
           cargo build --locked --release -p rarpar --no-default-features
           --features $env:FEATURES --target $env:TARGET
+          --config profile.release.package.aws-lc-sys.opt-level=3
       - name: Confirm AWS-LC and the allocator in the release binary
         shell: pwsh
         env:
@@ -1477,16 +1488,10 @@ jobs:
         if: always()
         shell: bash
         run: sccache --show-stats || true
-      - name: Save sccache directory
-        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
   package:
     name: package
-    needs: [changes, fmt, clippy, unit-tests]
+    needs: [changes, fmt, clippy]
     if: needs.changes.outputs.crates == 'true' || needs.changes.outputs.packaging == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 30
@@ -1509,17 +1514,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mold nasm
-      - name: Restore sccache directory
-        id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-package-${{ github.run_id }}
-          restore-keys: |
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-package-
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted sccache
+        # Pushes and this repository's own pull requests share the R2 cache;
+        # a fork's pull request has no secrets and keeps the local disk cache.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -1648,16 +1656,10 @@ jobs:
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
-      - name: Save sccache directory
-        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
   docs-package:
     name: docs-package
-    needs: [changes, fmt, clippy, unit-tests]
+    needs: [changes, fmt, clippy]
     if: needs.changes.outputs.rarpar == 'true' || needs.changes.outputs.docs == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 30
@@ -1680,17 +1682,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mold nasm mandoc
-      - name: Restore sccache directory
-        id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-docs-package-${{ github.run_id }}
-          restore-keys: |
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-docs-package-
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted sccache
+        # Pushes and this repository's own pull requests share the R2 cache;
+        # a fork's pull request has no secrets and keeps the local disk cache.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -1722,12 +1727,6 @@ jobs:
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
-      - name: Save sccache directory
-        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
   benchmark-harness:
     name: benchmark-harness
@@ -1753,7 +1752,7 @@ jobs:
 
   cli-smoke:
     name: cli-smoke
-    needs: [changes, unit-tests]
+    needs: [changes]
     if: needs.changes.outputs.rarpar == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 30
@@ -1776,17 +1775,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mold nasm
-      - name: Restore sccache directory
-        id: sccache-restore
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-smoke-${{ github.run_id }}
-          restore-keys: |
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-smoke-
-            gha-sccache-${{ env.SCCACHE_CACHE_VERSION }}-rarpar-ci-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted sccache
+        # Pushes and this repository's own pull requests share the R2 cache;
+        # a fork's pull request has no secrets and keeps the local disk cache.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
       - name: Prime sccache server
         run: |
           sccache --start-server || true
@@ -1813,12 +1815,6 @@ jobs:
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true
-      - name: Save sccache directory
-        if: ${{ always() && steps.sccache-restore.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: ${{ steps.sccache-restore.outputs.cache-primary-key }}
 
   # The wasm correctness harnesses. Both crates ship an example that runs the
   # real code over the real fixtures and prints a digest per case; until now
@@ -1829,7 +1825,7 @@ jobs:
   # lanes together, while a lane that decodes different bytes still fails.
   wasm-par2-harness:
     name: wasm-par2-harness
-    needs: [changes, fmt, clippy, unit-tests]
+    needs: [changes, fmt, clippy]
     if: needs.changes.outputs.par2 == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 45
@@ -2020,7 +2016,7 @@ jobs:
   # lane that lost the forwarding fails here rather than quietly slowing down.
   wasm-par3-harness:
     name: wasm-par3-harness
-    needs: [changes, fmt, clippy, unit-tests]
+    needs: [changes, fmt, clippy]
     if: needs.changes.outputs.par3 == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 45
@@ -2173,7 +2169,7 @@ jobs:
 
   wasm-unrar-harness:
     name: wasm-unrar-harness
-    needs: [changes, fmt, clippy, unit-tests]
+    needs: [changes, fmt, clippy]
     if: needs.changes.outputs.unrar == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 45
@@ -2311,7 +2307,7 @@ jobs:
   # success from every job it needs.
   unsafe-valgrind:
     name: unsafe-valgrind-${{ matrix.platform }}-${{ matrix.crate }}
-    needs: [changes, fmt, clippy, unit-tests]
+    needs: [changes, fmt, clippy]
     if: needs.changes.outputs.crates == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
@@ -2401,7 +2397,7 @@ jobs:
 
   unsafe-sanitizer:
     name: unsafe-${{ matrix.sanitizer }}-${{ matrix.platform }}-${{ matrix.crate }}
-    needs: [changes, fmt, clippy, unit-tests]
+    needs: [changes, fmt, clippy]
     if: needs.changes.outputs.crates == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
