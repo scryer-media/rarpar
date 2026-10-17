@@ -3,8 +3,8 @@
 [![crates.io](https://img.shields.io/crates/v/par2-rs.svg)](https://crates.io/crates/par2-rs)
 [![docs.rs](https://docs.rs/par2-rs/badge.svg)](https://docs.rs/par2-rs)
 
-PAR2 verification and repair in pure Rust. No C bindings, no external `par2`
-binary.
+Verify and repair files with PAR2 recovery sets, in Rust, with no C bindings
+and no `par2` program needed.
 
 ```toml
 [dependencies]
@@ -42,92 +42,79 @@ fn main() -> par2_rs::Result<()> {
 }
 ```
 
-`Par2Repairer` drives the full sequence: scan, verify, solve, repair, verify
-again.
+`Par2Repairer` does the whole job: scan, verify, work out the repair, rebuild,
+and verify again.
 
-`Par2RepairSession` retains verification evidence while a download is still
-arriving, so assessment is incremental and repair uses what is already known.
-Its source can be files under a base directory, a `FileAccess` implementation,
-or an already-parsed set; repair output is always real files.
+`Par2RepairSession` is for files that are still downloading. It remembers
+what it has already verified, so each new check only looks at what changed,
+and repair starts from what is known. Its input can be files in a
+directory, your own `FileAccess`, or a set you have already parsed; repair
+always writes real files.
 
-## Capabilities
+`verify_all` reads through the `FileAccess` trait. `DiskFileAccess` reads
+files from disk; your own implementation can verify bytes that are still
+arriving over the network, or that never exist as files.
 
-- All PAR2 packet types: Main, File Description, IFSC, Recovery Slice, Creator.
-- Packets from any number of `.par2` files aggregate into one set.
-- Slice-level verification from IFSC CRC32 + MD5 pairs, so damage is localised
-  rather than condemning a whole file.
-- 16 KB quick-check for cheap file identification; full-file MD5 for sets with
-  no IFSC data.
-- Placement-aware repair: renamed and moved files are matched by content.
-- Malformed or truncated packets are skipped by scanning forward, rather than
-  failing the set.
+## What it does
 
-## Verifying data that is not on disk
+- Reads every PAR2 packet type, from any number of `.par2` files, as one set.
+- Finds damage block by block, so one bad block does not condemn a whole
+  file.
+- Identifies files cheaply from their first 16 KiB, and by their full MD5
+  when a set has no per-block checksums.
+- Finds renamed and moved files by their content.
+- Skips malformed or truncated packets instead of failing the whole set.
 
-`verify_all` reads through the `FileAccess` trait. `DiskFileAccess` is the
-ordinary implementation, but supplying your own allows verification against
-bytes that are still arriving over a network, or that are assembled from a
-source with no file paths at all.
+## MD5 backend
 
-## Crypto backend
+MD5 is the slowest single step in verifying, scanning and creating, so the
+default backend is fast assembly:
 
-MD5 has two interchangeable backends, chosen at compile time.
-
-- `crypto-native` *(default)*: the crate's own assembly on x86-64 and
-  little-endian AArch64, AWS-LC's MD5 block functions carried into `asm!`.
-  No C toolchain and no crypto library, and it is the configuration the
-  performance figures below were measured with. Every other target uses
-  RustCrypto `md-5`.
-- `crypto-rust`: the portable RustCrypto `md-5` implementation on every
-  target. Expect slower hashing on x86-64; the digests are of course
-  identical.
-
-The assembly is here because RustCrypto `md-5` dropped its assembly after
-0.10.0, and its pure-Rust MD5 is about 25% slower on x86-64, where MD5 is the
-serial floor of verify, scan and create. Linking `aws-lc-sys` for one block
-function was heavy, and its version-keyed `links` gave consumers a second
-AWS-LC build whenever their own `aws-lc-rs` linked another version.
-
-To use RustCrypto everywhere:
+- `crypto-native` (default): AWS-LC's MD5 assembly, built into this crate, on
+  x86-64 and little-endian AArch64; RustCrypto's `md-5` elsewhere. No C
+  compiler is needed. The speed figures below use it.
+- `crypto-rust`: RustCrypto's `md-5` everywhere. About 25% slower on x86-64;
+  the results are the same.
 
 ```toml
 par2-rs = { version = "0.10", default-features = false, features = ["crypto-rust"] }
 ```
 
-`crypto-aws-lc` and `native-crypto` stay as aliases for `crypto-native`, so
-dependency declarations written against the old names keep resolving to the
-fast backend. On x86-64 and AArch64, enabling neither backend is a compile
-error rather than a silent choice.
+`crypto-aws-lc` and `native-crypto` are old names for `crypto-native`. On
+x86-64 and AArch64, turning on neither backend is a compile error.
 
-## Feature flags
+## GPU repair
 
-- `metal` / `wgpu`: GPU-accelerated repair through `reedsolomon-rs`, with CPU
-  fallback when no suitable device or driver is present. On native Apple
-  Silicon, `metal` also enables policy-driven creation through
-  `CreationBackend`.
+`metal` and `wgpu` repair on the GPU through `reedsolomon-rs`, and fall
+back to the CPU when there is no suitable device. On Apple Silicon, `metal`
+can also create sets on the GPU, through `CreationBackend`.
 
-## Performance
+## Speed
 
-`2.0×` means `rarpar` finished in half the time:
+How many times faster than par2cmdline-turbo a heavy repair runs, measured
+through the `rarpar` command (2.0× is half the time):
 
 | CPU | Arch | Instruction set | par2 (heavy) |
 |---|---|---|---:|
-| AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 1.8× |
-| Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 1.7× |
-| Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 1.9× |
-| AMD Ryzen 5 3600 (Zen 2) | x86-64 | AVX2 | 1.5× |
-| Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.3× |
-| Apple M5 Max | arm64 | NEON | 7.1× |
-| Arm Cortex-A72 | arm64 | NEON | 1.2× |
-| Arm Neoverse N1 | arm64 | NEON | 1.4× |
-| Arm Neoverse V2 | arm64 | NEON | 1.5× |
+| AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 3.3× |
+| Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 2.5× |
+| Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 3.0× |
+| Intel Xeon Platinum 8124M (Skylake-SP) | x86-64 | AVX-512 | 2.3× |
+| AMD Ryzen 5 3600 (Zen 2) † | x86-64 | AVX2 | 1.6× |
+| Intel Xeon E5-2666 v3 (Haswell) | x86-64 | AVX2 | 2.3× |
+| Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.6× |
+| Apple M5 Max † | arm64 | NEON | 7.8× |
+| Arm Cortex-A72 | arm64 | NEON | 1.3× |
+| Arm Neoverse N1 | arm64 | NEON | 1.8× |
+| Arm Neoverse V2 | arm64 | NEON | 2.0× |
 
-The Apple row is the CPU lane, measured against upstream's published macOS
-arm64 reference binary.
+† From an older release, awaiting a re-measure.
 
-Per-case charts for every machine, the full methodology, and the versions
-these numbers were measured with:
-[**rarpar benchmarks**](https://github.com/scryer-media/rarpar/blob/main/docs/benchmark.md).
+The Apple row is CPU only, against par2cmdline-turbo's published macOS arm64
+binary.
+
+Every case on every machine, the method and the versions measured are in
+[the rarpar benchmarks](https://github.com/scryer-media/rarpar/blob/main/docs/benchmark.md).
 
 ## Provenance
 
@@ -135,16 +122,20 @@ This is an independent Rust implementation, heavily informed by
 [par2cmdline-turbo](https://github.com/animetosho/par2cmdline-turbo), Anime
 Tosho's speed-focused fork of
 [par2cmdline](https://github.com/Parchive/par2cmdline). Both are
-GPL-2.0-or-later. That work is also the benchmark reference this crate is
-measured against.
+GPL-2.0-or-later, and par2cmdline-turbo is what the speed figures compare
+against.
 
-The PAR2 format itself is specified in the
+The PAR2 format is specified in the
 [Parity Volume Set Specification 2.0](https://parchive.sourceforge.net/docs/specifications/parity-volume-spec/article-spec.html).
 
-Versioned API and migration notes are in [CHANGELOG.md](https://github.com/scryer-media/rarpar/blob/main/crates/par2-rs/CHANGELOG.md).
+Changes by version are in [CHANGELOG.md](https://github.com/scryer-media/rarpar/blob/main/crates/par2-rs/CHANGELOG.md).
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](https://github.com/scryer-media/rarpar/blob/main/crates/par2-rs/LICENSE).
+Apache-2.0 from version 0.10.11 onward. See
+[LICENSE](https://github.com/scryer-media/rarpar/blob/main/crates/par2-rs/LICENSE).
+Releases before 0.10.11 stay under GPL-3.0-or-later.
 
-[`reedsolomon-rs`]: https://crates.io/crates/reedsolomon-rs
+The AArch64 MD5 assembly comes from AWS-LC (originally OpenSSL), also under
+Apache-2.0. The repository's tests adapted from par2cmdline stay GPL and are
+not part of the published crate.

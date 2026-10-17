@@ -3,143 +3,85 @@
 [![License](https://img.shields.io/badge/license-GPL--3.0--or--later%20AND%20UnRAR--restriction-blue)](#license)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/scryer-media/rarpar/badge)](https://scorecard.dev/viewer/?uri=github.com/scryer-media/rarpar)
 
-`rarpar` is a smart RAR/PAR2/PAR3 command-line tool written in Rust. Point it at an
-archive, a PAR2/PAR3 file, or a messy download directory and it will discover what is
-there, repair what can be repaired, restore recovery volumes when possible, and
-extract the archive with verification enabled.
+`rarpar` is a command-line tool for RAR archives and PAR2/PAR3 recovery sets,
+written in Rust. Point it at an archive, a recovery file, or a messy download
+folder, and it works out what is there, repairs what it can, rebuilds missing
+volumes, and extracts with every byte checked.
 
-It is built on reusable archive and parity crates that live in this workspace
-and are published on crates.io. The CLI is distributed as a binary release
-and source build, not as a crates.io package.
+It is built on library crates in this repository that are published on
+crates.io. The CLI itself ships as release binaries and source, not on
+crates.io.
 
-`rarpar` is not an official RAR, PAR2, or PAR3 utility. It does not ship binaries named
-`unrar`, `rar`, `par2`, or `par2repair`, and it does not provide RAR archive
-writing, compression, or modification APIs.
+`rarpar` is not an official RAR, PAR2 or PAR3 tool. It ships no binaries
+named `unrar`, `rar`, `par2` or `par2repair`, and it cannot create or modify
+RAR archives.
 
-## What It Does
+## What it does
 
-- Discovers RAR, REV, PAR2, and PAR3 sets from paths, headers, magic bytes, and
-  bounded directory scans.
-- Verifies and repairs PAR2 and PAR3 sets before extraction.
-- Creates PAR3 sets with Cauchy or FFT recovery, interleaving, deduplication,
-  Data packets, and configurable recovery volumes (`par3 create`).
-- Creates PAR2 recovery sets with validated, atomically committed output
-  (`par create`).
-- Restores missing RAR volumes from `.rev` recovery volumes when available.
-- Compresses, decompresses, tests and lists `.xz` files on several threads
-  (`xz compress`, `xz decompress`, `xz test`, `xz list`).
-- Extracts RAR archives with integrity checks enabled.
-- Handles encrypted archives through secure password sources or a hidden
-  interactive prompt.
-- Can delete consumed source files after successful extraction, using the OS
-  trash by default.
-- Provides JSON inspection/reporting for automation.
-- Supports an UnRAR-compatible command shape, including `-vp` incremental
-  extraction.
+- Finds RAR, REV, PAR2 and PAR3 sets in a file or folder.
+- Verifies and repairs PAR2 and PAR3 sets before extracting.
+- Creates PAR2 sets (`par create`) and PAR3 sets (`par3 create`).
+- Rebuilds missing RAR volumes from `.rev` files.
+- Extracts RAR archives, including encrypted ones, with integrity checks on.
+- Compresses, decompresses, tests and lists `.xz` files on several threads.
+- Can delete the source files after a successful extraction, to the trash by
+  default.
+- Reports in JSON for scripts.
+- Accepts UnRAR's command shape, including `-vp` for archives still
+  downloading.
 
-## Performance
+## Speed
 
-Deterministic end-to-end runs from the 43-case `rarpar-bench` corpus — one
-warmup, seven measured runs, byte-validated output — against reference
-UnRAR and `par2cmdline-turbo 1.4.0`, using shipped-style portable release
-builds rather than benchmark-only binaries.
-
-Each cell is the **geometric mean** of `reference wall time / rarpar wall
-time` over that workload class, so `2.0×` means `rarpar` finished in half the
-time.
+How many times faster than the reference tools a whole `rarpar` run is
+(2.0× is half the time). The references are RARLAB's UnRAR and
+par2cmdline-turbo 1.4.0.
 
 | CPU | Arch | Instruction set | unrar (binary) | unrar (text) | par2 (heavy) |
 |---|---|---|---:|---:|---:|
 | AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 2.5× | 1.8× | 3.3× |
 | Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 2.0× | 1.5× | 2.5× |
-| Intel Core i5-1240P (Alder Lake) ‡ | x86-64 | GFNI + AVX2 | 1.6× | 1.4× | 3.0× |
+| Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 1.6× | 1.4× | 3.0× |
 | Intel Xeon Platinum 8124M (Skylake-SP) | x86-64 | AVX-512 | 1.6× | 1.3× | 2.3× |
 | AMD Ryzen 5 3600 (Zen 2) † | x86-64 | AVX2 | 1.6× | 1.5× | 1.6× |
 | Intel Xeon E5-2666 v3 (Haswell) | x86-64 | AVX2 | 1.6× | 1.3× | 2.3× |
-| Intel Atom C3538 (Denverton) ‡ | x86-64 | SSSE3 (no AVX) | 1.2× | 1.4× | 1.6× |
+| Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.2× | 1.4× | 1.6× |
 | Apple M5 Max † | arm64 | NEON | 1.3× | 1.5× | 7.8× |
 | Arm Cortex-A72 | arm64 | NEON | 2.0× | 1.6× | 1.3× |
 | Arm Neoverse N1 | arm64 | NEON | 2.9× | 1.7× | 1.8× |
 | Arm Neoverse V2 | arm64 | NEON | 3.1× | 1.8× | 2.0× |
 
-Rows without a mark measure `rarpar 0.8.0`; ‡ rows measure `rarpar 0.8.1`.
-† Carried from the `rarpar 0.3.3` publication, pending a re-measure.
+- **unrar (binary)** is extracting stored media, with and without encryption.
+- **unrar (text)** is extracting compressed data, including PPMd.
+- **par2 (heavy)** is the two heavy repairs.
+- † From an older release (`rarpar` 0.3.3), awaiting a re-measure. The other
+  rows measure `rarpar` 0.8.0 and 0.8.1.
+- The Apple PAR2 figure is against par2cmdline-turbo's macOS arm64 build,
+  which is much slower than its Linux and Windows builds.
 
-**unrar (binary)** is store-mode extraction — uncompressible media payloads,
-including the encrypted and BLAKE2sp variants; this is the dominant
-real-world shape by data volume. **unrar (text)** is compressed extraction
-across the LZ and PPMd decode paths, including compressed machine code and
-the encrypted compressed cases; it includes PPMd, an archaic RAR4 mode that
-is now ahead of the reference decoder on every re-measured machine.
-**par2 (heavy)**
-is the two heavy-repair cases. The Apple row is the CPU lane; the optional
-Metal lane is charted in the deep dive.
+Encrypted extraction gains the most, up to 11.9×. A few cases are at or just
+below parity, among them PAR2 verify on the Intel machines and stored media on
+Denverton.
 
-The class geomeans above blend quiet cases with `rarpar`'s widest wins: on
-the re-measured machines **encrypted extraction runs 1.1×–11.9×** depending on
-silicon and shape (encrypted store-mode, the dominant large-release shape,
-reaches 5.8×–11.9× on the Linux Arm cores), inside classes that average lower. Per-case charts for every machine
-are in the [benchmark deep dive](docs/benchmark.md).
+PAR3, against par3cmdline 0.0.1 on Alder Lake and Denverton: creating is
+4.6×–7.6× faster, verifying 5.2×–5.8×, repairing 6.3×–8.6×.
 
-One caveat travels with this table: the macOS PAR2 figure is measured against
-upstream's published macOS arm64 reference binary, which is much slower than
-the same version's Linux and Windows builds. The deep dive explains it.
-
-Known weaker shapes remain. On the three Intel cloud machines and Alder Lake,
-PAR2 verification and the missing-volume repair run 0.87×–0.99×; dense
-compressible source-text archives sit at about parity; and on Denverton plain
-stored media runs 0.81×–0.92×. PAR2 generation is now ahead of
-`par2cmdline-turbo` on every re-measured machine (1.19×–2.22×); the carried
-rows still show the earlier picture, with PPMd and PAR2 generation below
-parity on Zen 2. `rarpar 0.8.0` is also
-slower than the previous release in store-mode extraction on Zen 4 and the
-Neoverse cores (8–17% in `rarpar`'s own time); the deep dive has the numbers.
-`rarpar` verifies repaired and extracted output rather than trusting
-timing-only success.
-
-**PAR3.** Against `par3cmdline 0.0.1` on generated sets shaped after the
-block sizes and redundancy found in a usenet census, on Alder Lake and
-Denverton with every thread, `rarpar par3` creates 4.6×–7.6× faster, verifies
-5.2×–5.8× faster and repairs 6.3×–8.6× faster while retaining the original
-files as the reference does; in place it repairs 6.1×–11× faster. Against
-`par2cmdline-turbo` on the same shapes it repairs 1.7×–5.0× faster, retaining
-files. The deep dive has the per-set tables and the PAR2-against-PAR3 charts.
-
-Release builds use AWS-LC-backed native crypto and CPU execution only, which
-keeps startup behavior consistent across supported platforms; `rarpar`
-deliberately does not enable optional GPU backends from its underlying PAR2
-library.
-
-**Per-case charts for all machines, the full methodology, and the
-versions these numbers were measured with are in
-[docs/benchmark.md](docs/benchmark.md).**
+Release builds run on the CPU only; the GPU options of the PAR2 library are
+not turned on. Every case, chart, method and version is in
+[docs/benchmark.md](docs/benchmark.md).
 
 ## Install
 
 With Homebrew:
 
 ```bash
-brew tap scryer-media/rarpar
-brew install rarpar
-```
-
-One-shot install:
-
-```bash
 brew install scryer-media/rarpar/rarpar
 ```
 
-From a release archive, download the `rarpar` binary for your platform from
-GitHub Releases and place it on your `PATH`.
-
-Release archives include a `rarpar(1)` manpage and shell completions under
-`share/`. Homebrew installs those automatically.
-
-Linux direct archives are available in GNU and musl forms.
-
-Releases include signed checksums and SLSA provenance for all eight platform
-archives. See [release verification](.github/release-signing/verification.md)
-for verification commands and retry behavior.
+Or download the archive for your platform from GitHub Releases and put
+`rarpar` on your `PATH`. Archives include a manpage and shell completions
+under `share/`, signed checksums and build provenance; Linux comes in GNU and
+musl builds. [Release verification](.github/release-signing/verification.md)
+shows how to check them.
 
 From source:
 
@@ -147,541 +89,143 @@ From source:
 cargo install --locked --path tools/rarpar
 ```
 
-Or build a local release binary:
+## Quick start
 
-```bash
-cargo build --locked --release -p rarpar
-./target/release/rarpar --help
-```
-
-## Quick Start
-
-Run the smart workflow on a file or directory:
+Do everything for a download (`rarpar auto` is the same):
 
 ```bash
 rarpar ~/Downloads/some-release
 ```
 
-That is equivalent to:
-
-```bash
-rarpar auto ~/Downloads/some-release
-```
-
-Inspect what `auto` would do without mutating files:
+See what it would do, without changing anything:
 
 ```bash
 rarpar inspect --json ~/Downloads/some-release
 ```
 
-Extract under a specific output directory:
+Extract somewhere else, then move the sources to the trash:
 
 ```bash
-rarpar auto --output ~/Extracted ~/Downloads/some-release
+rarpar auto --output ~/Extracted --delete-sources ~/Downloads/some-release
 ```
 
-Delete consumed source files only after successful verified extraction:
+`--permanent-delete` deletes instead of using the trash, and
+`rarpar cleanup --dry-run` shows what cleanup would remove.
 
-```bash
-rarpar auto --delete-sources ~/Downloads/some-release
-```
-
-By default cleanup moves files to the OS trash/recycle bin. Irreversible
-deletion requires an explicit extra flag:
-
-```bash
-rarpar auto --delete-sources --permanent-delete ~/Downloads/some-release
-```
-
-Preview cleanup without deleting anything:
-
-```bash
-rarpar cleanup --dry-run ~/Downloads/some-release
-```
-
-## Explicit Commands
-
-RAR operations:
+## Commands
 
 ```bash
 rarpar rar list archive.part1.rar
-rarpar rar test archive.part1.rar
 rarpar rar extract archive.part1.rar ./out
 rarpar rar restore-volumes archive.part1.rar archive.part1.rev
-```
 
-PAR2 operations:
-
-```bash
 rarpar par verify release.par2
 rarpar par repair release.par2
-rarpar par create ./release/release --block-size 1048576 \
-  --recovery-percent 5 part01.rar part02.rar
-```
+rarpar par create ./release/release --recovery-percent 5 part01.rar part02.rar
 
-`par create` takes one OUTPUT path or stem followed by one or more explicit
-FILE inputs. Directories, recursion, and file-list expansion are rejected. If omitted,
-`--base-path` defaults to OUTPUT's parent, and input names are recorded relative
-to that directory. Use `--block-size` or `--block-count` to choose source-block
-sizing, then select recovery with `--recovery-percent` or the exact, long-only
-`--recovery-count`. Recovery blocks begin at `--first-exponent`; volumes use the
-variable scheme by default and can be selected as `uniform` with
-`--volume-scheme`, then split with `--volume-count`. `--memory-mib` sets the
-creator's bounded planning/working budget.
-
-With the global `-o DIR`, a relative OUTPUT is written under DIR (an absolute
-OUTPUT wins), but `--base-path` still defaults to the parent of OUTPUT as typed,
-so the inputs are found where they were and an explicit `--base-path` is used
-as given. `rarpar -o sets par create set.par2 input.bin` writes
-`sets/set.par2` protecting `./input.bin`; verify it with the data's directory
-as a search directory (`rarpar par verify sets/set.par2 .`).
-
-Creation honors the global safety/reporting flags:
-
-```bash
-rarpar --dry-run --json par create ./release/release \
-  --block-count 256 --recovery-count 16 \
-  part01.rar part02.rar
-rarpar --overwrite par create ./release/release --recovery-percent 10 \
-  part01.rar part02.rar
-```
-
-Dry-run produces a creation-specific plan report and does not write PAR2 files.
-Human progress is rate-limited and goes to stderr; JSON mode emits one final
-structured creation report on stdout. Add `--quiet` to suppress human output.
-
-Automation that already emits a PAR2-command-shaped repair invocation can use
-the compatibility form directly. This form accepts repair mode, `-B` as a
-separate or joined base-directory option, the PAR2 file, and an optional data
-wildcard:
-
-```bash
-rarpar r -B ./release ./release/release.par2 "*.rar"
-```
-
-The explicit `rarpar par ...` commands remain the general-purpose interface.
-
-`par verify` can check one protected file as it streams in, without saving it
-first: give the set as a path and name the file the stream is with `--name`.
-
-```bash
-curl -s "$URL" | rarpar par verify release.par2 --name part01.rar
-```
-
-The stream is hashed one slice at a time in memory that does not depend on its
-length. That slice must fit `--par3-memory-mib` (default 256 MiB) and the file
-may have at most 32768 slices; a set that declares more exits 1 before any
-slice is allocated. The report names the damaged slices, how many are missing from a short
-stream or trail a long one, and whether the set's recovery blocks could repair
-it; an intact stream exits 0 and a damaged one 1. An unknown `--name` exits 2
-and lists the names the set protects. `par repair` works on files on disk only
-and exits 2 when given `-` or `--name`.
-
-PAR3 operations:
-
-```bash
 rarpar par3 create release.par3 part01.rar part02.rar -s 1048576 -r 5
 rarpar par3 verify release.par3
 rarpar par3 repair release.par3
-rarpar auto release.par3
-rarpar par3 create fft.par3 part01.rar --codec fft --capacity-log2 8 \
-  --interleave 1 --recovery-count 32 --volume-blocks 8
-```
 
-PAR3 creation takes an output stem (or `.par3` path) and explicit files. Names
-are recorded relative to `--base-path`, which defaults to the current directory.
-The defaults are Cauchy, one recovery packet, 1 MiB blocks, no deduplication,
-and power-of-two recovery volumes. Opt into `--dedup aligned|sliding`,
-`--data-packets`, `--volume-blocks`, or `--volume-bytes` as needed. FFT requires
-`--capacity-log2`; `--interleave` counts extra cohorts and `--first-recovery`
-selects the first recovery index. An interleaved set is cut and named by row —
-one recovery index in each cohort — so `--first-recovery` takes a multiple of
-the cohort count and a recovery count or percentage is completed to the whole
-rows that hold it. Percentage sizing uses the block count after deduplication
-and requires a second planning pass over sources.
-
-`par3 create OUTPUT -` (or an absent FILE when standard input is not a terminal)
-makes a set for one file read from standard input:
-
-```bash
-tar -c ./release | rarpar par3 create release.tar.par3 - \
-  --name release.tar -s 1048576 -c 16
-```
-
-The stream's length is unknown until it ends, so `--name` (the file name the set
-records), `-s/--block-size` and `-c/--recovery-count` are required, and options
-that depend on the length or on seeing the data twice (`-r`, FFT, interleave,
-`--first-recovery`, deduplication, data packets, volume sizing, `--base-path`,
-`--scratch-dir`) are refused. The data is read once as it arrives and never
-buffered or staged to a temporary file; memory is the recovery blocks plus a few
-dozen bytes per input block (twice the recovery blocks until the stream passes
-128 blocks, while the set's field is still open). OUTPUT is a stem or `.par3`
-path, or an existing directory that takes `--name` inside it. The set is laid out
-as `par3 archive` lays out its sibling sets; verify it against the saved file.
-
-Use `--dry-run --json par3 create ...` to obtain output paths, sizes, block counts,
-and scratch requirements without writing. Existing carriers require `--overwrite`;
-creation stages and authenticates every output before installation and refuses
-to overwrite an input. par3-rs flushes every file it writes but never fsyncs,
-so by default `par3 create`, `par3 repair` and `par3 inside` issue no storage
-barrier. `--fsync` on `par3 create`, `par3 repair`, and
-`par3 inside insert|repair|remove` opts in:
-once the run has succeeded, each file it wrote is opened and synced (parent
-directories are not), and the JSON report records `"fsync": true`.
-Installation is per file, not atomic for the entire set.
-An overwrite that would leave obsolete authenticated carriers is rejected before
-writing. Move the old set aside or choose a new output directory when changing
-volume layouts.
-
-Verification and repair accept a carrier or directory, matching sibling `.par3`
-files and magic-detected renamed carriers by authenticated set identity.
-`--set-id` selects among multiple sets.
-`-C DIR` chooses the protected-data working directory, defaulting to the selected
-carrier's directory; `--output` controls RAR extraction only. Repair replaces
-a damaged file without keeping it unless `--backup` is given, which keeps it
-as a numbered backup (`NAME.1`, or the next free number), and does not rewrite
-clean files. Smart placement searches explicit
-`--search-dir` candidates by content when recovery is insufficient; canonical
-placement uses recorded paths only. JSON reports include file-coordinate damage,
-verified prefixes, cohort deficits, and installed paths and backups.
-Repair checks destination aliases using temporary name probes on the target
-filesystem before binding files; it rejects names that collapse to one path.
-Dry runs check existing paths without creating probes; missing-name collisions
-are checked again during execution. Damaged embedded layouts with unprotected
-ranges require the explicit self-repair API, including during dry-run validation.
-The CLI sizes its shared handle ceiling for the selected carrier collection plus
-32 execution handles, so retained Windows carriers do not consume repair headroom.
-Explicit carrier discovery counts admitted candidates against `--max-files`;
-smart placement separately counts the source files it inspects. Inferred RAR
-members expand to their volume family for automatic and standalone cleanup.
-Dry-run repair also enforces the configured Cauchy loss ceiling. Cleanup uses
-the same `-C` data root as repair. Auto mode retains discovery packets and tries
-available PAR2 recovery before returning a deferred PAR3 deficit.
-
-PAR3 commands use the bounded session engine, including FFT and Data-only
-recovery. Global `--par3-memory-mib` (default 256), `--par3-workers`, and
-`--par3-max-lost-blocks` (default 4096 for Cauchy) control resources. The memory
-budget covers engine allocations; CLI path/report storage is bounded separately
-by `--max-files` and metadata limits. `auto` repairs before rediscovering and
-extracting RAR inputs. Container insertion/self-repair and recovery-carrier
-reconstruction remain explicit library APIs rather than CLI commands.
-
-xz operations:
-
-```bash
-rarpar xz compress data.tar                    # writes data.tar.xz
-rarpar xz compress --level 9 --extreme --threads 8 data.tar
-rarpar xz decompress data.tar.xz ./out         # writes ./out/data.tar
-rarpar xz test data.tar.xz
-rarpar --json xz list data.tar.xz
+rarpar xz compress data.tar
+rarpar xz decompress data.tar.xz ./out
 tar -c ./release | rarpar xz compress > release.tar.xz
-curl -s "$URL" | rarpar xz decompress --threads 4 | tar -x
 ```
 
-`xz compress [INPUT] [OUTPUT]` and `xz decompress [INPUT] [OUTPUT]` take a file,
-or `-` for standard input or output; an absent INPUT is standard input when that
-is not a terminal. Pipes are read and written as the data flows, never staged
-to a temporary file, in memory that does not depend on the stream's length, and
-a slow reader holds rarpar back rather than growing a buffer. OUTPUT defaults to INPUT with `.xz` added
-(compress) or removed (decompress, where `.txz` becomes `.tar`), beside INPUT or
-in the global `--output` directory; an existing directory as OUTPUT takes that
-name inside it, and standard input defaults to standard output. When both
-`-o DIR` and OUTPUT are given, a relative OUTPUT is placed under DIR keeping its
-own subdirectories (`-o out ... sub/a.xz` writes `out/sub/a.xz`), an absolute
-OUTPUT wins and ignores `-o`, and `-` is always standard output; `par3 create`
-and `par3 archive` place their OUTPUT the same way. Inputs are
-always kept, so `--delete-sources` is refused. An existing output requires
-`--overwrite`; the output is staged beside its destination, installed only once
-complete, and keeps the input's permissions and modification time. Compressed
-data is not written to a terminal.
+Pipes work without temporary files: `par verify --name` checks a file as it
+streams in, `par3 create -` and `xz compress --sidecar` make a recovery set
+from a stream, and `xz` reads and writes standard input and output.
 
-`--level` 0-9 and `--extreme` select the xz preset of that number; the default
-is 6 with a CRC-64 check, and `--check` selects `crc32`, `crc64`, `sha256` or
-`none`. The stream is cut into blocks of `--block-size` bytes, by default three
-times the preset's dictionary (at least 1 MiB) as xz's threaded mode does, and
-up to `--threads` blocks (default: available CPUs) are compressed at once. The
-output bytes do not depend on `--threads`. A dictionary larger than the largest
-block is shrunk to fit it. `--memory-mib` caps the estimated encoder memory by
-running fewer threads; there is no cap by default.
-
-Decompression and `xz test` verify every block's check. A file with more than
-one block is decoded on up to `--threads` threads within `--memory-mib` (default
-1024), with fewer threads when the largest block needs it; single-block files
-and files the parallel decoder cannot map are decoded in one pass, whose
-dictionary must fit the same limit. A pipe is decoded as it arrives: on several
-threads, blocks whose headers record their sizes (as rarpar's and xz's threaded
-output do) go to workers, and other blocks are decoded in order.
-Concatenated streams and stream padding decode as one output. `xz list` reads
-the index of every stream from the end of a file and reports each stream's
-offset, sizes, check, padding and blocks. A pipe has no end to seek to, so
-`xz list -` decodes it once and reports the sizes, the stream and block counts,
-each block's uncompressed size and the first stream's check, with `unknown`
-naming what a single forward pass cannot give. With `--json`, every action prints one
-report; when the data itself goes to standard output, reports go to standard
-error. A damaged stream exits 1, an exceeded memory limit 4, and a refused
-output 3.
-
-Sidecar recovery sets in the same pass:
-
-```bash
-rarpar xz compress --sidecar par2 --sidecar-block-size 1048576 \
-  --sidecar-recovery-count 16 data.tar         # data.tar.xz + data.tar.xz.par2 + volumes
-tar -c ./release | rarpar xz compress --sidecar par3 --sidecar-block-size 1048576 \
-  --sidecar-recovery-count 16 --sidecar-name release.tar.xz > release.tar.xz
-rarpar par3 archive --format zip --sidecar par2 -s 1048576 -c 16 set.zip ./release
-```
-
-`xz compress --sidecar par2|par3` and `par3 archive --sidecar par2|par3` feed
-the archive's bytes, as they are written, to a PAR2 or PAR3 creator and write a
-conventional one-file set (an index plus power-of-two recovery volumes) beside
-the archive. The archive is never read back and nothing is staged to a temporary
-file; memory is the recovery blocks, one block, and a few dozen bytes per input
-block, within `--par3-memory-mib` for either format. The archive's length is
-unknown until its last byte, so the block size and recovery count are fixed up
-front: `--sidecar-block-size` and `--sidecar-recovery-count` (both required for
-`xz compress`; on `par3 archive` they are aliases of `-s` and `-c`, and `-c`
-defaults to 1). A PAR2 sidecar records the same packets in the same layout as
-`par create` over the finished archive with the same block size and recovery
-count, byte for byte. Verify and repair with `par verify|repair` or
-`par3 verify|repair` against the archive.
-
-An xz file names its set after itself (`data.tar.xz.par2`); `par3 archive`
-names it after the archive's stem (`set.par2`, as its PAR3 sibling sets are
-named). The set follows the archive's placement under `-o`, is staged beside
-its names and installed after the archive, and every name it will take is
-checked, with the same `--overwrite` and symlink rules, before a byte is
-read. An archive written to standard output has no name to record, so
-`--sidecar` there needs `--sidecar-name NAME`, the name the output will be
-saved under (placed under `-o` like an OUTPUT); otherwise it exits 2. Neither
-command writes multi-volume archives, so one set covers the one archive.
-`par3 archive --format 7z --sidecar par2` is refused (exit 2): the 7z writer
-writes its start header last, over bytes PAR2's whole-file MD5 has already
-taken, so use `--sidecar par3` or run `par create` over the finished 7z.
-
-PAR2 placement defaults to `smart`, which can locate renamed or moved data by
-content. For a conventional expected-path-only verification or repair, use:
-
-```bash
-rarpar par verify --par-placement canonical release.par2
-rarpar auto --par-placement canonical ./release
-```
-
-Explicit RAR selection recognizes modern `partNN` names and old-style `.r00`,
-`.s00`, and numeric volume sequences. Discovery probes only name-compatible
-siblings for an explicitly selected multi-volume archive. During `auto`, RAR
-volumes restored from `.rev` files stay beside the source set; `--output`
-controls extracted payload placement, not those intermediate volumes.
-
-Discovery controls are global:
-
-```bash
-rarpar --no-recursive inspect ./release
-rarpar --max-depth 4 --max-files 5000 ./downloads
-```
-
-Directory inputs recurse by default with a maximum depth of 8 and a maximum of
-20,000 files. Symlink directories are not traversed.
+The [command reference](docs/cli.md) covers every command, including PAR3
+options, recovery sets written alongside an archive, file placement, and
+folder scanning limits.
 
 ## Passwords
 
-`rarpar` never prints passwords and does not include them in JSON output.
-
-Use one or more non-interactive password sources:
-
 ```bash
 rarpar --password-file passwords.txt ./release
-RAR_PASSWORD='correct horse battery staple' rarpar --password-env RAR_PASSWORD ./release
+rarpar --password-env RAR_PASSWORD ./release
 rarpar --password-fd 3 ./release 3< passwords.txt
 ```
 
-`--password-file` and `--password-fd` read newline-separated candidates.
-`--password-env` reads one candidate from the named environment variable. If no
-non-interactive candidate works and stdin/stderr are TTYs, `rarpar` prompts with
-hidden input only when a password is needed.
+Files and descriptors hold one password per line. If none works and you are
+at a terminal, `rarpar` asks, with the input hidden. Passwords are never
+printed or written to JSON.
 
-Use `-p-` in UnRAR-compatible mode to disable prompting.
+## Cleanup
 
-## Cleanup Safety
+Cleanup only removes files it used: the RAR volumes, their `.rev` files, and
+the PAR2 and PAR3 files for that set. It leaves `.nfo`, `.sfv`, samples,
+subtitles and anything else alone.
 
-Cleanup is intentionally narrow. Automatic cleanup only considers files
-positively identified as consumed source files for an extracted set:
+## UnRAR-compatible mode
 
-- RAR volumes used for extraction
-- Restored or repaired RAR volumes used for extraction
-- `.rev` recovery volumes for that set
-- PAR2 files used for that set
-- PAR3 carriers whose authenticated sets protect only volumes of that archive;
-  carriers shared with other protected data are retained
-
-It does not delete unrelated sidecar files such as `.nfo`, `.sfv`, samples,
-subtitles, or PAR2-protected data files. Standalone `cleanup` validates expected
-outputs before deleting anything for a set.
-
-## UnRAR-Compatible Mode
-
-Tools that expect an UnRAR-shaped command can call the `rarpar` binary directly.
-`rarpar` accepts these command forms:
+Programs that expect UnRAR can call `rarpar` the same way:
 
 ```bash
 rarpar x archive.part1.rar /dest/
-rarpar e archive.rar /dest/
 rarpar t archive.rar
 rarpar l archive.rar
-rarpar lb archive.rar
 ```
 
-Supported compatibility switches include `-y`, `-ai`, `-idp`, `-scf`, `-tsm-`,
-`-mlp`, `-vp`, `-o+`, `-o-`, `-or`, `-p-`, `-pPASSWORD`, `-om`, `-om1`, `-om-`,
-and `-riN[:S]`.
+`x`, `e`, `t`, `l` and `lb` work, with the common switches. `-vp` waits for
+each volume while a set is still downloading. See
+[docs/rarpar-compatibility.md](docs/rarpar-compatibility.md).
 
-`-vp` keeps the archive open, waits for later volumes, and prints the
-incremental prompt expected by UnRAR-compatible callers. `rarpar` intentionally
-does not print an UnRAR banner and does not claim to be official UnRAR.
+## Crates
 
-Normal `x` and `e` extraction uses sibling `.rev` recovery files to restore
-missing volumes before extraction. The incremental `-vp` path does not mutate
-the archive set; it waits for each later volume instead.
-
-## Workspace Packages
-
-- `crates/reedsolomon-rs`: Reed-Solomon finite-field kernels shared by
-  RAR recovery and PAR2 repair. Licensed Apache-2.0.
-- `crates/unrar-rs`: RAR reading, probing, extraction, and recovery only.
-  Licensed Apache-2.0 plus the unRAR license restriction: its RAR engine was
-  developed using RARLAB's unRAR source code, which remains governed by that
-  restriction.
-- `crates/par2-rs`: PAR2 packet loading, creation, verification,
-  placement-aware repair, and post-repair verification. Licensed
-  GPL-3.0-or-later.
-- `crates/par3-rs`: PAR3 packet parsing, input-set inspection, verification,
-  creation and repair with bounded sessions, Cauchy/FFT, interleaving,
-  deduplication, Data packets, content placement, recovery-carrier rebuilding,
-  and ZIP/7z embedded protection. Powers the CLI's PAR3 operations. See the
-  [crate README](crates/par3-rs/README.md) for API boundaries and compatibility.
-  Licensed Apache-2.0.
-- `tools/rarpar`: the standalone CLI. Licensed GPL-3.0-or-later with a
-  GPLv3 section 7 permission to combine with `unrar-rs` — `unrar-rs` is a
-  default dependency, so an ordinary build carries the unRAR restriction.
+- [`unrar-rs`](crates/unrar-rs): reads and extracts RAR archives.
+- [`par2-rs`](crates/par2-rs): creates, verifies and repairs PAR2 sets.
+- [`par3-rs`](crates/par3-rs): creates, verifies and repairs PAR3 sets.
+- [`reedsolomon-rs`](crates/reedsolomon-rs): the recovery math they share.
+- [`tools/rarpar`](tools/rarpar): this command.
 
 ## Development
 
-The binary test fixtures are the **test corpus**: a signed, content-addressed
-object set on R2, described by the ledger in `test-corpus/` and pinned by
-`test-corpus/lock.json` (see [docs/test-corpus.md](docs/test-corpus.md)). The
-repository carries no fixture bytes at all — a clone needs no Git LFS. After
-cloning:
+Test files live in a separate signed store, not in Git
+([docs/test-corpus.md](docs/test-corpus.md)). After cloning:
 
 ```bash
 git config core.hooksPath .githooks
-```
-
-Then hydrate the profiles you need; every object is digest-checked against the
-pinned, signed manifest:
-
-```bash
 cargo run --locked -p xtask -- test-corpus hydrate --profile unrar --profile par2
 ```
 
-The versioned pre-commit hook runs `gitleaks` and blocks staged machine-local
-usernames or home-directory paths.
-
-Common validation commands:
+The checks CI runs:
 
 ```bash
 cargo fmt --check --all
-cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --no-fail-fast
+cargo clippy --locked --workspace --all-targets --features unrar-rs/unstable-internals -- -D warnings
+cargo nextest run --locked --workspace --lib --bins --examples --no-fail-fast --features unrar-rs/unstable-internals
 ```
 
-Release and crates.io publishing automation lives under `.github/workflows/`.
-Publishing notes are in `docs/publishing.md`.
-Linux packaging layout notes are in `docs/packaging.md`.
-Continuous fuzzing — targets, seed corpora and the nightly schedule — is in
-[docs/fuzzing.md](docs/fuzzing.md).
-Versioned CLI and library migration notes are in [CHANGELOG.md](CHANGELOG.md).
-
-## Technology Radar
-
-Engine-side kernel and platform work for the PAR2, PAR3 and RAR crates. Weaver keeps the yEnc, CRC and server-side radar in its own repository.
-
-Rules that govern every row: one binary with runtime dispatch; a kernel tier is never dropped because no local host has its instruction set; a tier is kept when it materially moves wall clock or CPU time where it engages without adding significant risk or code, and regresses nothing else by more than 1%; there is no minimum percentage; disk work (fsyncs, opens, read and write calls) is a regression axis on its own.
-
-Status: **Landed** ships; **Building** has an owner now; **Exploring** is a measured spike before a decision; **Watch** waits on hardware or evidence; **Dropped** was measured and abandoned, kept on the radar so the attempt is not repeated.
-
-| Item | Serves | Status | Needs |
-|---|---|---|---|
-| GFNI affine tiers on AVX2 for GF(2^8), GF(2^16) and the FFT linear maps | PAR2, PAR3 | Landed | |
-| Native 8-bit FFT lane, fused butterflies and radix-4, zero truncation, in-place scaling | PAR3 FFT | Landed | |
-| FFT repair through capacity-sized windows (Algorithm 5 of Chen, Lin, Tang, Han and others, 2026): two banks of `capacity` rows plus a third that overlaps the next fill when workers can use it; pass-count admission, proof frontiers before decode; 1.2–1.9x faster repair on c7a, c7i and c8g, and a 4096 × 16 KiB repair's charged peak down from 137.9 MB to 15.8 MB | PAR3 repair | Landed | |
-| Four-step FFT transform (leaf 2^6), gated to AMD CPUs with the AVX2 linear kernels, on pooled transforms over more than 64 points and serial ones over rows of at least 16 KiB | PAR3 FFT on AMD | Landed | Zen 5 with AVX-512 kernels, two workers and 2–8 KiB serial rows are unmeasured, so gated off |
-| Grouped multi-source Cauchy kernels, resident recovery rows, clone-based staging, no read-back, spool never fsynced | PAR3 create and repair | Landed | |
-| Reference comparison fleet and PAR3 bench suite (`rarpar-bench par3`) | measurement | Landed | live Windows and SSM runs |
-| GF(2^8) AVX-512 tiers (GFNI on zmm, VBMI nibble form), cached multiply plans, factor 0 and 1 short-circuits | PAR2, PAR3 | Building | Zen 4 and Sapphire Rapids via the fleet |
-| SVE2 tiers for GF(2^8), the FFT linear maps and the fused Cauchy kernels | PAR2, PAR3 on Graviton 4 | Building | c8g via the fleet |
-| wasm simd128 tiers for the FFT linear maps and grouped GF(2^8); GF(2^16) wasm widened to all lanes | PAR3, PAR2 on wasm | Building | wasmtime benches |
-| Column-tiled FFT execution, budget-sized FFT stripes, contiguous aligned banks | PAR3 FFT | Building | |
-| Planning hashes fused with the encode read; redundant zero-fills and coverage scans removed; repair validation fused into the codec read | PAR3 disk work | Building | |
-| par3cmdline-compatible command-line facade | rarpar CLI | Building | |
-| PAR3 inside RAR5 volume sets (experimental `par3 inside`): trailing region by default, `PAR3` service header as the alternative; trailing reads clean in unrar and unrar-rs with a 7-Zip "data after end" warning, the service header reads clean in all three; 1 GiB inserts in 0.7 to 1.5 s at 2 to 15% and repairs in 1.6 to 2.6 s | PAR3, rarpar CLI | Building | layout agreed with the PAR3 maintainers |
-| Frobenius additive FFT: evaluations at conjugate points follow from one another under the Frobenius map, so one point per orbit is transformed (Li, Chen, Kuo, Cheng, Yang 2018) | PAR3 FFT | Exploring | the published saving is for polynomials whose coefficients lie in a subfield, and block data fills the whole field, so the spike first has to show that any of it carries over; on create the byte-exact par3cmdline differential is the gate |
-| Recursive stage order for the additive FFT (Samanta, Badakhshan, Gong 2026) and the `encode-pruned`, `fft-hash-feed` and `cauchy-shared` lanes | PAR3 FFT and Cauchy | Dropped | measured on c7a, c7i and c8g: the recursive order and `encode-pruned` about 1.0x everywhere; `fft-hash-feed` halved source reads but saved no time and was 0.73–0.92x at 4 workers on the 1.5 GiB create; `cauchy-shared` 10–100x slower on Cauchy create with a higher charged peak; see `crates/par3-rs/PERFORMANCE.md` |
-| SME2 GF(2) outer-product GEMM (`BMOPA`) for Cauchy and Vandermonde encode and solve | PAR2, PAR3 | Watch | spike measured: slower than NEON at the 12–16 source groups the engines issue and at 8–18 workers (SME unit shared per cluster); wins 2–3x only at 64 or more sources per product; kept as an opt-in `kernel_ceiling` lane |
-| Wide-K engine restructure: stage 64 or more source stripes per matrix product instead of 16 | PAR2, PAR3 Cauchy, matrix-unit ISAs | Dropped | breakpoint spike measured on Apple silicon at 8 workers: repair of 1–10 lost blocks never crosses on realistic sets (N 256–51,200 blocks, 64 KiB stripe: SME2 saves 8–14 ms of compute per pass against at least 130 ms of streamed read, and holding K stripes resident forfeits NEON's read-ahead overlap, a net loss cold); PAR2 shows no crossover up to N=32,000 for 1–4 lost blocks or 5–10% recovery; full-recovery create is 1.2–1.5x on the kernel but per-pass plan rebuilds erase it and cached plans cost 32·R·N bytes (1.6 GB at N=32,000); the apparent 1.9x on one lost block was the PAR3 repair nest running row-parallel on one thread, fixed by a column split instead (see PAR3 repair row); revisit only if large-set create with page-cached sources and a 256 KiB or larger stripe becomes a hot path |
-| PAR3 repair nest column split when fewer blocks are lost than there are workers | PAR3 | Dropped | measured on Sapphire Rapids and Apple silicon against the merged column-tiled FFT: at 8 workers it was 1.06–1.11x slower on wall and 1.26–1.64x on CPU for 1–4 lost blocks at a 64 KiB stripe, flat at 10 lost, and 1.02–1.16x CPU with +16 MiB at a 1 MiB stripe; repair is bounded by disk reads the existing nest already overlaps, so the idle threads the wide-K spike saw were waiting on I/O, not on the kernel; the patch is kept in the campaign handoff folder |
-| GF(2^16) folded tier for AVX2 hosts without GFNI (Zen 2, pre-Ice-Lake) | PAR2 repair | Watch | measured gap on Zen 2 is 2.4x wall against par2cmdline-turbo |
-| SME streaming-width multi-buffer hashing (MD5, BLAKE3) | PAR2 verify, PAR3 planning | Watch | unproven; mode-switch cost |
-| AVX512BMM GF(2^16) tier (Zen 6 `VBMACXOR16x16x16`) | PAR2, PAR3 | Watch | no Zen 6 instances on EC2 yet |
-| AVX10.2 and APX | every x86 kernel | Watch | Diamond Rapids and Nova Lake; EVEX kernels carry over, APX helps register-bound grouped kernels |
-| AVX-512 FFT linear map tier | PAR3 FFT | Watch | depends on the GF(2^8) AVX-512 result |
-
-The PAR3 FFT lane shipped today is the additive transform of Lin, Al-Naffouri, Han and Chung (2016) with the capacity-window erasure decoder of Chen, Lin, Tang, Han and others (2026). The other rows come from later work:
-
-- Baseline: S.-J. Lin, T. Y. Al-Naffouri, Y. S. Han, W.-H. Chung, "Novel Polynomial Basis With Fast Fourier Transform and Its Application to Reed-Solomon Erasure Codes", IEEE Trans. Inf. Theory 62(11), 2016, [doi:10.1109/TIT.2016.2608892](https://doi.org/10.1109/TIT.2016.2608892).
-- C. Chen, S.-J. Lin, Z. Li, S. Cai, Y. S. Han, B. Bai, "Reduced-Complexity Erasure Decoding of Low-Rate Reed-Solomon Codes Based on LCH-FFT", IEEE ISIT 2023, pp. 1015-1019; extended by C. Chen, S.-J. Lin, N. Tang, Y. S. Han, S. Cai, L. Yu, Z. Li, B. Bai, B. Bai, "Two Fast Erasure Decoding Algorithms for Reed-Solomon Codes Based on LCH-FFT", IEEE Trans. Inf. Theory, 2026 (authors' version).
-- W.-D. Li, M.-S. Chen, P.-C. Kuo, C.-M. Cheng, B.-Y. Yang, "Frobenius Additive Fast Fourier Transform", ISSAC 2018, [arXiv:1802.03932](https://arxiv.org/abs/1802.03932).
-- S. Samanta, M. Badakhshan, G. Gong, "On the Additive FFT Techniques over Binary Extension Fields", 2026, [arXiv:2608.20855](https://arxiv.org/abs/2608.20855).
-
-Error-correcting decoders (the Welch-Berlekamp line, Tang and Han 2022) are not on the radar: PAR3 repair knows which blocks are lost from their checksums, so it only ever decodes erasures.
-
-What each shipped paper contributed, and where it is used, is recorded in
-[ATTRIBUTION.md](ATTRIBUTION.md).
-
+More in `docs/`: [publishing](docs/publishing.md),
+[packaging](docs/packaging.md), [fuzzing](docs/fuzzing.md), and the
+[technology radar](docs/technology-radar.md). Changes by version are in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-The `rarpar` CLI and `par2-rs` are GPL-3.0-or-later; the other library crates
-are Apache-2.0. The UnRAR restriction is carried wherever `unrar-rs` is used:
+- `rarpar` is GPL-3.0-or-later, with a section 7 permission to combine it
+  with `unrar-rs` ([tools/rarpar/LICENSE](tools/rarpar/LICENSE)). It includes
+  `unrar-rs` by default, so an ordinary build, `cargo install` or release
+  archive carries the UnRAR restriction too. Release archives include
+  `LICENSE`, `LICENSE.GPL-3.0-or-later` and `LICENSE.unrar-rs`.
+- `unrar-rs` is Apache-2.0 plus the UnRAR licence restriction, from 0.11.0 on.
+  Its RAR engine was developed from RARLAB's UnRAR source, and the restriction
+  still governs that code ([LICENSE](crates/unrar-rs/LICENSE)).
+- `par2-rs` (from 0.10.11), `par3-rs` (from 0.5.1) and `reedsolomon-rs`
+  (from 0.4.10) are Apache-2.0. The par2-rs tests adapted from par2cmdline's
+  GPL-2.0-or-later suite stay GPL-3.0-or-later and are not published with
+  the crate. `reedsolomon-rs` includes GF(2¹⁶) kernels ported from
+  [ParPar](https://github.com/animetosho/ParPar), which its author released as
+  public domain or CC0.
 
-- `reedsolomon-rs` and `par3-rs` are Apache-2.0, from `reedsolomon-rs` 0.4.10
-  and `par3-rs` 0.5.1 onward. Neither depends on `unrar-rs`, so neither
-  carries the restriction. `reedsolomon-rs` contains GF(2^16) kernels ported
-  from [ParPar](https://github.com/animetosho/ParPar), which its author
-  released as public domain or CC0.
-- `par2-rs` is GPL-3.0-or-later. Its test suite includes cases adapted from
-  the GPL-2.0-or-later unit tests of par2cmdline, so it was not relicensed
-  with the other libraries. It does not depend on `unrar-rs`.
-- `unrar-rs` is Apache-2.0 plus the unRAR license restriction, from 0.11.0
-  onward; its RAR engine was developed using RARLAB's unRAR source code, and
-  the restriction continues to govern that derived code — see
-  `crates/unrar-rs/LICENSE`.
-- `rarpar` is GPL-3.0-or-later with a GPLv3 section 7 additional permission
-  to combine with `unrar-rs` — see `tools/rarpar/LICENSE`.
-  `unrar-rs` is a default dependency — `default` enables `runtime`, which
-  enables `dep:unrar-rs` — so an ordinary `cargo build`, `cargo install` or
-  release archive contains UnRAR-derived code. Release archives include
-  `LICENSE`, `LICENSE.GPL-3.0-or-later`, and `LICENSE.unrar-rs`.
+Earlier releases of the library crates stay under
+GPL-3.0-or-later (`unrar-rs` with the UnRAR restriction).
 
-Releases of `reedsolomon-rs` before 0.4.10, `par3-rs` before 0.5.1 and
-`unrar-rs` before 0.11.0 stay under GPL-3.0-or-later (`unrar-rs` with the
-unRAR restriction); the change applies to those versions and later ones only.
+The UnRAR restriction covers `unrar-rs` and `rarpar` only, never the PAR2,
+PAR3 or Reed-Solomon crates. That is why those are published with an SPDX
+licence expression, while `unrar-rs` and `rarpar` use a licence file: the
+restriction has no SPDX form.
 
-The additional restriction applies to the RAR extraction and recovery code in
-`unrar-rs`, and to `rarpar`, which includes it by default. It does not apply
-to the PAR2, PAR3 or Reed-Solomon crates, which is why those are published to
-crates.io under a plain SPDX identifier (`Apache-2.0`, or `GPL-3.0-or-later`
-for `par2-rs`) while `unrar-rs` and `rarpar` use `license-file` instead — the
-combination is not expressible as an SPDX identifier.
-
-Building `rarpar` with `--no-default-features` and without `runtime` links no
-`unrar-rs` and is GPL-3.0-or-later alone, but no distributed rarpar is built
-that way.
+Papers and borrowed algorithms are credited in [ATTRIBUTION.md](ATTRIBUTION.md).

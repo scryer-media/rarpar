@@ -1,7 +1,5 @@
 # Publishing
 
-Initial external package version: `0.1.0`.
-
 Publish order:
 
 1. `reedsolomon-rs`
@@ -22,12 +20,10 @@ and CLI behavior, plus dependency requirements and the lockfile. Reuse an
 appropriate unreleased version instead of incrementing it for every follow-up.
 Version preparation does not publish packages or authorize tags or deployment.
 
-For the advanced PAR3 engine, the current versions are `reedsolomon-rs` 0.4.5,
-`par3-rs` 0.4.2, and binary `rarpar` 0.5.1, against `unrar-rs` 0.10.6 and
-`par2-rs` 0.10.3. PAR3 requires arithmetic 0.4.5 and the CLI requires PAR3
-0.4.2. The CLI names each sibling library by workspace path together with
-that version floor, so the binary is always built from the tree being tagged
-while the floor still records the published release it corresponds to. A
+The published versions are whatever crates.io lists; the manifests on `main`
+are the next ones. A crate that uses a sibling library names it by workspace
+path together with a version floor, so a workspace build always uses the
+sibling in the tree while the floor records the published release it needs. A
 floor is a caret requirement (`version = "0.7.1"`), never an exact `=` pin,
 so a later patch release of the library unifies with it in a consumer's
 graph instead of forcing a second copy; the same goes for every external
@@ -43,16 +39,16 @@ Use the dependency order above for coordinated multi-crate releases.
 Before publishing:
 
 ```text
-rtk cargo fmt --check --all
-rtk cargo clippy --locked --workspace --all-targets -- -D warnings
-rtk cargo test --locked --workspace --no-fail-fast
-rtk cargo package --locked -p reedsolomon-rs -p par3-rs
-rtk cargo package --locked --no-verify -p unrar-rs
-rtk cargo package --locked --no-verify -p par2-rs
-rtk cargo package --locked --list -p reedsolomon-rs
-rtk cargo package --locked --list -p unrar-rs
-rtk cargo package --locked --list -p par2-rs
-rtk cargo package --locked --list -p par3-rs
+cargo fmt --check --all
+cargo clippy --locked --workspace --all-targets --features unrar-rs/unstable-internals -- -D warnings
+cargo nextest run --locked --workspace --lib --bins --examples --no-fail-fast --features unrar-rs/unstable-internals
+cargo package --locked -p reedsolomon-rs -p par3-rs
+cargo package --locked --no-verify -p unrar-rs
+cargo package --locked --no-verify -p par2-rs
+cargo package --locked --list -p reedsolomon-rs
+cargo package --locked --list -p unrar-rs
+cargo package --locked --list -p par2-rs
+cargo package --locked --list -p par3-rs
 ```
 
 Use `.github/workflows/publish-crates.yml` for real crates.io publishing. Its
@@ -134,8 +130,8 @@ Verify repository metadata before the first publish.
   supply the GHCR image. The workflow validates this target-specific feature
   policy against the dependency graph and builds from `cargo package -p rarpar`
   output unpacked outside the
-  workspace, so the binary resolves published `weaver-*` crates just as a
-  downstream consumer would. The workspace `[profile.release]` does not
+  workspace, so the binary resolves the published library crates just
+  as a downstream consumer would. The workspace `[profile.release]` does not
   reach a crate unpacked there, so the build passes it as `--config`
   overrides read from `Cargo.toml` by
   `.github/scripts/release/release_profile.py`, and the Linux and macOS
@@ -154,7 +150,7 @@ Verify repository metadata before the first publish.
   workspace crate whose manifest version is not there yet, in dependency
   order. It is manual-only and defaults to dry-run/preflight mode; set
   `dry_run` to `false` to publish. Real publishing runs exact
-  package/list/size checks immediately before each crate, retries failures,
+  package and file-list checks immediately before each crate, retries failures,
   and waits for each published crate version to appear in the crates.io
   index before continuing.
 
@@ -240,5 +236,5 @@ suite. For a first coordinated release of a new shared version, dry-run
 preflight cannot run exact `cargo package` checks for downstream crates until
 their same-version dependencies exist in the registry; it checks manifest
 fixture excludes instead. The protected real publish workflow performs the exact
-downstream package file-list and archive-size checks immediately before each
+downstream package and file-list checks immediately before each
 publish, after the upstream crate has reached the crates.io index.
