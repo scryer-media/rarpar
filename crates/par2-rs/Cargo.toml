@@ -7,14 +7,9 @@ edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0"
 repository.workspace = true
-exclude = [
-    "tests/fixtures/**",
-    "fuzz/**",
-    # Adapted from par2cmdline's GPL tests; they stay GPL and out of the package.
-    "tests/par2cmdline_turbo_*.rs",
-    "tests/support/par2cmdline_turbo_support.rs",
-    "tests/create_interop.rs",
-]
+# The par2cmdline_turbo tests are adapted from par2cmdline's GPL tests; they
+# stay GPL and out of the package.
+exclude = ["tests/fixtures/**", "fuzz/**", "tests/par2cmdline_turbo_*.rs", "tests/support/par2cmdline_turbo_support.rs", "tests/create_interop.rs"]
 
 # Crypto backend selection.
 #
