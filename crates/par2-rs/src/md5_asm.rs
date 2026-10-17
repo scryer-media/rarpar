@@ -25,7 +25,7 @@
 //!   reserves `rbx` for its own use, so B lives in `%r13d` here.
 //! - AArch64: `crypto/fipsmodule/md5/asm/md5-armv8.pl`, Copyright 2021-2022
 //!   The OpenSSL Project Authors, licensed under the Apache License 2.0
-//!   (`LICENSE-APACHE` beside this crate's `LICENSE`). Comments are removed
+//!   (the same licence as this crate). Comments are removed
 //!   and `x19`, which Rust reserves, is renamed to `x30`.
 //!
 //! Both bodies are the generated instruction streams with nothing else

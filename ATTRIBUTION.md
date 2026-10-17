@@ -100,5 +100,6 @@ and [PAR3 draft](https://parchive.github.io/doc/Parity_Volume_Set_Specification_
 specifications. Format facts were established against
 [par2cmdline](https://github.com/Parchive/par2cmdline) and
 [par3cmdline](https://github.com/Parchive/par3cmdline); the `par2-rs` test
-suite includes cases adapted from par2cmdline's unit tests, which is why it
-remains GPL-3.0-or-later.
+suite includes cases adapted from par2cmdline's unit tests. Those test files
+stay GPL-3.0-or-later and are not part of the published crate, which is
+Apache-2.0.
