@@ -52,6 +52,7 @@ pub(crate) mod blake2sp_x86;
 mod differential_tests;
 
 use std::borrow::Cow;
+use std::fmt;
 use std::io::Read;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -83,11 +84,18 @@ pub const CRYPT5_KDF_LG2_COUNT_MAX: u8 = 24;
 /// custom RAR29 SHA-1 KDF and legacy RAR 1.5/2.0 ciphers are RAR-specific
 /// legacy algorithms, so they stay as local implementations.
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Rar5KeyMaterial {
     pub key: [u8; 32],
     pub hash_key: [u8; 32],
     pub psw_check: [u8; 8],
+}
+
+/// Every field is key material, so `Debug` prints the type name alone.
+impl fmt::Debug for Rar5KeyMaterial {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Rar5KeyMaterial").finish_non_exhaustive()
+    }
 }
 
 impl Drop for Rar5KeyMaterial {
@@ -474,12 +482,16 @@ pub(crate) use blake2sp_simd::{Blake2spLeafGroup, GROUP_LEAVES};
 // KDF cache — avoids re-deriving keys for repeated password+salt combinations
 // =============================================================================
 
-const KDF_CACHE_SLOTS: usize = 4;
+/// RAR5 derivations held at once, each keyed on (password, salt, KDF count).
+/// A repeat parse of the same archive finds every key it derived the first
+/// time while it used no more than this many distinct triples; the 65th
+/// overwrites the oldest. Lookups are a linear scan over at most 64 entries.
+const KDF_CACHE_SLOTS: usize = 64;
 
 /// RAR4 keys each `-hp` header from that header's own salt, so a volume walk
 /// derives once per header and a repeat walk of the same image — a volume
 /// still arriving, parsed as each piece lands — only stays cheap while every
-/// one of those salts is still cached. Four slots would evict the first salt
+/// one of those salts is still cached. A small ring would evict the first salt
 /// before the second walk reached it and then miss on every header in turn,
 /// so the RAR4 side holds enough for any volume a facts walk plausibly sees.
 /// Lookups stay a linear scan: each entry is checked by its 8-byte salt first,
@@ -487,7 +499,6 @@ const KDF_CACHE_SLOTS: usize = 4;
 const KDF3_CACHE_SLOTS: usize = 1024;
 
 /// Cached RAR5 key derivation result.
-#[derive(Debug)]
 struct Kdf5Entry {
     password: String,
     salt: [u8; 16],
@@ -508,8 +519,18 @@ impl Drop for Kdf5Entry {
     }
 }
 
+/// Prints the salt and KDF count only: the password and every derived byte stay
+/// out of logs.
+impl fmt::Debug for Kdf5Entry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Kdf5Entry")
+            .field("salt", &self.salt)
+            .field("kdf_count", &self.kdf_count)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Cached RAR4 key derivation result.
-#[derive(Debug)]
 struct Kdf3Entry {
     password: String,
     salt: Option<[u8; 8]>,
@@ -526,6 +547,16 @@ impl Drop for Kdf3Entry {
         self.salt = None;
         self.key.zeroize();
         self.iv.zeroize();
+    }
+}
+
+/// Prints the salt only: the password, key and IV stay out of logs. The RAR4
+/// KDF has a fixed round count, so there is no count to print.
+impl fmt::Debug for Kdf3Entry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Kdf3Entry")
+            .field("salt", &self.salt)
+            .finish_non_exhaustive()
     }
 }
 
@@ -2708,7 +2739,9 @@ pub fn encrypt_cipher_range_rar4(
 /// serialization, deliberately: a key in a log is a key on disk. `PartialEq` is
 /// here for *identity* — "did these two members derive the same key" — and is a
 /// plain byte comparison; nothing authenticates against it, and nothing should.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// It is not `Copy` and zeroizes its key when dropped, so the only copies that
+/// outlive it are ones a caller made with `clone`.
+#[derive(Clone, PartialEq, Eq)]
 pub enum MemberCipherKey {
     /// RAR5 file encryption: AES-256-CBC, keyed by PBKDF2-HMAC-SHA256 over the
     /// `FHEXTRA_CRYPT` salt and iteration count.
@@ -2717,6 +2750,15 @@ pub enum MemberCipherKey {
     /// iterative SHA-1 KDF over the password and the header's optional 8-byte
     /// file salt.
     Aes128([u8; 16]),
+}
+
+impl Drop for MemberCipherKey {
+    fn drop(&mut self) {
+        match self {
+            Self::Aes256(key) => key.zeroize(),
+            Self::Aes128(key) => key.zeroize(),
+        }
+    }
 }
 
 impl MemberCipherKey {
@@ -3825,6 +3867,65 @@ mod tests {
             check
         }));
         assert_eq!(cache.rar5_derivation_count(), 4);
+    }
+
+    #[test]
+    fn rar5_kdf_cache_holds_sixty_four_derivations() {
+        // Sixty-four distinct (password, salt) pairs fill the ring without
+        // evicting any of them, so a repeat of the first derives nothing.
+        let cache = KdfCache::new();
+        let before = cache.rar5_derivation_count();
+        for i in 0..64u8 {
+            let password = format!("slot-{i}");
+            cache.derive_material_rar5(&password, &[i; 16], 4).unwrap();
+        }
+        assert_eq!(cache.rar5_derivation_count(), before + 64);
+
+        let first = cache.derive_material_rar5("slot-0", &[0; 16], 4).unwrap();
+        assert_eq!(cache.rar5_derivation_count(), before + 64);
+        assert_eq!(
+            first.key,
+            derive_rar5_material("slot-0", &[0; 16], 4).unwrap().key
+        );
+    }
+
+    #[test]
+    fn kdf_cache_debug_prints_no_password_or_key_bytes() {
+        let password = "orchid-seventeen";
+        let salt = [0x5Au8; 16];
+        let cache = KdfCache::new();
+        cache.derive_material_rar5(password, &salt, 4).unwrap();
+        let rar4_salt = [0x22u8; 8];
+        cache.derive_key_rar4(password, Some(&rar4_salt));
+
+        let material = derive_rar5_material(password, &salt, 4).unwrap();
+        let (rar4_key, rar4_iv) = rar4_derive_key(password, Some(&rar4_salt));
+        let rendered = format!("{cache:?} {material:?}");
+        assert!(rendered.contains("Kdf5Entry"), "{rendered}");
+        assert!(rendered.contains("Kdf3Entry"), "{rendered}");
+        assert!(!rendered.contains(password), "{rendered}");
+
+        let secrets: [&[u8]; 5] = [
+            &material.key,
+            &material.hash_key,
+            &material.psw_check,
+            &rar4_key,
+            &rar4_iv,
+        ];
+        for secret in secrets {
+            let lower: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+            let upper: String = secret.iter().map(|b| format!("{b:02X}")).collect();
+            let decimal = format!("{secret:?}");
+            let decimal_bare = decimal.trim_start_matches('[').trim_end_matches(']');
+            for needle in [
+                lower.as_str(),
+                upper.as_str(),
+                decimal.as_str(),
+                decimal_bare,
+            ] {
+                assert!(!rendered.contains(needle), "{needle} in {rendered}");
+            }
+        }
     }
 
     #[test]
