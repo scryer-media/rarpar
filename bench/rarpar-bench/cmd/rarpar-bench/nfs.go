@@ -12,7 +12,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/bench"
 	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/nfsrig"
 	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/par3bench"
 )
@@ -138,12 +137,8 @@ func runNFSClient(ctx context.Context, args []string, stdout io.Writer) error {
 		}
 	}
 	if _, err := os.Stat(binaries.Reference); err != nil && config.Reference {
-		lock, err := bench.LoadToolchains(filepath.Join(nfsrig.Source, "bench", "rarpar-bench", "config", "toolchains.json"))
-		if err != nil {
-			return err
-		}
 		build, err := par3bench.BuildReference(ctx, par3bench.ReferenceBuildOptions{
-			Lock: lock, Out: filepath.Join(nfsrig.Cache, "ref"), Cache: filepath.Join(nfsrig.Cache, "ref-archive"),
+			Out: filepath.Join(nfsrig.Cache, "ref"), Cache: filepath.Join(nfsrig.Cache, "ref-archive"),
 			MirrorBase: os.Getenv("RARPAR_TOOL_MIRROR_BASE"), Log: os.Stderr,
 		})
 		if err != nil {

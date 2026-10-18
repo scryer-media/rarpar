@@ -1041,6 +1041,33 @@ func TestResolveToolchainSourcesCoversTheWholeLock(t *testing.T) {
 	}
 }
 
+// An extra archive the lock already names resolves once, not twice.
+func TestResolveToolchainSourcesSkipsAnExtraTheLockNames(t *testing.T) {
+	fixture := newMirrorFixture(t)
+	lock := mirroredToolchainLock(t, fixture)
+	par3, err := PAR3ArchiveSource(lock.PAR3Generator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	if err := ResolveToolchainSources(context.Background(), lock, fixture.mirror, &out, par3); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(strings.Split(strings.TrimSpace(out.String()), "\n")); got != len(lock.RARWriters)+2 {
+		t.Fatalf("resolved %d archives, want %d", got, len(lock.RARWriters)+2)
+	}
+}
+
+func TestPAR3ReferenceIsSourceLocked(t *testing.T) {
+	source, err := PAR3ArchiveSource(PAR3Reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if PAR3Reference.ID == "" || !digestPattern.MatchString(source.BLAKE3) {
+		t.Fatalf("PAR3 reference %+v is not source locked", PAR3Reference)
+	}
+}
+
 // mirroredToolchainLock rewrites the checked-in lock so every archive is a
 // small, mirrored blob, leaving the writer identities and URLs intact.
 func mirroredToolchainLock(t *testing.T, fixture *mirrorFixture) ToolchainLock {

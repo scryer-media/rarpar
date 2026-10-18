@@ -187,10 +187,10 @@ version = "unrar 7.2.3"
 
 [machines.oracles.par2]
 policy = "official-binary"
-url = "https://example.invalid/par2cmdline-turbo-1.4.0-linux-amd64.zip"
+url = "https://example.invalid/par2cmdline-turbo-1.5.0-linux-amd64.zip"
 sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
 archive_member = "par2"
-version = "par2cmdline-turbo 1.4.0"
+version = "par2cmdline-turbo 1.5.0"
 
 [machines.run]
 warmups = 1
@@ -223,13 +223,13 @@ par3_record_sets = ["a-gf16"]
 # macro-par3: the shipped rarpar CLI against the pinned par3cmdline reference
 # on generated data (no corpus). par3cmdline publishes no release and no Linux
 # binary (its tree ships only windows/par3.exe), so the reference is built on
-# the host from the config/toolchains.json pin (the bundle ships that file; the
-# host needs cmake and a C compiler).
+# the host from the commit rarpar-bench pins (internal/par3bench/reference.go;
+# the host needs cmake and a C compiler).
 [machines.oracles.par3]
 policy = "source-build"
 reason = "par3cmdline publishes no release and no Linux binary; the tree ships only windows/par3.exe"
 recipe = "par3cmdline-onhost"
-version = "par3cmdline 0.0.1 (2971702e)"
+version = "par3cmdline 0.0.1 (50ac474a)"
 
 [machines.par3]
 profile = "full"                         # full | smoke | fleet
@@ -306,8 +306,8 @@ version = "unrar 7.2.3"
 
 [machines.oracles.par2]
 policy = "host-path"
-path = "/var/services/homes/bench/bench/bin/par2cmdline-turbo-1.4.0-linux-amd64"
-version = "par2cmdline-turbo 1.4.0"
+path = "/var/services/homes/bench/bench/bin/par2cmdline-turbo-1.5.0-linux-amd64"
+version = "par2cmdline-turbo 1.5.0"
 
 [machines.run]
 warmups = 1
@@ -354,10 +354,10 @@ go_arch = "arm64"                        # the linux-arm64-musl-direct asset
 
 [machines.oracles.par2]
 policy = "official-binary"
-url = "https://example.invalid/par2cmdline-turbo-1.4.0-linux-arm64.zip"
+url = "https://example.invalid/par2cmdline-turbo-1.5.0-linux-arm64.zip"
 sha256 = "3333333333333333333333333333333333333333333333333333333333333333"
 archive_member = "par2"
-version = "par2cmdline-turbo 1.4.0"
+version = "par2cmdline-turbo 1.5.0"
 
 [machines.oracles.rar]
 # The one UnRAR source build, because RARLAB publishes no Linux arm64 UnRAR
@@ -577,11 +577,11 @@ version = "unrar 7.2.3"
 # standing rule applies: use it, never build it.
 [machines.oracles.par3]
 policy = "official-binary"
-url = "https://github.com/Parchive/par3cmdline/archive/2971702e501f1350b1c7b9d11369af9157d6ed56.tar.gz"
-sha256 = "41695d424730bfa4838bada4f2750928f895ff8cf5cb6e6dc81ebe89731c6e8d"
-archive_member = "par3cmdline-2971702e501f1350b1c7b9d11369af9157d6ed56/windows/par3.exe"
-binary_sha256 = "3170c437d54ca1cb3a46bc1f046e6e63a7d0c98fd47177fb2212d687d3febe20"
-version = "par3cmdline 0.0.1 (2971702e)"
+url = "https://github.com/Parchive/par3cmdline/archive/50ac474a0efea20224ce4930020dc16e4ad36ec5.tar.gz"
+sha256 = "c7f8461ec9b49529e839bfc4829b6714c659790ee986f59645eb25563e1d0d73"
+archive_member = "par3cmdline-50ac474a0efea20224ce4930020dc16e4ad36ec5/windows/par3.exe"
+binary_sha256 = "b942f3f170faa0827913da43c98b9b035e06f8db620d5aaed9f02b3d7e721534"
+version = "par3cmdline 0.0.1 (50ac474a)"
 
 [machines.par3]
 profile = "full"

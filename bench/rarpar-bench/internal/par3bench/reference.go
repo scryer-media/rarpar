@@ -27,11 +27,11 @@ import (
 // macOSPatch is the bench-only macOS port of the pinned par3cmdline commit.
 // See the header of the patch file for what it changes and why.
 //
-//go:embed patches/par3cmdline-2971702e-macos.patch
+//go:embed patches/par3cmdline-50ac474a-macos.patch
 var macOSPatch []byte
 
 // macOSPatchCommit is the only par3cmdline commit the patch applies to.
-const macOSPatchCommit = "2971702e501f1350b1c7b9d11369af9157d6ed56"
+const macOSPatchCommit = "50ac474a0efea20224ce4930020dc16e4ad36ec5"
 
 // sse2neon pins the header Leopard's ARM path includes. It is fetched at
 // build time and checked against both digests, not vendored.
@@ -45,7 +45,6 @@ var sse2neon = struct {
 
 // ReferenceBuildOptions configures `par3 build-reference`.
 type ReferenceBuildOptions struct {
-	Lock       bench.ToolchainLock
 	Out        string
 	Cache      string
 	MirrorBase string
@@ -78,11 +77,11 @@ func (o ReferenceBuildOptions) logf(format string, args ...any) {
 	}
 }
 
-// BuildReference resolves the pinned par3cmdline archive (mirror first, then
+// BuildReference resolves the pinned par3cmdline reference archive (mirror first, then
 // the official URL, BLAKE3-verified either way), applies the macOS port on
 // macOS only, and builds it with CMake in Release mode.
 func BuildReference(ctx context.Context, options ReferenceBuildOptions) (ReferenceBuild, error) {
-	generator := options.Lock.PAR3Generator
+	generator := bench.PAR3Reference
 	source, err := bench.PAR3ArchiveSource(generator)
 	if err != nil {
 		return ReferenceBuild{}, err
@@ -130,9 +129,9 @@ func BuildReference(ctx context.Context, options ReferenceBuildOptions) (Referen
 	// hunks are guarded, so the Linux code paths are unchanged.
 	if portPatchApplies(runtime.GOOS, runtime.GOARCH) {
 		if !strings.Contains(generator.URL, macOSPatchCommit) {
-			return ReferenceBuild{}, fmt.Errorf("the macOS port patch is for par3cmdline %s; the lock pins %s — refresh the patch with the pin", macOSPatchCommit, generator.URL)
+			return ReferenceBuild{}, fmt.Errorf("the macOS port patch is for par3cmdline %s; bench.PAR3Reference pins %s — refresh the patch with the pin", macOSPatchCommit, generator.URL)
 		}
-		patchPath := filepath.Join(out, "par3cmdline-2971702e-macos.patch")
+		patchPath := filepath.Join(out, "par3cmdline-50ac474a-macos.patch")
 		if err := os.WriteFile(patchPath, macOSPatch, 0o644); err != nil {
 			return ReferenceBuild{}, err
 		}

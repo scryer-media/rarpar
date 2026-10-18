@@ -523,6 +523,11 @@ class WorkflowTests(unittest.TestCase):
                         self.assertFalse([f for f in flags if f.startswith("-O")], (platform, flags))
                         self.assertEqual("-mno-outline-atomics" in flags,
                                          target == "aarch64-unknown-linux-musl", platform)
+                        # The runner's gcc may default past baseline x86-64
+                        # (see confirm-baseline-x86-64-c-toolchain.sh).
+                        if target.startswith("x86_64-unknown-linux-"):
+                            self.assertIn("-march=x86-64", flags, platform)
+                            self.assertIn("-mtune=generic", flags, platform)
             build = jobs[job].index("- name: Build rarpar")
             script = "confirm-native-code.ps1" if job == "build-windows" else "confirm-native-code.sh"
             self.assertGreater(jobs[job].index(f".github/scripts/release/{script}"), build, job)

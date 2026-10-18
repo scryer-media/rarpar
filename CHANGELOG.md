@@ -3,6 +3,22 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.9.1
+
+### Fixed
+
+- The `linux-x86_64-musl-direct` binary runs on x86_64 CPUs without AVX
+  again. 0.9.0's was built on GitHub's Ubuntu 26.04 runner, whose C
+  toolchain comes from Ubuntu's amd64v3 package variant: its gcc targets
+  x86-64-v3 by default, and the musl `libc.a` it installs is built the same
+  way. mimalloc's startup environment scan came out as AVX2 code, so every
+  command, `--version` included, died with SIGILL before `main` (seen on a
+  4-core Atom C3538). The Linux release builds now install the baseline
+  amd64 toolchain packages and pass `-march=x86-64 -mtune=generic` to C code
+  on x86_64. They also fail if the C compiler predefines anything past
+  baseline x86-64 or a C runtime archive it links carries such instructions.
+  The glibc, arm64, macOS and Windows binaries are unchanged.
+
 ## rarpar 0.9.0
 
 ### Changed

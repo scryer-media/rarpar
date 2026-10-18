@@ -278,12 +278,23 @@ func ToolchainSources(lock ToolchainLock) ([]ArchiveSource, error) {
 }
 
 // ResolveToolchainSources resolves — and, when the mirror publishes, mirrors —
-// every archive the lock pins without building anything, printing one line per
-// archive: kind, name, digest, origin.
-func ResolveToolchainSources(ctx context.Context, lock ToolchainLock, mirror *SourceMirror, out io.Writer) error {
+// every archive the lock pins, then each extra archive the lock does not
+// already name (the benchmark's PAR3 reference), without building anything,
+// printing one line per archive: kind, name, digest, origin.
+func ResolveToolchainSources(ctx context.Context, lock ToolchainLock, mirror *SourceMirror, out io.Writer, extra ...ArchiveSource) error {
 	sources, err := ToolchainSources(lock)
 	if err != nil {
 		return err
+	}
+	named := make(map[string]bool, len(sources))
+	for _, source := range sources {
+		named[source.Kind+"/"+source.Name] = true
+	}
+	for _, source := range extra {
+		if !named[source.Kind+"/"+source.Name] {
+			named[source.Kind+"/"+source.Name] = true
+			sources = append(sources, source)
+		}
 	}
 	cacheDir := mirror.cacheDir()
 	for _, source := range sources {

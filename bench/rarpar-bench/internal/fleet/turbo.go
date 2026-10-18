@@ -67,19 +67,20 @@ const (
 
 	// XZ Utils, the lzma suite's xz oracle, built static-only under the run
 	// root (never installed system-wide). Same pin as lzma-turbo's
-	// .github/scripts/install-xz.sh.
-	xzVersion = "5.8.3"
-	xzSHA256  = "3d3a1b973af218114f4f889bbaa2f4c037deaae0c8e815eec381c3d546b974a0"
+	// .github/scripts/install-xz.sh at the time; bumped 2026-10-18 to the
+	// current stable release.
+	xzVersion = "5.8.4"
+	xzSHA256  = "0014c7886930454fe8bd4228665b51af55eeae560ea135c9c4cd33f55b2591d9"
 
 	// The official 7-Zip console binary for Linux, both suites' 7zz oracle.
-	// Same pins as lzma-turbo's xtask/src/fetch.rs; the standing rule is to
+	// Bumped 2026-10-18 to the current stable 7-Zip; the standing rule is to
 	// use the official release asset, never a distribution package and never
 	// a build of our own.
-	sevenZipVersion   = "26.03"
-	sevenZipAssetX86  = "7z2603-linux-x64.tar.xz"
-	sevenZipSHA256X86 = "dc99eff5008f1ab79bd7084c68513701547a808a89502bf4133683535ab3c695"
-	sevenZipAssetARM  = "7z2603-linux-arm64.tar.xz"
-	sevenZipSHA256ARM = "2389ba20e4d8295e8709c20b6263b69bd1ec4972fe38a04ad7a1badbf595b996"
+	sevenZipVersion   = "26.04"
+	sevenZipAssetX86  = "7z2604-linux-x64.tar.xz"
+	sevenZipSHA256X86 = "fc0327ba27e89bd086cf426dff17d77de582953cdbbc10a6576540a06853ffcd"
+	sevenZipAssetARM  = "7z2604-linux-arm64.tar.xz"
+	sevenZipSHA256ARM = "5b0ac3aa91c1e3499f011d6af69d7f6b4de3ef2f011d9e2ff44c58ebd04aa388"
 )
 
 func rustupURL(triple string) string {

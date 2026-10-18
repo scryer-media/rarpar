@@ -152,7 +152,11 @@ func runToolchains(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		return bench.ResolveToolchainSources(ctx, lock, mirror, os.Stdout)
+		reference, err := bench.PAR3ArchiveSource(bench.PAR3Reference)
+		if err != nil {
+			return err
+		}
+		return bench.ResolveToolchainSources(ctx, lock, mirror, os.Stdout, reference)
 	default:
 		return fmt.Errorf("unknown toolchains command %q", args[0])
 	}

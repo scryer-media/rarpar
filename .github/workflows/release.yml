@@ -253,13 +253,17 @@ jobs:
       # no optimisation level: the cc crate already passes -O3 from the release
       # profile, and it appends CFLAGS after a build script's own flags, so an
       # -O3 here would override the -O0 aws-lc-sys compiles jitterentropy with.
+      # x86_64 passes -march=x86-64 -mtune=generic: the ubuntu-26.04 image's
+      # amd64v3 gcc targets x86-64-v3 by default, and C code outside AWS-LC's
+      # runtime-dispatched assembly must start on any x86_64 CPU (0.9.0's
+      # musl binary died with SIGILL without AVX).
       # aarch64 musl also passes -mno-outline-atomics, as weaver does, so C
       # code inlines its atomics instead of calling libgcc's __aarch64_*
       # outline helpers from the static musl binary.
-      CFLAGS_x86_64_unknown_linux_gnu: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
-      CXXFLAGS_x86_64_unknown_linux_gnu: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
-      CFLAGS_x86_64_unknown_linux_musl: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden -DMI_DEFAULT_ALLOW_THP=0"
-      CXXFLAGS_x86_64_unknown_linux_musl: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      CFLAGS_x86_64_unknown_linux_gnu: "-DNDEBUG -march=x86-64 -mtune=generic -ffunction-sections -fdata-sections -fvisibility=hidden"
+      CXXFLAGS_x86_64_unknown_linux_gnu: "-DNDEBUG -march=x86-64 -mtune=generic -ffunction-sections -fdata-sections -fvisibility=hidden"
+      CFLAGS_x86_64_unknown_linux_musl: "-DNDEBUG -march=x86-64 -mtune=generic -ffunction-sections -fdata-sections -fvisibility=hidden -DMI_DEFAULT_ALLOW_THP=0"
+      CXXFLAGS_x86_64_unknown_linux_musl: "-DNDEBUG -march=x86-64 -mtune=generic -ffunction-sections -fdata-sections -fvisibility=hidden"
       CFLAGS_aarch64_unknown_linux_gnu: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
       CXXFLAGS_aarch64_unknown_linux_gnu: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
       CFLAGS_aarch64_unknown_linux_musl: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden -mno-outline-atomics -DMI_DEFAULT_ALLOW_THP=0"
@@ -308,6 +312,8 @@ jobs:
         run: .github/scripts/release/install-build-dependencies-linux.sh
       - name: Configure build environment
         run: .github/scripts/release/configure-build-environment-linux.sh
+      - name: Confirm a baseline x86_64 C toolchain
+        run: .github/scripts/release/confirm-baseline-x86-64-c-toolchain.sh
       - name: Stage rarpar release source
         run: .github/scripts/release/stage-release-source.sh
       - name: Audit release target features
