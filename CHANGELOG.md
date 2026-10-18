@@ -3,6 +3,12 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.9.2
+
+### Changed
+
+- Builds against unrar-rs 0.13.0. No CLI behaviour changed.
+
 ## rarpar 0.9.1
 
 ### Fixed
