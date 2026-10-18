@@ -39,6 +39,9 @@ check_macros "with $cflags_var" "${cflags[@]}"
 # instructions that x86-64-v2 and v3 add. objdump prints tzcnt for the
 # rep bsf baseline compilers emit, so tzcnt is not on the list.
 pattern='^[[:space:]]*[0-9a-f]+:[[:space:]]+(v[a-z0-9]+[[:space:]].*%[xyz]mm|.*%[yz]mm|(andn|bextr|blsi|blsmsk|blsr|bzhi|mulx|pdep|pext|rorx|sarx|shlx|shrx|lzcnt|movbe|popcnt|crc32)[bwlq]?[[:space:]])'
+# libgcc.a carries the ms-ABI AVX register save/restore stubs on every
+# x86_64 gcc, baseline included; only -mcall-ms2sysv-xlogues links them.
+skip_members='^(avx_(sav|res)ms64[a-z]*)\.o$'
 check_archive() {
   local archive="$1" hits
   if [ ! -f "$archive" ]; then
@@ -46,7 +49,11 @@ check_archive() {
     failed=1
     return
   fi
-  hits="$(objdump -d --no-show-raw-insn "$archive" | grep -E "$pattern" || true)"
+  hits="$(objdump -d --no-show-raw-insn "$archive" \
+    | awk -v skip="$skip_members" '
+        /:[[:space:]]+file format / { member = $1; sub(/:$/, "", member); skipping = (member ~ skip); next }
+        !skipping { print }' \
+    | grep -E "$pattern" || true)"
   if [ -n "$hits" ]; then
     echo "::error::$archive carries $(wc -l <<< "$hits") instructions past baseline x86-64"
     head -n 10 <<< "$hits"

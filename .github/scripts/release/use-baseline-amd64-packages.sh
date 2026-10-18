@@ -44,6 +44,8 @@ mapfile -t toolchain < <(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' \
   'libc6' 'libc6-dev' 'libgcc-s1' 'libstdc++6' 2>/dev/null | awk '$1 == "ii" { print $2 }')
 if [ "${#toolchain[@]}" -gt 0 ]; then
   echo "reinstalling the baseline amd64 builds of: ${toolchain[*]}"
-  sudo apt-get install -y --no-install-recommends --reinstall "${toolchain[@]}"
+  # apt orders the v3 builds above the baseline ones, so swapping them back
+  # is a downgrade of the same upstream version.
+  sudo apt-get install -y --no-install-recommends --reinstall --allow-downgrades "${toolchain[@]}"
 fi
 gcc -v 2>&1 | grep -o -e '--with-arch[^ ]*' -e '--with-tune[^ ]*' || echo "gcc configures no default --with-arch"
