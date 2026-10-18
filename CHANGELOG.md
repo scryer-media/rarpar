@@ -13,7 +13,7 @@ documented in each crate's own changelog so those notes ship with the crate.
   Send tracing diagnostics to stderr so warnings leave JSON output parseable.
 
 - RAR5 volume recovery allocates buffers for the useful volume length and
-  creates read-ahead buffers only for multi-chunk restores (unrar-rs 0.12.1).
+  creates read-ahead buffers only for multi-chunk restores (unrar-rs 0.13.0).
 
 - Retain production compute-tile and source-batch defaults while exposing
   diagnostic-only controls for further validation.
@@ -24,6 +24,9 @@ documented in each crate's own changelog so those notes ship with the crate.
 - Use ParPar's paired x86-64/AArch64 MD5 assembly where strict verification is
   already serial, preserving the available two-chain parallel pipeline, 16 KiB
   prefix, slice padding, and single-stream fallback.
+
+- Builds against unrar-rs 0.13.0, which also caches up to 64 RAR5 key
+  derivations and keeps passwords and key material out of `Debug` output.
 
 ## rarpar 0.9.1
 
