@@ -105,7 +105,7 @@ func sourceBuildResolution(machine Machine, role string, oracle Oracle, layout R
 	switch oracle.Recipe {
 	case RecipePAR3CmdlineHost:
 		resolution.RemotePath = hostJoin(machine, par3ReferenceDir(machine, layout), "build", "par3cmd", oracleBinaryName(machine, role, oracle))
-		resolution.Origin = "on-host source build (" + oracle.Recipe + ") of the config/toolchains.json par3_generator pin"
+		resolution.Origin = "on-host source build (" + oracle.Recipe + ") of the config/toolchains.json par3_reference pin (par3_generator when unset)"
 	case RecipeUnrarHost:
 		resolution.RemotePath = hostJoin(machine, unrarReferenceDir(machine, layout), unrarBinaryName)
 		resolution.SHA256 = oracle.BinarySHA256

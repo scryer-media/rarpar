@@ -1021,7 +1021,7 @@ func validateOracles(state *decodeState, prefix string, machine *Machine) {
 			case recipeRole != role:
 				state.fail("%s: oracles.%s.recipe %q builds the %s oracle, not %s", prefix, role, oracle.Recipe, recipeRole, role)
 			case oracle.Recipe == RecipePAR3CmdlineHost:
-				// The source pin lives in config/toolchains.json (par3_generator,
+				// The source pin lives in config/toolchains.json (par3_reference,
 				// BLAKE3-verified, mirror first); a second pin here could only
 				// disagree with it.
 				if oracle.URL != "" || oracle.SHA256 != "" {

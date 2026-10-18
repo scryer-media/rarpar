@@ -540,10 +540,10 @@ On the host, the run script:
 1. installs rustup 1.29.1 from its pinned, digest-checked installer under the
    run root with no default toolchain, so each checkout's `rust-toolchain.toml`
    installs exactly its own compiler;
-2. fetches the official 7-Zip 26.03 Linux release (digest-checked) as the
-   `7zz` oracle, with the same pin lzma-turbo's `xtask` carries;
+2. fetches the official 7-Zip 26.04 Linux release (digest-checked) as the
+   `7zz` oracle;
 3. for `lzma-turbo`: clones the bundle, verifies the commit, builds XZ Utils
-   5.8.3 from its pinned tarball (static), runs `toolchain --build`,
+   5.8.4 from its pinned tarball (static), runs `toolchain --build`,
    `fixtures`, then `run --profile <lzma_profile>` into `results/lzma-turbo/`;
 4. for `sevenz-turbo`: clones the bundle, verifies the commit, builds
    `decode-bench` twice (`aws-lc-rs` and `native-crypto`), generates the
