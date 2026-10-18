@@ -34,36 +34,36 @@ RAR archives.
 
 How many times faster than the reference tools a whole `rarpar` run is
 (2.0× is half the time). The references are RARLAB's UnRAR and
-par2cmdline-turbo 1.4.0.
+par2cmdline-turbo 1.5.0.
 
 | CPU | Arch | Instruction set | unrar (binary) | unrar (text) | par2 (heavy) |
 |---|---|---|---:|---:|---:|
-| AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 2.5× | 1.8× | 3.3× |
-| Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 2.0× | 1.5× | 2.5× |
-| Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 1.6× | 1.4× | 3.0× |
-| Intel Xeon Platinum 8124M (Skylake-SP) | x86-64 | AVX-512 | 1.6× | 1.3× | 2.3× |
-| AMD Ryzen 5 3600 (Zen 2) † | x86-64 | AVX2 | 1.6× | 1.5× | 1.6× |
-| Intel Xeon E5-2666 v3 (Haswell) | x86-64 | AVX2 | 1.6× | 1.3× | 2.3× |
-| Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.2× | 1.4× | 1.6× |
+| AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 2.2× | 1.6× | 3.1× |
+| Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 2.3× | 1.5× | 2.5× |
+| Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 2.2× | 1.4× | 2.7× |
+| Intel Xeon Platinum 8124M (Skylake-SP) | x86-64 | AVX-512 | 1.8× | 1.3× | 2.2× |
+| AMD Ryzen 5 3600 (Zen 2) | x86-64 | AVX2 | 2.2× | 1.7× | 1.9× |
+| Intel Xeon E5-2666 v3 (Haswell) | x86-64 | AVX2 | 1.8× | 1.3× | 2.2× |
+| Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.8× | 1.4× | 1.5× |
 | Apple M5 Max † | arm64 | NEON | 1.3× | 1.5× | 7.8× |
-| Arm Cortex-A72 | arm64 | NEON | 2.0× | 1.6× | 1.3× |
-| Arm Neoverse N1 | arm64 | NEON | 2.9× | 1.7× | 1.8× |
-| Arm Neoverse V2 | arm64 | NEON | 3.1× | 1.8× | 2.0× |
+| Arm Cortex-A72 | arm64 | NEON | 2.3× | 1.5× | 1.4× |
+| Arm Neoverse N1 | arm64 | NEON | 2.9× | 1.6× | 1.8× |
+| Arm Neoverse V2 | arm64 | NEON | 3.1× | 1.7× | 1.9× |
 
 - **unrar (binary)** is extracting stored media, with and without encryption.
 - **unrar (text)** is extracting compressed data, including PPMd.
 - **par2 (heavy)** is the two heavy repairs.
-- † From an older release (`rarpar` 0.3.3), awaiting a re-measure. The other
-  rows measure `rarpar` 0.8.0 and 0.8.1.
+- † From an older release (`rarpar` 0.3.3, against par2cmdline-turbo 1.4.0),
+  awaiting a re-measure. The other rows measure `rarpar` 0.9.0 and 0.9.1.
 - The Apple PAR2 figure is against par2cmdline-turbo's macOS arm64 build,
   which is much slower than its Linux and Windows builds.
 
-Encrypted extraction gains the most, up to 11.9×. A few cases are at or just
-below parity, among them PAR2 verify on the Intel machines and stored media on
-Denverton.
+Encrypted extraction gains the most, up to 12.7×. A few cases are at or just
+below parity, among them PAR2 verify and missing-volume repair on the cloud
+x86-64 machines and dense source text on Alder Lake and Denverton.
 
-PAR3, against par3cmdline 0.0.1 on Alder Lake and Denverton: creating is
-4.6×–7.6× faster, verifying 5.2×–5.8×, repairing 6.3×–8.6×.
+PAR3, against par3cmdline 0.0.1 on Alder Lake, Zen 2 and Denverton: creating
+is 4.4×–7.1× faster, verifying 5.2×–6.0×, repairing 6.2×–10×.
 
 Release builds run on the CPU only; the GPU options of the PAR2 library are
 not turned on. Every case, chart, method and version is in

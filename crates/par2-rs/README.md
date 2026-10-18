@@ -96,17 +96,17 @@ through the `rarpar` command (2.0× is half the time):
 
 | CPU | Arch | Instruction set | par2 (heavy) |
 |---|---|---|---:|
-| AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 3.3× |
+| AMD EPYC 9R14 (Zen 4) | x86-64 | GFNI + AVX-512 | 3.1× |
 | Intel Xeon Platinum 8488C (Sapphire Rapids) | x86-64 | GFNI + AVX-512 | 2.5× |
-| Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 3.0× |
-| Intel Xeon Platinum 8124M (Skylake-SP) | x86-64 | AVX-512 | 2.3× |
-| AMD Ryzen 5 3600 (Zen 2) † | x86-64 | AVX2 | 1.6× |
-| Intel Xeon E5-2666 v3 (Haswell) | x86-64 | AVX2 | 2.3× |
-| Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.6× |
+| Intel Core i5-1240P (Alder Lake) | x86-64 | GFNI + AVX2 | 2.7× |
+| Intel Xeon Platinum 8124M (Skylake-SP) | x86-64 | AVX-512 | 2.2× |
+| AMD Ryzen 5 3600 (Zen 2) | x86-64 | AVX2 | 1.9× |
+| Intel Xeon E5-2666 v3 (Haswell) | x86-64 | AVX2 | 2.2× |
+| Intel Atom C3538 (Denverton) | x86-64 | SSSE3 (no AVX) | 1.5× |
 | Apple M5 Max † | arm64 | NEON | 7.8× |
-| Arm Cortex-A72 | arm64 | NEON | 1.3× |
+| Arm Cortex-A72 | arm64 | NEON | 1.4× |
 | Arm Neoverse N1 | arm64 | NEON | 1.8× |
-| Arm Neoverse V2 | arm64 | NEON | 2.0× |
+| Arm Neoverse V2 | arm64 | NEON | 1.9× |
 
 † From an older release, awaiting a re-measure.
 

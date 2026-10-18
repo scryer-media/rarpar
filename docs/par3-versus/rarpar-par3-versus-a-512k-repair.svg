@@ -11,7 +11,7 @@
     .cpu { fill: #2563eb; } .gpu { fill: #7c3aed; } .slower { fill: #d97706; }
     @media (prefers-color-scheme: dark) { .bg { fill: #0d1117; } text { fill: #e6edf3; } .subtitle, .column, .timing, .tick { fill: #9ca7b5; } .grid { stroke: #30363d; } .parity { stroke: #e6edf3; } .rule { stroke: #21262d; } .cpu { fill: #58a6ff; } .gpu { fill: #bc8cff; } .slower { fill: #f2a65a; } }
   </style>
-  <metadata>schema=rarpar-par3-bench-v4; shape=a-512k; op=repair; baseline=par2cmdline-turbo; inputs=Alder Lake:93a71095a0cbe63c5423a1db0f7563455e0878d1ce5c298d9542e8bc992fb62b:1/7, Denverton:93a71095a0cbe63c5423a1db0f7563455e0878d1ce5c298d9542e8bc992fb62b:1/7</metadata>
+  <metadata>schema=rarpar-par3-bench-v4; shape=a-512k; op=repair; baseline=par2cmdline-turbo; inputs=Alder Lake:651cd0b230936bb5a12004764b528af84bb27470c5caf1349ee4b5664bc414eb:1/7, Zen 2:c63b4ff2013eba76e12d626ddfa8c84acf4e44ec6b64090ea5ec69c8a067876f:1/7</metadata>
   <rect class="bg" width="1200" height="674"/>
   <text class="title" x="48" y="48">PAR2 against PAR3: a-512k, repair</text>
   <text class="subtitle" x="48" y="75">Damage lost-20x512k (20 blocks). 1 GiB in one file, 512 KiB blocks, 2% (2048 + 41): the par2cmdline cluster of about 2000 blocks at 2%.</text>
@@ -32,69 +32,69 @@
   <g aria-label="a-512k repair rows">
     <text class="machine" x="48" y="152">Alder Lake</text><text class="timing" x="148" y="152">linux / amd64, 16 logical CPUs, rarpar par3 at 16 workers, 7 run(s) per arm</text>
     <text class="workload" x="64" y="176">par2-rs, in place</text>
-    <text class="timing" x="360" y="176">1.20 s wall  ·  4.53 s CPU  ·  213 MiB</text>
-    <rect class="cpu" x="885.0" y="165" width="159.1" height="12" rx="2"/>
-    <text class="ratio" x="1052.1" y="176">3.5x</text>
+    <text class="timing" x="360" y="176">1.24 s wall  ·  4.56 s CPU  ·  224 MiB</text>
+    <rect class="cpu" x="885.0" y="165" width="156.2" height="12" rx="2"/>
+    <text class="ratio" x="1049.2" y="176">3.4x</text>
     <text class="workload" x="64" y="200">par2cmdline-turbo, retains file</text>
-    <text class="timing" x="360" y="200">4.19 s wall  ·  5.46 s CPU  ·  213 MiB</text>
+    <text class="timing" x="360" y="200">4.21 s wall  ·  5.51 s CPU  ·  224 MiB</text>
     <text class="ratio" x="893.0" y="200">baseline</text>
     <text class="workload" x="64" y="224">par3cmdline (Cauchy), retains file</text>
-    <text class="timing" x="360" y="224">9.45 s wall  ·  9.44 s CPU  ·  213 MiB</text>
-    <rect class="slower" x="781.2" y="213" width="103.8" height="12" rx="2"/>
-    <text class="ratio" x="773.2" y="224" text-anchor="end">2.3x</text>
+    <text class="timing" x="360" y="224">9.42 s wall  ·  9.41 s CPU  ·  224 MiB</text>
+    <rect class="slower" x="782.5" y="213" width="102.5" height="12" rx="2"/>
+    <text class="ratio" x="774.5" y="224" text-anchor="end">2.2x</text>
     <text class="workload" x="64" y="248">par3cmdline (FFT), retains file</text>
-    <text class="timing" x="360" y="248">6.34 s wall  ·  6.33 s CPU  ·  3087 MiB</text>
-    <rect class="slower" x="832.1" y="237" width="52.9" height="12" rx="2"/>
-    <text class="ratio" x="824.1" y="248" text-anchor="end">1.5x</text>
+    <text class="timing" x="360" y="248">6.49 s wall  ·  6.49 s CPU  ·  3087 MiB</text>
+    <rect class="slower" x="829.9" y="237" width="55.1" height="12" rx="2"/>
+    <text class="ratio" x="821.9" y="248" text-anchor="end">1.5x</text>
     <text class="workload" x="64" y="272">rarpar par3 (Cauchy), in place</text>
-    <text class="timing" x="360" y="272">0.85 s wall  ·  3.96 s CPU  ·  213 MiB</text>
-    <rect class="cpu" x="885.0" y="261" width="203.7" height="12" rx="2"/>
-    <text class="ratio" x="1096.7" y="272">4.9x</text>
+    <text class="timing" x="360" y="272">0.88 s wall  ·  4.05 s CPU  ·  224 MiB</text>
+    <rect class="cpu" x="885.0" y="261" width="200.1" height="12" rx="2"/>
+    <text class="ratio" x="1093.1" y="272">4.8x</text>
     <text class="workload" x="64" y="296">rarpar par3 (Cauchy), retains file</text>
-    <text class="timing" x="360" y="296">1.14 s wall  ·  3.75 s CPU  ·  213 MiB</text>
-    <rect class="cpu" x="885.0" y="285" width="165.8" height="12" rx="2"/>
-    <text class="ratio" x="1058.8" y="296">3.7x</text>
+    <text class="timing" x="360" y="296">0.92 s wall  ·  3.79 s CPU  ·  224 MiB</text>
+    <rect class="cpu" x="885.0" y="285" width="194.0" height="12" rx="2"/>
+    <text class="ratio" x="1087.0" y="296">4.6x</text>
     <text class="workload" x="64" y="320">rarpar par3 (FFT), in place</text>
-    <text class="timing" x="360" y="320">0.94 s wall  ·  3.38 s CPU  ·  213 MiB</text>
-    <rect class="cpu" x="885.0" y="309" width="190.7" height="12" rx="2"/>
-    <text class="ratio" x="1083.7" y="320">4.5x</text>
+    <text class="timing" x="360" y="320">0.97 s wall  ·  3.36 s CPU  ·  224 MiB</text>
+    <rect class="cpu" x="885.0" y="309" width="186.8" height="12" rx="2"/>
+    <text class="ratio" x="1079.8" y="320">4.3x</text>
     <text class="workload" x="64" y="344">rarpar par3 (FFT), retains file</text>
-    <text class="timing" x="360" y="344">1.22 s wall  ·  3.15 s CPU  ·  213 MiB</text>
-    <rect class="cpu" x="885.0" y="333" width="157.2" height="12" rx="2"/>
-    <text class="ratio" x="1050.2" y="344">3.4x</text>
+    <text class="timing" x="360" y="344">0.98 s wall  ·  3.07 s CPU  ·  224 MiB</text>
+    <rect class="cpu" x="885.0" y="333" width="185.6" height="12" rx="2"/>
+    <text class="ratio" x="1078.6" y="344">4.3x</text>
     <line class="rule" x1="48" y1="357" x2="1150" y2="357"/>
-    <text class="machine" x="48" y="382">Denverton</text><text class="timing" x="139" y="382">linux / amd64, 4 logical CPUs, rarpar par3 at 4 workers, 7 run(s) per arm</text>
+    <text class="machine" x="48" y="382">Zen 2</text><text class="timing" x="105" y="382">windows / amd64, 12 logical CPUs, rarpar par3 at 12 workers, 7 run(s) per arm</text>
     <text class="workload" x="64" y="406">par2-rs, in place</text>
-    <text class="timing" x="360" y="406">6.34 s wall  ·  14.40 s CPU  ·  211 MiB</text>
-    <rect class="cpu" x="885.0" y="395" width="100.1" height="12" rx="2"/>
-    <text class="ratio" x="993.1" y="406">2.2x</text>
+    <text class="timing" x="360" y="406">1.47 s wall  ·  1.11 s CPU  ·  63 MiB</text>
+    <rect class="cpu" x="885.0" y="395" width="165.1" height="12" rx="2"/>
+    <text class="ratio" x="1058.1" y="406">3.7x</text>
     <text class="workload" x="64" y="430">par2cmdline-turbo, retains file</text>
-    <text class="timing" x="360" y="430">13.91 s wall  ·  18.60 s CPU  ·  211 MiB</text>
+    <text class="timing" x="360" y="430">5.38 s wall  ·  4.80 s CPU  ·  28 MiB</text>
     <text class="ratio" x="893.0" y="430">baseline</text>
     <text class="workload" x="64" y="454">par3cmdline (Cauchy), retains file</text>
-    <text class="timing" x="360" y="454">44.40 s wall  ·  43.78 s CPU  ·  211 MiB</text>
-    <rect class="slower" x="737.1" y="443" width="147.9" height="12" rx="2"/>
-    <text class="ratio" x="729.1" y="454" text-anchor="end">3.2x</text>
+    <text class="timing" x="360" y="454">12.98 s wall  ·  9.39 s CPU  ·  15 MiB</text>
+    <rect class="slower" x="772.6" y="443" width="112.4" height="12" rx="2"/>
+    <text class="ratio" x="764.6" y="454" text-anchor="end">2.4x</text>
     <text class="workload" x="64" y="478">par3cmdline (FFT), retains file</text>
-    <text class="timing" x="360" y="478">24.80 s wall  ·  24.45 s CPU  ·  3084 MiB</text>
-    <rect class="slower" x="811.3" y="467" width="73.7" height="12" rx="2"/>
-    <text class="ratio" x="803.3" y="478" text-anchor="end">1.8x</text>
+    <text class="timing" x="360" y="478">8.66 s wall  ·  7.66 s CPU  ·  3094 MiB</text>
+    <rect class="slower" x="824.2" y="467" width="60.8" height="12" rx="2"/>
+    <text class="ratio" x="816.2" y="478" text-anchor="end">1.6x</text>
     <text class="workload" x="64" y="502">rarpar par3 (Cauchy), in place</text>
-    <text class="timing" x="360" y="502">8.27 s wall  ·  19.27 s CPU  ·  211 MiB</text>
-    <rect class="cpu" x="885.0" y="491" width="66.3" height="12" rx="2"/>
-    <text class="ratio" x="959.3" y="502">1.7x</text>
+    <text class="timing" x="360" y="502">1.89 s wall  ·  1.38 s CPU  ·  32 MiB</text>
+    <rect class="cpu" x="885.0" y="491" width="133.0" height="12" rx="2"/>
+    <text class="ratio" x="1026.0" y="502">2.8x</text>
     <text class="workload" x="64" y="526">rarpar par3 (Cauchy), retains file</text>
-    <text class="timing" x="360" y="526">7.79 s wall  ·  17.51 s CPU  ·  211 MiB</text>
-    <rect class="cpu" x="885.0" y="515" width="73.9" height="12" rx="2"/>
-    <text class="ratio" x="966.9" y="526">1.8x</text>
+    <text class="timing" x="360" y="526">1.72 s wall  ·  1.39 s CPU  ·  32 MiB</text>
+    <rect class="cpu" x="885.0" y="515" width="145.1" height="12" rx="2"/>
+    <text class="ratio" x="1038.1" y="526">3.1x</text>
     <text class="workload" x="64" y="550">rarpar par3 (FFT), in place</text>
-    <text class="timing" x="360" y="550">6.26 s wall  ·  11.62 s CPU  ·  211 MiB</text>
-    <rect class="cpu" x="885.0" y="539" width="101.8" height="12" rx="2"/>
-    <text class="ratio" x="994.8" y="550">2.2x</text>
+    <text class="timing" x="360" y="550">1.85 s wall  ·  1.52 s CPU  ·  30 MiB</text>
+    <rect class="cpu" x="885.0" y="539" width="136.0" height="12" rx="2"/>
+    <text class="ratio" x="1029.0" y="550">2.9x</text>
     <text class="workload" x="64" y="574">rarpar par3 (FFT), retains file</text>
-    <text class="timing" x="360" y="574">5.87 s wall  ·  9.83 s CPU  ·  211 MiB</text>
-    <rect class="cpu" x="885.0" y="563" width="109.9" height="12" rx="2"/>
-    <text class="ratio" x="1002.9" y="574">2.4x</text>
+    <text class="timing" x="360" y="574">1.76 s wall  ·  1.33 s CPU  ·  30 MiB</text>
+    <rect class="cpu" x="885.0" y="563" width="142.6" height="12" rx="2"/>
+    <text class="ratio" x="1035.6" y="574">3.1x</text>
     <line class="rule" x1="48" y1="587" x2="1150" y2="587"/>
   </g>
 </svg>
