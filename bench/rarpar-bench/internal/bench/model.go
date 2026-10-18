@@ -35,6 +35,17 @@ type ToolchainLock struct {
 	PAR3Generator PAR3Generator `json:"par3_generator"`
 }
 
+// PAR3Reference is the par3cmdline source the benchmark builds as its PAR3
+// oracle (par3bench's macOS patch applies to this commit only). It moves with
+// upstream, so it is not in config/toolchains.json: that file is the corpus
+// toolchain lock, the published corpus manifest pins its digest, and its
+// par3_generator stays at the commit that wrote the published PAR3 fixtures.
+var PAR3Reference = PAR3Generator{
+	ID:     "par3cmdline-50ac474a",
+	URL:    "https://github.com/Parchive/par3cmdline/archive/50ac474a0efea20224ce4930020dc16e4ad36ec5.tar.gz",
+	BLAKE3: "1a6dd80d9da6b9fe372481e8d6bc39f437985a3da27b7c6a56545dfad543ca1b",
+}
+
 type VideoEncoder struct {
 	ID       string `json:"id"`
 	Image    string `json:"image"`

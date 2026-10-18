@@ -33,17 +33,6 @@ var macOSPatch []byte
 // macOSPatchCommit is the only par3cmdline commit the patch applies to.
 const macOSPatchCommit = "50ac474a0efea20224ce4930020dc16e4ad36ec5"
 
-// referencePin is the par3cmdline source the benchmark builds as its PAR3
-// oracle. It moves with upstream, so it lives here and not in
-// config/toolchains.json: that file is the corpus toolchain lock, the
-// published corpus manifest pins its digest, and its par3_generator stays at
-// the commit that wrote the published PAR3 fixtures.
-var referencePin = bench.PAR3Generator{
-	ID:     "par3cmdline-50ac474a",
-	URL:    "https://github.com/Parchive/par3cmdline/archive/" + macOSPatchCommit + ".tar.gz",
-	BLAKE3: "1a6dd80d9da6b9fe372481e8d6bc39f437985a3da27b7c6a56545dfad543ca1b",
-}
-
 // sse2neon pins the header Leopard's ARM path includes. It is fetched at
 // build time and checked against both digests, not vendored.
 var sse2neon = struct {
@@ -92,7 +81,7 @@ func (o ReferenceBuildOptions) logf(format string, args ...any) {
 // the official URL, BLAKE3-verified either way), applies the macOS port on
 // macOS only, and builds it with CMake in Release mode.
 func BuildReference(ctx context.Context, options ReferenceBuildOptions) (ReferenceBuild, error) {
-	generator := referencePin
+	generator := bench.PAR3Reference
 	source, err := bench.PAR3ArchiveSource(generator)
 	if err != nil {
 		return ReferenceBuild{}, err
@@ -140,7 +129,7 @@ func BuildReference(ctx context.Context, options ReferenceBuildOptions) (Referen
 	// hunks are guarded, so the Linux code paths are unchanged.
 	if portPatchApplies(runtime.GOOS, runtime.GOARCH) {
 		if !strings.Contains(generator.URL, macOSPatchCommit) {
-			return ReferenceBuild{}, fmt.Errorf("the macOS port patch is for par3cmdline %s; the lock pins %s — refresh the patch with the pin", macOSPatchCommit, generator.URL)
+			return ReferenceBuild{}, fmt.Errorf("the macOS port patch is for par3cmdline %s; bench.PAR3Reference pins %s — refresh the patch with the pin", macOSPatchCommit, generator.URL)
 		}
 		patchPath := filepath.Join(out, "par3cmdline-50ac474a-macos.patch")
 		if err := os.WriteFile(patchPath, macOSPatch, 0o644); err != nil {
