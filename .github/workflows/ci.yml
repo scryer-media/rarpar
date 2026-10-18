@@ -1174,6 +1174,10 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: .github/scripts/ci/target-checks-install-build-dependencies-linux.sh
+      - name: Confirm a baseline x86_64 C toolchain
+        env:
+          TARGET: ${{ matrix.target }}
+        run: .github/scripts/release/confirm-baseline-x86-64-c-toolchain.sh
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:

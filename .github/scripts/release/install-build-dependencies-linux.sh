@@ -8,5 +8,6 @@ esac
 case "$RELEASE_TARGET" in
   *-musl) packages+=(musl-tools) ;;
 esac
+.github/scripts/release/use-baseline-amd64-packages.sh
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends "${packages[@]}"

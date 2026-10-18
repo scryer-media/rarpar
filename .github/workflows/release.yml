@@ -308,6 +308,8 @@ jobs:
         run: .github/scripts/release/install-build-dependencies-linux.sh
       - name: Configure build environment
         run: .github/scripts/release/configure-build-environment-linux.sh
+      - name: Confirm a baseline x86_64 C toolchain
+        run: .github/scripts/release/confirm-baseline-x86-64-c-toolchain.sh
       - name: Stage rarpar release source
         run: .github/scripts/release/stage-release-source.sh
       - name: Audit release target features
