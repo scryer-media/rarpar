@@ -191,7 +191,7 @@ func TestConfigValidation(t *testing.T) {
 		},
 		{
 			name: "macro suite without an oracle is refused",
-			old:  "[machines.oracles.par2]\npolicy = \"host-path\"\npath = \"/var/services/homes/bench/bench/bin/par2cmdline-turbo-1.4.0-linux-amd64\"\nversion = \"par2cmdline-turbo 1.4.0\"",
+			old:  "[machines.oracles.par2]\npolicy = \"host-path\"\npath = \"/var/services/homes/bench/bench/bin/par2cmdline-turbo-1.5.0-linux-amd64\"\nversion = \"par2cmdline-turbo 1.5.0\"",
 			new:  "",
 			want: "needs [machines.oracles.par2]",
 		},

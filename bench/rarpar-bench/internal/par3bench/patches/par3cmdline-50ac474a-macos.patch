@@ -1,4 +1,4 @@
-rarpar-bench macOS port of par3cmdline 2971702e501f1350b1c7b9d11369af9157d6ed56.
+rarpar-bench macOS port of par3cmdline 50ac474a0efea20224ce4930020dc16e4ad36ec5.
 
 BENCH-ONLY PATCH. It is applied by `rarpar-bench par3 build-reference` on
 macOS hosts only, to the pinned upstream source archive, so the reference can

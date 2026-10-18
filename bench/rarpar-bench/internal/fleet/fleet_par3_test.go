@@ -57,11 +57,11 @@ func TestPAR3ConfigValidation(t *testing.T) {
 		{"missing par3 oracle", "[machines.oracles.par3]\npolicy = \"source-build\"\nreason = \"par3cmdline publishes no release and no Linux binary; the tree ships only windows/par3.exe\"\nrecipe = \"par3cmdline-onhost\"\nversion",
 			"[machines.oracles.par3x]\npolicy = \"source-build\"\nreason = \"x\"\nrecipe = \"par3cmdline-onhost\"\nversion", "needs [machines.oracles.par3]"},
 		{"onhost recipe takes no url", `recipe = "par3cmdline-onhost"
-version = "par3cmdline 0.0.1 (2971702e)"`, `recipe = "par3cmdline-onhost"
+version = "par3cmdline 0.0.1 (50ac474a)"`, `recipe = "par3cmdline-onhost"
 url = "https://example.invalid/x.tar.gz"
 sha256 = "0000000000000000000000000000000000000000000000000000000000000000"`, "drop url and sha256"},
 		{"unrar recipe cannot build par3", `recipe = "par3cmdline-onhost"
-version = "par3cmdline 0.0.1 (2971702e)"`, `recipe = "unrar-portable-onhost"
+version = "par3cmdline 0.0.1 (50ac474a)"`, `recipe = "unrar-portable-onhost"
 url = "https://example.invalid/x.tar.gz"
 sha256 = "0000000000000000000000000000000000000000000000000000000000000000"`, `recipe "unrar-portable-onhost" builds the rar oracle, not par3`},
 		{"ssm needs a bucket", `ssm_bucket = "example-bench-transfer-bucket"`, `ssm_bucket = ""`, "needs fleet.aws.ssm_bucket"},
