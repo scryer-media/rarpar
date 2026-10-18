@@ -223,8 +223,8 @@ par3_record_sets = ["a-gf16"]
 # macro-par3: the shipped rarpar CLI against the pinned par3cmdline reference
 # on generated data (no corpus). par3cmdline publishes no release and no Linux
 # binary (its tree ships only windows/par3.exe), so the reference is built on
-# the host from the config/toolchains.json pin (the bundle ships that file; the
-# host needs cmake and a C compiler).
+# the host from the commit rarpar-bench pins (internal/par3bench/reference.go;
+# the host needs cmake and a C compiler).
 [machines.oracles.par3]
 policy = "source-build"
 reason = "par3cmdline publishes no release and no Linux binary; the tree ships only windows/par3.exe"

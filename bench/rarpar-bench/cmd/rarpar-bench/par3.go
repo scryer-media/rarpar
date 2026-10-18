@@ -12,14 +12,13 @@ import (
 	"syscall"
 	"text/tabwriter"
 
-	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/bench"
 	"github.com/scryer-media/rarpar/bench/rarpar-bench/internal/par3bench"
 )
 
 const par3Usage = `Usage:
   rarpar-bench par3 matrix [--profile smoke|full|fleet] [--set ID]... [--ops LIST] [--workers 1,8]
         [--kernel-variant NAME:VAR=V]... [--json]
-  rarpar-bench par3 build-reference --out DIR [--toolchains PATH] [--cache DIR] [--mirror-base URL] [--cmake PATH] [--jobs N]
+  rarpar-bench par3 build-reference --out DIR [--cache DIR] [--mirror-base URL] [--cmake PATH] [--jobs N]
   rarpar-bench par3 run --reference PATH --candidate PATH --work DIR --out DIR [--profile smoke|full|fleet] [--set ID]...
         [--ops create,verify,repair] [--warmups N] [--repeats N] [--workers 1,8] [--pin-cpus 0-7]
         [--kernel-variant NAME:VAR=V[,VAR=V]]... [--iocount] [--engine-perf PATH]
@@ -224,7 +223,6 @@ func runPAR3Matrix(args []string, stdout io.Writer) error {
 func runPAR3BuildReference(ctx context.Context, args []string, stdout io.Writer) error {
 	flags := flag.NewFlagSet("par3 build-reference", flag.ContinueOnError)
 	out := flags.String("out", "", "build directory (source, build tree, reference.json)")
-	toolchains := flags.String("toolchains", defaultPath("config/toolchains.json"), "toolchain lock")
 	cache := flags.String("cache", "", "directory for the resolved source archive")
 	mirrorBase := flags.String("mirror-base", os.Getenv("RARPAR_TOOL_MIRROR_BASE"), "public read base URL of the tool source mirror")
 	cmake := flags.String("cmake", "cmake", "CMake executable")
@@ -235,12 +233,8 @@ func runPAR3BuildReference(ctx context.Context, args []string, stdout io.Writer)
 	if *out == "" {
 		return fmt.Errorf("--out is required")
 	}
-	lock, err := bench.LoadToolchains(workspacePath(*toolchains))
-	if err != nil {
-		return err
-	}
 	build, err := par3bench.BuildReference(ctx, par3bench.ReferenceBuildOptions{
-		Lock: lock, Out: workspacePath(*out), Cache: workspacePath(*cache), MirrorBase: *mirrorBase,
+		Out: workspacePath(*out), Cache: workspacePath(*cache), MirrorBase: *mirrorBase,
 		CMake: *cmake, Jobs: *jobs, Log: os.Stderr,
 	})
 	if err != nil {

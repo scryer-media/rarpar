@@ -203,7 +203,7 @@ go build -o target/rarpar-bench ./cmd/rarpar-bench
 # The matrix the profile runs; it builds and runs nothing.
 target/rarpar-bench par3 matrix --profile full
 
-# Build the reference from the pinned archive in config/toolchains.json
+# Build the reference from the commit archive internal/par3bench pins
 # (mirror first, then upstream; BLAKE3-verified either way). Needs CMake.
 target/rarpar-bench par3 build-reference --out target/par3-reference
 

@@ -1276,17 +1276,3 @@ func TestCurlCredentialConfigEscapes(t *testing.T) {
 		t.Fatalf("config = %q, want %q", got, want)
 	}
 }
-
-func TestReferencePAR3FallsBackToTheGenerator(t *testing.T) {
-	lock := ToolchainLock{PAR3Generator: PAR3Generator{ID: "gen", URL: "https://example.invalid/gen.tar.gz", BLAKE3: "g"}}
-	if got := lock.ReferencePAR3(); got.ID != "gen" {
-		t.Fatalf("no par3_reference: got %q, want the generator", got.ID)
-	}
-	lock.PAR3Reference = &PAR3Reference{ID: "ref", URL: "https://example.invalid/ref.tar.gz", BLAKE3: "r"}
-	if got := lock.ReferencePAR3(); got.ID != "ref" || got.URL != lock.PAR3Reference.URL || got.BLAKE3 != "r" {
-		t.Fatalf("par3_reference set: got %+v", got)
-	}
-	if lock.PAR3Generator.ID != "gen" {
-		t.Fatal("the fixture generator pin must not move with the reference")
-	}
-}

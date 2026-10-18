@@ -69,10 +69,5 @@
     "platform": "linux/amd64",
     "url": "https://github.com/Parchive/par3cmdline/archive/2971702e501f1350b1c7b9d11369af9157d6ed56.tar.gz",
     "blake3": "2989f64bcfff5ca14493ffa4e68dd058ab2b88236a9e64e884ac74387a225072"
-  },
-  "par3_reference": {
-    "id": "par3cmdline-50ac474a",
-    "url": "https://github.com/Parchive/par3cmdline/archive/50ac474a0efea20224ce4930020dc16e4ad36ec5.tar.gz",
-    "blake3": "1a6dd80d9da6b9fe372481e8d6bc39f437985a3da27b7c6a56545dfad543ca1b"
   }
 }

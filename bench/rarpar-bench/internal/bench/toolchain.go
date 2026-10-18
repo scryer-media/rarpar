@@ -97,11 +97,6 @@ func (lock ToolchainLock) Validate() error {
 	if par3.ID == par2.ID || par3.Image == par2.Image || par3.URL == par2.URL || par3.BLAKE3 == par2.BLAKE3 {
 		return fmt.Errorf("PAR3 generator %q duplicates the PAR2 generator's id, image or source", par3.ID)
 	}
-	if ref := lock.PAR3Reference; ref != nil {
-		if ref.ID == "" || ref.URL == "" || !digestPattern.MatchString(ref.BLAKE3) {
-			return fmt.Errorf("PAR3 reference is not source locked")
-		}
-	}
 	if encoder := lock.VideoEncoder; encoder.ID != "" || encoder.Image != "" {
 		// The encoder is consumed as a published image, so the digest is the
 		// only thing that makes its output reproducible; a floating tag would

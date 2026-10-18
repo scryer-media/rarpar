@@ -33,27 +33,6 @@ type ToolchainLock struct {
 	VideoEncoder  VideoEncoder  `json:"video_encoder"`
 	PAR2Generator PAR2Generator `json:"par2_generator"`
 	PAR3Generator PAR3Generator `json:"par3_generator"`
-	// PAR3Reference, when set, is the par3cmdline the benchmark builds as its
-	// PAR3 oracle. It moves with upstream; PAR3Generator stays at the commit
-	// that wrote the published PAR3 fixtures, so their provenance holds.
-	PAR3Reference *PAR3Reference `json:"par3_reference,omitempty"`
-}
-
-// PAR3Reference pins the par3cmdline source the benchmark oracle is built
-// from. It is never built into an image and never writes a fixture.
-type PAR3Reference struct {
-	ID     string `json:"id"`
-	URL    string `json:"url"`
-	BLAKE3 string `json:"blake3"`
-}
-
-// ReferencePAR3 is the par3cmdline source the benchmark oracle is built from:
-// par3_reference when the lock pins one, else the fixture generator's source.
-func (lock ToolchainLock) ReferencePAR3() PAR3Generator {
-	if ref := lock.PAR3Reference; ref != nil {
-		return PAR3Generator{ID: ref.ID, URL: ref.URL, BLAKE3: ref.BLAKE3}
-	}
-	return lock.PAR3Generator
 }
 
 type VideoEncoder struct {

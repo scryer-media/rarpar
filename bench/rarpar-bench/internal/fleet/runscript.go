@@ -510,9 +510,9 @@ func par3Section(machine Machine, layout RemoteLayout, reference string) string 
 	write("P3_REFERENCE=%s", shellQuote(reference))
 	write("P3_WORK=%s", shellQuote(PAR3Work(machine, layout)))
 	if oracle, ok := machine.Oracles["par3"]; ok && oracle.Policy == OracleSourceBuild && oracle.Recipe == RecipePAR3CmdlineHost {
-		write("# par3cmdline publishes no Linux/macOS binary: build the toolchains.json pin here.")
+		write("# par3cmdline publishes no Linux/macOS binary: build the pinned commit here.")
 		write("log 'building the par3cmdline reference on this host'")
-		write("\"$BENCH\" par3 build-reference --out %s --toolchains \"$BIN/toolchains.json\" --cache \"$BASE/par3-cache\" \\",
+		write("\"$BENCH\" par3 build-reference --out %s --cache \"$BASE/par3-cache\" \\",
 			shellQuote(par3ReferenceDir(machine, layout)))
 		write("  > \"$R/par3-build-reference.json\" 2> \"$R/par3-build-reference.log\" || fail par3-build-reference")
 	}

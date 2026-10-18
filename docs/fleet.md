@@ -470,8 +470,8 @@ timeout_minutes = 20              # per run, rarpar rows too; a reference over i
 
 - **Linux and macOS hosts** use `recipe = "par3cmdline-onhost"`, because
   par3cmdline publishes no release and no Linux binary; the tree ships only
-  windows/par3.exe. The host runs `par3 build-reference` against the shipped
-  `toolchains.json`, so the reference is compiled natively and never
+  windows/par3.exe. The host runs `par3 build-reference`, which builds the
+  commit `internal/par3bench/reference.go` pins, so the reference is compiled natively and never
   emulated. It needs CMake and a C compiler; EC2 user-data installs
   `build-essential` and `cmake` when this recipe is selected. This recipe
   takes no `url` or `sha256`.

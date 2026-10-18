@@ -93,7 +93,7 @@ func TestPAR3RunScriptSection(t *testing.T) {
 		map[string]string{"rar": "/o/unrar", "par2": "/o/par2", "par3": resolution.RemotePath})
 	for _, expected := range []string{
 		"# ---- suite: macro-par3",
-		`par3 build-reference --out '/home/bench/fleet-stage/fleet-testrun/par3-reference' --toolchains "$BIN/toolchains.json"`,
+		`par3 build-reference --out '/home/bench/fleet-stage/fleet-testrun/par3-reference' --cache`,
 		`par3 run --reference "$P3_REFERENCE" --candidate "$CANDIDATE" --work "$P3_WORK"`,
 		"P3_WORK='/home/bench/p3'",
 		"'--profile' 'full' '--workers' '1,8' '--warmups' '1' '--repeats' '5' '--timeout' '20m' '--pin-cpus' '0-7'",
