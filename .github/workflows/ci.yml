@@ -1177,6 +1177,8 @@ jobs:
       - name: Confirm a baseline x86_64 C toolchain
         env:
           TARGET: ${{ matrix.target }}
+          CFLAGS_x86_64_unknown_linux_gnu: "-DNDEBUG -march=x86-64 -mtune=generic -ffunction-sections -fdata-sections -fvisibility=hidden"
+          CFLAGS_x86_64_unknown_linux_musl: "-DNDEBUG -march=x86-64 -mtune=generic -ffunction-sections -fdata-sections -fvisibility=hidden -DMI_DEFAULT_ALLOW_THP=0"
         run: .github/scripts/release/confirm-baseline-x86-64-c-toolchain.sh
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
@@ -1220,10 +1222,10 @@ jobs:
           CC_ENABLE_DEBUG_OUTPUT: "1"
           CARGO_PROFILE_RELEASE_OPT_LEVEL: "1"
           CARGO_PROFILE_RELEASE_LTO: thin
-          CFLAGS_x86_64_unknown_linux_gnu: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
-          CXXFLAGS_x86_64_unknown_linux_gnu: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
-          CFLAGS_x86_64_unknown_linux_musl: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden -DMI_DEFAULT_ALLOW_THP=0"
-          CXXFLAGS_x86_64_unknown_linux_musl: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+          CFLAGS_x86_64_unknown_linux_gnu: "-DNDEBUG -march=x86-64 -mtune=generic -ffunction-sections -fdata-sections -fvisibility=hidden"
+          CXXFLAGS_x86_64_unknown_linux_gnu: "-DNDEBUG -march=x86-64 -mtune=generic -ffunction-sections -fdata-sections -fvisibility=hidden"
+          CFLAGS_x86_64_unknown_linux_musl: "-DNDEBUG -march=x86-64 -mtune=generic -ffunction-sections -fdata-sections -fvisibility=hidden -DMI_DEFAULT_ALLOW_THP=0"
+          CXXFLAGS_x86_64_unknown_linux_musl: "-DNDEBUG -march=x86-64 -mtune=generic -ffunction-sections -fdata-sections -fvisibility=hidden"
           CFLAGS_aarch64_unknown_linux_gnu: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
           CXXFLAGS_aarch64_unknown_linux_gnu: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
           CFLAGS_aarch64_unknown_linux_musl: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden -mno-outline-atomics -DMI_DEFAULT_ALLOW_THP=0"
