@@ -17,8 +17,12 @@ both have tree `301d37839ebb51bb9ec41b42ff8f036b081fbd4b`.
 Its SHA-256 is `ab41bf03196854dcb5bfa475e552b40ba97498a85d184e09e9bcbd2a56b4e46c`.
 The measured integrated source patch SHA-256 is
 `a70168de5959251750e342f7de8e406b986c322ad736c34c25b82f8b981732fd`.
-Final documentation updates can change the review patch hash without changing
-these measured Rust sources; each host retains a source-file hash inventory.
+The first signed commit, `054d1877`, keeps these measured Rust sources.
+A later review fix changes only the CLI's stream-metadata path and tracing
+output destination, plus its integration regression. The hashing, discovery
+helpers, repair controller and RAR5 kernels remain the measured bytes. No
+new performance measurement is claimed for that review fix; each host
+retains a source-file hash inventory.
 
 The supplied sizing diagnosis has two material errors:
 
@@ -86,6 +90,18 @@ The spare input set is allocated only when another chunk exists. Large
 restores retain the existing two-input-set budget and overlapping reads.
 Short even/odd tails, actual multi-chunk read-ahead and output bytes are tested.
 The THP-off default is unchanged.
+
+During PR review, `par verify --name` was found to omit deferred volumes
+before choosing its file. It now expands those volumes before reading stdin:
+the pipe cannot be reread if hidden metadata changes its checksums. This
+stream-only path opens deferred candidates eagerly, preserving descriptions,
+IFSC checksums and recovery-block counts. Disk verification retains its lazy
+fallback. A real pipe regression covers missing FileDesc, missing IFSC and
+complete metadata with obfuscated recovery blocks, and checks clean and damaged
+verdicts. The original implementation fails the regression. Tracing now writes
+to stderr, keeping warnings out of JSON stdout without suppressing them.
+The narrow paired-MD5 exception in AGENTS.md records the operator's explicit
+F2 instruction; source origins, notices and single-stream fallback remain.
 
 ## Native Spot method and scope
 
@@ -353,6 +369,28 @@ strict verdict/read-count and actual dispatch regressions are included.
 No current GPU performance, full Windows PAR2 suite or new ASan result is
 claimed. Both musl release builds retain the pre-existing `libc::time_t`
 deprecation warning; host Clippy with warnings denied passed.
+
+## PR review follow-up validation, 2026-10-19
+
+The real-pipe regression failed on `054d1877` (exit 100, missing requested
+name). After eager stream metadata expansion it exposed warnings on JSON
+stdout; directing tracing to stderr fixed that without relaxing the test.
+All 16 stream CLI tests then passed, including clean/damaged checks for
+FileDesc, IFSC and obfuscated recovery counts. The full local workspace
+passed again with 3,202 tests and 24 skips; 25 doctests passed. Formatting,
+warnings-denied Clippy, locked docs and locked metadata also passed.
+Library implementations, dependency versions and resolutions did not change.
+The exact commands use the same external target directory and four jobs:
+
+```text
+cargo fmt --all --check
+cargo nextest run --locked --offline -p rarpar --test stream_cli --no-fail-fast --test-threads 4
+cargo clippy --workspace --all-targets --features unrar-rs/unstable-internals --locked --offline -- -D warnings
+cargo nextest run --workspace --features unrar-rs/unstable-internals --locked --offline --no-fail-fast --test-threads 4
+cargo test --doc --workspace --features unrar-rs/unstable-internals --locked --offline --no-fail-fast
+cargo run --locked --offline -p xtask -- docs --check
+cargo metadata --locked --offline --no-deps --format-version 1
+```
 
 ## Resource cleanup, evidence and publication
 

@@ -5,6 +5,10 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ## rarpar 0.9.2
 
+- Resolve deferred PAR2 metadata before `par verify --name` selects a streamed
+  file, retaining slice checksums and recovery counts from obfuscated siblings.
+  Send tracing diagnostics to stderr so warnings leave JSON output parseable.
+
 - RAR5 volume recovery allocates buffers for the useful volume length and
   creates read-ahead buffers only for multi-chunk restores (unrar-rs 0.12.1).
 
@@ -13,8 +17,8 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 - Reuse the initial PAR2 scan across recovery volumes and defer unrelated
   sibling header reads until verification needs recovery data. Preserve
-  obfuscated volumes, including ones at a protected file name and length. -
-  Use ParPar's paired x86-64/AArch64 MD5 assembly where strict verification is
+  obfuscated volumes, including ones at a protected file name and length.
+- Use ParPar's paired x86-64/AArch64 MD5 assembly where strict verification is
   already serial, preserving the available two-chain parallel pipeline, 16 KiB
   prefix, slice padding, and single-stream fallback.
 

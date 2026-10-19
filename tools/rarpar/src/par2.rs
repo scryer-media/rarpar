@@ -856,10 +856,13 @@ fn verify_stream(cli: &Cli, args: &ParArgs, name: &str) -> Result<u8, RarparErro
         )
     })?;
     let mut resolved = resolve_input(cli, args)?;
-    let set = match resolved.scanned.take() {
+    let mut set = match resolved.scanned.take() {
         Some(set) => set,
         None => par2_rs::Par2FileSet::from_paths(&resolved.par2_paths)?,
     };
+    // The stream cannot be reread if deferred metadata changes its checksums.
+    // Load all volumes before choosing its file and counting recovery blocks.
+    expand_deferred_volumes(&mut resolved, &mut set, &[])?;
     // Names that differ only in `\` and `/` read as one file name, and a
     // malformed set can repeat a name, so every file answering to NAME counts.
     let mut matches: Vec<par2_rs::FileId> = set

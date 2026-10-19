@@ -883,6 +883,47 @@ fn rewrite_set(directory: &Path, mut edit: impl FnMut(&mut Vec<u8>) -> bool) {
 }
 
 #[test]
+fn par_verify_from_a_pipe_loads_metadata_from_deferred_volumes() {
+    for missing in [
+        Some(b"PAR 2.0\0FileDesc"),
+        Some(b"PAR 2.0\0IFSC\0\0\0\0"),
+        None,
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (first, _) = par2_set(root);
+        let index = std::fs::read(root.join("set.par2")).unwrap();
+        let incomplete = rewrite_packets(&index, |packet| {
+            missing.is_none_or(|kind| &packet[48..64] != kind)
+        });
+        assert_eq!(incomplete.len() < index.len(), missing.is_some());
+        let mut hidden = index;
+        for name in listing(root) {
+            if name.ends_with(".par2") && name != "set.par2" {
+                hidden.extend(std::fs::read(root.join(&name)).unwrap());
+            }
+            std::fs::remove_file(root.join(name)).unwrap();
+        }
+        std::fs::write(root.join("set.par2"), incomplete).unwrap();
+        std::fs::write(root.join("metadata.bin"), hidden).unwrap();
+
+        let args = ["--json", "par", "verify", "set.par2", "--name", "first.bin"];
+        let verified = through_pipes(root, &args, first.clone());
+        ok(&verified);
+        assert_eq!(json(&verified)["stream"]["slice_checksums"], true);
+
+        let mut damaged = first;
+        damaged[70_000] ^= 1;
+        let verified = through_pipes(root, &args, damaged);
+        code_of(&verified, 1);
+        let report = json(&verified);
+        assert_eq!(report["stream"]["damaged_slices"], serde_json::json!([1]));
+        assert_eq!(report["stream"]["recovery_blocks_available"], 4);
+        assert_eq!(report["stream"]["repairable"], true);
+    }
+}
+
+#[test]
 fn par_verify_from_a_pipe_refuses_a_name_two_files_answer_to() {
     // PAR2 names that differ only in `\` and `/` are one file name once read,
     // so --name cannot say which file it means and must not pick one.
