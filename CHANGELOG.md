@@ -5,6 +5,9 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ## rarpar 0.9.2
 
+- Allow absent working directories while expanding PAR2 siblings; skip
+  protected files at impossible volume lengths and all sub-header files unread.
+
 - Resolve deferred PAR2 metadata before `par verify --name` selects a streamed
   file, retaining slice checksums and recovery counts from obfuscated siblings.
   Send tracing diagnostics to stderr so warnings leave JSON output parseable.

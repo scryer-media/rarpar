@@ -18,10 +18,10 @@ Its SHA-256 is `ab41bf03196854dcb5bfa475e552b40ba97498a85d184e09e9bcbd2a56b4e46c
 The measured integrated source patch SHA-256 is
 `a70168de5959251750e342f7de8e406b986c322ad736c34c25b82f8b981732fd`.
 The first signed commit, `054d1877`, keeps these measured Rust sources.
-A later review fix changes only the CLI's stream-metadata path and tracing
-output destination, plus its integration regression. The hashing, discovery
-helpers, repair controller and RAR5 kernels remain the measured bytes. No
-new performance measurement is claimed for that review fix; each host
+Later review fixes change the CLI's stream/deferred-discovery paths and
+tracing output destination, plus integration regressions. The hashing,
+repair controller and RAR5 kernels remain the measured bytes. No new
+performance measurement is claimed for those review fixes; each host
 retains a source-file hash inventory.
 
 The supplied sizing diagnosis has two material errors:
@@ -391,6 +391,31 @@ cargo test --doc --workspace --features unrar-rs/unstable-internals --locked --o
 cargo run --locked --offline -p xtask -- docs --check
 cargo metadata --locked --offline --no-deps --format-version 1
 ```
+
+## Deferred-discovery review regressions, 2026-10-19
+
+The review of `c7400e9` found two further CLI issues. Real-pipe tests
+reproduced ENOENT for an absent `-C` directory and EACCES when opening a
+protected file whose length cannot form a PAR2 volume. Deferred expansion
+now returns immediately for no candidates and canonicalizes the primary
+only as an optional optimization for verified canonical data. Missing
+working directories remain valid in Smart and Canonical placement, with
+and without deferred metadata.
+
+Exhaustive discovery and deferred expansion share the recorded-name/length
+guard; a matching protected file shorter than a header or not divisible by
+four is skipped unread. All files shorter than a header are also rejected
+before opening. Other names and mismatched lengths remain eligible, including
+valid obfuscated volumes; no general nonmultiple-of-four filter was added
+for unknown files that might contain packets plus trailing bytes.
+
+The regressions cover unreadable 32/65-byte protected files and an unreadable
+unrelated sub-header sibling. All 18 stream tests pass, along with 3,204 full
+workspace tests (24 skipped), 25 doctests, formatting, warnings-denied Clippy,
+locked docs and locked metadata. The commands are the same as the preceding
+review-follow-up run. Library MD5 backend selection, parallel scheduling and
+all dependency/version records are unchanged. These CLI changes have no new
+performance measurements.
 
 ## Resource cleanup, evidence and publication
 

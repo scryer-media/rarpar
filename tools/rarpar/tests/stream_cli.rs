@@ -883,6 +883,86 @@ fn rewrite_set(directory: &Path, mut edit: impl FnMut(&mut Vec<u8>) -> bool) {
 }
 
 #[test]
+fn par_verify_from_a_pipe_allows_a_missing_working_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let (first, _) = par2_set(root);
+    let index = std::fs::read(root.join("set.par2")).unwrap();
+    for name in listing(root) {
+        if name != "set.par2" {
+            std::fs::remove_file(root.join(name)).unwrap();
+        }
+    }
+    for deferred in [false, true] {
+        if deferred {
+            std::fs::write(root.join("metadata.bin"), &index).unwrap();
+        }
+        for placement in ["smart", "canonical"] {
+            let verified = through_pipes(
+                root,
+                &[
+                    "-C",
+                    "absent",
+                    "--par-placement",
+                    placement,
+                    "--json",
+                    "par",
+                    "verify",
+                    "set.par2",
+                    "--name",
+                    "first.bin",
+                ],
+                first.clone(),
+            );
+            ok(&verified);
+            assert_eq!(json(&verified)["success"], true);
+            assert!(!root.join("absent").exists());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn par_verify_from_a_pipe_skips_unreadable_protected_non_volumes() {
+    use std::os::unix::fs::PermissionsExt;
+    for length in [32, 65] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let data = sample(length, 17);
+        let source = root.join("short.bin");
+        std::fs::write(&source, &data).unwrap();
+        ok(&rarpar(
+            root,
+            &[
+                "par",
+                "create",
+                "set.par2",
+                "short.bin",
+                "-s",
+                "65536",
+                "--recovery-count",
+                "1",
+            ],
+        ));
+        let unrelated = root.join("unrelated.bin");
+        std::fs::write(&unrelated, b"too short for a PAR2 header").unwrap();
+        for path in [&source, &unrelated] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let verified = through_pipes(
+            root,
+            &["--json", "par", "verify", "set.par2", "--name", "short.bin"],
+            data,
+        );
+        for path in [&source, &unrelated] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        ok(&verified);
+        assert_eq!(json(&verified)["success"], true);
+    }
+}
+
+#[test]
 fn par_verify_from_a_pipe_loads_metadata_from_deferred_volumes() {
     for missing in [
         Some(b"PAR 2.0\0FileDesc"),

@@ -1224,13 +1224,29 @@ fn identify_set_volumes(
     identify_set_volume_paths(dir, seed.recovery_set_id, protected, None).map(|(paths, _)| paths)
 }
 
+fn is_protected_non_volume(
+    path: &Path,
+    protected: &std::collections::HashMap<&str, u64>,
+) -> Result<bool, RarparError> {
+    let Some(&length) = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| protected.get(name))
+    else {
+        return Ok(false);
+    };
+    if length >= 64 && length.is_multiple_of(4) {
+        return Ok(false);
+    }
+    Ok(std::fs::metadata(path)?.len() == length)
+}
+
 fn identify_set_volume_paths(
     dir: &Path,
     set_id: par2_rs::RecoverySetId,
     protected: std::collections::HashMap<&str, u64>,
     scanned_input: Option<&Path>,
 ) -> Result<(Vec<PathBuf>, Vec<PathBuf>), RarparError> {
-    const HEADER_SIZE: usize = 64;
     let mut matches = Vec::new();
     let mut deferred = Vec::new();
     for entry in std::fs::read_dir(dir)? {
@@ -1273,10 +1289,7 @@ fn identify_set_volume_paths(
         // bytes, so a whole volume is too: a protected file at a length no
         // volume can have is skipped unread, and any other is sniffed, since
         // an obfuscated volume can sit at a missing file's name and length.
-        if let Some(&length) = protected.get(name)
-            && std::fs::metadata(&path)?.len() == length
-            && (length < HEADER_SIZE as u64 || !length.is_multiple_of(4))
-        {
+        if is_protected_non_volume(&path, &protected)? {
             continue;
         }
         if has_recovery_set_header(&path, set_id)? {
@@ -1291,6 +1304,9 @@ fn has_recovery_set_header(
     set_id: par2_rs::RecoverySetId,
 ) -> Result<bool, RarparError> {
     let mut header = [0u8; 64];
+    if std::fs::metadata(path)?.len() < header.len() as u64 {
+        return Ok(false);
+    }
     match std::fs::File::open(path)?.read_exact(&mut header) {
         Ok(()) => Ok(par2_rs::PacketHeader::parse(&header, 0)
             .is_ok_and(|header| header.recovery_set_id == set_id)),
@@ -1334,24 +1350,41 @@ fn expand_deferred_volumes(
     set: &mut par2_rs::Par2FileSet,
     complete: &[par2_rs::FileId],
 ) -> Result<bool, RarparError> {
+    if resolved.deferred_par2.is_empty() {
+        return Ok(false);
+    }
     let complete_names: std::collections::HashSet<_> = complete
         .iter()
         .filter_map(|id| set.file_description(id))
         .map(|desc| desc.filename.as_str())
         .collect();
-    let primary = std::fs::canonicalize(&resolved.primary_dir)?;
+    // Canonicalization only supports skipping already verified canonical data.
+    // A missing working directory is valid and cannot identify such a file.
+    let primary = if resolved.placement == ParPlacement::Canonical && !complete_names.is_empty() {
+        std::fs::canonicalize(&resolved.primary_dir).ok()
+    } else {
+        None
+    };
+    let protected = set
+        .files
+        .values()
+        .map(|desc| (desc.filename.as_str(), desc.length))
+        .collect();
     let mut added = false;
     for path in std::mem::take(&mut resolved.deferred_par2) {
-        if resolved.placement == ParPlacement::Canonical
-            && path
-                .parent()
-                .and_then(|dir| std::fs::canonicalize(dir).ok())
-                .as_ref()
-                == Some(&primary)
-            && path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| complete_names.contains(name))
+        if is_protected_non_volume(&path, &protected)? {
+            continue;
+        }
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| complete_names.contains(name))
+            && primary.as_ref().is_some_and(|primary| {
+                path.parent()
+                    .and_then(|dir| std::fs::canonicalize(dir).ok())
+                    .as_ref()
+                    == Some(primary)
+            })
         {
             continue;
         }
