@@ -56,7 +56,9 @@ unsafe fn blocks_x86<const BMI: bool>(
     y: &[u8],
 ) {
     #[cfg(test)]
-    record_execution(if BMI { 2 } else { 1 });
+    if !x.is_empty() {
+        record_execution(if BMI { 2 } else { 1 });
+    }
     let [mut a1, mut b1, mut c1, mut d1] = *left;
     let [mut a2, mut b2, mut c2, mut d2] = *right;
     for (x, y) in x.chunks_exact(64).zip(y.chunks_exact(64)) {
@@ -98,7 +100,9 @@ unsafe fn blocks_x86<const BMI: bool>(
 #[inline(never)]
 unsafe fn blocks_aarch64(left: &mut [u32; 4], right: &mut [u32; 4], x: &[u8], y: &[u8]) {
     #[cfg(test)]
-    record_execution(0);
+    if !x.is_empty() {
+        record_execution(0);
+    }
     let [mut a1, mut b1, mut c1, mut d1] = *left;
     let [mut a2, mut b2, mut c2, mut d2] = *right;
     for (x, y) in x.chunks_exact(64).zip(y.chunks_exact(64)) {

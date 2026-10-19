@@ -505,6 +505,7 @@ mod tests {
     #[cfg(par2_md5_asm)]
     #[test]
     fn paired_assembly_matches_scalar_states_and_rust_pairs() {
+        let before = crate::md5_pair_asm::executions();
         let mut seed = 0xf0c3_19b8_8457_2d61;
         let mut x = vec![0; 1024 + 64];
         let mut y = vec![0; 1024 + 64];
@@ -546,6 +547,7 @@ mod tests {
                 }
             }
         }
+        assert_assembly_executions(before, true);
     }
 
     #[cfg(par2_md5_asm)]
@@ -565,6 +567,36 @@ mod tests {
             1
         };
         assert!(after[backend] > before[backend]);
+        let memcheck = {
+            #[cfg(target_os = "linux")]
+            {
+                std::fs::read_to_string("/proc/self/maps")
+                    .expect("read own mappings for CI instrumentation evidence")
+                    .contains("vgpreload_memcheck")
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                false
+            }
+        };
+        match std::env::var("PAR2_CI_MD5_RUN").as_deref() {
+            Ok("native") => assert!(!memcheck, "native dispatch pass must be uninstrumented"),
+            Ok("memcheck") => assert!(memcheck, "Memcheck runner did not instrument the test"),
+            Err(std::env::VarError::NotPresent) => {}
+            other => panic!("unsupported MD5 CI instrumentation mode: {other:?}"),
+        }
+        #[cfg(target_arch = "aarch64")]
+        let selected = "aarch64-baseline";
+        #[cfg(target_arch = "x86_64")]
+        let selected = if backend == 2 {
+            "x86-bmi1"
+        } else {
+            "x86-baseline"
+        };
+        eprintln!(
+            "MD5 assembly execution: arch={}, selected={selected}, counts={after:?}, memcheck={memcheck}",
+            std::env::consts::ARCH
+        );
         assert_eq!(left.finalize(), right.finalize());
     }
 
@@ -614,6 +646,62 @@ mod tests {
         }
     }
 
+    /// Heap redzones give Memcheck byte-exact upper bounds even when an
+    /// unaligned complete-block stream cannot end at a page boundary.
+    #[cfg(par2_md5_asm)]
+    #[test]
+    fn paired_assembly_respects_exact_allocations() {
+        let before = crate::md5_pair_asm::executions();
+        for offset in 0..64 {
+            for len in [64, 128, 4096] {
+                let other_offset = 63 - offset;
+                let x = vec![0x39; offset + len].into_boxed_slice();
+                let y = vec![0xa7; other_offset + len].into_boxed_slice();
+                let (x, y) = (&x[offset..], &y[other_offset..]);
+                let (mut left, mut right) = ([0x12345678; 4], [0xfedcba98; 4]);
+                let (mut expected_left, mut expected_right) = (left, right);
+                crate::md5_simd::compress_scalar_state(&mut expected_left, x);
+                crate::md5_simd::compress_scalar_state(&mut expected_right, y);
+                crate::md5_pair_asm::compress_pair(&mut left, &mut right, x, y);
+                assert_eq!((left, right), (expected_left, expected_right));
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let (mut left, mut right) = ([0x12345678; 4], [0xfedcba98; 4]);
+                    crate::md5_pair_asm::compress_baseline(&mut left, &mut right, x, y);
+                    assert_eq!((left, right), (expected_left, expected_right));
+                }
+            }
+        }
+        assert_assembly_executions(before, true);
+    }
+
+    #[cfg(par2_md5_asm)]
+    fn assert_assembly_executions(before: [usize; 3], baseline: bool) {
+        let after = crate::md5_pair_asm::executions();
+        #[cfg(target_arch = "aarch64")]
+        assert!(after[0] > before[0], "AArch64 assembly must execute");
+        #[cfg(target_arch = "x86_64")]
+        {
+            if baseline {
+                assert!(after[1] > before[1], "baseline x86 assembly must execute");
+            }
+            if std::is_x86_feature_detected!("bmi1") {
+                assert!(
+                    after[2] > before[2],
+                    "advertised BMI1 assembly must execute"
+                );
+            } else {
+                assert_eq!(
+                    after[2], before[2],
+                    "BMI1 must not execute without detection"
+                );
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        let _ = baseline;
+        eprintln!("MD5 assembly differential/bounds execution: before={before:?}, after={after:?}");
+    }
+
     #[cfg(all(par2_md5_asm, unix))]
     #[test]
     fn paired_assembly_stops_at_guard_page() {
@@ -625,14 +713,14 @@ mod tests {
             fn new(value: u8) -> Self {
                 // SAFETY: query-only sysconf, followed by a private mapping.
                 let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-                assert!(page >= 64);
+                assert!(page >= 128);
                 let page = page as usize;
-                // SAFETY: allocate two anonymous pages; no existing mapping is replaced.
+                // SAFETY: allocate three anonymous pages; replace no mapping.
                 let address = unsafe {
                     libc::mmap(
                         std::ptr::null_mut(),
-                        page * 2,
-                        libc::PROT_READ | libc::PROT_WRITE,
+                        page * 3,
+                        libc::PROT_NONE,
                         libc::MAP_PRIVATE | libc::MAP_ANON,
                         -1,
                         0,
@@ -640,50 +728,63 @@ mod tests {
                 };
                 assert_ne!(address, libc::MAP_FAILED);
                 let guard = Self { address, page };
-                // SAFETY: both ranges are within this mapping; only the second
-                // page is protected. The last block of the first is initialized.
+                // SAFETY: only the middle page is made writable and initialized;
+                // inaccessible pages on both sides catch under/over-reads.
                 unsafe {
-                    std::ptr::write_bytes(address.cast::<u8>().add(page - 64), value, 64);
+                    let middle = address.cast::<u8>().add(page);
                     assert_eq!(
-                        libc::mprotect(
-                            address.cast::<u8>().add(page).cast(),
-                            page,
-                            libc::PROT_NONE
-                        ),
+                        libc::mprotect(middle.cast(), page, libc::PROT_READ | libc::PROT_WRITE),
                         0
                     );
+                    std::ptr::write_bytes(middle, value, page);
                 }
                 guard
             }
-            fn block(&self) -> &[u8] {
-                // SAFETY: the initialized 64 bytes immediately precede the
-                // inaccessible page, and the mapping outlives this borrow.
-                unsafe {
-                    std::slice::from_raw_parts(self.address.cast::<u8>().add(self.page - 64), 64)
-                }
+            fn blocks(&self, len: usize, offset: usize, at_end: bool) -> &[u8] {
+                assert!(len + offset <= self.page);
+                let start = if at_end {
+                    self.page * 2 - len - offset
+                } else {
+                    self.page + offset
+                };
+                // SAFETY: this initialized range lies entirely in the middle
+                // page, and the mapping outlives the returned borrow.
+                unsafe { std::slice::from_raw_parts(self.address.cast::<u8>().add(start), len) }
             }
         }
         impl Drop for Guard {
             fn drop(&mut self) {
-                // SAFETY: this object uniquely owns the complete mapping.
+                // SAFETY: this object uniquely owns all three pages.
                 unsafe {
-                    libc::munmap(self.address, self.page * 2);
+                    libc::munmap(self.address, self.page * 3);
                 }
             }
         }
+        let before = crate::md5_pair_asm::executions();
         let (x, y) = (Guard::new(0x39), Guard::new(0xa7));
-        let (mut left, mut right) = ([0x12345678; 4], [0xfedcba98; 4]);
-        let (mut expected_left, mut expected_right) = (left, right);
-        crate::md5_simd::compress_scalar_state(&mut expected_left, x.block());
-        crate::md5_simd::compress_scalar_state(&mut expected_right, y.block());
-        crate::md5_pair_asm::compress_pair(&mut left, &mut right, x.block(), y.block());
-        assert_eq!((left, right), (expected_left, expected_right));
-        #[cfg(target_arch = "x86_64")]
-        {
-            let (mut left, mut right) = ([0x12345678; 4], [0xfedcba98; 4]);
-            crate::md5_pair_asm::compress_baseline(&mut left, &mut right, x.block(), y.block());
-            assert_eq!((left, right), (expected_left, expected_right));
+        for at_end in [false, true] {
+            for offset in 0..64 {
+                for len in [64, 128, x.page - 64] {
+                    let (x, y) = (
+                        x.blocks(len, offset, at_end),
+                        y.blocks(len, 63 - offset, !at_end),
+                    );
+                    let (mut left, mut right) = ([0x12345678; 4], [0xfedcba98; 4]);
+                    let (mut expected_left, mut expected_right) = (left, right);
+                    crate::md5_simd::compress_scalar_state(&mut expected_left, x);
+                    crate::md5_simd::compress_scalar_state(&mut expected_right, y);
+                    crate::md5_pair_asm::compress_pair(&mut left, &mut right, x, y);
+                    assert_eq!((left, right), (expected_left, expected_right));
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        let (mut left, mut right) = ([0x12345678; 4], [0xfedcba98; 4]);
+                        crate::md5_pair_asm::compress_baseline(&mut left, &mut right, x, y);
+                        assert_eq!((left, right), (expected_left, expected_right));
+                    }
+                }
+            }
         }
+        assert_assembly_executions(before, true);
     }
 
     #[cfg(par2_md5_asm)]

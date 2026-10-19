@@ -5,6 +5,9 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ## rarpar 0.9.2
 
+- Require explicit native MD5 and Rust-only coverage evidence in the existing
+  safety CI jobs; keep assembly as the default backend.
+
 - Allow absent working directories while expanding PAR2 siblings; skip
   protected files at impossible volume lengths and all sub-header files unread.
 

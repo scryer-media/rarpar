@@ -427,6 +427,15 @@ jobs:
           set -euo pipefail
           cargo nextest run --locked --no-fail-fast -p unrar-rs --lib --no-default-features --features crypto-rust crypto::
           cargo nextest run --locked --no-fail-fast -p unrar-rs --test integration --no-default-features --features crypto-rust encrypted
+      - name: Require the Rust-only MD5 inventory and exclude handwritten MD5 IR
+        run: |
+          set -euo pipefail
+          cargo nextest list --locked -p par2-rs --lib --no-default-features --features crypto-rust \
+            --message-format json -E 'test(/^checksum::/)' > "$RUNNER_TEMP/par2-md5-rust.json"
+          cargo rustc --locked -p par2-rs --lib --no-default-features --features crypto-rust -- \
+            -Ccodegen-units=1 --emit=llvm-ir="$RUNNER_TEMP/par2-md5-rust.ll"
+          python3 .github/scripts/ci/par2-md5-coverage.py --mode rust \
+            --listing "$RUNNER_TEMP/par2-md5-rust.json" --rust-only-ir "$RUNNER_TEMP/par2-md5-rust.ll"
       - name: Test par2-rs on the RustCrypto backend
         # The MD5/CRC seam, and a verify/repair pass that runs on top of it.
         run: |
@@ -440,7 +449,10 @@ jobs:
         run: |
           set -euo pipefail
           cargo nextest run --locked --no-fail-fast -p unrar-rs --lib --features crypto-rust crypto::
-          cargo nextest run --locked --no-fail-fast -p par2-rs --lib --features crypto-rust checksum::
+          cargo nextest list --locked -p par2-rs --lib --features crypto-rust \
+            --message-format json -E 'test(/^checksum::/)' > "$RUNNER_TEMP/par2-md5-both.json"
+          python3 .github/scripts/ci/par2-md5-coverage.py --mode both --listing "$RUNNER_TEMP/par2-md5-both.json"
+          cargo nextest run --locked --no-fail-fast -p par2-rs --lib --features crypto-rust --success-output immediate checksum::
       - name: Check rarpar on the RustCrypto backend
         run: cargo check --locked -p rarpar --no-default-features --features runtime,crypto-rust
       - name: Run clippy on the RustCrypto backend
@@ -2386,6 +2398,21 @@ jobs:
         # unit-tests lane.
         if: steps.gate.outputs.run == 'true'
         run: cargo run --locked -p xtask -- test-corpus hydrate --profile unit --profile par3
+      - name: Require and execute native MD5 coverage before Memcheck
+        if: steps.gate.outputs.run == 'true' && matrix.crate == 'par2-rs'
+        env:
+          PAR2_CI_MD5_RUN: native
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/ci/par2-md5-coverage.py --self-test
+          cargo nextest list --locked --cargo-profile memcheck -p par2-rs --lib \
+            --message-format json -E "$FILTER" > "$RUNNER_TEMP/par2-md5-memcheck.json"
+          python3 .github/scripts/ci/par2-md5-coverage.py --mode native --strict \
+            --expected-arch "$RUNNER_ARCH" --listing "$RUNNER_TEMP/par2-md5-memcheck.json"
+          # The uninstrumented pass exposes host BMI1 even if Valgrind masks it.
+          # Reuse this build for the existing instrumented selector below.
+          cargo nextest run --locked --cargo-profile memcheck --no-fail-fast -p par2-rs --lib \
+            -E 'test(/^checksum::/) | test(/^verify::tests::single_read_/)' --success-output immediate
       - name: Run the crate's unsafe-bearing lib tests under Memcheck
         # Default features: AWS-LC's assembly and the native SIMD kernels are
         # what Memcheck can see and the sanitizers cannot. Memcheck's CPUID
@@ -2395,13 +2422,18 @@ jobs:
         # Cargo.toml.
         if: steps.gate.outputs.run == 'true'
         env:
+          PAR2_CI_MD5_RUN: memcheck
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: valgrind --quiet --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect
           # Fair guest-thread scheduling lets cancellation watchdogs run
           # during CPU-bound scans on ARM64; retain every test assertion.
           # ARM64 alone loads one documented suppression; see
           # .github/valgrind/aarch64-memcheck.supp.
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: valgrind --quiet --fair-sched=yes --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect --suppressions=${{ github.workspace }}/.github/valgrind/aarch64-memcheck.supp
-        run: cargo nextest run --locked --cargo-profile memcheck --no-fail-fast -p "$CRATE" --lib -E "$FILTER"
+        run: |
+          set -euo pipefail
+          output=()
+          if [ "$CRATE" = par2-rs ]; then output=(--success-output immediate); fi
+          cargo nextest run --locked --cargo-profile memcheck --no-fail-fast -p "$CRATE" --lib -E "$FILTER" ${output[@]+"${output[@]}"}
 
   unsafe-sanitizer:
     name: unsafe-${{ matrix.sanitizer }}-${{ matrix.platform }}-${{ matrix.crate }}
@@ -2498,6 +2530,13 @@ jobs:
         run: |
           set -euo pipefail
           read -ra features <<<"$FEATURES"
+          if [ "$CRATE" = par2-rs ]; then
+            cargo +nightly-2026-09-01 nextest list -Zbuild-std --target "$TARGET" \
+              --locked -p "$CRATE" ${features[@]+"${features[@]}"} --lib -E "$FILTER" \
+              --message-format json > "$RUNNER_TEMP/par2-md5-asan.json"
+            python3 .github/scripts/ci/par2-md5-coverage.py --mode rust --strict \
+              --expected-arch "$RUNNER_ARCH" --listing "$RUNNER_TEMP/par2-md5-asan.json"
+          fi
           cargo +nightly-2026-09-01 nextest run -Zbuild-std --target "$TARGET" \
             --locked --no-fail-fast -p "$CRATE" ${features[@]+"${features[@]}"} --lib -E "$FILTER"
 

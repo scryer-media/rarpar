@@ -2,6 +2,11 @@
 
 ## 0.10.12
 
+- Enforce native MD5 test selection and execution evidence in existing x86/ARM
+  CI lanes; exercise both guard boundaries, lengths and alignments. Audit the
+  opt-in Rust-only build for handwritten MD5 assembly exclusion. Defaults and
+  production hashing/scheduling remain unchanged.
+
 - Enable fair ARM64 Memcheck thread scheduling so existing cancellation watchdog tests run without guest-thread starvation.
 
 - Add diagnostic-only compute-tile and source-batch controls; retain production ARM/x86 preferences and 12-input repair batches until cross-host validation supports changing them.

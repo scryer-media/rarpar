@@ -6,8 +6,12 @@ compute preferences and 12-source repair batches. **F1's A72 CPU acceptance
 criterion remains unresolved.** Current Spot measurements are separate from
 the earlier A72 prototype; no Mac timing is acceptance evidence.
 
-Versions: par2-rs 0.10.11 → 0.10.12, unrar-rs 0.12.0 → 0.12.1,
-and rarpar 0.9.1 → 0.9.2. Dependency floors, lockfile and changelogs agree.
+Current PR versions: par2-rs 0.10.11 → 0.10.12, unrar-rs 0.12.0 → 0.13.0,
+and rarpar 0.9.1 → 0.9.2. The measured candidate used unrar-rs 0.12.1 before
+the operator added the KDF/key-hygiene API change in `a3b6df5`. That code and
+the recovery fix now share prospective 0.13.0; dependency floors, lockfile,
+README examples and changelogs agree. No new performance measurement is
+claimed for the combined KDF change.
 
 ## Source findings and implemented behavior
 
@@ -417,6 +421,62 @@ review-follow-up run. Library MD5 backend selection, parallel scheduling and
 all dependency/version records are unchanged. These CLI changes have no new
 performance measurements.
 
+## Durable MD5 safety CI audit, 2026-10-19
+
+Completed c7400e9 workflow logs confirm the paired-state, runtime-dispatch,
+guard-page and strict single-read tests passed in the existing native
+Memcheck jobs (197 x86 tests, 183 AArch64 tests). The new controls retain
+those jobs and add no runner or matrix job. The audit found that broad
+selectors alone could hide cfg-gated omissions, Valgrind could mask host
+BMI1, the original guard case was narrow, and Rust-only exclusion lacked
+an explicit build-artifact assertion.
+
+The existing native jobs now require the actual selected nextest inventory
+and execute a short uninstrumented checksum pass before reusing the same
+build under Memcheck. Nonempty execution counters prove native assembly,
+forced x86 baseline and runtime BMI1 where advertised. Test-only mapping
+checks distinguish the uninstrumented pass from actual Memcheck execution.
+The inventory checker fails for absent, ignored, filtered or wrongly compiled
+backend tests; five negative/self tests cover those failure modes.
+
+Bounds coverage includes 384 two-sided guard cases and 192 exact-sized heap
+cases for unaligned Memcheck redzones. Arbitrary-state coverage contains
+20,480 length/alignment/state cases, including 16,384 nonempty calls. Native
+and both-feature tests still require the assembly default. Rust-only jobs
+require the portable fallback and absence of native MD5 tests; a real LLVM
+IR audit rejects both handwritten MD5 modules. Existing x86/ARM ASan jobs
+require portable verdict/read-count coverage with native tests excluded.
+See [the coverage mapping](unsafe-validation.md#fail-closed-md5-assembly-controls).
+Miri is not assembly coverage, and no MD5 Miri claim is made. Linux provides
+native instrumentation; Darwin/Windows retain functional platform tests,
+with Unix guard pages on Darwin and no Windows instrumentation claim.
+
+On the combined tree including the operator's a3b6df5 commit, local validation
+passed 3,207 workspace tests (24 skipped), 25 doctests, warnings-denied Clippy,
+all-feature checks, formatting, locked docs/metadata and both package checks.
+The selected native/both/Rust-only MD5 passes ran 20/21/12 tests. Native and
+both modes require 12/13 named tests respectively, including strict dispatch;
+Rust-only requires four portable tests and excludes native dispatch. The
+Rust-only IR audit passed. Workflow actionlint also passed. The operator's
+Rust-only crypto and encrypted integration lanes passed 60 and 19 tests;
+the combined-crypto lane passed 66.
+
+Par2-rs semver checks passed 196 applicable checks (58 skipped). For unrar-rs,
+a forced-minor compatibility probe identified only the deliberate Copy
+removal (195 pass, one incompatible API finding, 58 skip). Checking the
+actual 0.12 → 0.13 version step correctly classifies it as breaking and
+accepts it; 254 API checks are skipped at that permitted boundary. This is
+not a claim that the new API is backward compatible. Formatting and
+semver-checks do not support `--locked`; other Cargo gates used it.
+
+The operator's added cache tests also produced six CodeQL hard-coded-value
+alerts against fixed test passwords/salts. The flagged lines are inside
+`#[cfg(test)] mod tests` and exercise cache identity and Debug redaction,
+not production credentials. They were not dismissed, suppressed, hidden by
+query configuration, or changed to evade analysis. Their resolution remains
+separate from the native safety controls. No additional AWS resource or
+security-setting change was used.
+
 ## Resource cleanup, evidence and publication
 
 | Lease | Launch UTC | Local / guest deadlines UTC | Verified final resources |
@@ -454,23 +514,23 @@ one branch. Signing initially failed with `1Password: failed to fill whole
 buffer`; the operator reported signing available on 2026-10-19 and authorized
 the signed-commit and PR flow. No unsigned bypass is permitted.
 
-## Release-order reconciliation, 2026-10-19
+## Version reconciliation and intentional additions, 2026-10-19
 
-Publication preflight found `main` still at `e954b913`, with published
-par2-rs 0.10.11, unrar-rs 0.12.0 and rarpar 0.9.1. The proposed versions
-remain par2-rs 0.10.12, unrar-rs 0.12.1 and rarpar 0.9.2.
-[PR #121](https://github.com/scryer-media/rarpar/pull/121) remained open at
-`34e0a033`, carrying a separate unrar-rs 0.13.0 API change and the same
-prospective rarpar 0.9.2. Its implementation and shared files were not
-imported or modified here. The operator requested a separate performance PR.
+Initial publication preflight found main at `e954b913`, published par2-rs
+0.10.11, unrar-rs 0.12.0 and rarpar 0.9.1. The initial performance branch
+proposed unrar-rs 0.12.1 separately from PR #121's 0.13.0 API change.
 
-This branch's 0.12.1 must merge and publish before PR #121's 0.13.0; do not
-publish 0.12.1 after 0.13.0. The PR that lands second must reconcile shared
-manifests, lockfile and changelogs against actual main and published versions,
-retaining both changes. Reuse an appropriate unpublished CLI version; if
-0.9.2 has already shipped, the later CLI change needs the next patch. If
-PR #121 lands first instead, this branch must be rebased to preserve its
-0.13 API line, reuse unpublished 0.13.0 or use 0.13.1 if already published,
-and rerun the affected locked gates before merging. Neither PR can be
-merged blindly over the other's shared version files. No release is
-performed by this performance PR.
+The operator then intentionally added signed commit `a3b6df5` to this PR:
+64 cached RAR5 derivations, redacted key debugging, and non-Copy key material
+that zeroizes on drop. The combined branch therefore uses unrar-rs 0.13.0,
+with recovery-buffer and API-change entries under one heading and rarpar's
+requirement at 0.13.0. The CI additions were reconciled by fast-forwarding
+to the operator's commit, preserving all six of its changed files. No user
+code was reset, removed or rewritten. No third-party dependency changed.
+
+This branch no longer proposes a 0.12.1 release. PR #121 remains separate
+and was not modified or merged by this work. Its overlapping KDF/version
+changes require reconciliation before both PRs can land; the second PR must
+preserve already-landed code and changelog entries. Reuse appropriate
+unpublished 0.13.0 / CLI 0.9.2 versions, or use the next patch if published
+before additional behavior lands. No release is performed here.
