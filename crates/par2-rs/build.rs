@@ -8,8 +8,13 @@
 use std::env;
 
 fn main() {
+    println!("cargo::rustc-check-cfg=cfg(par2_bench_diagnostics)");
     println!("cargo::rustc-check-cfg=cfg(par2_md5_asm)");
     println!("cargo::rustc-check-cfg=cfg(par2_md5_rustcrypto)");
+    println!("cargo::rerun-if-env-changed=PAR2_BENCH_DIAGNOSTICS");
+    if env::var_os("PAR2_BENCH_DIAGNOSTICS").is_some() {
+        println!("cargo::rustc-cfg=par2_bench_diagnostics");
+    }
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let endian = env::var("CARGO_CFG_TARGET_ENDIAN").unwrap_or_default();
     let asm_target = arch == "x86_64" || (arch == "aarch64" && endian == "little");

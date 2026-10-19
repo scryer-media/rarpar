@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.13.0
+
+### Changed
+
+- RAR5 volume recovery caps each input/output buffer at the useful volume
+  length, including its GF16 padding byte. It allocates a second input set
+  only when another chunk needs read-ahead. Larger restores keep the existing
+  buffer budget and overlapping read/decode pipeline.
+- `KdfCache` holds 64 RAR5 derivations instead of 4, so a repeat parse of
+  an archive with up to 64 distinct (password, salt, KDF count) triples runs
+  no PBKDF2 a second time. The RAR4 side keeps its 1024 slots.
+- `Debug` output carries no password or key material. `KdfCache` prints
+  each cached entry's salt and KDF count only, and `Rar5KeyMaterial` prints
+  its type name only; neither prints the password, key, hash key, password
+  check or IV.
+- `MemberCipherKey` is no longer `Copy` (it stays `Clone`, `PartialEq` and
+  `Eq`) and zeroizes its key when dropped. This is a breaking change: code
+  that reused a `MemberCipherKey` after moving it must borrow or clone it.
+
 ## 0.12.0
 
 ### Changed

@@ -54,6 +54,71 @@ pub struct Par2FileSet {
     pub creator: Option<String>,
 }
 
+/// Incremental disk scan of one recovery set, with a shared packet budget.
+///
+/// Discovery can inspect the authenticated Main and File Description packets,
+/// then append volumes and finish without reopening the seed. IFSC validation
+/// is deferred until `finish`, so descriptions split across volumes work in
+/// either order. Recovery payloads remain file-backed.
+pub struct Par2FileSetScanner {
+    budget: PacketScanBudget,
+    builder: Par2FileSetBuilder,
+    failed: bool,
+}
+
+impl Par2FileSetScanner {
+    /// Start an empty scan under caller-selected resource limits.
+    pub fn new(limits: PacketScanLimits) -> Self {
+        Self {
+            budget: PacketScanBudget::new(limits),
+            builder: Par2FileSetBuilder::new(),
+            failed: false,
+        }
+    }
+
+    /// Append a volume. A scan error must be propagated: finishing after one
+    /// would accept an incomplete inventory.
+    pub fn scan_path(&mut self, path: &Path) -> Result<()> {
+        if self.failed {
+            return Err(Par2Error::ResourceLimitExceeded {
+                reason: "cannot resume a failed packet scan".into(),
+            });
+        }
+        self.failed = true;
+        let mut sink = |packet, offset, set_id| {
+            self.builder
+                .add_packet_budgeted(packet, offset, Some(set_id), &self.budget)?;
+            Ok(())
+        };
+        scan_packets_from_path_bounded(path, &self.budget, &mut sink)?;
+        self.failed = false;
+        Ok(())
+    }
+
+    /// The authenticated Main packet's set ID, once a Main has been scanned.
+    pub fn recovery_set_id(&self) -> Option<RecoverySetId> {
+        self.builder
+            .main_packet
+            .as_ref()
+            .map(|main| main.recovery_set_id)
+    }
+
+    /// File descriptions discovered so far, before cross-volume validation.
+    pub fn file_descriptions(&self) -> impl Iterator<Item = &FileDescription> {
+        self.builder.files.values()
+    }
+
+    /// Validate the combined inventory and produce a usable set.
+    pub fn finish(self) -> Result<Par2FileSet> {
+        if self.failed {
+            return Err(Par2Error::ResourceLimitExceeded {
+                reason: "cannot finish a failed packet scan".into(),
+            });
+        }
+        self.builder.build()
+    }
+}
+
 impl Par2FileSet {
     /// Create a new Par2FileSet by parsing packets from one or more .par2 file contents.
     ///
@@ -780,6 +845,30 @@ mod tests {
             creator: None,
         };
         (set, file_id)
+    }
+
+    #[test]
+    fn incremental_scan_does_not_finish_after_error() {
+        let dir = tempdir().unwrap();
+        let mut scanner = Par2FileSetScanner::new(PacketScanLimits::default());
+        assert!(scanner.scan_path(&dir.path().join("missing.par2")).is_err());
+        assert!(scanner.finish().is_err());
+    }
+
+    #[test]
+    fn incremental_scan_has_one_examined_packet_budget() {
+        let dir = tempdir().unwrap();
+        let body = make_main_body(4, &[]);
+        let bytes = make_full_packet(header::TYPE_MAIN, &body, compute_rsid(&body));
+        let path = dir.path().join("main.par2");
+        std::fs::write(&path, bytes).unwrap();
+        let mut scanner = Par2FileSetScanner::new(PacketScanLimits {
+            max_examined_packets: 1,
+            ..PacketScanLimits::default()
+        });
+        scanner.scan_path(&path).unwrap();
+        assert!(scanner.scan_path(&path).is_err());
+        assert!(scanner.finish().is_err());
     }
 
     #[test]

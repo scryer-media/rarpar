@@ -2,7 +2,7 @@
 name = "par2-rs"
 description = "PAR2 parity verification and repair"
 readme = "README.md"
-version = "0.10.11"
+version = "0.10.12"
 edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0"
@@ -15,8 +15,9 @@ exclude = ["tests/fixtures/**", "fuzz/**", "tests/par2cmdline_turbo_*.rs", "test
 #
 # The MD5 seam in `crate::checksum` has two backends. `crypto-native`
 # (default) is the crate's own assembly on x86-64 and little-endian AArch64
-# (`src/md5_asm.rs`, AWS-LC's MD5 carried into `asm!`), so it needs no C
-# toolchain and no crypto library. `crypto-rust` selects the portable
+# (`src/md5_asm.rs`, AWS-LC single-stream, and `src/md5_pair_asm.rs`,
+# ParPar paired MD5, carried into `asm!`), so it needs no C toolchain and no
+# crypto library. `crypto-rust` selects the portable
 # RustCrypto `md-5` implementation. Where both are compiled the assembly wins;
 # both stay compiled so the backend differential test can compare them. Every
 # other target (wasm included) has only RustCrypto, and takes it without being

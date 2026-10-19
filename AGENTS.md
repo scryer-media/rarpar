@@ -49,9 +49,11 @@ and PAR2 workflows.
   `aws-lc-sys` directly: its `links` key is versioned, so a direct
   requirement that differs from what a consumer's `aws-lc-rs` links puts a
   second AWS-LC in their graph. The one exception is `par2-rs` MD5, which
-  `aws-lc-rs` does not offer: it is AWS-LC's MD5 assembly carried into `asm!`
-  in `par2-rs` (`md5_asm.rs`) on x86-64 and AArch64, and RustCrypto `md-5`
-  elsewhere.
+  `aws-lc-rs` does not offer: on x86-64 and AArch64 it uses AWS-LC's
+  single-stream assembly (`md5_asm.rs`) and the explicitly approved ParPar
+  public-domain/CC0 paired assembly (`md5_pair_asm.rs`), carried into `asm!`.
+  Preserve their pinned origins and license notices. Other targets use
+  RustCrypto `md-5`; `crypto-rust` excludes both handwritten MD5 modules.
   The `crypto-rust` feature is the supported opt-out for library consumers
   that cannot carry a C or assembly dependency; it must never be the default,
   never be selected by the release matrix, and never change the AWS-LC code

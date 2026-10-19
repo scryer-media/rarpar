@@ -3,6 +3,31 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.9.2
+
+- Allow absent working directories while expanding PAR2 siblings; skip
+  protected files at impossible volume lengths and all sub-header files unread.
+
+- Resolve deferred PAR2 metadata before `par verify --name` selects a streamed
+  file, retaining slice checksums and recovery counts from obfuscated siblings.
+  Send tracing diagnostics to stderr so warnings leave JSON output parseable.
+
+- RAR5 volume recovery allocates buffers for the useful volume length and
+  creates read-ahead buffers only for multi-chunk restores (unrar-rs 0.13.0).
+
+- Retain production compute-tile and source-batch defaults while exposing
+  diagnostic-only controls for further validation.
+
+- Reuse the initial PAR2 scan across recovery volumes and defer unrelated
+  sibling header reads until verification needs recovery data. Preserve
+  obfuscated volumes, including ones at a protected file name and length.
+- Use ParPar's paired x86-64/AArch64 MD5 assembly where strict verification is
+  already serial, preserving the available two-chain parallel pipeline, 16 KiB
+  prefix, slice padding, and single-stream fallback.
+
+- Builds against unrar-rs 0.13.0, which also caches up to 64 RAR5 key
+  derivations and keeps passwords and key material out of `Debug` output.
+
 ## rarpar 0.9.1
 
 ### Fixed
