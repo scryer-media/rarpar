@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.12
+
+- Enable fair ARM64 Memcheck thread scheduling so existing cancellation watchdog tests run without guest-thread starvation.
+
+- Add diagnostic-only compute-tile and source-batch controls; retain production ARM/x86 preferences and 12-input repair batches until cross-host validation supports changing them.
+
+- Add an incremental, budgeted disk scanner so discovery can reuse its seed packets without dropping IFSC metadata split across volumes.
+- Port ParPar's paired x86-64/AArch64 scalar assembly for serial strict single-read file and slice MD5, including file-parallel workers, with runtime-gated x86 BMI1 rounds. Keep the permitted parallel chain/SIMD path for a lone file with spare workers, the native single-stream fallback for unequal offsets, and the portable backend.
+
 ## 0.10.11
 
 ### Changed
@@ -206,7 +215,7 @@ Fewer redundant reads on the verify and repair paths.
   above). `VerifyOptions::default()` is now written out by hand rather than
   derived; every other field keeps its default.
 
-## 0.10.7 (Unreleased)
+## 0.10.7
 
 ### Fixed
 

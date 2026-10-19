@@ -456,6 +456,83 @@ macro_rules! scalar_op {
     };
 }
 
+// Two independent dependency chains, scheduled round by round as in ParPar's
+// md5_update_block_x2 (Public Domain/CC0). This reuses our round schedule and
+// does not copy the GPL par2cmdline wrapper. Both states may start anywhere
+// in their streams; neither is reset by this compression operation.
+#[cfg(all(test, par2_md5_asm))]
+macro_rules! pair_op {
+    (splat, $k:expr) => {
+        [$k as u32; 2]
+    };
+    (splat_i, $k:expr) => {
+        [$k as u32; 2]
+    };
+    (add, $x:expr, $y:expr) => {
+        [scalar_op!(add, $x[0], $y[0]), scalar_op!(add, $x[1], $y[1])]
+    };
+    (rotl, $v:expr, $s:literal, $rs:literal) => {
+        [
+            scalar_op!(rotl, $v[0], $s, $rs),
+            scalar_op!(rotl, $v[1], $s, $rs),
+        ]
+    };
+    ($op:ident, $a:expr, $b:expr, $c:expr, $d:expr) => {
+        [
+            scalar_op!($op, $a[0], $b[0], $c[0], $d[0]),
+            scalar_op!($op, $a[1], $b[1], $c[1], $d[1]),
+        ]
+    };
+}
+
+/// Advance two MD5 states over equally many whole blocks. Safe loads also
+/// permit unaligned input, including different prefixes and slice resets.
+#[cfg(all(test, par2_md5_asm))]
+pub(crate) fn compress_pair(left: &mut [u32; 4], right: &mut [u32; 4], x: &[u8], y: &[u8]) {
+    assert_eq!(x.len(), y.len());
+    assert_eq!(x.len() % BLOCK, 0);
+    let mut a = [left[0], right[0]];
+    let mut b = [left[1], right[1]];
+    let mut c = [left[2], right[2]];
+    let mut d = [left[3], right[3]];
+    for (x, y) in x.chunks_exact(BLOCK).zip(y.chunks_exact(BLOCK)) {
+        let mut m = [[0u32; 2]; 16];
+        for (i, word) in m.iter_mut().enumerate() {
+            *word = [
+                u32::from_le_bytes(x[i * 4..i * 4 + 4].try_into().unwrap()),
+                u32::from_le_bytes(y[i * 4..i * 4 + 4].try_into().unwrap()),
+            ];
+        }
+        let (aa, bb, cc, dd) = (a, b, c, d);
+        md5_block_rounds!(pair_op, a, b, c, d, m);
+        a = pair_op!(add, a, aa);
+        b = pair_op!(add, b, bb);
+        c = pair_op!(add, c, cc);
+        d = pair_op!(add, d, dd);
+    }
+    *left = [a[0], b[0], c[0], d[0]];
+    *right = [a[1], b[1], c[1], d[1]];
+}
+
+/// Independent one-state textbook rounds for paired-assembly differentials.
+#[cfg(all(test, par2_md5_asm))]
+pub(crate) fn compress_scalar_state(state: &mut [u32; 4], data: &[u8]) {
+    assert_eq!(data.len() % BLOCK, 0);
+    let [mut a, mut b, mut c, mut d] = *state;
+    for block in data.chunks_exact(BLOCK) {
+        let m: [u32; 16] = std::array::from_fn(|i| {
+            u32::from_le_bytes(block[i * 4..i * 4 + 4].try_into().unwrap())
+        });
+        let (aa, bb, cc, dd) = (a, b, c, d);
+        md5_block_rounds!(scalar_op, a, b, c, d, m);
+        a = a.wrapping_add(aa);
+        b = b.wrapping_add(bb);
+        c = c.wrapping_add(cc);
+        d = d.wrapping_add(dd);
+    }
+    *state = [a, b, c, d];
+}
+
 macro_rules! scalar_load {
     ($ptrs:expr) => {{
         let mut words = [0u32; 16];

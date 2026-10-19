@@ -51,7 +51,12 @@ pub(crate) const DEFAULT_REPAIR_MEMORY_LIMIT: usize = 128 * 1024 * 1024;
 /// raises it further. Bounded in practice by the 32768-slice spec cap.
 const MATRIX_WORKSPACE_BUDGET_FLOOR: usize = 1024 * 1024 * 1024;
 const XOR_OUT_PAR_CHUNK: usize = 16;
+#[cfg(not(all(target_arch = "aarch64", par2_bench_diagnostics)))]
 const CPU_CONTROLLER_BUDGET_INPUTS: usize = 12;
+// A deliberately instrumented build may test the reference's 16-source
+// grouping. Normal builds retain their 12-entry scratch and policy.
+#[cfg(all(target_arch = "aarch64", par2_bench_diagnostics))]
+const CPU_CONTROLLER_BUDGET_INPUTS: usize = 16;
 
 /// A plan for repairing missing/damaged slices.
 #[derive(Debug, Clone)]
@@ -1206,13 +1211,11 @@ impl CpuKernelKind {
                 },
                 strict_wx_available: false,
             },
-            // Identical to `Plain` except for the two fields ParPar's aarch64
-            // packed staging actually fixes: the block granularity and the
-            // checksum width. `ideal_input_multiple`/`staging_multiple` stay 1
-            // because the oracle's region interleave (`CLMUL_NUM_REGIONS == 8`,
-            // `parpar/gf16/gf16_clmul_neon_base.h:49-51`) lives *inside* the
-            // muladd kernel — rarpar already carries it as
-            // `gf_simd::CLMUL_SRC_GROUP` — not in the controller's batch shape.
+            // Match the reference's packed block and checksum granularity.
+            // The current controller still groups 12 inputs; the reference's
+            // CLMUL idealInputMultiple=8 rounds that to 16. Batch width and
+            // compute tile size are separate policy variables. Native A72
+            // measurements retain 12 inputs: the 16-input control regressed.
             #[cfg(target_arch = "aarch64")]
             Self::NeonPacked => CpuMethodContract {
                 stride: NEON_PACKED_BLOCK_BYTES,
@@ -4848,6 +4851,25 @@ fn execute_repair_streaming_with_trace(
         .as_ref()
         .map_or(cpu_kernel, |memo| CpuKernelKind::XorJit(memo.width));
     let method = cpu_kernel.method();
+    // Only a deliberately instrumented build accepts the experiment override.
+    // Shipped builds retain their established preferences pending broader
+    // validation. This changes compute tiles, not the I/O chunk or budget.
+    #[cfg(par2_bench_diagnostics)]
+    let method = CpuMethodContract {
+        ideal_chunk_size: match std::env::var("RARPAR_BENCH_COMPUTE_KIB").ok().as_deref() {
+            Some("8") => 8 * 1024,
+            Some("16") => 16 * 1024,
+            Some("32") => 32 * 1024,
+            _ => method.ideal_chunk_size,
+        },
+        #[cfg(target_arch = "aarch64")]
+        ideal_input_multiple: match std::env::var("RARPAR_BENCH_SOURCE_BATCH").ok().as_deref() {
+            Some("12") => 1,
+            Some("16") => 8,
+            _ => method.ideal_input_multiple,
+        },
+        ..method
+    };
     let input_grouping = method.input_grouping();
     #[cfg(target_arch = "x86_64")]
     let persistent_jit_bytes = jit_memo.as_ref().map_or(0, JitMemo::reserved_bytes);
@@ -5130,12 +5152,12 @@ fn execute_repair_streaming_with_trace(
                 let byte_len = chunk_len * 2;
                 let controller = cpu_controller_plan(byte_len, n, workers, method, staging_width);
                 let controller_layout = Arc::new(controller.layout().clone());
-                debug!(
+                info!(
                     chunk = chunk_idx,
                     aligned_bytes = controller.layout().aligned_len,
                     compute_chunk_bytes = controller.layout().chunk_len,
                     compute_chunks = controller.layout().num_chunks,
-                    assignments = controller.layout().assignments.len(),
+                    assignments = ?controller.layout().assignments,
                     input_grouping = controller.input_grouping(),
                     "CPU repair controller plan"
                 );
@@ -7546,6 +7568,21 @@ pub(crate) mod tests {
                 "NeonPacked must be default-on when the pin is unset"
             );
         }
+    }
+
+    #[test]
+    fn established_cpu_chunk_preferences_are_unchanged() {
+        assert_eq!(CpuKernelKind::Plain.method().ideal_chunk_size, 32768);
+        assert_eq!(CpuKernelKind::Folded.method().ideal_chunk_size, 8192);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(CpuKernelKind::NeonPacked.method().ideal_chunk_size, 32768);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            CpuKernelKind::XorJit(reedsolomon_rs::xor_jit::JitWidth::Avx2)
+                .method()
+                .ideal_chunk_size,
+            XORJIT_AVX2_IDEAL_CHUNK_BYTES
+        );
     }
 
     /// The four-lane multiply-by-two must agree with the scalar one on every

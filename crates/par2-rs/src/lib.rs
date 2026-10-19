@@ -78,13 +78,18 @@
 //!
 //! # Feature flags
 //!
-//! - `crypto-native` *(default)*: single-stream MD5 in the crate's own
-//!   assembly on x86-64 and little-endian AArch64 (AWS-LC's MD5 carried into
-//!   `asm!`; see `md5_asm.rs` for its origin and licence). No C toolchain and
-//!   no crypto library. Every other target uses RustCrypto `md-5`.
+//! - `crypto-native` *(default)*: AWS-LC single-stream MD5 and ParPar paired
+//!   MD5 assembly on x86-64 and little-endian AArch64, carried into `asm!`;
+//!   see `md5_asm.rs` and `md5_pair_asm.rs` for origin and licences. Paired
+//!   x86 BMI1 rounds require runtime detection; baseline x86 and ARM rounds
+//!   use no optional instructions. No C toolchain or crypto library is
+//!   needed. Every other target uses RustCrypto `md-5`.
 //! - `crypto-rust`: the portable RustCrypto (`md-5`) MD5 backend on every
 //!   target. Select it with `default-features = false, features =
-//!   ["crypto-rust"]`. Expect slower hashing on x86-64; nothing else changes.
+//!   ["crypto-rust"]`. This excludes both handwritten MD5 assembly modules
+//!   at compile time; other SIMD, I/O and repair code still uses unsafe Rust.
+//!   It does not make this crate or its dependencies unsafe-free. Expect
+//!   slower hashing on x86-64; digests are unchanged.
 //! - `crypto-aws-lc`, `native-crypto`: back-compat aliases for
 //!   `crypto-native`.
 //!
@@ -147,6 +152,8 @@ mod file_cache;
 pub mod matrix;
 #[cfg(par2_md5_asm)]
 mod md5_asm;
+#[cfg(par2_md5_asm)]
+mod md5_pair_asm;
 pub mod md5_simd;
 pub mod packet;
 pub mod par2_set;

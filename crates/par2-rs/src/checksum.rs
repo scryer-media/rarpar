@@ -141,6 +141,19 @@ impl Md5State {
         }
     }
 
+    #[allow(irrefutable_let_patterns)]
+    fn update_pair(&mut self, other: &mut Self, data: &[u8]) {
+        #[cfg(par2_md5_asm)]
+        if let (Md5StateInner::Native(left), Md5StateInner::Native(right)) =
+            (&mut self.inner, &mut other.inner)
+        {
+            left.update_pair(right, data);
+            return;
+        }
+        self.update(data);
+        other.update(data);
+    }
+
     pub(crate) fn finalize(self) -> [u8; 16] {
         match self.inner {
             #[cfg(par2_md5_rustcrypto)]
@@ -188,6 +201,15 @@ impl SliceChecksumState {
         self.crc32.update(data);
         self.md5.update(data);
         self.bytes_fed += data.len() as u64;
+    }
+
+    /// Feed the same bytes to the independent file and slice MD5 chains,
+    /// interleaving their rounds where the native backend permits it.
+    pub(crate) fn update_with_file_hash(&mut self, file: &mut FileHashState, data: &[u8]) {
+        self.crc32.update(data);
+        self.md5.update_pair(&mut file.md5, data);
+        self.bytes_fed += data.len() as u64;
+        file.bytes_fed += data.len() as u64;
     }
 
     /// How many bytes have been fed so far.
@@ -453,6 +475,244 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[cfg(all(par2_md5_rustcrypto, not(par2_md5_asm)))]
+    #[test]
+    fn rust_only_md5_keeps_safe_streaming_pair_fallback() {
+        use md5::Digest as _;
+        assert_eq!(default_md5_backend(), Par2Md5Backend::RustCrypto);
+        let data: Vec<u8> = (0..70000).map(|i| (i * 37 + 11) as u8).collect();
+        for (prefix, other_prefix) in [(0, 0), (1, 63), (64, 64), (65, 129)] {
+            for len in [0, 1, 55, 56, 63, 64, 65, 4097, 65536] {
+                let (mut a, mut b) = (Md5State::new(), Md5State::new());
+                let (mut ra, mut rb) = (md5::Md5::new(), md5::Md5::new());
+                a.update(&data[..prefix]);
+                ra.update(&data[..prefix]);
+                b.update(&data[129..129 + other_prefix]);
+                rb.update(&data[129..129 + other_prefix]);
+                for chunk in data[256..256 + len].chunks(137) {
+                    a.update_pair(&mut b, chunk);
+                    ra.update(chunk);
+                    rb.update(chunk);
+                }
+                assert_eq!(a.finalize(), <[u8; 16]>::from(ra.finalize()));
+                assert_eq!(b.finalize(), <[u8; 16]>::from(rb.finalize()));
+            }
+        }
+    }
+
+    #[cfg(par2_md5_asm)]
+    #[test]
+    fn paired_assembly_matches_scalar_states_and_rust_pairs() {
+        let mut seed = 0xf0c3_19b8_8457_2d61;
+        let mut x = vec![0; 1024 + 64];
+        let mut y = vec![0; 1024 + 64];
+        for byte in x.iter_mut().chain(&mut y) {
+            *byte = (next_pseudorandom(&mut seed) >> 32) as u8;
+        }
+        for offset in 0..64 {
+            for other_offset in 0..64 {
+                for len in [0, 64, 128, 192, 1024] {
+                    let left = std::array::from_fn(|_| (next_pseudorandom(&mut seed) >> 16) as u32);
+                    let right =
+                        std::array::from_fn(|_| (next_pseudorandom(&mut seed) >> 16) as u32);
+                    let x = &x[offset..offset + len];
+                    let y = &y[other_offset..other_offset + len];
+                    let (mut scalar_left, mut scalar_right) = (left, right);
+                    crate::md5_simd::compress_scalar_state(&mut scalar_left, x);
+                    crate::md5_simd::compress_scalar_state(&mut scalar_right, y);
+                    let (mut rust_left, mut rust_right) = (left, right);
+                    crate::md5_simd::compress_pair(&mut rust_left, &mut rust_right, x, y);
+                    assert_eq!((rust_left, rust_right), (scalar_left, scalar_right));
+                    let (mut actual_left, mut actual_right) = (left, right);
+                    crate::md5_pair_asm::compress_pair(&mut actual_left, &mut actual_right, x, y);
+                    assert_eq!(
+                        (actual_left, actual_right),
+                        (scalar_left, scalar_right),
+                        "alignment {offset}/{other_offset}, len {len}"
+                    );
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        let (mut actual_left, mut actual_right) = (left, right);
+                        crate::md5_pair_asm::compress_baseline(
+                            &mut actual_left,
+                            &mut actual_right,
+                            x,
+                            y,
+                        );
+                        assert_eq!((actual_left, actual_right), (scalar_left, scalar_right));
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(par2_md5_asm)]
+    #[test]
+    fn paired_native_streaming_uses_selected_assembly() {
+        assert_eq!(default_md5_backend(), Par2Md5Backend::Native);
+        let before = crate::md5_pair_asm::executions();
+        let (mut left, mut right) = (Md5State::new(), Md5State::new());
+        left.update_pair(&mut right, &[0x5a; 129]);
+        let after = crate::md5_pair_asm::executions();
+        #[cfg(target_arch = "aarch64")]
+        let backend = 0;
+        #[cfg(target_arch = "x86_64")]
+        let backend = if std::is_x86_feature_detected!("bmi1") {
+            2
+        } else {
+            1
+        };
+        assert!(after[backend] > before[backend]);
+        assert_eq!(left.finalize(), right.finalize());
+    }
+
+    #[cfg(par2_md5_asm)]
+    #[test]
+    fn paired_streams_random_chunks_match_rustcrypto() {
+        use md5::Digest as _;
+        let mut seed = 0x9568_ae75_e59c_24bd;
+        for case in 0..256 {
+            let offset = (next_pseudorandom(&mut seed) >> 32) as usize % 64;
+            let len = (next_pseudorandom(&mut seed) >> 32) as usize % 131073;
+            let mut data = vec![0; len + offset + 512];
+            for byte in &mut data {
+                *byte = (next_pseudorandom(&mut seed) >> 32) as u8;
+            }
+            let first_prefix = (next_pseudorandom(&mut seed) >> 32) as usize % 256;
+            let second_prefix = if case % 2 == 0 {
+                first_prefix
+            } else {
+                (next_pseudorandom(&mut seed) >> 32) as usize % 256
+            };
+            let (mut left, mut right) = (Md5State::new(), Md5State::new());
+            let (mut ref_left, mut ref_right) = (md5::Md5::new(), md5::Md5::new());
+            left.update(&data[..first_prefix]);
+            ref_left.update(&data[..first_prefix]);
+            right.update(&data[256..256 + second_prefix]);
+            ref_right.update(&data[256..256 + second_prefix]);
+            let mut rest = &data[offset..offset + len];
+            while !rest.is_empty() {
+                let chunk =
+                    ((next_pseudorandom(&mut seed) >> 32) as usize % 8192 + 1).min(rest.len());
+                left.update_pair(&mut right, &rest[..chunk]);
+                ref_left.update(&rest[..chunk]);
+                ref_right.update(&rest[..chunk]);
+                rest = &rest[chunk..];
+            }
+            assert_eq!(
+                left.finalize(),
+                <[u8; 16]>::from(ref_left.finalize()),
+                "case {case}"
+            );
+            assert_eq!(
+                right.finalize(),
+                <[u8; 16]>::from(ref_right.finalize()),
+                "case {case}"
+            );
+        }
+    }
+
+    #[cfg(all(par2_md5_asm, unix))]
+    #[test]
+    fn paired_assembly_stops_at_guard_page() {
+        struct Guard {
+            address: *mut libc::c_void,
+            page: usize,
+        }
+        impl Guard {
+            fn new(value: u8) -> Self {
+                // SAFETY: query-only sysconf, followed by a private mapping.
+                let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+                assert!(page >= 64);
+                let page = page as usize;
+                // SAFETY: allocate two anonymous pages; no existing mapping is replaced.
+                let address = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        page * 2,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANON,
+                        -1,
+                        0,
+                    )
+                };
+                assert_ne!(address, libc::MAP_FAILED);
+                let guard = Self { address, page };
+                // SAFETY: both ranges are within this mapping; only the second
+                // page is protected. The last block of the first is initialized.
+                unsafe {
+                    std::ptr::write_bytes(address.cast::<u8>().add(page - 64), value, 64);
+                    assert_eq!(
+                        libc::mprotect(
+                            address.cast::<u8>().add(page).cast(),
+                            page,
+                            libc::PROT_NONE
+                        ),
+                        0
+                    );
+                }
+                guard
+            }
+            fn block(&self) -> &[u8] {
+                // SAFETY: the initialized 64 bytes immediately precede the
+                // inaccessible page, and the mapping outlives this borrow.
+                unsafe {
+                    std::slice::from_raw_parts(self.address.cast::<u8>().add(self.page - 64), 64)
+                }
+            }
+        }
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                // SAFETY: this object uniquely owns the complete mapping.
+                unsafe {
+                    libc::munmap(self.address, self.page * 2);
+                }
+            }
+        }
+        let (x, y) = (Guard::new(0x39), Guard::new(0xa7));
+        let (mut left, mut right) = ([0x12345678; 4], [0xfedcba98; 4]);
+        let (mut expected_left, mut expected_right) = (left, right);
+        crate::md5_simd::compress_scalar_state(&mut expected_left, x.block());
+        crate::md5_simd::compress_scalar_state(&mut expected_right, y.block());
+        crate::md5_pair_asm::compress_pair(&mut left, &mut right, x.block(), y.block());
+        assert_eq!((left, right), (expected_left, expected_right));
+        #[cfg(target_arch = "x86_64")]
+        {
+            let (mut left, mut right) = ([0x12345678; 4], [0xfedcba98; 4]);
+            crate::md5_pair_asm::compress_baseline(&mut left, &mut right, x.block(), y.block());
+            assert_eq!((left, right), (expected_left, expected_right));
+        }
+    }
+
+    #[cfg(par2_md5_asm)]
+    #[test]
+    fn stitched_md5_matches_independent_states_at_every_offset() {
+        use md5::Digest as _;
+        let data: Vec<u8> = (0..70000).map(|i| (i * 37 + 11) as u8).collect();
+        for prefix in 0..128 {
+            for other_prefix in [0, prefix, 63, 64, 65] {
+                for len in [0, 1, 55, 56, 63, 64, 65, 127, 128, 129, 4097, 65536] {
+                    let mut a = Md5State::new();
+                    let mut b = Md5State::new();
+                    a.update(&data[..prefix]);
+                    b.update(&data[129..129 + other_prefix]);
+                    let mut ra = md5::Md5::new();
+                    let mut rb = md5::Md5::new();
+                    ra.update(&data[..prefix]);
+                    rb.update(&data[129..129 + other_prefix]);
+                    // Chunking crosses buffer-fill and block boundaries.
+                    for chunk in data[256..256 + len].chunks(137) {
+                        a.update_pair(&mut b, chunk);
+                        ra.update(chunk);
+                        rb.update(chunk);
+                    }
+                    assert_eq!(a.finalize(), <[u8; 16]>::from(ra.finalize()));
+                    assert_eq!(b.finalize(), <[u8; 16]>::from(rb.finalize()));
+                }
+            }
+        }
     }
 
     #[test]

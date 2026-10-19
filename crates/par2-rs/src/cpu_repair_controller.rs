@@ -899,6 +899,46 @@ mod tests {
     }
 
     #[test]
+    fn checksum_stride_changes_the_64k_four_worker_threshold() {
+        // The checksum stride puts targetThreadChunk *above* 32 KiB / 2.
+        // Thus a 32 KiB preference is four ~16 KiB tiles, not two ~32 KiB
+        // tiles with an output split. A 16 KiB preference has the same plan.
+        for stride in [2, 32] {
+            for ideal in [16 * 1024, 32 * 1024] {
+                let method = CpuMethodContract {
+                    stride,
+                    ideal_chunk_size: ideal,
+                    ..METHOD
+                };
+                let plan = CpuControllerPlan::new(65536, 250, 4, method);
+                assert_eq!(plan.layout.num_chunks, 4);
+                assert_eq!(
+                    plan.layout.chunk_len,
+                    if stride == 32 { 16416 } else { 16386 }
+                );
+                assert_eq!(plan.layout.assignments.len(), 4);
+                assert!(
+                    plan.layout
+                        .assignments
+                        .iter()
+                        .all(|assignment| assignment.output_len == 250)
+                );
+            }
+            let method = CpuMethodContract {
+                stride,
+                ideal_chunk_size: 8 * 1024,
+                ..METHOD
+            };
+            let plan = CpuControllerPlan::new(65536, 250, 4, method);
+            assert_eq!(plan.layout.num_chunks, 8);
+            assert_eq!(
+                plan.layout.chunk_len,
+                if stride == 32 { 8224 } else { 8194 }
+            );
+        }
+    }
+
+    #[test]
     fn input_grouping_rounds_twelve_to_kernel_multiple() {
         assert_eq!(METHOD.input_grouping(), 12);
         assert_eq!(

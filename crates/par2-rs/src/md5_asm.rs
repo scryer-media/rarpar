@@ -77,6 +77,50 @@ impl Md5 {
         self.buffered = rest.len();
     }
 
+    /// Advance a file chain and a slice chain together. Unequal block
+    /// offsets (possible with non-64-byte PAR2 slices) retain the assembly
+    /// single-stream fallback, including all buffering and padding semantics.
+    pub(crate) fn update_pair(&mut self, other: &mut Self, mut data: &[u8]) {
+        if self.buffered != other.buffered {
+            self.update(data);
+            other.update(data);
+            return;
+        }
+        self.length = self.length.wrapping_add(data.len() as u64);
+        other.length = other.length.wrapping_add(data.len() as u64);
+        if self.buffered > 0 {
+            let take = (64 - self.buffered).min(data.len());
+            self.buffer[self.buffered..self.buffered + take].copy_from_slice(&data[..take]);
+            other.buffer[other.buffered..other.buffered + take].copy_from_slice(&data[..take]);
+            self.buffered += take;
+            other.buffered += take;
+            data = &data[take..];
+            if self.buffered < 64 {
+                return;
+            }
+            crate::md5_pair_asm::compress_pair(
+                &mut self.state,
+                &mut other.state,
+                &self.buffer,
+                &other.buffer,
+            );
+            self.buffered = 0;
+            other.buffered = 0;
+        }
+        let whole = data.len() & !63;
+        crate::md5_pair_asm::compress_pair(
+            &mut self.state,
+            &mut other.state,
+            &data[..whole],
+            &data[..whole],
+        );
+        let rest = &data[whole..];
+        self.buffer[..rest.len()].copy_from_slice(rest);
+        other.buffer[..rest.len()].copy_from_slice(rest);
+        self.buffered = rest.len();
+        other.buffered = rest.len();
+    }
+
     pub(crate) fn finalize(mut self) -> [u8; 16] {
         let bits = self.length.wrapping_mul(8);
         let mut tail = [0u8; 128];

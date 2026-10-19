@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.12.1
+
+### Changed
+
+- RAR5 volume recovery caps each input/output buffer at the useful volume
+  length, including its GF16 padding byte. It allocates a second input set
+  only when another chunk needs read-ahead. Larger restores keep the existing
+  buffer budget and overlapping read/decode pipeline.
+
 ## 0.12.0
 
 ### Changed
