@@ -874,14 +874,7 @@ fn reconstruct_rar5(
         .map(|slot| slot.file_size)
         .max()
         .unwrap_or(0);
-    // Every unit of a chunk is held at once so the whole matrix can be
-    // applied across stripes on every core, and the next chunk's units are
-    // read meanwhile, which bounds the chunk by two sets of units plus the
-    // outputs rather than by the outputs alone.
-    let mut chunk_size = (RAR5_TOTAL_BUFFER_SIZE / (2 * data_count + missing_count).max(1)).max(2);
-    if !chunk_size.is_multiple_of(2) {
-        chunk_size -= 1;
-    }
+    let chunk_size = rar5_chunk_size(max_volume_size, data_count, missing_count);
 
     let mut data_files = data_slots
         .iter()
@@ -962,10 +955,10 @@ fn reconstruct_rar5(
         unit_files.push(unit);
     }
 
-    // Two sets of unit buffers: the next chunk is read into one while the
-    // other is decoded and written.
+    // The spare set is allocated only when a next chunk needs read-ahead.
+    // Single-chunk restores need just the current inputs and the outputs.
     let mut input_bufs = vec![vec![0u8; chunk_size]; data_count];
-    let mut next_bufs = vec![vec![0u8; chunk_size]; data_count];
+    let mut next_bufs = Vec::new();
     let mut out_bufs = vec![vec![0u8; chunk_size]; missing_count];
     // Each restored volume is hashed as it is written, so verifying it
     // afterwards does not read it back.
@@ -1007,6 +1000,9 @@ fn reconstruct_rar5(
         let rs_len = bytes_to_process + (bytes_to_process & 1);
         let next = processed + bytes_to_process as u64;
 
+        if next < max_volume_size && next_bufs.is_empty() {
+            next_bufs = vec![vec![0u8; chunk_size]; data_count];
+        }
         let (read_ahead, written) = rayon::join(
             || {
                 if next < max_volume_size {
@@ -1068,6 +1064,16 @@ fn reconstruct_rar5(
             .map(|(_, hasher, _)| hasher.map(crc32fast::Hasher::finalize))
             .collect(),
     })
+}
+
+fn rar5_chunk_size(max_volume_size: u64, data_count: usize, missing_count: usize) -> usize {
+    // Keep the two input sets and the outputs within the existing budget
+    // when read-ahead is useful, without allocating past the volume's end.
+    let budget = (RAR5_TOTAL_BUFFER_SIZE / (2 * data_count + missing_count).max(1)).max(2);
+    let budget = budget - (budget & 1);
+    let useful = max_volume_size.min(budget as u64) as usize;
+    // GF16 needs an even buffer length, including a final odd-byte pad.
+    useful + (useful & 1)
 }
 
 /// Run `task` over the pairs of two equally long slices, on rayon where the
@@ -2196,6 +2202,23 @@ impl<'a> SliceReader<'a> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn rar5_chunk_capacity_tracks_useful_bytes_with_gf16_padding() {
+        for (volume_size, expected) in [
+            (0, 0),
+            (1, 2),
+            (2, 2),
+            (3, 4),
+            (1_048_576, 1_048_576),
+            (3_532_043, 3_532_044),
+            (3_532_044, 3_532_044),
+            (3_532_045, 3_532_044),
+            (u64::MAX, 3_532_044),
+        ] {
+            assert_eq!(rar5_chunk_size(volume_size, 9, 1), expected);
+        }
+    }
+
     fn rar4_archive_with_recovery_flag() -> Vec<u8> {
         let mut bytes = b"Rar!\x1a\x07\0".to_vec();
         let mut header = vec![0u8; 7];
@@ -2667,17 +2690,29 @@ mod tests {
     /// volume is whatever the decoder rebuilds from it, and the table carries
     /// that volume's size and CRC32, so the set is consistent by construction.
     fn synthetic_rar5_set(dir: &Path, stem: &str, seed: u8) -> (Vec<PathBuf>, Vec<u8>) {
+        synthetic_rar5_set_with_payload_len(dir, stem, seed, 97)
+    }
+
+    fn synthetic_rar5_set_with_payload_len(
+        dir: &Path,
+        stem: &str,
+        seed: u8,
+        payload_len: usize,
+    ) -> (Vec<PathBuf>, Vec<u8>) {
         let mut second = build_probe_rar5_archive(
             crate::header::main_archive::flags::VOLUME
                 | crate::header::main_archive::flags::VOLUME_NUMBER,
             Some(1),
         );
-        second.extend((0..97u8).map(|i| i.wrapping_mul(7) ^ seed));
+        second.extend((0..payload_len).map(|i| (i as u8).wrapping_mul(7) ^ seed));
         let first_len = second.len() + 23;
         let rs_len = first_len + (first_len & 1);
-        let payload = (0..rs_len)
+        let mut payload = (0..rs_len)
             .map(|i| (i as u8).wrapping_mul(13) ^ seed)
             .collect::<Vec<_>>();
+        // The reader supplies a zero GF16 pad after the maximum volume
+        // length, so the independent reference pass must use the same pad.
+        payload[first_len..].fill(0);
 
         let coder = Rar5RsCoder::new_decoder(2, 1, &[false, true, true]).unwrap();
         let mut second_unit = second.clone();
@@ -2703,6 +2738,51 @@ mod tests {
         std::fs::write(&second_path, &second).unwrap();
         std::fs::write(&rev_path, &rev).unwrap();
         (vec![second_path, rev_path], first)
+    }
+
+    #[test]
+    fn rar5_folded_restore_preserves_short_even_and_odd_volume_tails() {
+        for payload_len in 0..4 {
+            let dir = tempfile::tempdir().unwrap();
+            let (paths, expected) =
+                synthetic_rar5_set_with_payload_len(dir.path(), "short_tail", 0x63, payload_len);
+
+            let report = restore_volumes_from_paths(&paths, &RecoveryOptions::default()).unwrap();
+
+            let restored = dir.path().join("short_tail.part1.rar");
+            assert_eq!(report.restored_paths, vec![restored.clone()]);
+            assert_eq!(std::fs::read(restored).unwrap(), expected);
+            assert_eq!(stray_partials(dir.path(), &[]), Vec::<PathBuf>::new());
+        }
+    }
+
+    #[test]
+    fn rar5_folded_restore_preserves_read_ahead_and_a_final_odd_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let chunk_size = rar5_chunk_size(u64::MAX, 2, 1);
+        let header_len = build_probe_rar5_archive(
+            crate::header::main_archive::flags::VOLUME
+                | crate::header::main_archive::flags::VOLUME_NUMBER,
+            Some(1),
+        )
+        .len();
+        let (paths, expected) = synthetic_rar5_set_with_payload_len(
+            dir.path(),
+            "chunk_tail",
+            0x74,
+            chunk_size + 1 - header_len - 23,
+        );
+        // The fixture spans the unchanged two-input-set budget. Its expected
+        // bytes were reconstructed in one pass, independently of chunking.
+        assert_eq!(expected.len(), chunk_size + 1);
+        assert!(!expected.len().is_multiple_of(2));
+
+        let report = restore_volumes_from_paths(&paths, &RecoveryOptions::default()).unwrap();
+
+        let restored = dir.path().join("chunk_tail.part1.rar");
+        assert_eq!(report.restored_paths, vec![restored.clone()]);
+        assert_eq!(std::fs::read(restored).unwrap(), expected);
+        assert_eq!(stray_partials(dir.path(), &[]), Vec::<PathBuf>::new());
     }
 
     /// Hidden or `.partial` names in `dir`, other than `keep`.

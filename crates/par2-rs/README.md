@@ -55,6 +55,12 @@ always writes real files.
 files from disk; your own implementation can verify bytes that are still
 arriving over the network, or that never exist as files.
 
+For staged volume discovery, `par2_rs::par2_set::Par2FileSetScanner` keeps an
+unfinished, budgeted scan. Call `scan_path` for the seed, inspect
+`recovery_set_id` and `file_descriptions`, append other volumes, then `finish`.
+This avoids reopening the seed and retains slice checksums whose descriptions
+arrive in a later volume. Propagate scan errors; a failed scanner cannot finish.
+
 ## What it does
 
 - Reads every PAR2 packet type, from any number of `.par2` files, as one set.
@@ -80,8 +86,49 @@ default backend is fast assembly:
 par2-rs = { version = "0.10", default-features = false, features = ["crypto-rust"] }
 ```
 
-`crypto-aws-lc` and `native-crypto` are old names for `crypto-native`. On
-x86-64 and AArch64, turning on neither backend is a compile error.
+Strict single-read verification interleaves the independent file and slice
+MD5 chains using ParPar's paired scalar assembly when verification is confined
+to one worker, on x86-64 and little-endian AArch64. x86 selects BMI1 rounds only after runtime detection; the baseline
+x86 and ARM compressors need no optional instructions.
+The 16 KiB identity hash snapshots the file chain. Slice zero padding never
+enters the file hash. Unequal block offsets and single-stream hashing keep
+the assembly fallback; once damage is found, remaining slices use the
+existing SIMD batches. A lone file with spare workers keeps the existing
+parallel file-chain/SIMD-slice pipeline. File-parallel workers do not open a
+nested join and use the paired compressor instead. The portable backend
+retains its previous pipeline.
+
+To compile without either handwritten MD5 assembly module:
+
+```sh
+cargo build --locked -p par2-rs --no-default-features --features crypto-rust
+cargo nextest run --locked -p par2-rs --no-default-features --features crypto-rust --lib --no-fail-fast
+```
+
+This configuration uses safe RustCrypto streaming MD5, including the safe
+pair-update fallback. The earlier paired scalar Rust compressor is also
+retained as the independent assembly-test oracle. The native single-stream
+and paired assembly modules are excluded at compile time. This is an MD5
+backend guarantee: the crate still contains unsafe SIMD, mmap, file-system
+FFI and repair-buffer code, and its dependencies are not certified unsafe-free.
+It does not provide a whole-crate `forbid(unsafe_code)` configuration.
+On x86-64 and little-endian AArch64, RustCrypto 0.11 uses its software MD5
+compressor. RustCrypto has its own assembly on LoongArch64; select its
+software compressor explicitly when requiring software MD5 there:
+
+```sh
+RUSTFLAGS='--cfg md5_backend="soft"' cargo build --locked -p par2-rs --no-default-features --features crypto-rust
+```
+
+This additional setting concerns MD5, not all transitive code.
+
+The backend features are additive, not mutually exclusive. If `crypto-native`
+and `crypto-rust` are both enabled, native MD5 wins and both backends compile
+for differential testing. Cargo feature unification can enable native MD5
+through another dependency, so inspect the resolved graph when requiring
+Rust-only MD5. `crypto-aws-lc` and `native-crypto` are compatibility aliases
+that enable `crypto-native`. On x86-64 and AArch64, enabling neither backend
+is a compile error.
 
 ## GPU repair
 
@@ -136,6 +183,7 @@ Apache-2.0 from version 0.10.11 onward. See
 [LICENSE](https://github.com/scryer-media/rarpar/blob/main/crates/par2-rs/LICENSE).
 Releases before 0.10.11 stay under GPL-3.0-or-later.
 
-The AArch64 MD5 assembly comes from AWS-LC (originally OpenSSL), also under
-Apache-2.0. The repository's tests adapted from par2cmdline stay GPL and are
+The single-stream AArch64 MD5 assembly comes from AWS-LC (originally
+OpenSSL), also under Apache-2.0. The paired MD5 instruction streams come from
+[ParPar](https://github.com/animetosho/ParPar#license), Public Domain/CC0. The repository's tests adapted from par2cmdline stay GPL and are
 not part of the published crate.

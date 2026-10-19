@@ -57,6 +57,8 @@ struct ResolvedPar2Input {
     /// hash every volume a second time. `None` when resolution could not
     /// parse it; the flow then scans again and reports why.
     scanned: Option<par2_rs::Par2FileSet>,
+    /// Nonstandard sibling names, opened only if verification needs them.
+    deferred_par2: Vec<PathBuf>,
 }
 
 pub fn run_command(cli: &Cli, command: ParCommand) -> Result<u8, RarparError> {
@@ -446,7 +448,8 @@ fn resolve_compat_input(
         return Err(RarparError::MissingInput(input.to_path_buf()));
     }
 
-    let (par2_paths, seed) = discover_compat_par2_paths(input, wildcard.as_deref())?;
+    let (par2_paths, mut seed) = discover_compat_par2_paths(input, wildcard.as_deref())?;
+    let deferred_par2 = take_deferred_paths(&mut seed);
     let scanned = scan_discovered_set(&par2_paths, seed);
     let set_id = scanned.as_ref().map_or_else(
         || format!("par2:{}", input.display()),
@@ -467,6 +470,7 @@ fn resolve_compat_input(
         search_dirs: Vec::new(),
         placement: ParPlacement::Smart,
         scanned,
+        deferred_par2,
     })
 }
 
@@ -498,6 +502,7 @@ pub fn repair_set(cli: &Cli, set: &Par2Set) -> Result<ParOutcome, RarparError> {
         search_dirs: cli.search_dir.clone(),
         placement: cli.par_placement,
         scanned: set.reusable_packets(),
+        deferred_par2: Vec::new(),
     };
     run_flow(&mut resolved, true, false, cli.quiet || cli.json)
 }
@@ -520,11 +525,19 @@ fn run_flow(
     let _cache_retention = repair.then(par2_rs::CacheEvictionDeferral::acquire);
 
     let load_started = std::time::Instant::now();
-    let par2_set = match resolved.scanned.take() {
+    let mut par2_set = match resolved.scanned.take() {
         Some(set) => set,
         None => par2_rs::Par2FileSet::from_paths(&resolved.par2_paths)?,
     };
-    let resolved = &*resolved;
+    // Metadata can itself be split across obfuscated volumes. Recover it
+    // before interpreting absent descriptions/checksums as damaged data.
+    if par2_set.recovery_file_ids.iter().any(|id| {
+        par2_set
+            .file_description(id)
+            .is_none_or(|desc| desc.length > 0 && par2_set.file_checksums(id).is_none())
+    }) {
+        expand_deferred_volumes(resolved, &mut par2_set, &[])?;
+    }
     info!(
         elapsed_ms = load_started.elapsed().as_secs_f64() * 1_000.0,
         "PAR2 set loaded"
@@ -538,7 +551,22 @@ fn run_flow(
     }
 
     let verify_started = std::time::Instant::now();
-    let (verification, placement_plan) = verify_set(resolved, &par2_set)?;
+    let (mut verification, mut placement_plan) = verify_set(resolved, &par2_set)?;
+    if verification
+        .files
+        .iter()
+        .any(|file| !matches!(file.status, par2_rs::FileStatus::Complete))
+    {
+        let complete: Vec<_> = verification
+            .files
+            .iter()
+            .filter(|file| matches!(file.status, par2_rs::FileStatus::Complete))
+            .map(|file| file.file_id)
+            .collect();
+        if expand_deferred_volumes(resolved, &mut par2_set, &complete)? {
+            (verification, placement_plan) = verify_set(resolved, &par2_set)?;
+        }
+    }
     info!(
         elapsed_ms = verify_started.elapsed().as_secs_f64() * 1_000.0,
         "initial PAR2 verification complete"
@@ -685,12 +713,13 @@ fn resolve_input(cli: &Cli, args: &ParArgs) -> Result<ResolvedPar2Input, RarparE
         return Err(RarparError::MissingInput(args.input.clone()));
     }
 
-    let (par2_paths, seed) = if args.input.is_dir() {
+    let (par2_paths, mut seed) = if args.input.is_dir() {
         (collect_par2_paths_from_dir(&args.input)?, None)
     } else {
         let (paths, seed) = discover_matching_par2_paths(&args.input)?;
         (paths, Some(seed))
     };
+    let deferred_par2 = take_deferred_paths(&mut seed);
     let scanned = scan_discovered_set(&par2_paths, seed);
     let set_id = scanned.as_ref().map_or_else(
         || format!("par2:{}", args.input.display()),
@@ -720,6 +749,7 @@ fn resolve_input(cli: &Cli, args: &ParArgs) -> Result<ResolvedPar2Input, RarparE
         search_dirs,
         placement: cli.par_placement,
         scanned,
+        deferred_par2,
     })
 }
 
@@ -826,10 +856,13 @@ fn verify_stream(cli: &Cli, args: &ParArgs, name: &str) -> Result<u8, RarparErro
         )
     })?;
     let mut resolved = resolve_input(cli, args)?;
-    let set = match resolved.scanned.take() {
+    let mut set = match resolved.scanned.take() {
         Some(set) => set,
         None => par2_rs::Par2FileSet::from_paths(&resolved.par2_paths)?,
     };
+    // The stream cannot be reread if deferred metadata changes its checksums.
+    // Load all volumes before choosing its file and counting recovery blocks.
+    expand_deferred_volumes(&mut resolved, &mut set, &[])?;
     // Names that differ only in `\` and `/` read as one file name, and a
     // malformed set can repeat a name, so every file answering to NAME counts.
     let mut matches: Vec<par2_rs::FileId> = set
@@ -1074,7 +1107,17 @@ fn collect_par2_paths_from_dir(dir: &Path) -> Result<Vec<PathBuf>, RarparError> 
 /// The parse of the named `.par2` that volume discovery makes, with that
 /// file's spelling in the discovered path list (`None` when the list does not
 /// hold it).
-type SeedParse = (Option<PathBuf>, par2_rs::Par2FileSet);
+type SeedParse = (
+    Option<PathBuf>,
+    par2_rs::par2_set::Par2FileSetScanner,
+    Vec<PathBuf>,
+);
+
+fn take_deferred_paths(seed: &mut Option<SeedParse>) -> Vec<PathBuf> {
+    seed.as_mut()
+        .map(|seed| std::mem::take(&mut seed.2))
+        .unwrap_or_default()
+}
 
 /// The discovered paths, and the seed parse when discovery made one, so the
 /// caller can build the full set without parsing the seed file again.
@@ -1114,30 +1157,37 @@ fn discover_compat_par2_paths(
     Ok((par2_paths, None))
 }
 
-/// The full set over `paths`, reusing `seed` (the parse of one of them that
-/// volume discovery already made) when it is the only path.
-///
-/// With other volumes the whole list is parsed once more, seed included: one
-/// packet builder sees every packet (an IFSC whose description sits in
-/// another volume is kept) and one budget meters the combined inventory.
-/// Two finalized parses cannot be unioned faithfully. `None` keeps the
-/// caller's lazy re-parse, which reports the error.
+/// Finish discovery's unfinished seed scan with the other volumes. One
+/// builder and budget see every packet; the named input is never rescanned.
 fn scan_discovered_set(paths: &[PathBuf], seed: Option<SeedParse>) -> Option<par2_rs::Par2FileSet> {
-    if let Some((Some(seed_path), seed)) = seed
-        && paths.iter().all(|path| *path == seed_path)
-    {
-        return Some(seed);
+    if let Some((Some(seed_path), mut scan, _)) = seed {
+        for path in paths.iter().filter(|path| **path != seed_path) {
+            scan.scan_path(path).ok()?;
+        }
+        return scan.finish().ok();
     }
     par2_rs::Par2FileSet::from_paths(paths).ok()
 }
 
 fn discover_matching_par2_paths(input: &Path) -> Result<(Vec<PathBuf>, SeedParse), RarparError> {
-    let seed_set = par2_rs::Par2FileSet::from_paths(&[input])?;
+    let mut seed_scan =
+        par2_rs::par2_set::Par2FileSetScanner::new(par2_rs::PacketScanLimits::default());
+    seed_scan.scan_path(input)?;
+    let set_id = seed_scan
+        .recovery_set_id()
+        .ok_or(par2_rs::Par2Error::NoMainPacket)?;
+    // Only metadata is needed to discover siblings. Do not finalize the
+    // builder here: it may hold IFSCs described by another volume.
+    let protected = seed_scan
+        .file_descriptions()
+        .map(|desc| (desc.filename.as_str(), desc.length))
+        .collect();
     let parent = input
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let mut par2_paths = identify_set_volumes(parent, &seed_set)?;
+    let (mut par2_paths, deferred) =
+        identify_set_volume_paths(parent, set_id, protected, Some(input))?;
     if par2_paths.is_empty() {
         par2_paths.push(input.to_path_buf());
     }
@@ -1151,7 +1201,7 @@ fn discover_matching_par2_paths(input: &Path) -> Result<(Vec<PathBuf>, SeedParse
         .flatten()
         .find(|candidate| par2_paths.iter().any(|path| path == candidate))
         .map(Path::to_path_buf);
-    Ok((par2_paths, (seed_path, seed_set)))
+    Ok((par2_paths, (seed_path, seed_scan, deferred)))
 }
 
 /// [`par2_rs::identify_par2_files`] without opening the files the seed set
@@ -1161,18 +1211,44 @@ fn discover_matching_par2_paths(input: &Path) -> Result<(Vec<PathBuf>, SeedParse
 /// and its recorded length is skipped unread only when that length is under
 /// a packet header or not a multiple of 4, which spares an open and a read
 /// per such data file before verification reads it in full.
+#[cfg(test)]
 fn identify_set_volumes(
     dir: &Path,
     seed: &par2_rs::Par2FileSet,
 ) -> Result<Vec<PathBuf>, RarparError> {
-    use std::io::Read;
-    const HEADER_SIZE: usize = 64;
-    let protected: std::collections::HashMap<&str, u64> = seed
+    let protected = seed
         .files
         .values()
         .map(|description| (description.filename.as_str(), description.length))
         .collect();
+    identify_set_volume_paths(dir, seed.recovery_set_id, protected, None).map(|(paths, _)| paths)
+}
+
+fn is_protected_non_volume(
+    path: &Path,
+    protected: &std::collections::HashMap<&str, u64>,
+) -> Result<bool, RarparError> {
+    let Some(&length) = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| protected.get(name))
+    else {
+        return Ok(false);
+    };
+    if length >= 64 && length.is_multiple_of(4) {
+        return Ok(false);
+    }
+    Ok(std::fs::metadata(path)?.len() == length)
+}
+
+fn identify_set_volume_paths(
+    dir: &Path,
+    set_id: par2_rs::RecoverySetId,
+    protected: std::collections::HashMap<&str, u64>,
+    scanned_input: Option<&Path>,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>), RarparError> {
     let mut matches = Vec::new();
+    let mut deferred = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let file_name = entry.file_name();
@@ -1187,34 +1263,142 @@ fn identify_set_volumes(
             continue;
         }
         let path = entry.path();
+        if scanned_input.is_some_and(|input| input.file_name() == path.file_name()) {
+            matches.push(path);
+            continue;
+        }
         // The entry's type does not follow links; a link still counts when it
         // names a regular file, as `Path::is_file` decides.
         let kind = entry.file_type()?;
         if !(kind.is_file() || (kind.is_symlink() && path.is_file())) {
             continue;
         }
+        // The fast pass uses turbo's name.*.par2 shape. Other siblings,
+        // including data at its expected name and length, are deferred until
+        // verification establishes whether their bytes could be needed.
+        if let Some(input) = scanned_input {
+            let expected_data = protected
+                .get(name)
+                .is_some_and(|&length| std::fs::metadata(&path).is_ok_and(|m| m.len() == length));
+            if expected_data || !recovery_volume_name_matches(input, name) {
+                deferred.push(path);
+                continue;
+            }
+        }
         // Every PAR2 packet is at least a header long and a multiple of 4
         // bytes, so a whole volume is too: a protected file at a length no
         // volume can have is skipped unread, and any other is sniffed, since
         // an obfuscated volume can sit at a missing file's name and length.
-        if let Some(&length) = protected.get(name)
-            && std::fs::metadata(&path)?.len() == length
-            && (length < HEADER_SIZE as u64 || !length.is_multiple_of(4))
-        {
+        if is_protected_non_volume(&path, &protected)? {
             continue;
         }
-        let mut header = Vec::with_capacity(HEADER_SIZE);
-        std::fs::File::open(&path)?
-            .take(HEADER_SIZE as u64)
-            .read_to_end(&mut header)?;
-        if header.len() == HEADER_SIZE
-            && let Ok(parsed) = par2_rs::PacketHeader::parse(&header, 0)
-            && parsed.recovery_set_id == seed.recovery_set_id
-        {
+        if has_recovery_set_header(&path, set_id)? {
             matches.push(path);
         }
     }
-    Ok(matches)
+    Ok((matches, deferred))
+}
+
+fn has_recovery_set_header(
+    path: &Path,
+    set_id: par2_rs::RecoverySetId,
+) -> Result<bool, RarparError> {
+    let mut header = [0u8; 64];
+    if std::fs::metadata(path)?.len() < header.len() as u64 {
+        return Ok(false);
+    }
+    match std::fs::File::open(path)?.read_exact(&mut header) {
+        Ok(()) => Ok(par2_rs::PacketHeader::parse(&header, 0)
+            .is_ok_and(|header| header.recovery_set_id == set_id)),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Match name.*.par2, also when the named input is itself name.volN+M.par2.
+fn recovery_volume_name_matches(input: &Path, name: &str) -> bool {
+    let Some(stem) = input.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    let base = stem
+        .rsplit_once(".vol")
+        .filter(|(_, suffix)| {
+            suffix.split_once('+').is_some_and(|(a, b)| {
+                !a.is_empty()
+                    && !b.is_empty()
+                    && a.bytes().all(|b| b.is_ascii_digit())
+                    && b.bytes().all(|b| b.is_ascii_digit())
+            })
+        })
+        .map_or(stem, |(base, _)| base);
+    name.get(..base.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(base))
+        && name.get(base.len()..).is_some_and(|rest| {
+            rest.len() > 6
+                && rest.starts_with('.')
+                && rest
+                    .get(rest.len() - 5..)
+                    .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".par2"))
+        })
+}
+
+/// Only incomplete files can hide recovery data at an expected data name.
+/// If no new volume is found, verification is not repeated. A found volume
+/// is parsed with the existing paths under one combined scan budget.
+fn expand_deferred_volumes(
+    resolved: &mut ResolvedPar2Input,
+    set: &mut par2_rs::Par2FileSet,
+    complete: &[par2_rs::FileId],
+) -> Result<bool, RarparError> {
+    if resolved.deferred_par2.is_empty() {
+        return Ok(false);
+    }
+    let complete_names: std::collections::HashSet<_> = complete
+        .iter()
+        .filter_map(|id| set.file_description(id))
+        .map(|desc| desc.filename.as_str())
+        .collect();
+    // Canonicalization only supports skipping already verified canonical data.
+    // A missing working directory is valid and cannot identify such a file.
+    let primary = if resolved.placement == ParPlacement::Canonical && !complete_names.is_empty() {
+        std::fs::canonicalize(&resolved.primary_dir).ok()
+    } else {
+        None
+    };
+    let protected = set
+        .files
+        .values()
+        .map(|desc| (desc.filename.as_str(), desc.length))
+        .collect();
+    let mut added = false;
+    for path in std::mem::take(&mut resolved.deferred_par2) {
+        if is_protected_non_volume(&path, &protected)? {
+            continue;
+        }
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| complete_names.contains(name))
+            && primary.as_ref().is_some_and(|primary| {
+                path.parent()
+                    .and_then(|dir| std::fs::canonicalize(dir).ok())
+                    .as_ref()
+                    == Some(primary)
+            })
+        {
+            continue;
+        }
+        if has_recovery_set_header(&path, set.recovery_set_id)? {
+            resolved.par2_paths.push(path);
+            added = true;
+        }
+    }
+    if added {
+        resolved.par2_paths.sort();
+        resolved.par2_paths.dedup();
+        *set = par2_rs::Par2FileSet::from_paths(&resolved.par2_paths)?;
+    }
+    Ok(added)
 }
 
 fn wildcard_match(pattern: &str, text: &str) -> bool {
@@ -1589,6 +1773,19 @@ mod tests {
         assert_eq!(set.slice_checksums.len(), reference.slice_checksums.len());
     }
 
+    #[test]
+    fn named_par2_with_siblings_is_not_reopened() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, outcome) = create_small_set(temp.path());
+        let (paths, seed) = discover_matching_par2_paths(&outcome.main_path).unwrap();
+        let expected = par2_rs::Par2FileSet::from_paths(&paths).unwrap();
+        std::fs::remove_file(&outcome.main_path).unwrap();
+        let actual = scan_discovered_set(&paths, Some(seed)).expect("seed already scanned");
+        assert_eq!(actual.recovery_set_id, expected.recovery_set_id);
+        assert_eq!(actual.slice_checksums, expected.slice_checksums);
+        assert_eq!(actual.recovery_slices.len(), expected.recovery_slices.len());
+    }
+
     /// The whole packets of a PAR2 file whose type passes `keep`, in order.
     fn packets_of(path: &Path, keep: impl Fn(&par2_rs::PacketType) -> bool) -> Vec<u8> {
         let bytes = std::fs::read(path).unwrap();
@@ -1636,6 +1833,34 @@ mod tests {
         assert_eq!(set.files.len(), 3);
         assert_eq!(set.slice_checksums.len(), 3);
         assert!(!set.recovery_slices.is_empty());
+    }
+
+    #[test]
+    fn seed_ifsc_is_kept_until_a_sibling_describes_it() {
+        use par2_rs::PacketType;
+        let temp = tempfile::tempdir().unwrap();
+        let (_, outcome) = create_small_set(temp.path());
+        let index = packets_of(&outcome.main_path, |kind| {
+            matches!(kind, PacketType::Main | PacketType::InputFileSliceChecksum)
+        });
+        let descriptions = packets_of(&outcome.main_path, |kind| {
+            matches!(kind, PacketType::Main | PacketType::FileDescription)
+        });
+        let (kept, removed) = outcome.volume_paths.split_first().unwrap();
+        let mut volume = descriptions;
+        volume.extend(packets_of(kept, |kind| {
+            matches!(kind, PacketType::RecoverySlice)
+        }));
+        for path in removed {
+            std::fs::remove_file(path).unwrap();
+        }
+        std::fs::write(&outcome.main_path, index).unwrap();
+        std::fs::write(kept, volume).unwrap();
+        let (paths, seed) = discover_matching_par2_paths(&outcome.main_path).unwrap();
+        let actual = scan_discovered_set(&paths, Some(seed)).unwrap();
+        assert_eq!(actual.files.len(), 3);
+        assert_eq!(actual.slice_checksums.len(), 3);
+        assert!(!actual.recovery_slices.is_empty());
     }
 
     /// Volume discovery used to open and read the first 64 bytes of every
@@ -1718,6 +1943,85 @@ mod tests {
             par2_rs::Par2FileSet::from_paths(std::slice::from_ref(&outcome.main_path)).unwrap();
         let found = identify_set_volumes(temp.path(), &seed).unwrap();
         assert!(found.contains(renamed), "{found:?}");
+    }
+
+    #[test]
+    fn deferred_discovery_finds_volume_at_protected_name_and_length() {
+        let temp = tempfile::tempdir().unwrap();
+        let (sources, outcome) = create_small_set(temp.path());
+        let renamed = &outcome
+            .main_path
+            .parent()
+            .unwrap()
+            .join(sources[1].file_name().unwrap());
+        let volume = &outcome.volume_paths[0];
+        let mut bytes = std::fs::read(volume).unwrap();
+        bytes.resize(3000, 0);
+        std::fs::remove_file(volume).unwrap();
+        std::fs::write(renamed, bytes).unwrap();
+        let (paths, seed) = discover_matching_par2_paths(&outcome.main_path).unwrap();
+        assert!(!paths.contains(renamed));
+        let mut seed = Some(seed);
+        let deferred_par2 = take_deferred_paths(&mut seed);
+        assert!(
+            deferred_par2.contains(renamed),
+            "renamed={renamed:?}, deferred={deferred_par2:?}"
+        );
+        let scanned = scan_discovered_set(&paths, seed);
+        let mut resolved = ResolvedPar2Input {
+            set_id: "test".into(),
+            par2_paths: paths,
+            primary_dir: temp.path().into(),
+            search_dirs: Vec::new(),
+            placement: ParPlacement::Canonical,
+            scanned,
+            deferred_par2,
+        };
+        let _ = run_flow(&mut resolved, false, false, true).unwrap();
+        assert!(resolved.par2_paths.contains(renamed));
+    }
+
+    #[test]
+    fn recovery_volume_names_follow_turbo_shape() {
+        for input in ["set.par2", "set.vol001+03.par2"] {
+            assert!(recovery_volume_name_matches(
+                Path::new(input),
+                "set.vol002+03.par2"
+            ));
+            assert!(recovery_volume_name_matches(
+                Path::new(input),
+                "set.other.PAR2"
+            ));
+            for sibling in [
+                "set.rar",
+                "set.par2",
+                "other.vol1+2.par2",
+                "setx.vol1+2.par2",
+            ] {
+                assert!(!recovery_volume_name_matches(Path::new(input), sibling));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fast_discovery_defers_divisible_by_four_sources_and_unrelated_siblings() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let (sources, outcome) = create_small_set_of(temp.path(), 4096);
+        let unrelated = temp.path().join("unrelated.bin");
+        std::fs::write(&unrelated, vec![0u8; 4096]).unwrap();
+        for path in sources.iter().chain([&unrelated]) {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let (paths, seed) = discover_matching_par2_paths(&outcome.main_path)
+            .expect("fast discovery opens no source or unrelated sibling");
+        assert_eq!(paths.len(), outcome.output_paths.len());
+        assert_eq!(seed.2.len(), sources.len() + 1);
+        // Restore permissions so cleanup works even on restrictive hosts.
+        for path in sources.iter().chain([&unrelated]) {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
     }
 
     /// A stream that ends inside a slice leaves that slice unverified and

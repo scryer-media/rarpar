@@ -22,18 +22,18 @@ crate.
 | --- | --- |
 | `reedsolomon-rs` | GF(2^8)/GF(2^16) SIMD kernels (`gf_simd`, `gf8`, `gf_pmul`, `sve2`: SSSE3/AVX2/AVX-512/GFNI, NEON, SVE2); the FFT's shared row banks and raw row views (`fft`); the tiled inversion's byte views (`matrix_tiled`); the x86-64 XOR JIT (`xor_jit`: W^X mappings and an `asm!` trampoline); the Metal and wgpu backends (opt-in features) |
 | `unrar-rs` | The LZ window and bit readers' unaligned loads and stores (`decompress::lz::window`, `block_reader`); the parallel RAR5 decoder's fast symbol path (`decompress::lz::parallel`); BLAKE2sp, AES and CRC SIMD (`crypto::`, `crc_simd`); the AWS-LC backend's FFI; member metadata FFI (`archive::member`: umask, owners, extended attributes, Windows security); `mktime` in `rar4` |
-| `par2-rs` | The repair controller's interleaved output pointers and packed checksums (`repair`); MD5 and CRC SIMD (`md5_simd`, `crc_simd`); the single-stream MD5 assembly (`md5_asm`, reached through `checksum`); the repair transform and matrix byte views; `openat`/`unlinkat` (`disk`); create's aligned encode buffers and JIT calls (`create::encode`); output-file FFI (`create::output`); the repairer's `MappedFile` mmap wrapper (`repairer`); `posix_fadvise` on Linux for sources of 64 MiB or more (`file_cache`) |
+| `par2-rs` | The repair controller's interleaved output pointers and packed checksums (`repair`); MD5 and CRC SIMD (`md5_simd`, `crc_simd`); the single-stream and paired MD5 assembly (`md5_asm`, `md5_pair_asm`, reached through `checksum`); checksum tests' guard-page mmap/mprotect wrapper; the repair transform and matrix byte views; `openat`/`unlinkat` (`disk`); create's aligned encode buffers and JIT calls (`create::encode`); output-file FFI (`create::output`); the repairer's `MappedFile` mmap wrapper (`repairer`); `posix_fadvise` on Linux for sources of 64 MiB or more (`file_cache`) |
 | `par3-rs` | Only OS FFI: `statfs`/`GetVolumePathNameW` (`mount`), `fclonefileat`/`FICLONE`/`copy_file_range` (`repair_tree_clone`), Windows file identity (`repair_tree_windows`). Its threading (hash, FFT, repair and creation pools) has no unsafe code but is where a race would come from |
 
 ## Lanes per crate
 
 | Lane | `reedsolomon-rs` | `unrar-rs` | `par2-rs` | `par3-rs` |
 | --- | --- | --- | --- | --- |
-| `unsafe-valgrind` (Memcheck, Linux x86-64 and ARM64, default features) | `gf_simd`, `gf8`, `gf_pmul`, `fft`, `matrix_tiled`, `sve2`, `decode_apply`, `threading`, `xor_jit` | `decompress::`, `crypto::`, `crc_simd`, `hash_pipeline`, `archive::member`, `rar4` (AWS-LC) | `repair`, `md5_simd`, `crc_simd`, `repair_transform`, `matrix`, `disk`, `checksum`, `create::encode`, `create::output`, the `repairer` tests that map a file or copy from a 64 MiB source, the latter reaching `file_cache`'s `posix_fadvise` (assembly MD5) | `mount`, `repair_tree`, `session_repair`, `hash`, `fft`, `runtime`, `gf` |
+| `unsafe-valgrind` (Memcheck, Linux x86-64 and ARM64, default features) | `gf_simd`, `gf8`, `gf_pmul`, `fft`, `matrix_tiled`, `sve2`, `decode_apply`, `threading`, `xor_jit` | `decompress::`, `crypto::`, `crc_simd`, `hash_pipeline`, `archive::member`, `rar4` (AWS-LC) | `repair`, `md5_simd`, `crc_simd`, `repair_transform`, `matrix`, `disk`, `checksum`, `create::encode`, `create::output`, the `repairer` tests that map a file or copy from a 64 MiB source, the latter reaching `file_cache`'s `posix_fadvise`; the strict single-read dispatch, verdict-differential and one-read tests in `verify` (assembly MD5) | `mount`, `repair_tree`, `session_repair`, `hash`, `fft`, `runtime`, `gf` |
 | `unsafe-sanitizer` AddressSanitizer (Linux x86-64 and ARM64, `-Zbuild-std`) | as Memcheck | as Memcheck, RustCrypto | as Memcheck, RustCrypto | as Memcheck |
 | `unsafe-sanitizer` ThreadSanitizer (same) | — | `decompress::lz::parallel`, `decompress::lz::tests`, `hash_pipeline`, `recovery`, RustCrypto | — | `hash`, `fft`, `runtime`, `session_repair`, `session`, `evidence`, `creation` |
 | `unsafe-miri` (one job per discovered test, `-Zmiri-strict-provenance`) | `fft::tests`: the row-bank, known-zero-step and transform round-trip tests | `decompress::lz::window::tests`, `decompress::lz::block_reader::tests` except the exhaustive `copy_matrix_matches_reference_*` sweeps, RustCrypto | — | — |
-| guard pages | — | — | — | — |
+| guard pages | — | — | `checksum::tests::paired_assembly_stops_at_guard_page` (Unix, native backend, also selected by Memcheck) | — |
 
 The sanitizer lanes run on nightly `nightly-2026-09-01` with an instrumented
 standard library. They use the RustCrypto backend for `unrar-rs` and
@@ -43,6 +43,20 @@ in `unrar-rs`, the `md5_asm` assembly in `par2-rs`), because assembly is what
 Memcheck can see and the sanitizers cannot. Memcheck builds the tests with the
 `memcheck` profile: optimised, with debug assertions and overflow checks kept.
 
+The selected strict single-read tests cover both a permitted two-chain join
+and a one-worker execution context, so adaptive scheduling cannot leave the
+paired assembly untested. The dispatch counter assertion is native-only;
+RustCrypto sanitizer runs still exercise both execution contexts for verdicts
+and byte counts.
+
+The ARM64 Memcheck runner uses `--fair-sched=yes`. Valgrind's default
+non-fair guest-thread scheduler can starve the helper that cancels a CPU-bound
+scan: two existing mid-scan cancellation tests completed the entire scan under
+the default scheduler on A72. Both passed natively and under fair scheduling,
+with unchanged assertions, polling, inputs and cancellation timing. This is a
+runner setting, not a longer test deadline or a memory-error suppression. The
+original failures are retained with the performance validation evidence.
+
 Miri discovery runs `cargo miri nextest list` with the same filters the matrix
 script enforces, requires named tests to stay selected, and fails if a filter
 picks up a test outside the allowed modules. Miri's runtime feature detection
@@ -51,13 +65,56 @@ fallbacks run: Miri checks the pointer arithmetic, aliasing and
 initialization of the scalar paths and the shared row banks, not the
 dispatched SIMD kernels.
 
+## Fail-closed MD5 assembly controls
+
+The existing Linux x86-64 and AArch64 Memcheck jobs first run a short native
+checksum/strict-verification pass from the same optimized test build. This
+exposes host BMI1 before Valgrind can mask CPU features. There is no extra
+matrix job. `.github/scripts/ci/par2-md5-coverage.py` checks nextest's actual
+inventory: every required test must exist, be non-ignored, and match the same
+filter the instrumented pass uses. A missing cfg-gated assembly test fails
+the job instead of silently reducing its coverage. Runner architecture is
+checked against the matrix, and negative checker self-tests run in both jobs.
+
+| Evidence | Durable gate |
+| --- | --- |
+| Native default on both architectures | Native streaming test asserts the selected backend is assembly and a nonempty assembly execution counter increased; logs identify AArch64 baseline, x86 baseline or BMI1 |
+| Arbitrary-state differential | 20,480 state/length/alignment cases (16,384 nonempty assembly calls) compare against independent scalar MD5 and the Rust paired oracle, including all 64-by-64 input alignments |
+| x86 baseline and BMI1 | Baseline is called directly even on BMI1 hosts. BMI1 must execute when runtime detection advertises it; it must remain unused otherwise. Both paths have counter assertions |
+| Bounds | Guard pages precede/follow readable pages; 384 paired cases vary boundaries, alignments and block lengths. Another 192 exact-sized heap cases give Memcheck byte-exact upper redzones for unaligned streams. Both compare scalar results and assert baseline/runtime execution |
+| Actual Memcheck | `PAR2_CI_MD5_RUN=memcheck` makes the native streaming test require the Memcheck preload in its own Linux mappings. The preceding native pass requires its absence. These are test-only controls, with no production behavior switch |
+| Both features | Existing crypto-backend job requires the native and independent Rust differential tests, then runs them. The streaming assertion continues to require native selection |
+| Opt-in Rust-only | Existing crypto-backend job requires the Rust-only fallback test and absence of all native MD5 test cases. A dev LLVM IR audit requires RustCrypto evidence and rejects both handwritten MD5 module names |
+| ASan wrapper/fallback on x86 and ARM | Existing Rust-only sanitizer builds must list the fallback, verdict-differential and read-count tests, with native MD5/dispatch test cases absent, before the unchanged sanitizer pass runs |
+
+The native and Memcheck steps print successful test output, including selected
+backend and execution counters. They share the same profile/build artifacts;
+only the short uninstrumented checksum pass is additional execution. Existing
+ARM suppression and sanitizer settings are unchanged.
+
+Miri does **not** execute these MD5 assembly paths and no MD5 Miri coverage is
+claimed. Its existing FFT/window/bit-reader gates cover their selected Rust
+invariants. Rust-only MD5 wrappers/fallback receive native differential and
+ASan coverage instead. ASan cannot see handwritten assembly; native guard
+pages and Linux Memcheck provide that memory-bounds evidence. The IR audit
+excludes handwritten **MD5** assembly, not all SIMD, unsafe code or FFI in
+the crate/dependency graph.
+
+Darwin and Windows retain their native platform unit tests. Unix guard pages
+also run on Darwin; this focused inventory/IR audit and native instrumentation
+are enforced on Linux. Windows guard pages and Windows native memory
+instrumentation are unsupported here. A BMI1-less runner proves baseline
+and records that BMI1 was unavailable; no additional hardware is provisioned.
+
 ## Scoped out, and why
 
-- **Guard pages.** None of the four crates has guard-page tests, and none
-  fits in the ~150 lines budgeted for adding one: the allocations that
-  matter (the LZ window, the FFT row banks, the repair controller's output
-  area) are made inside the crates with `alloc_zeroed` or `Vec`, so guarding
-  them needs a global guard allocator in each test binary, not a test.
+- **Guard pages beyond paired MD5.** Paired MD5 receives caller-owned
+  buffers, so a direct mmap test guards both sides of each input across
+  complete-block lengths and all byte alignments. Its alignment, arbitrary-state and dispatch tests also live in
+  `checksum`, already included in the native Memcheck selector above. The
+  LZ window, FFT row banks and repair output area allocate internally through
+  `alloc_zeroed` or `Vec`; guarding them would need a global guard allocator.
+  These other allocations have no guard-page tests.
 - **Miri for `par2-rs`.** The repair controller rebuilds output pointers from
   `usize` (`interleaved_output_ptr` in `src/repair.rs`, `base as *mut u8`),
   which `-Zmiri-strict-provenance` rejects by design. Its tests stay under

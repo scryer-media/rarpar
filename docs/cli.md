@@ -15,6 +15,15 @@ rarpar rar restore-volumes archive.part1.rar archive.part1.rev
 
 ## PAR2
 
+For a named PAR2 input, volume discovery reuses the seed scan and first reads
+siblings matching `name.*.par2`. Other sibling names, including protected
+files at their recorded length, are deferred. If metadata is missing or
+verification finds an incomplete file, discovery checks the deferred siblings
+for matching recovery headers before reporting repairability. Obfuscated
+volumes remain usable, including a volume at a missing protected file's name
+and length. Directory and explicit wildcard inputs retain their requested
+scope.
+
 
 ```bash
 rarpar par verify release.par2

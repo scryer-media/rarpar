@@ -4,6 +4,10 @@
 
 ### Changed
 
+- RAR5 volume recovery caps each input/output buffer at the useful volume
+  length, including its GF16 padding byte. It allocates a second input set
+  only when another chunk needs read-ahead. Larger restores keep the existing
+  buffer budget and overlapping read/decode pipeline.
 - `KdfCache` holds 64 RAR5 derivations instead of 4, so a repeat parse of
   an archive with up to 64 distinct (password, salt, KDF count) triples runs
   no PBKDF2 a second time. The RAR4 side keeps its 1024 slots.

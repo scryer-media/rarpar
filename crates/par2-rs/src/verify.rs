@@ -605,6 +605,58 @@ impl<'a> SliceVerdictStream<'a> {
     }
 }
 
+/// ParPar's stitched file/slice dependency chains, without a second worker
+/// or a second read. A block reset changes only the slice state. The 16 KiB
+/// prefix is a snapshot of the file chain, not a third hashing pass.
+struct StitchedVerdictStream<'a> {
+    slices: SliceVerdictStream<'a>,
+    file: checksum::FileHashState,
+    quick: Option<[u8; 16]>,
+}
+
+impl<'a> StitchedVerdictStream<'a> {
+    fn new(checksums: &'a [SliceChecksum], slice_size: u64, file_len: u64) -> Self {
+        Self {
+            slices: SliceVerdictStream::new(checksums, slice_size, file_len),
+            file: checksum::FileHashState::new(),
+            quick: None,
+        }
+    }
+
+    fn feed(&mut self, mut data: &[u8]) {
+        while !data.is_empty() && self.slices.fed < self.slices.file_len {
+            if self.slices.any_invalid {
+                // The file chain can no longer establish completeness. Keep
+                // the existing SIMD slice batches for the remaining bytes.
+                self.slices.feed(data);
+                return;
+            }
+            let end = ((self.slices.fed / self.slices.slice_size + 1) * self.slices.slice_size)
+                .min(self.slices.file_len);
+            let quick_end = (QUICK_CHECK_16K_BYTES as u64).min(self.slices.file_len);
+            let mut take = ((end - self.slices.fed) as usize).min(data.len());
+            if self.slices.fed < quick_end {
+                take = take.min((quick_end - self.slices.fed) as usize);
+            }
+            let part = self
+                .slices
+                .partial
+                .get_or_insert_with(checksum::SliceChecksumState::new);
+            part.update_with_file_hash(&mut self.file, &data[..take]);
+            self.slices.fed += take as u64;
+            data = &data[take..];
+            if self.slices.fed == quick_end && self.quick.is_none() {
+                self.quick = Some(self.file.clone().finalize());
+            }
+            if self.slices.fed == end {
+                let part = self.slices.partial.take().expect("slice in progress");
+                let (crc, md5) = part.finalize(Some(self.slices.slice_size));
+                self.slices.push(crc, md5);
+            }
+        }
+    }
+}
+
 /// Chunk size for the single-read pass: the largest whole number of slices
 /// that fits the slice-check batch budget ([`VERIFY_SIMD_BATCH_MEMORY_BYTES`]),
 /// so each chunk carries enough slices to fill the MD5 lanes and the
@@ -636,6 +688,11 @@ struct SingleReadOutcome {
 /// The strict pipeline's first pass with the per-slice verdicts computed in
 /// the same read ([`VerifyOptions::single_read`]).
 ///
+/// On native MD5 targets, when verification has only one worker available,
+/// the file and slice dependency chains are stitched round by round. An
+/// available per-chunk join keeps the existing parallel pipeline so stitching
+/// does not serialize independent work. After damage, either path uses the
+/// existing SIMD slice batches.
 /// Every chunk feeds two independent computations: the serial 16 KiB and
 /// whole-file MD5 chain, and the per-slice CRC32 + MD5 checks, which hash in
 /// SIMD lanes. Where rayon has a second worker the two run side by side on
@@ -677,6 +734,28 @@ fn stream_strict_single_read(
     let mut quick_state = checksum::FileHashState::new();
     let mut full_state = None;
     let mut slices = SliceVerdictStream::new(checksums, slice_size, actual_len);
+    // Stitching saves CPU when the two chains would otherwise run serially.
+    // Preserve the permitted parallel join for a lone file with spare workers:
+    // the native A72 measurements show lower latency from that existing path.
+    let use_stitched = cfg!(par2_md5_asm) && !side_by_side;
+    #[cfg(par2_bench_diagnostics)]
+    let use_stitched = cfg!(par2_md5_asm)
+        && match std::env::var("RARPAR_BENCH_STITCHED").ok().as_deref() {
+            Some("0") => false,
+            Some("1") => true,
+            _ => use_stitched,
+        };
+    #[cfg(par2_bench_diagnostics)]
+    tracing::info!(
+        file_id = %file_id,
+        file_bytes = actual_len,
+        chunk_bytes,
+        side_by_side,
+        use_stitched,
+        "single-read hashing plan"
+    );
+    let mut stitched =
+        use_stitched.then(|| StitchedVerdictStream::new(checksums, slice_size, actual_len));
     let mut buf = vec![0u8; chunk_bytes];
     let mut total_read = 0u64;
     let Ok(mut reader) = access.open_sequential_reader(file_id) else {
@@ -696,7 +775,9 @@ fn stream_strict_single_read(
             break;
         }
         let data = &buf[..read_len];
-        if slices.any_invalid {
+        if let Some(stitched) = &mut stitched {
+            stitched.feed(data);
+        } else if slices.any_invalid {
             slices.feed(data);
         } else if side_by_side {
             rayon::join(
@@ -715,6 +796,34 @@ fn stream_strict_single_read(
 
     if total_read != actual_len {
         return failed;
+    }
+    if let Some(stitched) = stitched {
+        let abandoned = stitched.slices.any_invalid;
+        let valid_slices = stitched.slices.finish();
+        if abandoned {
+            return SingleReadOutcome {
+                complete: false,
+                valid_slices,
+            };
+        }
+        let grew = match reader.as_mut() {
+            Some(reader) => {
+                let mut probe = [0u8; 1];
+                match read_from_sequential_reader(&mut **reader, &mut probe, 1) {
+                    Ok(read) => read != 0,
+                    Err(_) => return failed,
+                }
+            }
+            None => false,
+        };
+        let full = stitched.file.finalize();
+        return SingleReadOutcome {
+            complete: !grew
+                && actual_len == desc.length
+                && stitched.quick.unwrap_or(full) == desc.hash_16k
+                && full == desc.hash_full,
+            valid_slices,
+        };
     }
     let abandoned = slices.any_invalid;
     let valid_slices = slices.finish();
@@ -4369,6 +4478,10 @@ mod tests {
     /// scanners are exercised.
     #[test]
     fn single_read_verdicts_match_the_two_pass_path_for_every_damage_position() {
+        let serial_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
         for slice_size in [1024u64, 3000, (VERIFY_FULL_HASH_CHUNK_BYTES as u64) + 512] {
             let len = (slice_size as usize) * 5 + 300;
             let pristine = deterministic_file(len);
@@ -4403,7 +4516,13 @@ mod tests {
                             )
                         };
                         let single = run(&strict_opts());
+                        let serial_single = serial_pool.install(|| run(&strict_opts()));
                         let two_pass = run(&two_pass_opts());
+                        assert_eq!(
+                            format!("{serial_single:?}"),
+                            format!("{two_pass:?}"),
+                            "serial slice_size {slice_size} damaged {damaged:?}"
+                        );
                         assert_eq!(
                             format!("{single:?}"),
                             format!("{two_pass:?}"),
@@ -4432,6 +4551,46 @@ mod tests {
             verify_selected_file_ids_with_options(&set, &access, &[file_id], &two_pass_opts());
         assert!(matches!(single.files[0].status, FileStatus::Damaged(0)));
         assert_eq!(format!("{single:?}"), format!("{two_pass:?}"));
+        let serial_single = serial_pool.install(|| {
+            verify_selected_file_ids_with_options(&set, &access, &[file_id], &strict_opts())
+        });
+        assert_eq!(format!("{serial_single:?}"), format!("{two_pass:?}"));
+    }
+
+    /// The native pair must actually run when confined to one worker, while
+    /// preserving the independent-chain join when a lone file can use it.
+    /// Dispatch counters check execution, rather than inferring it from time.
+    #[cfg(par2_md5_asm)]
+    #[test]
+    fn single_read_keeps_parallel_chains_and_stitches_serial_work() {
+        let slice_size = 64 * 1024;
+        let data = deterministic_file(2 * slice_size as usize + 17);
+        let (set, access, file_id) = setup_test_set(&data, slice_size);
+        let checksums = set.file_checksums(&file_id).unwrap();
+        for (workers, may_join) in [(1, true), (2, true), (2, false)] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let before: usize = crate::md5_pair_asm::executions().iter().sum();
+                let outcome =
+                    stream_strict_single_read(&set, &file_id, &access, checksums, may_join);
+                let after: usize = crate::md5_pair_asm::executions().iter().sum();
+                assert!(outcome.complete, "workers={workers} may_join={may_join}");
+                assert_eq!(outcome.valid_slices, Some(vec![true; 3]));
+                let parallel =
+                    may_join && workers > 1 && reedsolomon_rs::threading::parallel_enabled();
+                if parallel {
+                    assert_eq!(after, before, "keep the available parallel hashing path");
+                } else {
+                    assert!(
+                        after > before,
+                        "serial verification reaches paired assembly"
+                    );
+                }
+            });
+        }
     }
 
     /// A damaged file costs exactly one read of its length in single-read
@@ -4439,6 +4598,10 @@ mod tests {
     /// damage and then again in full. A clean file costs one read either way.
     #[test]
     fn single_read_reads_a_damaged_file_once() {
+        let serial_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
         let slice_size = 64 * 1024u64;
         let len = (slice_size as usize) * 64;
         let pristine = deterministic_file(len);
@@ -4465,6 +4628,11 @@ mod tests {
                 verify_selected_file_ids_with_options(&set, &ranges, &[file_id], &two_pass_opts());
             assert!(ranges.take_bytes_read() > len);
             assert_eq!(format!("{single:?}"), format!("{two_pass:?}"));
+            let serial_single = serial_pool.install(|| {
+                verify_selected_file_ids_with_options(&set, &ranges, &[file_id], &strict_opts())
+            });
+            assert_eq!(ranges.take_bytes_read(), len);
+            assert_eq!(format!("{serial_single:?}"), format!("{two_pass:?}"));
 
             verify_selected_file_ids_with_options(&set, &reader, &[file_id], &strict_opts());
             assert_eq!(
@@ -4472,6 +4640,10 @@ mod tests {
                 len,
                 "damaged slice {damaged_slice}"
             );
+            serial_pool.install(|| {
+                verify_selected_file_ids_with_options(&set, &reader, &[file_id], &strict_opts())
+            });
+            assert_eq!(reader.take_bytes_read(), len);
         }
 
         let (set, _, file_id) = setup_test_set(&pristine, slice_size);

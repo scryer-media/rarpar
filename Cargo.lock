@@ -2007,7 +2007,7 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.10.11"
+version = "0.10.12"
 dependencies = [
  "bytes",
  "cap-std",
