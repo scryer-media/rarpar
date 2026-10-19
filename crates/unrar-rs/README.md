@@ -8,7 +8,7 @@ program needed.
 
 ```toml
 [dependencies]
-unrar-rs = "0.13"
+unrar-rs = "0.14"
 ```
 
 It only reads archives. It cannot create them, for the licensing reason

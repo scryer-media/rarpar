@@ -6689,6 +6689,8 @@ fn stray_files(dir: &tempfile::TempDir) -> Vec<String> {
         .collect()
 }
 
+/// Restore into `dir`, verifying every rebuilt volume and replacing no
+/// file. Nothing in it is particular to RAR5; the RAR3 tests use it too.
 fn rar5_restore_options(dir: &tempfile::TempDir) -> unrar_rs::RecoveryOptions {
     unrar_rs::RecoveryOptions {
         output_dir: Some(dir.path().to_path_buf()),
@@ -6822,6 +6824,1523 @@ fn test_recovery_restore_is_idempotent_for_complete_sets() {
         assert!(report.restored_paths.is_empty());
         assert!(report.used_recovery_paths.is_empty());
     }
+}
+
+/// Every file in `dir` by name, with its bytes. A plan must leave it exactly
+/// as it found it.
+fn dir_snapshot(dir: &tempfile::TempDir) -> std::collections::BTreeMap<String, Vec<u8>> {
+    std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            (name, std::fs::read(entry.path()).unwrap())
+        })
+        .collect()
+}
+
+/// The restore did what the plan said it would: the same volumes rebuilt, at
+/// the planned output paths, from the usable recovery volumes in slot order
+/// (these sets hold one `.rev` per slot).
+fn assert_restore_matches_plan(plan: &unrar_rs::RestorePlan, report: &unrar_rs::RecoveryReport) {
+    assert_eq!(report.format, plan.format);
+    assert_eq!(report.missing_volume_numbers, plan.missing_volume_numbers());
+    let planned_outputs = plan
+        .missing_volume_numbers()
+        .iter()
+        .map(|&index| plan.data_volumes[index].output_path.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(report.restored_paths, planned_outputs);
+    let mut usable = plan
+        .recovery_volumes
+        .iter()
+        .filter(|volume| volume.usable)
+        .collect::<Vec<_>>();
+    usable.sort_by_key(|volume| volume.slot);
+    let usable = usable
+        .into_iter()
+        .map(|volume| volume.path.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(report.used_recovery_paths, usable);
+}
+
+fn rar5_rev(dir: &tempfile::TempDir, volume: usize) -> std::path::PathBuf {
+    dir.path()
+        .join(format!("rar5_recovery_volumes.part{volume:02}.rev"))
+}
+
+/// A data volume plan entry as a tuple, `(index, path, status, output_path,
+/// set_aside_path)`. The plan types are `#[non_exhaustive]`, so code outside
+/// the crate reads them field by field.
+type DataVolumeView = (
+    usize,
+    Option<std::path::PathBuf>,
+    unrar_rs::DataVolumeStatus,
+    std::path::PathBuf,
+    Option<std::path::PathBuf>,
+);
+
+fn data_volume_view(volume: &unrar_rs::DataVolumePlan) -> DataVolumeView {
+    (
+        volume.index,
+        volume.path.clone(),
+        volume.status.clone(),
+        volume.output_path.clone(),
+        volume.set_aside_path.clone(),
+    )
+}
+
+fn data_volume_views(plan: &unrar_rs::RestorePlan) -> Vec<DataVolumeView> {
+    plan.data_volumes.iter().map(data_volume_view).collect()
+}
+
+fn valid_data_volume(index: usize, path: std::path::PathBuf) -> DataVolumeView {
+    (
+        index,
+        Some(path.clone()),
+        unrar_rs::DataVolumeStatus::Valid,
+        path,
+        None,
+    )
+}
+
+/// A recovery volume plan entry as a tuple, `(slot, volume_number, path,
+/// status, usable)`.
+type RecoveryVolumeView = (
+    usize,
+    usize,
+    std::path::PathBuf,
+    unrar_rs::RevTestStatus,
+    bool,
+);
+
+fn recovery_volume_view(volume: &unrar_rs::RecoveryVolumePlan) -> RecoveryVolumeView {
+    (
+        volume.slot,
+        volume.volume_number,
+        volume.path.clone(),
+        volume.status.clone(),
+        volume.usable,
+    )
+}
+
+fn recovery_volume_views(plan: &unrar_rs::RestorePlan) -> Vec<RecoveryVolumeView> {
+    plan.recovery_volumes
+        .iter()
+        .map(recovery_volume_view)
+        .collect()
+}
+
+/// A usable `.rev` in recovery `slot`, volume `volume_number` of its set.
+fn usable_rev(slot: usize, volume_number: usize, path: std::path::PathBuf) -> RecoveryVolumeView {
+    (slot, volume_number, path, unrar_rs::RevTestStatus::Ok, true)
+}
+
+/// A test result as a tuple, `(path, format, status)`.
+type RevTestView = (
+    std::path::PathBuf,
+    Option<unrar_rs::ArchiveFormat>,
+    unrar_rs::RevTestStatus,
+);
+
+fn rev_test_views(results: &[unrar_rs::RevTestResult]) -> Vec<RevTestView> {
+    results
+        .iter()
+        .map(|result| (result.path.clone(), result.format, result.status.clone()))
+        .collect()
+}
+
+#[test]
+fn test_plan_volume_restore_reports_a_complete_rar5_set_without_writing() {
+    let (dir, paths) = rar5_recovery_set_without(&[]);
+    let before = dir_snapshot(&dir);
+
+    let plan = unrar_rs::plan_volume_restore(&paths, &rar5_restore_options(&dir)).unwrap();
+
+    assert_eq!(plan.format, unrar_rs::ArchiveFormat::Rar5);
+    assert_eq!((plan.data_count, plan.recovery_count), (10, 2));
+    assert_eq!(plan.output_dir, dir.path());
+    let expected = (1..=10)
+        .map(|volume| valid_data_volume(volume - 1, rar5_volume(&dir, volume)))
+        .collect::<Vec<_>>();
+    assert_eq!(data_volume_views(&plan), expected);
+    assert_eq!(
+        recovery_volume_views(&plan),
+        vec![
+            usable_rev(0, 10, rar5_rev(&dir, 1)),
+            usable_rev(1, 11, rar5_rev(&dir, 2))
+        ]
+    );
+    assert_eq!(plan.missing_volume_numbers(), Vec::<usize>::new());
+    assert_eq!(plan.needed(), 0);
+    assert_eq!(plan.usable_recovery_count(), 2);
+    assert!(plan.is_complete());
+    assert!(plan.is_sufficient());
+    assert_eq!(dir_snapshot(&dir), before);
+    assert_eq!(stray_files(&dir), Vec::<String>::new());
+}
+
+/// A missing volume and a same-size one with a damaged byte. The plan names
+/// both, sets the damaged one aside under `.bad` because it sits at its own
+/// output name, and writes nothing; the restore then rebuilds exactly those
+/// volumes at exactly those paths.
+#[test]
+fn test_plan_volume_restore_predicts_the_rar5_restore_of_a_missing_and_a_damaged_volume() {
+    let (dir, paths) = rar5_recovery_set_without(&[5]);
+    let damaged = rar5_volume(&dir, 3);
+    corrupt_in_place(&damaged);
+    let damaged_bytes = std::fs::read(&damaged).unwrap();
+    let options = rar5_restore_options(&dir);
+    let before = dir_snapshot(&dir);
+
+    let plan = unrar_rs::plan_volume_restore(&paths, &options).unwrap();
+
+    assert_eq!(dir_snapshot(&dir), before);
+    assert_eq!(plan.missing_volume_numbers(), vec![2, 4]);
+    assert_eq!(plan.needed(), 2);
+    assert_eq!(plan.usable_recovery_count(), 2);
+    assert!(!plan.is_complete());
+    assert!(plan.is_sufficient());
+    let bad = dir.path().join("rar5_recovery_volumes.part03.rar.bad");
+    assert_eq!(
+        data_volume_view(&plan.data_volumes[2]),
+        (
+            2,
+            Some(damaged.clone()),
+            unrar_rs::DataVolumeStatus::CrcMismatch,
+            damaged.clone(),
+            Some(bad.clone()),
+        )
+    );
+    assert_eq!(
+        data_volume_view(&plan.data_volumes[4]),
+        (
+            4,
+            None,
+            unrar_rs::DataVolumeStatus::Missing,
+            rar5_volume(&dir, 5),
+            None,
+        )
+    );
+    for volume in [1, 2, 4, 6, 7, 8, 9, 10] {
+        assert_eq!(
+            data_volume_view(&plan.data_volumes[volume - 1]),
+            valid_data_volume(volume - 1, rar5_volume(&dir, volume))
+        );
+    }
+
+    let report = unrar_rs::restore_volumes_from_paths(&paths, &options).unwrap();
+
+    assert_restore_matches_plan(&plan, &report);
+    assert!(std::fs::read(&bad).unwrap() == damaged_bytes);
+    for volume in [3, 5] {
+        let name = format!("rar5_recovery_volumes.part{volume:02}.rar");
+        assert!(
+            std::fs::read(rar5_volume(&dir, volume)).unwrap()
+                == std::fs::read(fixture("rar5", &name)).unwrap(),
+            "{name} differs from RARLAB's volume"
+        );
+    }
+}
+
+/// Three losses against two recovery volumes. The plan reports the shortfall
+/// with the counts instead of failing, writes nothing, and the restore's
+/// refusal carries the same counts.
+#[test]
+fn test_plan_volume_restore_reports_an_insufficient_rar5_set_without_failing() {
+    let (dir, paths) = rar5_recovery_set_without(&[5]);
+    for volume in [3, 7] {
+        corrupt_in_place(&rar5_volume(&dir, volume));
+    }
+    let options = rar5_restore_options(&dir);
+    let before = dir_snapshot(&dir);
+
+    let plan = unrar_rs::plan_volume_restore(&paths, &options).unwrap();
+
+    assert_eq!(dir_snapshot(&dir), before);
+    assert_eq!(plan.missing_volume_numbers(), vec![2, 4, 6]);
+    assert_eq!(plan.needed(), 3);
+    assert_eq!(plan.usable_recovery_count(), 2);
+    assert!(!plan.is_sufficient());
+
+    let error = unrar_rs::restore_volumes_from_paths(&paths, &options)
+        .expect_err("three losses exceed two recovery volumes");
+    assert!(
+        error.to_string().contains(&format!(
+            "insufficient RAR5 recovery volumes: need {}, have {}",
+            plan.needed(),
+            plan.usable_recovery_count()
+        )),
+        "{error}"
+    );
+    assert_eq!(dir_snapshot(&dir), before);
+}
+
+/// A truncated volume is reported by its size against the `.rev` table, with
+/// both lengths, and the restore rebuilds it where the plan said.
+#[test]
+fn test_plan_volume_restore_reports_a_short_rar5_volume_by_size() {
+    let (dir, paths) = rar5_recovery_set_without(&[]);
+    let short = rar5_volume(&dir, 2);
+    let bytes = std::fs::read(&short).unwrap();
+    std::fs::write(&short, &bytes[..bytes.len() - 100]).unwrap();
+    let options = rar5_restore_options(&dir);
+
+    let plan = unrar_rs::plan_volume_restore(&paths, &options).unwrap();
+
+    assert_eq!(
+        plan.data_volumes[1].status,
+        unrar_rs::DataVolumeStatus::WrongSize {
+            expected: bytes.len() as u64,
+            actual: bytes.len() as u64 - 100,
+        }
+    );
+    assert_eq!(
+        plan.data_volumes[1].set_aside_path,
+        Some(dir.path().join("rar5_recovery_volumes.part02.rar.bad"))
+    );
+    assert_eq!(plan.missing_volume_numbers(), vec![1]);
+    assert!(plan.is_sufficient());
+
+    let report = unrar_rs::restore_volumes_from_paths(&paths, &options).unwrap();
+
+    assert_restore_matches_plan(&plan, &report);
+    assert!(std::fs::read(&short).unwrap() == bytes);
+}
+
+/// With an output directory that does not exist yet, the plan names outputs
+/// inside it without creating it. A damaged volume is not at its output name
+/// there, so it has no `.bad` name: the restore leaves it where it is.
+#[test]
+fn test_plan_volume_restore_creates_no_output_directory() {
+    let (dir, paths) = rar5_recovery_set_without(&[5]);
+    let damaged = rar5_volume(&dir, 3);
+    corrupt_in_place(&damaged);
+    let damaged_bytes = std::fs::read(&damaged).unwrap();
+    let out = dir.path().join("restored");
+    let options = unrar_rs::RecoveryOptions {
+        output_dir: Some(out.clone()),
+        overwrite_existing: false,
+        verify_restored: true,
+    };
+    let before = dir_snapshot(&dir);
+
+    let plan = unrar_rs::plan_volume_restore(&paths, &options).unwrap();
+
+    assert!(!out.exists());
+    assert_eq!(dir_snapshot(&dir), before);
+    assert_eq!(plan.output_dir, out);
+    assert_eq!(plan.missing_volume_numbers(), vec![2, 4]);
+    assert_eq!(
+        plan.data_volumes[2].output_path,
+        out.join("rar5_recovery_volumes.part03.rar")
+    );
+    assert_eq!(plan.data_volumes[2].path, Some(damaged.clone()));
+    assert_eq!(plan.data_volumes[2].set_aside_path, None);
+    assert_eq!(
+        plan.data_volumes[4].output_path,
+        out.join("rar5_recovery_volumes.part05.rar")
+    );
+
+    let report = unrar_rs::restore_volumes_from_paths(&paths, &options).unwrap();
+
+    assert_restore_matches_plan(&plan, &report);
+    assert!(std::fs::read(&damaged).unwrap() == damaged_bytes);
+    assert!(
+        !dir.path()
+            .join("rar5_recovery_volumes.part03.rar.bad")
+            .exists()
+    );
+}
+
+/// The `-hp` set, whose volume numbers sit behind the header encryption: the
+/// plan places each volume by its name, as the restore does, and the
+/// removed one is the only one to rebuild.
+#[test]
+fn test_plan_volume_restore_places_header_encrypted_rar5_volumes_by_name() {
+    if !fixture("rar5", "rar5_hp_recovery_volumes.part1.rev").exists() {
+        eprintln!("skipping test: rar57 rar5_hp_recovery_volumes fixtures not present");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let present = [
+        "rar5_hp_recovery_volumes.part1.rar",
+        "rar5_hp_recovery_volumes.part2.rar",
+        "rar5_hp_recovery_volumes.part4.rar",
+        "rar5_hp_recovery_volumes.part5.rar",
+        "rar5_hp_recovery_volumes.part1.rev",
+        "rar5_hp_recovery_volumes.part2.rev",
+    ];
+    let mut paths = Vec::new();
+    for name in present {
+        let dst = dir.path().join(name);
+        std::fs::copy(fixture("rar5", name), &dst).unwrap();
+        paths.push(dst);
+    }
+    let options = rar5_restore_options(&dir);
+    let before = dir_snapshot(&dir);
+
+    let plan = unrar_rs::plan_volume_restore(&paths, &options).unwrap();
+
+    assert_eq!(dir_snapshot(&dir), before);
+    assert_eq!(plan.format, unrar_rs::ArchiveFormat::Rar5);
+    assert_eq!((plan.data_count, plan.recovery_count), (5, 2));
+    let hp_volume = |volume: usize| {
+        dir.path()
+            .join(format!("rar5_hp_recovery_volumes.part{volume}.rar"))
+    };
+    for volume in [1, 2, 4, 5] {
+        assert_eq!(
+            data_volume_view(&plan.data_volumes[volume - 1]),
+            valid_data_volume(volume - 1, hp_volume(volume))
+        );
+    }
+    assert_eq!(
+        data_volume_view(&plan.data_volumes[2]),
+        (
+            2,
+            None,
+            unrar_rs::DataVolumeStatus::Missing,
+            hp_volume(3),
+            None,
+        )
+    );
+    assert_eq!(plan.usable_recovery_count(), 2);
+    assert!(plan.is_sufficient());
+
+    let report = unrar_rs::restore_volumes_from_paths(&paths, &options).unwrap();
+
+    assert_restore_matches_plan(&plan, &report);
+    assert!(
+        std::fs::read(hp_volume(3)).unwrap()
+            == std::fs::read(fixture("rar5", "rar5_hp_recovery_volumes.part3.rar")).unwrap()
+    );
+}
+
+/// Copy the 5+2 RAR3 recovery set into a fresh directory, leaving out the
+/// data volumes in `drop`, and return the directory with the copied paths.
+fn rar3_recovery_set_without(drop: &[usize]) -> (tempfile::TempDir, Vec<std::path::PathBuf>) {
+    let dir = tempfile::tempdir().unwrap();
+    let names = (1..=5)
+        .filter(|volume| !drop.contains(volume))
+        .map(|volume| format!("rar3_recovery_volumes.part{volume}.rar"))
+        .chain([1, 2].map(|rev| format!("rar3_recovery_volumes.part{rev}.rev")));
+    let paths = names
+        .map(|name| {
+            let dst = dir.path().join(&name);
+            std::fs::copy(fixture("rar4", &name), &dst).unwrap();
+            dst
+        })
+        .collect();
+    (dir, paths)
+}
+
+fn rar3_volume(dir: &tempfile::TempDir, volume: usize) -> std::path::PathBuf {
+    dir.path()
+        .join(format!("rar3_recovery_volumes.part{volume}.rar"))
+}
+
+/// A RAR3 data volume is judged by its headers and by the data CRC32 in its
+/// end-of-archive header. RAR 3.x writes that CRC into every volume of a
+/// multivolume set, so a volume with one damaged byte is `CrcMismatch`, not
+/// `Valid`, and the plan names it for rebuilding as it names a missing one.
+/// The restore then rebuilds exactly those volumes at exactly those paths.
+#[test]
+fn test_plan_volume_restore_predicts_the_rar3_restore() {
+    let options = |dir: &tempfile::TempDir| unrar_rs::RecoveryOptions {
+        output_dir: Some(dir.path().to_path_buf()),
+        overwrite_existing: false,
+        verify_restored: true,
+    };
+    let revs = |dir: &tempfile::TempDir| {
+        vec![
+            usable_rev(0, 5, dir.path().join("rar3_recovery_volumes.part1.rev")),
+            usable_rev(1, 6, dir.path().join("rar3_recovery_volumes.part2.rev")),
+        ]
+    };
+
+    let (dir, paths) = rar3_recovery_set_without(&[3]);
+    let before = dir_snapshot(&dir);
+
+    let plan = unrar_rs::plan_volume_restore(&paths, &options(&dir)).unwrap();
+
+    assert_eq!(dir_snapshot(&dir), before);
+    assert_eq!(plan.format, unrar_rs::ArchiveFormat::Rar4);
+    assert_eq!((plan.data_count, plan.recovery_count), (5, 2));
+    assert_eq!(
+        data_volume_view(&plan.data_volumes[2]),
+        (
+            2,
+            None,
+            unrar_rs::DataVolumeStatus::Missing,
+            rar3_volume(&dir, 3),
+            None,
+        )
+    );
+    for volume in [1, 2, 4, 5] {
+        assert_eq!(
+            data_volume_view(&plan.data_volumes[volume - 1]),
+            valid_data_volume(volume - 1, rar3_volume(&dir, volume))
+        );
+    }
+    assert_eq!(recovery_volume_views(&plan), revs(&dir));
+    assert!(plan.is_sufficient());
+
+    let report = unrar_rs::restore_volumes_from_paths(&paths, &options(&dir)).unwrap();
+
+    assert_restore_matches_plan(&plan, &report);
+
+    let (dir, paths) = rar3_recovery_set_without(&[]);
+    let damaged = rar3_volume(&dir, 2);
+    corrupt_in_place(&damaged);
+    let damaged_bytes = std::fs::read(&damaged).unwrap();
+    let before = dir_snapshot(&dir);
+
+    let plan = unrar_rs::plan_volume_restore(&paths, &options(&dir)).unwrap();
+
+    assert_eq!(dir_snapshot(&dir), before);
+    let bad = dir.path().join("rar3_recovery_volumes.part2.rar.bad");
+    assert_eq!(
+        data_volume_view(&plan.data_volumes[1]),
+        (
+            1,
+            Some(damaged.clone()),
+            unrar_rs::DataVolumeStatus::CrcMismatch,
+            damaged.clone(),
+            Some(bad.clone()),
+        )
+    );
+    assert_eq!(plan.missing_volume_numbers(), vec![1]);
+    assert_eq!(recovery_volume_views(&plan), revs(&dir));
+    assert!(plan.is_sufficient());
+
+    let report = unrar_rs::restore_volumes_from_paths(&paths, &options(&dir)).unwrap();
+
+    assert_restore_matches_plan(&plan, &report);
+    assert!(std::fs::read(&bad).unwrap() == damaged_bytes);
+    assert!(
+        std::fs::read(&damaged).unwrap()
+            == std::fs::read(fixture("rar4", "rar3_recovery_volumes.part2.rar")).unwrap()
+    );
+}
+
+/// A `.rev` whose payload fails its CRC32 is listed, unusable, in its slot;
+/// the other one covers the single loss, and the restore uses only that one.
+#[test]
+fn test_plan_volume_restore_marks_a_damaged_rev_unusable() {
+    let (dir, paths) = rar5_recovery_set_without(&[5]);
+    let damaged = rar5_rev(&dir, 2);
+    corrupt_in_place(&damaged);
+    let options = rar5_restore_options(&dir);
+    let before = dir_snapshot(&dir);
+
+    let plan = unrar_rs::plan_volume_restore(&paths, &options).unwrap();
+
+    assert_eq!(dir_snapshot(&dir), before);
+    assert_eq!(plan.recovery_volumes.len(), 2);
+    assert_eq!(
+        recovery_volume_view(&plan.recovery_volumes[0]),
+        usable_rev(0, 10, rar5_rev(&dir, 1))
+    );
+    let unusable = &plan.recovery_volumes[1];
+    assert_eq!(
+        (unusable.slot, unusable.volume_number, &unusable.path),
+        (1, 11, &damaged)
+    );
+    assert!(!unusable.usable);
+    assert!(
+        matches!(
+            unusable.status,
+            unrar_rs::RevTestStatus::CrcMismatch { expected, actual } if expected != actual
+        ),
+        "{:?}",
+        unusable.status
+    );
+    assert_eq!(plan.usable_recovery_count(), 1);
+    assert_eq!(plan.missing_volume_numbers(), vec![4]);
+    assert!(plan.is_sufficient());
+
+    let report = unrar_rs::restore_volumes_from_paths(&paths, &options).unwrap();
+
+    assert_restore_matches_plan(&plan, &report);
+    assert_eq!(report.used_recovery_paths, vec![rar5_rev(&dir, 1)]);
+}
+
+#[test]
+fn test_recovery_volumes_reports_every_fixture_rev_ok() {
+    use unrar_rs::ArchiveFormat::{Rar4, Rar5};
+    let mut cases = vec![
+        ("rar5", "rar5_recovery_volumes.part01.rev", Rar5),
+        ("rar5", "rar5_recovery_volumes.part02.rev", Rar5),
+        ("rar4", "rar3_recovery_volumes.part1.rev", Rar4),
+        ("rar4", "rar3_recovery_volumes.part2.rev", Rar4),
+        ("rar4", "rar3_recovery_volumes_large.part1.rev", Rar4),
+        ("rar4", "rar3_recovery_volumes_large.part2.rev", Rar4),
+    ];
+    if fixture("rar5", "rar5_hp_recovery_volumes.part1.rev").exists() {
+        cases.push(("rar5", "rar5_hp_recovery_volumes.part1.rev", Rar5));
+        cases.push(("rar5", "rar5_hp_recovery_volumes.part2.rev", Rar5));
+    } else {
+        eprintln!("skipping the -hp revs: rar57 rar5_hp_recovery_volumes fixtures not present");
+    }
+    let paths = cases
+        .iter()
+        .map(|(directory, name, _)| fixture(directory, name))
+        .collect::<Vec<_>>();
+
+    let results = unrar_rs::test_recovery_volumes(&paths).unwrap();
+
+    let expected = cases
+        .iter()
+        .zip(&paths)
+        .map(|((_, _, format), path)| (path.clone(), Some(*format), unrar_rs::RevTestStatus::Ok))
+        .collect::<Vec<_>>();
+    assert_eq!(rev_test_views(&results), expected);
+}
+
+/// One result per path, in order, for damaged recovery volumes and for paths
+/// that are not recovery volumes at all. A damaged payload reports both
+/// CRC32s: the one the volume states and the one its bytes hash to.
+#[test]
+fn test_recovery_volumes_classifies_damaged_and_foreign_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let copy = |directory: &str, name: &str| {
+        let dst = dir.path().join(name);
+        std::fs::copy(fixture(directory, name), &dst).unwrap();
+        dst
+    };
+
+    // RAR5: the payload starts after the 16-byte prefix and the header size
+    // it states, and the header's CRC32 is the intact payload's.
+    let rar5 = copy("rar5", "rar5_recovery_volumes.part01.rev");
+    let intact = std::fs::read(&rar5).unwrap();
+    let data_offset = 16 + u32::from_le_bytes(intact[12..16].try_into().unwrap()) as usize;
+    corrupt_in_place(&rar5);
+    let damaged = std::fs::read(&rar5).unwrap();
+    let rar5_crcs = (
+        crc32fast::hash(&intact[data_offset..]),
+        crc32fast::hash(&damaged[data_offset..]),
+    );
+
+    // RAR3: the CRC32 is the last four bytes, over everything before them.
+    let rar3 = copy("rar4", "rar3_recovery_volumes.part1.rev");
+    corrupt_in_place(&rar3);
+    let damaged = std::fs::read(&rar3).unwrap();
+    let (covered, stated) = damaged.split_at(damaged.len() - 4);
+    let rar3_crcs = (
+        u32::from_le_bytes(stated.try_into().unwrap()),
+        crc32fast::hash(covered),
+    );
+
+    // Cut inside the RAR5 header, after the prefix.
+    let truncated = copy("rar5", "rar5_recovery_volumes.part02.rev");
+    let bytes = std::fs::read(&truncated).unwrap();
+    std::fs::write(&truncated, &bytes[..20]).unwrap();
+
+    let data = copy("rar5", "rar5_recovery_volumes.part01.rar");
+    let gone = dir.path().join("rar5_recovery_volumes.part03.rev");
+    // A RAR 3.0 name states the set and the format carries no checksum, so
+    // the file's contents cannot be tested.
+    let old_style = dir.path().join("set_5_2_1.rev");
+    std::fs::write(&old_style, b"").unwrap();
+
+    let paths = vec![
+        rar5.clone(),
+        rar3.clone(),
+        truncated.clone(),
+        data.clone(),
+        gone.clone(),
+        old_style.clone(),
+    ];
+    let results = unrar_rs::test_recovery_volumes(&paths).unwrap();
+
+    assert_ne!(rar5_crcs.0, rar5_crcs.1);
+    assert_ne!(rar3_crcs.0, rar3_crcs.1);
+    let result = |path: &std::path::PathBuf, format, status| (path.clone(), format, status);
+    assert_eq!(
+        rev_test_views(&results),
+        vec![
+            result(
+                &rar5,
+                Some(unrar_rs::ArchiveFormat::Rar5),
+                unrar_rs::RevTestStatus::CrcMismatch {
+                    expected: rar5_crcs.0,
+                    actual: rar5_crcs.1,
+                },
+            ),
+            result(
+                &rar3,
+                Some(unrar_rs::ArchiveFormat::Rar4),
+                unrar_rs::RevTestStatus::CrcMismatch {
+                    expected: rar3_crcs.0,
+                    actual: rar3_crcs.1,
+                },
+            ),
+            result(&truncated, None, unrar_rs::RevTestStatus::InvalidHeader),
+            result(&data, None, unrar_rs::RevTestStatus::NotRecoveryVolume),
+            result(&gone, None, unrar_rs::RevTestStatus::Missing),
+            result(
+                &old_style,
+                Some(unrar_rs::ArchiveFormat::Rar4),
+                unrar_rs::RevTestStatus::Unverifiable,
+            ),
+        ]
+    );
+    assert!(!gone.exists());
+}
+
+/// Copy fixture `directory`/`name` into `dir` as `as_name`.
+fn copy_fixture_as(
+    dir: &std::path::Path,
+    directory: &str,
+    name: &str,
+    as_name: &str,
+) -> std::path::PathBuf {
+    let dst = dir.join(as_name);
+    std::fs::copy(fixture(directory, name), &dst).unwrap();
+    dst
+}
+
+/// The RAR5 set (`"rar5"`) or the RAR3 one (`"rar4"`), as
+/// [`rar5_recovery_set_without`] and [`rar3_recovery_set_without`] copy them.
+fn recovery_set_without(
+    directory: &str,
+    drop: &[usize],
+) -> (tempfile::TempDir, Vec<std::path::PathBuf>) {
+    match directory {
+        "rar5" => rar5_recovery_set_without(drop),
+        _ => rar3_recovery_set_without(drop),
+    }
+}
+
+/// Plan and restore both refuse `paths`, with the same error, which says
+/// `needle`, and leave every file in `dirs` as they found it. The restore
+/// writes to the first of `dirs`.
+fn assert_plan_and_restore_refuse(
+    dirs: &[&tempfile::TempDir],
+    paths: &[std::path::PathBuf],
+    needle: &str,
+) {
+    let options = rar5_restore_options(dirs[0]);
+    let snapshots = || dirs.iter().map(|dir| dir_snapshot(dir)).collect::<Vec<_>>();
+    let before = snapshots();
+
+    let planned = unrar_rs::plan_volume_restore(paths, &options)
+        .expect_err("the plan refuses the paths")
+        .to_string();
+    let restored = unrar_rs::restore_volumes_from_paths(paths, &options)
+        .expect_err("the restore refuses the paths")
+        .to_string();
+
+    assert_eq!(planned, restored);
+    assert!(
+        planned.contains(needle),
+        "{planned}\ndoes not say\n{needle}"
+    );
+    assert!(snapshots() == before, "the refusal changed a file");
+}
+
+/// Set the volume number a RAR5 `.rev`'s header states, and the header's
+/// CRC32 to match, so the header still reads.
+fn set_rar5_rev_number(bytes: &mut [u8], number: u16) {
+    // The signature, the header's CRC32 and its size come first; the CRC32
+    // covers the size and the header. The header starts with its version,
+    // then the data count, the recovery count and this volume's number,
+    // two bytes each.
+    let size = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    bytes[21..23].copy_from_slice(&number.to_le_bytes());
+    let crc = crc32fast::hash(&bytes[12..16 + size]);
+    bytes[8..12].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// A given path that is not named as one of the set's volumes is refused by
+/// the plan and the restore alike, naming the path and the volume the set's
+/// name came from: another set's volume, an archive that is no volume at
+/// all, and another set's `.rev`, in both formats. Nothing is renamed or
+/// written.
+#[test]
+fn test_recovery_refuses_a_given_path_not_named_as_the_sets() {
+    for (directory, name, as_name) in [
+        (
+            "rar5",
+            "rar5_mv_solid_pair.part02.rar",
+            "rar5_mv_solid_pair.part02.rar",
+        ),
+        (
+            "rar5",
+            "rar5_recovery_volumes.part02.rev",
+            "other_set.part02.rev",
+        ),
+        ("rar4", "rar4_store.rar", "rar4_store.rar"),
+        (
+            "rar4",
+            "rar4_tiny_volumes.part2.rar",
+            "rar4_tiny_volumes.part2.rar",
+        ),
+        (
+            "rar4",
+            "rar3_recovery_volumes_large.part1.rev",
+            "rar3_recovery_volumes_large.part1.rev",
+        ),
+    ] {
+        let missing = if directory == "rar5" { 5 } else { 3 };
+        let (dir, mut paths) = recovery_set_without(directory, &[missing]);
+        let set_name = paths[0].clone();
+        let other = tempfile::tempdir().unwrap();
+        let foreign = copy_fixture_as(other.path(), directory, name, as_name);
+        paths.push(foreign.clone());
+
+        assert_plan_and_restore_refuse(
+            &[&dir, &other],
+            &paths,
+            &format!(
+                "{} is not named as a volume of the recovery set of {}",
+                foreign.display(),
+                set_name.display()
+            ),
+        );
+    }
+}
+
+/// Beside the given paths, only files named in the set's numbering are its
+/// volumes. A copy of volume 3 whose name prints the number at another
+/// width is passed over and left as it is, and volume 3 is rebuilt at its
+/// own name; given, the same copy is refused. A second file for a volume
+/// the set already has, from another directory, is refused naming both, for
+/// a data volume and a `.rev` in both formats, while the same file reached
+/// by a second name is taken once.
+#[test]
+fn test_recovery_takes_only_the_sets_numbering_and_one_file_per_volume() {
+    for (directory, own_name, other_width) in [
+        (
+            "rar5",
+            "rar5_recovery_volumes.part03.rar",
+            "rar5_recovery_volumes.part3.rar",
+        ),
+        (
+            "rar4",
+            "rar3_recovery_volumes.part3.rar",
+            "rar3_recovery_volumes.part03.rar",
+        ),
+    ] {
+        let (dir, mut paths) = recovery_set_without(directory, &[3]);
+        let stray = copy_fixture_as(dir.path(), directory, own_name, other_width);
+        let own = dir.path().join(own_name);
+        let original = std::fs::read(fixture(directory, own_name)).unwrap();
+        let options = rar5_restore_options(&dir);
+
+        let plan = unrar_rs::plan_volume_restore(&paths, &options).unwrap();
+
+        assert_eq!(
+            data_volume_view(&plan.data_volumes[2]),
+            (
+                2,
+                None,
+                unrar_rs::DataVolumeStatus::Missing,
+                own.clone(),
+                None,
+            ),
+            "{other_width}"
+        );
+        assert_eq!(plan.missing_volume_numbers(), vec![2]);
+
+        let report = unrar_rs::restore_volumes_from_paths(&paths, &options).unwrap();
+
+        assert_restore_matches_plan(&plan, &report);
+        assert!(
+            std::fs::read(&own).unwrap() == original,
+            "{own_name} differs from RARLAB's volume"
+        );
+        assert!(
+            std::fs::read(&stray).unwrap() == original,
+            "{other_width} was changed"
+        );
+        assert!(!dir.path().join(format!("{other_width}.bad")).exists());
+        assert_eq!(stray_files(&dir), Vec::<String>::new());
+
+        paths.push(stray.clone());
+        assert_plan_and_restore_refuse(
+            &[&dir],
+            &paths,
+            &format!(
+                "{} is not named as a volume of the recovery set of {}",
+                stray.display(),
+                paths[0].display()
+            ),
+        );
+    }
+
+    for (directory, data_name, rev_name) in [
+        (
+            "rar5",
+            "rar5_recovery_volumes.part04.rar",
+            "rar5_recovery_volumes.part02.rev",
+        ),
+        (
+            "rar4",
+            "rar3_recovery_volumes.part4.rar",
+            "rar3_recovery_volumes.part2.rev",
+        ),
+    ] {
+        let (dir, paths) = recovery_set_without(directory, &[3]);
+        for (name, volume) in [
+            (data_name, "data volume 4"),
+            (rev_name, "recovery volume 2"),
+        ] {
+            let elsewhere = tempfile::tempdir().unwrap();
+            let second = copy_fixture_as(elsewhere.path(), directory, name, name);
+            let mut given = paths.clone();
+            given.push(second.clone());
+
+            assert_plan_and_restore_refuse(
+                &[&dir, &elsewhere],
+                &given,
+                &format!(
+                    "{} and {} both claim {volume} of the recovery set",
+                    dir.path().join(name).display(),
+                    second.display()
+                ),
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let elsewhere = tempfile::tempdir().unwrap();
+            let alias = elsewhere.path().join(data_name);
+            std::os::unix::fs::symlink(dir.path().join(data_name), &alias).unwrap();
+            let mut given = paths.clone();
+            given.push(alias);
+
+            let plan = unrar_rs::plan_volume_restore(&given, &rar5_restore_options(&dir)).unwrap();
+
+            assert_eq!(
+                data_volume_view(&plan.data_volumes[3]),
+                valid_data_volume(3, dir.path().join(data_name))
+            );
+            assert_eq!(plan.missing_volume_numbers(), vec![2]);
+        }
+    }
+}
+
+/// A RAR3 volume cut short inside its main header, its file header, its
+/// packed data, or its end-of-archive header, and one whose end-of-archive
+/// header numbers it as another volume, are invalid where they stand: the
+/// plan names each with its path, and the restore, verifying what it
+/// rebuilds, sets it aside as `.bad`, rebuilds it as RARLAB wrote it and
+/// leaves nothing else behind.
+#[test]
+fn test_rar3_restore_rebuilds_cut_short_and_misnumbered_volumes() {
+    let original = std::fs::read(fixture("rar4", "rar3_recovery_volumes.part2.rar")).unwrap();
+    let fourth = std::fs::read(fixture("rar4", "rar3_recovery_volumes.part4.rar")).unwrap();
+    // The main header is at 7, the file header at 20 with its data from 68,
+    // and the end-of-archive header at 1004: seven bytes of type, flags and
+    // size, then the data CRC32, the volume number and reserved bytes.
+    let mut damages = [10, 40, 500, 1007, 1012, 1016, 1020]
+        .map(|len| (format!("cut at {len}"), original[..len].to_vec()))
+        .to_vec();
+    damages.push(("volume 4 at volume 2's name".to_string(), fourth));
+
+    for (case, damaged_bytes) in damages {
+        let (dir, paths) = rar3_recovery_set_without(&[]);
+        let damaged = rar3_volume(&dir, 2);
+        std::fs::write(&damaged, &damaged_bytes).unwrap();
+        let options = rar5_restore_options(&dir);
+        let before = dir_snapshot(&dir);
+
+        let plan = unrar_rs::plan_volume_restore(&paths, &options).unwrap();
+
+        assert!(
+            dir_snapshot(&dir) == before,
+            "{case}: the plan changed a file"
+        );
+        let bad = dir.path().join("rar3_recovery_volumes.part2.rar.bad");
+        assert_eq!(
+            data_volume_view(&plan.data_volumes[1]),
+            (
+                1,
+                Some(damaged.clone()),
+                unrar_rs::DataVolumeStatus::InvalidHeaders,
+                damaged.clone(),
+                Some(bad.clone()),
+            ),
+            "{case}"
+        );
+        assert_eq!(plan.missing_volume_numbers(), vec![1], "{case}");
+        assert!(plan.is_sufficient(), "{case}");
+
+        let report = unrar_rs::restore_volumes_from_paths(&paths, &options).unwrap();
+
+        assert_restore_matches_plan(&plan, &report);
+        assert!(
+            std::fs::read(&damaged).unwrap() == original,
+            "{case}: the rebuilt volume differs from RARLAB's"
+        );
+        assert!(
+            std::fs::read(&bad).unwrap() == damaged_bytes,
+            "{case}: the .bad file is not the damaged volume"
+        );
+        assert_eq!(stray_files(&dir), Vec::<String>::new(), "{case}");
+    }
+}
+
+/// With `verify_restored`, each rebuilt RAR3 volume is judged as a data
+/// volume in its slot is, before anything is moved. Volume 3 rebuilt from a
+/// `.rev` whose recovery data has a damaged byte, under a footer CRC32
+/// recomputed to match, fails its data CRC32: the restore refuses it, and
+/// installs, renames and leaves behind nothing. Without the check, the same
+/// restore installs the wrong bytes.
+#[test]
+fn test_rar3_restore_verifies_rebuilt_volumes_before_installing_them() {
+    let (dir, mut paths) = rar3_recovery_set_without(&[3]);
+    let dropped = dir.path().join("rar3_recovery_volumes.part2.rev");
+    std::fs::remove_file(&dropped).unwrap();
+    paths.retain(|path| *path != dropped);
+    let rev = dir.path().join("rar3_recovery_volumes.part1.rev");
+    corrupt_in_place(&rev);
+    let mut bytes = std::fs::read(&rev).unwrap();
+    let covered = bytes.len() - 4;
+    let crc = crc32fast::hash(&bytes[..covered]);
+    bytes[covered..].copy_from_slice(&crc.to_le_bytes());
+    std::fs::write(&rev, &bytes).unwrap();
+    let options = rar5_restore_options(&dir);
+    let before = dir_snapshot(&dir);
+
+    let plan = unrar_rs::plan_volume_restore(&paths, &options).unwrap();
+
+    assert_eq!(
+        recovery_volume_views(&plan),
+        vec![usable_rev(0, 5, rev.clone())]
+    );
+    assert_eq!(plan.missing_volume_numbers(), vec![2]);
+    assert!(plan.is_sufficient());
+
+    let error = unrar_rs::restore_volumes_from_paths(&paths, &options)
+        .expect_err("the rebuilt volume fails its data CRC32");
+
+    let output = rar3_volume(&dir, 3);
+    assert!(
+        error.to_string().contains(&format!(
+            "restored RAR3 volume {} failed verification (CrcMismatch)",
+            output.display()
+        )),
+        "{error}"
+    );
+    assert!(
+        dir_snapshot(&dir) == before,
+        "the refused restore changed a file"
+    );
+
+    let unchecked = unrar_rs::RecoveryOptions {
+        verify_restored: false,
+        ..options
+    };
+    let report = unrar_rs::restore_volumes_from_paths(&paths, &unchecked).unwrap();
+
+    assert_eq!(report.restored_paths, vec![output.clone()]);
+    assert!(
+        std::fs::read(&output).unwrap()
+            != std::fs::read(fixture("rar4", "rar3_recovery_volumes.part3.rar")).unwrap()
+    );
+}
+
+/// A first volume whose main header is zeroed cannot name the set, so the
+/// naming comes from the next volume that can, as reference UnRAR takes it
+/// from the first volume it opens. The first volume is rebuilt at its own
+/// name, its damaged bytes kept as `.bad`, and the missing third one at the
+/// name the naming gives it.
+#[test]
+fn test_rar3_restore_takes_the_naming_from_a_later_volume() {
+    let (dir, paths) = rar3_recovery_set_without(&[3]);
+    let first = rar3_volume(&dir, 1);
+    let mut damaged_bytes = std::fs::read(&first).unwrap();
+    // The main header, between the signature and the file header.
+    damaged_bytes[7..20].fill(0);
+    std::fs::write(&first, &damaged_bytes).unwrap();
+    let options = rar5_restore_options(&dir);
+    let before = dir_snapshot(&dir);
+
+    let plan = unrar_rs::plan_volume_restore(&paths, &options).unwrap();
+
+    assert!(dir_snapshot(&dir) == before, "the plan changed a file");
+    let bad = dir.path().join("rar3_recovery_volumes.part1.rar.bad");
+    assert_eq!(
+        data_volume_view(&plan.data_volumes[0]),
+        (
+            0,
+            Some(first.clone()),
+            unrar_rs::DataVolumeStatus::InvalidHeaders,
+            first.clone(),
+            Some(bad.clone()),
+        )
+    );
+    assert_eq!(
+        data_volume_view(&plan.data_volumes[2]),
+        (
+            2,
+            None,
+            unrar_rs::DataVolumeStatus::Missing,
+            rar3_volume(&dir, 3),
+            None,
+        )
+    );
+    assert_eq!(plan.missing_volume_numbers(), vec![0, 2]);
+    assert!(plan.is_sufficient());
+
+    let report = unrar_rs::restore_volumes_from_paths(&paths, &options).unwrap();
+
+    assert_restore_matches_plan(&plan, &report);
+    for volume in [1, 3] {
+        let name = format!("rar3_recovery_volumes.part{volume}.rar");
+        assert!(
+            std::fs::read(rar3_volume(&dir, volume)).unwrap()
+                == std::fs::read(fixture("rar4", &name)).unwrap(),
+            "{name} differs from RARLAB's volume"
+        );
+    }
+    assert!(std::fs::read(&bad).unwrap() == damaged_bytes);
+    assert_eq!(stray_files(&dir), Vec::<String>::new());
+}
+
+/// RAR5 data volumes are placed by the number their names print, as
+/// reference UnRAR places them, without reading their headers. One whose
+/// headers are zeroed and one too short to hold any are judged, like any
+/// other, by size and CRC32 against the `.rev` table, then set aside as
+/// `.bad` and rebuilt.
+#[test]
+fn test_rar5_restore_places_unreadable_volumes_by_name() {
+    let size = std::fs::metadata(fixture("rar5", "rar5_recovery_volumes.part07.rar"))
+        .unwrap()
+        .len();
+    for (volume, status) in [
+        (3, unrar_rs::DataVolumeStatus::CrcMismatch),
+        (
+            7,
+            unrar_rs::DataVolumeStatus::WrongSize {
+                expected: size,
+                actual: 3,
+            },
+        ),
+    ] {
+        let (dir, paths) = rar5_recovery_set_without(&[5]);
+        let damaged = rar5_volume(&dir, volume);
+        let original = std::fs::read(&damaged).unwrap();
+        let mut damaged_bytes = original.clone();
+        if volume == 3 {
+            damaged_bytes[..64].fill(0);
+        } else {
+            damaged_bytes.truncate(3);
+        }
+        std::fs::write(&damaged, &damaged_bytes).unwrap();
+        let options = rar5_restore_options(&dir);
+        let before = dir_snapshot(&dir);
+
+        let plan = unrar_rs::plan_volume_restore(&paths, &options).unwrap();
+
+        assert!(dir_snapshot(&dir) == before, "the plan changed a file");
+        let bad = dir
+            .path()
+            .join(format!("rar5_recovery_volumes.part{volume:02}.rar.bad"));
+        assert_eq!(
+            data_volume_view(&plan.data_volumes[volume - 1]),
+            (
+                volume - 1,
+                Some(damaged.clone()),
+                status,
+                damaged.clone(),
+                Some(bad.clone()),
+            )
+        );
+        let mut missing = vec![volume - 1, 4];
+        missing.sort_unstable();
+        assert_eq!(plan.missing_volume_numbers(), missing);
+        assert!(plan.is_sufficient());
+
+        let report = unrar_rs::restore_volumes_from_paths(&paths, &options).unwrap();
+
+        assert_restore_matches_plan(&plan, &report);
+        assert!(std::fs::read(&damaged).unwrap() == original);
+        assert!(std::fs::read(&bad).unwrap() == damaged_bytes);
+        assert!(
+            std::fs::read(rar5_volume(&dir, 5)).unwrap()
+                == std::fs::read(fixture("rar5", "rar5_recovery_volumes.part05.rar")).unwrap()
+        );
+        assert_eq!(stray_files(&dir), Vec::<String>::new());
+    }
+}
+
+/// A path that cannot be read gets its own result, with the kind of error,
+/// and the paths beside it are tested as usual.
+#[test]
+fn test_recovery_volumes_reports_an_unreadable_path_in_its_own_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let rev = copy_fixture_as(
+        dir.path(),
+        "rar5",
+        "rar5_recovery_volumes.part01.rev",
+        "rar5_recovery_volumes.part01.rev",
+    );
+    let directory = dir.path().join("rar5_recovery_volumes.part02.rev");
+    std::fs::create_dir(&directory).unwrap();
+    let gone = dir.path().join("rar5_recovery_volumes.part03.rev");
+
+    let results =
+        unrar_rs::test_recovery_volumes(&[rev.clone(), directory.clone(), gone.clone()]).unwrap();
+
+    let views = rev_test_views(&results);
+    assert_eq!(views.len(), 3);
+    assert_eq!(
+        views[0],
+        (
+            rev,
+            Some(unrar_rs::ArchiveFormat::Rar5),
+            unrar_rs::RevTestStatus::Ok
+        )
+    );
+    assert_eq!((&views[1].0, views[1].1), (&directory, None));
+    assert!(
+        matches!(views[1].2, unrar_rs::RevTestStatus::Unreadable { .. }),
+        "{:?}",
+        views[1].2
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        views[1].2,
+        unrar_rs::RevTestStatus::Unreadable {
+            kind: std::io::ErrorKind::IsADirectory
+        }
+    );
+    assert_eq!(views[2], (gone, None, unrar_rs::RevTestStatus::Missing));
+}
+
+/// A RAR3 set whose every `.rev` fails its CRC32 is still a plan, as a RAR5
+/// one is: each `.rev` listed in its slot, unusable, with both CRC32s, and
+/// the shortfall in the counts. The restore refuses it with the same counts
+/// and changes nothing.
+#[test]
+fn test_plan_volume_restore_lists_every_failed_rar3_rev() {
+    let (dir, paths) = rar3_recovery_set_without(&[3]);
+    let revs = [1, 2].map(|rev| {
+        dir.path()
+            .join(format!("rar3_recovery_volumes.part{rev}.rev"))
+    });
+    for rev in &revs {
+        corrupt_in_place(rev);
+    }
+    let options = rar5_restore_options(&dir);
+    let before = dir_snapshot(&dir);
+
+    let plan = unrar_rs::plan_volume_restore(&paths, &options).unwrap();
+
+    assert!(dir_snapshot(&dir) == before, "the plan changed a file");
+    let listed = recovery_volume_views(&plan);
+    assert_eq!(listed.len(), 2);
+    for (position, (slot, volume_number, path, status, usable)) in listed.into_iter().enumerate() {
+        assert_eq!(
+            (slot, volume_number, &path, usable),
+            (position, 5 + position, &revs[position], false)
+        );
+        assert!(
+            matches!(
+                status,
+                unrar_rs::RevTestStatus::CrcMismatch { expected, actual } if expected != actual
+            ),
+            "{status:?}"
+        );
+    }
+    assert_eq!(plan.usable_recovery_count(), 0);
+    assert_eq!(plan.needed(), 1);
+    assert!(!plan.is_sufficient());
+
+    let error = unrar_rs::restore_volumes_from_paths(&paths, &options)
+        .expect_err("no usable recovery volume");
+
+    assert!(
+        error
+            .to_string()
+            .contains("insufficient RAR3 recovery volumes: need 1, have 0"),
+        "{error}"
+    );
+    assert!(dir_snapshot(&dir) == before, "the refusal changed a file");
+}
+
+/// Names with upper-case extensions are the set's, as RAR takes them on a
+/// file system that ignores case, and a rebuilt volume's extension is
+/// spelled as the set spells it, in both formats.
+#[test]
+fn test_recovery_restores_upper_case_extensions_in_their_case() {
+    let rar5_names = (1..=10)
+        .filter(|&volume| volume != 5)
+        .map(|volume| format!("rar5_recovery_volumes.part{volume:02}.rar"))
+        .chain([1, 2].map(|rev| format!("rar5_recovery_volumes.part{rev:02}.rev")))
+        .collect::<Vec<_>>();
+    let rar3_names = (1..=5)
+        .filter(|&volume| volume != 3)
+        .map(|volume| format!("rar3_recovery_volumes.part{volume}.rar"))
+        .chain([1, 2].map(|rev| format!("rar3_recovery_volumes.part{rev}.rev")))
+        .collect::<Vec<_>>();
+
+    for (directory, names, missing, rebuilt) in [
+        ("rar5", rar5_names, 4, "rar5_recovery_volumes.part05"),
+        ("rar4", rar3_names, 2, "rar3_recovery_volumes.part3"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = names
+            .iter()
+            .map(|name| {
+                let (stem, ext) = name.rsplit_once('.').unwrap();
+                let upper = format!("{stem}.{}", ext.to_ascii_uppercase());
+                copy_fixture_as(dir.path(), directory, name, &upper)
+            })
+            .collect::<Vec<_>>();
+        let options = rar5_restore_options(&dir);
+
+        let plan = unrar_rs::plan_volume_restore(&paths, &options).unwrap();
+
+        let output = dir.path().join(format!("{rebuilt}.RAR"));
+        assert_eq!(plan.missing_volume_numbers(), vec![missing]);
+        assert_eq!(plan.data_volumes[missing].output_path, output);
+        assert_eq!(plan.usable_recovery_count(), 2);
+
+        let report = unrar_rs::restore_volumes_from_paths(&paths, &options).unwrap();
+
+        assert_restore_matches_plan(&plan, &report);
+        // A listing spells each name as it was created, whether or not the
+        // file system ignores case.
+        let listed = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(listed.contains(&format!("{rebuilt}.RAR")), "{listed:?}");
+        assert!(!listed.contains(&format!("{rebuilt}.rar")), "{listed:?}");
+        assert!(
+            std::fs::read(&output).unwrap()
+                == std::fs::read(fixture(directory, &format!("{rebuilt}.rar"))).unwrap(),
+            "{rebuilt} differs from RARLAB's volume"
+        );
+        assert_eq!(stray_files(&dir), Vec::<String>::new());
+    }
+}
+
+/// A RAR5 `.rev` whose header numbers it 0 is refused, as reference UnRAR's
+/// header reader refuses it by returning 0: it tests as an invalid header,
+/// the plan does not list it, and the other `.rev` restores the set alone.
+#[test]
+fn test_recovery_passes_over_a_rar5_rev_numbered_zero() {
+    let (dir, paths) = rar5_recovery_set_without(&[5]);
+    let zero = rar5_rev(&dir, 1);
+    let mut bytes = std::fs::read(&zero).unwrap();
+    set_rar5_rev_number(&mut bytes, 0);
+    std::fs::write(&zero, &bytes).unwrap();
+    let options = rar5_restore_options(&dir);
+
+    let results = unrar_rs::test_recovery_volumes(std::slice::from_ref(&zero)).unwrap();
+
+    assert_eq!(
+        rev_test_views(&results),
+        vec![(zero.clone(), None, unrar_rs::RevTestStatus::InvalidHeader)]
+    );
+
+    let plan = unrar_rs::plan_volume_restore(&paths, &options).unwrap();
+
+    assert_eq!(
+        recovery_volume_views(&plan),
+        vec![usable_rev(1, 11, rar5_rev(&dir, 2))]
+    );
+    assert_eq!(plan.missing_volume_numbers(), vec![4]);
+    assert!(plan.is_sufficient());
+
+    let report = unrar_rs::restore_volumes_from_paths(&paths, &options).unwrap();
+
+    assert_restore_matches_plan(&plan, &report);
+    assert!(
+        std::fs::read(rar5_volume(&dir, 5)).unwrap()
+            == std::fs::read(fixture("rar5", "rar5_recovery_volumes.part05.rar")).unwrap()
+    );
+}
+
+/// Every RAR 3.0-style name is untestable, numbers RAR could not have
+/// written included: the name is all such a volume states, and the format
+/// has no checksum to test.
+#[test]
+fn test_recovery_volumes_reports_every_old_style_name_untestable() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = [
+        "set_5_2_1.rev",
+        "set_200_100_1.rev",
+        "set_5_0_1.rev",
+        "set_999_1_1.rev",
+    ]
+    .map(|name| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"").unwrap();
+        path
+    });
+
+    let results = unrar_rs::test_recovery_volumes(&paths).unwrap();
+
+    let expected = paths
+        .iter()
+        .map(|path| {
+            (
+                path.clone(),
+                Some(unrar_rs::ArchiveFormat::Rar4),
+                unrar_rs::RevTestStatus::Unverifiable,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rev_test_views(&results), expected);
+}
+
+/// A `.rev` numbered outside its set's recovery slots is listed, unusable,
+/// with the number it states, and the restore uses the others: a RAR3 one
+/// whose footer states position 3 of 2, and a RAR5 one whose header numbers
+/// it among the data volumes. Each footer or header is rewritten with a
+/// CRC32 to match, so the volume itself tests as sound.
+#[test]
+fn test_plan_volume_restore_lists_a_rev_numbered_outside_the_recovery_slots() {
+    // RAR3: the footer is the data count, the recovery count and the
+    // position, each less one, then the CRC32 of everything before it.
+    let (dir, paths) = rar3_recovery_set_without(&[3]);
+    let outside = dir.path().join("rar3_recovery_volumes.part2.rev");
+    let mut bytes = std::fs::read(&outside).unwrap();
+    let footer = bytes.len() - 7;
+    assert!(bytes[footer..footer + 3] == [4, 1, 1]);
+    bytes[footer + 2] = 2;
+    let crc = crc32fast::hash(&bytes[..footer + 3]);
+    bytes[footer + 3..].copy_from_slice(&crc.to_le_bytes());
+    std::fs::write(&outside, &bytes).unwrap();
+    let options = rar5_restore_options(&dir);
+
+    let results = unrar_rs::test_recovery_volumes(std::slice::from_ref(&outside)).unwrap();
+
+    assert_eq!(
+        rev_test_views(&results),
+        vec![(
+            outside.clone(),
+            Some(unrar_rs::ArchiveFormat::Rar4),
+            unrar_rs::RevTestStatus::Ok
+        )]
+    );
+
+    let plan = unrar_rs::plan_volume_restore(&paths, &options).unwrap();
+
+    let first = dir.path().join("rar3_recovery_volumes.part1.rev");
+    assert_eq!(
+        recovery_volume_views(&plan),
+        vec![
+            usable_rev(0, 5, first.clone()),
+            (2, 7, outside.clone(), unrar_rs::RevTestStatus::Ok, false),
+        ]
+    );
+    assert_eq!(plan.usable_recovery_count(), 1);
+    assert!(plan.is_sufficient());
+
+    let report = unrar_rs::restore_volumes_from_paths(&paths, &options).unwrap();
+
+    assert_restore_matches_plan(&plan, &report);
+    assert_eq!(report.used_recovery_paths, vec![first]);
+    assert!(
+        std::fs::read(rar3_volume(&dir, 3)).unwrap()
+            == std::fs::read(fixture("rar4", "rar3_recovery_volumes.part3.rar")).unwrap()
+    );
+
+    // RAR5: the second `.rev` is volume 11 of 12; renumbered 3, it states
+    // one of the data volumes.
+    let (dir, paths) = rar5_recovery_set_without(&[5]);
+    let outside = rar5_rev(&dir, 2);
+    let original = std::fs::read(&outside).unwrap();
+    let mut bytes = original.clone();
+    set_rar5_rev_number(&mut bytes, 11);
+    assert!(
+        bytes == original,
+        "the rewrite changes the number field only"
+    );
+    set_rar5_rev_number(&mut bytes, 3);
+    std::fs::write(&outside, &bytes).unwrap();
+    let options = rar5_restore_options(&dir);
+
+    let results = unrar_rs::test_recovery_volumes(std::slice::from_ref(&outside)).unwrap();
+
+    assert_eq!(
+        rev_test_views(&results),
+        vec![(
+            outside.clone(),
+            Some(unrar_rs::ArchiveFormat::Rar5),
+            unrar_rs::RevTestStatus::Ok
+        )]
+    );
+
+    let plan = unrar_rs::plan_volume_restore(&paths, &options).unwrap();
+
+    let first = rar5_rev(&dir, 1);
+    assert_eq!(
+        recovery_volume_views(&plan),
+        vec![
+            usable_rev(0, 10, first.clone()),
+            (0, 3, outside.clone(), unrar_rs::RevTestStatus::Ok, false),
+        ]
+    );
+    assert_eq!(plan.usable_recovery_count(), 1);
+    assert!(plan.is_sufficient());
+
+    let report = unrar_rs::restore_volumes_from_paths(&paths, &options).unwrap();
+
+    assert_restore_matches_plan(&plan, &report);
+    assert_eq!(report.used_recovery_paths, vec![first]);
+    assert!(
+        std::fs::read(rar5_volume(&dir, 5)).unwrap()
+            == std::fs::read(fixture("rar5", "rar5_recovery_volumes.part05.rar")).unwrap()
+    );
+}
+
+/// With no data volume to name them after, missing RAR5 volumes are named
+/// after the longest `.rev` name, at its digit width, as reference UnRAR
+/// names them, so the numbers have room.
+#[test]
+fn test_plan_volume_restore_names_rar5_volumes_after_the_longest_rev() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = vec![
+        copy_fixture_as(
+            dir.path(),
+            "rar5",
+            "rar5_recovery_volumes.part01.rev",
+            "movie.part11.rev",
+        ),
+        copy_fixture_as(
+            dir.path(),
+            "rar5",
+            "rar5_recovery_volumes.part02.rev",
+            "movie.part0000000012.rev",
+        ),
+    ];
+    let options = rar5_restore_options(&dir);
+    let before = dir_snapshot(&dir);
+
+    let plan = unrar_rs::plan_volume_restore(&paths, &options).unwrap();
+
+    assert!(dir_snapshot(&dir) == before, "the plan changed a file");
+    let expected = (1..=10)
+        .map(|volume| {
+            (
+                volume - 1,
+                None,
+                unrar_rs::DataVolumeStatus::Missing,
+                dir.path().join(format!("movie.part{volume:010}.rar")),
+                None,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(data_volume_views(&plan), expected);
+    assert_eq!(
+        recovery_volume_views(&plan),
+        vec![
+            usable_rev(0, 10, paths[0].clone()),
+            usable_rev(1, 11, paths[1].clone())
+        ]
+    );
+    assert_eq!(plan.needed(), 10);
+    assert!(!plan.is_sufficient());
 }
 
 // -- Comment archives ---------------------------------------------------------

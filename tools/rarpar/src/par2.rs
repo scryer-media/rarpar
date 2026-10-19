@@ -43,6 +43,7 @@ impl ParOutcome {
             action: "par_verify_repair".to_string(),
             success: self.success,
             message: self.message.clone(),
+            deferred_to: None,
         }
     }
 }

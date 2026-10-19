@@ -95,14 +95,13 @@ fn run(cli: Cli) -> Result<u8, RarparError> {
 fn run_auto(cli: &Cli, mut paths: Vec<std::path::PathBuf>) -> Result<u8, RarparError> {
     let options = DiscoveryOptions::from_cli(cli);
     let mut report = discovery::discover(paths.clone(), &options)?;
-    emit_progress(cli, &report)?;
 
     if cli.dry_run {
-        if cli.json {
-            report::emit_discovery(cli, &report)?;
-        }
-        return Ok(EXIT_SUCCESS);
+        let exit_code = plan_rar_restores(cli, &mut report);
+        report::emit_discovery(cli, &report)?;
+        return Ok(exit_code);
     }
+    emit_progress(cli, &report)?;
 
     if report.files.iter().any(|file| {
         file.kind == discovery::DiscoveredKind::Par3
@@ -186,7 +185,7 @@ fn run_auto(cli: &Cli, mut paths: Vec<std::path::PathBuf>) -> Result<u8, RarparE
             let mut restore_cli = cli.clone();
             restore_cli.output = None;
             let outcome = rar::restore_volumes(&restore_cli, &rar_set)?;
-            restored_paths.extend(outcome.restored_paths.clone());
+            restored_paths.extend_from_slice(outcome.restored_paths());
             report.record_action(outcome.action());
             if !outcome.success {
                 report::emit_discovery(cli, &report)?;
@@ -225,6 +224,52 @@ fn run_auto(cli: &Cli, mut paths: Vec<std::path::PathBuf>) -> Result<u8, RarparE
 
     report::emit_discovery(cli, &report)?;
     Ok(EXIT_SUCCESS)
+}
+
+/// The restore step of `auto --dry-run`: plan each RAR set's restore as the
+/// real run would make it, beside the set's volumes, and record the plan as
+/// the step's action. A set whose restore cannot be planned is recorded as a
+/// failed step, and the sets after it are still planned. Returns the exit
+/// code of the first set that fails, as the real run stops there.
+///
+/// The real run repairs with PAR3 and PAR2 before it restores. A dry run
+/// cannot run those repairs, so it judges each plan with the volumes they
+/// would rebuild in mind; see [`rar::ParityCover`].
+fn plan_rar_restores(cli: &Cli, report: &mut DiscoveryReport) -> u8 {
+    let mut restore_cli = cli.clone();
+    restore_cli.output = None;
+    let mut exit_code = EXIT_SUCCESS;
+    for rar_set in report.rar_sets.clone() {
+        if rar_set.recovery_volumes.is_empty() {
+            continue;
+        }
+        let cover = parity_cover(report, &rar_set);
+        let outcome = rar::plan_restore(&restore_cli, &rar_set, &cover)
+            .unwrap_or_else(|error| rar::RarRestoreOutcome::unplanned(&rar_set.id, &error));
+        if exit_code == EXIT_SUCCESS {
+            exit_code = outcome.exit_code;
+        }
+        report.record_action(outcome.action());
+    }
+    exit_code
+}
+
+/// The file names the parity sets a real `auto` run repairs before it
+/// restores `rar_set` protect: each PAR2 set related to the RAR set, and
+/// each PAR3 set the run repairs.
+fn parity_cover(report: &DiscoveryReport, rar_set: &discovery::RarSet) -> rar::ParityCover {
+    rar::ParityCover {
+        par2: discovery::related_par2_sets(rar_set, &report.par2_sets)
+            .into_iter()
+            .flat_map(|set| set.protected_files.iter().cloned())
+            .collect(),
+        par3: report
+            .par3_sets
+            .iter()
+            .filter(|set| discovery::selected_par3_set(set, &report.roots))
+            .flat_map(|set| set.protected_files.iter().cloned())
+            .collect(),
+    }
 }
 
 fn run_inspect(cli: &Cli, paths: Vec<std::path::PathBuf>) -> Result<u8, RarparError> {
@@ -355,6 +400,7 @@ fn run_rar_command(cli: &Cli, command: RarCommand) -> Result<u8, RarparError> {
             })
         }
         RarCommand::RestoreVolumes { paths } => rar::restore_volume_paths(cli, &paths),
+        RarCommand::TestVolumes { paths } => rar::test_volume_paths(cli, &paths),
     }
 }
 

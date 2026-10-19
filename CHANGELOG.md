@@ -28,8 +28,64 @@ documented in each crate's own changelog so those notes ship with the crate.
   already serial, preserving the available two-chain parallel pipeline, 16 KiB
   prefix, slice padding, and single-stream fallback.
 
-- Builds against unrar-rs 0.13.0, which also caches up to 64 RAR5 key
-  derivations and keeps passwords and key material out of `Debug` output.
+- Add `rar test-volumes <REV>...`, which reads only the named `.rev` files and
+  prints one line for each: `<path>: OK`, or why it failed (a CRC32 mismatch
+  with the expected and actual values, an invalid header, a RAR 3.0 name-form
+  volume with no checksum, a file that is not a recovery volume, a missing
+  file, or `unreadable (<kind>)` with the I/O error kind for a file it cannot
+  open or read, which does not stop the other files being tested). It exits 1
+  unless every file tests OK. Unlike `rar t`, it does not go on to a set's
+  other `.rev` files. `--json` prints a `rar_test_volumes` report (schema
+  version 1) with each file's format, status and CRC32 values, and
+  `status: "unreadable"` with the I/O error kind as `message` for a file it
+  cannot read (unrar-rs 0.14.0).
+
+- `rar restore-volumes --dry-run` and the restore step of `auto --dry-run` now
+  plan the restore with the options a real run uses, and write nothing
+  (unrar-rs 0.14.0). To judge the volumes they read every data volume of a set
+  with `.rev` files in full, where `auto --dry-run` read only headers before.
+  They name the volumes a restore would rebuild, count the usable recovery
+  volumes that cover them, and count the damaged volumes it would set aside as
+  `.bad`. Where the restore would fail, the plan fails with the restore's exit
+  code: a set short of recovery volumes reports `insufficient recovery
+  volumes: need M, have K for <names>` and exits 1, and without `--overwrite`
+  an existing `.bad` backup (exit 3) or restored volume (exit 1) is refused in
+  the restore's words.
+
+- `auto --dry-run` counts a damaged or missing volume as repaired before the
+  restore when its file name appears exactly among the protected files of a
+  PAR2 set related to the RAR set or of a PAR3 set `auto` repairs. A set short
+  of recovery volumes is deferred to that repair, not failed, when the volumes
+  no parity names fit within its usable `.rev` files: the step passes, shows
+  `[deferred]` in place of `[ok]`, carries `deferred_to` (`par2`, `par3` or
+  `par2+par3`) in the JSON, and its message ends `; PAR2 repair runs first for
+  <names>`. The dry run does not check that the parity holds enough recovery
+  data for those volumes. A set whose restore cannot be planned is recorded
+  as a failed step, `cannot plan restore: <error>`, and the other sets are
+  still planned and the report printed. Each plan is listed as a
+  `dry-run rar_restore_volumes` line and in the JSON report's
+  `executed_actions`, and the discovery JSON of `auto`, `inspect` and
+  `cleanup` gains a top-level `dry_run` flag.
+
+- `rar restore-volumes` now prints its result, which it did not before:
+  `restored M volume(s) (<names>) from K recovery volume(s) read`, where K
+  counts every valid recovery volume the restore read and can exceed M, or
+  `nothing to restore: all data volumes valid`, as a dry run says it too.
+  `--json` prints a `rar_restore_volumes` report (schema version 1) with the
+  dry run's plan or the real run's outcome. The plan gives each recovery
+  volume's `slot` and `volume_number`. A data volume's `index`, a recovery
+  volume's `volume_number` and the outcome's `missing_volume_numbers` are
+  zero-based positions in the whole set, data volumes first.
+
+- `rar restore-volumes`, its dry run and the restore step of `auto` refuse a
+  named path that is not one of the set's volumes by its name, or that
+  numbers a data volume past the set's count, and two files for one volume,
+  with an error naming the paths and exit 1. A file found beside the named
+  ones that does not fit the set is passed over (unrar-rs 0.14.0).
+
+- Builds against unrar-rs 0.14.0. With unrar-rs 0.13.0's changes it also
+  caches up to 64 RAR5 key derivations and keeps passwords and key material
+  out of `Debug` output.
 
 ## rarpar 0.9.1
 

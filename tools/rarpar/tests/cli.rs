@@ -1612,6 +1612,1056 @@ fn rar_restore_volumes_restores_a_missing_volume_explicitly() {
     assert!(restored.is_file());
 }
 
+/// Copy the ten RAR5 data volumes of `rar5_recovery_volumes` and its two
+/// `.rev` files into `dir`.
+fn copy_rar5_recovery_set(dir: &Path) {
+    let rar5 = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar5"]);
+    std::fs::create_dir_all(dir).unwrap();
+    let volumes = (1..=10).map(|volume| format!("rar5_recovery_volumes.part{volume:02}.rar"));
+    let revs = (1..=2).map(|volume| format!("rar5_recovery_volumes.part{volume:02}.rev"));
+    for name in volumes.chain(revs) {
+        std::fs::copy(rar5.join(&name), dir.join(&name)).unwrap();
+    }
+}
+
+/// Invert the byte of `path` that `at` picks from the file's length, in a
+/// test's own copy of a fixture.
+fn flip_byte(path: &Path, at: impl FnOnce(usize) -> usize) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let offset = at(bytes.len());
+    bytes[offset] ^= 0xff;
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// The names in `dir`, sorted, to show a dry run left it as it was.
+fn listing(dir: &Path) -> Vec<std::ffi::OsString> {
+    let mut names = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+fn assert_data_failure(output: &Output, what: &str) {
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{what}: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn rar_test_volumes_checks_each_named_recovery_volume() {
+    let temp = tempfile::tempdir().unwrap();
+    copy_rar5_recovery_set(temp.path());
+    let rar4 = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar4"]);
+    let rar3_rev = temp.path().join("rar3_recovery_volumes.part1.rev");
+    std::fs::copy(rar4.join("rar3_recovery_volumes.part1.rev"), &rar3_rev).unwrap();
+    let first = temp.path().join("rar5_recovery_volumes.part01.rev");
+    let second = temp.path().join("rar5_recovery_volumes.part02.rev");
+    let volume = temp.path().join("rar5_recovery_volumes.part01.rar");
+    let missing = temp.path().join("rar5_recovery_volumes.part03.rev");
+
+    let output = run(&[
+        OsStr::new("rar"),
+        OsStr::new("test-volumes"),
+        first.as_os_str(),
+        second.as_os_str(),
+    ]);
+    assert_success(&output, "rar test-volumes");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{}: OK\n{}: OK\n", first.display(), second.display())
+    );
+
+    // A RAR5 .rev's CRC32 covers everything after its header, the last byte
+    // included.
+    flip_byte(&second, |len| len - 1);
+    let output = run(&[
+        OsStr::new("--json"),
+        OsStr::new("rar"),
+        OsStr::new("test-volumes"),
+        first.as_os_str(),
+        second.as_os_str(),
+        volume.as_os_str(),
+        missing.as_os_str(),
+        rar3_rev.as_os_str(),
+    ]);
+    assert_data_failure(&output, "rar test-volumes --json over a damaged .rev");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["command"], "rar_test_volumes");
+    assert_eq!(report["success"], false);
+    let results = report["results"].as_array().unwrap();
+    let statuses = results
+        .iter()
+        .map(|result| {
+            (
+                result["path"].as_str().unwrap().to_string(),
+                result["format"].as_str(),
+                result["status"].as_str().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        statuses,
+        [
+            (first.display().to_string(), Some("rar5"), "ok"),
+            (second.display().to_string(), Some("rar5"), "crc_mismatch"),
+            (volume.display().to_string(), None, "not_recovery_volume"),
+            (missing.display().to_string(), None, "missing"),
+            (rar3_rev.display().to_string(), Some("rar4"), "ok"),
+        ]
+    );
+    assert!(results[0]["expected_crc32"].is_null() && results[0]["actual_crc32"].is_null());
+    let expected = results[1]["expected_crc32"].as_u64().unwrap();
+    let actual = results[1]["actual_crc32"].as_u64().unwrap();
+    assert_ne!(expected, actual);
+
+    let output = run(&[
+        OsStr::new("rar"),
+        OsStr::new("test-volumes"),
+        first.as_os_str(),
+        second.as_os_str(),
+        volume.as_os_str(),
+        missing.as_os_str(),
+    ]);
+    assert_data_failure(&output, "rar test-volumes over a damaged .rev");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!(
+            "{}: OK\n{}: CRC32 mismatch (expected {expected:08x}, actual {actual:08x})\n\
+             {}: not a recovery volume\n{}: missing\n",
+            first.display(),
+            second.display(),
+            volume.display(),
+            missing.display()
+        )
+    );
+}
+
+#[test]
+fn rar_restore_volumes_dry_run_plans_without_writing() {
+    let temp = tempfile::tempdir().unwrap();
+    let download_dir = temp.path().join("download");
+    copy_rar5_recovery_set(&download_dir);
+    let missing = download_dir.join("rar5_recovery_volumes.part05.rar");
+    std::fs::remove_file(&missing).unwrap();
+    let first = download_dir.join("rar5_recovery_volumes.part01.rar");
+    let before = listing(&download_dir);
+
+    let output = run(&[
+        OsStr::new("rar"),
+        OsStr::new("restore-volumes"),
+        OsStr::new("--dry-run"),
+        first.as_os_str(),
+    ]);
+    assert_success(&output, "rar restore-volumes --dry-run");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "would restore 1 volume(s) (rar5_recovery_volumes.part05.rar) using 1 of 2 usable \
+         recovery volume(s)\n"
+    );
+    assert_eq!(listing(&download_dir), before);
+
+    let output = run(&[
+        OsStr::new("--json"),
+        OsStr::new("rar"),
+        OsStr::new("restore-volumes"),
+        OsStr::new("--dry-run"),
+        first.as_os_str(),
+    ]);
+    assert_success(&output, "rar restore-volumes --dry-run --json");
+    assert_eq!(listing(&download_dir), before);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["command"], "rar_restore_volumes");
+    assert_eq!(report["dry_run"], true);
+    assert_eq!(report["success"], true);
+    assert!(report["outcome"].is_null());
+    let plan = &report["plan"];
+    assert_eq!(plan["format"], "rar5");
+    assert_eq!(plan["data_count"], 10);
+    assert_eq!(plan["recovery_count"], 2);
+    assert_eq!(plan["needed"], 1);
+    assert_eq!(plan["usable_recovery_count"], 2);
+    assert_eq!(plan["sufficient"], true);
+    let data_volumes = plan["data_volumes"].as_array().unwrap();
+    assert_eq!(data_volumes.len(), 10);
+    let rebuilt = data_volumes
+        .iter()
+        .filter(|volume| volume["status"] != "valid")
+        .collect::<Vec<_>>();
+    assert_eq!(rebuilt.len(), 1);
+    assert_eq!(rebuilt[0]["index"], 4);
+    assert_eq!(rebuilt[0]["status"], "missing");
+    assert!(rebuilt[0]["path"].is_null());
+    assert_eq!(rebuilt[0]["output_path"], missing.display().to_string());
+    assert!(rebuilt[0]["set_aside_path"].is_null());
+    let recovery_volumes = plan["recovery_volumes"].as_array().unwrap();
+    assert_eq!(recovery_volumes.len(), 2);
+    assert!(
+        recovery_volumes
+            .iter()
+            .all(|volume| volume["status"] == "ok" && volume["usable"] == true)
+    );
+    // Volume numbers count the ten data volumes first.
+    let numbers = recovery_volumes
+        .iter()
+        .map(|volume| (volume["slot"].as_u64(), volume["volume_number"].as_u64()))
+        .collect::<Vec<_>>();
+    assert_eq!(numbers, [(Some(0), Some(10)), (Some(1), Some(11))]);
+}
+
+#[test]
+fn rar_restore_volumes_json_reports_the_restore() {
+    let temp = tempfile::tempdir().unwrap();
+    let download_dir = temp.path().join("download");
+    copy_rar5_recovery_set(&download_dir);
+    let missing = download_dir.join("rar5_recovery_volumes.part05.rar");
+    std::fs::remove_file(&missing).unwrap();
+    let first = download_dir.join("rar5_recovery_volumes.part01.rar");
+
+    let output = run(&[
+        OsStr::new("--json"),
+        OsStr::new("rar"),
+        OsStr::new("restore-volumes"),
+        first.as_os_str(),
+    ]);
+    assert_success(&output, "rar restore-volumes --json");
+    assert!(missing.is_file());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["command"], "rar_restore_volumes");
+    assert_eq!(report["dry_run"], false);
+    assert_eq!(report["success"], true);
+    assert_eq!(
+        report["message"],
+        "restored 1 volume(s) (rar5_recovery_volumes.part05.rar) from 2 recovery volume(s) read"
+    );
+    assert!(report["plan"].is_null());
+    let outcome = &report["outcome"];
+    assert_eq!(
+        outcome["restored_paths"],
+        serde_json::json!([missing.display().to_string()])
+    );
+    assert_eq!(outcome["missing_volume_numbers"], serde_json::json!([4]));
+    assert_eq!(outcome["used_recovery_paths"].as_array().unwrap().len(), 2);
+
+    let output = run(&[
+        OsStr::new("rar"),
+        OsStr::new("restore-volumes"),
+        first.as_os_str(),
+    ]);
+    assert_success(&output, "rar restore-volumes over a whole set");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "nothing to restore: all data volumes valid\n"
+    );
+}
+
+#[test]
+fn rar_restore_volumes_dry_run_fails_short_of_recovery_volumes() {
+    let temp = tempfile::tempdir().unwrap();
+    let download_dir = temp.path().join("download");
+    copy_rar5_recovery_set(&download_dir);
+    std::fs::remove_file(download_dir.join("rar5_recovery_volumes.part05.rar")).unwrap();
+    for name in [
+        "rar5_recovery_volumes.part03.rar",
+        "rar5_recovery_volumes.part07.rar",
+    ] {
+        flip_byte(&download_dir.join(name), |len| len / 2);
+    }
+    let first = download_dir.join("rar5_recovery_volumes.part01.rar");
+    let before = listing(&download_dir);
+
+    let output = run(&[
+        OsStr::new("rar"),
+        OsStr::new("restore-volumes"),
+        OsStr::new("--dry-run"),
+        first.as_os_str(),
+    ]);
+    assert_data_failure(&output, "rar restore-volumes --dry-run short of .rev files");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "insufficient recovery volumes: need 3, have 2 for rar5_recovery_volumes.part03.rar, \
+         rar5_recovery_volumes.part05.rar, rar5_recovery_volumes.part07.rar\n"
+    );
+
+    let output = run(&[
+        OsStr::new("--json"),
+        OsStr::new("rar"),
+        OsStr::new("restore-volumes"),
+        OsStr::new("--dry-run"),
+        first.as_os_str(),
+    ]);
+    assert_data_failure(
+        &output,
+        "rar restore-volumes --dry-run --json short of .rev files",
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["success"], false);
+    assert_eq!(report["plan"]["sufficient"], false);
+    assert_eq!(report["plan"]["needed"], 3);
+    assert_eq!(report["plan"]["usable_recovery_count"], 2);
+    let statuses = report["plan"]["data_volumes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|volume| volume["status"] != "valid")
+        .map(|volume| {
+            (
+                volume["index"].as_u64().unwrap(),
+                volume["status"].as_str().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        statuses,
+        [(2, "crc_mismatch"), (4, "missing"), (6, "crc_mismatch")]
+    );
+    assert_eq!(listing(&download_dir), before);
+}
+
+#[test]
+fn auto_dry_run_fails_a_set_short_of_recovery_volumes() {
+    let temp = tempfile::tempdir().unwrap();
+    let download_dir = temp.path().join("download");
+    copy_rar5_recovery_set(&download_dir);
+    std::fs::remove_file(download_dir.join("rar5_recovery_volumes.part05.rar")).unwrap();
+    for name in [
+        "rar5_recovery_volumes.part03.rar",
+        "rar5_recovery_volumes.part07.rar",
+    ] {
+        flip_byte(&download_dir.join(name), |len| len / 2);
+    }
+    let before = listing(&download_dir);
+
+    let output = run(&[
+        OsStr::new("auto"),
+        OsStr::new("--dry-run"),
+        download_dir.as_os_str(),
+    ]);
+    assert_data_failure(&output, "auto --dry-run short of .rev files");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(
+            "dry-run rar_restore_volumes [failed]: insufficient recovery volumes: need 3, have 2"
+        ),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let output = run(&[
+        OsStr::new("auto"),
+        OsStr::new("--dry-run"),
+        OsStr::new("--json"),
+        download_dir.as_os_str(),
+    ]);
+    assert_data_failure(&output, "auto --dry-run --json short of .rev files");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["dry_run"], true);
+    let actions = report["executed_actions"].as_array().unwrap();
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0]["action"], "rar_restore_volumes");
+    assert_eq!(actions[0]["success"], false);
+    assert!(actions[0].get("deferred_to").is_none());
+    assert!(
+        actions[0]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("insufficient recovery volumes: need 3, have 2 for ")
+    );
+    assert_eq!(listing(&download_dir), before);
+}
+
+/// The names of `rar5_recovery_volumes` data volumes `numbers`.
+fn rar5_volume_names(numbers: impl IntoIterator<Item = usize>) -> Vec<String> {
+    numbers
+        .into_iter()
+        .map(|volume| format!("rar5_recovery_volumes.part{volume:02}.rar"))
+        .collect()
+}
+
+/// Create a `PAR2` or `PAR3` set named `set` in `dir` over `files`, with 16
+/// recovery blocks of 256 bytes: enough to rebuild any three of the
+/// `rar5_recovery_volumes` data volumes.
+fn create_parity(dir: &Path, parity: &str, files: &[String]) {
+    let mut create = match parity {
+        "PAR2" => vec![
+            "--quiet",
+            "par",
+            "create",
+            "set",
+            "--block-size",
+            "256",
+            "--recovery-count",
+            "16",
+        ],
+        _ => vec!["--quiet", "par3", "create", "set", "-s", "256", "-c", "16"],
+    };
+    create.extend(files.iter().map(String::as_str));
+    let create = create.into_iter().map(OsStr::new).collect::<Vec<_>>();
+    assert_success(&run_in_dir(dir, &create), parity);
+}
+
+/// Remove volume 5 of the RAR5 set in `dir` and damage volumes 3 and 7: one
+/// volume more than its two `.rev` files restore.
+fn damage_three_rar5_volumes(dir: &Path) {
+    std::fs::remove_file(dir.join("rar5_recovery_volumes.part05.rar")).unwrap();
+    for name in rar5_volume_names([3, 7]) {
+        flip_byte(&dir.join(name), |len| len / 2);
+    }
+}
+
+/// `auto --dry-run --json` over `dir`, with its exit code and its one
+/// restore step.
+fn auto_dry_run_restore_step(dir: &Path) -> (Option<i32>, serde_json::Value) {
+    let output = run(&[
+        OsStr::new("auto"),
+        OsStr::new("--dry-run"),
+        OsStr::new("--json"),
+        dir.as_os_str(),
+    ]);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "auto --dry-run --json: {error}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    assert_eq!(report["dry_run"], true);
+    let actions = report["executed_actions"].as_array().unwrap();
+    assert_eq!(actions.len(), 1, "{actions:?}");
+    assert_eq!(actions[0]["action"], "rar_restore_volumes");
+    (output.status.code(), actions[0].clone())
+}
+
+/// The real `auto` run over `dir`, extracting into `out_dir`.
+fn auto_into(dir: &Path, out_dir: &Path) -> Output {
+    run(&[
+        OsStr::new("--quiet"),
+        OsStr::new("auto"),
+        OsStr::new("--output"),
+        out_dir.as_os_str(),
+        dir.as_os_str(),
+    ])
+}
+
+/// `auto` repairs with PAR2 or PAR3 before it restores from `.rev` files, so
+/// a dry run that finds too few `.rev` files for a set whose damaged volumes
+/// parity protects defers to that repair instead of failing; the real run
+/// then repairs the set without them.
+#[test]
+fn auto_dry_run_leaves_a_short_restore_to_the_parity_repair_before_it() {
+    let damaged = rar5_volume_names([3, 5, 7]).join(", ");
+    for (parity, deferred_to) in [("PAR2", "par2"), ("PAR3", "par3")] {
+        let temp = tempfile::tempdir().unwrap();
+        let download_dir = temp.path().join("download");
+        copy_rar5_recovery_set(&download_dir);
+        create_parity(&download_dir, parity, &rar5_volume_names(1..=10));
+        damage_three_rar5_volumes(&download_dir);
+
+        let (code, action) = auto_dry_run_restore_step(&download_dir);
+        assert_eq!(code, Some(0), "auto --dry-run with {parity}: {action}");
+        assert_eq!(action["success"], true);
+        assert_eq!(action["deferred_to"], deferred_to);
+        assert_eq!(
+            action["message"],
+            format!(
+                "insufficient recovery volumes: need 3, have 2 for {damaged}; {parity} repair \
+                 runs first for {damaged}"
+            )
+        );
+        let output = run(&[
+            OsStr::new("auto"),
+            OsStr::new("--dry-run"),
+            download_dir.as_os_str(),
+        ]);
+        assert_success(&output, &format!("auto --dry-run with {parity}"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("dry-run rar_restore_volumes [deferred]: insufficient recovery"),
+            "{stdout}"
+        );
+
+        let out_dir = temp.path().join("out");
+        assert_success(
+            &auto_into(&download_dir, &out_dir),
+            &format!("auto with {parity}"),
+        );
+        assert!(out_dir.join("payload.bin").is_file());
+    }
+}
+
+/// Parity counts toward a short restore only for the damaged volumes it
+/// names: a PAR2 set over a file beside the volumes, or over volumes that
+/// are intact, rebuilds none of them, so the dry run fails as the real run
+/// does.
+#[test]
+fn auto_dry_run_fails_a_short_restore_parity_does_not_cover() {
+    for nfo_only in [true, false] {
+        let case = if nfo_only {
+            "PAR2 over the .nfo only"
+        } else {
+            "PAR2 over volumes 1-4 with 5-7 missing"
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let download_dir = temp.path().join("download");
+        copy_rar5_recovery_set(&download_dir);
+        if nfo_only {
+            let nfo = "rar5_recovery_volumes.nfo".to_string();
+            std::fs::write(download_dir.join(&nfo), [b'n'; 4096]).unwrap();
+            create_parity(&download_dir, "PAR2", &[nfo]);
+            damage_three_rar5_volumes(&download_dir);
+        } else {
+            create_parity(&download_dir, "PAR2", &rar5_volume_names(1..=4));
+            for name in rar5_volume_names(5..=7) {
+                std::fs::remove_file(download_dir.join(name)).unwrap();
+            }
+        }
+
+        let (code, action) = auto_dry_run_restore_step(&download_dir);
+        assert_eq!(code, Some(1), "auto --dry-run, {case}: {action}");
+        assert_eq!(action["success"], false, "{case}");
+        assert!(action.get("deferred_to").is_none(), "{case}: {action}");
+        let message = action["message"].as_str().unwrap();
+        assert!(
+            message.starts_with("insufficient recovery volumes: need 3, have 2 for ")
+                && !message.contains("first for"),
+            "{case}: {message}"
+        );
+
+        let output = auto_into(&download_dir, &temp.path().join("out"));
+        assert_data_failure(&output, &format!("auto, {case}"));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("insufficient RAR5 recovery volumes: need 3, have 2"),
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// A PAR3 set over exactly the volumes that are gone covers them although
+/// none of them is present to match by: the dry run defers, and the real run
+/// rebuilds them from PAR3 and extracts.
+#[test]
+fn auto_dry_run_defers_to_parity_over_exactly_the_missing_volumes() {
+    let temp = tempfile::tempdir().unwrap();
+    let download_dir = temp.path().join("download");
+    copy_rar5_recovery_set(&download_dir);
+    let removed = rar5_volume_names([3, 5, 7]);
+    create_parity(&download_dir, "PAR3", &removed);
+    for name in &removed {
+        std::fs::remove_file(download_dir.join(name)).unwrap();
+    }
+
+    let (code, action) = auto_dry_run_restore_step(&download_dir);
+    assert_eq!(code, Some(0), "{action}");
+    assert_eq!(action["success"], true);
+    assert_eq!(action["deferred_to"], "par3");
+    let removed = removed.join(", ");
+    assert_eq!(
+        action["message"],
+        format!(
+            "insufficient recovery volumes: need 3, have 2 for {removed}; PAR3 repair runs \
+             first for {removed}"
+        )
+    );
+
+    let out_dir = temp.path().join("out");
+    assert_success(&auto_into(&download_dir, &out_dir), "auto with PAR3");
+    assert!(out_dir.join("payload.bin").is_file());
+}
+
+/// A data volume is placed by its name and judged by its size and CRC32,
+/// never by its headers, so one whose headers are damaged plans as the
+/// restore treats it: the dry run would restore it from the `.rev` files,
+/// or defers to the parity over it when they are too few, and the real run
+/// then restores or repairs it.
+#[test]
+fn auto_dry_run_plans_a_volume_with_damaged_headers_as_the_real_run_restores_it() {
+    let damaged = "rar5_recovery_volumes.part03.rar";
+    // Byte 13 is the type of the volume's first header.
+    let damage_headers = |dir: &Path| flip_byte(&dir.join(damaged), |_| 13);
+
+    let temp = tempfile::tempdir().unwrap();
+    let download_dir = temp.path().join("download");
+    copy_rar5_recovery_set(&download_dir);
+    damage_headers(&download_dir);
+    let before = listing(&download_dir);
+    let (code, action) = auto_dry_run_restore_step(&download_dir);
+    assert_eq!(code, Some(0), "{action}");
+    assert_eq!(action["success"], true);
+    assert!(action.get("deferred_to").is_none(), "{action}");
+    assert_eq!(
+        action["message"],
+        format!(
+            "would restore 1 volume(s) ({damaged}) using 1 of 2 usable recovery volume(s); \
+             would set aside 1 damaged volume(s) as .bad"
+        )
+    );
+    assert_eq!(listing(&download_dir), before);
+
+    let out_dir = temp.path().join("out");
+    assert_success(
+        &auto_into(&download_dir, &out_dir),
+        "auto over a volume with damaged headers",
+    );
+    assert!(out_dir.join("payload.bin").is_file());
+    let rar5 = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar5"]);
+    assert_eq!(
+        std::fs::read(download_dir.join(damaged)).unwrap(),
+        std::fs::read(rar5.join(damaged)).unwrap()
+    );
+    assert!(download_dir.join(format!("{damaged}.bad")).is_file());
+
+    for (parity, deferred_to) in [("PAR2", "par2"), ("PAR3", "par3")] {
+        let temp = tempfile::tempdir().unwrap();
+        let download_dir = temp.path().join("download");
+        copy_rar5_recovery_set(&download_dir);
+        create_parity(&download_dir, parity, &rar5_volume_names(1..=10));
+        std::fs::remove_file(download_dir.join("rar5_recovery_volumes.part05.rar")).unwrap();
+        flip_byte(
+            &download_dir.join("rar5_recovery_volumes.part07.rar"),
+            |len| len / 2,
+        );
+        damage_headers(&download_dir);
+
+        let (code, action) = auto_dry_run_restore_step(&download_dir);
+        assert_eq!(code, Some(0), "auto --dry-run with {parity}: {action}");
+        assert_eq!(action["success"], true);
+        assert_eq!(action["deferred_to"], deferred_to);
+        let bad = rar5_volume_names([3, 5, 7]).join(", ");
+        assert_eq!(
+            action["message"],
+            format!(
+                "insufficient recovery volumes: need 3, have 2 for {bad}; {parity} repair runs \
+                 first for {bad}"
+            )
+        );
+
+        let out_dir = temp.path().join("out");
+        assert_success(
+            &auto_into(&download_dir, &out_dir),
+            &format!("auto with {parity} over a volume with damaged headers"),
+        );
+        assert!(out_dir.join("payload.bin").is_file());
+    }
+}
+
+/// Copy the five RAR3 data volumes of `rar3_recovery_volumes` and its two
+/// `.rev` files into `dir`.
+fn copy_rar3_recovery_set(dir: &Path) {
+    let rar4 = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar4"]);
+    std::fs::create_dir_all(dir).unwrap();
+    let volumes = (1..=5).map(|volume| format!("rar3_recovery_volumes.part{volume}.rar"));
+    let revs = (1..=2).map(|volume| format!("rar3_recovery_volumes.part{volume}.rev"));
+    for name in volumes.chain(revs) {
+        std::fs::copy(rar4.join(&name), dir.join(&name)).unwrap();
+    }
+}
+
+/// A set whose restore cannot be planned is a failed step of the dry run,
+/// not the end of it: the sets after it are planned and the report printed.
+#[test]
+fn auto_dry_run_records_a_set_it_cannot_plan_and_plans_the_rest() {
+    let temp = tempfile::tempdir().unwrap();
+    // Sets are planned in directory order, so the broken one comes first.
+    // Discovery takes a stray `part11` into the set by its name, but the
+    // `.rev` files describe ten data volumes, so the restore refuses it.
+    let broken = temp.path().join("a");
+    copy_rar5_recovery_set(&broken);
+    std::fs::copy(
+        broken.join("rar5_recovery_volumes.part10.rar"),
+        broken.join("rar5_recovery_volumes.part11.rar"),
+    )
+    .unwrap();
+    let healthy = temp.path().join("b");
+    copy_rar3_recovery_set(&healthy);
+    let before = (listing(&broken), listing(&healthy));
+
+    let output = run(&[
+        OsStr::new("auto"),
+        OsStr::new("--dry-run"),
+        OsStr::new("--json"),
+        broken.as_os_str(),
+        healthy.as_os_str(),
+    ]);
+    assert_data_failure(&output, "auto --dry-run --json over an unplannable set");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["dry_run"], true);
+    let actions = report["executed_actions"].as_array().unwrap();
+    let steps = actions
+        .iter()
+        .map(|action| {
+            (
+                action["action"].as_str().unwrap(),
+                action["success"].as_bool().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        steps,
+        [
+            ("rar_restore_volumes", false),
+            ("rar_restore_volumes", true)
+        ],
+        "{actions:?}"
+    );
+    let message = actions[0]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("cannot plan restore: ")
+            && message.ends_with(
+                "rar5_recovery_volumes.part11.rar names data volume 11, but its recovery set \
+                 has 10 data volumes"
+            ),
+        "{message}"
+    );
+    assert_eq!(
+        actions[1]["message"],
+        "nothing to restore: all data volumes valid"
+    );
+
+    let output = run(&[
+        OsStr::new("auto"),
+        OsStr::new("--dry-run"),
+        broken.as_os_str(),
+        healthy.as_os_str(),
+    ]);
+    assert_data_failure(&output, "auto --dry-run over an unplannable set");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("rarpar discovery\n"), "{stdout}");
+    assert!(
+        stdout.contains("dry-run rar_restore_volumes [failed]: cannot plan restore: "),
+        "{stdout}"
+    );
+    assert_eq!((listing(&broken), listing(&healthy)), before);
+}
+
+/// A volume damaged in place is set aside as `.bad` before it is rebuilt. A
+/// dry run names that backup, and when one is already there fails as the
+/// restore does, with the same message and exit code.
+#[test]
+fn rar_restore_volumes_dry_run_foresees_an_existing_bad_volume_backup() {
+    let temp = tempfile::tempdir().unwrap();
+    let download_dir = temp.path().join("download");
+    copy_rar5_recovery_set(&download_dir);
+    let damaged = download_dir.join("rar5_recovery_volumes.part03.rar");
+    flip_byte(&damaged, |len| len / 2);
+    let backup = download_dir.join("rar5_recovery_volumes.part03.rar.bad");
+    let first = download_dir.join("rar5_recovery_volumes.part01.rar");
+
+    let output = run(&[
+        OsStr::new("--json"),
+        OsStr::new("rar"),
+        OsStr::new("restore-volumes"),
+        OsStr::new("--dry-run"),
+        first.as_os_str(),
+    ]);
+    assert_success(&output, "rar restore-volumes --dry-run --json");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["message"],
+        "would restore 1 volume(s) (rar5_recovery_volumes.part03.rar) using 1 of 2 usable \
+         recovery volume(s); would set aside 1 damaged volume(s) as .bad"
+    );
+    let volume = &report["plan"]["data_volumes"][2];
+    assert_eq!(volume["status"], "crc_mismatch");
+    assert_eq!(volume["path"], damaged.display().to_string());
+    assert_eq!(volume["output_path"], damaged.display().to_string());
+    assert_eq!(volume["set_aside_path"], backup.display().to_string());
+
+    std::fs::write(&backup, b"an earlier backup").unwrap();
+    let before = listing(&download_dir);
+    let refusal = format!(
+        "refusing to overwrite existing bad-volume backup {}",
+        backup.display()
+    );
+    let output = run(&[
+        OsStr::new("rar"),
+        OsStr::new("restore-volumes"),
+        OsStr::new("--dry-run"),
+        first.as_os_str(),
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "dry run: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{refusal}\n")
+    );
+    assert_eq!(listing(&download_dir), before);
+
+    let output = run(&[
+        OsStr::new("rar"),
+        OsStr::new("restore-volumes"),
+        first.as_os_str(),
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "restore: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(&refusal),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = run(&[
+        OsStr::new("--overwrite"),
+        OsStr::new("rar"),
+        OsStr::new("restore-volumes"),
+        OsStr::new("--dry-run"),
+        first.as_os_str(),
+    ]);
+    assert_success(&output, "rar restore-volumes --dry-run --overwrite");
+}
+
+/// With `--output`, a volume is rebuilt into that directory, and a file
+/// already there stops the restore and fails the dry run alike.
+#[test]
+fn rar_restore_volumes_dry_run_foresees_an_existing_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let download_dir = temp.path().join("download");
+    copy_rar5_recovery_set(&download_dir);
+    std::fs::remove_file(download_dir.join("rar5_recovery_volumes.part05.rar")).unwrap();
+    let first = download_dir.join("rar5_recovery_volumes.part01.rar");
+    let out_dir = temp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let existing = out_dir.join("rar5_recovery_volumes.part05.rar");
+    std::fs::write(&existing, b"another file").unwrap();
+    let refusal = format!(
+        "refusing to overwrite existing restored volume {}",
+        existing.display()
+    );
+
+    for dry_run in [true, false] {
+        let mut args = vec![
+            OsStr::new("--output"),
+            out_dir.as_os_str(),
+            OsStr::new("rar"),
+            OsStr::new("restore-volumes"),
+        ];
+        if dry_run {
+            args.push(OsStr::new("--dry-run"));
+        }
+        args.push(first.as_os_str());
+        let output = run(&args);
+        assert_data_failure(
+            &output,
+            &format!("restore over an existing output, dry run {dry_run}"),
+        );
+        let shown = if dry_run {
+            &output.stdout
+        } else {
+            &output.stderr
+        };
+        assert!(
+            String::from_utf8_lossy(shown).contains(&refusal),
+            "dry run {dry_run}: {}",
+            String::from_utf8_lossy(shown)
+        );
+    }
+    assert_eq!(std::fs::read(&existing).unwrap(), b"another file");
+}
+
+#[test]
+fn quiet_restore_plans_and_volume_tests_print_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let download_dir = temp.path().join("download");
+    copy_rar5_recovery_set(&download_dir);
+    std::fs::remove_file(download_dir.join("rar5_recovery_volumes.part05.rar")).unwrap();
+    let first = download_dir.join("rar5_recovery_volumes.part01.rar");
+    let first_rev = download_dir.join("rar5_recovery_volumes.part01.rev");
+    let second_rev = download_dir.join("rar5_recovery_volumes.part02.rev");
+    let commands = [
+        vec![
+            OsStr::new("--quiet"),
+            OsStr::new("rar"),
+            OsStr::new("restore-volumes"),
+            OsStr::new("--dry-run"),
+            first.as_os_str(),
+        ],
+        vec![
+            OsStr::new("--quiet"),
+            OsStr::new("auto"),
+            OsStr::new("--dry-run"),
+            download_dir.as_os_str(),
+        ],
+        vec![
+            OsStr::new("--quiet"),
+            OsStr::new("rar"),
+            OsStr::new("test-volumes"),
+            first_rev.as_os_str(),
+            second_rev.as_os_str(),
+        ],
+    ];
+    for args in &commands {
+        let output = run(args);
+        assert_success(&output, &format!("{args:?}"));
+        assert!(
+            output.stdout.is_empty() && output.stderr.is_empty(),
+            "{args:?}"
+        );
+    }
+
+    // Failing, they still print nothing: the exit code says it.
+    flip_byte(&second_rev, |len| len - 1);
+    for name in rar5_volume_names([3, 7]) {
+        std::fs::remove_file(download_dir.join(name)).unwrap();
+    }
+    for args in &commands {
+        let output = run(args);
+        assert_data_failure(&output, &format!("{args:?}"));
+        assert!(
+            output.stdout.is_empty() && output.stderr.is_empty(),
+            "{args:?}"
+        );
+    }
+}
+
+/// A path that cannot be read is reported `unreadable` with its I/O error
+/// kind; the other paths are still tested.
+#[test]
+fn rar_test_volumes_reports_an_unreadable_path_and_tests_the_rest() {
+    let temp = tempfile::tempdir().unwrap();
+    copy_rar5_recovery_set(temp.path());
+    let first = temp.path().join("rar5_recovery_volumes.part01.rev");
+    let unreadable = temp.path().join("directory.rev");
+    std::fs::create_dir(&unreadable).unwrap();
+    let second = temp.path().join("rar5_recovery_volumes.part02.rev");
+
+    let output = run(&[
+        OsStr::new("rar"),
+        OsStr::new("test-volumes"),
+        first.as_os_str(),
+        unreadable.as_os_str(),
+        second.as_os_str(),
+    ]);
+    assert_data_failure(&output, "rar test-volumes over a directory");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 3, "{stdout}");
+    assert_eq!(lines[0], format!("{}: OK", first.display()));
+    let unreadable_line = lines[1].to_string();
+    assert_eq!(lines[2], format!("{}: OK", second.display()));
+
+    let output = run(&[
+        OsStr::new("--json"),
+        OsStr::new("rar"),
+        OsStr::new("test-volumes"),
+        first.as_os_str(),
+        unreadable.as_os_str(),
+        second.as_os_str(),
+    ]);
+    assert_data_failure(&output, "rar test-volumes --json over a directory");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["success"], false);
+    let results = report["results"].as_array().unwrap();
+    let statuses = results
+        .iter()
+        .map(|result| result["status"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(statuses, ["ok", "unreadable", "ok"]);
+    assert_eq!(results[1]["path"], unreadable.display().to_string());
+    assert!(results[1]["format"].is_null());
+    // The kind differs by platform (a directory opens on Unix but not on
+    // Windows), so it is checked only to agree between the two outputs.
+    let kind = results[1]["message"].as_str().unwrap();
+    assert!(!kind.is_empty());
+    assert_eq!(
+        unreadable_line,
+        format!("{}: unreadable ({kind})", unreadable.display())
+    );
+    assert!(results[0]["message"].is_null() && results[2]["message"].is_null());
+}
+
+#[test]
+fn rar_restore_volumes_plans_and_restores_a_rar3_set() {
+    let temp = tempfile::tempdir().unwrap();
+    let download_dir = temp.path().join("download");
+    copy_rar3_recovery_set(&download_dir);
+    let missing = download_dir.join("rar3_recovery_volumes.part3.rar");
+    std::fs::remove_file(&missing).unwrap();
+    let first = download_dir.join("rar3_recovery_volumes.part1.rar");
+
+    let output = run(&[
+        OsStr::new("--json"),
+        OsStr::new("rar"),
+        OsStr::new("restore-volumes"),
+        OsStr::new("--dry-run"),
+        first.as_os_str(),
+    ]);
+    assert_success(&output, "rar restore-volumes --dry-run --json over RAR3");
+    assert!(!missing.exists());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["message"],
+        "would restore 1 volume(s) (rar3_recovery_volumes.part3.rar) using 1 of 2 usable \
+         recovery volume(s)"
+    );
+    let plan = &report["plan"];
+    assert_eq!(plan["format"], "rar4");
+    assert_eq!(plan["data_count"], 5);
+    assert_eq!(plan["needed"], 1);
+    assert_eq!(plan["usable_recovery_count"], 2);
+    let numbers = plan["recovery_volumes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|volume| volume["volume_number"].as_u64())
+        .collect::<Vec<_>>();
+    assert_eq!(numbers, [Some(5), Some(6)]);
+    let rebuilt = plan["data_volumes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|volume| volume["status"] != "valid")
+        .collect::<Vec<_>>();
+    assert_eq!(rebuilt.len(), 1);
+    assert_eq!(rebuilt[0]["index"], 2);
+    assert_eq!(rebuilt[0]["status"], "missing");
+    assert_eq!(rebuilt[0]["output_path"], missing.display().to_string());
+
+    let output = run(&[
+        OsStr::new("--json"),
+        OsStr::new("rar"),
+        OsStr::new("restore-volumes"),
+        first.as_os_str(),
+    ]);
+    assert_success(&output, "rar restore-volumes --json over RAR3");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let read = report["outcome"]["used_recovery_paths"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(
+        report["message"],
+        format!(
+            "restored 1 volume(s) (rar3_recovery_volumes.part3.rar) from {read} recovery \
+             volume(s) read"
+        )
+    );
+    assert_eq!(
+        report["outcome"]["missing_volume_numbers"],
+        serde_json::json!([2])
+    );
+    let rar4 = fixture(&["crates", "unrar-rs", "tests", "fixtures", "rar4"]);
+    assert_eq!(
+        std::fs::read(&missing).unwrap(),
+        std::fs::read(rar4.join("rar3_recovery_volumes.part3.rar")).unwrap()
+    );
+}
+
 #[test]
 fn cleanup_deletes_validated_sources_after_explicit_extraction() {
     let temp = tempfile::tempdir().unwrap();

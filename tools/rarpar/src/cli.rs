@@ -662,8 +662,23 @@ files are rejected unless --overwrite is supplied.")]
         dest: Option<PathBuf>,
     },
     /// Restore missing RAR data volumes from recovery volumes.
+    #[command(long_about = "\
+Restore missing or damaged RAR data volumes from the set's .rev recovery
+volumes. Any volume or .rev of the set finds the rest beside it. A damaged
+volume rebuilt where it lies is first renamed to <name>.bad. With --dry-run,
+report the volumes a restore would rebuild and how many usable recovery
+volumes cover them, writing nothing.")]
     RestoreVolumes {
         #[arg(value_name = "RAR_OR_REV", required = true)]
+        paths: Vec<PathBuf>,
+    },
+    /// Test RAR recovery volumes (.rev) against their CRC32.
+    #[command(long_about = "\
+Test each named .rev recovery volume: its header must parse and the CRC32 it
+states must match the bytes it covers. Only the named files are read, and
+nothing is written. Exits 1 unless every file tests OK.")]
+    TestVolumes {
+        #[arg(value_name = "REV", required = true)]
         paths: Vec<PathBuf>,
     },
 }
@@ -1120,5 +1135,33 @@ mod tests {
         // Without -o, the positional no longer leaks into the global option.
         let cli = Cli::try_parse_from(["rarpar", "xz", "compress", "in.tar", "out.xz"]).unwrap();
         assert_eq!(cli.output, None);
+    }
+
+    #[test]
+    fn rar_test_volumes_needs_at_least_one_path() {
+        let cli = Cli::try_parse_from([
+            "rarpar",
+            "rar",
+            "test-volumes",
+            "set.part1.rev",
+            "set.part2.rev",
+            "--json",
+        ])
+        .expect("rar test-volumes should parse");
+        assert!(cli.json);
+        let Some(Command::Rar {
+            command: RarCommand::TestVolumes { paths },
+        }) = cli.command
+        else {
+            panic!("expected rar test-volumes");
+        };
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from("set.part1.rev"),
+                PathBuf::from("set.part2.rev")
+            ]
+        );
+        assert!(Cli::try_parse_from(["rarpar", "rar", "test-volumes"]).is_err());
     }
 }

@@ -1,5 +1,106 @@
 # Changelog
 
+## 0.14.0
+
+### Added
+
+- `test_recovery_volumes` tests each given path as a recovery volume, the
+  check reference UnRAR makes when it tests a `.rev`: the header must parse
+  and the CRC32 it states must match the bytes it covers (a RAR5 volume's
+  payload, everything before a RAR3 volume's trailing CRC32). It returns one
+  `RevTestResult` per path, in the order given, with both CRC32s on a
+  mismatch, and it does not fail as a whole: a path that does not exist is
+  `RevTestStatus::Missing`, and one that cannot be opened or read is
+  `RevTestStatus::Unreadable { kind }` with the I/O error's kind. Each file
+  is opened once and read through once, and only the given paths are read:
+  nothing is discovered beside them or checked against a set. A RAR
+  3.0-style `name<d>_<r>_<p>.rev` carries no checksum and is reported
+  `Unverifiable`, whatever numbers its name carries. A RAR5 header that
+  numbers its volume 0 is `InvalidHeader`, as reference UnRAR fails it.
+- `plan_volume_restore` works out what `restore_volumes_from_paths` would do
+  with the same paths and options without writing, renaming or creating
+  anything. The `RestorePlan` gives every data volume's `DataVolumeStatus`
+  (a RAR5 volume's size and CRC32 against the `.rev` table; a RAR3 volume's
+  headers through to its end-of-archive header, the volume number that
+  header states and the data CRC it states), the path a restore would write
+  it to and the `.bad` name it would move it to. It lists the set's `.rev`s,
+  each with its recovery slot, its `volume_number` in the whole set and
+  whether the restore can use it: one whose CRC32 fails, or whose number
+  falls outside the set's recovery slots, is listed as unusable. A `.rev`
+  that states no set RAR could have written is not listed;
+  `test_recovery_volumes` reports on it. Both functions share discovery,
+  slot assignment, validity checks and output naming, so for the files as
+  they are when the plan runs, its `missing_volume_numbers()` and output
+  paths are the volumes the restore rebuilds and the paths it reports. A set
+  short of usable recovery volumes, one whose every `.rev` fails its CRC32
+  included, is a plan with `is_sufficient()` false and the counts, not an
+  error, so a caller can say how many more volumes it needs before fetching
+  them.
+- `RevTestStatus`, `RevTestResult`, `DataVolumeStatus`, `DataVolumePlan`,
+  `RecoveryVolumePlan` and `RestorePlan` are `#[non_exhaustive]`, so a later
+  release can add to them: match the enums with a wildcard arm, and read the
+  structs' fields rather than building them.
+
+### Changed
+
+- A RAR3 restore reads each data volume once: the volume it takes its
+  names from is no longer checked a second time when the volumes are placed
+  in their slots. A volume that changes after it was read is left to
+  `verify_restored`, which checks every rebuilt volume's headers and data
+  CRC before it is installed.
+- A RAR3 set whose every `.rev` fails its CRC32 is taken as a RAR5 set is:
+  a restore with volumes to rebuild fails as short of recovery volumes
+  ("insufficient RAR3 recovery volumes: need N, have 0") instead of with "no
+  valid RAR recovery volumes were found", and one whose data volumes are all
+  intact reports nothing to restore.
+
+### Fixed
+
+- `restore_volumes_from_paths` takes only the files of the set it is given.
+  Beside the given paths it takes the files named in the set's naming: for
+  RAR5, `name.partNN.rar` and `name.partNN.rev` at the set's digit width;
+  for RAR3, `name.partN.rar` or `name.rar`, `name.r00`, ..., and `.rev`s
+  named after the same base. The naming is taken from a volume of the set,
+  as reference UnRAR takes it. A given path not named as one of the set's
+  volumes, or naming a data volume past its count, and a second file for a
+  volume another file fills, are errors naming the paths; a file found
+  beside the given paths and named otherwise is passed over. Files found
+  beside the given paths are taken in name order, not in the order the
+  directory lists them. It used to take every file whose name started as a
+  given path's did, and the last one found for a volume won, so a copy of a
+  volume, or another set's volume with the same prefix, could fill a slot or
+  be moved to `.bad` and replaced.
+- A RAR5 restore places data volumes by the number their names carry, as
+  reference UnRAR does, instead of opening each one to read the number its
+  headers state. A volume whose headers are damaged, or that is too short to
+  have any, is judged by its size and CRC32 against the `.rev` table like
+  any other, moved to `.bad` and rebuilt. The restore used to fail when that
+  read raised an error, and otherwise report the volume missing and then
+  refuse the file at its name, or with `overwrite_existing` replace it
+  without moving it aside.
+- A RAR5 `.rev` whose header numbers it volume 0, which reference UnRAR
+  refuses, no longer describes the set to a restore.
+- A RAR3 data volume that is cut short, ends without an end-of-archive
+  header, is not marked a volume by its main header, or whose end-of-archive
+  header numbers it as another volume is `InvalidHeaders`: a restore moves
+  it to `.bad` and rebuilds it. A volume cut short in its packed data or
+  between headers used to pass as valid, as did a misnumbered one, so the
+  rebuild used wrong bytes and reported success; one cut short inside a
+  header failed the whole restore with an I/O error.
+- A RAR3 restore writes each rebuilt volume to a hidden partial file beside
+  its name and, with `verify_restored`, reads it back through the same
+  handle and checks it as it checks a data volume: headers, end-of-archive
+  volume number and data CRC. Only once every rebuilt volume is written and
+  has passed are invalid volumes moved to `.bad`, existing outputs refused
+  and the partial files moved into place; a failure up to then removes the
+  partial files and leaves every other file as it was. It used to move
+  invalid volumes aside and write the outputs in place first, and its
+  verification read only the rebuilt volume's signature, so a wrong rebuild
+  was installed and reported as restored.
+- A rebuilt volume's name takes its extension's case from the data volume
+  the set's naming comes from (`name.part05.RAR`, `NAME.R01`), instead of
+  always lower case.
+
 ## 0.13.0
 
 ### Changed

@@ -676,6 +676,7 @@ impl RepairOutcome {
             action: "par3_verify_repair".into(),
             success: self.success,
             message: self.report.to_string(),
+            deferred_to: None,
         }
     }
 }

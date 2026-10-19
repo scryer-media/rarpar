@@ -280,6 +280,11 @@ pub struct ExecutedAction {
     pub action: String,
     pub success: bool,
     pub message: String,
+    /// For an `auto --dry-run` restore that would fail by itself, the parity
+    /// repair the real run makes first that covers the shortfall: `par2`,
+    /// `par3` or `par2+par3`. Absent from the JSON otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deferred_to: Option<&'static str>,
 }
 
 pub fn selected_par3_set(set: &crate::par3::Par3Set, roots: &[PathBuf]) -> bool {

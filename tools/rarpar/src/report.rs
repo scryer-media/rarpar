@@ -1,8 +1,12 @@
 use crate::discovery::DiscoveryReport;
 use crate::error::RarparError;
+use crate::rar::RarRestoreOutcome;
 use par2_rs::{CreationBackend, Par2CreateOutcome, Par2CreatePlan};
 use rarpar::cli::Cli;
 use serde::Serialize;
+use unrar_rs::{
+    ArchiveFormat, DataVolumeStatus, RecoveryReport, RestorePlan, RevTestResult, RevTestStatus,
+};
 
 #[derive(Debug, Serialize)]
 struct ParCreateReport {
@@ -174,6 +178,209 @@ impl From<&Par2CreateOutcome> for ParCreateOutcomeReport {
     }
 }
 
+/// `rar restore-volumes --json`: `plan` for a dry run, `outcome` for a real
+/// run, never both.
+#[derive(Debug, Serialize)]
+struct RarRestoreReport {
+    schema_version: u8,
+    command: &'static str,
+    dry_run: bool,
+    success: bool,
+    message: String,
+    plan: Option<RarRestorePlanReport>,
+    outcome: Option<RarRestoreOutcomeReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct RarRestorePlanReport {
+    format: &'static str,
+    data_count: usize,
+    recovery_count: usize,
+    needed: usize,
+    usable_recovery_count: usize,
+    sufficient: bool,
+    output_dir: String,
+    data_volumes: Vec<RarDataVolumeReport>,
+    recovery_volumes: Vec<RarRecoveryVolumeReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct RarDataVolumeReport {
+    /// Zero-based, as `missing_volume_numbers` counts volumes.
+    index: usize,
+    path: Option<String>,
+    status: &'static str,
+    /// Set for `wrong_size` only: the `.rev` table's length and the file's.
+    expected_size: Option<u64>,
+    actual_size: Option<u64>,
+    output_path: String,
+    set_aside_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RarRecoveryVolumeReport {
+    slot: usize,
+    /// Zero-based position in the whole set, data volumes first.
+    volume_number: usize,
+    path: String,
+    status: &'static str,
+    usable: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RarRestoreOutcomeReport {
+    restored_paths: Vec<String>,
+    /// Every valid recovery volume the restore read, which can be more than
+    /// it needed.
+    used_recovery_paths: Vec<String>,
+    missing_volume_numbers: Vec<usize>,
+}
+
+/// `rar test-volumes --json`: one result per path, in the order given.
+#[derive(Debug, Serialize)]
+struct RarTestVolumesReport {
+    schema_version: u8,
+    command: &'static str,
+    success: bool,
+    results: Vec<RarTestVolumeReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct RarTestVolumeReport {
+    path: String,
+    format: Option<&'static str>,
+    /// `unreadable` for a file that could not be opened or read, with
+    /// `message` naming the I/O error kind.
+    status: &'static str,
+    /// Set for `crc_mismatch` only.
+    expected_crc32: Option<u32>,
+    actual_crc32: Option<u32>,
+    /// Set for `unreadable` only.
+    message: Option<String>,
+}
+
+/// A discovery report as `--json` prints it, marked with whether the run was
+/// a dry run: an `auto --dry-run` report records the steps it planned, none
+/// of which ran, as `executed_actions`.
+#[derive(Serialize)]
+struct DiscoveryJson<'a> {
+    dry_run: bool,
+    #[serde(flatten)]
+    report: &'a DiscoveryReport,
+}
+
+impl RarRestorePlanReport {
+    fn from_plan(plan: &RestorePlan) -> Self {
+        Self {
+            format: rar_format_name(plan.format),
+            data_count: plan.data_count,
+            recovery_count: plan.recovery_count,
+            needed: plan.needed(),
+            usable_recovery_count: plan.usable_recovery_count(),
+            sufficient: plan.is_sufficient(),
+            output_dir: plan.output_dir.display().to_string(),
+            data_volumes: plan
+                .data_volumes
+                .iter()
+                .map(|volume| {
+                    let (expected_size, actual_size) = match volume.status {
+                        DataVolumeStatus::WrongSize { expected, actual } => {
+                            (Some(expected), Some(actual))
+                        }
+                        _ => (None, None),
+                    };
+                    RarDataVolumeReport {
+                        index: volume.index,
+                        path: volume.path.as_ref().map(|path| path.display().to_string()),
+                        status: data_volume_status_name(&volume.status),
+                        expected_size,
+                        actual_size,
+                        output_path: volume.output_path.display().to_string(),
+                        set_aside_path: volume
+                            .set_aside_path
+                            .as_ref()
+                            .map(|path| path.display().to_string()),
+                    }
+                })
+                .collect(),
+            recovery_volumes: plan
+                .recovery_volumes
+                .iter()
+                .map(|volume| RarRecoveryVolumeReport {
+                    slot: volume.slot,
+                    volume_number: volume.volume_number,
+                    path: volume.path.display().to_string(),
+                    status: rev_status_name(&volume.status),
+                    usable: volume.usable,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl RarRestoreOutcomeReport {
+    fn from_report(report: &RecoveryReport) -> Self {
+        Self {
+            restored_paths: display_paths(&report.restored_paths),
+            used_recovery_paths: display_paths(&report.used_recovery_paths),
+            missing_volume_numbers: report.missing_volume_numbers.clone(),
+        }
+    }
+}
+
+impl RarTestVolumeReport {
+    fn from_result(result: &RevTestResult) -> Self {
+        let (expected_crc32, actual_crc32) = match result.status {
+            RevTestStatus::CrcMismatch { expected, actual } => (Some(expected), Some(actual)),
+            _ => (None, None),
+        };
+        let message = match result.status {
+            RevTestStatus::Unreadable { kind } => Some(kind.to_string()),
+            _ => None,
+        };
+        Self {
+            path: result.path.display().to_string(),
+            format: result.format.map(rar_format_name),
+            status: rev_status_name(&result.status),
+            expected_crc32,
+            actual_crc32,
+            message,
+        }
+    }
+}
+
+fn rar_format_name(format: ArchiveFormat) -> &'static str {
+    match format {
+        ArchiveFormat::Rar14 => "rar14",
+        ArchiveFormat::Rar4 => "rar4",
+        ArchiveFormat::Rar5 => "rar5",
+    }
+}
+
+fn rev_status_name(status: &RevTestStatus) -> &'static str {
+    match status {
+        RevTestStatus::Ok => "ok",
+        RevTestStatus::CrcMismatch { .. } => "crc_mismatch",
+        RevTestStatus::InvalidHeader => "invalid_header",
+        RevTestStatus::Unverifiable => "unverifiable",
+        RevTestStatus::NotRecoveryVolume => "not_recovery_volume",
+        RevTestStatus::Missing => "missing",
+        RevTestStatus::Unreadable { .. } => "unreadable",
+        _ => "unknown",
+    }
+}
+
+fn data_volume_status_name(status: &DataVolumeStatus) -> &'static str {
+    match status {
+        DataVolumeStatus::Valid => "valid",
+        DataVolumeStatus::Missing => "missing",
+        DataVolumeStatus::WrongSize { .. } => "wrong_size",
+        DataVolumeStatus::CrcMismatch => "crc_mismatch",
+        DataVolumeStatus::InvalidHeaders => "invalid_headers",
+        _ => "unknown",
+    }
+}
+
 fn display_paths(paths: &[std::path::PathBuf]) -> Vec<String> {
     paths
         .iter()
@@ -183,7 +390,11 @@ fn display_paths(paths: &[std::path::PathBuf]) -> Vec<String> {
 
 pub fn emit_discovery(cli: &Cli, report: &DiscoveryReport) -> Result<(), RarparError> {
     if cli.json {
-        println!("{}", serde_json::to_string_pretty(report)?);
+        let report = DiscoveryJson {
+            dry_run: cli.dry_run,
+            report,
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
     if cli.quiet {
@@ -217,9 +428,17 @@ pub fn emit_discovery(cli: &Cli, report: &DiscoveryReport) -> Result<(), RarparE
             println!("  cleanup candidates: {}", cleanup.candidates.len());
         }
     }
+    // A dry run records the restores it planned, none of which it ran.
+    let ran = if cli.dry_run { "dry-run" } else { "ran" };
     for action in &report.executed_actions {
-        let status = if action.success { "ok" } else { "failed" };
-        println!("  ran {} [{}]: {}", action.action, status, action.message);
+        let status = if !action.success {
+            "failed"
+        } else if action.deferred_to.is_some() {
+            "deferred"
+        } else {
+            "ok"
+        };
+        println!("  {ran} {} [{}]: {}", action.action, status, action.message);
     }
     for cleanup in &report.cleanup_results {
         let status = if cleanup.success { "ok" } else { "failed" };
@@ -299,6 +518,67 @@ pub fn emit_par_create_outcome(
             outcome.output_paths.len()
         );
         eprintln!("  bytes written: {}", outcome.bytes_written);
+    }
+    Ok(())
+}
+
+pub fn emit_rar_restore(cli: &Cli, outcome: &RarRestoreOutcome) -> Result<(), RarparError> {
+    if cli.json {
+        let report = RarRestoreReport {
+            schema_version: 1,
+            command: "rar_restore_volumes",
+            dry_run: outcome.dry_run,
+            success: outcome.success,
+            message: outcome.message.clone(),
+            plan: outcome.plan.as_ref().map(RarRestorePlanReport::from_plan),
+            outcome: outcome
+                .report
+                .as_ref()
+                .map(RarRestoreOutcomeReport::from_report),
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if !cli.quiet {
+        println!("{}", outcome.message);
+    }
+    Ok(())
+}
+
+pub fn emit_rar_test_volumes(
+    cli: &Cli,
+    success: bool,
+    results: &[RevTestResult],
+) -> Result<(), RarparError> {
+    if cli.json {
+        let report = RarTestVolumesReport {
+            schema_version: 1,
+            command: "rar_test_volumes",
+            success,
+            results: results
+                .iter()
+                .map(RarTestVolumeReport::from_result)
+                .collect(),
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if !cli.quiet {
+        for result in results {
+            let status = match result.status {
+                RevTestStatus::Ok => "OK".to_string(),
+                RevTestStatus::CrcMismatch { expected, actual } => {
+                    format!("CRC32 mismatch (expected {expected:08x}, actual {actual:08x})")
+                }
+                RevTestStatus::InvalidHeader => "invalid recovery volume header".to_string(),
+                RevTestStatus::Unverifiable => {
+                    "RAR 3.0 name-form recovery volume carries no checksum".to_string()
+                }
+                RevTestStatus::NotRecoveryVolume => "not a recovery volume".to_string(),
+                RevTestStatus::Missing => "missing".to_string(),
+                RevTestStatus::Unreadable { kind } => format!("unreadable ({kind})"),
+                // A status this build does not know yet, named as the
+                // library debug-prints it.
+                ref status => format!("{status:?}"),
+            };
+            println!("{}: {status}", result.path.display());
+        }
     }
     Ok(())
 }

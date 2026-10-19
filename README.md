@@ -118,6 +118,7 @@ rarpar auto --output ~/Extracted --delete-sources ~/Downloads/some-release
 rarpar rar list archive.part1.rar
 rarpar rar extract archive.part1.rar ./out
 rarpar rar restore-volumes archive.part1.rar archive.part1.rev
+rarpar rar test-volumes archive.part1.rev archive.part2.rev
 
 rarpar par verify release.par2
 rarpar par repair release.par2
@@ -131,6 +132,11 @@ rarpar xz compress data.tar
 rarpar xz decompress data.tar.xz ./out
 tar -c ./release | rarpar xz compress > release.tar.xz
 ```
+
+`rarpar rar restore-volumes --dry-run` reads every volume of the set, names
+the volumes a restore would rebuild and counts the usable `.rev` files that
+cover them. Where the restore would fail, for too few usable `.rev` files or
+a file already in its way, the dry run fails the same way. It writes nothing.
 
 Pipes work without temporary files: `par verify --name` checks a file as it
 streams in, `par3 create -` and `xz compress --sidecar` make a recovery set

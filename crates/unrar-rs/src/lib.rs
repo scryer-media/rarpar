@@ -335,7 +335,11 @@ pub use limits::Limits;
 pub use path::sanitize_path;
 pub use probe::{ProbeFile, VolumeProbe, probe_volume};
 pub use progress::{NoProgress, ProgressHandler};
-pub use recovery::{RecoveryOptions, RecoveryReport, restore_volumes_from_paths};
+pub use recovery::{
+    DataVolumePlan, DataVolumeStatus, RecoveryOptions, RecoveryReport, RecoveryVolumePlan,
+    RestorePlan, RevTestResult, RevTestStatus, plan_volume_restore, restore_volumes_from_paths,
+    test_recovery_volumes,
+};
 pub use stored_layout::{
     EncryptedStore, IneligibilityReason, MalformedReason, MappedSlice, MemberEligibility,
     MemberKeying, StoredLayoutBuilder, StoredLayoutError, StoredMember, StoredMemberPart,
