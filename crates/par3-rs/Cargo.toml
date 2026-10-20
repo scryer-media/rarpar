@@ -2,7 +2,7 @@
 name = "par3-rs"
 description = "PAR3 (Parity Volume Set 3.0) packet parsing, set inspection, verification, creation and repair — work in progress"
 readme = "README.md"
-version = "0.8.0"
+version = "0.8.1"
 edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0"
@@ -27,7 +27,7 @@ wasm-simd = ["blake3/wasm32_simd"]
 
 [dependencies]
 blake3 = { workspace = true, features = ["rayon"] }
-crc-fast = { workspace = true }
+crc-turbo = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 reedsolomon-rs = { path = "../reedsolomon-rs", version = "0.4.10", default-features = false }

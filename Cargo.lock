@@ -750,6 +750,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc-turbo"
+version = "1.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe9845f8267cd17ae1edacec5cd2bc0f8b891d1946db64d929209170fcf7e9b8"
+dependencies = [
+ "digest 0.10.7",
+ "spin",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2007,11 +2017,11 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.10.12"
+version = "0.10.13"
 dependencies = [
  "bytes",
  "cap-std",
- "crc-fast",
+ "crc-turbo",
  "criterion",
  "libc",
  "md-5",
@@ -2027,11 +2037,11 @@ dependencies = [
 
 [[package]]
 name = "par3-rs"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "blake3",
  "cap-std",
- "crc-fast",
+ "crc-turbo",
  "libc",
  "rayon",
  "reedsolomon-rs",
@@ -2251,11 +2261,11 @@ checksum = "ca45419789ae5a7899559e9512e58ca889e41f04f1f2445e9f4b290ceccd1d08"
 
 [[package]]
 name = "rarpar"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "blake3",
  "clap",
- "crc-fast",
+ "crc-turbo",
  "filetime",
  "libc",
  "lzma-turbo",
@@ -3005,13 +3015,13 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "unrar-rs"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "aes",
  "aws-lc-rs",
  "blake2s_simd",
  "cbc",
- "crc-fast",
+ "crc-turbo",
  "criterion",
  "filetime",
  "hmac",

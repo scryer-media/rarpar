@@ -363,7 +363,7 @@ fn bench_crc_hasher(c: &mut Criterion) {
 
     c.bench_function("rar_crc_fast_baseline", |b| {
         b.iter(|| {
-            let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+            let mut hasher = crc_turbo::Digest::new(crc_turbo::CrcAlgorithm::Crc32IsoHdlc);
             hasher.update(black_box(&data));
             black_box(hasher.finalize());
         });

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.14.1
+
+### Changed
+
+- CRC-32 and CRC-64 come from `crc-turbo` 1.11, the maintained fork of
+  `crc-fast`, in place of `crc-fast` 1.10. Its runtime dispatch has the
+  256-bit VPCLMULQDQ fold for x86-64 CPUs that have VPCLMULQDQ without
+  AVX-512 (AMD Zen 3, Intel Alder Lake through Arrow Lake), so the crate's
+  own stopgap kernel for those CPUs (`crc_simd`) is removed and every CRC
+  goes through `crc-turbo`. Checksums are unchanged.
+- The `RARPAR_CRC32_VPCLMUL` environment override went with that kernel.
+  `CRC_TURBO_TIER` pins `crc-turbo`'s tier instead, for example
+  `CRC_TURBO_TIER=x86_64-sse-pclmulqdq`.
+
 ## 0.14.0
 
 ### Added

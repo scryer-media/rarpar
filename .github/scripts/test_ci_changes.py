@@ -47,20 +47,20 @@ PACKAGES = {
     "rarpar": _pkg("rarpar", "0.4.1", "tools/rarpar"),
     "xtask": _pkg("xtask", "0.4.3", "xtask"),
     "blake3": _pkg("blake3", "1.8.7"),
-    "crc-fast": _pkg("crc-fast", "1.6.0"),
+    "crc-turbo": _pkg("crc-turbo", "1.11.0"),
     "unrar-rs@registry": _pkg("unrar-rs", "0.9.2"),
 }
 
 EDGES = {
     "reedsolomon-rs": [],
-    "unrar-rs": ["reedsolomon-rs", "crc-fast"],
-    "par2-rs": ["reedsolomon-rs", "unrar-rs", "crc-fast"],
+    "unrar-rs": ["reedsolomon-rs", "crc-turbo"],
+    "par2-rs": ["reedsolomon-rs", "unrar-rs", "crc-turbo"],
     "par3-rs": ["blake3"],
-    "rarpar": ["unrar-rs@registry", "crc-fast"],
+    "rarpar": ["unrar-rs@registry", "crc-turbo"],
     "xtask": ["rarpar"],
     "blake3": [],
-    "crc-fast": [],
-    "unrar-rs@registry": ["crc-fast"],
+    "crc-turbo": [],
+    "unrar-rs@registry": ["crc-turbo"],
 }
 
 MEMBERS = ["reedsolomon-rs", "unrar-rs", "par2-rs", "par3-rs", "rarpar", "xtask"]
@@ -185,7 +185,7 @@ class LockfileClassification(unittest.TestCase):
         self.assertIn("`Cargo.lock`: blake3", result.reasons["par3-rs"])
 
     def test_shared_dependency_reaches_every_user(self):
-        result = self.classify_lock(lock(), lock(**{"crc-fast": "sha-new"}))
+        result = self.classify_lock(lock(), lock(**{"crc-turbo": "sha-new"}))
         self.assertEqual(affected(result), ["par2-rs", "rarpar", "unrar-rs", "xtask"])
 
     def test_registry_twin_is_not_the_workspace_crate(self):
@@ -249,7 +249,7 @@ class CommandLine(unittest.TestCase):
             (tmp / "metadata.json").write_text(__import__("json").dumps(metadata()))
             (tmp / "changed.txt").write_text("crates/par3-rs/src/lib.rs\nCargo.lock\n")
             (tmp / "old.lock").write_text(lock())
-            (tmp / "new.lock").write_text(lock(**{"crc-fast": "sha-new"}))
+            (tmp / "new.lock").write_text(lock(**{"crc-turbo": "sha-new"}))
             out = tmp / "output.txt"
             summary = tmp / "summary.md"
             rc = ci_changes.main([

@@ -278,8 +278,8 @@ fn reference_host_crc32(
     }
 
     // Resume from the finalized CRC seed used by the guest contract.
-    let mut hasher = crc_fast::Digest::new_with_init_state(
-        crc_fast::CrcAlgorithm::Crc32IsoHdlc,
+    let mut hasher = crc_turbo::Digest::new_with_init_state(
+        crc_turbo::CrcAlgorithm::Crc32IsoHdlc,
         u64::from(!seed),
     );
     hasher.update(&buf);
@@ -379,17 +379,17 @@ fn reference_crc_host_fn_chains() {
     let a = b"the quick brown fox ";
     let b = b"jumps over the lazy dog";
     let whole = {
-        let mut h = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+        let mut h = crc_turbo::Digest::new(crc_turbo::CrcAlgorithm::Crc32IsoHdlc);
         h.update(a);
         h.update(b);
         h.finalize() as u32
     };
     let seeded = {
-        let mut h = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+        let mut h = crc_turbo::Digest::new(crc_turbo::CrcAlgorithm::Crc32IsoHdlc);
         h.update(a);
         let crc_a = h.finalize() as u32;
-        let mut h2 = crc_fast::Digest::new_with_init_state(
-            crc_fast::CrcAlgorithm::Crc32IsoHdlc,
+        let mut h2 = crc_turbo::Digest::new_with_init_state(
+            crc_turbo::CrcAlgorithm::Crc32IsoHdlc,
             u64::from(!crc_a),
         );
         h2.update(b);
@@ -401,8 +401,8 @@ fn reference_crc_host_fn_chains() {
     );
 
     let empty_seed = 0x1234_5678u32;
-    let mut h = crc_fast::Digest::new_with_init_state(
-        crc_fast::CrcAlgorithm::Crc32IsoHdlc,
+    let mut h = crc_turbo::Digest::new_with_init_state(
+        crc_turbo::CrcAlgorithm::Crc32IsoHdlc,
         u64::from(!empty_seed),
     );
     h.update(&[]);

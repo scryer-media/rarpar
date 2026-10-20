@@ -2,7 +2,7 @@
 name = "unrar-rs"
 description = "RAR archive reading, decompression, and streaming extraction only"
 readme = "README.md"
-version = "0.14.0"
+version = "0.14.1"
 edition.workspace = true
 license-file = "LICENSE"
 repository.workspace = true
@@ -32,10 +32,10 @@ crypto-rust = ["dep:hmac", "dep:aes", "dep:cbc"]
 # mixed workspace cannot silently turn a native build into a delegating one.
 crypto-host = ["crypto-rust"]
 # Delegate the bulk member-data CRC-32 to an embedder-installed hook (see the
-# `hooks` module) instead of computing it in-guest with `crc-fast`. Same
+# `hooks` module) instead of computing it in-guest with `crc-turbo`. Same
 # wasm32-only engagement as `crypto-host`; on native targets the
-# `crate::crc::Crc32` seam keeps its portable `crc-fast` backend regardless.
-# Adds NO new dependency: `crc-fast` is already a normal dep that the
+# `crate::crc::Crc32` seam keeps its portable `crc-turbo` backend regardless.
+# Adds NO new dependency: `crc-turbo` is already a normal dep that the
 # native/portable seam path (and the header/probe CRCs) use unchanged.
 crc-host = []
 # Back-compat alias for existing workspace dependency declarations (was a
@@ -53,7 +53,7 @@ ppmd-turbo = "0.2.0"
 reedsolomon-rs = { path = "../reedsolomon-rs", version = "0.4.11", default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-crc-fast = { workspace = true }
+crc-turbo = { workspace = true }
 blake2s_simd = { workspace = true }
 # NOT optional and NOT part of a backend: the RAR5 KDF's HMAC-SHA256 runs on
 # `sha2` on every backend (see `crypto::kdf_hmac`) so the per-iteration path

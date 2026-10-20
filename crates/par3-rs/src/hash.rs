@@ -18,7 +18,7 @@
 //! assert_eq!(fingerprint(b"qrstuvwxyz").len(), 16);
 //! ```
 
-use crc_fast::{CrcAlgorithm, Digest};
+use crc_turbo::{CrcAlgorithm, Digest};
 
 /// Length of a PAR3 fingerprint hash, in bytes.
 pub const FINGERPRINT_LEN: usize = 16;
@@ -154,7 +154,7 @@ impl std::fmt::Debug for FingerprintHasher {
 /// PAR3 stores this value as a little-endian `u64`.
 #[must_use]
 pub fn rolling_hash(data: &[u8]) -> u64 {
-    crc_fast::checksum(CrcAlgorithm::Crc64GoIso, data)
+    crc_turbo::checksum(CrcAlgorithm::Crc64GoIso, data)
 }
 
 /// The rolling hash a File packet stores for the first [`QUICK_HASH_LEN`] bytes.

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.1
+
+- The PAR3 rolling hash (CRC-64/GO-ISO) and the PAR-inside CRC-32 come from
+  `crc-turbo` 1.11, the maintained fork of `crc-fast`, in place of
+  `crc-fast` 1.10. Hashes are unchanged.
+
 ## 0.8.0
 
 Breaking: par3-rs no longer knows RAR. PAR-inside for RAR moved to `rarpar`,

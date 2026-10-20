@@ -1789,7 +1789,6 @@ mod sha1_hw {
 /// overridden by it. The ISA probe is never bypassed in either direction —
 /// forcing a tier the CPU cannot execute would be an undefined opcode, so the
 /// override widens the *policy* and leaves the *capability* check intact.
-/// Same `OnceLock` + environment-override shape as [`crate::crc_simd`].
 #[cfg(target_arch = "x86_64")]
 mod sha1_x86_vec {
     // Each kernel is one contiguous unsafe region under a single precondition
@@ -1797,7 +1796,7 @@ mod sha1_x86_vec {
     // would add hundreds of tokens without adding a distinct safety
     // obligation, so the module opts out of the per-operation requirement and
     // documents the one obligation at each `#[target_feature]` entry point
-    // instead. Same convention as `crate::crc_simd::x86_vpclmul`.
+    // instead.
     #![allow(unsafe_op_in_unsafe_fn)]
 
     use std::arch::x86_64::*;

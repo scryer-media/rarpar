@@ -3,6 +3,15 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.9.3
+
+- CRCs come from `crc-turbo`, the maintained fork of `crc-fast`, through
+  unrar-rs 0.14.1, par2-rs 0.10.13, par3-rs 0.8.1 and the 7z extractor.
+  On x86-64 CPUs with VPCLMULQDQ and no AVX-512 the 256-bit fold now comes
+  from `crc-turbo` instead of a kernel carried in unrar-rs and par2-rs. The
+  `RARPAR_CRC32_VPCLMUL` environment override is gone; `CRC_TURBO_TIER` pins
+  the CRC tier instead.
+
 ## rarpar 0.9.2
 
 - `auto --dry-run` assesses the PAR3 and PAR2 repairs the real run makes

@@ -100,7 +100,7 @@ fn main() {
         let data = vec![0x3Cu8; HASH_TOTAL_BYTES];
         let mut sink = 0u32;
         let secs = best_secs(|| {
-            let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+            let mut hasher = crc_turbo::Digest::new(crc_turbo::CrcAlgorithm::Crc32IsoHdlc);
             for chunk in data.chunks(HASH_CHUNK_BYTES) {
                 hasher.update(chunk);
             }

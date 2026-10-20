@@ -242,7 +242,6 @@
 pub mod archive;
 pub mod container;
 pub(crate) mod crc;
-pub(crate) mod crc_simd;
 #[cfg(any(feature = "crypto-host", feature = "crc-host"))]
 pub mod hooks;
 extern crate self as crc32fast;
