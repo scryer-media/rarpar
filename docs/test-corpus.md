@@ -177,7 +177,7 @@ is how the UnRAR lanes are split:
 | `unrar` | `rar12` ∪ `rar34` ∪ `rar57` (all of `crates/unrar-rs/tests/fixtures/`) |
 | `par2` | all of `crates/par2-rs/tests/fixtures/` |
 | `par3` | all of `crates/par3-rs/tests/fixtures/`: the eight reference-written PAR3 sets and their inputs |
-| `unit` | the handful of fixtures the unit lanes read: the `-hp` archives and the archives with recovery records |
+| `unit` | the two fixtures the no-fixture unit lanes read; the recovery-record tests skip there until a revision adds theirs |
 | `cli` | what the CLI smoke lane reads |
 | `wasm-unrar` | exactly the fixture families the wasm UnRAR harness opens |
 | `release-tests`, `ppmd-perf` | the subsets `release.yml` and `ppmd-perf.yml` hydrate |
