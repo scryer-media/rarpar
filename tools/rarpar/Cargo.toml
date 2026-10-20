@@ -85,7 +85,7 @@ filetime = { workspace = true, optional = true }
 # The .xz codec behind `rarpar xz`. Held at the version sevenz-turbo resolves
 # so the binary links one copy of it; `xz` brings the container, `enc` the
 # writer. The SHA-256 check comes from the crypto backend features above.
-lzma-turbo = { version = "0.10.0", default-features = false, features = [
+lzma-turbo = { version = "0.10.2", default-features = false, features = [
     "std",
     "asm",
     "xz",

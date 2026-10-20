@@ -11,6 +11,8 @@ documented in each crate's own changelog so those notes ship with the crate.
   from `crc-turbo` instead of a kernel carried in unrar-rs and par2-rs. The
   `RARPAR_CRC32_VPCLMUL` environment override is gone; `CRC_TURBO_TIER` pins
   the CRC tier instead.
+- Requires `lzma-turbo` 0.10.2, which takes its CRCs from `crc-turbo`, so
+  `crc-fast` is no longer in the binary.
 
 ## rarpar 0.9.2
 
