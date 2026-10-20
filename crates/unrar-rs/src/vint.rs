@@ -68,8 +68,8 @@ pub fn read_vint_from<R: Read>(reader: &mut R) -> RarResult<(u64, usize)> {
     Err(RarError::TruncatedHeader { offset: 0 })
 }
 
-/// Encode a u64 as a vint, returning the bytes.
-#[cfg(test)]
+/// Encode a u64 as a vint, returning the bytes. Used by
+/// [`crate::container`] to write service record headers, and by tests.
 pub fn encode_vint(mut value: u64) -> Vec<u8> {
     let mut result = Vec::new();
     loop {

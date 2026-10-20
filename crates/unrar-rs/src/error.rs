@@ -25,6 +25,11 @@ pub enum RarError {
     #[error("corrupt archive: {detail}")]
     CorruptArchive { detail: String },
 
+    /// A container modification ([`crate::container`]) was refused: the
+    /// archive or the request does not allow it, and nothing was written.
+    #[error("modification refused: {detail}")]
+    ModificationRefused { detail: String },
+
     // The display keeps the wording this failure had while it was reported as
     // `CorruptArchive`, so logs read the same.
     #[non_exhaustive]

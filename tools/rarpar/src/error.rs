@@ -32,6 +32,20 @@ pub enum RarparError {
     Par2(#[from] par2_rs::Par2Error),
     #[error("PAR3 error: {0}")]
     Par3(#[from] par3_rs::runtime::EngineError),
+    #[error("operation refused: {0}")]
+    Refused(String),
+}
+
+impl From<rarpar::par_inside::InsideError> for RarparError {
+    fn from(error: rarpar::par_inside::InsideError) -> Self {
+        use rarpar::par_inside::InsideError;
+        match error {
+            InsideError::Rar(error) => Self::Rar(error),
+            InsideError::Par3(error) => Self::Par3(error),
+            InsideError::Io(error) => Self::Io(error),
+            InsideError::Refused(detail) => Self::Refused(detail),
+        }
+    }
 }
 
 impl RarparError {
@@ -40,7 +54,7 @@ impl RarparError {
             Self::NoInput | Self::MissingInput(_) | Self::Usage(_) => EXIT_USAGE,
             Self::Unsafe(_) => EXIT_UNSAFE,
             Self::Resource(_) => EXIT_RESOURCE,
-            Self::Io(_) | Self::Json(_) | Self::Data(_) => EXIT_DATA_FAILURE,
+            Self::Io(_) | Self::Json(_) | Self::Data(_) | Self::Refused(_) => EXIT_DATA_FAILURE,
             Self::Rar(error) => match error {
                 unrar_rs::RarError::ResourceLimit { .. }
                 | unrar_rs::RarError::AllocationFailed { .. } => EXIT_RESOURCE,

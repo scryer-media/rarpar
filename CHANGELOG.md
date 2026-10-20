@@ -87,6 +87,27 @@ documented in each crate's own changelog so those notes ship with the crate.
   caches up to 64 RAR5 key derivations and keeps passwords and key material
   out of `Debug` output.
 
+- `par3 inside` (EXPERIMENTAL) changes its on-disk layout: each archive or
+  volume now carries its PAR3 carrier as one RAR5 service record named
+  `PAR3`, placed before the end-of-archive header. The trailing and block
+  layouts are gone, and `--layout` accepts only `service`. Archives
+  protected by an earlier version do not verify with this one: remove their
+  protection with that version, then insert again. Archives with encrypted
+  headers (`-hp`) are now protected with their password (`--password-file`,
+  `--password-env` or `--password-fd`; prompted for on a terminal): the
+  record header is encrypted like the archive's other headers, and volume
+  sets with encrypted headers are accepted, their order and completeness
+  checked from the unsealed headers. Of several candidate passwords the
+  next is tried only when one is rejected, so a damaged header is reported
+  as damage, not as a wrong password. Without the password an `-hp` archive
+  is refused for insertion, and verification reports its record header as
+  unchecked (`"framing_checked": false` in the JSON host report, a new
+  field). A damaged record header is now detected and rebuilt by repair.
+  The RAR orchestration moved into the `rarpar` library (`par_inside`): it
+  uses unrar-rs 0.14.0's service-record hooks and par3-rs 0.8.0's
+  container-blind `embedded` sets. The experimental RAR4 PAR-inside path is
+  dropped; RAR 2.9-4.x archives are refused.
+
 ## rarpar 0.9.1
 
 ### Fixed

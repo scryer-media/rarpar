@@ -1,18 +1,36 @@
-//! `rarpar par3 inside`: PAR3 recovery embedded in RAR5 archives.
+//! `rarpar par3 inside`: PAR3 recovery embedded in RAR5 archives. The work
+//! is done by the library's [`rarpar::par_inside`]; this is the command
+//! line around it: finding volumes, naming and staging outputs, reports.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use par3_rs::creation::CreationOptions;
-use par3_rs::inside::rar5::{self, Rar5Layout, Rar5Placement, Rar5Set};
 use par3_rs::session::RepairStatus;
 use rarpar::cli::{
     Cli, Par3InsideArgs, Par3InsideCommand, Par3InsideInsertArgs, Par3InsideLayout,
     Par3InsidePlacement, Par3InsideRemoveArgs, Par3InsideRepairArgs,
 };
+use rarpar::par_inside::{self, InsideSet, Passwords, Placement};
 use serde_json::{Value, json};
 
 use crate::error::{EXIT_DATA_FAILURE, EXIT_SUCCESS, RarparError};
+use crate::password::PasswordResolver;
+
+/// Password candidates, asked for only when one of `paths` has sealed
+/// headers (`-hp`).
+fn passwords(cli: &Cli, paths: &[PathBuf]) -> Result<Passwords, RarparError> {
+    let sealed = paths.iter().any(|path| {
+        std::fs::File::open(path).is_ok_and(|file| {
+            unrar_rs::container::headers_sealed(&mut std::io::BufReader::new(file)).unwrap_or(false)
+        })
+    });
+    if !sealed {
+        return Ok(Passwords::default());
+    }
+    let candidates = PasswordResolver::from_cli(cli)?.candidates_with_prompt("RAR password: ")?;
+    Ok(Passwords::new(candidates))
+}
 
 /// Printed on stderr by every `par3 inside` run unless `--quiet`.
 const EXPERIMENTAL_NOTICE: &str = "rarpar: par3 inside is EXPERIMENTAL: the on-disk layout may change before it is stable, and output from this version may not verify with a later one";
@@ -185,21 +203,14 @@ fn part_number(path: &Path) -> Option<(String, u64)> {
     Some((name[..at].to_owned(), digits.parse().ok()?))
 }
 
-fn layout(value: Par3InsideLayout) -> Rar5Layout {
+fn layout_name(value: Par3InsideLayout) -> &'static str {
     match value {
-        Par3InsideLayout::Trailing => Rar5Layout::Trailing,
-        Par3InsideLayout::Block => Rar5Layout::Block,
-        Par3InsideLayout::Service => Rar5Layout::Service,
+        Par3InsideLayout::Service => "service",
     }
 }
 
-fn layout_name(value: Rar5Layout) -> &'static str {
-    match value {
-        Rar5Layout::Trailing => "trailing",
-        Rar5Layout::Block => "block",
-        Rar5Layout::Service => "service",
-    }
-}
+/// The one layout an opened set can have.
+const SET_LAYOUT: &str = "service";
 
 fn status_name(status: RepairStatus) -> &'static str {
     match status {
@@ -218,9 +229,9 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
         cli.par3_max_lost_blocks,
     )?;
     let paths = volume_set(&args.archives)?;
-    let region_layout = layout(args.layout);
-    let hosts = rar5::prepare_hosts(&paths, region_layout, &execution)?;
-    let total: u64 = hosts.iter().map(|host| host.archive.length).sum();
+    let passwords = passwords(cli, &paths)?;
+    let hosts = par_inside::prepare_hosts(&paths, &passwords, &execution)?;
+    let total: u64 = hosts.iter().map(|host| host.len()).sum();
     let block_size = args.block_size.unwrap_or_else(|| {
         let mut size = 4096u64;
         while total.div_ceil(size) > 2048 {
@@ -237,9 +248,9 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
         })
     };
     let placement = match args.placement {
-        Par3InsidePlacement::Spread => Rar5Placement::Spread,
-        Par3InsidePlacement::Last => Rar5Placement::Last,
-        Par3InsidePlacement::Independent => Rar5Placement::Independent,
+        Par3InsidePlacement::Spread => Placement::Spread,
+        Par3InsidePlacement::Last => Placement::Last,
+        Par3InsidePlacement::Independent => Placement::Independent,
     };
     let refuse_existing = |outputs: &[PathBuf]| -> Result<(), RarparError> {
         match outputs.iter().find(|output| output.exists()) {
@@ -256,13 +267,13 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
         if let Some(directory) = args.output_dir.as_ref().filter(|_| !args.in_place) {
             let outputs: Vec<PathBuf> = hosts
                 .iter()
-                .map(|host| directory.join(&host.name))
+                .map(|host| directory.join(host.name()))
                 .collect();
             refuse_existing(&outputs)?;
         }
         return Ok((
             true,
-            json!({"operation":"par3_inside_insert","status":"planned","dry_run":true,"hosts":hosts.iter().map(|h| &h.name).collect::<Vec<_>>(),"block_size":block_size,"fsync":args.fsync}),
+            json!({"operation":"par3_inside_insert","status":"planned","dry_run":true,"hosts":hosts.iter().map(|h| h.name()).collect::<Vec<_>>(),"block_size":block_size,"fsync":args.fsync}),
         ));
     }
     // In place, each output is staged in its own volume's directory, so the
@@ -273,14 +284,14 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
         hosts
             .iter()
             .zip(&stages)
-            .map(|(host, stage)| stage.join(&host.name))
+            .map(|(host, stage)| stage.join(host.name()))
             .collect()
     } else {
         let directory = args.output_dir.clone().expect("required by clap");
         std::fs::create_dir_all(&directory)?;
         hosts
             .iter()
-            .map(|host| directory.join(&host.name))
+            .map(|host| directory.join(host.name()))
             .collect()
     };
     let output_dir = outputs[0].parent().expect("joined").to_owned();
@@ -300,14 +311,13 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
         ..CreationOptions::default()
     };
     let mut inserted = Vec::new();
-    if placement == Rar5Placement::Independent {
+    if placement == Placement::Independent {
         for (host, output) in hosts.iter().zip(&outputs) {
-            let count = count_for(blocks_of(host.archive.length));
-            match rar5::insert_set(
+            let count = count_for(blocks_of(host.len()));
+            match par_inside::insert_set(
                 std::slice::from_ref(host),
                 std::slice::from_ref(output),
                 &[count],
-                region_layout,
                 creation(count),
                 &scratch,
             ) {
@@ -323,21 +333,9 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
             }
         }
     } else {
-        let count = count_for(
-            hosts
-                .iter()
-                .map(|host| blocks_of(host.archive.length))
-                .sum(),
-        );
-        let counts = rar5::placement_counts(placement, hosts.len(), count)?;
-        inserted = rar5::insert_set(
-            &hosts,
-            &outputs,
-            &counts,
-            region_layout,
-            creation(count),
-            &scratch,
-        )?;
+        let count = count_for(hosts.iter().map(|host| blocks_of(host.len())).sum());
+        let counts = par_inside::placement_counts(placement, hosts.len(), count)?;
+        inserted = par_inside::insert_set(&hosts, &outputs, &counts, creation(count), &scratch)?;
     }
     let mut written = Vec::new();
     let mut destinations = Vec::new();
@@ -357,14 +355,14 @@ fn insert(cli: &Cli, args: &Par3InsideInsertArgs) -> Result<(bool, Value), Rarpa
     }
     Ok((
         true,
-        json!({"operation":"par3_inside_insert","status":"inserted","block_size":block_size,"layout":layout_name(region_layout),"outputs":written,"fsync":args.fsync}),
+        json!({"operation":"par3_inside_insert","status":"inserted","block_size":block_size,"layout":layout_name(args.layout),"outputs":written,"fsync":args.fsync}),
     ))
 }
 
 /// The names a set's hosts are written under, each refused unless it is one
 /// safe path component: a recorded name comes from the set's own packets, so
 /// an absolute one or one with `..` would leave the chosen directory.
-fn host_names(set: &Rar5Set) -> Result<Vec<String>, RarparError> {
+fn host_names(set: &InsideSet) -> Result<Vec<String>, RarparError> {
     let names = set.current_names();
     for name in &names {
         check_host_name(name)?;
@@ -373,7 +371,7 @@ fn host_names(set: &Rar5Set) -> Result<Vec<String>, RarparError> {
 }
 
 fn check_host_name(name: &str) -> Result<(), RarparError> {
-    rar5::validate_host_name(name)
+    par_inside::validate_host_name(name)
         .map_err(|error| RarparError::Unsafe(format!("recorded host name {name:?}: {error}")))
 }
 
@@ -406,10 +404,10 @@ fn stage_directories(
         .collect()
 }
 
-fn set_report(set: &Rar5Set) -> Value {
+fn set_report(set: &InsideSet) -> Value {
     json!({
         "set_id": set.id.to_string(),
-        "layout": layout_name(set.layout),
+        "layout": SET_LAYOUT,
         "status": status_name(set.status),
         "lost_blocks": set.lost_blocks,
         "additional": set.additional,
@@ -419,7 +417,8 @@ fn set_report(set: &Rar5Set) -> Value {
             "path": host.path,
             "matched_by": host.matched_by,
             "complete": host.complete,
-            "region_intact": host.region_intact,
+            "region_intact": host.region_intact(),
+            "framing_checked": host.framing_intact.is_some(),
             "packets_found": host.packets_found,
             "packets_expected": host.packets_expected,
             "recovery_indices": [host.recovery.start, host.recovery.end],
@@ -429,7 +428,8 @@ fn set_report(set: &Rar5Set) -> Value {
     })
 }
 
-fn open(cli: &Cli, args: &Par3InsideArgs) -> Result<Vec<Rar5Set>, RarparError> {
+/// Every set in the given archives, and the passwords that opened them.
+fn open(cli: &Cli, args: &Par3InsideArgs) -> Result<(Vec<InsideSet>, Passwords), RarparError> {
     let execution = crate::par3::execution_options(
         cli.par3_memory_mib,
         cli.par3_workers,
@@ -467,7 +467,9 @@ fn open(cli: &Cli, args: &Par3InsideArgs) -> Result<Vec<Rar5Set>, RarparError> {
         listed.extend(siblings.iter().cloned());
         paths.extend(siblings);
     }
-    Ok(rar5::open(&paths, &execution)?)
+    let passwords = passwords(cli, &paths)?;
+    let sets = par_inside::open(&paths, &passwords, &execution)?;
+    Ok((sets, passwords))
 }
 
 /// Volumes of the given archives' `.partN.rar` sets that are absent and that
@@ -479,7 +481,11 @@ fn open(cli: &Cli, args: &Par3InsideArgs) -> Result<Vec<Rar5Set>, RarparError> {
 /// the volumes present and the hosts the opened sets record, plus one. Some
 /// number at or under that bound is then always absent, so a family whose
 /// suffixes run past it still reports a missing volume and is never healthy.
-fn uncovered_volumes(cli: &Cli, args: &Par3InsideArgs, sets: &[Rar5Set]) -> Vec<String> {
+fn uncovered_volumes(
+    args: &Par3InsideArgs,
+    sets: &[InsideSet],
+    passwords: &Passwords,
+) -> Vec<String> {
     // A set covers its recorded names in the directories its found hosts are
     // in: a same-named volume elsewhere is another family's.
     let mut covered: HashSet<(PathBuf, String)> = HashSet::new();
@@ -533,18 +539,7 @@ fn uncovered_volumes(cli: &Cli, args: &Par3InsideArgs, sets: &[Rar5Set]) -> Vec<
         let Some((highest, last, width, spelling)) = present.last().cloned() else {
             continue;
         };
-        let more = crate::par3::execution_options(
-            cli.par3_memory_mib,
-            cli.par3_workers,
-            cli.par3_max_lost_blocks,
-        )
-        .ok()
-        .and_then(|options| {
-            let mut disk = par3_rs::source::DiskSourceAccess::with_options(options.clone());
-            disk.insert(par3_rs::source::SourceId(0), last.clone());
-            rar5::inspect(&disk, par3_rs::source::SourceId(0), &options).ok()
-        })
-        .is_some_and(|archive| archive.more_volumes);
+        let more = par_inside::more_volumes(&last, passwords).unwrap_or(false);
         let bound = (present.len() + recorded + 1) as u64;
         let end = highest.saturating_add(u64::from(more)).min(bound);
         let numbers: HashSet<u64> = present.iter().map(|(found, ..)| *found).collect();
@@ -564,14 +559,14 @@ fn uncovered_volumes(cli: &Cli, args: &Par3InsideArgs, sets: &[Rar5Set]) -> Vec<
 }
 
 fn verify(cli: &Cli, args: &Par3InsideArgs) -> Result<(bool, Value), RarparError> {
-    let sets = open(cli, args)?;
+    let (sets, passwords) = open(cli, args)?;
     // Verifying no set proves nothing, so an archive without one fails.
     if sets.is_empty() {
         return Err(RarparError::Data(
             "no embedded PAR3 set found in the given archives".to_owned(),
         ));
     }
-    let uncovered = uncovered_volumes(cli, args, &sets);
+    let uncovered = uncovered_volumes(args, &sets, &passwords);
     let healthy = uncovered.is_empty() && sets.iter().all(|set| set.needs_repair().is_empty());
     let repairable = uncovered.is_empty()
         && sets
@@ -591,11 +586,11 @@ fn verify(cli: &Cli, args: &Par3InsideArgs) -> Result<(bool, Value), RarparError
 }
 
 fn repair(cli: &Cli, args: &Par3InsideRepairArgs) -> Result<(bool, Value), RarparError> {
-    let mut sets = open(cli, &args.inputs)?;
+    let (mut sets, passwords) = open(cli, &args.inputs)?;
     let mut outputs = Vec::new();
     let mut destinations = Vec::new();
     let mut planned = false;
-    let uncovered = uncovered_volumes(cli, &args.inputs, &sets);
+    let uncovered = uncovered_volumes(&args.inputs, &sets, &passwords);
     let mut success = uncovered.is_empty();
     for set in &mut sets {
         let needed = set.needs_repair();
@@ -652,7 +647,7 @@ fn repair(cli: &Cli, args: &Par3InsideRepairArgs) -> Result<(bool, Value), Rarpa
                 )));
             }
         }
-        let report = set.repair(&staged, &scratch)?;
+        let report = set.repair(&staged, &scratch, &passwords)?;
         for (entry, index) in report.iter().zip(&needed) {
             let destination = &finals[*index];
             if args.output_dir.is_none() && destination.exists() && args.backup {
@@ -695,7 +690,7 @@ fn numbered_backup(path: &Path) -> PathBuf {
 }
 
 fn remove(cli: &Cli, args: &Par3InsideRemoveArgs) -> Result<(bool, Value), RarparError> {
-    let mut sets = open(cli, &args.inputs)?;
+    let (mut sets, passwords) = open(cli, &args.inputs)?;
     let mut outputs = Vec::new();
     let mut removed = Vec::new();
     for set in &mut sets {
@@ -725,7 +720,7 @@ fn remove(cli: &Cli, args: &Par3InsideRemoveArgs) -> Result<(bool, Value), Rarpa
             .zip(&directories)
             .map(|(name, directory)| directory.join(name))
             .collect();
-        let written = set.remove(&destinations)?;
+        let written = set.remove(&destinations, &passwords)?;
         for (path, host) in written.iter().zip(&set.hosts) {
             let destination = if args.in_place {
                 let original = host.path.clone().expect("bound host");

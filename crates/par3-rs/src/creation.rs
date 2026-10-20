@@ -884,7 +884,7 @@ impl CreationPlan {
     /// Assemble one embedded file per host from its body view and an optional
     /// tail view, planned in that order as `SourceId(2k)` and `SourceId(2k+1)`.
     /// Each file becomes `body, gap, tail`: the gap is one unprotected chunk
-    /// holding a format prefix of `prefix(carrier)` bytes and then host `k`'s
+    /// holding a format prefix of `prefix(k, carrier)` bytes and then host `k`'s
     /// carrier, which is the whole metadata and `counts[k]` recovery packets,
     /// taken in host order from one contiguous recovery range. The file
     /// fingerprint covers the body and the tail, so it is the fingerprint of
@@ -894,7 +894,7 @@ impl CreationPlan {
         &mut self,
         tails: &[bool],
         counts: &[u64],
-        prefix: &dyn Fn(u64) -> u64,
+        prefix: &dyn Fn(usize, u64) -> u64,
     ) -> EngineResult<Vec<(u64, u64)>> {
         if self.options.codec != CreationCodec::Cauchy
             || self.options.store_data
@@ -980,12 +980,12 @@ impl CreationPlan {
             .checked_add(88)
             .ok_or(EngineError::resource_limit("embedded packet bytes"))?;
         let mut gaps = Vec::with_capacity(counts.len());
-        for (file, &count) in self.files.iter_mut().zip(counts) {
+        for (host, (file, &count)) in self.files.iter_mut().zip(counts).enumerate() {
             let carrier = packet
                 .checked_mul(count)
                 .and_then(|bytes| bytes.checked_add(metadata_size))
                 .ok_or(EngineError::resource_limit("embedded packet bytes"))?;
-            let lead = prefix(carrier);
+            let lead = prefix(host, carrier);
             let gap = file
                 .packet
                 .chunks

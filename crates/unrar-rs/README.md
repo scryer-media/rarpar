@@ -11,8 +11,12 @@ program needed.
 unrar-rs = "0.14"
 ```
 
-It only reads archives. It cannot create them, for the licensing reason
-given [below](#license).
+It reads archives. It cannot create them, write or compress members, for the
+licensing reason given [below](#license). The one change it makes to an
+existing RAR5 archive is adding or removing a service record you name and
+fill (`container::Rar5Container`), copying every member and other header
+unchanged; under encrypted headers (`-hp`) the record header is encrypted
+like the others, with the archive's password.
 
 ## Listing
 

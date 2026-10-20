@@ -131,6 +131,29 @@
   crate refuses. The RAR3 header's `FileCRC` field is not checked: no CRC32
   convention over any byte range gives it, and `rar r` ignores it. All four
   types are `#[non_exhaustive]`.
+- `container` module: `Rar5Container` walks a RAR5 archive's block headers
+  (CRC-checked, unsealing `-hp` headers with a password) into a block map
+  with the volume number, end-of-archive flags, solid, locked and
+  recovery-record flags, the main header's quick-open and recovery-record
+  locators, and named service records. A wrong password is
+  `RarError::InvalidPassword` whether or not the archive has a password
+  check value, and a walk past `limits::MAX_HEADERS_PER_VOLUME` blocks is a
+  `RarError::ResourceLimit`. `append_service_record`
+  and `remove_service_record` plan adding or removing a service record whose
+  name and payload the caller supplies; `ServiceRecordAppend` and
+  `ServiceRecordRemoval` write the result, copying every other byte of the
+  archive verbatim. The record goes immediately before the end header, so no
+  offset the archive records moves; its header has the data-area and
+  skip-if-unknown flags, no CRC or time, and is sealed under `-hp` with the
+  archive's header key and a deterministic IV, so a damaged record header can
+  be rebuilt byte for byte (`service_record_header`,
+  `service_record_header_len`, `HeaderSealing::from_archive`). Locked
+  archives, a duplicate name, a change that would move a block a locator
+  names, a record too long for a file length, and a source archive whose
+  length changed since it was walked are refused with the new
+  `RarError::ModificationRefused`; archives that do not walk cleanly to
+  their end header fail the walk. No member is ever created, rewritten or
+  compressed.
 
 ### Changed
 

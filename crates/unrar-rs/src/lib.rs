@@ -11,8 +11,12 @@
 //! is not available, and in source code comments of resulting package.
 //!
 //! This crate provides reading, decompression, and extraction of existing RAR
-//! archives only. It intentionally exposes no archive writer, builder, or
-//! creation API — the restriction above is why.
+//! archives. It intentionally exposes no archive writer, builder, compressor,
+//! or creation API, and never creates or rewrites a member — the restriction
+//! above is why. The one change it makes to an existing RAR5 archive is
+//! adding or removing a caller-named service record whose payload the caller
+//! supplies, copying every member and other header verbatim
+//! ([`container`]).
 //!
 //! # Listing an archive
 //!
@@ -236,6 +240,7 @@
 //! [rarpar benchmarks](https://github.com/scryer-media/rarpar/blob/main/docs/benchmark.md).
 
 pub mod archive;
+pub mod container;
 pub(crate) mod crc;
 pub(crate) mod crc_simd;
 #[cfg(any(feature = "crypto-host", feature = "crc-host"))]

@@ -42,8 +42,12 @@ and PAR2 workflows.
 
 ## RAR/PAR2 Rules
 
-- `unrar-rs` is read/extract/recovery-only.
-- Do not add archive writer, archive builder, compressor, or modify-RAR APIs.
+- `unrar-rs` is read/extract/recovery-only, plus service-record hooks.
+- Do not add archive writer, archive builder, compressor, or member writer
+  APIs, or any API that creates, rewrites or recompresses a member. The one
+  allowed modification is appending or removing a caller-named service
+  record with a caller-supplied payload in an existing RAR5 archive
+  (`unrar-rs` `container`), copying every member and other header verbatim.
 - Standard crypto must use `aws-lc-rs` in the default feature set of every
   crate and in every shipped `rarpar` artifact. No crate depends on
   `aws-lc-sys` directly: its `links` key is versioned, so a direct

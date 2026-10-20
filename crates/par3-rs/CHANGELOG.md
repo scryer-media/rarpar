@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.8.0
+
+Breaking: par3-rs no longer knows RAR. PAR-inside for RAR moved to `rarpar`,
+which frames each carrier as a RAR5 service record through `unrar-rs`.
+
+- Removed `inside::rar5` (`Rar5Layout`, `Rar5Placement`, `Rar5Set`,
+  `prepare_hosts`, `inspect` and the rest), the experimental `inside::rar4`,
+  and `RarCipher`. ZIP, ZIP64 and 7z `inside` are unchanged.
+- **Experimental:** new `embedded` module, container-blind embedded carrier
+  sets. The caller describes each host file (`EmbeddedHost`: path, recorded
+  name, and the split the carrier goes at) and implements the container side:
+  `InsertFraming` writes the host bytes around each carrier and the framing
+  in front of it, and `CarrierFraming` says which framing lengths fit, rebuilds
+  the framing bytes on repair (or answers that it cannot, when it lacks a key)
+  and hints where a file's carrier and volume number are. The crate plans one
+  set over the hosts (`Placement::{Spread, Last, Independent}`,
+  `placement_counts`), writes, verifies, repairs and removes, with the staging,
+  authentication and all-or-nothing installation the RAR5 code had.
+  `insert_set`, `open`, `EmbeddedSet::{needs_repair, repair, removable,
+  remove}`. `Placement` and the `EmbeddedInserted` and `EmbeddedRepaired`
+  reports are `#[non_exhaustive]`. The carrier layout is not part of the PAR3 specification and may
+  change; carriers written by this version may not verify with a later one.
+- An opened host reports `carrier_intact` (every carrier packet at its slot)
+  and `framing_intact` (`None` when the caller could not rebuild its framing);
+  `region_intact()` combines them. Damaged framing is rebuilt by repair.
+
 ## 0.7.1
 
 - A repair that keeps a backup (`RepairOptions::with_backup(true)`, or
