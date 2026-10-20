@@ -336,8 +336,11 @@ pub use path::sanitize_path;
 pub use probe::{ProbeFile, VolumeProbe, probe_volume};
 pub use progress::{NoProgress, ProgressHandler};
 pub use recovery::{
-    DataVolumePlan, DataVolumeStatus, RecoveryOptions, RecoveryReport, RecoveryVolumePlan,
-    RestorePlan, RevTestResult, RevTestStatus, plan_volume_restore, restore_volumes_from_paths,
+    DataVolumePlan, DataVolumeState, DataVolumeStatus, FileVolumeSource, RecoveryOptions,
+    RecoveryReport, RecoveryVolumePlan, RecoveryVolumeState, RestorePlan, RestoreSet,
+    RestoredVolume, RevTestResult, RevTestStatus, SliceVolumeSource, StreamRestoreOptions,
+    VolumeAssessment, VolumeRef, VolumeRestoreError, VolumeRestoreReport, VolumeSource,
+    assess_volume_set, plan_volume_restore, restore_volume_set, restore_volumes_from_paths,
     test_recovery_volumes,
 };
 pub use stored_layout::{

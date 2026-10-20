@@ -26,20 +26,69 @@
   it to and the `.bad` name it would move it to. It lists the set's `.rev`s,
   each with its recovery slot, its `volume_number` in the whole set and
   whether the restore can use it: one whose CRC32 fails, or whose number
-  falls outside the set's recovery slots, is listed as unusable. A `.rev`
-  that states no set RAR could have written is not listed;
-  `test_recovery_volumes` reports on it. Both functions share discovery,
-  slot assignment, validity checks and output naming, so for the files as
-  they are when the plan runs, its `missing_volume_numbers()` and output
-  paths are the volumes the restore rebuilds and the paths it reports. A set
-  short of usable recovery volumes, one whose every `.rev` fails its CRC32
-  included, is a plan with `is_sufficient()` false and the counts, not an
-  error, so a caller can say how many more volumes it needs before fetching
-  them.
+  falls outside the set's recovery slots, is listed as unusable. A RAR5
+  set whose table gives a data volume more bytes than a usable `.rev`
+  carries is refused by the plan and the restore alike, naming the `.rev`,
+  the volume and both lengths, as the rebuild would write past anything the
+  `.rev`s hold. A `.rev` that states no set RAR could have written is not
+  listed; `test_recovery_volumes` reports on it. Both functions share
+  discovery, slot assignment, validity checks and output naming, so for the
+  files as they are when the plan runs, its `missing_volume_numbers()` and
+  output paths are the volumes the restore rebuilds and the paths it
+  reports. A set short of usable recovery volumes, one whose every `.rev`
+  fails its CRC32 included, is a plan with `is_sufficient()` false and the
+  counts, not an error, so a caller can say how many more volumes it needs
+  before fetching them.
 - `RevTestStatus`, `RevTestResult`, `DataVolumeStatus`, `DataVolumePlan`,
   `RecoveryVolumePlan` and `RestorePlan` are `#[non_exhaustive]`, so a later
   release can add to them: match the enums with a wildcard arm, and read the
   structs' fields rather than building them.
+- `restore_volume_set` rebuilds a set's missing and damaged data volumes from
+  volumes the caller holds, without staging files. The caller gives the set's
+  shape as a `RestoreSet` (each slot's length, or `None` for a volume it
+  lacks, built with `RestoreSet::new`), serves reads through a `VolumeSource`
+  (`SliceVolumeSource` over buffers and `FileVolumeSource` over open files are
+  provided) and takes the rebuilt bytes in a sink called as
+  `write(index, offset, bytes)`, each volume's offsets running on from 0.
+  Every volume the decode uses is checked first: a RAR5 `.rev` header, or a
+  RAR 3.10 `.rev` footer, must state the set's counts and its own position, a
+  RAR5 table may give no data volume more bytes than a usable `.rev` carries,
+  and each data volume must pass the check `plan_volume_restore` makes;
+  volumes in `known_bad` are rebuilt unread. When the rebuilt volumes fit
+  `StreamRestoreOptions::memory_bytes`, each data volume is read once and the
+  rebuild is held until every check has passed; otherwise a check pass and a
+  decode pass read each data volume twice at most, in slices of 4 KiB or more
+  when the volumes run that long. The field arithmetic runs on a pool of
+  `StreamRestoreOptions::workers` threads, at most the machine's available
+  parallelism, that the call builds for itself, never the caller's; reads and
+  sink calls stay on the calling thread. A RAR5 volume of odd length is
+  rebuilt from whole words, each input read to the next even byte, as
+  reference UnRAR reads it. A RAR3 set's last volume is cut at its
+  end-of-archive block where reference UnRAR cuts it, and the bytes the cut
+  could drop reach the sink only once it is decided. A set whose `.rev`s show
+  neither the RAR5 signature nor a RAR 3.10 footer is told by its data
+  volumes: one that starts with the RAR5 signature makes it a RAR5 set with no
+  `.rev` header to read (`NoRecoveryVolumes`); otherwise it is taken as RAR
+  3.0's when a data volume's RAR 1.5-4.x main header reads and marks it a
+  volume, and refused (`InconsistentSet`) when none does. A RAR 3.0 `.rev`
+  states nothing to check and is used unverified at the position given, unless
+  it is shorter than a data volume present and not known bad, as RAR writes
+  each as long as the longest; a slot longer than the `.rev`s, from bytes
+  appended to a volume or a wrong file in it, therefore makes every RAR 3.0
+  `.rev` unusable until that slot is passed in `known_bad`. `RestoreSet` and
+  `StreamRestoreOptions` are
+  `#[non_exhaustive]`: build the options from `Default`. The
+  `VolumeRestoreReport` gives each rebuilt volume's length, CRC32 and whether
+  it passes the check a present volume gets; a failure is a
+  `VolumeRestoreError`, an I/O one naming the volume as a `VolumeRef`.
+- `assess_volume_set` makes the same checks without rebuilding, reading each
+  present volume once (and before that, when the `.rev`s do not show the
+  set's format, the start of the data volumes), and returns a
+  `VolumeAssessment`: every data and recovery volume's status, and whether
+  the set is sufficient. A set short of usable recovery volumes is an
+  assessment, not an error. The stream and path restores share the `.rev`
+  parsers, the RAR3 header walk and the decoders, and keep separate I/O, so
+  the path restore reads and writes as it did.
 
 ### Changed
 
@@ -53,6 +102,11 @@
   ("insufficient RAR3 recovery volumes: need N, have 0") instead of with "no
   valid RAR recovery volumes were found", and one whose data volumes are all
   intact reports nothing to restore.
+- `restore_volumes_from_paths` refuses a RAR5 set whose table gives a data
+  volume more bytes than a usable `.rev` carries, as `plan_volume_restore`
+  does, before it reads a data volume or writes anything. RAR writes every
+  `.rev` payload as long as the longest volume, so a table past that is not
+  the set's, and rebuilding to it would write zeros past the recovery data.
 
 ### Fixed
 

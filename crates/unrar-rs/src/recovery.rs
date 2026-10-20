@@ -20,6 +20,14 @@ use reedsolomon_rs::decode_apply::apply_decode_matrix_gf8;
 use reedsolomon_rs::rar3::Rar3RsCoder;
 use reedsolomon_rs::rar5::Rar5RsCoder;
 
+mod stream;
+
+pub use stream::{
+    DataVolumeState, FileVolumeSource, RecoveryVolumeState, RestoreSet, RestoredVolume,
+    SliceVolumeSource, StreamRestoreOptions, VolumeAssessment, VolumeRef, VolumeRestoreError,
+    VolumeRestoreReport, VolumeSource, assess_volume_set, restore_volume_set,
+};
+
 const REV5_SIGN: &[u8; 8] = b"Rar!\x1aRev";
 const REV5_PREFIX_LEN: usize = 16;
 const MAX_RAR5_VOLUMES: usize = 65_535;
@@ -349,7 +357,7 @@ fn test_recovery_volume(path: &Path) -> RevTestResult {
 fn test_rev(path: &Path) -> RarResult<(Option<ArchiveFormat>, RevTestStatus)> {
     let file = File::open(path).map_err(RarError::from)?;
     Ok(match read_rev(file, path)? {
-        RevRead::Rar5 { payload, .. } => (Some(ArchiveFormat::Rar5), rar5_rev_status(&payload)?),
+        RevRead::Rar5 { payload, .. } => (Some(ArchiveFormat::Rar5), rar5_rev_status(&payload)?.0),
         RevRead::Rar3 { header, payload } => {
             let rev = Rar3Rev {
                 header,
@@ -600,24 +608,40 @@ struct RevPayload {
 }
 
 impl RevPayload {
-    /// `None` when the payload's CRC32 is the one the volume states, else
-    /// the stated and the computed CRC32.
-    fn mismatch(&self) -> RarResult<Option<(u32, u32)>> {
+    /// The payload's CRC32 and the bytes it covered, from one read through
+    /// it: the count is what the read found, so a RAR5 payload's length
+    /// needs no other call on the file.
+    fn hash(&self) -> RarResult<(u32, u64)> {
         let mut file = &self.file;
         if let Some(start) = self.start {
             file.seek(SeekFrom::Start(start)).map_err(RarError::from)?;
         }
-        let actual = crc32_stream(&mut file, self.len)?;
+        let mut payload = file.take(self.len);
+        let actual = crc32_stream(&mut payload, self.len)?;
+        Ok((actual, self.len - payload.limit()))
+    }
+
+    /// `None` when the payload's CRC32 is the one the volume states, else
+    /// the stated and the computed CRC32.
+    fn mismatch(&self) -> RarResult<Option<(u32, u32)>> {
+        let (actual, _) = self.hash()?;
         Ok((actual != self.expected).then_some((self.expected, actual)))
     }
 }
 
-/// What a RAR5 `.rev`'s payload CRC32 says about it.
-fn rar5_rev_status(payload: &RevPayload) -> RarResult<RevTestStatus> {
-    Ok(match payload.mismatch()? {
-        None => RevTestStatus::Ok,
-        Some((expected, actual)) => RevTestStatus::CrcMismatch { expected, actual },
-    })
+/// What a RAR5 `.rev`'s payload CRC32 says about it, and the payload's
+/// length: the recovery data it carries.
+fn rar5_rev_status(payload: &RevPayload) -> RarResult<(RevTestStatus, u64)> {
+    let (actual, carried) = payload.hash()?;
+    let status = if actual == payload.expected {
+        RevTestStatus::Ok
+    } else {
+        RevTestStatus::CrcMismatch {
+            expected: payload.expected,
+            actual,
+        }
+    };
+    Ok((status, carried))
 }
 
 /// What a RAR3 `.rev`'s footer CRC32 says about it.
@@ -683,26 +707,39 @@ fn read_rev(mut file: File, path: &Path) -> RarResult<RevRead> {
     if read_padded(&mut file, &mut footer)? < footer.len() {
         return Ok(RevRead::Unrecognised);
     }
-    let data_count = footer[0] as usize + 1;
-    let rec_count = footer[1] as usize + 1;
-    let rec_position = footer[2] as usize + 1;
-    if data_count + rec_count > 255 || data_count + rec_position - 1 > 255 {
+    let Some((header, expected)) = parse_rar3_rev_footer(footer) else {
         return Ok(RevRead::Unrecognised);
-    }
+    };
     Ok(RevRead::Rar3 {
-        header: Rar3RevHeader {
-            rec_position,
-            rec_count,
-            data_count,
-            new_style: true,
-        },
+        header,
         payload: RevPayload {
             file,
             start: Some(0),
             len: len - 4,
-            expected: le_u32(&footer[3..]),
+            expected,
         },
     })
+}
+
+/// The set a new-style RAR3 `.rev` footer states, and the CRC32 it stores:
+/// the data volume count, the recovery volume count and this volume's
+/// position among the recovery volumes, each stored less one, then the
+/// CRC32 of every byte before it, little-endian. `None` for parameters RAR
+/// could not have written, which reference UnRAR passes over.
+fn parse_rar3_rev_footer(footer: [u8; 7]) -> Option<(Rar3RevHeader, u32)> {
+    let data_count = footer[0] as usize + 1;
+    let rec_count = footer[1] as usize + 1;
+    let rec_position = footer[2] as usize + 1;
+    if data_count + rec_count > 255 || data_count + rec_position - 1 > 255 {
+        return None;
+    }
+    let header = Rar3RevHeader {
+        rec_position,
+        rec_count,
+        data_count,
+        new_style: true,
+    };
+    Some((header, le_u32(&footer[3..])))
 }
 
 /// A volume name split around its volume number, `head` `digits` `tail` `.`
@@ -1126,7 +1163,7 @@ fn survey_rar5_set(
         let Some(status) = statuses[index].take() else {
             continue;
         };
-        let status = status?;
+        let (status, carried) = status?;
         let slot = header.rec_num.saturating_sub(data_count);
         let usable = status == RevTestStatus::Ok && header.rec_num >= data_count;
         if usable
@@ -1135,6 +1172,26 @@ fn survey_rar5_set(
             })?
         {
             continue;
+        }
+        // A missing volume is rebuilt at the length the table gives, from
+        // the payloads of the usable `.rev`s, which RAR writes as long as the
+        // longest volume. A table that gives a volume more than a usable
+        // `.rev` carries is not the set's, and would have the restore write
+        // past anything the `.rev`s hold.
+        if usable
+            && let Some((number, info)) = table
+                .iter()
+                .enumerate()
+                .find(|(_, info)| info.file_size > carried)
+        {
+            return Err(RarError::CorruptArchive {
+                detail: format!(
+                    "RAR5 recovery volume {} carries {carried} bytes of recovery data, fewer than the {} bytes the set's table gives data volume {}",
+                    candidate.path.display(),
+                    info.file_size,
+                    number + 1
+                ),
+            });
         }
         recovery_volumes.push(RecoveryVolumePlan {
             slot,
@@ -1862,7 +1919,12 @@ fn reconstruct_rar5(
         .map(|slot| slot.file_size)
         .max()
         .unwrap_or(0);
-    let chunk_size = rar5_chunk_size(max_volume_size, data_count, missing_count);
+    let chunk_size = rar5_chunk_size(
+        max_volume_size,
+        data_count,
+        missing_count,
+        RAR5_TOTAL_BUFFER_SIZE,
+    );
 
     let mut data_files = data_slots
         .iter()
@@ -2054,10 +2116,17 @@ fn reconstruct_rar5(
     })
 }
 
-fn rar5_chunk_size(max_volume_size: u64, data_count: usize, missing_count: usize) -> usize {
-    // Keep the two input sets and the outputs within the existing budget
-    // when read-ahead is useful, without allocating past the volume's end.
-    let budget = (RAR5_TOTAL_BUFFER_SIZE / (2 * data_count + missing_count).max(1)).max(2);
+/// The RAR5 decode's chunk length: two input sets and the outputs within
+/// `budget` bytes when read-ahead is useful, without allocating past the
+/// longest volume's end. The path restore passes [`RAR5_TOTAL_BUFFER_SIZE`];
+/// the stream restore passes the caller's memory budget.
+fn rar5_chunk_size(
+    max_volume_size: u64,
+    data_count: usize,
+    missing_count: usize,
+    budget: usize,
+) -> usize {
+    let budget = (budget / (2 * data_count + missing_count).max(1)).max(2);
     let budget = budget - (budget & 1);
     let useful = max_volume_size.min(budget as u64) as usize;
     // GF16 needs an even buffer length, including a final odd-byte pad.
@@ -2087,13 +2156,13 @@ where
     }
 }
 
-/// Read the rest of a RAR5 `.rev` header from `file`, whose first
+/// Read the rest of a RAR5 `.rev` header from `reader`, whose first
 /// [`REV5_PREFIX_LEN`] bytes, `prefix`, have been read and start with the
 /// RAR5 signature. The read stops at the end of the header, where the
 /// payload starts. `None` when the header does not parse, as reference UnRAR
 /// refuses it.
-fn read_rar5_rev_header(
-    file: &mut File,
+fn read_rar5_rev_header<R: Read>(
+    reader: &mut R,
     prefix: &[u8; REV5_PREFIX_LEN],
 ) -> RarResult<Option<Rar5RevHeader>> {
     let size_bytes = &prefix[REV5_SIGN.len() + 4..REV5_SIGN.len() + 8];
@@ -2104,7 +2173,7 @@ fn read_rar5_rev_header(
     }
 
     let mut raw = vec![0u8; header_size];
-    if read_padded(file, &mut raw)? < header_size {
+    if read_padded(reader, &mut raw)? < header_size {
         return Ok(None);
     }
     let mut hasher = crc32fast::Hasher::new();
@@ -2276,9 +2345,20 @@ struct Rar3VolumeScan {
 /// flags when they were read. One whose headers are encrypted shows nothing
 /// past its main header and is taken as valid on that, as UnRAR takes it.
 /// Only an I/O error other than an early end of file is an error.
-fn rar3_volume_scan(file: &mut File) -> RarResult<Rar3VolumeScan> {
-    let mut main_flags = None;
-    match rar3_volume_walk(file, &mut main_flags) {
+fn rar3_volume_scan<R: Read + Seek>(reader: &mut R) -> RarResult<Rar3VolumeScan> {
+    let mut walk = Rar3Walk::default();
+    let walked = rar3_volume_walk(reader, &mut walk);
+    rar3_scan_verdict(walk.main_flags, walked)
+}
+
+/// A [`Rar3VolumeScan`] from the outcome of a walk that read `main_flags`:
+/// an error that says the headers are damaged is the `InvalidHeaders`
+/// verdict, and any other error stays an error.
+fn rar3_scan_verdict(
+    main_flags: Option<u16>,
+    walked: RarResult<(DataVolumeStatus, Option<u16>)>,
+) -> RarResult<Rar3VolumeScan> {
+    match walked {
         Ok((status, end_volume_number)) => Ok(Rar3VolumeScan {
             main_flags,
             status,
@@ -2310,48 +2390,24 @@ fn rar3_volume_damage(error: &RarError) -> bool {
     }
 }
 
-/// The header walk of [`rar3_volume_scan`]: the verdict on the headers and
-/// data CRC, and the volume number the end-of-archive header states.
-fn rar3_volume_walk(
-    file: &mut File,
-    main_flags: &mut Option<u16>,
+/// The header walk of [`rar3_volume_scan`] over a reader it can seek back
+/// in: the verdict on the headers and data CRC, and the volume number the
+/// end-of-archive header states. The data CRC is a second read of
+/// everything before that header.
+fn rar3_volume_walk<R: Read + Seek>(
+    reader: &mut R,
+    walk: &mut Rar3Walk,
 ) -> RarResult<(DataVolumeStatus, Option<u16>)> {
-    use crate::rar4::header::{parse_end_header, parse_file_header, read_raw_header, skip_forward};
-    use crate::rar4::types::{Rar4HeaderType, archive_flags};
-
-    file.seek(SeekFrom::Start(0)).map_err(RarError::from)?;
-    // A RAR 1.4 archive has no end-of-archive header, and no RAR version
-    // that writes recovery volumes writes that format.
-    if crate::signature::read_signature(file)? != ArchiveFormat::Rar4 {
-        return Ok((DataVolumeStatus::InvalidHeaders, None));
-    }
-    let Some(main) = read_raw_header(file)? else {
-        return Ok((DataVolumeStatus::InvalidHeaders, None));
-    };
-    if main.header_type != Rar4HeaderType::Archive {
-        return Ok((DataVolumeStatus::InvalidHeaders, None));
-    }
-    *main_flags = Some(main.flags);
-    if main.flags & archive_flags::ENCRYPTED_HEADERS != 0 {
-        return Ok((DataVolumeStatus::Valid, None));
-    }
-    skip_forward(file, main.data_area_size)?;
-
-    while let Some(raw) = read_raw_header(file)? {
-        match raw.header_type {
-            Rar4HeaderType::File | Rar4HeaderType::NewSub => {
-                let header = parse_file_header(&raw)?;
-                // Forward-only skip: a declared size above `i64::MAX` would
-                // otherwise rewind this scan and loop forever (fuzz reproducer
-                // `timeout-a8693f23`).
-                skip_forward(file, header.packed_size)?;
-            }
-            Rar4HeaderType::EndArchive => {
-                let end = parse_end_header(&raw);
+    reader.seek(SeekFrom::Start(0)).map_err(RarError::from)?;
+    loop {
+        match walk.step(reader)? {
+            Rar3WalkStep::Next => {}
+            Rar3WalkStep::Stopped(status) => return Ok((status, None)),
+            Rar3WalkStep::End(end) => {
                 let status = match end.data_crc {
                     Some(expected) => {
-                        file.seek(SeekFrom::Start(0)).map_err(RarError::from)?;
-                        if crc32_stream(file, raw.offset)? == expected {
+                        reader.seek(SeekFrom::Start(0)).map_err(RarError::from)?;
+                        if crc32_stream(reader, end.offset)? == expected {
                             DataVolumeStatus::Valid
                         } else {
                             DataVolumeStatus::CrcMismatch
@@ -2361,12 +2417,122 @@ fn rar3_volume_walk(
                 };
                 return Ok((status, end.volume_number));
             }
-            _ => {
-                skip_forward(file, raw.data_area_size)?;
+        }
+    }
+}
+
+/// Where a [`Rar3Walk`] stands: before the signature, before the main
+/// header, or before one of the headers after it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Rar3WalkAt {
+    #[default]
+    Signature,
+    Main,
+    Header,
+}
+
+/// The header walk of a RAR3 data volume, one header per step, so the same
+/// walk judges a file it can seek back in and bytes streaming past once.
+/// A step reads at the reader's position and leaves it at the next header.
+#[derive(Debug, Clone, Copy, Default)]
+struct Rar3Walk {
+    at: Rar3WalkAt,
+    /// The main header's flags, once the main header is read.
+    main_flags: Option<u16>,
+}
+
+/// What one step of a [`Rar3Walk`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Rar3WalkStep {
+    /// Another header follows.
+    Next,
+    /// The walk ended before an end-of-archive header with this verdict:
+    /// `InvalidHeaders`, or `Valid` for a volume whose headers are
+    /// encrypted.
+    Stopped(DataVolumeStatus),
+    /// The walk reached the end-of-archive header.
+    End(Rar3EndBlock),
+}
+
+/// The end-of-archive header a [`Rar3Walk`] reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rar3EndBlock {
+    /// Where the header starts; a stated data CRC covers every byte before.
+    offset: u64,
+    /// Where the block ends, past the header and any data area it declares.
+    next: u64,
+    /// The CRC32 of every byte before the header, when stated.
+    data_crc: Option<u32>,
+    /// The zero-based volume number, when stated.
+    volume_number: Option<u16>,
+}
+
+impl Rar3Walk {
+    /// Read the next header, or the signature first.
+    fn step<R: Read + Seek>(&mut self, reader: &mut R) -> RarResult<Rar3WalkStep> {
+        use crate::rar4::header::{
+            parse_end_header, parse_file_header, read_raw_header, skip_forward,
+        };
+        use crate::rar4::types::{Rar4HeaderType, archive_flags};
+
+        match self.at {
+            Rar3WalkAt::Signature => {
+                // A RAR 1.4 archive has no end-of-archive header, and no RAR
+                // version that writes recovery volumes writes that format.
+                if crate::signature::read_signature(reader)? != ArchiveFormat::Rar4 {
+                    return Ok(Rar3WalkStep::Stopped(DataVolumeStatus::InvalidHeaders));
+                }
+                self.at = Rar3WalkAt::Main;
+                Ok(Rar3WalkStep::Next)
+            }
+            Rar3WalkAt::Main => {
+                let Some(main) = read_raw_header(reader)? else {
+                    return Ok(Rar3WalkStep::Stopped(DataVolumeStatus::InvalidHeaders));
+                };
+                if main.header_type != Rar4HeaderType::Archive {
+                    return Ok(Rar3WalkStep::Stopped(DataVolumeStatus::InvalidHeaders));
+                }
+                self.main_flags = Some(main.flags);
+                if main.flags & archive_flags::ENCRYPTED_HEADERS != 0 {
+                    return Ok(Rar3WalkStep::Stopped(DataVolumeStatus::Valid));
+                }
+                skip_forward(reader, main.data_area_size)?;
+                self.at = Rar3WalkAt::Header;
+                Ok(Rar3WalkStep::Next)
+            }
+            Rar3WalkAt::Header => {
+                let Some(raw) = read_raw_header(reader)? else {
+                    return Ok(Rar3WalkStep::Stopped(DataVolumeStatus::InvalidHeaders));
+                };
+                match raw.header_type {
+                    Rar4HeaderType::File | Rar4HeaderType::NewSub => {
+                        let header = parse_file_header(&raw)?;
+                        // Forward-only skip: a declared size above `i64::MAX`
+                        // would otherwise rewind this walk and loop forever
+                        // (fuzz reproducer `timeout-a8693f23`).
+                        skip_forward(reader, header.packed_size)?;
+                        Ok(Rar3WalkStep::Next)
+                    }
+                    Rar4HeaderType::EndArchive => {
+                        let end = parse_end_header(&raw);
+                        Ok(Rar3WalkStep::End(Rar3EndBlock {
+                            offset: raw.offset,
+                            next: raw
+                                .offset
+                                .saturating_add(u64::from(raw.header_size))
+                                .saturating_add(raw.data_area_size),
+                            data_crc: end.data_crc,
+                            volume_number: end.volume_number,
+                        }))
+                    }
+                    _ => {
+                        skip_forward(reader, raw.data_area_size)?;
+                        Ok(Rar3WalkStep::Next)
+                    }
+                }
             }
         }
     }
-    Ok((DataVolumeStatus::InvalidHeaders, None))
 }
 
 /// [`rar3_volume_scan`] for a path; `None` when there is no file.
@@ -3513,7 +3679,10 @@ mod tests {
             (3_532_045, 3_532_044),
             (u64::MAX, 3_532_044),
         ] {
-            assert_eq!(rar5_chunk_size(volume_size, 9, 1), expected);
+            assert_eq!(
+                rar5_chunk_size(volume_size, 9, 1, RAR5_TOTAL_BUFFER_SIZE),
+                expected
+            );
         }
     }
 
@@ -3960,7 +4129,7 @@ mod tests {
     #[test]
     fn rar5_folded_restore_preserves_read_ahead_and_a_final_odd_tail() {
         let dir = tempfile::tempdir().unwrap();
-        let chunk_size = rar5_chunk_size(u64::MAX, 2, 1);
+        let chunk_size = rar5_chunk_size(u64::MAX, 2, 1, RAR5_TOTAL_BUFFER_SIZE);
         let header_len = build_probe_rar5_archive(
             crate::header::main_archive::flags::VOLUME
                 | crate::header::main_archive::flags::VOLUME_NUMBER,
