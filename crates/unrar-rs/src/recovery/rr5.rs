@@ -698,7 +698,7 @@ mod tests {
         "rar5_mv_store_rr.part6.rar",
     ];
 
-    fn rar5(name: &str) -> Vec<u8> {
+    fn rar5(name: &str) -> Option<Vec<u8>> {
         fixture("rar5", name)
     }
 
@@ -818,7 +818,9 @@ mod tests {
     #[test]
     fn fixture_records_recompute_byte_for_byte() {
         for name in FIXTURES {
-            let bytes = rar5(name);
+            let Some(bytes) = rar5(name) else {
+                return;
+            };
             let record = record(&bytes);
             assert!(!record.found_by_scan, "{name}: locator");
             let geometry = &record.geometry;
@@ -858,7 +860,9 @@ mod tests {
 
     #[test]
     fn fixture_geometry_is_what_rar_chose() {
-        let bytes = rar5("rar5_recovery.rar");
+        let Some(bytes) = rar5("rar5_recovery.rar") else {
+            return;
+        };
         let single = layout(&bytes);
         assert_eq!((single.data_units, single.parity_units), (1, 1));
         assert_eq!(record(&bytes).geometry.slices(), 1);
@@ -866,17 +870,25 @@ mod tests {
         assert_eq!(single.record_size, 0x50 + 154);
         // `-rr5p -v4k`: 2869 protected bytes in a 4096-byte volume give three
         // 958-byte units and one parity unit, since 5% of 3 rounds to none.
-        let part1 = layout(&rar5("rar5_mv_store_rr.part1.rar"));
+        let Some(part1) = rar5("rar5_mv_store_rr.part1.rar") else {
+            return;
+        };
+        let part1 = layout(&part1);
         assert_eq!((part1.data_units, part1.parity_units), (3, 1));
         assert_eq!(part1.unit_size, 958);
         assert_eq!((part1.protected_size, part1.record_offset), (2869, 2892));
-        let part6 = layout(&rar5("rar5_mv_store_rr.part6.rar"));
+        let Some(part6) = rar5("rar5_mv_store_rr.part6.rar") else {
+            return;
+        };
+        let part6 = layout(&part6);
         assert_eq!((part6.protected_size, part6.unit_size), (2584, 862));
     }
 
     #[test]
     fn repairs_one_damaged_unit_anywhere_in_a_fixture() {
-        let original = rar5("rar5_mv_store_rr.part3.rar");
+        let Some(original) = rar5("rar5_mv_store_rr.part3.rar") else {
+            return;
+        };
         let layout = layout(&original);
         assert_eq!(layout.parity_units, 1);
         for unit in 0..layout.data_units {
@@ -898,7 +910,9 @@ mod tests {
 
     #[test]
     fn repairs_a_damaged_signature_and_main_header() {
-        let original = rar5("rar5_mv_store_rr.part1.rar");
+        let Some(original) = rar5("rar5_mv_store_rr.part1.rar") else {
+            return;
+        };
         let hurt = damaged(&original, &[(0, 40)], Damage::Noise);
         let assessment = assess(&hurt);
         assert!(assessment.layout.found_by_scan);
@@ -908,7 +922,9 @@ mod tests {
 
     #[test]
     fn repairs_the_whole_protected_range_of_a_one_unit_record() {
-        let original = rar5("rar5_recovery.rar");
+        let Some(original) = rar5("rar5_recovery.rar") else {
+            return;
+        };
         let layout = layout(&original);
         let hurt = damaged(&original, &[(0, layout.protected_size)], Damage::Zero);
         let (repair, fixed) = repaired(&hurt);
@@ -918,7 +934,9 @@ mod tests {
 
     #[test]
     fn over_capacity_damage_is_refused() {
-        let original = rar5("rar5_mv_store_rr.part2.rar");
+        let Some(original) = rar5("rar5_mv_store_rr.part2.rar") else {
+            return;
+        };
         let layout = layout(&original);
         let (a, _) = unit_range(&layout, 0);
         let (b, _) = unit_range(&layout, 2);
@@ -932,7 +950,9 @@ mod tests {
 
     #[test]
     fn a_record_whose_only_chunk_is_damaged_is_no_record() {
-        let original = rar5("rar5_mv_store_rr.part4.rar");
+        let Some(original) = rar5("rar5_mv_store_rr.part4.rar") else {
+            return;
+        };
         let layout = layout(&original);
         // Inside the parity bytes of the only chunk.
         let hurt = damaged(
@@ -947,7 +967,9 @@ mod tests {
 
     #[test]
     fn damage_after_the_record_is_outside_its_reach() {
-        let original = rar5("rar5_mv_store_rr.part5.rar");
+        let Some(original) = rar5("rar5_mv_store_rr.part5.rar") else {
+            return;
+        };
         let layout = layout(&original);
         let end = layout.record_range().end;
         let hurt = damaged(&original, &[(end + 1, 2)], Damage::Noise);
@@ -959,7 +981,9 @@ mod tests {
 
     #[test]
     fn a_damaged_rr_header_is_bridged_by_the_backward_scan() {
-        let original = rar5("rar5_mv_store_rr.part6.rar");
+        let Some(original) = rar5("rar5_mv_store_rr.part6.rar") else {
+            return;
+        };
         let layout = layout(&original);
         let gap = layout.record_offset - layout.protected_size;
         let hurt = damaged(&original, &[(layout.protected_size, gap)], Damage::Noise);
@@ -975,8 +999,12 @@ mod tests {
     /// the volume's own record.
     #[test]
     fn a_foreign_chunk_after_the_record_does_not_stop_the_scan() {
-        let original = rar5("rar5_mv_store_rr.part1.rar");
-        let other = rar5("rar5_recovery.rar");
+        let Some(original) = rar5("rar5_mv_store_rr.part1.rar") else {
+            return;
+        };
+        let Some(other) = rar5("rar5_recovery.rar") else {
+            return;
+        };
         let other_record = record(&other);
         let mut hurt = original.clone();
         hurt[2869..2892].fill(0x55);

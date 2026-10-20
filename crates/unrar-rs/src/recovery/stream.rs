@@ -2505,7 +2505,6 @@ impl LastVolume {
 #[cfg(test)]
 mod tests {
     use std::io::{Cursor, Write};
-    use std::path::Path;
 
     use super::*;
     use crate::recovery::{rar3_volume_scan, truncate_rar3_last_volume_padding};
@@ -2515,14 +2514,7 @@ mod tests {
         shareable::<VolumeRestoreError>();
     };
 
-    /// A fixture's bytes, or `None` where the corpus is not hydrated.
-    fn fixture(dir: &str, name: &str) -> Option<Vec<u8>> {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures")
-            .join(dir)
-            .join(name);
-        std::fs::read(path).ok()
-    }
+    use crate::recovery::test_support::fixture;
 
     /// The RAR3 data volumes RARLAB wrote for the recovery tests, with the
     /// slot each takes in its set.
@@ -2603,7 +2595,11 @@ mod tests {
                 &[4096, 65_537, usize::MAX]
             };
             for (case, bytes) in damage_cases(bytes) {
-                let expected = format!("{:?}", rar3_volume_scan(&mut Cursor::new(&bytes)));
+                // The file walk also reports the volume's length; a stream
+                // has no end to measure until its producer says so.
+                let expected = rar3_volume_scan(&mut Cursor::new(&bytes))
+                    .map(|scan| Rar3VolumeScan { len: None, ..scan });
+                let expected = format!("{expected:?}");
                 for &chunk in chunks {
                     let (stream, _) = stream_over(&bytes, chunk);
                     let verdict = format!("{:?}", stream.verdict.as_ref().unwrap());

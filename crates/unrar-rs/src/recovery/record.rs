@@ -418,16 +418,26 @@ pub(super) fn xor_into(acc: &mut [u8], bytes: &[u8]) {
 }
 
 #[cfg(test)]
-pub(super) mod test_support {
+pub(crate) mod test_support {
     use std::path::{Path, PathBuf};
 
-    /// A committed fixture under `tests/fixtures/<dir>`.
-    pub(in crate::recovery) fn fixture(dir: &str, name: &str) -> Vec<u8> {
+    /// A corpus fixture's bytes, under `tests/fixtures/<dir>`, or `None` with
+    /// a note on stderr where the lane's hydration profile does not carry it:
+    /// the test then returns, having checked nothing, as the fixture lanes
+    /// that hydrate the whole corpus run it in full.
+    pub(crate) fn fixture(dir: &str, name: &str) -> Option<Vec<u8>> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures")
             .join(dir)
             .join(name);
-        std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping: fixture {} is not hydrated", path.display());
+                None
+            }
+            Err(error) => panic!("{}: {error}", path.display()),
+        }
     }
 
     /// Deterministic bytes for damage: xorshift64 from `seed`.
@@ -465,10 +475,13 @@ mod tests {
 
     #[test]
     fn a_volume_without_a_record_has_none() {
+        let Some(archive) = fixture("rar5", "rar5_recovery.rar") else {
+            return;
+        };
         for bytes in [
             Vec::new(),
             b"not an archive at all".to_vec(),
-            fixture("rar5", "rar5_recovery.rar")[..154].to_vec(),
+            archive[..154].to_vec(),
         ] {
             let mut cursor = Cursor::new(bytes);
             assert_eq!(locate_recovery_record(&mut cursor, None).unwrap(), None);
@@ -482,10 +495,12 @@ mod tests {
 
     #[test]
     fn both_formats_give_the_same_shape() {
-        let rar4 =
-            locate_recovery_record(&mut Cursor::new(fixture("rar4", "rar4_recovery.rar")), None)
-                .unwrap()
-                .unwrap();
+        let Some(rar4) = fixture("rar4", "rar4_recovery.rar") else {
+            return;
+        };
+        let rar4 = locate_recovery_record(&mut Cursor::new(rar4), None)
+            .unwrap()
+            .unwrap();
         assert_eq!(rar4.format, ArchiveFormat::Rar4);
         assert_eq!((rar4.protected_size, rar4.record_offset), (152, 206));
         assert_eq!(
@@ -496,10 +511,12 @@ mod tests {
         assert_eq!(rar4.unit_range(0), 0..152);
         assert!(!rar4.found_by_scan);
 
-        let rar5 =
-            locate_recovery_record(&mut Cursor::new(fixture("rar5", "rar5_recovery.rar")), None)
-                .unwrap()
-                .unwrap();
+        let Some(rar5) = fixture("rar5", "rar5_recovery.rar") else {
+            return;
+        };
+        let rar5 = locate_recovery_record(&mut Cursor::new(rar5), None)
+            .unwrap()
+            .unwrap();
         assert_eq!(rar5.format, ArchiveFormat::Rar5);
         assert_eq!((rar5.protected_size, rar5.record_offset), (154, 177));
         assert_eq!((rar5.data_units, rar5.parity_units), (1, 1));

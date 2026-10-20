@@ -391,17 +391,22 @@ fn recovery_options(cli: &Cli) -> unrar_rs::RecoveryOptions {
 /// run's report does not count the set's data volumes, so neither does this.
 const NOTHING_TO_RESTORE: &str = "nothing to restore: all data volumes valid";
 
-/// The data volume names that the parity sets `auto` repairs before its RAR
-/// restore protect: those of each PAR2 set related to the RAR set and of
-/// each PAR3 set the run repairs, each resolved against its set's
-/// directory. A dry run cannot run those repairs, so it counts a damaged or
-/// missing volume whose output path one of them lists as rebuilt by then; a
+/// The files that the parity sets `auto` repairs before its RAR restore
+/// protect: those of each PAR2 set related to the RAR set and of each PAR3
+/// set the run repairs, each resolved against its set's directory. A dry
+/// run cannot run those repairs, so it counts a damaged or missing volume
+/// whose output path one of them lists as rebuilt by then, and a `.rev`
+/// file of the set one lists among the usable recovery volumes by then. A
 /// set under another directory that lists the same file name does not
-/// count.
+/// count; one that lists the name in another case counts where the
+/// directory folds case, as [`same_file`] decides.
 #[derive(Debug, Default)]
 pub struct ParityCover {
     pub par2: BTreeSet<PathBuf>,
     pub par3: BTreeSet<PathBuf>,
+    /// The `.rev` files of the RAR set among `par2` and `par3`, present or
+    /// not, as [`crate::discovery::recovery_volume_of`] picks them.
+    pub recovery_volumes: BTreeSet<PathBuf>,
 }
 
 impl ParityCover {
@@ -417,16 +422,30 @@ impl ParityCover {
         par2 || par3
     }
 
+    /// The `.rev` files of the set the parity rebuilds before the restore:
+    /// the listed ones at which `plan` found no usable recovery volume,
+    /// missing or passed over. Each adds one usable volume by then; which
+    /// slot a missing file fills, its name does not say for certain, so the
+    /// count is capped at the set's recovery volumes.
+    fn rebuilt_recovery_volumes(&self, plan: &unrar_rs::RestorePlan) -> Vec<&Path> {
+        self.recovery_volumes
+            .iter()
+            .map(PathBuf::as_path)
+            .filter(|listed| {
+                !plan
+                    .recovery_volumes
+                    .iter()
+                    .any(|volume| volume.usable && same_file(&volume.path, listed))
+            })
+            .collect()
+    }
+
     /// How [`ExecutedAction::deferred_to`] names the parity that rebuilds
-    /// `covered`, and how the message says it, PAR3 first as the real run
-    /// repairs.
-    fn deferral(&self, covered: &[&unrar_rs::DataVolumePlan]) -> (&'static str, &'static str) {
-        let par2 = covered
-            .iter()
-            .any(|volume| self.lists(&volume.output_path).0);
-        let par3 = covered
-            .iter()
-            .any(|volume| self.lists(&volume.output_path).1);
+    /// the files at `rebuilt`, and how the message says it, PAR3 first as
+    /// the real run repairs.
+    fn deferral(&self, rebuilt: &[&Path]) -> (&'static str, &'static str) {
+        let par2 = rebuilt.iter().any(|path| self.lists(path).0);
+        let par3 = rebuilt.iter().any(|path| self.lists(path).1);
         match (par2, par3) {
             (true, true) => ("par2+par3", "PAR3 and PAR2 repairs run"),
             (false, true) => ("par3", "PAR3 repair runs"),
@@ -449,9 +468,9 @@ impl Verdict {
 
 /// Judges a dry run's plan. A restore that would stop by itself is deferred,
 /// and passes, when the volumes `cover` lists are rebuilt first and the rest
-/// fit within the usable recovery volumes with no file in their way. Whether
-/// the parity holds enough recovery data for the volumes it lists is not
-/// checked.
+/// fit within the usable recovery volumes, counting the `.rev` files it
+/// lists, with no file in their way. Whether the parity holds enough
+/// recovery data for the files it lists is not checked.
 fn judge_plan(
     set_id: &str,
     overwrite: bool,
@@ -463,20 +482,29 @@ fn judge_plan(
         .iter()
         .filter(|volume| volume.status != unrar_rs::DataVolumeStatus::Valid)
         .collect::<Vec<_>>();
-    let alone = verdict(&plan, overwrite, &rebuild);
+    let usable = plan.usable_recovery_count();
+    let alone = verdict(overwrite, &rebuild, usable);
     let (covered, uncovered): (Vec<_>, Vec<_>) = rebuild
         .iter()
         .copied()
         .partition(|volume| cover.covers(volume));
-    let (judged, deferred_to) = if alone.passes() || covered.is_empty() {
+    let rebuilt_revs = cover.rebuilt_recovery_volumes(&plan);
+    let (judged, deferred_to) = if alone.passes() || (covered.is_empty() && rebuilt_revs.is_empty())
+    {
         (alone, None)
     } else {
-        let (kind, repairs) = cover.deferral(&covered);
+        let rebuilt = covered
+            .iter()
+            .map(|volume| volume.output_path.as_path())
+            .chain(rebuilt_revs.iter().copied())
+            .collect::<Vec<_>>();
+        let (kind, repairs) = cover.deferral(&rebuilt);
         let first = format!(
             "; {repairs} first for {}",
-            file_names(covered.iter().map(|volume| volume.output_path.as_path()))
+            file_names(rebuilt.iter().copied())
         );
-        let after = verdict(&plan, overwrite, &uncovered);
+        let usable_after = usable.max((usable + rebuilt_revs.len()).min(plan.recovery_count));
+        let after = verdict(overwrite, &uncovered, usable_after);
         if after.passes() {
             let message = alone.message + &first;
             (
@@ -509,14 +537,11 @@ fn judge_plan(
     }
 }
 
-/// What restoring `rebuild` would do: nothing, rebuild it, or stop as the
-/// real restore stops, short of recovery volumes or refusing a file in its
-/// way, with the exit code the real run's error maps to.
-fn verdict(
-    plan: &unrar_rs::RestorePlan,
-    overwrite: bool,
-    rebuild: &[&unrar_rs::DataVolumePlan],
-) -> Verdict {
+/// What restoring `rebuild` with `usable` recovery volumes would do:
+/// nothing, rebuild it, or stop as the real restore stops, short of
+/// recovery volumes or refusing a file in its way, with the exit code the
+/// real run's error maps to.
+fn verdict(overwrite: bool, rebuild: &[&unrar_rs::DataVolumePlan], usable: usize) -> Verdict {
     if rebuild.is_empty() {
         return Verdict {
             exit_code: EXIT_SUCCESS,
@@ -525,7 +550,6 @@ fn verdict(
     }
     let names = file_names(rebuild.iter().map(|volume| volume.output_path.as_path()));
     let needed = rebuild.len();
-    let usable = plan.usable_recovery_count();
     if needed > usable {
         return Verdict {
             exit_code: EXIT_DATA_FAILURE,
@@ -555,21 +579,32 @@ fn verdict(
     }
 }
 
-/// Whether `left` and `right` name the same file: the same path, or the
-/// same file name under the same directory. The file need not exist, as a
-/// missing volume's output does not, so only the directories are resolved.
+/// Whether `left` and `right` name the same file: the same path, or under
+/// the same directory the same file name, or one differing from it by case
+/// alone where that directory folds case, as
+/// [`crate::discovery::same_name_on_disk`] probes it, so that a parity set
+/// listing `SET.part05.rar` rebuilds `set.part05.rar` on a volume that
+/// ignores case and not on one that keeps it. The file need not exist, as
+/// a missing volume's output does not.
 fn same_file(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
     }
-    match (left.parent(), right.parent()) {
-        (Some(left_dir), Some(right_dir)) => {
-            left.file_name().is_some()
-                && left.file_name() == right.file_name()
-                && crate::discovery::same_path(left_dir, right_dir)
-        }
-        _ => false,
+    let (Some(left_dir), Some(right_dir)) = (left.parent(), right.parent()) else {
+        return false;
+    };
+    let (Some(left_name), Some(right_name)) = (left.file_name(), right.file_name()) else {
+        return false;
+    };
+    if left_name == right_name {
+        return crate::discovery::same_path(left_dir, right_dir);
     }
+    let (Some(left_str), Some(right_str)) = (left_name.to_str(), right_name.to_str()) else {
+        return false;
+    };
+    crate::par3_inside::fold_case(left_str) == crate::par3_inside::fold_case(right_str)
+        && crate::discovery::same_path(left_dir, right_dir)
+        && crate::discovery::same_name_on_disk(left, &left_dir.join(right_name))
 }
 
 /// Whether a directory entry holds `path`'s name, as the restore's exclusive
@@ -739,6 +774,7 @@ mod tests {
         let cover = ParityCover {
             par2: BTreeSet::from([here.join("set.part05.rar")]),
             par3: BTreeSet::from([elsewhere.join("set.part05.rar")]),
+            recovery_volumes: BTreeSet::new(),
         };
 
         assert_eq!(cover.lists(&here.join("set.part05.rar")), (true, false));
@@ -756,6 +792,39 @@ mod tests {
             let link = temp.path().join("link");
             std::os::unix::fs::symlink(&here, &link).unwrap();
             assert_eq!(cover.lists(&link.join("set.part05.rar")), (true, false));
+        }
+    }
+
+    /// A parity set that lists a volume's name in another case covers the
+    /// volume exactly where its directory folds case: probed on the
+    /// directory's entries for a missing volume, on the files themselves
+    /// for a present one. A directory with nothing to probe keeps the
+    /// spellings apart, and a name differing by more than case never
+    /// matches.
+    #[test]
+    fn parity_cover_compares_names_as_the_directory_does() {
+        let temp = tempfile::tempdir().unwrap();
+        let here = temp.path().join("here");
+        std::fs::create_dir_all(&here).unwrap();
+        let cover = ParityCover {
+            par2: BTreeSet::from([here.join("SET.part05.rar")]),
+            par3: BTreeSet::new(),
+            recovery_volumes: BTreeSet::new(),
+        };
+        let volume = here.join("set.part05.rar");
+        assert_eq!(cover.lists(&volume), (false, false));
+
+        std::fs::write(here.join("set.part01.rar"), b"volume").unwrap();
+        let folds = std::fs::metadata(here.join("SET.PART01.RAR")).is_ok();
+        assert_eq!(cover.lists(&volume), (folds, false));
+        assert_eq!(cover.lists(&here.join("set.part06.rar")), (false, false));
+        assert_eq!(cover.lists(&here.join("SET.part05.rar")), (true, false));
+
+        std::fs::write(&volume, b"damaged").unwrap();
+        assert_eq!(cover.lists(&volume), (folds, false));
+        if !folds {
+            std::fs::write(here.join("SET.part05.rar"), b"other").unwrap();
+            assert_eq!(cover.lists(&volume), (false, false));
         }
     }
 }

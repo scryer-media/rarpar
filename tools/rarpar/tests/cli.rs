@@ -2177,6 +2177,42 @@ fn auto_dry_run_defers_to_parity_over_exactly_the_missing_volumes() {
     assert!(out_dir.join("payload.bin").is_file());
 }
 
+/// A `.rev` file the parity lists is rebuilt before the restore, like a
+/// data volume, so the dry run counts it among the usable recovery volumes
+/// by then and defers a restore it makes sufficient instead of failing it.
+/// The real run then repairs the `.rev` file, restores from it and
+/// extracts.
+#[test]
+fn auto_dry_run_defers_to_parity_over_a_missing_recovery_volume() {
+    let temp = tempfile::tempdir().unwrap();
+    let download_dir = temp.path().join("download");
+    copy_rar5_recovery_set(&download_dir);
+    let rev = "rar5_recovery_volumes.part02.rev".to_string();
+    create_parity(&download_dir, "PAR2", std::slice::from_ref(&rev));
+    std::fs::remove_file(download_dir.join(&rev)).unwrap();
+    let removed = rar5_volume_names([3, 5]);
+    for name in &removed {
+        std::fs::remove_file(download_dir.join(name)).unwrap();
+    }
+
+    let (code, action) = auto_dry_run_restore_step(&download_dir);
+    assert_eq!(code, Some(0), "{action}");
+    assert_eq!(action["success"], true);
+    assert_eq!(action["deferred_to"], "par2");
+    assert_eq!(
+        action["message"],
+        format!(
+            "insufficient recovery volumes: need 2, have 1 for {}; PAR2 repair runs first for \
+             {rev}",
+            removed.join(", ")
+        )
+    );
+
+    let out_dir = temp.path().join("out");
+    assert_success(&auto_into(&download_dir, &out_dir), "auto with PAR2");
+    assert!(out_dir.join("payload.bin").is_file());
+}
+
 /// A data volume is placed by its name and judged by its size and CRC32,
 /// never by its headers, so one whose headers are damaged plans as the
 /// restore treats it: the dry run would restore it from the `.rev` files,

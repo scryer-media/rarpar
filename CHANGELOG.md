@@ -8,7 +8,13 @@ documented in each crate's own changelog so those notes ship with the crate.
 - `auto --dry-run` counts a damaged or missing volume as rebuilt by the PAR2
   or PAR3 repair before the restore only when that set lists the volume at
   its own path, not merely its file name, so a set under another root no
-  longer defers an unrelated set's shortage.
+  longer defers an unrelated set's shortage. A name listed in another case
+  counts where the volume's directory folds case, as discovery groups the
+  set's volumes.
+- `auto --dry-run` counts a `.rev` file of the set that a PAR2 or PAR3 set
+  lists among the usable recovery volumes by the time the restore runs, so a
+  restore that those repairs make sufficient is deferred to them instead of
+  failed; the deferral names the `.rev` files alongside the volumes.
 - A dry run foresees the refusal the restore makes of an output or `.bad`
   name that a symlink holds, even one pointing nowhere, which it used to
   report as free.

@@ -76,17 +76,22 @@ file's `format` is `rar4`, a RAR 3.0 name-form one's included.
 and before extraction. `auto --dry-run` plans each of those restores beside
 the set's volumes and lists it as a `dry-run rar_restore_volumes` step, in the
 JSON report's `executed_actions`; that report carries `dry_run: true`. A
-damaged or missing volume whose file name appears exactly among the protected
-files of a PAR2 set related to the RAR set, or of a PAR3 set `auto` repairs,
-counts as repaired by the time the restore runs. A restore short of `.rev`
-files is then deferred, not failed, when the volumes no parity names fit
-within the usable `.rev` files: the step passes, shows `[deferred]` in place
-of `[ok]`, carries `deferred_to` (`par2`, `par3` or `par2+par3`) in the JSON,
-and its message ends `; PAR2 repair runs first for <names>`. The dry run does
-not check that the parity holds enough recovery data for those volumes. A set
-whose restore cannot be planned is a failed step,
-`cannot plan restore: <error>`, and the sets after it are still planned.
-`auto --dry-run` exits with the code of the first set that fails.
+damaged or missing volume whose path appears among the protected files of a
+PAR2 set related to the RAR set, or of a PAR3 set `auto` repairs, counts as
+repaired by the time the restore runs, and a `.rev` file of the set they
+list counts among its usable `.rev` files by then. A protected name is
+compared as the volume's directory compares names: one differing by case
+alone matches where that directory folds case, never where it keeps case
+apart. A restore short of `.rev` files is then deferred, not failed, when the
+volumes no parity names fit within the usable `.rev` files: the step passes,
+shows `[deferred]` in place of `[ok]`, carries `deferred_to` (`par2`, `par3`
+or `par2+par3`) in the JSON, and its message ends
+`; PAR2 repair runs first for <names>`, naming the volumes and `.rev` files
+the parity rebuilds. The dry run does not check that the parity holds enough
+recovery data for those files, and it still needs one `.rev` file of the set
+to read to plan at all. A set whose restore cannot be planned is a failed
+step, `cannot plan restore: <error>`, and the sets after it are still
+planned. `auto --dry-run` exits with the code of the first set that fails.
 
 ## PAR2
 

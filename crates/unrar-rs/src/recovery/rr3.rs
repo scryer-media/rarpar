@@ -509,7 +509,7 @@ mod tests {
 
     const SCRATCH: &str = "UNRAR_RS_RR3_SCRATCH";
 
-    fn original() -> Vec<u8> {
+    fn original() -> Option<Vec<u8>> {
         fixture("rar4", "rar4_recovery.rar")
     }
 
@@ -569,7 +569,9 @@ mod tests {
 
     #[test]
     fn fixture_record_recomputes_byte_exact() {
-        let bytes = original();
+        let Some(bytes) = original() else {
+            return;
+        };
         let record = record(&bytes, None);
         assert!(!record.found_by_scan);
         assert_eq!((record.sectors, record.slots), (1, 1));
@@ -589,7 +591,9 @@ mod tests {
     /// `RR` header, hashed and XORed as if zero-padded to 512.
     #[test]
     fn fixture_repairs_its_single_partial_sector() {
-        let original = original();
+        let Some(original) = original() else {
+            return;
+        };
         for zero in [true, false] {
             let damaged = damage(&original, &[0], zero);
             assert_ne!(damaged, original);
@@ -613,7 +617,9 @@ mod tests {
 
     #[test]
     fn a_damaged_signature_is_bridged_by_the_scan() {
-        let original = original();
+        let Some(original) = original() else {
+            return;
+        };
         let damaged = damage(&original, &[0], true);
         let layout = locate_recovery_record(&mut Cursor::new(&damaged), None)
             .unwrap()
@@ -628,7 +634,9 @@ mod tests {
     /// a forward scan meets first) must not stand in for the record.
     #[test]
     fn a_copy_of_the_header_among_the_protected_bytes_is_not_the_record() {
-        let original = original();
+        let Some(original) = original() else {
+            return;
+        };
         let mut damaged = original.clone();
         damaged.copy_within(152..206, 60);
         damaged[..7].fill(0);
@@ -643,7 +651,9 @@ mod tests {
     /// overflows on the way to saying so.
     #[test]
     fn a_header_with_impossible_counts_is_not_a_record() {
-        let mut bytes = original();
+        let Some(mut bytes) = original() else {
+            return;
+        };
         bytes[152 + 46..152 + 54].copy_from_slice(&(1u64 << 63).to_le_bytes());
         let crc = rar4_header_crc16(&bytes[152..206]);
         bytes[152..154].copy_from_slice(&crc.to_le_bytes());
@@ -661,7 +671,10 @@ mod tests {
     /// cannot be confirmed, so the repair is refused and nothing written.
     #[test]
     fn an_unconfirmed_rebuild_is_refused() {
-        let mut damaged = damage(&original(), &[0], true);
+        let Some(original) = original() else {
+            return;
+        };
+        let mut damaged = damage(&original, &[0], true);
         damaged[206..208].copy_from_slice(&[0xFF, 0xFF]);
         let assessment = assess(&damaged, None);
         assert_eq!(assessment.damaged_units, [0]);
@@ -673,7 +686,9 @@ mod tests {
     /// so it is reported as a damaged checksum and nothing is rebuilt.
     #[test]
     fn a_damaged_checksum_entry_alone_is_record_damage() {
-        let mut damaged = original();
+        let Some(mut damaged) = original() else {
+            return;
+        };
         damaged[206..208].copy_from_slice(&[0xFF, 0xFF]);
         let assessment = assess(&damaged, None);
         assert!(assessment.damaged_units.is_empty(), "{assessment:?}");
@@ -686,7 +701,9 @@ mod tests {
 
     #[test]
     fn a_damaged_parity_sector_is_reported_and_left() {
-        let mut damaged = original();
+        let Some(mut damaged) = original() else {
+            return;
+        };
         damaged[208 + 100] ^= 0x55;
         let assessment = assess(&damaged, None);
         assert!(assessment.damaged_units.is_empty());
@@ -698,7 +715,9 @@ mod tests {
 
     #[test]
     fn damage_after_the_record_is_outside_it() {
-        let mut damaged = original();
+        let Some(mut damaged) = original() else {
+            return;
+        };
         damaged[208 + 512..].fill(0);
         assert!(assess(&damaged, None).is_intact());
     }

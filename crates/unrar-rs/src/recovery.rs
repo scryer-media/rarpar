@@ -21,6 +21,8 @@ use reedsolomon_rs::rar3::Rar3RsCoder;
 use reedsolomon_rs::rar5::Rar5RsCoder;
 
 mod record;
+#[cfg(test)]
+pub(crate) use record::test_support;
 mod rr3;
 mod rr5;
 mod stream;

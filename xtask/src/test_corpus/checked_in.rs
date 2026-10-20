@@ -238,7 +238,22 @@ fn era_profiles_partition_the_rar_fixtures_by_format() {
         );
     }
     // The lanes' profiles resolve to what the CI hydration patterns resolved to.
-    assert_eq!(members("unit").len(), 2);
+    let unit = members("unit");
+    assert_eq!(unit.len(), 12);
+    for name in [
+        "rar5/rar5_hp_store.rar",
+        "rar5/rar5_hp_lz.rar",
+        "rar5/rar5_hp_recovery_volumes.part1.rar",
+        "rar4/rar4_hp_large.rar",
+        "rar4/rar4_recovery.rar",
+        "rar5/rar5_recovery.rar",
+        "rar5/rar5_mv_store_rr.part6.rar",
+    ] {
+        assert!(
+            unit.iter().any(|path| path.ends_with(name)),
+            "unit lacks {name}"
+        );
+    }
     assert!(
         members("cli")
             .iter()

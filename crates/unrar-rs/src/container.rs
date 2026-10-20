@@ -865,13 +865,9 @@ mod tests {
         assert_eq!(parsed.service_name(), "PAR3");
     }
 
-    fn fixture(name: &str) -> Vec<u8> {
-        std::fs::read(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/rar5")
-                .join(name),
-        )
-        .unwrap()
+    /// A RAR5 corpus fixture, or `None` where this lane did not hydrate it.
+    fn fixture(name: &str) -> Option<Vec<u8>> {
+        crate::recovery::test_support::fixture("rar5", name)
     }
 
     /// An archive without a password check value is confirmed on its main
@@ -886,7 +882,9 @@ mod tests {
             "rar5_hp_store.rar",
             "rar5_hp_recovery_volumes.part1.rar",
         ] {
-            let bytes = fixture(name);
+            let Some(bytes) = fixture(name) else {
+                return;
+            };
             let mut reader = io::Cursor::new(&bytes);
             let header = read_encryption_header(&mut reader).unwrap().unwrap();
             let at = reader.stream_position().unwrap();
@@ -921,7 +919,9 @@ mod tests {
     /// that block, and is refused.
     #[test]
     fn a_change_that_moves_a_located_block_is_refused() {
-        let bytes = fixture("rar5_recovery.rar");
+        let Some(bytes) = fixture("rar5_recovery.rar") else {
+            return;
+        };
         let kdf = KdfCache::new();
         let map = Rar5Container::read(&mut io::Cursor::new(&bytes), None, &kdf).unwrap();
         let rr = map.recovery_record_at.expect("the fixture locates its RR");

@@ -20,6 +20,7 @@ mod sidecar;
 mod streams;
 mod xz;
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::process::ExitCode;
 
@@ -258,28 +259,39 @@ fn plan_rar_restores(cli: &Cli, report: &mut DiscoveryReport) -> u8 {
 /// `rar_set` protect, each resolved as that repair resolves it: a PAR2
 /// set's against its own directory, a PAR3 set's against `working_dir` when
 /// given, else its own directory. The PAR2 sets are those related to the
-/// RAR set, the PAR3 sets those the run repairs.
+/// RAR set, the PAR3 sets those the run repairs. The `.rev` files of the
+/// RAR set among them are picked out, as the restore after those repairs
+/// reads them.
 fn parity_cover(
     report: &DiscoveryReport,
     rar_set: &discovery::RarSet,
     working_dir: Option<&std::path::Path>,
 ) -> rar::ParityCover {
+    let par2 = discovery::related_par2_sets(rar_set, &report.par2_sets)
+        .into_iter()
+        .flat_map(|set| {
+            set.protected_files
+                .iter()
+                .map(|name| set.base_dir.join(name))
+        })
+        .collect::<BTreeSet<_>>();
+    let par3 = report
+        .par3_sets
+        .iter()
+        .filter(|set| discovery::selected_par3_set(set, &report.roots))
+        .filter_map(|set| set.member_paths(working_dir).ok())
+        .flatten()
+        .collect::<BTreeSet<_>>();
+    let recovery_volumes = par2
+        .iter()
+        .chain(&par3)
+        .filter(|path| discovery::recovery_volume_of(rar_set, path))
+        .cloned()
+        .collect();
     rar::ParityCover {
-        par2: discovery::related_par2_sets(rar_set, &report.par2_sets)
-            .into_iter()
-            .flat_map(|set| {
-                set.protected_files
-                    .iter()
-                    .map(|name| set.base_dir.join(name))
-            })
-            .collect(),
-        par3: report
-            .par3_sets
-            .iter()
-            .filter(|set| discovery::selected_par3_set(set, &report.roots))
-            .filter_map(|set| set.member_paths(working_dir).ok())
-            .flatten()
-            .collect(),
+        par2,
+        par3,
+        recovery_volumes,
     }
 }
 
