@@ -67,7 +67,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
-use crc_fast::{CrcAlgorithm, Digest};
+use crc_turbo::{CrcAlgorithm, Digest};
 use reedsolomon_rs::rar5::Rar5RsCoder;
 
 use super::record::{
@@ -604,7 +604,7 @@ fn slice_crc(bytes: &[u8]) -> u64 {
 
 /// A chunk's CRC64: CRC-64/XZ.
 fn chunk_crc(bytes: &[u8]) -> u64 {
-    crc_fast::checksum(CrcAlgorithm::Crc64Xz, bytes)
+    crc_turbo::checksum(CrcAlgorithm::Crc64Xz, bytes)
 }
 
 /// The record RAR would write for the volume's bytes `0..P` with this

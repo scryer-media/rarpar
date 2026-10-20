@@ -14,7 +14,7 @@ pub use create::{InsertionPlan, InsertionRequirements};
 mod repair;
 pub use repair::{SelfRepairPlan, SelfRepairReport};
 
-use crc_fast::{CrcAlgorithm, Digest};
+use crc_turbo::{CrcAlgorithm, Digest};
 
 use crate::runtime::{EngineError, EngineResult, ExecutionOptions, MemoryCategory};
 use crate::source::{SourceAccess, SourceId, SourceSnapshot, ensure_snapshot, read_exact_at};

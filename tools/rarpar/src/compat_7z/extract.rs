@@ -7,7 +7,7 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use std::path::PathBuf;
 
-use crc_fast::{CrcAlgorithm, Digest};
+use crc_turbo::{CrcAlgorithm, Digest};
 use sevenz_turbo::{ArchiveEntry, ArchiveReader, BlockErrorKind, Error as SevenZError, Password};
 
 use super::censor::{Censor, split_path};

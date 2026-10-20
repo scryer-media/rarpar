@@ -87,10 +87,10 @@ mod embedding {
     }
 
     /// Never called here (`crc-host` is off in this build), but the hook pair
-    /// is installed whole; `crc-fast` stands in so the pair is still honest.
+    /// is installed whole; `crc-turbo` stands in so the pair is still honest.
     fn crc32(seed: u32, data: &[u8]) -> u32 {
-        let mut hasher = crc_fast::Digest::new_with_init_state(
-            crc_fast::CrcAlgorithm::Crc32IsoHdlc,
+        let mut hasher = crc_turbo::Digest::new_with_init_state(
+            crc_turbo::CrcAlgorithm::Crc32IsoHdlc,
             u64::from(!seed),
         );
         hasher.update(data);

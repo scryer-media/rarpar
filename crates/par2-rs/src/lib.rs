@@ -143,7 +143,6 @@ compile_error!(
 
 pub mod checksum;
 mod cpu_repair_controller;
-mod crc_simd;
 pub mod create;
 pub mod disk;
 pub mod error;

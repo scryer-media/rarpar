@@ -600,7 +600,7 @@ fn inside_verify_without_an_embedded_set_fails() {
 mod generated {
     use std::path::Path;
 
-    use crc_fast::{CrcAlgorithm, Digest};
+    use crc_turbo::{CrcAlgorithm, Digest};
 
     use super::run;
 

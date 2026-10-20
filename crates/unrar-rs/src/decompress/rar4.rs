@@ -575,7 +575,7 @@ fn mt_batch_items() -> usize {
 /// half is all there is to hide and it is only a few percent of the work. A
 /// RAR4 apply is one eight-byte store per literal run and a `memcpy` per match;
 /// the per-member CRC — the other candidate for hiding — measures at 3% here
-/// (21.9 ms with verification against 21.5 ms without), because `crc-fast` is
+/// (21.9 ms with verification against 21.5 ms without), because `crc-turbo` is
 /// hardware-accelerated. Against that ceiling the record stream costs about two
 /// bytes written and two bytes read per output byte, and that is the 16–28%.
 ///

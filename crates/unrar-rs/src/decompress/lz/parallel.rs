@@ -872,8 +872,7 @@ mod x86_v3 {
     /// Set to `0` to pin the baseline loop on a capable CPU, so the two can be
     /// A/B'd on one binary without a rebuild. There is no `1`: the clone has
     /// no policy above the capability probe, and forcing it onto a CPU that
-    /// lacks the features would execute an undefined opcode. Same `OnceLock` +
-    /// escape-hatch shape as `RARPAR_CRC32_VPCLMUL`.
+    /// lacks the features would execute an undefined opcode.
     const FORCE_ENV: &str = "RARPAR_LZ_DECODE_V3";
 
     pub(super) fn available() -> bool {
