@@ -1988,6 +1988,13 @@ fn rar5_volume_names(numbers: impl IntoIterator<Item = usize>) -> Vec<String> {
 /// recovery blocks of 256 bytes: enough to rebuild any three of the
 /// `rar5_recovery_volumes` data volumes.
 fn create_parity(dir: &Path, parity: &str, files: &[String]) {
+    create_parity_with(dir, parity, files, 16);
+}
+
+/// [`create_parity`] with `recovery_count` recovery blocks; one is short of
+/// any damaged `rar5_recovery_volumes` data volume.
+fn create_parity_with(dir: &Path, parity: &str, files: &[String], recovery_count: usize) {
+    let recovery_count = recovery_count.to_string();
     let mut create = match parity {
         "PAR2" => vec![
             "--quiet",
@@ -1997,9 +2004,18 @@ fn create_parity(dir: &Path, parity: &str, files: &[String]) {
             "--block-size",
             "256",
             "--recovery-count",
-            "16",
+            &recovery_count,
         ],
-        _ => vec!["--quiet", "par3", "create", "set", "-s", "256", "-c", "16"],
+        _ => vec![
+            "--quiet",
+            "par3",
+            "create",
+            "set",
+            "-s",
+            "256",
+            "-c",
+            &recovery_count,
+        ],
     };
     create.extend(files.iter().map(String::as_str));
     let create = create.into_iter().map(OsStr::new).collect::<Vec<_>>();
@@ -2015,9 +2031,8 @@ fn damage_three_rar5_volumes(dir: &Path) {
     }
 }
 
-/// `auto --dry-run --json` over `dir`, with its exit code and its one
-/// restore step.
-fn auto_dry_run_restore_step(dir: &Path) -> (Option<i32>, serde_json::Value) {
+/// `auto --dry-run --json` over `dir`, with its exit code and its steps.
+fn auto_dry_run_steps(dir: &Path) -> (Option<i32>, Vec<serde_json::Value>) {
     let output = run(&[
         OsStr::new("auto"),
         OsStr::new("--dry-run"),
@@ -2033,10 +2048,145 @@ fn auto_dry_run_restore_step(dir: &Path) -> (Option<i32>, serde_json::Value) {
             )
         });
     assert_eq!(report["dry_run"], true);
-    let actions = report["executed_actions"].as_array().unwrap();
-    assert_eq!(actions.len(), 1, "{actions:?}");
-    assert_eq!(actions[0]["action"], "rar_restore_volumes");
-    (output.status.code(), actions[0].clone())
+    let actions = report["executed_actions"].as_array().unwrap().clone();
+    (output.status.code(), actions)
+}
+
+/// `auto --dry-run --json` over `dir`, with its exit code and its one
+/// restore step; every parity step before it passes.
+fn auto_dry_run_restore_step(dir: &Path) -> (Option<i32>, serde_json::Value) {
+    let (code, actions) = auto_dry_run_steps(dir);
+    let (restores, parity): (Vec<_>, Vec<_>) = actions
+        .iter()
+        .partition(|action| action["action"] == "rar_restore_volumes");
+    assert_eq!(restores.len(), 1, "{actions:?}");
+    for step in parity {
+        assert!(
+            step["action"].as_str().unwrap().contains("par")
+                && step["success"] == true
+                && step.get("deferred_to").is_none(),
+            "{step}"
+        );
+    }
+    (code, restores[0].clone())
+}
+
+/// A parity set short of the recovery data its damaged volumes need fails
+/// the real run at its repair, before any restore, so the dry run assesses
+/// each repair the same way and fails the parity step and the restore it
+/// would otherwise have deferred, instead of passing on the volumes the set
+/// merely lists.
+#[test]
+fn auto_dry_run_fails_a_restore_deferred_to_parity_short_of_recovery_data() {
+    let damaged = rar5_volume_names([3, 5, 7]).join(", ");
+    for (parity, step) in [
+        ("PAR2", "par_verify_repair"),
+        ("PAR3", "par3_verify_repair"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let download_dir = temp.path().join("download");
+        copy_rar5_recovery_set(&download_dir);
+        create_parity_with(&download_dir, parity, &rar5_volume_names(1..=10), 1);
+        damage_three_rar5_volumes(&download_dir);
+        let before = listing(&download_dir);
+
+        let (code, actions) = auto_dry_run_steps(&download_dir);
+        assert_eq!(code, Some(1), "auto --dry-run with {parity}: {actions:?}");
+        let steps = actions
+            .iter()
+            .map(|action| {
+                (
+                    action["action"].as_str().unwrap(),
+                    action["success"].as_bool().unwrap(),
+                    action.get("deferred_to").cloned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            steps,
+            [(step, false, None), ("rar_restore_volumes", false, None)],
+            "{actions:?}"
+        );
+        assert_eq!(
+            actions[1]["message"],
+            format!("insufficient recovery volumes: need 3, have 2 for {damaged}")
+        );
+        let output = run(&[
+            OsStr::new("auto"),
+            OsStr::new("--dry-run"),
+            download_dir.as_os_str(),
+        ]);
+        assert_data_failure(&output, &format!("auto --dry-run with {parity}"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!("dry-run {step} [failed]: "))
+                && stdout.contains(
+                    "dry-run rar_restore_volumes [failed]: insufficient recovery volumes"
+                ),
+            "{stdout}"
+        );
+        assert_eq!(listing(&download_dir), before, "the dry run wrote a file");
+
+        let out_dir = temp.path().join("out");
+        assert_data_failure(
+            &auto_into(&download_dir, &out_dir),
+            &format!("auto with {parity}"),
+        );
+    }
+}
+
+/// The real run repairs with PAR3, then PAR2, then reassesses the PAR3 sets
+/// that were short, so a PAR3 set short of recovery data whose incomplete
+/// files a sufficient PAR2 set rebuilds is repaired by the time the restore
+/// runs. The dry run, which repairs nothing, defers that set to the PAR2
+/// repair instead of failing it, and the restore to both.
+#[test]
+fn auto_dry_run_defers_a_short_par3_set_to_the_par2_repair_before_it() {
+    let damaged = rar5_volume_names([3, 5, 7]).join(", ");
+    let temp = tempfile::tempdir().unwrap();
+    let download_dir = temp.path().join("download");
+    copy_rar5_recovery_set(&download_dir);
+    create_parity_with(&download_dir, "PAR3", &rar5_volume_names(1..=10), 1);
+    create_parity(&download_dir, "PAR2", &rar5_volume_names(1..=10));
+    damage_three_rar5_volumes(&download_dir);
+
+    let (code, actions) = auto_dry_run_steps(&download_dir);
+    assert_eq!(code, Some(0), "{actions:?}");
+    let steps = actions
+        .iter()
+        .map(|action| {
+            (
+                action["action"].as_str().unwrap(),
+                action["success"].as_bool().unwrap(),
+                action.get("deferred_to").and_then(|to| to.as_str()),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        steps,
+        [
+            ("par3_verify_repair", false, None),
+            ("par_verify_repair", true, None),
+            ("par3_verify_repair", true, Some("par2")),
+            ("rar_restore_volumes", true, Some("par2+par3")),
+        ],
+        "{actions:?}"
+    );
+    assert_eq!(
+        actions[2]["message"],
+        format!("PAR2 repair runs first for {damaged}")
+    );
+    assert_eq!(
+        actions[3]["message"],
+        format!(
+            "insufficient recovery volumes: need 3, have 2 for {damaged}; PAR3 and PAR2 \
+             repairs run first for {damaged}"
+        )
+    );
+
+    let out_dir = temp.path().join("out");
+    assert_success(&auto_into(&download_dir, &out_dir), "auto");
+    assert!(out_dir.join("payload.bin").is_file());
 }
 
 /// The real `auto` run over `dir`, extracting into `out_dir`.

@@ -419,13 +419,14 @@ const NOTHING_TO_RESTORE: &str = "nothing to restore: all data volumes valid";
 
 /// The files that the parity sets `auto` repairs before its RAR restore
 /// protect: those of each PAR2 set related to the RAR set and of each PAR3
-/// set the run repairs, each resolved against its set's directory. A dry
-/// run cannot run those repairs, so it counts a damaged or missing volume
-/// whose output path one of them lists as rebuilt by then, and a `.rev`
-/// file of the set one lists among the usable recovery volumes by then. A
-/// set under another directory that lists the same file name does not
-/// count; one that lists the name in another case counts where the
-/// directory folds case, as [`same_file`] decides.
+/// set the run repairs, among the sets the dry run assessed as repairing or
+/// needing no repair, each resolved against its set's directory. A dry run
+/// cannot run those repairs, so it counts a damaged or missing volume whose
+/// output path one of them lists as rebuilt by then, and a `.rev` file of
+/// the set one lists among the usable recovery volumes by then. A set under
+/// another directory that lists the same file name does not count; one that
+/// lists the name in another case counts where the directory folds case, as
+/// [`same_file`] decides.
 #[derive(Debug, Default)]
 pub struct ParityCover {
     pub par2: BTreeSet<PathBuf>,
@@ -495,8 +496,8 @@ impl Verdict {
 /// Judges a dry run's plan. A restore that would stop by itself is deferred,
 /// and passes, when the volumes `cover` lists are rebuilt first and the rest
 /// fit within the usable recovery volumes, counting the `.rev` files it
-/// lists, with no file in their way. Whether the parity holds enough
-/// recovery data for the files it lists is not checked.
+/// lists, with no file in their way. `cover` holds only the parity the dry
+/// run assessed as able to repair what it lists.
 fn judge_plan(
     set_id: &str,
     overwrite: bool,
@@ -612,7 +613,7 @@ fn verdict(overwrite: bool, rebuild: &[&unrar_rs::DataVolumePlan], usable: usize
 /// listing `SET.part05.rar` rebuilds `set.part05.rar` on a volume that
 /// ignores case and not on one that keeps it. The file need not exist, as
 /// a missing volume's output does not.
-fn same_file(left: &Path, right: &Path) -> bool {
+pub(crate) fn same_file(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
     }
@@ -701,7 +702,7 @@ fn report_message(report: &unrar_rs::RecoveryReport) -> String {
 
 /// The file names of `paths`, comma separated, for a message; a path with no
 /// file name is shown whole.
-fn file_names<'a>(paths: impl Iterator<Item = &'a Path>) -> String {
+pub(crate) fn file_names<'a>(paths: impl Iterator<Item = &'a Path>) -> String {
     paths
         .map(|path| match path.file_name() {
             Some(name) => name.to_string_lossy().into_owned(),

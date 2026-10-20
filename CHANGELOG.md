@@ -5,6 +5,17 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ## rarpar 0.9.2
 
+- `auto --dry-run` assesses the PAR3 and PAR2 repairs the real run makes
+  before its restores, as dry runs in the real run's order, and lists them
+  as `par3_verify_repair` and `par_verify_repair` steps. A restore is
+  deferred only to parity the assessment passes, and a parity set short of
+  recovery data fails the dry run as its repair fails the real run, unless
+  the other parity's passing sets list every file it left damaged, when the
+  step is deferred to them (`deferred_to` `par3` for a PAR2 set, `par2` for
+  a PAR3 set), as the real run repairs with PAR3 first and reassesses a
+  short PAR3 set after PAR2. The dry run used to credit any parity set that
+  listed a volume, and could pass where the real run stops at the failed
+  parity repair. It exits with the code of the first failing step.
 - `auto --dry-run` counts a damaged or missing volume as rebuilt by the PAR2
   or PAR3 repair before the restore only when that set lists the volume at
   its own path, not merely its file name, so a set under another root no

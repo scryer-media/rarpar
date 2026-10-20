@@ -24,6 +24,11 @@ pub struct ParOutcome {
     pub message: String,
     pub repaired: bool,
     pub recovery_blocks_needed: Option<u32>,
+    /// The files a repair short of recovery data found damaged, missing or
+    /// out of place, each under the directory the set resolves against;
+    /// empty for any other outcome. `auto --dry-run` asks whether a PAR3
+    /// repair before this one rebuilds them all.
+    pub damaged_paths: Vec<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -492,6 +497,8 @@ fn emit_par2cmdline_outcome(outcome: &ParOutcome) {
     }
 }
 
+/// `auto`'s repair of `set`. Under `--dry-run` it verifies the set and
+/// reports what the repair would do, or that it cannot, and writes nothing.
 pub fn repair_set(cli: &Cli, set: &Par2Set) -> Result<ParOutcome, RarparError> {
     let mut resolved = ResolvedPar2Input {
         set_id: set.id.clone(),
@@ -505,7 +512,7 @@ pub fn repair_set(cli: &Cli, set: &Par2Set) -> Result<ParOutcome, RarparError> {
         scanned: set.reusable_packets(),
         deferred_par2: Vec::new(),
     };
-    run_flow(&mut resolved, true, false, cli.quiet || cli.json)
+    run_flow(&mut resolved, true, cli.dry_run, cli.quiet || cli.json)
 }
 
 fn run_flow(
@@ -588,6 +595,7 @@ fn run_flow(
             ),
             repaired: false,
             recovery_blocks_needed: None,
+            damaged_paths: Vec::new(),
         });
     }
 
@@ -599,6 +607,7 @@ fn run_flow(
                 message: format!("no repair needed; completed in {:.2?}", started.elapsed()),
                 repaired: false,
                 recovery_blocks_needed: None,
+                damaged_paths: Vec::new(),
             });
         }
         par2_rs::Repairability::Insufficient {
@@ -614,6 +623,12 @@ fn run_flow(
                 ),
                 repaired: false,
                 recovery_blocks_needed: Some(*deficit),
+                damaged_paths: verification
+                    .files
+                    .iter()
+                    .filter(|file| !matches!(file.status, par2_rs::FileStatus::Complete))
+                    .map(|file| resolved.primary_dir.join(&file.filename))
+                    .collect(),
             });
         }
         par2_rs::Repairability::ResourceLimited { reason } => {
@@ -656,6 +671,7 @@ fn run_flow(
             ),
             repaired: false,
             recovery_blocks_needed: None,
+            damaged_paths: Vec::new(),
         });
     }
 
@@ -706,6 +722,7 @@ fn run_flow(
         ),
         repaired: success,
         recovery_blocks_needed: None,
+        damaged_paths: Vec::new(),
     })
 }
 

@@ -73,28 +73,37 @@ file's `format` is `rar4`, a RAR 3.0 name-form one's included.
 `--quiet` silences both commands; the exit code still gives the result.
 
 `auto` restores each set with `.rev` files after its PAR2 and PAR3 repairs
-and before extraction. `auto --dry-run` plans each of those restores beside
-the set's volumes and lists it as a `dry-run rar_restore_volumes` step, in the
-JSON report's `executed_actions`; that report carries `dry_run: true`. A
-damaged or missing volume whose path appears among the protected files of a
-PAR2 set related to the RAR set, or of a PAR3 set `auto` repairs, counts as
-repaired by the time the restore runs, and a `.rev` file of the set they
-list counts among its usable `.rev` files by then. A protected name is
-compared as the volume's directory compares names: one differing by case
+and before extraction. `auto --dry-run` assesses each of those repairs as the
+real run orders them, PAR3 then PAR2, and lists each as a `dry-run
+par3_verify_repair` or `par_verify_repair` step in the JSON report's
+`executed_actions`; that report carries `dry_run: true`, and the dry run
+writes nothing. A parity step passes when its set needs no repair or holds
+enough recovery data to repair, and fails otherwise, as the real run stops at
+that repair. A PAR2 set short of recovery data whose damaged files the
+passing PAR3 sets all list is deferred to them instead, as the real run
+repairs with PAR3 first; a PAR3 set short of it whose incomplete files the
+passing PAR2 sets all list is deferred to them, as the real run reassesses
+it after those repairs. The dry run then plans each restore beside the set's
+volumes and lists it as a `dry-run rar_restore_volumes` step. A damaged or
+missing volume whose path appears among the protected files of a passing
+PAR2 set related to the RAR set, or of a passing PAR3 set `auto` repairs,
+counts as repaired by the time the restore runs, and a `.rev` file of the
+set they list counts among its usable `.rev` files by then. A protected name
+is compared as the volume's directory compares names: one differing by case
 alone matches where that directory folds case, never where it keeps case
 apart. A restore short of `.rev` files is then deferred, not failed, when the
-volumes no parity names fit within the usable `.rev` files: the step passes,
-shows `[deferred]` in place of `[ok]`, carries `deferred_to` (`par2`, `par3`
-or `par2+par3`) in the JSON, and its message ends
-`; PAR2 repair runs first for <names>`, naming the volumes and `.rev` files
-the parity rebuilds. The dry run does not check that the parity holds enough
-recovery data for those files. A set with no `.rev` file on disk whose
-`.rev` files a parity set lists is deferred without a plan, as
-`no recovery volumes present to plan with; PAR2 repair runs first for
-<names>`; one whose `.rev` files no parity lists is not planned, as the real
-run does not restore it. A set whose restore cannot be planned is a failed
-step, `cannot plan restore: <error>`, and the sets after it are still
-planned. `auto --dry-run` exits with the code of the first set that fails.
+volumes no passing parity names fit within the usable `.rev` files. A
+deferred step passes, shows `[deferred]` in place of `[ok]`, carries
+`deferred_to` in the JSON (`par2`, `par3` or `par2+par3` for a restore,
+`par3` for a PAR2 repair, `par2` for a PAR3 repair), and its message ends
+`; PAR2 repair runs first for <names>`, naming the files the parity rebuilds.
+A set with no `.rev` file on disk whose `.rev` files a passing parity set
+lists is deferred without a plan, as `no recovery volumes present to plan
+with; PAR2 repair runs first for <names>`; one whose `.rev` files no parity
+lists is not planned, as the real run does not restore it. A set whose
+restore cannot be planned is a failed step, `cannot plan restore: <error>`,
+and the sets after it are still planned. `auto --dry-run` exits with the
+code of the first step that fails.
 
 ## PAR2
 

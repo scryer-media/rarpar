@@ -280,9 +280,10 @@ pub struct ExecutedAction {
     pub action: String,
     pub success: bool,
     pub message: String,
-    /// For an `auto --dry-run` restore that would fail by itself, the parity
-    /// repair the real run makes first that covers the shortfall: `par2`,
-    /// `par3` or `par2+par3`. Absent from the JSON otherwise.
+    /// For an `auto --dry-run` step that would fail by itself, the parity
+    /// repair the real run makes first that covers the shortfall: a
+    /// restore's `par2`, `par3` or `par2+par3`, a PAR2 repair's `par3`, a
+    /// PAR3 repair's `par2`. Absent from the JSON otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deferred_to: Option<&'static str>,
 }
