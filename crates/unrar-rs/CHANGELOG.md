@@ -89,6 +89,25 @@
   assessment, not an error. The stream and path restores share the `.rev`
   parsers, the RAR3 header walk and the decoders, and keep separate I/O, so
   the path restore reads and writes as it did.
+- The RAR5 recovery record (`rar a -rr`, the `RR` service block) is decoded
+  and used. `locate_rar5_recovery_record` finds a volume's record through
+  the main header's locator or, when the headers are encrypted or damaged,
+  by scanning back from the end of the volume, and gives its
+  `Rar5RecoveryLayout`: the protected bytes `0..P` (everything before the
+  `RR` header, an SFX module included), the record's offset and size, the
+  data unit size and the data, parity and slice counts.
+  `check_rar5_recovery_record` reads the volume once and reports, in a
+  `Rar5RecoveryCheck`, the data units whose CRC64 no longer matches, the
+  record chunks that fail their own CRC64 and the slices no intact chunk
+  is left for. `repair_rar5_recovery_record` writes a copy of the volume
+  with every damaged data unit rebuilt from the record's GF(2^16) Cauchy
+  parity, the same code the `.rev` restore decodes, after each rebuilt unit
+  has matched its CRC64; damage beyond what the intact chunks can rebuild
+  is `Rar5RecoveryError::Unrepairable` with the units left, and nothing is
+  written. The record itself is never rewritten: a damaged chunk is
+  reported and copied as it is, as `rar r` documents for its own repair.
+  The module's docs give the record's layout as the Rust recompute
+  reproduces it byte for byte from RARLAB-written archives.
 
 ### Changed
 

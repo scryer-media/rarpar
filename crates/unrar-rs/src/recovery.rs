@@ -20,8 +20,13 @@ use reedsolomon_rs::decode_apply::apply_decode_matrix_gf8;
 use reedsolomon_rs::rar3::Rar3RsCoder;
 use reedsolomon_rs::rar5::Rar5RsCoder;
 
+mod rr5;
 mod stream;
 
+pub use rr5::{
+    Rar5RecoveryCheck, Rar5RecoveryError, Rar5RecoveryLayout, check_rar5_recovery_record,
+    locate_rar5_recovery_record, repair_rar5_recovery_record,
+};
 pub use stream::{
     DataVolumeState, FileVolumeSource, RecoveryVolumeState, RestoreSet, RestoredVolume,
     SliceVolumeSource, StreamRestoreOptions, VolumeAssessment, VolumeRef, VolumeRestoreError,

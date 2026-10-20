@@ -16,6 +16,10 @@
     range, the output length and every bucket before doing nothing for an
     empty call: an empty row range takes no output bytes and no buckets.
   - `bucket_batch` reports the batch the plan was built with.
+- `rar5::Rar5RsCoder::new_encoder` builds the Cauchy encoder RAR writes
+  recovery volumes and RAR5 recovery records with, fed through the same
+  `update_outputs` and `apply_units` as a decoder; `output_count` reports
+  a coder's output rows. Decoders are unchanged.
 
 ## 0.4.10
 
