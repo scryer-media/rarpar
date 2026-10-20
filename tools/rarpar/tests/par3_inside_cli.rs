@@ -482,6 +482,94 @@ fn inside_dry_run_removal_checks_like_a_removal() {
     assert!(!root.join("stripped").join(name(3)).exists());
 }
 
+/// An `-hp` archive takes its `PAR3` record with the password from the
+/// global password options, and gives the original back on removal.
+#[test]
+fn inside_round_trips_an_archive_with_encrypted_headers() {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/unrar-rs/tests/fixtures/rar5/rar5_hp_lz.rar");
+    if !source.is_file() {
+        eprintln!("skipping: fixture {} is not present", source.display());
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let host = root.join("sealed.rar");
+    std::fs::copy(&source, &host).unwrap();
+    let rarpar = |args: &[&str], password: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rarpar"));
+        command.current_dir(root).arg("--json");
+        if password {
+            command
+                .args(["--password-env", "RARPAR_TEST_INSIDE_PASSWORD"])
+                .env("RARPAR_TEST_INSIDE_PASSWORD", "secretpass");
+        }
+        command.args(args).output().unwrap()
+    };
+    // Without a password the archive cannot be walked, so nothing is written.
+    let refused = rarpar(
+        &["par3", "inside", "insert", "sealed.rar", "-d", "out"],
+        false,
+    );
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(!root.join("out/sealed.rar").exists());
+    let inserted = rarpar(
+        &[
+            "par3",
+            "inside",
+            "insert",
+            "sealed.rar",
+            "-d",
+            "out",
+            "-s",
+            "256",
+            "-c",
+            "2",
+        ],
+        true,
+    );
+    assert_eq!(inserted.status.code(), Some(0), "{inserted:?}");
+    let verified = rarpar(&["par3", "inside", "verify", "out/sealed.rar"], true);
+    assert_eq!(verified.status.code(), Some(0), "{verified:?}");
+    let report: Value = serde_json::from_slice(&verified.stdout).unwrap();
+    let host_report = &report["sets"][0]["hosts"][0];
+    assert_eq!(host_report["region_intact"], true);
+    assert_eq!(host_report["framing_checked"], true);
+    // Without the password the sealed record header is reported unchecked.
+    let unchecked = rarpar(&["par3", "inside", "verify", "out/sealed.rar"], false);
+    assert_eq!(unchecked.status.code(), Some(0), "{unchecked:?}");
+    let report: Value = serde_json::from_slice(&unchecked.stdout).unwrap();
+    assert_eq!(report["sets"][0]["hosts"][0]["framing_checked"], false);
+    // Damage to the signature and encryption header hides that the headers
+    // are sealed; the given password is still used to rebuild them.
+    let protected = root.join("out/sealed.rar");
+    let pristine = std::fs::read(&protected).unwrap();
+    let mut bytes = pristine.clone();
+    for byte in &mut bytes[..32] {
+        *byte ^= 0x5a;
+    }
+    std::fs::write(&protected, &bytes).unwrap();
+    let repaired = rarpar(&["par3", "inside", "repair", "out/sealed.rar"], true);
+    assert_eq!(repaired.status.code(), Some(0), "{repaired:?}");
+    assert_eq!(std::fs::read(&protected).unwrap(), pristine);
+    let removed = rarpar(
+        &[
+            "par3",
+            "inside",
+            "remove",
+            "out/sealed.rar",
+            "-d",
+            "stripped",
+        ],
+        true,
+    );
+    assert_eq!(removed.status.code(), Some(0), "{removed:?}");
+    assert_eq!(
+        std::fs::read(root.join("stripped/sealed.rar")).unwrap(),
+        std::fs::read(&source).unwrap()
+    );
+}
+
 /// An ordinary RAR5 archive carries no embedded set, so verifying it fails
 /// instead of reporting nothing checked as intact.
 #[test]

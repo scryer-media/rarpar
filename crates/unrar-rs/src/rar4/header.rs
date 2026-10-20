@@ -90,7 +90,7 @@ const OLD_SERVICE_STREAM: u16 = 0x105;
 const MAX_STREAM_NAME20: usize = 260;
 const SIZEOF_FILEHEAD3: usize = 32;
 
-fn rar4_header_crc16(data: &[u8]) -> u16 {
+pub(crate) fn rar4_header_crc16(data: &[u8]) -> u16 {
     if data.len() <= 2 {
         return 0;
     }
@@ -193,7 +193,7 @@ fn is_rar4_unix_symlink(host_os: Rar4HostOs, attributes: u32) -> bool {
 }
 
 /// Raw header data as read from the stream.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawRar4Header {
     pub header_type: Rar4HeaderType,
     pub flags: u16,
@@ -203,6 +203,17 @@ pub struct RawRar4Header {
     pub offset: u64,
     /// Size of the data area following the header (0 if none).
     pub data_area_size: u64,
+}
+
+impl RawRar4Header {
+    /// Whether the CRC16 the header states matches its bytes.
+    /// [`read_raw_header`] parses a header whose CRC16 fails, so that a
+    /// damaged archive can still be walked for recovery; a caller that must
+    /// not trust such a header checks here.
+    pub fn crc_matches(&self) -> bool {
+        self.data.len() >= MIN_HEADER_SIZE
+            && rar4_header_crc16(&self.data) == read_u16(&self.data, 0)
+    }
 }
 
 /// Read one raw RAR4 header from the stream.

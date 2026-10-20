@@ -237,7 +237,7 @@ impl Par3RepairSession {
     }
 
     /// Admit an authenticated packet. Replays preserve the assessment unchanged.
-    /// A refusal is counted once, by cause, on [`ExecutionDiagnostics`].
+    /// A refusal is counted once, by cause, on [`ExecutionDiagnostics`](crate::runtime::ExecutionDiagnostics).
     pub fn merge(&mut self, packet: IngestedPacket) -> EngineResult<MergeEffect> {
         let outcome = self.merge_admitted(packet);
         if let Err(error) = &outcome {
@@ -456,7 +456,7 @@ impl Par3RepairSession {
     }
 
     /// Resolve currently available metadata, returning `None` while incomplete.
-    /// A refusal is counted once, by cause, on [`ExecutionDiagnostics`].
+    /// A refusal is counted once, by cause, on [`ExecutionDiagnostics`](crate::runtime::ExecutionDiagnostics).
     ///
     /// # The returned layout must not outlive this session
     ///
@@ -594,7 +594,7 @@ impl Par3RepairSession {
     /// Assess losses and precise recovery requirements. Unchanged evidence costs
     /// only source snapshot checks; a recovery merge never triggers source reads.
     ///
-    /// A refusal is counted once, by cause, on [`ExecutionDiagnostics`]. This is
+    /// A refusal is counted once, by cause, on [`ExecutionDiagnostics`](crate::runtime::ExecutionDiagnostics). This is
     /// the boundary a host sees, so a request refused deep inside the stage is
     /// reported here exactly once rather than at every frame it passes.
     pub fn assess(&mut self) -> EngineResult<&RepairAssessment> {

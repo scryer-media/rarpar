@@ -9,7 +9,7 @@ memory budget.
 
 ```toml
 [dependencies]
-par3-rs = "0.7"
+par3-rs = "0.8"
 ```
 
 **Status:** a 0.x library, tested against the reference tool, par3cmdline.
@@ -28,7 +28,9 @@ independent, clean-room software, not official Parchive tooling.
 - **More control when creating** (codec, block layout, deduplication, volume
   sizes): `creation::CreationPlan`.
 - **Protection embedded inside an archive:** `inside::{InsertionPlan,
-  SelfRepairPlan}`, and `inside::rar5` for RAR5 (experimental).
+  SelfRepairPlan}` for ZIP, ZIP64 and 7z, and `embedded` (experimental) for
+  any container you frame yourself: you say where each carrier goes and
+  write the container bytes around it, the crate does the PAR3 side.
 
 Everything is synchronous and suits a blocking worker thread. Downloading,
 scheduling and storage are up to the caller. The
@@ -177,7 +179,8 @@ shortfall, and how files are identified without rereading them.
 - Recovery volumes of variable, uniform or limited size.
 - Rebuilding a lost recovery file from a saved manifest.
 - Protection embedded in ZIP, ZIP64 and 7z archives, without changing the
-  archive's own members, and (experimental) in RAR5 archives and volume sets.
+  archive's own members, and (experimental) in host files of any container
+  the caller frames (`embedded`).
 
 Not supported:
 
@@ -186,8 +189,9 @@ Not supported:
   inside protection.
 - Finding the source directory automatically.
 - Guessing missing set metadata or a recovery file's original byte order.
-- RAR4 hosts for embedded protection, and RAR5 volume sets with encrypted
-  headers.
+- Any RAR knowledge. PAR3 inside RAR5 archives is built in `rarpar` on
+  `embedded`, with `unrar-rs` framing each carrier as a service record;
+  the `inside::rar5` and `inside::rar4` modules were removed in 0.8.0.
 
 Ordinary repair never removes embedded protection; that takes the explicit
 `inside` APIs.
@@ -196,7 +200,7 @@ Ordinary repair never removes embedded protection; that takes the explicit
 
 The `rarpar` CLI in this workspace has `par3 create`, `par3 verify`,
 `par3 repair`, `par3 archive` (a 7z or ZIP archive protected in one pass),
-the experimental `par3 inside` for RAR5, and PAR3 handling in `auto` mode.
+the experimental `par3 inside` for RAR5 (built on `embedded`), and PAR3 handling in `auto` mode.
 Run as `par3`, it also accepts par3cmdline's command line for verifying,
 listing and repairing (`v`, `l`, `r`, `vs`, `rs`); par3cmdline's create,
 insert and delete commands are refused there.

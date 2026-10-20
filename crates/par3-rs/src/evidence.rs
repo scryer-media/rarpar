@@ -712,10 +712,10 @@ fn verification_buffer(options: &ExecutionOptions, len: u64) -> EngineResult<Res
 /// only later, hashing switches to extents there and only the prefix before
 /// the gap is read again.
 ///
-/// A source of at least [`crate::hash::PARALLEL_SOURCE_BYTES`] may start a
+/// A source of at least `PARALLEL_SOURCE_BYTES` may start a
 /// private worker pool solely to hash it; a smaller one never does, because the
 /// pool's own startup would cost more than the hash. A caller that already
-/// holds an admitted pool must call [`verify_source_in_pool`] instead, so that
+/// holds an admitted pool must call `verify_source_in_pool` instead, so that
 /// pools are never nested.
 pub fn verify_source(
     layout: Arc<BlockLayout>,

@@ -76,8 +76,8 @@ musl-allocator = ["dep:mimalloc"]
 
 [dependencies]
 par2-rs = { path = "../../crates/par2-rs", version = "0.10.12", default-features = false, optional = true }
-par3-rs = { path = "../../crates/par3-rs", version = "0.7.1", default-features = false, optional = true }
-unrar-rs = { path = "../../crates/unrar-rs", version = "0.13.0", default-features = false, optional = true }
+par3-rs = { path = "../../crates/par3-rs", version = "0.8.0", default-features = false, optional = true }
+unrar-rs = { path = "../../crates/unrar-rs", version = "0.14.0", default-features = false, optional = true }
 blake3 = { workspace = true, optional = true }
 clap = { workspace = true }
 crc-fast = { workspace = true, optional = true }

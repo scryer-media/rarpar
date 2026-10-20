@@ -5,6 +5,37 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ## rarpar 0.9.2
 
+- `auto --dry-run` assesses the PAR3 and PAR2 repairs the real run makes
+  before its restores, as dry runs in the real run's order, and lists them
+  as `par3_verify_repair` and `par_verify_repair` steps. A restore is
+  deferred only to parity the assessment passes, and a parity set short of
+  recovery data fails the dry run as its repair fails the real run, unless
+  the other parity's passing sets list every file it left damaged, when the
+  step is deferred to them (`deferred_to` `par3` for a PAR2 set, `par2` for
+  a PAR3 set), as the real run repairs with PAR3 first and reassesses a
+  short PAR3 set after PAR2. The dry run used to credit any parity set that
+  listed a volume, and could pass where the real run stops at the failed
+  parity repair. It exits with the code of the first failing step.
+- `auto --dry-run` counts a damaged or missing volume as rebuilt by the PAR2
+  or PAR3 repair before the restore only when that set lists the volume at
+  its own path, not merely its file name, so a set under another root no
+  longer defers an unrelated set's shortage. A name listed in another case
+  counts where the volume's directory folds case, as discovery groups the
+  set's volumes.
+- `auto --dry-run` counts a `.rev` file of the set that a PAR2 or PAR3 set
+  lists among the usable recovery volumes by the time the restore runs, so a
+  restore that those repairs make sufficient is deferred to them instead of
+  failed; the deferral names the `.rev` files alongside the volumes. A set
+  with no `.rev` file on disk whose `.rev` files a parity set lists is a
+  deferred step without a plan, where it used to be left out of the report.
+- A dry run foresees the refusal the restore makes of an output or `.bad`
+  name that a symlink holds, even one pointing nowhere, which it used to
+  report as free.
+- `par3 inside` keeps the passwords given by `--password-file`,
+  `--password-env` and `--password-fd` when damage to an archive's signature
+  or encryption header hides that its headers are sealed, so repairing that
+  damage can rebuild the sealed `PAR3` record header instead of refusing.
+
 - Require explicit native MD5 and Rust-only coverage evidence in the existing
   safety CI jobs; keep assembly as the default backend.
 
@@ -28,8 +59,85 @@ documented in each crate's own changelog so those notes ship with the crate.
   already serial, preserving the available two-chain parallel pipeline, 16 KiB
   prefix, slice padding, and single-stream fallback.
 
-- Builds against unrar-rs 0.13.0, which also caches up to 64 RAR5 key
-  derivations and keeps passwords and key material out of `Debug` output.
+- Add `rar test-volumes <REV>...`, which reads only the named `.rev` files and
+  prints one line for each: `<path>: OK`, or why it failed (a CRC32 mismatch
+  with the expected and actual values, an invalid header, a RAR 3.0 name-form
+  volume with no checksum, a file that is not a recovery volume, a missing
+  file, or `unreadable (<kind>)` with the I/O error kind for a file it cannot
+  open or read, which does not stop the other files being tested). It exits 1
+  unless every file tests OK. Unlike `rar t`, it does not go on to a set's
+  other `.rev` files. `--json` prints a `rar_test_volumes` report (schema
+  version 1) with each file's format, status and CRC32 values, and
+  `status: "unreadable"` with the I/O error kind as `message` for a file it
+  cannot read (unrar-rs 0.14.0).
+
+- `rar restore-volumes --dry-run` and the restore step of `auto --dry-run` now
+  plan the restore with the options a real run uses, and write nothing
+  (unrar-rs 0.14.0). To judge the volumes they read every data volume of a set
+  with `.rev` files in full, where `auto --dry-run` read only headers before.
+  They name the volumes a restore would rebuild, count the usable recovery
+  volumes that cover them, and count the damaged volumes it would set aside as
+  `.bad`. Where the restore would fail, the plan fails with the restore's exit
+  code: a set short of recovery volumes reports `insufficient recovery
+  volumes: need M, have K for <names>` and exits 1, and without `--overwrite`
+  an existing `.bad` backup (exit 3) or restored volume (exit 1) is refused in
+  the restore's words.
+
+- `auto --dry-run` counts a damaged or missing volume as repaired before the
+  restore when its file name appears exactly among the protected files of a
+  PAR2 set related to the RAR set or of a PAR3 set `auto` repairs. A set short
+  of recovery volumes is deferred to that repair, not failed, when the volumes
+  no parity names fit within its usable `.rev` files: the step passes, shows
+  `[deferred]` in place of `[ok]`, carries `deferred_to` (`par2`, `par3` or
+  `par2+par3`) in the JSON, and its message ends `; PAR2 repair runs first for
+  <names>`. The dry run does not check that the parity holds enough recovery
+  data for those volumes. A set whose restore cannot be planned is recorded
+  as a failed step, `cannot plan restore: <error>`, and the other sets are
+  still planned and the report printed. Each plan is listed as a
+  `dry-run rar_restore_volumes` line and in the JSON report's
+  `executed_actions`, and the discovery JSON of `auto`, `inspect` and
+  `cleanup` gains a top-level `dry_run` flag.
+
+- `rar restore-volumes` now prints its result, which it did not before:
+  `restored M volume(s) (<names>) from K recovery volume(s) read`, where K
+  counts every valid recovery volume the restore read and can exceed M, or
+  `nothing to restore: all data volumes valid`, as a dry run says it too.
+  `--json` prints a `rar_restore_volumes` report (schema version 1) with the
+  dry run's plan or the real run's outcome. The plan gives each recovery
+  volume's `slot` and `volume_number`. A data volume's `index`, a recovery
+  volume's `volume_number` and the outcome's `missing_volume_numbers` are
+  zero-based positions in the whole set, data volumes first.
+
+- `rar restore-volumes`, its dry run and the restore step of `auto` refuse a
+  named path that is not one of the set's volumes by its name, or that
+  numbers a data volume past the set's count, and two files for one volume,
+  with an error naming the paths and exit 1. A file found beside the named
+  ones that does not fit the set is passed over (unrar-rs 0.14.0).
+
+- Builds against unrar-rs 0.14.0. With unrar-rs 0.13.0's changes it also
+  caches up to 64 RAR5 key derivations and keeps passwords and key material
+  out of `Debug` output.
+
+- `par3 inside` (EXPERIMENTAL) changes its on-disk layout: each archive or
+  volume now carries its PAR3 carrier as one RAR5 service record named
+  `PAR3`, placed before the end-of-archive header. The trailing and block
+  layouts are gone, and `--layout` accepts only `service`. Archives
+  protected by an earlier version do not verify with this one: remove their
+  protection with that version, then insert again. Archives with encrypted
+  headers (`-hp`) are now protected with their password (`--password-file`,
+  `--password-env` or `--password-fd`; prompted for on a terminal): the
+  record header is encrypted like the archive's other headers, and volume
+  sets with encrypted headers are accepted, their order and completeness
+  checked from the unsealed headers. Of several candidate passwords the
+  next is tried only when one is rejected, so a damaged header is reported
+  as damage, not as a wrong password. Without the password an `-hp` archive
+  is refused for insertion, and verification reports its record header as
+  unchecked (`"framing_checked": false` in the JSON host report, a new
+  field). A damaged record header is now detected and rebuilt by repair.
+  The RAR orchestration moved into the `rarpar` library (`par_inside`): it
+  uses unrar-rs 0.14.0's service-record hooks and par3-rs 0.8.0's
+  container-blind `embedded` sets. The experimental RAR4 PAR-inside path is
+  dropped; RAR 2.9-4.x archives are refused.
 
 ## rarpar 0.9.1
 

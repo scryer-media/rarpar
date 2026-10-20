@@ -2,7 +2,8 @@
 //!
 //! An erasure decoder for a fixed set of missing positions is a linear map:
 //! each restored region is a sum of every present region times one field
-//! coefficient. [`apply_decode_matrix_gf8`] and [`apply_decode_matrix_gf16`]
+//! coefficient. [`apply_decode_matrix_gf8`](crate::decode_apply::apply_decode_matrix_gf8)
+//! and [`apply_decode_matrix_gf16`](crate::decode_apply::apply_decode_matrix_gf16)
 //! run that map with the grouped-input kernels ([`gf8::mul_acc_input_batch`],
 //! [`gf_simd::mul_acc_input_batch_prepared`]) over stripes of the regions, one
 //! rayon task per (output row, stripe). Each task owns its slice of one output,

@@ -26,8 +26,9 @@ Examples:
   rarpar xz decompress data.tar.xz
 
 rarpar is not an official RAR, UnRAR, or PAR2 utility and does not create or
-recompress RAR archives. `rarpar par3 inside` adds or removes a PAR3 region in
-a copy of an existing RAR5 archive without changing the archive's own bytes.";
+recompress RAR archives. `rarpar par3 inside` adds or removes a PAR3 service
+record in a copy of an existing RAR5 archive; its members and other headers
+are copied unchanged.";
 
 #[derive(Clone, Debug, Parser)]
 #[command(
@@ -347,37 +348,37 @@ where 7z readers ignore it and PAR3 tools find it.")]
     #[command(
         subcommand,
         long_about = "\
-EXPERIMENTAL: the on-disk layout of the embedded PAR3 region may change before
+EXPERIMENTAL: the on-disk layout of the embedded PAR3 record may change before
 it is stable, and output from this version may not verify with a later one.
 
 Embed PAR3 recovery inside existing RAR5 archives, verify and repair them from
-that embedded recovery, and remove it again. The archive's own bytes are never
-changed: insertion writes a new copy with a PAR3 region added, and removal
-restores the original byte for byte. RAR archives are never created or
-recompressed."
+that embedded recovery, and remove it again. Insertion writes a new copy of
+each archive with one service record named PAR3 added before its end header;
+the archive's members and other headers are copied unchanged, and removal
+restores the original byte for byte. Archives with encrypted headers (-hp)
+need their password (--password-file, --password-env or --password-fd), and
+their PAR3 record header is encrypted like the others. RAR archives are never
+created or recompressed."
     )]
     Inside(Par3InsideCommand),
 }
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Par3InsideCommand {
-    /// EXPERIMENTAL: add a PAR3 region to a RAR5 archive or every volume of a RAR5 set.
+    /// EXPERIMENTAL: add a PAR3 record to a RAR5 archive or every volume of a RAR5 set.
     Insert(Par3InsideInsertArgs),
     /// EXPERIMENTAL: verify archive data and embedded regions.
     Verify(Par3InsideArgs),
     /// EXPERIMENTAL: rebuild damaged or missing volumes and regions from embedded recovery.
     Repair(Par3InsideRepairArgs),
-    /// EXPERIMENTAL: write the archives without their PAR3 regions, byte-identical to the originals.
+    /// EXPERIMENTAL: write the archives without their PAR3 records, byte-identical to the originals.
     Remove(Par3InsideRemoveArgs),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Par3InsideLayout {
-    /// After the end-of-archive header; the archive itself is untouched.
-    Trailing,
-    /// A skippable block of an unassigned type before the end-of-archive header.
-    Block,
-    /// A skippable `PAR3` service header before the end-of-archive header.
+    /// A skippable `PAR3` service record before the end-of-archive header,
+    /// sealed like the archive's other headers when they are encrypted.
     Service,
 }
 
@@ -416,7 +417,7 @@ pub struct Par3InsideInsertArgs {
     /// Recovery percentage of protected blocks (default 5).
     #[arg(short = 'r', long, conflicts_with = "recovery_count")]
     pub recovery_percent: Option<u32>,
-    #[arg(long, value_enum, default_value_t = Par3InsideLayout::Trailing)]
+    #[arg(long, value_enum, default_value_t = Par3InsideLayout::Service)]
     pub layout: Par3InsideLayout,
     #[arg(long, value_enum, default_value_t = Par3InsidePlacement::Spread)]
     pub placement: Par3InsidePlacement,
@@ -662,8 +663,23 @@ files are rejected unless --overwrite is supplied.")]
         dest: Option<PathBuf>,
     },
     /// Restore missing RAR data volumes from recovery volumes.
+    #[command(long_about = "\
+Restore missing or damaged RAR data volumes from the set's .rev recovery
+volumes. Any volume or .rev of the set finds the rest beside it. A damaged
+volume rebuilt where it lies is first renamed to <name>.bad. With --dry-run,
+report the volumes a restore would rebuild and how many usable recovery
+volumes cover them, writing nothing.")]
     RestoreVolumes {
         #[arg(value_name = "RAR_OR_REV", required = true)]
+        paths: Vec<PathBuf>,
+    },
+    /// Test RAR recovery volumes (.rev) against their CRC32.
+    #[command(long_about = "\
+Test each named .rev recovery volume: its header must parse and the CRC32 it
+states must match the bytes it covers. Only the named files are read, and
+nothing is written. Exits 1 unless every file tests OK.")]
+    TestVolumes {
+        #[arg(value_name = "REV", required = true)]
         paths: Vec<PathBuf>,
     },
 }
@@ -1120,5 +1136,33 @@ mod tests {
         // Without -o, the positional no longer leaks into the global option.
         let cli = Cli::try_parse_from(["rarpar", "xz", "compress", "in.tar", "out.xz"]).unwrap();
         assert_eq!(cli.output, None);
+    }
+
+    #[test]
+    fn rar_test_volumes_needs_at_least_one_path() {
+        let cli = Cli::try_parse_from([
+            "rarpar",
+            "rar",
+            "test-volumes",
+            "set.part1.rev",
+            "set.part2.rev",
+            "--json",
+        ])
+        .expect("rar test-volumes should parse");
+        assert!(cli.json);
+        let Some(Command::Rar {
+            command: RarCommand::TestVolumes { paths },
+        }) = cli.command
+        else {
+            panic!("expected rar test-volumes");
+        };
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from("set.part1.rev"),
+                PathBuf::from("set.part2.rev")
+            ]
+        );
+        assert!(Cli::try_parse_from(["rarpar", "rar", "test-volumes"]).is_err());
     }
 }

@@ -396,6 +396,12 @@ pub fn convert_blake2_to_mac(value: [u8; 32], key: &[u8; 32]) -> [u8; 32] {
     backend::hmac_sha256(&backend::hmac_sha256_key(key), &value)
 }
 
+/// HMAC-SHA256 on the active backend, for this crate's own derivations
+/// (the sealed service header IV in [`crate::container`]).
+pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    backend::hmac_sha256(&backend::hmac_sha256_key(key), data)
+}
+
 /// Incremental BLAKE2sp hasher with runtime-dispatched x86 groups,
 /// NEON/simd128 groups on ARM/wasm, and a portable upstream fallback.
 #[derive(Clone, Debug)]

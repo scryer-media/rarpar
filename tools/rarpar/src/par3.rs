@@ -653,6 +653,10 @@ pub struct RepairOutcome {
     pub success: bool,
     pub report: Value,
     pub protected_paths: Vec<PathBuf>,
+    /// The protected files the assessment left incomplete, as resolved for
+    /// the repair; empty after a repair. `auto --dry-run` asks whether the
+    /// PAR2 repairs before a reassessment rebuild them all.
+    pub incomplete_paths: Vec<PathBuf>,
 }
 
 pub fn repair_set(cli: &Cli, set: &Par3Set) -> Result<RepairOutcome, RarparError> {
@@ -676,6 +680,7 @@ impl RepairOutcome {
             action: "par3_verify_repair".into(),
             success: self.success,
             message: self.report.to_string(),
+            deferred_to: None,
         }
     }
 }
@@ -812,6 +817,12 @@ fn verify_repair_loaded(
     }
     let mut success = assessment.status == RepairStatus::Complete;
     let ready = assessment.status == RepairStatus::Ready;
+    let mut incomplete_paths: Vec<_> = protected_paths
+        .iter()
+        .zip(&assessment.files)
+        .filter(|(_, file)| !file.complete)
+        .map(|(path, _)| path.clone())
+        .collect();
     let mut report = json!({
         "operation": if repair {"par3_repair"} else {"par3_verify"}, "set_id":loaded.id.to_string(),
         "status":format!("{:?}", assessment.status), "success":success, "dry_run":cli.dry_run,
@@ -839,6 +850,7 @@ fn verify_repair_loaded(
                 .collect::<Vec<_>>()
         );
         report["reconstructed_blocks"] = json!(result.reconstructed_blocks);
+        incomplete_paths.clear();
         report["initial_lost_blocks"] = report["lost_blocks"].take();
         report["initial_requirements"] = report["requirements"].take();
         report["lost_blocks"] = json!([]);
@@ -865,6 +877,7 @@ fn verify_repair_loaded(
         success,
         report,
         protected_paths,
+        incomplete_paths,
     })
 }
 

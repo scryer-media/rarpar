@@ -5,13 +5,105 @@ and `rarpar <command> --help` list every flag.
 
 ## RAR
 
-
 ```bash
 rarpar rar list archive.part1.rar
 rarpar rar test archive.part1.rar
 rarpar rar extract archive.part1.rar ./out
 rarpar rar restore-volumes archive.part1.rar archive.part1.rev
+rarpar rar restore-volumes --dry-run archive.part1.rar
+rarpar rar test-volumes archive.part1.rev archive.part2.rev
 ```
+
+### Recovery volumes
+
+`rar restore-volumes` rebuilds missing or damaged data volumes of a set from
+its `.rev` files. Name any volume or `.rev` file of the set; the rest of the
+set is found beside it by name. Every named path must be one of the set's
+volumes by its name: a path named otherwise, or one that numbers a data
+volume past the set's count, is an error naming it, as are two files for one
+volume, and the command exits 1. A file found beside the named ones that does
+not fit the set is passed over. A damaged volume is renamed to `<name>.bad`
+and rebuilt under its own name. With `--output DIR` the volumes are rebuilt
+into DIR and damaged ones are left where they are. Without `--overwrite`, a
+`.bad` backup or rebuilt volume that already exists stops the restore: exit 3
+for a `.bad` backup, exit 1 for a volume. The restore prints
+`restored M volume(s) (<names>) from K recovery volume(s) read`, where K
+counts every valid `.rev` file it read and can be more than M, or
+`nothing to restore: all data volumes valid`.
+
+`--dry-run` plans the restore and writes nothing. To judge each volume as the
+restore would, it reads every data volume of the set in full. It prints
+`would restore M volume(s) (<names>) using M of K usable recovery volume(s)`,
+followed by `; would set aside N damaged volume(s) as .bad` when the restore
+would rename damaged volumes. Where the restore would fail, the dry run fails
+with the restore's exit code: `insufficient recovery volumes: need M, have K
+for <names>` exits 1, and without `--overwrite` an existing `.bad` backup
+(exit 3) or rebuilt volume (exit 1) is refused in the restore's own words. A
+set the planner cannot read fails with the error the restore would raise.
+
+`--json` prints a `rar_restore_volumes` report (schema version 1) with
+`dry_run`, `success`, `message`, and the dry run's `plan` or the real run's
+`outcome`. The plan lists each data volume (`index`, `path`, `status`, the
+`expected_size` and `actual_size` of a `wrong_size` volume, `output_path`,
+`set_aside_path`) and each recovery volume (`slot`, `volume_number`, `path`,
+`status`, `usable`), with `needed`, `usable_recovery_count` and `sufficient`.
+A recovery volume is `usable: false` when the restore passes it over, for a
+failed CRC32 or a number outside the set's recovery slots. The outcome lists
+`restored_paths`, `used_recovery_paths` and `missing_volume_numbers`. A data
+volume's `index`, a recovery volume's `volume_number` and the
+`missing_volume_numbers` are zero-based positions in the whole set, data
+volumes first: the set's first volume is 0, and slot 0 of a set with ten data
+volumes is volume 10.
+
+`rar test-volumes <REV>...` tests each named `.rev` file as `rar t` does: its
+header must parse and the CRC32 it records must match. It prints one line per
+path, in order: `<path>: OK`, a CRC32 mismatch with the expected and actual
+values, an invalid header, a RAR 3.0 name-form volume (which records no
+CRC32), a file that is not a recovery volume, a missing file, or
+`<path>: unreadable (<kind>)` for a file it cannot open or read, naming the
+I/O error kind (`is a directory`, `permission denied`), which does not stop
+the other paths being tested. Only the named paths are tested; see
+[the compatibility notes](rarpar-compatibility.md#recovery-volumes) for how
+that differs from `rar t`. It exits 1 unless every path tests OK. `--json`
+prints a `rar_test_volumes` report (schema version 1) with each path's
+`format`, `status`, `expected_crc32` and `actual_crc32` for a `crc_mismatch`,
+and the I/O error kind as `message` for an `unreadable` file. A RAR3 `.rev`
+file's `format` is `rar4`, a RAR 3.0 name-form one's included.
+
+`--quiet` silences both commands; the exit code still gives the result.
+
+`auto` restores each set with `.rev` files after its PAR2 and PAR3 repairs
+and before extraction. `auto --dry-run` assesses each of those repairs as the
+real run orders them, PAR3 then PAR2, and lists each as a `dry-run
+par3_verify_repair` or `par_verify_repair` step in the JSON report's
+`executed_actions`; that report carries `dry_run: true`, and the dry run
+writes nothing. A parity step passes when its set needs no repair or holds
+enough recovery data to repair, and fails otherwise, as the real run stops at
+that repair. A PAR2 set short of recovery data whose damaged files the
+passing PAR3 sets all list is deferred to them instead, as the real run
+repairs with PAR3 first; a PAR3 set short of it whose incomplete files the
+passing PAR2 sets all list is deferred to them, as the real run reassesses
+it after those repairs. The dry run then plans each restore beside the set's
+volumes and lists it as a `dry-run rar_restore_volumes` step. A damaged or
+missing volume whose path appears among the protected files of a passing
+PAR2 set related to the RAR set, or of a passing PAR3 set `auto` repairs,
+counts as repaired by the time the restore runs, and a `.rev` file of the
+set they list counts among its usable `.rev` files by then. A protected name
+is compared as the volume's directory compares names: one differing by case
+alone matches where that directory folds case, never where it keeps case
+apart. A restore short of `.rev` files is then deferred, not failed, when the
+volumes no passing parity names fit within the usable `.rev` files. A
+deferred step passes, shows `[deferred]` in place of `[ok]`, carries
+`deferred_to` in the JSON (`par2`, `par3` or `par2+par3` for a restore,
+`par3` for a PAR2 repair, `par2` for a PAR3 repair), and its message ends
+`; PAR2 repair runs first for <names>`, naming the files the parity rebuilds.
+A set with no `.rev` file on disk whose `.rev` files a passing parity set
+lists is deferred without a plan, as `no recovery volumes present to plan
+with; PAR2 repair runs first for <names>`; one whose `.rev` files no parity
+lists is not planned, as the real run does not restore it. A set whose
+restore cannot be planned is a failed step, `cannot plan restore: <error>`,
+and the sets after it are still planned. `auto --dry-run` exits with the
+code of the first step that fails.
 
 ## PAR2
 
@@ -177,8 +269,25 @@ recovery. Global `--par3-memory-mib` (default 256), `--par3-workers`, and
 `--par3-max-lost-blocks` (default 4096 for Cauchy) control resources. The memory
 budget covers engine allocations; CLI path/report storage is bounded separately
 by `--max-files` and metadata limits. `auto` repairs before rediscovering and
-extracting RAR inputs. Container insertion/self-repair and recovery-carrier
-reconstruction remain explicit library APIs rather than CLI commands.
+extracting RAR inputs.
+
+`par3 inside` (EXPERIMENTAL: the on-disk layout may change before it is
+stable, and output from this version may not verify with a later one) embeds
+PAR3 recovery inside existing RAR5 archives made by RARLAB `rar`, verifies and
+repairs them from it, and removes it again: `par3 inside insert|verify|repair|remove`.
+`insert` writes a protected copy of each archive, or of every volume of a
+`.partN.rar` set, into `-d DIR` or `--in-place`, with one `PAR3` service record
+added before the end-of-archive header (`--layout service`, the only layout);
+members and other headers are copied unchanged, and `remove` restores the
+originals byte for byte. `--placement spread|last|independent` chooses one set
+shared across the volumes with the recovery spread evenly or all on the last
+volume, or a separate set per volume; `-s`, `-c` and `-r` (default 5%) size
+it. Archives with encrypted headers (`-hp`) need their password and get their
+record header encrypted like the others. `repair` rebuilds damaged or missing
+volumes in place, into `-d DIR`, or with `--backup`. RAR archives are never
+created or recompressed. Container self-repair for damaged embedded layouts
+with unprotected ranges and recovery-carrier
+reconstruction remain library APIs rather than CLI commands.
 
 ## xz
 

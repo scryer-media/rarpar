@@ -25,6 +25,11 @@ pub enum RarError {
     #[error("corrupt archive: {detail}")]
     CorruptArchive { detail: String },
 
+    /// A container modification ([`crate::container`]) was refused: the
+    /// archive or the request does not allow it, and nothing was written.
+    #[error("modification refused: {detail}")]
+    ModificationRefused { detail: String },
+
     // The display keeps the wording this failure had while it was reported as
     // `CorruptArchive`, so logs read the same.
     #[non_exhaustive]
@@ -157,6 +162,19 @@ pub enum RarError {
         "solid decoder state was left mid-member by {member} and no longer describes the archive: {detail}"
     )]
     SolidStatePoisoned { member: String, detail: String },
+
+    /// A volume's recovery record cannot rebuild every damaged unit it
+    /// protects, so [`repair_from_recovery_record`] rebuilt none of them.
+    /// [`assess_recovery_record`] reports the whole damage.
+    ///
+    /// [`repair_from_recovery_record`]: crate::repair_from_recovery_record
+    /// [`assess_recovery_record`]: crate::assess_recovery_record
+    #[non_exhaustive]
+    #[error("the recovery record cannot rebuild {} damaged unit(s)", units.len())]
+    RecoveryRecordInsufficient {
+        /// The damaged units it cannot rebuild, ascending.
+        units: Vec<u64>,
+    },
 }
 
 /// The limit a [`RarError::ResourceLimit`] is above.

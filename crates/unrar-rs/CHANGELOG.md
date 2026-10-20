@@ -1,5 +1,262 @@
 # Changelog
 
+## 0.14.0
+
+### Added
+
+- `test_recovery_volumes` tests each given path as a recovery volume, the
+  check reference UnRAR makes when it tests a `.rev`: the header must parse
+  and the CRC32 it states must match the bytes it covers (a RAR5 volume's
+  payload, everything before a RAR3 volume's trailing CRC32). It returns one
+  `RevTestResult` per path, in the order given, with both CRC32s on a
+  mismatch, and it does not fail as a whole: a path that does not exist is
+  `RevTestStatus::Missing`, and one that cannot be opened or read is
+  `RevTestStatus::Unreadable { kind }` with the I/O error's kind. Each file
+  is opened once and read through once, and only the given paths are read:
+  nothing is discovered beside them or checked against a set. A RAR
+  3.0-style `name<d>_<r>_<p>.rev` carries no checksum and is reported
+  `Unverifiable`, whatever numbers its name carries. A RAR5 header that
+  numbers its volume 0 is `InvalidHeader`, as reference UnRAR fails it.
+- `plan_volume_restore` works out what `restore_volumes_from_paths` would do
+  with the same paths and options without writing, renaming or creating
+  anything. The `RestorePlan` gives every data volume's `DataVolumeStatus`
+  (a RAR5 volume's size and CRC32 against the `.rev` table; a RAR3 volume's
+  headers through to its end-of-archive header, the volume number that
+  header states and the data CRC it states), the path a restore would write
+  it to and the `.bad` name it would move it to. It lists the set's `.rev`s,
+  each with its recovery slot, its `volume_number` in the whole set and
+  whether the restore can use it: one whose CRC32 fails, or whose number
+  falls outside the set's recovery slots, is listed as unusable. A RAR5
+  set whose table gives a data volume more bytes than a usable `.rev`
+  carries is refused by the plan and the restore alike, naming the `.rev`,
+  the volume and both lengths, as the rebuild would write past anything the
+  `.rev`s hold. A `.rev` that states no set RAR could have written is not
+  listed; `test_recovery_volumes` reports on it. Both functions share
+  discovery, slot assignment, validity checks and output naming, so for the
+  files as they are when the plan runs, its `missing_volume_numbers()` and
+  output paths are the volumes the restore rebuilds and the paths it
+  reports. A set short of usable recovery volumes, one whose every `.rev`
+  fails its CRC32 included, is a plan with `is_sufficient()` false and the
+  counts, not an error, so a caller can say how many more volumes it needs
+  before fetching them.
+- `RevTestStatus`, `RevTestResult`, `DataVolumeStatus`, `DataVolumePlan`,
+  `RecoveryVolumePlan` and `RestorePlan` are `#[non_exhaustive]`, so a later
+  release can add to them: match the enums with a wildcard arm, and read the
+  structs' fields rather than building them.
+- `restore_volume_set` rebuilds a set's missing and damaged data volumes from
+  volumes the caller holds, without staging files. The caller gives the set's
+  shape as a `RestoreSet` (each slot's length, or `None` for a volume it
+  lacks, built with `RestoreSet::new`), serves reads through a `VolumeSource`
+  (`SliceVolumeSource` over buffers and `FileVolumeSource` over open files are
+  provided) and takes the rebuilt bytes in a sink called as
+  `write(index, offset, bytes)`, each volume's offsets running on from 0.
+  Every volume the decode uses is checked first: a RAR5 `.rev` header, or a
+  RAR 3.10 `.rev` footer, must state the set's counts and its own position, a
+  RAR5 table may give no data volume more bytes than a usable `.rev` carries,
+  and each data volume must pass the check `plan_volume_restore` makes;
+  volumes in `known_bad` are rebuilt unread. When the rebuilt volumes fit
+  `StreamRestoreOptions::memory_bytes`, each data volume is read once and the
+  rebuild is held until every check has passed; otherwise a check pass and a
+  decode pass read each data volume twice at most, in slices of 4 KiB or more
+  when the volumes run that long. The field arithmetic runs on a pool of
+  `StreamRestoreOptions::workers` threads, at most the machine's available
+  parallelism, that the call builds for itself, never the caller's; reads and
+  sink calls stay on the calling thread. A RAR5 volume of odd length is
+  rebuilt from whole words, each input read to the next even byte, as
+  reference UnRAR reads it. A RAR3 set's last volume is cut at its
+  end-of-archive block where reference UnRAR cuts it, and the bytes the cut
+  could drop reach the sink only once it is decided. A set whose `.rev`s show
+  neither the RAR5 signature nor a RAR 3.10 footer is told by its data
+  volumes: one that starts with the RAR5 signature makes it a RAR5 set with no
+  `.rev` header to read (`NoRecoveryVolumes`); otherwise it is taken as RAR
+  3.0's when a data volume's RAR 1.5-4.x main header reads and marks it a
+  volume, and refused (`InconsistentSet`) when none does. A RAR 3.0 `.rev`
+  states nothing to check and is used unverified at the position given, unless
+  it is shorter than a data volume present and not known bad, as RAR writes
+  each as long as the longest; a slot longer than the `.rev`s, from bytes
+  appended to a volume or a wrong file in it, therefore makes every RAR 3.0
+  `.rev` unusable until that slot is passed in `known_bad`. `RestoreSet` and
+  `StreamRestoreOptions` are
+  `#[non_exhaustive]`: build the options from `Default`. The
+  `VolumeRestoreReport` gives each rebuilt volume's length, CRC32 and whether
+  it passes the check a present volume gets; a failure is a
+  `VolumeRestoreError`, an I/O one naming the volume as a `VolumeRef`.
+- `assess_volume_set` makes the same checks without rebuilding, reading each
+  present volume once (and before that, when the `.rev`s do not show the
+  set's format, the start of the data volumes), and returns a
+  `VolumeAssessment`: every data and recovery volume's status, and whether
+  the set is sufficient. A set short of usable recovery volumes is an
+  assessment, not an error. The stream and path restores share the `.rev`
+  parsers, the RAR3 header walk and the decoders, and keep separate I/O, so
+  the path restore reads and writes as it did.
+- A volume's own recovery record, the `RR` service block `rar a -rr` and
+  `rar rr` add, is decoded and used, for RAR5 and RAR 2.9-4.x volumes alike.
+  `locate_recovery_record` finds it and gives its `RecoveryRecordLayout`:
+  the format, the protected bytes `0..P` (everything before the `RR` header,
+  an SFX module included), the record's offset and size, the unit size and
+  the data and parity unit counts, and whether the record was found by
+  scanning back from the end of the volume, as it is when the headers before
+  it are damaged or, in RAR5, encrypted. A RAR3 volume with encrypted
+  headers (`-hp`) needs the password to be walked, as it does for `rar r`.
+  `assess_recovery_record` checks every data unit against the checksum the
+  record keeps for it and every parity unit against its own check, reading
+  the protected bytes once and the record once, and returns a
+  `RecoveryRecordAssessment`: the damaged and the unrepairable data units,
+  the damaged parity units, the RAR3 checksum entries that are what is
+  damaged (the parity vouches for the sector), and the bytes no checksum
+  survives for. `repair_from_recovery_record` returns a
+  `RecoveryRecordRepair` holding every damaged unit rebuilt as
+  `RecoveryRecordPatch`es, each confirmed against its checksum; it only
+  reads, and the repair writes the patches into the volume itself
+  (`write_in_place`) or into a copy (`write_repaired_copy`). When any
+  damaged unit cannot be rebuilt the result is the new
+  `RarError::RecoveryRecordInsufficient` naming those units, and no partial
+  repair is offered. The record itself is never rebuilt or rewritten, and
+  nothing here writes a record. A RAR3 sector is rebuilt from the XOR
+  parity of its slot when it is the slot's only damaged sector; a RAR5 unit
+  is rebuilt 64 KiB slice by slice from the GF(2^16) Cauchy parity the
+  `.rev` restore decodes, each slice from that slice's intact parity chunks,
+  so damage is repairable while no slice has more damaged units than intact
+  chunks. A record is found by its position, never by its first copy: a
+  backward scan takes the candidate nearest the end that sits where its
+  counts say the record must, so a copy of a record header among the
+  protected bytes or a stray chunk after the record is passed over. Memory
+  stays bounded whatever the headers state: a few MiB of buffers for RAR3,
+  and for RAR5 one chunk, 8 bytes per data unit per slice and, to rebuild a
+  slice, 64 KiB per damaged unit in it, plus the rebuilt bytes. The records
+  the tests recompute from the protected bytes match the ones RARLAB's `rar`
+  wrote byte for byte, and on the damaged RAR3 archives checked, a repair
+  equals what `rar r` writes wherever every damaged sector is repairable;
+  where some are not, `rar r` leaves those sectors as they were and this
+  crate refuses. The RAR3 header's `FileCRC` field is not checked: no CRC32
+  convention over any byte range gives it, and `rar r` ignores it. All four
+  types are `#[non_exhaustive]`.
+- `container` module: `Rar5Container` walks a RAR5 archive's block headers
+  (CRC-checked, unsealing `-hp` headers with a password) into a block map
+  with the volume number, end-of-archive flags, solid, locked and
+  recovery-record flags, the main header's quick-open and recovery-record
+  locators, and named service records. A wrong password is
+  `RarError::InvalidPassword` whether or not the archive has a password
+  check value, and a walk past `limits::MAX_HEADERS_PER_VOLUME` blocks is a
+  `RarError::ResourceLimit`. `append_service_record`
+  and `remove_service_record` plan adding or removing a service record whose
+  name and payload the caller supplies; `ServiceRecordAppend` and
+  `ServiceRecordRemoval` write the result, copying every other byte of the
+  archive verbatim. The record goes immediately before the end header, so no
+  offset the archive records moves; its header has the data-area and
+  skip-if-unknown flags, no CRC or time, and is sealed under `-hp` with the
+  archive's header key and a deterministic IV, so a damaged record header can
+  be rebuilt byte for byte (`service_record_header`,
+  `service_record_header_len`, `HeaderSealing::from_archive`). Locked
+  archives, a duplicate name, a change that would move a block a locator
+  names, a record too long for a file length, and a source archive whose
+  length changed since it was walked are refused with the new
+  `RarError::ModificationRefused`; archives that do not walk cleanly to
+  their end header fail the walk. No member is ever created, rewritten or
+  compressed.
+
+### Changed
+
+- A RAR3 restore reads each data volume once: the volume it takes its
+  names from is no longer checked a second time when the volumes are placed
+  in their slots. A volume that changes after it was read is left to
+  `verify_restored`, which checks every rebuilt volume's headers and data
+  CRC before it is installed.
+- A RAR3 set whose every `.rev` fails its CRC32 is taken as a RAR5 set is:
+  a restore with volumes to rebuild fails as short of recovery volumes
+  ("insufficient RAR3 recovery volumes: need N, have 0") instead of with "no
+  valid RAR recovery volumes were found", and one whose data volumes are all
+  intact reports nothing to restore.
+- A RAR3 data volume with a header whose CRC16 fails is `InvalidHeaders`:
+  the volume scan behind `plan_volume_restore`, `restore_volumes_from_paths`
+  and the stream restore stops at the first such header, so the volume is
+  rebuilt rather than read as input, whether or not its end-of-archive
+  header carries a data CRC that would have caught the damage. The header
+  reader itself still parses such a header, for the extraction paths that
+  recover what they can; `RawRar4Header::crc_matches` says whether it may be
+  trusted.
+- `Rar5Container::read` refuses a main header out of its place, as
+  `RarError::CorruptArchive`: a second one, one after any block but the
+  encryption header, or an end-of-archive header before any. A second
+  main header used to overwrite the lock flag and locators the first
+  stated, so an archive whose lock forbids changes could be changed.
+- `restore_volumes_from_paths` refuses a RAR5 set whose table gives a data
+  volume more bytes than a usable `.rev` carries, as `plan_volume_restore`
+  does, before it reads a data volume or writes anything. RAR writes every
+  `.rev` payload as long as the longest volume, so a table past that is not
+  the set's, and rebuilding to it would write zeros past the recovery data.
+
+### Fixed
+
+- `restore_volumes_from_paths` takes only the files of the set it is given.
+  Beside the given paths it takes the files named in the set's naming: for
+  RAR5, `name.partNN.rar` and `name.partNN.rev` at the set's digit width;
+  for RAR3, `name.partN.rar` or `name.rar`, `name.r00`, ..., and `.rev`s
+  named after the same base. The naming is taken from a volume of the set,
+  as reference UnRAR takes it. A given path not named as one of the set's
+  volumes, or naming a data volume past its count, and a second file for a
+  volume another file fills, are errors naming the paths; a file found
+  beside the given paths and named otherwise is passed over. Files found
+  beside the given paths are taken in name order, not in the order the
+  directory lists them. It used to take every file whose name started as a
+  given path's did, and the last one found for a volume won, so a copy of a
+  volume, or another set's volume with the same prefix, could fill a slot or
+  be moved to `.bad` and replaced.
+- A RAR5 restore places data volumes by the number their names carry, as
+  reference UnRAR does, instead of opening each one to read the number its
+  headers state. A volume whose headers are damaged, or that is too short to
+  have any, is judged by its size and CRC32 against the `.rev` table like
+  any other, moved to `.bad` and rebuilt. The restore used to fail when that
+  read raised an error, and otherwise report the volume missing and then
+  refuse the file at its name, or with `overwrite_existing` replace it
+  without moving it aside.
+- A RAR5 `.rev` whose header numbers it volume 0, which reference UnRAR
+  refuses, no longer describes the set to a restore.
+- A RAR3 data volume that is cut short, ends without an end-of-archive
+  header, is not marked a volume by its main header, or whose end-of-archive
+  header numbers it as another volume is `InvalidHeaders`: a restore moves
+  it to `.bad` and rebuilds it. A volume cut short in its packed data or
+  between headers used to pass as valid, as did a misnumbered one, so the
+  rebuild used wrong bytes and reported success; one cut short inside a
+  header failed the whole restore with an I/O error.
+- A RAR3 restore writes each rebuilt volume to a hidden partial file beside
+  its name and, with `verify_restored`, reads it back through the same
+  handle and checks it as it checks a data volume: headers, end-of-archive
+  volume number and data CRC. Only once every rebuilt volume is written and
+  has passed are invalid volumes moved to `.bad`, existing outputs refused
+  and the partial files moved into place; a failure up to then removes the
+  partial files and leaves every other file as it was. It used to move
+  invalid volumes aside and write the outputs in place first, and its
+  verification read only the rebuilt volume's signature, so a wrong rebuild
+  was installed and reported as restored.
+- A rebuilt volume's name takes its extension's case from the data volume
+  the set's naming comes from (`name.part05.RAR`, `NAME.R01`), instead of
+  always lower case.
+- A RAR5 restore reads each input through the word the longest volume ends
+  in, as reference UnRAR reads whole words of each. A rebuilt volume of odd
+  length used to take a zero for its last word's high byte, which the
+  `.rev` payload carries past the volume's length, so its last byte was
+  rebuilt wrong and `verify_restored` failed the restore.
+- The cut of a RAR3 rebuilt last volume walks its headers as the volume
+  scan and the stream restore do: a member is skipped by its full 64-bit
+  packed size, so a volume holding a member over 4 GiB is cut after its
+  end-of-archive block instead of failing the restore from inside the
+  member's data; and a volume whose headers are encrypted (`-hp`) or
+  damaged is left as it is, for `verify_restored` to judge, where the walk
+  used to read the encrypted or damaged bytes as headers and fail the
+  restore after the volume was written.
+- A restore checks every `.bad` name it would move a damaged volume to
+  before it moves the first one, for RAR5 and RAR3 alike, so a restore that
+  refuses a taken `.bad` name without `overwrite_existing` leaves every
+  volume at its own name. It used to move the damaged volumes before the
+  taken name, then stop, leaving them under `.bad` and their names empty.
+- `locate_recovery_record` and the repair and assessment built on it return
+  an I/O error met while reading the main header's locator, other than an
+  early end of file, instead of falling back to the backward scan: the scan
+  reads from the end of the volume and could succeed over the unreadable
+  bytes and hide the error. Damaged or cut-short headers still fall back
+  to the scan.
+
 ## 0.13.0
 
 ### Changed

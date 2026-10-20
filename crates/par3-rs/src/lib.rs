@@ -77,15 +77,21 @@
 //!   checksum for their shared block.
 //! - Recovery-carrier reconstruction and staged Cauchy PAR-inside insertion or
 //!   self-repair for supported ZIP, ZIP64, and 7z layouts ([`carrier`], [`inside`]).
-//! - Experimental PAR-inside for RAR5 archives and RAR5 volume sets made by
-//!   RARLAB rar: one set across every volume, a region per volume, insertion,
-//!   verification, byte-exact self-repair of lost volumes and regions, and
-//!   byte-exact removal ([`inside::rar5`]). The region layout is not yet
-//!   specified by PAR3 and may change in a later release. RAR4 hosts, a
-//!   recovery-index base other than zero, and header-encrypted volume sets
-//!   (whose completeness cannot be checked) are refused.
+//! - Experimental container-blind embedded carrier sets ([`embedded`]): one
+//!   set across host files whose container format the caller knows and this
+//!   crate does not; a carrier per host at a split the caller picks, behind
+//!   framing the caller writes and rebuilds; insertion, verification,
+//!   byte-exact self-repair of lost hosts, carriers and framing, and
+//!   byte-exact removal. The carrier layout is not yet specified by PAR3 and
+//!   may change in a later release. `rarpar` builds PAR-inside for RAR5 on
+//!   it.
 //!
 //! # What is not
+//!
+//! - Any RAR knowledge: PAR-inside for RAR archives lives in `rarpar`, which
+//!   frames carriers as RAR5 service records through `unrar-rs`. The
+//!   `inside::rar5` and `inside::rar4` modules and `RarCipher` were removed
+//!   in 0.8.0.
 //!
 //! - Sparse/explicit matrix execution, high-rate FFT, and parent-set backups.
 //! - Permission/link restoration, recursive PAR-inside, and automatic source
@@ -99,7 +105,7 @@
 //!
 //! The workspace's `rarpar` binary exposes `par3 create`, `par3 verify`,
 //! `par3 repair`, `par3 archive` (a 7z or ZIP archive protected in the same
-//! pass), the experimental `par3 inside` for RAR5 hosts, and PAR3 processing in
+//! pass), the experimental `par3 inside` for RAR5 hosts (built on [`embedded`]), and PAR3 processing in
 //! `auto` mode through the session engine. Invoked as `par3`, or under its own
 //! name with a par3cmdline command line, it is also a par3cmdline-compatible
 //! facade for verification, listing and repair (`v`, `l`, `r` and the
@@ -245,6 +251,7 @@ pub mod cauchy;
 pub mod checksums;
 pub mod create;
 pub mod creation;
+pub mod embedded;
 pub mod error;
 pub mod evidence;
 pub mod fft;

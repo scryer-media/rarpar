@@ -44,6 +44,11 @@ impl PasswordResolver {
         })
     }
 
+    /// The candidates the command line gave, without ever prompting.
+    pub fn given(&self) -> Vec<String> {
+        self.candidates.clone()
+    }
+
     pub fn candidates_with_prompt(&mut self, prompt: &str) -> Result<Vec<String>, RarparError> {
         if !self.candidates.is_empty() {
             return Ok(self.candidates.clone());

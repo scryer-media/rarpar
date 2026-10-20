@@ -1,0 +1,4 @@
+# Review requests for every path go to the maintainer. The main ruleset
+# requires a pull request and resolved threads, not a code-owner approval,
+# so this routes reviews rather than gating merges.
+* @NZBMan

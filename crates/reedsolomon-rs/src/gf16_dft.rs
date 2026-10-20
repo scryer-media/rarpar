@@ -106,7 +106,7 @@
 //! buckets' results at once turns that into a `G`-source batch into one
 //! destination — one destination read and write for `G` source reads — which is
 //! what [`crate::gf_simd::mul_acc_input_batch`] is built for. `G` trades scratch for
-//! bandwidth and is a plan parameter ([`DftPlan::build_tuned`]).
+//! bandwidth and is a plan parameter ([`DftPlan::build_tuned`](crate::gf16_dft::DftPlan::build_tuned)).
 //!
 //! # What this module does not do
 //!
@@ -143,7 +143,7 @@ const P_ORDER: usize = 255;
 /// Cells in one `(g5, g3)` plane of the row layout: 5 * 3.
 const PLANE: usize = 15;
 
-/// Largest bucket batch [`DftPlan::build_tuned`] accepts.
+/// Largest bucket batch [`DftPlan::build_tuned`](crate::gf16_dft::DftPlan::build_tuned) accepts.
 pub const MAX_BUCKET_BATCH: usize = 8;
 
 /// Bucket batch [`DftPlan::build`] selects.

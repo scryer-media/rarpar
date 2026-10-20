@@ -280,6 +280,12 @@ pub struct ExecutedAction {
     pub action: String,
     pub success: bool,
     pub message: String,
+    /// For an `auto --dry-run` step that would fail by itself, the parity
+    /// repair the real run makes first that covers the shortfall: a
+    /// restore's `par2`, `par3` or `par2+par3`, a PAR2 repair's `par3`, a
+    /// PAR3 repair's `par2`. Absent from the JSON otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deferred_to: Option<&'static str>,
 }
 
 pub fn selected_par3_set(set: &crate::par3::Par3Set, roots: &[PathBuf]) -> bool {
@@ -594,6 +600,63 @@ fn same_file_on_disk(left: &Path, right: &Path) -> bool {
         (Ok(left), Ok(right)) => left == right,
         _ => false,
     }
+}
+
+/// Whether `left` and `right`, one name under one directory in two
+/// spellings, open the same file there: on disk, as [`same_file_on_disk`]
+/// sees it, when either exists, else as the directory opens the names it
+/// holds, probed on its first entry with a letter to respell. A directory
+/// with no such entry keeps the spellings apart. This stands in for the
+/// probe on a file that does not exist yet, such as a volume a parity
+/// repair would write.
+pub(crate) fn same_name_on_disk(left: &Path, right: &Path) -> bool {
+    if left.symlink_metadata().is_ok() || right.symlink_metadata().is_ok() {
+        return same_file_on_disk(left, right);
+    }
+    left.parent().is_some_and(folds_case)
+}
+
+/// Whether `dir` opens an entry under its name respelled in another case,
+/// as a case-insensitive volume does, probed on its first entry with an
+/// ASCII letter to respell; false where it has none the probe can read.
+fn folds_case(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .find_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            if !name.bytes().any(|byte| byte.is_ascii_alphabetic()) {
+                return None;
+            }
+            let path = entry.path();
+            path.metadata().ok()?;
+            let respelled = name
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_lowercase() {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c.to_ascii_lowercase()
+                    }
+                })
+                .collect::<String>();
+            Some(same_file_on_disk(&path, &dir.join(respelled)))
+        })
+        .unwrap_or(false)
+}
+
+/// Whether `path` names a `.rev` file of `set`: one under the set's own
+/// directory that its family takes, as [`in_named_family`] decides it,
+/// whether or not the file exists.
+pub(crate) fn recovery_volume_of(set: &RarSet, path: &Path) -> bool {
+    is_ext(path, "rev")
+        && in_named_family_with(path, &set.label, same_name_on_disk)
+        && path
+            .parent()
+            .is_some_and(|dir| same_path(dir, &set.base_dir))
 }
 
 /// [`Path::canonicalize`], counted per thread under test so RAR set
@@ -1321,7 +1384,7 @@ fn safe_label(label: &str) -> String {
     }
 }
 
-fn same_path(left: &Path, right: &Path) -> bool {
+pub(crate) fn same_path(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
     }

@@ -26,7 +26,9 @@ impl Rar5RsCoder {
     pub fn new_decoder(data_count: usize, rec_count: usize, valid_flags: &[bool]) -> Option<Self> {
         if data_count == 0
             || rec_count == 0
-            || data_count + rec_count > GF_SIZE
+            || data_count
+                .checked_add(rec_count)
+                .is_none_or(|total| total > GF_SIZE)
             || valid_flags.len() != data_count + rec_count
         {
             return None;
@@ -55,6 +57,42 @@ impl Rar5RsCoder {
             matrix,
             missing_data_count,
         })
+    }
+
+    /// Build the encoder RAR writes recovery volumes and RAR5 recovery
+    /// records with: output row `k` is the sum over data units `d` of
+    /// `inv((data_count + k) xor d) * unit[d]`.
+    ///
+    /// The coder then has `rec_count` output rows, fed through
+    /// [`update_outputs`](Self::update_outputs) or
+    /// [`apply_units`](Self::apply_units) exactly like a decoder's, and
+    /// [`output_count`](Self::output_count) is `rec_count`.
+    pub fn new_encoder(data_count: usize, rec_count: usize) -> Option<Self> {
+        if data_count == 0
+            || rec_count == 0
+            || data_count
+                .checked_add(rec_count)
+                .is_none_or(|total| total > GF_SIZE)
+        {
+            return None;
+        }
+        let mut matrix = vec![0u16; rec_count * data_count];
+        for (rec, row) in matrix.chunks_exact_mut(data_count).enumerate() {
+            for (col, cell) in row.iter_mut().enumerate() {
+                *cell = gf::inv(((rec + data_count) as u16) ^ (col as u16));
+            }
+        }
+        Some(Self {
+            data_count,
+            matrix,
+            missing_data_count: rec_count,
+        })
+    }
+
+    /// Output rows: the missing data rows of a decoder, the recovery rows of
+    /// an encoder.
+    pub fn output_count(&self) -> usize {
+        self.missing_data_count
     }
 
     pub fn missing_data_count(&self) -> usize {
@@ -366,8 +404,54 @@ mod tests {
     }
 
     #[test]
+    fn encoder_matches_reference_sums() {
+        let data = vec![
+            (0..130).map(|i| (i * 5) as u8).collect::<Vec<_>>(),
+            (0..130).map(|i| (i * 7 + 11) as u8).collect::<Vec<_>>(),
+            (0..130).map(|i| (255 - i) as u8).collect::<Vec<_>>(),
+        ];
+        let expected = encode_recovery(&data, 4);
+        let coder = Rar5RsCoder::new_encoder(3, 4).unwrap();
+        assert_eq!(coder.output_count(), 4);
+
+        let mut rows = vec![vec![0xAAu8; 130]; 4];
+        {
+            let mut outs = rows.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>();
+            for (d, unit) in data.iter().enumerate() {
+                coder.update_outputs(d, unit, &mut outs);
+            }
+        }
+        assert_eq!(rows, expected);
+
+        let mut batched = vec![vec![0u8; 130]; 4];
+        {
+            let mut outs = batched
+                .iter_mut()
+                .map(Vec::as_mut_slice)
+                .collect::<Vec<_>>();
+            let units = data.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            coder.apply_units(&units, &mut outs);
+        }
+        assert_eq!(batched, expected);
+        assert!(Rar5RsCoder::new_encoder(0, 1).is_none());
+        assert!(Rar5RsCoder::new_encoder(1, 0).is_none());
+        assert!(Rar5RsCoder::new_encoder(65_000, 1_000).is_none());
+    }
+
+    #[test]
     fn decoder_rejects_insufficient_recovery() {
         let valid = [false, false, true, true, false];
         assert!(Rar5RsCoder::new_decoder(3, 2, &valid).is_none());
+    }
+
+    /// A geometry whose counts overflow their sum is refused like one past
+    /// the field, not computed with the wrapped sum.
+    #[test]
+    fn constructors_refuse_counts_whose_sum_overflows() {
+        assert!(Rar5RsCoder::new_encoder(usize::MAX, 1).is_none());
+        assert!(Rar5RsCoder::new_encoder(1, usize::MAX).is_none());
+        assert!(Rar5RsCoder::new_encoder(usize::MAX, usize::MAX).is_none());
+        assert!(Rar5RsCoder::new_decoder(usize::MAX, 1, &[]).is_none());
+        assert!(Rar5RsCoder::new_decoder(1, usize::MAX, &[]).is_none());
     }
 }

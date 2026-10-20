@@ -11,8 +11,12 @@
 //! is not available, and in source code comments of resulting package.
 //!
 //! This crate provides reading, decompression, and extraction of existing RAR
-//! archives only. It intentionally exposes no archive writer, builder, or
-//! creation API — the restriction above is why.
+//! archives. It intentionally exposes no archive writer, builder, compressor,
+//! or creation API, and never creates or rewrites a member — the restriction
+//! above is why. The one change it makes to an existing RAR5 archive is
+//! adding or removing a caller-named service record whose payload the caller
+//! supplies, copying every member and other header verbatim
+//! ([`container`]).
 //!
 //! # Listing an archive
 //!
@@ -236,6 +240,7 @@
 //! [rarpar benchmarks](https://github.com/scryer-media/rarpar/blob/main/docs/benchmark.md).
 
 pub mod archive;
+pub mod container;
 pub(crate) mod crc;
 pub(crate) mod crc_simd;
 #[cfg(any(feature = "crypto-host", feature = "crc-host"))]
@@ -335,7 +340,18 @@ pub use limits::Limits;
 pub use path::sanitize_path;
 pub use probe::{ProbeFile, VolumeProbe, probe_volume};
 pub use progress::{NoProgress, ProgressHandler};
-pub use recovery::{RecoveryOptions, RecoveryReport, restore_volumes_from_paths};
+pub use recovery::{
+    DataVolumePlan, DataVolumeState, DataVolumeStatus, FileVolumeSource, RecoveryOptions,
+    RecoveryReport, RecoveryVolumePlan, RecoveryVolumeState, RestorePlan, RestoreSet,
+    RestoredVolume, RevTestResult, RevTestStatus, SliceVolumeSource, StreamRestoreOptions,
+    VolumeAssessment, VolumeRef, VolumeRestoreError, VolumeRestoreReport, VolumeSource,
+    assess_volume_set, plan_volume_restore, restore_volume_set, restore_volumes_from_paths,
+    test_recovery_volumes,
+};
+pub use recovery::{
+    RecoveryRecordAssessment, RecoveryRecordLayout, RecoveryRecordPatch, RecoveryRecordRepair,
+    assess_recovery_record, locate_recovery_record, repair_from_recovery_record,
+};
 pub use stored_layout::{
     EncryptedStore, IneligibilityReason, MalformedReason, MappedSlice, MemberEligibility,
     MemberKeying, StoredLayoutBuilder, StoredLayoutError, StoredMember, StoredMemberPart,
