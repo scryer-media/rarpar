@@ -19,10 +19,10 @@ use reedsolomon_rs::rar5::Rar5RsCoder;
 use reedsolomon_rs::{gf_simd, gf8, threading};
 
 use super::{
-    CRC_READ_SIZE, DataVolumeStatus, MAX_RAR3_SET, REV5_PREFIX_LEN, REV5_SIGN, Rar3EndBlock,
-    Rar3RevHeader, Rar3VolumeScan, Rar3Walk, Rar3WalkStep, Rar5DataVolumeInfo, Rar5RevHeader,
-    RevTestStatus, parse_rar3_rev_footer, rar3_missing_rows, rar3_scan_verdict, rar3_volume_status,
-    rar5_chunk_size, read_rar5_rev_header,
+    CRC_READ_SIZE, DataVolumeStatus, MAX_RAR3_SET, RAR3_PADDING_PROBE, REV5_PREFIX_LEN, REV5_SIGN,
+    Rar3EndBlock, Rar3RevHeader, Rar3VolumeScan, Rar3Walk, Rar3WalkStep, Rar5DataVolumeInfo,
+    Rar5RevHeader, RevTestStatus, parse_rar3_rev_footer, rar3_missing_rows, rar3_scan_verdict,
+    rar3_volume_status, rar5_chunk_size, read_rar5_rev_header,
 };
 use crate::error::RarResult;
 use crate::types::ArchiveFormat;
@@ -35,9 +35,6 @@ const DEFAULT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DEFAULT_WORKERS: usize = 16;
 /// The smallest read a pass over a volume makes, whatever the budget.
 const MIN_READ_SIZE: usize = 4096;
-/// How far past a RAR3 last volume's end-of-archive block reference UnRAR
-/// looks for zero padding before it cuts the volume there.
-const RAR3_PADDING_PROBE: u64 = 8192;
 /// The bytes a RAR3 header walk reads to find the signature.
 const RAR3_SIGNATURE_READ: usize = 8;
 /// The fixed part of every RAR3 header, the least a header step reads.

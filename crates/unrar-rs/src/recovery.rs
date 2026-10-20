@@ -36,6 +36,9 @@ const RAR3_TOTAL_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 /// GF(2^8) symbol each, so one column always fits an array this size.
 const MAX_RAR3_SET: usize = Rar3RsCoder::MAX_BLOCK_LEN;
 const RAR5_TOTAL_BUFFER_SIZE: usize = 64 * 1024 * 1024;
+/// How far past a RAR3 last volume's end-of-archive block reference UnRAR
+/// looks for zero padding before it cuts the volume there.
+const RAR3_PADDING_PROBE: u64 = 8192;
 
 #[derive(Debug, Clone)]
 pub struct RecoveryOptions {
@@ -2027,10 +2030,12 @@ fn reconstruct_rar5(
         let rs_len = bytes + (bytes & 1);
         par_zip_mut(bufs, units, |input_buf, unit| {
             let (file, hasher, size) = unit;
-            // `read_padded` zeroes what the file does not fill; the odd pad
-            // byte of a final odd-length chunk lies past what it is handed.
-            input_buf[bytes..rs_len].fill(0);
-            read_padded(file, &mut input_buf[..bytes])?;
+            // Whole words: a final odd-length chunk ends in the low byte of
+            // a word whose high byte comes from every input that holds one,
+            // the `.rev`s above all, as reference UnRAR reads whole words of
+            // each. `read_padded` zeroes what an input does not fill, as the
+            // encoder padded it.
+            read_padded(file, &mut input_buf[..rs_len])?;
             if let Some(hasher) = hasher {
                 let hash_len = size.saturating_sub(offset).min(bytes as u64);
                 hasher.update(&input_buf[..hash_len as usize]);
@@ -3340,43 +3345,40 @@ fn finalize_rar3_restored_output(
     Ok(())
 }
 
+/// Cut the zero padding a RAR3 recovery set leaves after a rebuilt last
+/// volume's end-of-archive block, where reference UnRAR cuts it: at the
+/// block's end, when the [`RAR3_PADDING_PROBE`] bytes after it (or all of
+/// them, when fewer) are zero. The walk to the block is [`Rar3Walk`]'s, the
+/// one the stream restore and the volume scan make, so a member's full
+/// 64-bit packed size is skipped. A volume whose headers are encrypted or
+/// damaged, or whose signature is not a RAR 1.5-4.x one, cannot be measured
+/// and is left as it is: the restore has already written it, and
+/// `verify_restored` judges it.
 fn truncate_rar3_last_volume_padding(output: &mut File) -> RarResult<()> {
     output.seek(SeekFrom::Start(0)).map_err(RarError::from)?;
-    match crate::signature::read_signature(output) {
-        Ok(format) if format.is_rar4_family() => {}
-        Ok(_) => return Ok(()),
-        Err(RarError::InvalidSignature) => return Ok(()),
-        Err(err) => return Err(err),
-    }
-
-    while let Some(raw) = crate::rar4::header::read_raw_header(output)? {
-        let next_offset = raw
-            .offset
-            .saturating_add(u64::from(raw.header_size))
-            .saturating_add(raw.data_area_size);
-        if raw.header_type == crate::rar4::types::Rar4HeaderType::EndArchive {
-            let file_len = output.seek(SeekFrom::End(0)).map_err(RarError::from)?;
-            if next_offset >= file_len {
-                return Ok(());
-            }
-            output
-                .seek(SeekFrom::Start(next_offset))
-                .map_err(RarError::from)?;
-            let mut probe = [0u8; 8192];
-            let read = output.read(&mut probe).map_err(RarError::from)?;
-            if read > 0 && probe[..read].iter().all(|&byte| byte == 0) {
-                output.set_len(next_offset).map_err(RarError::from)?;
-            }
-            return Ok(());
+    let mut walk = Rar3Walk::default();
+    let end = loop {
+        match walk.step(output) {
+            Ok(Rar3WalkStep::Next) => {}
+            Ok(Rar3WalkStep::Stopped(_)) => return Ok(()),
+            Ok(Rar3WalkStep::End(end)) => break end,
+            Err(error) if rar3_volume_damage(&error) => return Ok(()),
+            Err(error) => return Err(error),
         }
+    };
 
-        if raw.data_area_size > 0 {
-            output
-                .seek(SeekFrom::Start(next_offset))
-                .map_err(RarError::from)?;
-        }
+    let file_len = output.seek(SeekFrom::End(0)).map_err(RarError::from)?;
+    if end.next >= file_len {
+        return Ok(());
     }
-
+    output
+        .seek(SeekFrom::Start(end.next))
+        .map_err(RarError::from)?;
+    let mut probe = [0u8; RAR3_PADDING_PROBE as usize];
+    let read = output.read(&mut probe).map_err(RarError::from)?;
+    if read > 0 && probe[..read].iter().all(|&byte| byte == 0) {
+        output.set_len(end.next).map_err(RarError::from)?;
+    }
     Ok(())
 }
 
@@ -4077,12 +4079,12 @@ mod tests {
         second.extend((0..payload_len).map(|i| (i as u8).wrapping_mul(7) ^ seed));
         let first_len = second.len() + 23;
         let rs_len = first_len + (first_len & 1);
-        let mut payload = (0..rs_len)
+        // The payload runs to the word the longest volume ends in, as RAR
+        // writes it; when that volume is of odd length, the byte past it is
+        // the high byte of its last word and takes part in the rebuild.
+        let payload = (0..rs_len)
             .map(|i| (i as u8).wrapping_mul(13) ^ seed)
             .collect::<Vec<_>>();
-        // The reader supplies a zero GF16 pad after the maximum volume
-        // length, so the independent reference pass must use the same pad.
-        payload[first_len..].fill(0);
 
         let coder = Rar5RsCoder::new_decoder(2, 1, &[false, true, true]).unwrap();
         let mut second_unit = second.clone();
@@ -4124,6 +4126,108 @@ mod tests {
             assert_eq!(std::fs::read(restored).unwrap(), expected);
             assert_eq!(stray_partials(dir.path(), &[]), Vec::<PathBuf>::new());
         }
+    }
+
+    /// A rebuilt volume of odd length ends in the low byte of a word whose
+    /// high byte the `.rev` payloads carry past the volume's length, and
+    /// with two `.rev`s in the rebuild that high byte reaches the low byte.
+    /// Four data volumes, the longest of odd length, and two `.rev`s; data
+    /// volumes 1 and 2 are whatever the decoder rebuilds from the rest, so
+    /// the set is consistent by construction, and the `.rev` bytes past the
+    /// longest volume are chosen so that zeros in their place rebuild a
+    /// different last byte.
+    #[test]
+    fn rar5_restore_reads_the_rev_bytes_past_an_odd_longest_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let flags = crate::header::main_archive::flags::VOLUME
+            | crate::header::main_archive::flags::VOLUME_NUMBER;
+        let first = {
+            let mut bytes =
+                build_probe_rar5_archive(crate::header::main_archive::flags::VOLUME, None);
+            bytes.extend((0..1001usize).map(|i| (i as u8).wrapping_mul(29) ^ 0x51));
+            bytes
+        };
+        let longest = first.len();
+        assert!(
+            !longest.is_multiple_of(2),
+            "the longest volume is of odd length"
+        );
+        let rs_len = longest + 1;
+        let fourth = {
+            let mut bytes = build_probe_rar5_archive(flags, Some(3));
+            bytes.extend((0..600usize).map(|i| (i as u8).wrapping_mul(31) ^ 0x1D));
+            bytes
+        };
+        let payloads = [0x77u8, 0xC3].map(|seed| {
+            (0..rs_len)
+                .map(|i| (i as u8).wrapping_mul(13) ^ seed)
+                .collect::<Vec<_>>()
+        });
+        assert!(payloads.iter().all(|payload| payload[longest] != 0));
+
+        let coder =
+            Rar5RsCoder::new_decoder(4, 2, &[true, false, false, true, true, true]).unwrap();
+        let rebuild = |payloads: &[Vec<u8>]| {
+            let mut first_unit = first.clone();
+            first_unit.resize(rs_len, 0);
+            let mut fourth_unit = fourth.clone();
+            fourth_unit.resize(rs_len, 0);
+            let mut second = vec![0u8; rs_len];
+            let mut third = vec![0u8; rs_len];
+            coder.apply_units(
+                &[&first_unit, &payloads[0], &payloads[1], &fourth_unit],
+                &mut [&mut second[..], &mut third[..]],
+            );
+            second.truncate(longest);
+            third.truncate(longest);
+            [second, third]
+        };
+        let expected = rebuild(&payloads);
+        let zeroed = payloads.clone().map(|mut payload| {
+            payload[longest] = 0;
+            payload
+        });
+        assert_ne!(
+            rebuild(&zeroed).map(|bytes| bytes[longest - 1]),
+            expected.each_ref().map(|bytes| bytes[longest - 1]),
+            "zeros past the longest volume rebuild other last bytes"
+        );
+
+        let volumes = [&first, &expected[0], &expected[1], &fourth];
+        let mut paths = Vec::new();
+        for (position, payload) in payloads.iter().enumerate() {
+            let mut raw = vec![1u8]; // version
+            raw.extend_from_slice(&4u16.to_le_bytes()); // data count
+            raw.extend_from_slice(&2u16.to_le_bytes()); // recovery count
+            raw.extend_from_slice(&(4 + position as u16).to_le_bytes()); // recovery volume number
+            raw.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
+            for volume in volumes {
+                raw.extend_from_slice(&(volume.len() as u64).to_le_bytes());
+                raw.extend_from_slice(&crc32fast::hash(volume).to_le_bytes());
+            }
+            let mut rev = build_rar5_rev_from_raw(&raw);
+            rev.extend_from_slice(payload);
+            let path = dir
+                .path()
+                .join(format!("odd_word.part{}.rev", position + 1));
+            std::fs::write(&path, &rev).unwrap();
+            paths.push(path);
+        }
+        for (index, volume) in [(0, &first), (3, &fourth)] {
+            let path = dir.path().join(format!("odd_word.part{}.rar", index + 1));
+            std::fs::write(&path, volume).unwrap();
+            paths.push(path);
+        }
+
+        let report = restore_volumes_from_paths(&paths, &RecoveryOptions::default()).unwrap();
+
+        let second = dir.path().join("odd_word.part2.rar");
+        let third = dir.path().join("odd_word.part3.rar");
+        assert_eq!(report.restored_paths, vec![second.clone(), third.clone()]);
+        assert_eq!(report.missing_volume_numbers, vec![1, 2]);
+        assert!(std::fs::read(second).unwrap() == expected[0]);
+        assert!(std::fs::read(third).unwrap() == expected[1]);
+        assert_eq!(stray_partials(dir.path(), &[]), Vec::<PathBuf>::new());
     }
 
     #[test]
@@ -4816,33 +4920,170 @@ mod tests {
         assert_eq!(std::fs::read(&new_style).unwrap(), expected);
     }
 
+    /// One RAR 1.5-4.x header block: the CRC16, type, flags and size over
+    /// `body`, which holds the fields after the size.
+    fn rar4_block(header_type: u8, flags: u16, body: &[u8]) -> Vec<u8> {
+        let mut header = vec![0u8; 7];
+        header[2] = header_type;
+        header[3..5].copy_from_slice(&flags.to_le_bytes());
+        header[5..7].copy_from_slice(&((7 + body.len()) as u16).to_le_bytes());
+        header.extend_from_slice(body);
+        let crc = (crc32fast::hash(&header[2..]) & 0xFFFF) as u16;
+        header[0..2].copy_from_slice(&crc.to_le_bytes());
+        header
+    }
+
+    /// The signature and main header of a RAR 1.5-4.x volume with `flags`.
+    fn rar4_volume_start(flags: u16) -> Vec<u8> {
+        let mut bytes = crate::signature::RAR4_SIGNATURE.to_vec();
+        bytes.extend_from_slice(&rar4_block(0x73, flags, &[0u8; 6]));
+        bytes
+    }
+
+    /// A stored file header for `name` whose packed and unpacked sizes are
+    /// `size`, with the LARGE high words when `size` needs them.
+    fn rar4_stored_file_header(name: &[u8], size: u64) -> Vec<u8> {
+        use crate::rar4::types::{common_flags, file_flags};
+        let large = size > u64::from(u32::MAX);
+        let mut body = Vec::new();
+        body.extend_from_slice(&(size as u32).to_le_bytes()); // packed low
+        body.extend_from_slice(&(size as u32).to_le_bytes()); // unpacked low
+        body.push(2); // Windows
+        body.extend_from_slice(&0u32.to_le_bytes()); // CRC32
+        body.extend_from_slice(&0u32.to_le_bytes()); // mtime
+        body.push(29);
+        body.push(0x30); // store
+        body.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // attributes
+        if large {
+            body.extend_from_slice(&((size >> 32) as u32).to_le_bytes());
+            body.extend_from_slice(&((size >> 32) as u32).to_le_bytes());
+        }
+        body.extend_from_slice(name);
+        let flags = common_flags::HAS_DATA | if large { file_flags::LARGE } else { 0 };
+        rar4_block(0x74, flags, &body)
+    }
+
+    fn rar4_end_block() -> Vec<u8> {
+        rar4_block(0x7B, 0, &[])
+    }
+
+    fn open_rw(path: &Path) -> File {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap()
+    }
+
     #[test]
     fn rar3_last_restored_volume_truncates_zero_padding_after_endarc() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("last-volume.rar");
-        let mut bytes = crate::signature::RAR4_SIGNATURE.to_vec();
-        bytes.extend_from_slice(&[
-            0x00, 0x00, // CRC16 placeholder; raw parser tolerates mismatch.
-            0x7B, // ENDARC
-            0x00, 0x00, // flags
-            0x07, 0x00, // header size
-        ]);
-        let endarc_offset = bytes.len();
+        let mut bytes = rar4_volume_start(crate::rar4::types::archive_flags::VOLUME);
+        bytes.extend_from_slice(&rar4_stored_file_header(b"a.bin", 5));
+        bytes.extend_from_slice(b"hello");
+        bytes.extend_from_slice(&rar4_end_block());
+        let block_end = bytes.len();
         bytes.extend_from_slice(&[0u8; 32]);
         std::fs::write(&path, bytes).unwrap();
 
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
+        let mut file = open_rw(&path);
         finalize_rar3_restored_output(&mut file, false, true).unwrap();
         drop(file);
 
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().len(),
-            endarc_offset as u64
-        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), block_end as u64);
+    }
+
+    /// A rebuilt last volume whose headers are encrypted (`-hp`) cannot be
+    /// walked to its end-of-archive block: it is left as it is, and the
+    /// restore does not fail on it. The volumes are RARLAB's `-hp` archives,
+    /// padded as a `.rev`'s slot pads the set's last volume.
+    #[test]
+    fn rar3_last_restored_volume_with_encrypted_headers_is_left_uncut() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar4");
+        let mut seen = 0;
+        for name in ["rar4_hp_store.rar", "rar4_hp_lz.rar"] {
+            let Ok(mut bytes) = std::fs::read(fixtures.join(name)) else {
+                continue;
+            };
+            if !bytes.starts_with(b"Rar!") {
+                continue;
+            }
+            seen += 1;
+            bytes.resize(bytes.len() + 4096, 0);
+            let path = dir.path().join(name);
+            std::fs::write(&path, &bytes).unwrap();
+
+            let mut file = open_rw(&path);
+            truncate_rar3_last_volume_padding(&mut file).unwrap();
+            drop(file);
+
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{name}");
+        }
+        if seen == 0 {
+            eprintln!("skipping test: RAR4 -hp fixtures not present");
+        }
+    }
+
+    /// A damaged rebuilt last volume is left as it is too, for
+    /// `verify_restored` to judge, rather than failing the restore after it
+    /// was written.
+    #[test]
+    fn rar3_last_restored_volume_with_damaged_headers_is_left_uncut() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sound = rar4_volume_start(crate::rar4::types::archive_flags::VOLUME);
+        sound.extend_from_slice(&rar4_stored_file_header(b"a.bin", 5));
+        sound.extend_from_slice(b"hello");
+        sound.extend_from_slice(&rar4_end_block());
+        sound.extend_from_slice(&[0u8; 32]);
+        let mut bad_signature = sound.clone();
+        bad_signature[0] ^= 0x5A;
+        let mut bad_header_size = sound.clone();
+        bad_header_size[7 + 13 + 5] = 1; // the file header says it is 1 byte long
+        let truncated_header = sound[..7 + 13 + 4].to_vec();
+        for (case, bytes) in [
+            ("a damaged signature", bad_signature),
+            ("a header shorter than its fixed part", bad_header_size),
+            ("a header cut short by the volume's end", truncated_header),
+        ] {
+            let path = dir.path().join("last-volume.rar");
+            std::fs::write(&path, &bytes).unwrap();
+            let mut file = open_rw(&path);
+            truncate_rar3_last_volume_padding(&mut file).unwrap();
+            drop(file);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{case}");
+        }
+    }
+
+    /// The walk to the end-of-archive block skips a member by its 64-bit
+    /// packed size: a member over 4 GiB, whose low 32 bits alone would land
+    /// the walk inside its data, is stepped over and the padding after the
+    /// block is cut. The member's data is a hole in a sparse file.
+    #[cfg(unix)]
+    #[test]
+    fn rar3_last_restored_volume_walks_a_member_over_4_gib() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("last-volume.rar");
+        let size = (1u64 << 32) + 100;
+        let mut head = rar4_volume_start(crate::rar4::types::archive_flags::VOLUME);
+        head.extend_from_slice(&rar4_stored_file_header(b"big.bin", size));
+        let data_start = head.len() as u64;
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&head).unwrap();
+        file.seek(SeekFrom::Start(data_start + size)).unwrap();
+        let tail_start = data_start + size;
+        file.write_all(&rar4_end_block()).unwrap();
+        let block_end = tail_start + 7;
+        file.write_all(&[0u8; 32]).unwrap();
+        drop(file);
+
+        let mut file = open_rw(&path);
+        truncate_rar3_last_volume_padding(&mut file).unwrap();
+        drop(file);
+
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), block_end);
     }
 
     #[test]

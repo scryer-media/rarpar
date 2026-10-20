@@ -154,6 +154,19 @@
 - A rebuilt volume's name takes its extension's case from the data volume
   the set's naming comes from (`name.part05.RAR`, `NAME.R01`), instead of
   always lower case.
+- A RAR5 restore reads each input through the word the longest volume ends
+  in, as reference UnRAR reads whole words of each. A rebuilt volume of odd
+  length used to take a zero for its last word's high byte, which the
+  `.rev` payload carries past the volume's length, so its last byte was
+  rebuilt wrong and `verify_restored` failed the restore.
+- The cut of a RAR3 rebuilt last volume walks its headers as the volume
+  scan and the stream restore do: a member is skipped by its full 64-bit
+  packed size, so a volume holding a member over 4 GiB is cut after its
+  end-of-archive block instead of failing the restore from inside the
+  member's data; and a volume whose headers are encrypted (`-hp`) or
+  damaged is left as it is, for `verify_restored` to judge, where the walk
+  used to read the encrypted or damaged bytes as headers and fail the
+  restore after the volume was written.
 
 ## 0.13.0
 
