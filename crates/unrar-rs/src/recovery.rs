@@ -20,18 +20,14 @@ use reedsolomon_rs::decode_apply::apply_decode_matrix_gf8;
 use reedsolomon_rs::rar3::Rar3RsCoder;
 use reedsolomon_rs::rar5::Rar5RsCoder;
 
+mod record;
 mod rr3;
 mod rr5;
 mod stream;
 
-pub use rr3::{
-    RR3_MARK, RR3_SECTOR_SIZE, RR3_SERVICE_NAME, Rr3Assessment, Rr3DamagedSector, Rr3Located,
-    Rr3Record, Rr3RepairReport, assess_rr3, compute_rr3_data, locate_rr3_record, read_rr3_data,
-    repair_rr3, rr3_sector_checksum, scan_rr3_record,
-};
-pub use rr5::{
-    Rar5RecoveryCheck, Rar5RecoveryError, Rar5RecoveryLayout, check_rar5_recovery_record,
-    locate_rar5_recovery_record, repair_rar5_recovery_record,
+pub use record::{
+    RecoveryRecordAssessment, RecoveryRecordLayout, RecoveryRecordPatch, RecoveryRecordRepair,
+    assess_recovery_record, locate_recovery_record, repair_from_recovery_record,
 };
 pub use stream::{
     DataVolumeState, FileVolumeSource, RecoveryVolumeState, RestoreSet, RestoredVolume,
@@ -2417,7 +2413,7 @@ fn rar3_volume_walk<R: Read + Seek>(
     reader.seek(SeekFrom::Start(0)).map_err(RarError::from)?;
     loop {
         match walk.step(reader)? {
-            Rar3WalkStep::Next => {}
+            Rar3WalkStep::Next | Rar3WalkStep::Service(_) => {}
             Rar3WalkStep::Stopped(status) => return Ok((status, None)),
             Rar3WalkStep::End(end) => {
                 let status = match end.data_crc {
@@ -2462,6 +2458,10 @@ struct Rar3Walk {
 enum Rar3WalkStep {
     /// Another header follows.
     Next,
+    /// A service header (`NEWSUB`), its data area skipped; another header
+    /// follows. The recovery record's `RR` header is one; other walks take
+    /// it as [`Next`](Self::Next).
+    Service(crate::rar4::header::RawRar4Header),
     /// The walk ended before an end-of-archive header with this verdict:
     /// `InvalidHeaders`, or `Valid` for a volume whose headers are
     /// encrypted.
@@ -2527,7 +2527,11 @@ impl Rar3Walk {
                         // would otherwise rewind this walk and loop forever
                         // (fuzz reproducer `timeout-a8693f23`).
                         skip_forward(reader, header.packed_size)?;
-                        Ok(Rar3WalkStep::Next)
+                        Ok(if raw.header_type == Rar4HeaderType::NewSub {
+                            Rar3WalkStep::Service(raw)
+                        } else {
+                            Rar3WalkStep::Next
+                        })
                     }
                     Rar4HeaderType::EndArchive => {
                         let end = parse_end_header(&raw);
@@ -3370,7 +3374,7 @@ fn truncate_rar3_last_volume_padding(output: &mut File) -> RarResult<()> {
     let mut walk = Rar3Walk::default();
     let end = loop {
         match walk.step(output) {
-            Ok(Rar3WalkStep::Next) => {}
+            Ok(Rar3WalkStep::Next | Rar3WalkStep::Service(_)) => {}
             Ok(Rar3WalkStep::Stopped(_)) => return Ok(()),
             Ok(Rar3WalkStep::End(end)) => break end,
             Err(error) if rar3_volume_damage(&error) => return Ok(()),

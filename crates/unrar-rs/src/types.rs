@@ -255,9 +255,18 @@ pub struct ArchiveMetadata {
 
 /// Metadata for embedded recovery records discovered in archive headers.
 ///
-/// This describes RAR4 protect headers and RAR5 `RR` service records. It does
-/// not feed volume restoration; standalone `.rev` recovery volumes are handled
-/// by the recovery-volume restore API instead of consuming embedded RR data.
+/// This describes RAR4 protect headers and RAR5 `RR` service records as the
+/// headers state them. To check a volume against its own record or repair
+/// it from the record, use [`locate_recovery_record`],
+/// [`assess_recovery_record`] and [`repair_from_recovery_record`], which work
+/// from the volume's bytes and find the record when its headers are damaged.
+/// Standalone `.rev` recovery volumes are restored by
+/// [`restore_volume_set`].
+///
+/// [`locate_recovery_record`]: crate::locate_recovery_record
+/// [`assess_recovery_record`]: crate::assess_recovery_record
+/// [`repair_from_recovery_record`]: crate::repair_from_recovery_record
+/// [`restore_volume_set`]: crate::restore_volume_set
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryRecordInfo {
     pub format: ArchiveFormat,

@@ -193,7 +193,7 @@ fn is_rar4_unix_symlink(host_os: Rar4HostOs, attributes: u32) -> bool {
 }
 
 /// Raw header data as read from the stream.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawRar4Header {
     pub header_type: Rar4HeaderType,
     pub flags: u16,

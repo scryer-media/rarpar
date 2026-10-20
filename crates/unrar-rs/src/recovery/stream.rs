@@ -1687,7 +1687,7 @@ impl Rar3Stream {
                 continue;
             }
             match step {
-                Ok(Rar3WalkStep::Next) => {
+                Ok(Rar3WalkStep::Next | Rar3WalkStep::Service(_)) => {
                     self.pos = at;
                     self.need = RAR3_HEADER_MIN;
                     self.drain();

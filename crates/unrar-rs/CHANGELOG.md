@@ -89,58 +89,48 @@
   assessment, not an error. The stream and path restores share the `.rev`
   parsers, the RAR3 header walk and the decoders, and keep separate I/O, so
   the path restore reads and writes as it did.
-- The RAR5 recovery record (`rar a -rr`, the `RR` service block) is decoded
-  and used. `locate_rar5_recovery_record` finds a volume's record through
-  the main header's locator or, when the headers are encrypted or damaged,
-  by scanning back from the end of the volume, and gives its
-  `Rar5RecoveryLayout`: the protected bytes `0..P` (everything before the
-  `RR` header, an SFX module included), the record's offset and size, the
-  data unit size and the data, parity and slice counts.
-  `check_rar5_recovery_record` reads the volume once and reports, in a
-  `Rar5RecoveryCheck`, the data units whose CRC64 no longer matches, the
-  record chunks that fail their own CRC64 and the slices no intact chunk
-  is left for. `repair_rar5_recovery_record` writes a copy of the volume
-  with every damaged data unit rebuilt from the record's GF(2^16) Cauchy
-  parity, the same code the `.rev` restore decodes, after each rebuilt unit
-  has matched its CRC64; damage beyond what the intact chunks can rebuild
-  is `Rar5RecoveryError::Unrepairable` with the units left, and nothing is
-  written. The record itself is never rewritten: a damaged chunk is
-  reported and copied as it is, as `rar r` documents for its own repair.
-  The module's docs give the record's layout as the Rust recompute
-  reproduces it byte for byte from RARLAB-written archives.
-- The RAR 2.9-4.x in-archive recovery record, the `RR` service block that
-  `rar a -rr` and `rar rr` append to a RAR3 volume, is decoded and used.
-  `locate_rr3_record` walks a volume's headers from the signature to the
-  record and returns an `Rr3Record`: where its header, its checksum list
-  and its parity sectors sit, the counts its sub-data states (the mark
-  `Protect+`, a `u32` recovery-sector count and a `u64` protected-sector
-  count) and the range it protects, which is every byte of the file before
-  the record header, an SFX stub included, in 512-byte sectors with the last
-  one zero-padded. A volume with encrypted headers (`-hp`) needs the
-  password to be walked, as it does for `rar r`; the record's data area
-  itself is in the clear. `scan_rr3_record` finds the record by its bytes
-  when the headers before it are damaged, as `rar r` does, and
-  `compute_rr3_data` recomputes the whole data area from the protected
-  bytes (each sector's checksum is the low 16 bits of the CRC32 register
-  before its final inversion; parity sector `k` is the XOR of the sectors
-  whose index is `k` modulo the recovery-sector count). `assess_rr3` lists
-  every sector whose checksum fails, with its byte range and parity slot,
-  and the parity sectors that no longer match their intact data sectors;
-  `repair_rr3` writes a copy of the volume in which every damaged sector
-  alone in its slot is rebuilt from the parity, confirmed against its
-  stored checksum, and every other byte is copied as it is. The report
-  names the sectors rebuilt, the ones whose rebuild failed its checksum and
-  the ones sharing a slot with other damage, so over-capacity damage is
-  reported per sector and never silently mis-repaired; the record itself is
-  never rewritten. On the archives checked, the repaired bytes equal what
-  `rar r` writes, sector for sector, where `rar r` repairs, and are left as
-  they were where it reports "cannot recover". A verify needs the checksum
-  list in memory (two bytes per protected sector) and reads the protected
-  range once; a repair adds one 512-byte accumulator per slot being rebuilt
-  and reads the protected range twice more. `Rr3Record`, `Rr3Assessment`,
-  `Rr3DamagedSector`, `Rr3RepairReport` and `Rr3Located` are
-  `#[non_exhaustive]`. The record's `FileCRC` header field is carried, not
-  checked: what it covers is not known.
+- A volume's own recovery record, the `RR` service block `rar a -rr` and
+  `rar rr` add, is decoded and used, for RAR5 and RAR 2.9-4.x volumes alike.
+  `locate_recovery_record` finds it and gives its `RecoveryRecordLayout`:
+  the format, the protected bytes `0..P` (everything before the `RR` header,
+  an SFX module included), the record's offset and size, the unit size and
+  the data and parity unit counts, and whether the record was found by
+  scanning back from the end of the volume, as it is when the headers before
+  it are damaged or, in RAR5, encrypted. A RAR3 volume with encrypted
+  headers (`-hp`) needs the password to be walked, as it does for `rar r`.
+  `assess_recovery_record` checks every data unit against the checksum the
+  record keeps for it and every parity unit against its own check, reading
+  the protected bytes once and the record once, and returns a
+  `RecoveryRecordAssessment`: the damaged and the unrepairable data units,
+  the damaged parity units, the RAR3 checksum entries that are what is
+  damaged (the parity vouches for the sector), and the bytes no checksum
+  survives for. `repair_from_recovery_record` returns a
+  `RecoveryRecordRepair` holding every damaged unit rebuilt as
+  `RecoveryRecordPatch`es, each confirmed against its checksum; it only
+  reads, and the repair writes the patches into the volume itself
+  (`write_in_place`) or into a copy (`write_repaired_copy`). When any
+  damaged unit cannot be rebuilt the result is the new
+  `RarError::RecoveryRecordInsufficient` naming those units, and no partial
+  repair is offered. The record itself is never rebuilt or rewritten, and
+  nothing here writes a record. A RAR3 sector is rebuilt from the XOR
+  parity of its slot when it is the slot's only damaged sector; a RAR5 unit
+  is rebuilt 64 KiB slice by slice from the GF(2^16) Cauchy parity the
+  `.rev` restore decodes, each slice from that slice's intact parity chunks,
+  so damage is repairable while no slice has more damaged units than intact
+  chunks. A record is found by its position, never by its first copy: a
+  backward scan takes the candidate nearest the end that sits where its
+  counts say the record must, so a copy of a record header among the
+  protected bytes or a stray chunk after the record is passed over. Memory
+  stays bounded whatever the headers state: a few MiB of buffers for RAR3,
+  and for RAR5 one chunk, 8 bytes per data unit per slice and, to rebuild a
+  slice, 64 KiB per damaged unit in it, plus the rebuilt bytes. The records
+  the tests recompute from the protected bytes match the ones RARLAB's `rar`
+  wrote byte for byte, and on the damaged RAR3 archives checked, a repair
+  equals what `rar r` writes wherever every damaged sector is repairable;
+  where some are not, `rar r` leaves those sectors as they were and this
+  crate refuses. The RAR3 header's `FileCRC` field is not checked: no CRC32
+  convention over any byte range gives it, and `rar r` ignores it. All four
+  types are `#[non_exhaustive]`.
 
 ### Changed
 
