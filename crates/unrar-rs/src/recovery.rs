@@ -20,9 +20,15 @@ use reedsolomon_rs::decode_apply::apply_decode_matrix_gf8;
 use reedsolomon_rs::rar3::Rar3RsCoder;
 use reedsolomon_rs::rar5::Rar5RsCoder;
 
+mod rr3;
 mod rr5;
 mod stream;
 
+pub use rr3::{
+    RR3_MARK, RR3_SECTOR_SIZE, RR3_SERVICE_NAME, Rr3Assessment, Rr3DamagedSector, Rr3Located,
+    Rr3Record, Rr3RepairReport, assess_rr3, compute_rr3_data, locate_rr3_record, read_rr3_data,
+    repair_rr3, rr3_sector_checksum, scan_rr3_record,
+};
 pub use rr5::{
     Rar5RecoveryCheck, Rar5RecoveryError, Rar5RecoveryLayout, check_rar5_recovery_record,
     locate_rar5_recovery_record, repair_rar5_recovery_record,

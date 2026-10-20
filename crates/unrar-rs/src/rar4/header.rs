@@ -90,7 +90,7 @@ const OLD_SERVICE_STREAM: u16 = 0x105;
 const MAX_STREAM_NAME20: usize = 260;
 const SIZEOF_FILEHEAD3: usize = 32;
 
-fn rar4_header_crc16(data: &[u8]) -> u16 {
+pub(crate) fn rar4_header_crc16(data: &[u8]) -> u16 {
     if data.len() <= 2 {
         return 0;
     }

@@ -343,6 +343,11 @@ pub use recovery::{
     assess_volume_set, plan_volume_restore, restore_volume_set, restore_volumes_from_paths,
     test_recovery_volumes,
 };
+pub use recovery::{
+    RR3_MARK, RR3_SECTOR_SIZE, RR3_SERVICE_NAME, Rr3Assessment, Rr3DamagedSector, Rr3Located,
+    Rr3Record, Rr3RepairReport, assess_rr3, compute_rr3_data, locate_rr3_record, read_rr3_data,
+    repair_rr3, rr3_sector_checksum, scan_rr3_record,
+};
 pub use stored_layout::{
     EncryptedStore, IneligibilityReason, MalformedReason, MappedSlice, MemberEligibility,
     MemberKeying, StoredLayoutBuilder, StoredLayoutError, StoredMember, StoredMemberPart,
