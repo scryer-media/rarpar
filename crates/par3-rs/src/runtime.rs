@@ -167,7 +167,7 @@ impl ResourceLimit {
     /// `PeerContention` is worth retrying, the other two never are.
     ///
     /// A refusal is unmeasured only when it carries no byte figures at all,
-    /// which is exactly what [`Self::named`] produces for a structural limit
+    /// which is exactly what `Self::named` produces for a structural limit
     /// (an overflowed count, a geometry the engine cannot express). A positive
     /// need against a ceiling of zero is a real, measured refusal — a budget
     /// of `MemoryBudget::new(0)` admits nothing — and is reported as

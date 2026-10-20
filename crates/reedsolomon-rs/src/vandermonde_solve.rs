@@ -63,13 +63,13 @@
 //! # Stage 1 as a blocked convolution
 //!
 //! A Hankel product is a correlation, and a correlation is a convolution with
-//! one side reversed. Cut both index ranges into segments of [`BLOCK`] = 128:
+//! one side reversed. Cut both index ranges into segments of `BLOCK` = 128:
 //! with `r = j*128 + r'` and `t = i*128 + t'`, the coefficient `p[r + t + 1]`
 //! depends on the segments only through `i + j`, so each segment pair is one
 //! convolution of a 128-tap block sequence with the reversed locator window
 //! `R_s[w] = p[s*128 + 255 - w]`, read out at `v = 254 - t'`. Those indices
 //! never wrap modulo 255, so a *cyclic* convolution of length
-//! [`CONV`] = `2*128 - 1` carries it exactly — and 255 divides 65535, so
+//! `CONV` = `2*128 - 1` carries it exactly — and 255 divides 65535, so
 //! GF(2^16) has a root of unity of exactly that order and the cyclic
 //! convolution is a length-255 transform, a pointwise product, and an inverse.
 //!
@@ -112,15 +112,15 @@
 //! coprime to 65535, so at most `phi(255) = 128` distinct residues exist and the
 //! whole stage costs `(groups + 257) * m` folds instead of `m^2`. It wins once
 //! `m` is comfortably past 257 and loses below that, which is what
-//! [`SolveStrategy::Auto`] arbitrates — for both stages, each against its own
+//! [`SolveStrategy::Auto`](crate::vandermonde_solve::SolveStrategy::Auto) arbitrates — for both stages, each against its own
 //! row-count threshold.
 //!
 //! # Shape
 //!
 //! The solve is stripe-wise and in place: the caller holds one `m x stripe`
 //! syndrome buffer whose rows are overwritten with the answers, plus a scratch
-//! buffer sized by [`ConsecutiveSolvePlan::scratch_bytes`]. Nothing is
-//! allocated inside [`ConsecutiveSolvePlan::solve_stripe`], and the working set
+//! buffer sized by [`ConsecutiveSolvePlan::scratch_bytes`](crate::vandermonde_solve::ConsecutiveSolvePlan::scratch_bytes). Nothing is
+//! allocated inside [`ConsecutiveSolvePlan::solve_stripe`](crate::vandermonde_solve::ConsecutiveSolvePlan::solve_stripe), and the working set
 //! never scales with the full slice length.
 //!
 //! Non-consecutive exponent selections are out of scope: build rejects them so
@@ -146,7 +146,7 @@ const CRT_INVERSE: u32 = 128;
 
 /// Segment length of the blocked stage-1 convolution.
 ///
-/// Paired with [`CONV`] = `2 * BLOCK - 1`: the linear convolution of two
+/// Paired with `CONV` = `2 * BLOCK - 1`: the linear convolution of two
 /// length-`BLOCK` sequences is exactly that long, so a cyclic convolution of
 /// that length carries it with nothing wrapping. 128 is the largest such
 /// pairing whose length divides 65535 — 255 does, 511 and 1023 do not — and the
@@ -157,14 +157,14 @@ const BLOCK: usize = 128;
 /// Length of the stage-1 cyclic convolution, `2 * BLOCK - 1 == 255`.
 const CONV: usize = 2 * BLOCK - 1;
 
-/// The pairwise coprime radices [`CONV`] factors into.
+/// The pairwise coprime radices `CONV` factors into.
 const RADICES: [usize; 3] = [3, 5, 17];
 
 /// Most rows of one segment that can share a `(n mod 3, n mod 5)` class: a
 /// class is one residue modulo 15, so `ceil(128 / 15) = 9`.
 const RADIX17_GROUP: usize = BLOCK.div_ceil(15);
 
-/// The re-indexing weight for one radix of [`CONV`]: the element of `Z/255`
+/// The re-indexing weight for one radix of `CONV`: the element of `Z/255`
 /// that is one modulo that radix and zero modulo the other two.
 ///
 /// Sending both the input and the output index of the transform through these
@@ -186,7 +186,7 @@ fn radix_weight(radix: usize) -> usize {
 /// allow — the same bound `gf_simd`'s own source blocking uses.
 const BATCH_SOURCES: usize = 8;
 
-/// Row count at or above which [`SolveStrategy::Auto`] moves stage 2 to the
+/// Row count at or above which [`SolveStrategy::Auto`](crate::vandermonde_solve::SolveStrategy::Auto) moves stage 2 to the
 /// grouped evaluation, and stage 1 to the transformed correlation. Below it
 /// the 257 bucket rows and the fixed per-segment transform cost more than the
 /// `m^2` and `m^2 / 2` folds they replace.
@@ -215,8 +215,8 @@ const BATCH_SOURCES: usize = 8;
 /// has to spend an `O(m^3)` Gauss-Jordan on before it can run at all.
 const GROUPED_MIN_ROWS: usize = 512;
 
-/// Row count at or above which [`SolveStrategy::Auto`] moves stage 1 to the
-/// transformed correlation. Equal to [`GROUPED_MIN_ROWS`]: see the table
+/// Row count at or above which [`SolveStrategy::Auto`](crate::vandermonde_solve::SolveStrategy::Auto) moves stage 1 to the
+/// transformed correlation. Equal to `GROUPED_MIN_ROWS`: see the table
 /// there.
 const TRANSFORM_MIN_ROWS: usize = GROUPED_MIN_ROWS;
 
@@ -260,8 +260,8 @@ pub enum SolveStrategy {
     /// Stage 1 as blocked length-255 convolutions as well. Adds the input
     /// spectra, which are the largest arena the solve holds.
     Transformed,
-    /// Per-stage thresholds: [`GROUPED_MIN_ROWS`] for stage 2,
-    /// [`TRANSFORM_MIN_ROWS`] for stage 1.
+    /// Per-stage thresholds: `GROUPED_MIN_ROWS` for stage 2,
+    /// `TRANSFORM_MIN_ROWS` for stage 1.
     Auto,
 }
 

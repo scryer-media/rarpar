@@ -540,6 +540,18 @@ fn inside_round_trips_an_archive_with_encrypted_headers() {
     assert_eq!(unchecked.status.code(), Some(0), "{unchecked:?}");
     let report: Value = serde_json::from_slice(&unchecked.stdout).unwrap();
     assert_eq!(report["sets"][0]["hosts"][0]["framing_checked"], false);
+    // Damage to the signature and encryption header hides that the headers
+    // are sealed; the given password is still used to rebuild them.
+    let protected = root.join("out/sealed.rar");
+    let pristine = std::fs::read(&protected).unwrap();
+    let mut bytes = pristine.clone();
+    for byte in &mut bytes[..32] {
+        *byte ^= 0x5a;
+    }
+    std::fs::write(&protected, &bytes).unwrap();
+    let repaired = rarpar(&["par3", "inside", "repair", "out/sealed.rar"], true);
+    assert_eq!(repaired.status.code(), Some(0), "{repaired:?}");
+    assert_eq!(std::fs::read(&protected).unwrap(), pristine);
     let removed = rarpar(
         &[
             "par3",

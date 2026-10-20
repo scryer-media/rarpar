@@ -10232,3 +10232,86 @@ fn test_stream_restore_judges_volumes_against_the_lengths_given() {
         "I/O error on data volume 0: the volume ended at byte 0 when read again, short of the 1024 bytes it held when checked"
     );
 }
+
+/// A RAR 3.0 `.rev` carries no footer, so its length is all the plan can
+/// hold it to: RAR writes each as long as the longest data volume. With
+/// RARLAB's `.rev`s under RAR 3.0's `name<d>_<r>_<p>.rev` names and their
+/// footers zeroed, both are usable and `Unverifiable`. One cut by 100 bytes
+/// is `InvalidHeader` and unusable, as the stream restore lists it; the
+/// other still covers the single loss, and the restore rebuilds RARLAB's
+/// volume from it alone.
+#[test]
+fn test_plan_volume_restore_holds_a_rar30_rev_to_the_longest_data_volume() {
+    let (dir, mut paths) = rar3_recovery_set_without(&[3]);
+    let revs = [1, 2].map(|position| {
+        let footered = dir
+            .path()
+            .join(format!("rar3_recovery_volumes.part{position}.rev"));
+        let old_style = dir
+            .path()
+            .join(format!("rar3_recovery_volumes.part5_2_{position}.rev"));
+        let mut bytes = std::fs::read(&footered).unwrap();
+        let len = bytes.len();
+        bytes[len - 7..].fill(0);
+        std::fs::write(&old_style, bytes).unwrap();
+        std::fs::remove_file(&footered).unwrap();
+        old_style
+    });
+    paths.retain(|path| path.extension().is_some_and(|ext| ext != "rev"));
+    paths.extend(revs.iter().cloned());
+    let options = unrar_rs::RecoveryOptions {
+        output_dir: Some(dir.path().to_path_buf()),
+        overwrite_existing: false,
+        verify_restored: true,
+    };
+    let view = |position: usize, status, usable| {
+        (
+            position,
+            5 + position,
+            revs[position].clone(),
+            status,
+            usable,
+        )
+    };
+
+    let plan = unrar_rs::plan_volume_restore(&paths, &options).unwrap();
+    assert_eq!(
+        recovery_volume_views(&plan),
+        vec![
+            view(0, unrar_rs::RevTestStatus::Unverifiable, true),
+            view(1, unrar_rs::RevTestStatus::Unverifiable, true),
+        ]
+    );
+    assert_eq!(plan.usable_recovery_count(), 2);
+
+    let len = std::fs::metadata(&revs[0]).unwrap().len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&revs[0])
+        .unwrap()
+        .set_len(len - 100)
+        .unwrap();
+    let before = dir_snapshot(&dir);
+
+    let plan = unrar_rs::plan_volume_restore(&paths, &options).unwrap();
+
+    assert_eq!(dir_snapshot(&dir), before);
+    assert_eq!(
+        recovery_volume_views(&plan),
+        vec![
+            view(0, unrar_rs::RevTestStatus::InvalidHeader, false),
+            view(1, unrar_rs::RevTestStatus::Unverifiable, true),
+        ]
+    );
+    assert_eq!(plan.usable_recovery_count(), 1);
+    assert_eq!(plan.missing_volume_numbers(), vec![2]);
+    assert!(plan.is_sufficient());
+
+    let report = unrar_rs::restore_volumes_from_paths(&paths, &options).unwrap();
+
+    assert_restore_matches_plan(&plan, &report);
+    assert!(
+        std::fs::read(rar3_volume(&dir, 3)).unwrap()
+            == std::fs::read(fixture("rar4", "rar3_recovery_volumes.part3.rar")).unwrap()
+    );
+}

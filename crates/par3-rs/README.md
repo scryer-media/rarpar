@@ -9,7 +9,7 @@ memory budget.
 
 ```toml
 [dependencies]
-par3-rs = "0.7"
+par3-rs = "0.8"
 ```
 
 **Status:** a 0.x library, tested against the reference tool, par3cmdline.

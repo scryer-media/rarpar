@@ -17,18 +17,22 @@ use serde_json::{Value, json};
 use crate::error::{EXIT_DATA_FAILURE, EXIT_SUCCESS, RarparError};
 use crate::password::PasswordResolver;
 
-/// Password candidates, asked for only when one of `paths` has sealed
-/// headers (`-hp`).
+/// Password candidates: the ones the command line gave, always, and a
+/// prompt for one only when a path proves its headers sealed (`-hp`). A
+/// damaged signature or encryption header proves nothing either way, and
+/// repairing that damage needs the given passwords, so they are kept.
 fn passwords(cli: &Cli, paths: &[PathBuf]) -> Result<Passwords, RarparError> {
+    let mut resolver = PasswordResolver::from_cli(cli)?;
     let sealed = paths.iter().any(|path| {
         std::fs::File::open(path).is_ok_and(|file| {
             unrar_rs::container::headers_sealed(&mut std::io::BufReader::new(file)).unwrap_or(false)
         })
     });
-    if !sealed {
-        return Ok(Passwords::default());
-    }
-    let candidates = PasswordResolver::from_cli(cli)?.candidates_with_prompt("RAR password: ")?;
+    let candidates = if sealed {
+        resolver.candidates_with_prompt("RAR password: ")?
+    } else {
+        resolver.given()
+    };
     Ok(Passwords::new(candidates))
 }
 

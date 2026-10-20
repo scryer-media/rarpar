@@ -3144,3 +3144,59 @@ fn compat_par2_facade_is_consumer_side_only() {
     names.sort();
     assert_eq!(names, ["ledger.bin"]);
 }
+
+/// A symlink at a missing volume's output name, even one pointing nowhere,
+/// is a directory entry the restore's exclusive create refuses, so the dry
+/// run refuses it too instead of following the link and finding the name
+/// free. The link is left as it was.
+#[cfg(unix)]
+#[test]
+fn rar_restore_volumes_dry_run_foresees_a_dangling_symlink_at_the_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let download_dir = temp.path().join("download");
+    copy_rar5_recovery_set(&download_dir);
+    std::fs::remove_file(download_dir.join("rar5_recovery_volumes.part05.rar")).unwrap();
+    let first = download_dir.join("rar5_recovery_volumes.part01.rar");
+    let out_dir = temp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let occupied = out_dir.join("rar5_recovery_volumes.part05.rar");
+    std::os::unix::fs::symlink("nowhere", &occupied).unwrap();
+    let refusal = format!(
+        "refusing to overwrite existing restored volume {}",
+        occupied.display()
+    );
+
+    for dry_run in [true, false] {
+        let mut args = vec![
+            OsStr::new("--output"),
+            out_dir.as_os_str(),
+            OsStr::new("rar"),
+            OsStr::new("restore-volumes"),
+        ];
+        if dry_run {
+            args.push(OsStr::new("--dry-run"));
+        }
+        args.push(first.as_os_str());
+        let output = run(&args);
+        assert_data_failure(
+            &output,
+            &format!("restore over a dangling symlink, dry run {dry_run}"),
+        );
+        let shown = if dry_run {
+            &output.stdout
+        } else {
+            &output.stderr
+        };
+        assert!(
+            String::from_utf8_lossy(shown).contains(&refusal),
+            "dry run {dry_run}: {}",
+            String::from_utf8_lossy(shown)
+        );
+    }
+    assert_eq!(
+        std::fs::read_link(&occupied).unwrap(),
+        Path::new("nowhere"),
+        "the link was replaced"
+    );
+    assert_eq!(listing(&out_dir).len(), 1);
+}

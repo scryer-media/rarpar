@@ -26,7 +26,9 @@ impl Rar5RsCoder {
     pub fn new_decoder(data_count: usize, rec_count: usize, valid_flags: &[bool]) -> Option<Self> {
         if data_count == 0
             || rec_count == 0
-            || data_count + rec_count > GF_SIZE
+            || data_count
+                .checked_add(rec_count)
+                .is_none_or(|total| total > GF_SIZE)
             || valid_flags.len() != data_count + rec_count
         {
             return None;
@@ -66,7 +68,12 @@ impl Rar5RsCoder {
     /// [`apply_units`](Self::apply_units) exactly like a decoder's, and
     /// [`output_count`](Self::output_count) is `rec_count`.
     pub fn new_encoder(data_count: usize, rec_count: usize) -> Option<Self> {
-        if data_count == 0 || rec_count == 0 || data_count + rec_count > GF_SIZE {
+        if data_count == 0
+            || rec_count == 0
+            || data_count
+                .checked_add(rec_count)
+                .is_none_or(|total| total > GF_SIZE)
+        {
             return None;
         }
         let mut matrix = vec![0u16; rec_count * data_count];
@@ -435,5 +442,16 @@ mod tests {
     fn decoder_rejects_insufficient_recovery() {
         let valid = [false, false, true, true, false];
         assert!(Rar5RsCoder::new_decoder(3, 2, &valid).is_none());
+    }
+
+    /// A geometry whose counts overflow their sum is refused like one past
+    /// the field, not computed with the wrapped sum.
+    #[test]
+    fn constructors_refuse_counts_whose_sum_overflows() {
+        assert!(Rar5RsCoder::new_encoder(usize::MAX, 1).is_none());
+        assert!(Rar5RsCoder::new_encoder(1, usize::MAX).is_none());
+        assert!(Rar5RsCoder::new_encoder(usize::MAX, usize::MAX).is_none());
+        assert!(Rar5RsCoder::new_decoder(usize::MAX, 1, &[]).is_none());
+        assert!(Rar5RsCoder::new_decoder(1, usize::MAX, &[]).is_none());
     }
 }

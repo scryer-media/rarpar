@@ -150,7 +150,7 @@ the original error, so `io::Error::downcast` gives back the `RarError` or the
   WebAssembly. Decryption is slower; the output is the same.
 
 ```toml
-unrar-rs = { version = "0.13", default-features = false, features = ["crypto-rust"] }
+unrar-rs = { version = "0.14", default-features = false, features = ["crypto-rust"] }
 ```
 
 Turning on neither is a compile error. With both on, AWS-LC is used.

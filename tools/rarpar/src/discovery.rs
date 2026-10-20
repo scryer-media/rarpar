@@ -1326,7 +1326,7 @@ fn safe_label(label: &str) -> String {
     }
 }
 
-fn same_path(left: &Path, right: &Path) -> bool {
+pub(crate) fn same_path(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
     }

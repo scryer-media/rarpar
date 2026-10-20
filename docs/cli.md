@@ -252,8 +252,25 @@ recovery. Global `--par3-memory-mib` (default 256), `--par3-workers`, and
 `--par3-max-lost-blocks` (default 4096 for Cauchy) control resources. The memory
 budget covers engine allocations; CLI path/report storage is bounded separately
 by `--max-files` and metadata limits. `auto` repairs before rediscovering and
-extracting RAR inputs. Container insertion/self-repair and recovery-carrier
-reconstruction remain explicit library APIs rather than CLI commands.
+extracting RAR inputs.
+
+`par3 inside` (EXPERIMENTAL: the on-disk layout may change before it is
+stable, and output from this version may not verify with a later one) embeds
+PAR3 recovery inside existing RAR5 archives made by RARLAB `rar`, verifies and
+repairs them from it, and removes it again: `par3 inside insert|verify|repair|remove`.
+`insert` writes a protected copy of each archive, or of every volume of a
+`.partN.rar` set, into `-d DIR` or `--in-place`, with one `PAR3` service record
+added before the end-of-archive header (`--layout service`, the only layout);
+members and other headers are copied unchanged, and `remove` restores the
+originals byte for byte. `--placement spread|last|independent` chooses one set
+shared across the volumes with the recovery spread evenly or all on the last
+volume, or a separate set per volume; `-s`, `-c` and `-r` (default 5%) size
+it. Archives with encrypted headers (`-hp`) need their password and get their
+record header encrypted like the others. `repair` rebuilds damaged or missing
+volumes in place, into `-d DIR`, or with `--backup`. RAR archives are never
+created or recompressed. Container self-repair for damaged embedded layouts
+with unprotected ranges and recovery-carrier
+reconstruction remain library APIs rather than CLI commands.
 
 ## xz
 

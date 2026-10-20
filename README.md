@@ -13,8 +13,9 @@ crates.io. The CLI itself ships as release binaries and source, not on
 crates.io.
 
 `rarpar` is not an official RAR, PAR2 or PAR3 tool. It ships no binaries
-named `unrar`, `rar`, `par2` or `par2repair`, and it cannot create or modify
-RAR archives.
+named `unrar`, `rar`, `par2` or `par2repair`, and it cannot create RAR
+archives or change their members: the one change it makes to an existing
+RAR5 archive is adding or removing the PAR3 service record of `par3 inside`.
 
 ## What it does
 
@@ -22,6 +23,8 @@ RAR archives.
 - Verifies and repairs PAR2 and PAR3 sets before extracting.
 - Creates PAR2 sets (`par create`) and PAR3 sets (`par3 create`).
 - Rebuilds missing RAR volumes from `.rev` files.
+- Embeds PAR3 recovery inside RAR5 archives and repairs them from it
+  (`par3 inside`, experimental).
 - Extracts RAR archives, including encrypted ones, with integrity checks on.
 - Compresses, decompresses, tests and lists `.xz` files on several threads.
 - Can delete the source files after a successful extraction, to the trash by

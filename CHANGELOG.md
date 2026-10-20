@@ -5,6 +5,18 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ## rarpar 0.9.2
 
+- `auto --dry-run` counts a damaged or missing volume as rebuilt by the PAR2
+  or PAR3 repair before the restore only when that set lists the volume at
+  its own path, not merely its file name, so a set under another root no
+  longer defers an unrelated set's shortage.
+- A dry run foresees the refusal the restore makes of an output or `.bad`
+  name that a symlink holds, even one pointing nowhere, which it used to
+  report as free.
+- `par3 inside` keeps the passwords given by `--password-file`,
+  `--password-env` and `--password-fd` when damage to an archive's signature
+  or encryption header hides that its headers are sealed, so repairing that
+  damage can rebuild the sealed `PAR3` record header instead of refusing.
+
 - Require explicit native MD5 and Rust-only coverage evidence in the existing
   safety CI jobs; keep assembly as the default backend.
 

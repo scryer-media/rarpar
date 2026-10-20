@@ -110,7 +110,12 @@ impl RecoveryRecordAssessment {
             && self.unchecked_bytes == 0
     }
 
-    /// Whether the record rebuilds every damaged unit.
+    /// Whether the record rebuilds every damaged unit it can see. Bytes
+    /// counted in [`unchecked_bytes`](Self::unchecked_bytes) are outside
+    /// this: no checksum survives for them, so a repair copies them as they
+    /// are and cannot tell whether they are damaged. A caller that needs the
+    /// whole protected range vouched for checks `unchecked_bytes` or
+    /// [`is_intact`](Self::is_intact) as well.
     pub fn is_repairable(&self) -> bool {
         self.unrepairable_units.is_empty()
     }

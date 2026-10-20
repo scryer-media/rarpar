@@ -243,7 +243,7 @@ fn plan_rar_restores(cli: &Cli, report: &mut DiscoveryReport) -> u8 {
         if rar_set.recovery_volumes.is_empty() {
             continue;
         }
-        let cover = parity_cover(report, &rar_set);
+        let cover = parity_cover(report, &rar_set, cli.working_dir.as_deref());
         let outcome = rar::plan_restore(&restore_cli, &rar_set, &cover)
             .unwrap_or_else(|error| rar::RarRestoreOutcome::unplanned(&rar_set.id, &error));
         if exit_code == EXIT_SUCCESS {
@@ -254,20 +254,31 @@ fn plan_rar_restores(cli: &Cli, report: &mut DiscoveryReport) -> u8 {
     exit_code
 }
 
-/// The file names the parity sets a real `auto` run repairs before it
-/// restores `rar_set` protect: each PAR2 set related to the RAR set, and
-/// each PAR3 set the run repairs.
-fn parity_cover(report: &DiscoveryReport, rar_set: &discovery::RarSet) -> rar::ParityCover {
+/// The files the parity sets a real `auto` run repairs before it restores
+/// `rar_set` protect, each resolved as that repair resolves it: a PAR2
+/// set's against its own directory, a PAR3 set's against `working_dir` when
+/// given, else its own directory. The PAR2 sets are those related to the
+/// RAR set, the PAR3 sets those the run repairs.
+fn parity_cover(
+    report: &DiscoveryReport,
+    rar_set: &discovery::RarSet,
+    working_dir: Option<&std::path::Path>,
+) -> rar::ParityCover {
     rar::ParityCover {
         par2: discovery::related_par2_sets(rar_set, &report.par2_sets)
             .into_iter()
-            .flat_map(|set| set.protected_files.iter().cloned())
+            .flat_map(|set| {
+                set.protected_files
+                    .iter()
+                    .map(|name| set.base_dir.join(name))
+            })
             .collect(),
         par3: report
             .par3_sets
             .iter()
             .filter(|set| discovery::selected_par3_set(set, &report.roots))
-            .flat_map(|set| set.protected_files.iter().cloned())
+            .filter_map(|set| set.member_paths(working_dir).ok())
+            .flatten()
             .collect(),
     }
 }

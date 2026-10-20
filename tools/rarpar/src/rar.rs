@@ -393,31 +393,27 @@ const NOTHING_TO_RESTORE: &str = "nothing to restore: all data volumes valid";
 
 /// The data volume names that the parity sets `auto` repairs before its RAR
 /// restore protect: those of each PAR2 set related to the RAR set and of
-/// each PAR3 set the run repairs. A dry run cannot run those repairs, so it
-/// counts a damaged or missing volume whose file name one of them lists
-/// exactly as rebuilt by then.
+/// each PAR3 set the run repairs, each resolved against its set's
+/// directory. A dry run cannot run those repairs, so it counts a damaged or
+/// missing volume whose output path one of them lists as rebuilt by then; a
+/// set under another directory that lists the same file name does not
+/// count.
 #[derive(Debug, Default)]
 pub struct ParityCover {
-    pub par2: BTreeSet<String>,
-    pub par3: BTreeSet<String>,
+    pub par2: BTreeSet<PathBuf>,
+    pub par3: BTreeSet<PathBuf>,
 }
 
 impl ParityCover {
-    /// Whether a PAR2 set, and whether a PAR3 set, lists the file name
-    /// `volume` is restored to.
-    fn lists(&self, volume: &unrar_rs::DataVolumePlan) -> (bool, bool) {
-        match volume
-            .output_path
-            .file_name()
-            .and_then(|name| name.to_str())
-        {
-            Some(name) => (self.par2.contains(name), self.par3.contains(name)),
-            None => (false, false),
-        }
+    /// Whether a PAR2 set, and whether a PAR3 set, lists `output`, the path
+    /// a volume is restored to.
+    fn lists(&self, output: &Path) -> (bool, bool) {
+        let listed = |paths: &BTreeSet<PathBuf>| paths.iter().any(|path| same_file(path, output));
+        (listed(&self.par2), listed(&self.par3))
     }
 
     fn covers(&self, volume: &unrar_rs::DataVolumePlan) -> bool {
-        let (par2, par3) = self.lists(volume);
+        let (par2, par3) = self.lists(&volume.output_path);
         par2 || par3
     }
 
@@ -425,8 +421,12 @@ impl ParityCover {
     /// `covered`, and how the message says it, PAR3 first as the real run
     /// repairs.
     fn deferral(&self, covered: &[&unrar_rs::DataVolumePlan]) -> (&'static str, &'static str) {
-        let par2 = covered.iter().any(|volume| self.lists(volume).0);
-        let par3 = covered.iter().any(|volume| self.lists(volume).1);
+        let par2 = covered
+            .iter()
+            .any(|volume| self.lists(&volume.output_path).0);
+        let par3 = covered
+            .iter()
+            .any(|volume| self.lists(&volume.output_path).1);
         match (par2, par3) {
             (true, true) => ("par2+par3", "PAR3 and PAR2 repairs run"),
             (false, true) => ("par3", "PAR3 repair runs"),
@@ -555,6 +555,30 @@ fn verdict(
     }
 }
 
+/// Whether `left` and `right` name the same file: the same path, or the
+/// same file name under the same directory. The file need not exist, as a
+/// missing volume's output does not, so only the directories are resolved.
+fn same_file(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left.parent(), right.parent()) {
+        (Some(left_dir), Some(right_dir)) => {
+            left.file_name().is_some()
+                && left.file_name() == right.file_name()
+                && crate::discovery::same_path(left_dir, right_dir)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a directory entry holds `path`'s name, as the restore's exclusive
+/// create and hard link see it: a symlink counts, even one that points
+/// nowhere, which [`Path::exists`] would follow and deny.
+fn name_taken(path: &Path) -> bool {
+    path.symlink_metadata().is_ok()
+}
+
 /// The refusal a restore without `--overwrite` would stop on, which the
 /// library's plan does not foresee, with the real run's wording and exit
 /// code. The restore sets every damaged volume aside before it checks any
@@ -564,7 +588,7 @@ fn verdict(
 fn foreseen_refusal(rebuild: &[&unrar_rs::DataVolumePlan]) -> Option<Verdict> {
     for volume in rebuild {
         if let Some(backup) = &volume.set_aside_path
-            && backup.exists()
+            && name_taken(backup)
         {
             let message = format!(
                 "refusing to overwrite existing bad-volume backup {}",
@@ -575,7 +599,7 @@ fn foreseen_refusal(rebuild: &[&unrar_rs::DataVolumePlan]) -> Option<Verdict> {
         }
     }
     for volume in rebuild {
-        if volume.set_aside_path.is_none() && volume.output_path.exists() {
+        if volume.set_aside_path.is_none() && name_taken(&volume.output_path) {
             let detail = format!(
                 "refusing to overwrite existing restored volume {}",
                 volume.output_path.display()
@@ -696,4 +720,42 @@ fn is_rar_password_error(error: &unrar_rs::RarError) -> bool {
             | unrar_rs::RarError::InvalidPassword
             | unrar_rs::RarError::WrongPassword { .. }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A parity set covers a volume it lists at the volume's own path,
+    /// however that path is spelled, and not a volume of the same name under
+    /// another directory.
+    #[test]
+    fn parity_cover_lists_a_volume_by_its_path_not_its_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let here = temp.path().join("here");
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::create_dir_all(&here).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let cover = ParityCover {
+            par2: BTreeSet::from([here.join("set.part05.rar")]),
+            par3: BTreeSet::from([elsewhere.join("set.part05.rar")]),
+        };
+
+        assert_eq!(cover.lists(&here.join("set.part05.rar")), (true, false));
+        assert_eq!(
+            cover.lists(&elsewhere.join("set.part05.rar")),
+            (false, true)
+        );
+        assert_eq!(cover.lists(&here.join("set.part06.rar")), (false, false));
+        assert_eq!(
+            cover.lists(&temp.path().join("set.part05.rar")),
+            (false, false)
+        );
+        #[cfg(unix)]
+        {
+            let link = temp.path().join("link");
+            std::os::unix::fs::symlink(&here, &link).unwrap();
+            assert_eq!(cover.lists(&link.join("set.part05.rar")), (true, false));
+        }
+    }
 }
