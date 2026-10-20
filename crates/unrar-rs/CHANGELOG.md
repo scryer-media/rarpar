@@ -167,6 +167,19 @@
   ("insufficient RAR3 recovery volumes: need N, have 0") instead of with "no
   valid RAR recovery volumes were found", and one whose data volumes are all
   intact reports nothing to restore.
+- A RAR3 data volume with a header whose CRC16 fails is `InvalidHeaders`:
+  the volume scan behind `plan_volume_restore`, `restore_volumes_from_paths`
+  and the stream restore stops at the first such header, so the volume is
+  rebuilt rather than read as input, whether or not its end-of-archive
+  header carries a data CRC that would have caught the damage. The header
+  reader itself still parses such a header, for the extraction paths that
+  recover what they can; `RawRar4Header::crc_matches` says whether it may be
+  trusted.
+- `Rar5Container::read` refuses a main header out of its place, as
+  `RarError::CorruptArchive`: a second one, one after any block but the
+  encryption header, or an end-of-archive header before any. A second
+  main header used to overwrite the lock flag and locators the first
+  stated, so an archive whose lock forbids changes could be changed.
 - `restore_volumes_from_paths` refuses a RAR5 set whose table gives a data
   volume more bytes than a usable `.rev` carries, as `plan_volume_restore`
   does, before it reads a data volume or writes anything. RAR writes every
@@ -232,6 +245,17 @@
   damaged is left as it is, for `verify_restored` to judge, where the walk
   used to read the encrypted or damaged bytes as headers and fail the
   restore after the volume was written.
+- A restore checks every `.bad` name it would move a damaged volume to
+  before it moves the first one, for RAR5 and RAR3 alike, so a restore that
+  refuses a taken `.bad` name without `overwrite_existing` leaves every
+  volume at its own name. It used to move the damaged volumes before the
+  taken name, then stop, leaving them under `.bad` and their names empty.
+- `locate_recovery_record` and the repair and assessment built on it return
+  an I/O error met while reading the main header's locator, other than an
+  early end of file, instead of falling back to the backward scan: the scan
+  reads from the end of the volume and could succeed over the unreadable
+  bytes and hide the error. Damaged or cut-short headers still fall back
+  to the scan.
 
 ## 0.13.0
 

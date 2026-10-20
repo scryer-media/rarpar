@@ -88,8 +88,11 @@ shows `[deferred]` in place of `[ok]`, carries `deferred_to` (`par2`, `par3`
 or `par2+par3`) in the JSON, and its message ends
 `; PAR2 repair runs first for <names>`, naming the volumes and `.rev` files
 the parity rebuilds. The dry run does not check that the parity holds enough
-recovery data for those files, and it still needs one `.rev` file of the set
-to read to plan at all. A set whose restore cannot be planned is a failed
+recovery data for those files. A set with no `.rev` file on disk whose
+`.rev` files a parity set lists is deferred without a plan, as
+`no recovery volumes present to plan with; PAR2 repair runs first for
+<names>`; one whose `.rev` files no parity lists is not planned, as the real
+run does not restore it. A set whose restore cannot be planned is a failed
 step, `cannot plan restore: <error>`, and the sets after it are still
 planned. `auto --dry-run` exits with the code of the first set that fails.
 

@@ -7882,6 +7882,99 @@ fn test_rar3_restore_verifies_rebuilt_volumes_before_installing_them() {
     );
 }
 
+/// A restore checks every `.bad` name it would move a damaged volume to
+/// before it moves the first one, so one that stops on a taken name leaves
+/// every volume where it was, and nothing else behind.
+#[test]
+fn test_rar3_restore_refuses_a_taken_backup_before_moving_any_volume() {
+    let (dir, paths) = rar3_recovery_set_without(&[]);
+    corrupt_in_place(&rar3_volume(&dir, 2));
+    corrupt_in_place(&rar3_volume(&dir, 3));
+    let taken = dir.path().join("rar3_recovery_volumes.part3.rar.bad");
+    std::fs::write(&taken, b"an earlier backup").unwrap();
+    let options = rar5_restore_options(&dir);
+    let before = dir_snapshot(&dir);
+
+    let plan = unrar_rs::plan_volume_restore(&paths, &options).unwrap();
+    assert_eq!(plan.missing_volume_numbers(), vec![1, 2]);
+    assert!(plan.is_sufficient());
+
+    let error = unrar_rs::restore_volumes_from_paths(&paths, &options)
+        .expect_err("the third volume's backup name is taken");
+
+    assert!(
+        error.to_string().contains(&format!(
+            "refusing to overwrite existing bad-volume backup {}",
+            taken.display()
+        )),
+        "{error}"
+    );
+    assert!(
+        dir_snapshot(&dir) == before,
+        "the refused restore changed a file"
+    );
+}
+
+/// [`test_rar3_restore_refuses_a_taken_backup_before_moving_any_volume`]
+/// for a RAR5 set.
+#[test]
+fn test_rar5_restore_refuses_a_taken_backup_before_moving_any_volume() {
+    let (dir, paths) = rar5_recovery_set_without(&[]);
+    corrupt_in_place(&rar5_volume(&dir, 3));
+    corrupt_in_place(&rar5_volume(&dir, 7));
+    let taken = dir.path().join("rar5_recovery_volumes.part07.rar.bad");
+    std::fs::write(&taken, b"an earlier backup").unwrap();
+    let options = rar5_restore_options(&dir);
+    let before = dir_snapshot(&dir);
+
+    let plan = unrar_rs::plan_volume_restore(&paths, &options).unwrap();
+    assert_eq!(plan.missing_volume_numbers(), vec![2, 6]);
+    assert!(plan.is_sufficient());
+
+    let error = unrar_rs::restore_volumes_from_paths(&paths, &options)
+        .expect_err("the seventh volume's backup name is taken");
+
+    assert!(
+        error.to_string().contains(&format!(
+            "refusing to overwrite existing bad-volume backup {}",
+            taken.display()
+        )),
+        "{error}"
+    );
+    assert!(
+        dir_snapshot(&dir) == before,
+        "the refused restore changed a file"
+    );
+}
+
+/// A RAR3 header whose CRC16 fails is damage, whatever the volume's data
+/// CRC says: the volume is `InvalidHeaders`, never input to a rebuild, and
+/// is rebuilt itself. The byte flipped here is the low byte of the main
+/// header's CRC16, right after the 7-byte signature.
+#[test]
+fn test_rar3_volume_with_a_failed_header_crc16_is_invalid() {
+    let (dir, paths) = rar3_recovery_set_without(&[]);
+    let volume = rar3_volume(&dir, 2);
+    let mut bytes = std::fs::read(&volume).unwrap();
+    bytes[7] ^= 0xFF;
+    std::fs::write(&volume, &bytes).unwrap();
+    let options = rar5_restore_options(&dir);
+
+    let plan = unrar_rs::plan_volume_restore(&paths, &options).unwrap();
+    assert_eq!(
+        plan.data_volumes[1].status,
+        unrar_rs::DataVolumeStatus::InvalidHeaders
+    );
+    assert_eq!(plan.missing_volume_numbers(), vec![1]);
+
+    let report = unrar_rs::restore_volumes_from_paths(&paths, &options).unwrap();
+    assert_eq!(report.restored_paths, vec![volume.clone()]);
+    assert_eq!(
+        std::fs::read(&volume).unwrap(),
+        std::fs::read(fixture("rar4", "rar3_recovery_volumes.part2.rar")).unwrap()
+    );
+}
+
 /// A first volume whose main header is zeroed cannot name the set, so the
 /// naming comes from the next volume that can, as reference UnRAR takes it
 /// from the first volume it opens. The first volume is rebuilt at its own

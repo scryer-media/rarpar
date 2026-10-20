@@ -14,7 +14,9 @@ documented in each crate's own changelog so those notes ship with the crate.
 - `auto --dry-run` counts a `.rev` file of the set that a PAR2 or PAR3 set
   lists among the usable recovery volumes by the time the restore runs, so a
   restore that those repairs make sufficient is deferred to them instead of
-  failed; the deferral names the `.rev` files alongside the volumes.
+  failed; the deferral names the `.rev` files alongside the volumes. A set
+  with no `.rev` file on disk whose `.rev` files a parity set lists is a
+  deferred step without a plan, where it used to be left out of the report.
 - A dry run foresees the refusal the restore makes of an output or `.bad`
   name that a symlink holds, even one pointing nowhere, which it used to
   report as free.

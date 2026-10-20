@@ -205,6 +205,17 @@ pub struct RawRar4Header {
     pub data_area_size: u64,
 }
 
+impl RawRar4Header {
+    /// Whether the CRC16 the header states matches its bytes.
+    /// [`read_raw_header`] parses a header whose CRC16 fails, so that a
+    /// damaged archive can still be walked for recovery; a caller that must
+    /// not trust such a header checks here.
+    pub fn crc_matches(&self) -> bool {
+        self.data.len() >= MIN_HEADER_SIZE
+            && rar4_header_crc16(&self.data) == read_u16(&self.data, 0)
+    }
+}
+
 /// Read one raw RAR4 header from the stream.
 ///
 /// Returns None on EOF.

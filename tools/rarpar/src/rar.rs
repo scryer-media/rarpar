@@ -194,6 +194,32 @@ pub fn plan_restore(
     plan_restore_paths(&set.id, cli, &set.source_paths(), cover)
 }
 
+/// `auto --dry-run`'s restore step for a set with no `.rev` file on disk
+/// whose `.rev` files `cover` lists: the real run repairs the parity, finds
+/// them beside the set and restores with them, so the step is deferred to
+/// that repair, with no plan, as there is nothing yet to plan from.
+pub fn defer_restore_to_parity(set_id: &str, cover: &ParityCover) -> RarRestoreOutcome {
+    let rebuilt = cover
+        .recovery_volumes
+        .iter()
+        .map(PathBuf::as_path)
+        .collect::<Vec<_>>();
+    let (kind, repairs) = cover.deferral(&rebuilt);
+    RarRestoreOutcome {
+        set_id: set_id.to_string(),
+        dry_run: true,
+        success: true,
+        exit_code: EXIT_SUCCESS,
+        message: format!(
+            "no recovery volumes present to plan with; {repairs} first for {}",
+            file_names(rebuilt.iter().copied())
+        ),
+        deferred_to: Some(kind),
+        plan: None,
+        report: None,
+    }
+}
+
 pub fn restore_volume_paths(cli: &Cli, paths: &[PathBuf]) -> Result<u8, RarparError> {
     let outcome = restore_volume_paths_inner("rar-restore", cli, paths)?;
     crate::report::emit_rar_restore(cli, &outcome)?;

@@ -138,7 +138,8 @@ pub enum DataVolumeStatus {
     CrcMismatch,
     /// RAR3: the file is not a volume in the RAR 1.5 to 4.x format, or its
     /// headers are broken: cut short, ending before an end-of-archive header,
-    /// or with an end-of-archive header that numbers it as another volume.
+    /// with a header whose CRC16 fails, or with an end-of-archive header
+    /// that numbers it as another volume.
     InvalidHeaders,
 }
 
@@ -1603,6 +1604,12 @@ fn restore_rar5_folded(
     }
 
     let finish = (|| -> RarResult<()> {
+        refuse_taken_backups(
+            missing
+                .iter()
+                .filter_map(|&i| rar5_set_aside(&data_slots[i])),
+            options,
+        )?;
         for &i in &missing {
             rename_invalid_rar5_data_volume(&mut data_slots[i], options)?;
         }
@@ -1673,6 +1680,12 @@ fn restore_rar5_checked(
         });
     }
 
+    refuse_taken_backups(
+        missing_volume_numbers
+            .iter()
+            .filter_map(|&i| rar5_set_aside(&data_slots[i])),
+        options,
+    )?;
     for &missing_idx in &missing_volume_numbers {
         rename_invalid_rar5_data_volume(&mut data_slots[missing_idx], options)?;
     }
@@ -1836,6 +1849,17 @@ fn partial_restore_path(output: &Path) -> PathBuf {
     ))
 }
 
+/// The invalid volume at `slot` and its output path, which the restore sets
+/// it aside for; `None` for a valid or missing one.
+fn rar5_set_aside(slot: &Rar5DataSlot) -> Option<(&Path, &Path)> {
+    if slot.valid {
+        return None;
+    }
+    slot.path
+        .as_deref()
+        .map(|path| (path, slot.output_path.as_path()))
+}
+
 fn rename_invalid_rar5_data_volume(
     slot: &mut Rar5DataSlot,
     options: &RecoveryOptions,
@@ -1864,13 +1888,7 @@ fn rename_invalid_data_volume(
         if options.overwrite_existing {
             std::fs::remove_file(&bad_path).map_err(RarError::from)?;
         } else {
-            return Err(RarError::Io(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                format!(
-                    "refusing to overwrite existing bad-volume backup {}",
-                    bad_path.display()
-                ),
-            )));
+            return Err(refuse_existing_backup(&bad_path));
         }
     }
 
@@ -1882,6 +1900,38 @@ fn rename_invalid_data_volume(
 /// its own name with `.bad` appended, and only when it is the file at the
 /// restore's output name. A volume anywhere else is left where it is, and
 /// the rebuilt one is written to the output name beside it.
+fn refuse_existing_backup(bad_path: &Path) -> RarError {
+    RarError::Io(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "refusing to overwrite existing bad-volume backup {}",
+            bad_path.display()
+        ),
+    ))
+}
+
+/// The refusal [`rename_invalid_data_volume`] would make for any of
+/// `volumes` (an invalid volume's path and the output path it is set aside
+/// for), found before the first of them is moved, so that a restore which
+/// stops on a taken `.bad` name leaves every volume where it was. With
+/// `overwrite_existing` nothing is refused.
+fn refuse_taken_backups<'a>(
+    volumes: impl Iterator<Item = (&'a Path, &'a Path)>,
+    options: &RecoveryOptions,
+) -> RarResult<()> {
+    if options.overwrite_existing {
+        return Ok(());
+    }
+    for (invalid_path, output_path) in volumes {
+        if let Some(bad_path) = set_aside_name(invalid_path, output_path)?
+            && name_taken(&bad_path)
+        {
+            return Err(refuse_existing_backup(&bad_path));
+        }
+    }
+    Ok(())
+}
+
 fn set_aside_name(invalid_path: &Path, output_path: &Path) -> RarResult<Option<PathBuf>> {
     Ok(same_existing_file(invalid_path, output_path)?.then(|| bad_volume_path(invalid_path)))
 }
@@ -2548,7 +2598,11 @@ impl Rar3Walk {
                 let Some(main) = read_raw_header(reader)? else {
                     return Ok(Rar3WalkStep::Stopped(DataVolumeStatus::InvalidHeaders));
                 };
-                if main.header_type != Rar4HeaderType::Archive {
+                // The reader parses a header whose CRC16 fails, for walks
+                // that recover what they can; this one decides whether the
+                // volume's bytes may feed a rebuild, so a damaged header
+                // makes the volume invalid.
+                if main.header_type != Rar4HeaderType::Archive || !main.crc_matches() {
                     return Ok(Rar3WalkStep::Stopped(DataVolumeStatus::InvalidHeaders));
                 }
                 self.main_flags = Some(main.flags);
@@ -2563,6 +2617,9 @@ impl Rar3Walk {
                 let Some(raw) = read_raw_header(reader)? else {
                     return Ok(Rar3WalkStep::Stopped(DataVolumeStatus::InvalidHeaders));
                 };
+                if !raw.crc_matches() {
+                    return Ok(Rar3WalkStep::Stopped(DataVolumeStatus::InvalidHeaders));
+                }
                 match raw.header_type {
                     Rar4HeaderType::File | Rar4HeaderType::NewSub => {
                         let header = parse_file_header(&raw)?;
@@ -3214,13 +3271,16 @@ fn restore_rar3(set: Rar3Set, options: &RecoveryOptions) -> RarResult<RecoveryRe
         }
         drop(outputs);
 
-        for &index in &missing_volume_numbers {
-            let slot = &data_volumes[index];
-            if let Some(path) = &slot.path
-                && slot.status != DataVolumeStatus::Missing
-            {
-                rename_invalid_data_volume(path, &slot.output_path, options)?;
-            }
+        let set_aside = |index: &usize| {
+            let slot = &data_volumes[*index];
+            slot.path
+                .as_deref()
+                .filter(|_| slot.status != DataVolumeStatus::Missing)
+                .map(|path| (path, slot.output_path.as_path()))
+        };
+        refuse_taken_backups(missing_volume_numbers.iter().filter_map(set_aside), options)?;
+        for (path, output_path) in missing_volume_numbers.iter().filter_map(set_aside) {
+            rename_invalid_data_volume(path, output_path, options)?;
         }
         for &index in &missing_volume_numbers {
             let path = &data_volumes[index].output_path;

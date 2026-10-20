@@ -408,7 +408,7 @@ impl Record {
 /// places a record where it can be.
 pub(super) fn locate<R: Read + Seek>(volume: &mut R, len: u64) -> RarResult<Option<Record>> {
     let mut buf = Vec::new();
-    if let Some((header_offset, data_offset)) = locator(volume)
+    if let Some((header_offset, data_offset)) = locator(volume)?
         && let Some(chunk) = read_chunk(volume, len, data_offset, &mut buf)?
         && chunk.row == 0
         && chunk.slice == 0
@@ -432,30 +432,58 @@ pub(super) fn locate<R: Read + Seek>(volume: &mut R, len: u64) -> RarResult<Opti
 }
 
 /// The offsets of the `RR` header and of its data area, when the main
-/// header's locator points at an `RR` service header.
-fn locator<R: Read + Seek>(volume: &mut R) -> Option<(u64, u64)> {
-    volume.seek(SeekFrom::Start(0)).ok()?;
-    if crate::signature::read_signature(volume).ok()? != ArchiveFormat::Rar5 {
-        return None;
+/// header's locator points at an `RR` service header. Damage to those
+/// headers is no locator, and the backward scan stands in; a source that
+/// cannot be read is an error, as the scan could otherwise succeed over the
+/// unread region and hide it.
+fn locator<R: Read + Seek>(volume: &mut R) -> RarResult<Option<(u64, u64)>> {
+    volume.seek(SeekFrom::Start(0))?;
+    if readable(crate::signature::read_signature(volume))? != Some(ArchiveFormat::Rar5) {
+        return Ok(None);
     }
-    let main = read_raw_header(volume).ok()??;
+    let Some(Some(main)) = readable(read_raw_header(volume))? else {
+        return Ok(None);
+    };
     if main.header_type != HeaderType::MainArchive {
-        return None;
+        return Ok(None);
     }
-    let offset = crate::header::main_archive::parse(&main)
-        .ok()?
-        .recovery_record_offset?;
-    volume.seek(SeekFrom::Start(offset)).ok()?;
-    let raw = read_raw_header(volume).ok()??;
+    let Some(offset) = crate::header::main_archive::parse(&main)
+        .ok()
+        .and_then(|main| main.recovery_record_offset)
+    else {
+        return Ok(None);
+    };
+    volume.seek(SeekFrom::Start(offset))?;
+    let Some(Some(raw)) = readable(read_raw_header(volume))? else {
+        return Ok(None);
+    };
     if raw.header_type != HeaderType::Service {
-        return None;
+        return Ok(None);
     }
-    let data_offset = raw
+    let Some(data_offset) = raw
         .offset
-        .checked_add(4 + raw.header_size_vint_len as u64)?
-        .checked_add(raw.header_size)?;
-    let service = crate::header::parse_service_from_raw(&raw, data_offset).ok()?;
-    (service.header.service_name() == "RR").then_some((raw.offset, data_offset))
+        .checked_add(4 + raw.header_size_vint_len as u64)
+        .and_then(|at| at.checked_add(raw.header_size))
+    else {
+        return Ok(None);
+    };
+    let Ok(service) = crate::header::parse_service_from_raw(&raw, data_offset) else {
+        return Ok(None);
+    };
+    Ok((service.header.service_name() == "RR").then_some((raw.offset, data_offset)))
+}
+
+/// `result` with an I/O error other than an early end of file kept, and
+/// any other error, a malformed or cut-short header included, folded to
+/// `None`.
+fn readable<T>(result: RarResult<T>) -> RarResult<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(RarError::Io(error)) if error.kind() != std::io::ErrorKind::UnexpectedEof => {
+            Err(RarError::Io(error))
+        }
+        Err(_) => Ok(None),
+    }
 }
 
 /// The chunk at `pos`, when there is one ending by `limit`.
@@ -716,6 +744,52 @@ mod tests {
         locate(&mut Cursor::new(bytes), bytes.len() as u64)
             .unwrap()
             .expect("a record")
+    }
+
+    /// A volume whose reads starting inside `fail` fail with an error
+    /// other than an early end of file: a source gone bad under the main
+    /// header, not a short file.
+    struct FailsIn {
+        inner: Cursor<Vec<u8>>,
+        fail: std::ops::Range<u64>,
+    }
+
+    impl Read for FailsIn {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.fail.contains(&self.inner.position()) {
+                return Err(std::io::Error::other("the device is gone"));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    impl Seek for FailsIn {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    /// The locator is a hint the backward scan replaces when the headers
+    /// are damaged, not when they cannot be read: an I/O error under the
+    /// main header is the locate's error, where the scan, reading from the
+    /// end, would otherwise find the record and hide it.
+    #[test]
+    fn an_unreadable_main_header_is_an_error_not_a_scan() {
+        let Some(bytes) = rar5("rar5_recovery.rar") else {
+            return;
+        };
+        let len = bytes.len() as u64;
+        assert!(locate(&mut Cursor::new(&bytes), len).unwrap().is_some());
+
+        let mut volume = FailsIn {
+            inner: Cursor::new(bytes),
+            fail: 8..9,
+        };
+        let error = locate(&mut volume, len).expect_err("the main header cannot be read");
+        assert!(
+            matches!(&error, RarError::Io(error) if error.kind() == std::io::ErrorKind::Other),
+            "{error}"
+        );
     }
 
     fn layout(bytes: &[u8]) -> RecoveryRecordLayout {

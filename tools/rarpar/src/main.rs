@@ -234,19 +234,25 @@ fn run_auto(cli: &Cli, mut paths: Vec<std::path::PathBuf>) -> Result<u8, RarparE
 /// code of the first set that fails, as the real run stops there.
 ///
 /// The real run repairs with PAR3 and PAR2 before it restores. A dry run
-/// cannot run those repairs, so it judges each plan with the volumes they
-/// would rebuild in mind; see [`rar::ParityCover`].
+/// cannot run those repairs, so it judges each plan with the files they
+/// would rebuild in mind; see [`rar::ParityCover`]. A set with no `.rev`
+/// file on disk is restored only when those repairs rebuild its `.rev`
+/// files, so it is deferred to them then and not planned otherwise.
 fn plan_rar_restores(cli: &Cli, report: &mut DiscoveryReport) -> u8 {
     let mut restore_cli = cli.clone();
     restore_cli.output = None;
     let mut exit_code = EXIT_SUCCESS;
     for rar_set in report.rar_sets.clone() {
-        if rar_set.recovery_volumes.is_empty() {
-            continue;
-        }
         let cover = parity_cover(report, &rar_set, cli.working_dir.as_deref());
-        let outcome = rar::plan_restore(&restore_cli, &rar_set, &cover)
-            .unwrap_or_else(|error| rar::RarRestoreOutcome::unplanned(&rar_set.id, &error));
+        let outcome = if rar_set.recovery_volumes.is_empty() {
+            if cover.recovery_volumes.is_empty() {
+                continue;
+            }
+            rar::defer_restore_to_parity(&rar_set.id, &cover)
+        } else {
+            rar::plan_restore(&restore_cli, &rar_set, &cover)
+                .unwrap_or_else(|error| rar::RarRestoreOutcome::unplanned(&rar_set.id, &error))
+        };
         if exit_code == EXIT_SUCCESS {
             exit_code = outcome.exit_code;
         }

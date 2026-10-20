@@ -2213,6 +2213,55 @@ fn auto_dry_run_defers_to_parity_over_a_missing_recovery_volume() {
     assert!(out_dir.join("payload.bin").is_file());
 }
 
+/// A set with no `.rev` file on disk is restored by the real run only once
+/// the parity has rebuilt its `.rev` files, so the dry run defers that
+/// restore to the parity without a plan, having nothing to plan from, and
+/// plans nothing at all for a set whose `.rev` files no parity lists.
+#[test]
+fn auto_dry_run_defers_to_parity_over_every_missing_recovery_volume() {
+    let temp = tempfile::tempdir().unwrap();
+    let download_dir = temp.path().join("download");
+    copy_rar5_recovery_set(&download_dir);
+    let revs = [1, 2]
+        .map(|rev| format!("rar5_recovery_volumes.part{rev:02}.rev"))
+        .to_vec();
+    create_parity(&download_dir, "PAR3", &revs);
+    for name in &revs {
+        std::fs::remove_file(download_dir.join(name)).unwrap();
+    }
+    std::fs::remove_file(download_dir.join("rar5_recovery_volumes.part05.rar")).unwrap();
+
+    let (code, action) = auto_dry_run_restore_step(&download_dir);
+    assert_eq!(code, Some(0), "{action}");
+    assert_eq!(action["success"], true);
+    assert_eq!(action["deferred_to"], "par3");
+    assert_eq!(
+        action["message"],
+        format!(
+            "no recovery volumes present to plan with; PAR3 repair runs first for {}",
+            revs.join(", ")
+        )
+    );
+
+    let out_dir = temp.path().join("out");
+    assert_success(&auto_into(&download_dir, &out_dir), "auto with PAR3");
+    assert!(out_dir.join("payload.bin").is_file());
+
+    let unlisted = temp.path().join("unlisted");
+    copy_rar5_recovery_set(&unlisted);
+    for name in &revs {
+        std::fs::remove_file(unlisted.join(name)).unwrap();
+    }
+    let output = run(&[
+        OsStr::new("auto"),
+        OsStr::new("--dry-run"),
+        OsStr::new("--json"),
+        unlisted.as_os_str(),
+    ]);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["executed_actions"].as_array().unwrap().len(), 0);
+}
+
 /// A data volume is placed by its name and judged by its size and CRC32,
 /// never by its headers, so one whose headers are damaged plans as the
 /// restore treats it: the dry run would restore it from the `.rev` files,

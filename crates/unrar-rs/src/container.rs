@@ -298,7 +298,10 @@ impl Rar5Container {
     /// [`HeaderSealing::from_archive`] confirms it;
     /// [`RarError::HeaderCrcMismatch`] for any damaged header;
     /// [`RarError::CorruptArchive`] or [`RarError::TruncatedHeader`] for a
-    /// walk that ends without an end-of-archive header or runs past the file;
+    /// walk that ends without an end-of-archive header or runs past the file,
+    /// and [`RarError::CorruptArchive`] for a main header out of its place:
+    /// a second one, one after any block but the encryption header, or an
+    /// end-of-archive header before any;
     /// [`RarError::ResourceLimit`] for more than
     /// [`MAX_HEADERS_PER_VOLUME`]
     /// blocks.
@@ -353,6 +356,25 @@ impl Rar5Container {
             }
             let kind = match raw.header_type {
                 HeaderType::MainArchive => {
+                    // The main header's flags and locators govern every
+                    // change to the archive, so only the one in its
+                    // prescribed place counts: first, after the encryption
+                    // header of a `-hp` archive. A second one would
+                    // overwrite what the first said.
+                    if map.blocks.iter().any(|block| block.kind == BlockKind::Main) {
+                        return Err(RarError::CorruptArchive {
+                            detail: format!("a second main header at offset {at}"),
+                        });
+                    }
+                    if map
+                        .blocks
+                        .iter()
+                        .any(|block| block.kind != BlockKind::Encryption)
+                    {
+                        return Err(RarError::CorruptArchive {
+                            detail: format!("the main header at offset {at} follows another block"),
+                        });
+                    }
                     let main = main_archive::parse(&raw)?;
                     map.volume = main.is_volume.then_some(main.volume_number.unwrap_or(0));
                     map.solid = main.is_solid;
@@ -369,6 +391,11 @@ impl Rar5Container {
                 }
                 HeaderType::Encryption => BlockKind::Encryption,
                 HeaderType::EndArchive => {
+                    if !map.blocks.iter().any(|block| block.kind == BlockKind::Main) {
+                        return Err(RarError::CorruptArchive {
+                            detail: format!("the end header at offset {at} follows no main header"),
+                        });
+                    }
                     map.more_volumes = end_archive::parse(&raw)?.more_volumes;
                     BlockKind::End
                 }
@@ -944,6 +971,47 @@ mod tests {
             Err(RarError::ModificationRefused { .. })
         ));
         assert!(rr < map.end_header().start);
+    }
+
+    /// The main header's lock and locators govern every change, so the
+    /// walk takes only the one in its place. Each damage case here is built
+    /// in memory from the fixture's own blocks: its main header repeated
+    /// before the end header, moved behind the block that follows it, and
+    /// left out altogether.
+    #[test]
+    fn a_main_header_out_of_its_place_is_refused() {
+        let Some(bytes) = fixture("rar5_recovery.rar") else {
+            return;
+        };
+        let kdf = KdfCache::new();
+        let map = Rar5Container::read(&mut io::Cursor::new(&bytes), None, &kdf).unwrap();
+        assert_eq!(map.blocks[0].kind, BlockKind::Main);
+        let main = map.blocks[0].header.clone();
+        let main = &bytes[main.start as usize..main.end as usize];
+        let next = map.blocks[1].header.start as usize..map.blocks[1].data.end as usize;
+        let end = map.end_header().start as usize;
+        let refused = |archive: Vec<u8>, wording: &str| {
+            let error =
+                Rar5Container::read(&mut io::Cursor::new(&archive), None, &kdf).expect_err(wording);
+            assert!(
+                matches!(&error, RarError::CorruptArchive { detail } if detail.contains(wording)),
+                "{error}"
+            );
+        };
+
+        let mut twice = bytes.clone();
+        twice.splice(end..end, main.iter().copied());
+        refused(twice, "second main header");
+
+        let mut late = bytes[..RAR5_SIGNATURE_LEN].to_vec();
+        late.extend_from_slice(&bytes[next.clone()]);
+        late.extend_from_slice(main);
+        late.extend_from_slice(&bytes[next.end..]);
+        refused(late, "follows another block");
+
+        let mut none = bytes[..RAR5_SIGNATURE_LEN].to_vec();
+        none.extend_from_slice(&bytes[end..]);
+        refused(none, "follows no main header");
     }
 
     /// A sealed header is rebuilt on repair, possibly by a build on the other
