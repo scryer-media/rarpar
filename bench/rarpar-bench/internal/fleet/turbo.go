@@ -48,9 +48,21 @@ type TurboPlan struct {
 	// TimeoutMinutes bounds one measured process in either harness (default
 	// 60); a run past it is recorded as DNF.
 	TimeoutMinutes int `json:"timeout_minutes"`
+	// SevenzFixturesImage is an OCI ref (ECR) caching this platform's sevenz
+	// fixture corpus. The host pulls it in-region before the fixtures step,
+	// which then reuses every archive whose provenance (the 7zz digest,
+	// source digest, switches and archive digest) still matches and rewrites
+	// the rest; when the tag is absent the host generates the corpus and
+	// publishes it there after the run. The 7zz digest differs per
+	// architecture, so each platform needs its own tag.
+	SevenzFixturesImage string `json:"sevenz_fixtures_image,omitempty"`
 }
 
 var turboProfiles = []string{"quick", "full", "fleet"}
+
+// sevenzFixturesTokenFile is the run-root file the orchestrator stages the
+// sevenz fixture image's ECR token into before the run starts.
+const sevenzFixturesTokenFile = "ecr-token-sevenz"
 
 // turboSuites maps each turbo suite to the source tree it needs and the
 // name its git bundle, commit sidecar and harness binary carry.
@@ -331,11 +343,31 @@ func turboSection(machine Machine, layout RemoteLayout) string {
 		write("  ( cd \"$SZ\" && cargo build --locked --release -p decode-bench --features native-crypto --target-dir target-native ) > \"$R/turbo/sevenz-build-native.log\" 2>&1 || { fail sevenz-turbo-build-native; SZ_OK=0; }")
 		write("  SZ_CAND=\"$SZ/target/release/decode-bench\"; SZ_NATIVE=\"$SZ/target-native/release/decode-bench\"")
 		write("  export SEVENZ_BENCH_ORACLE_OFFICIAL=1 SEVENZ_BENCH_ORACLE_PROVENANCE=\"$SEVENZIP_URL\"")
+		write("  SZ_FIX_OK=0; SZ_FIX_PULLED=0")
 		write("  if [ \"$SZ_OK\" = 1 ]; then")
-		write("    log 'sevenz-turbo: fixtures (%s corpus, written by the oracle)'", turboCorpus(plan.SevenzProfile))
 		write("    rm -rf \"$SZ_FIX\"")
-		write("    \"$BIN/sevenz-turbo-bench\" fixtures --profile %s --dir \"$SZ_FIX\" --oracle \"$SEVENZZ\" > \"$R/turbo/sevenz-fixtures.txt\" 2> \"$R/turbo/sevenz-fixtures.log\" || { fail sevenz-turbo-fixtures; SZ_OK=0; }",
+		if image := plan.SevenzFixturesImage; image != "" {
+			write("    SZ_FIX_IMAGE=%s; SZ_FIX_TOKEN=%s", shellQuote(image), shellQuote(joinPosix(layout.Base, sevenzFixturesTokenFile)))
+			write("    # In-region pull of this platform's corpus; the fixtures step below")
+			write("    # still checks every archive's provenance and rewrites what is stale.")
+			write("    log \"sevenz-turbo: fetching the fixture corpus $SZ_FIX_IMAGE\"")
+			write("    if [ -f \"$SZ_FIX_TOKEN\" ] && \"$BENCH\" corpus fetch --image \"$SZ_FIX_IMAGE\" --token-file \"$SZ_FIX_TOKEN\" --out \"$SZ_FIX\" > \"$R/turbo/sevenz-fixtures-fetch.txt\" 2>&1; then")
+			write("      SZ_FIX_PULLED=1")
+			write("      log \"sevenz-turbo: fixture corpus fetched: $(tail -1 \"$R/turbo/sevenz-fixtures-fetch.txt\")\"")
+			write("    else")
+			write("      rm -rf \"$SZ_FIX\"")
+			write("      log 'sevenz-turbo: no fixture corpus to pull; generating it, to publish after the run'")
+			write("    fi")
+		}
+		write("    log 'sevenz-turbo: fixtures (%s corpus, written by the oracle)'", turboCorpus(plan.SevenzProfile))
+		write("    \"$BIN/sevenz-turbo-bench\" fixtures --profile %s --dir \"$SZ_FIX\" --oracle \"$SEVENZZ\" > \"$R/turbo/sevenz-fixtures.txt\" 2> \"$R/turbo/sevenz-fixtures.log\" && SZ_FIX_OK=1 || { fail sevenz-turbo-fixtures; SZ_OK=0; }",
 			turboCorpus(plan.SevenzProfile))
+		if plan.SevenzFixturesImage != "" {
+			write("    if [ \"$SZ_FIX_PULLED\" = 1 ] && grep -q 'fixtures: generating\\|fixtures: 7zz a' \"$R/turbo/sevenz-fixtures.log\"; then")
+			write("      # A pulled corpus the oracle had to rewrite: the tag no longer names this corpus.")
+			write("      warn sevenz-fixtures-image-stale")
+			write("    fi")
+		}
 		write("  fi")
 		write("  if [ \"$SZ_OK\" = 1 ]; then")
 		write("    \"$BIN/sevenz-turbo-bench\" toolchain --repo \"$SZ\" --candidate \"$SZ_CAND\" --candidate-native \"$SZ_NATIVE\" --oracle \"$SEVENZZ\" > \"$R/turbo/sevenz-toolchain.json\" 2> \"$R/turbo/sevenz-toolchain.log\" || { fail sevenz-turbo-toolchain; SZ_OK=0; }")
@@ -359,6 +391,16 @@ func turboSection(machine Machine, layout RemoteLayout) string {
 		write("    log \"sevenz-turbo rc=$rc\"")
 		write("    [ \"$rc\" -eq 0 ] || fail sevenz-turbo")
 		write("  fi")
+		if plan.SevenzFixturesImage != "" {
+			write("  if [ \"$SZ_FIX_OK\" = 1 ] && [ \"$SZ_FIX_PULLED\" = 0 ]; then")
+			write("    # Publish after the timed pass so the upload never shares the host with it.")
+			write("    # The layer tar is staged on the run volume, not /tmp.")
+			write("    log \"sevenz-turbo: publishing the fixture corpus to $SZ_FIX_IMAGE\"")
+			write("    TMPDIR=\"$W\" \"$BENCH\" corpus push --root \"$SZ_FIX\" --image \"$SZ_FIX_IMAGE\" --token-file \"$SZ_FIX_TOKEN\" > \"$R/turbo/sevenz-fixtures-push.txt\" 2>&1 \\")
+			write("      && log \"sevenz-turbo: fixture corpus published: $(tail -1 \"$R/turbo/sevenz-fixtures-push.txt\")\" \\")
+			write("      || warn sevenz-fixtures-push")
+			write("  fi")
+		}
 		write("else")
 		write("  fail sevenz-turbo-setup")
 		write("fi")

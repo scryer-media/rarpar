@@ -617,6 +617,8 @@ func decodeMachine(item *section, settings Settings) Machine {
 		SevenzRepeats:  turbo.integer("sevenz_repeats", 0),
 		PinCPUs:        turbo.str("pin_cpus", ""),
 		TimeoutMinutes: turbo.integer("timeout_minutes", 60),
+
+		SevenzFixturesImage: turbo.str("sevenz_fixtures_image", ""),
 	}
 	turbo.finish()
 
@@ -1205,6 +1207,18 @@ func validateTurbo(state *decodeState, prefix string, machine *Machine, settings
 		for _, entry := range list {
 			if strings.TrimSpace(entry) == "" || strings.Contains(entry, ",") {
 				state.fail("%s: turbo.*_only entries must be non-empty scenario selectors without commas", prefix)
+			}
+		}
+	}
+	if image := plan.SevenzFixturesImage; image != "" {
+		switch {
+		case !machine.hasSuite(SuiteSevenzTurbo):
+			state.fail("%s: turbo.sevenz_fixtures_image is set but the machine does not run the sevenz-turbo suite", prefix)
+		case machine.EC2 == nil:
+			state.fail("%s: turbo.sevenz_fixtures_image needs an aws-ec2 machine: the image moves in-region on an orchestrator-minted ECR token", prefix)
+		default:
+			if _, err := oci.ParseImageRef(image); err != nil {
+				state.fail("%s: turbo.sevenz_fixtures_image: %v", prefix, err)
 			}
 		}
 	}

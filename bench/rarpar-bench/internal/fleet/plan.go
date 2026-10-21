@@ -383,7 +383,7 @@ func machineSteps(machine Machine, layout RemoteLayout) []string {
 	if machine.hasSuite(SuiteSevenzTurbo) {
 		steps = append(steps,
 			"on host: clone sevenz-turbo from the shipped git bundle, verify the commit, cargo build --locked decode-bench (aws-lc-rs and native-crypto)",
-			fmt.Sprintf("on host: generate the %s sevenz fixture corpus with the official 7zz", turboCorpus(machine.Turbo.SevenzProfile)),
+			sevenzFixturesStep(machine),
 			fmt.Sprintf("on host: sevenz-turbo run, profile %s%s, %dm per-case timeout, results under results/sevenz-turbo",
 				machine.Turbo.SevenzProfile, turboOnlyNote(machine.Turbo.SevenzOnly, machine.Turbo.SevenzRepeats), machine.Turbo.TimeoutMinutes))
 	}
@@ -741,4 +741,14 @@ func turboOnlyNote(only []string, repeats int) string {
 		note += fmt.Sprintf(", repeats=%d", repeats)
 	}
 	return note
+}
+
+// sevenzFixturesStep is the plan line for the sevenz fixture corpus: written
+// on the host, or pulled from its image and only rewritten where stale.
+func sevenzFixturesStep(machine Machine) string {
+	corpus := turboCorpus(machine.Turbo.SevenzProfile)
+	if image := machine.Turbo.SevenzFixturesImage; image != "" {
+		return fmt.Sprintf("on host: pull the %s sevenz fixture corpus from %s in-region, rewrite any archive the official 7zz did not write (the whole corpus, published to the image after the run, when the tag is absent)", corpus, image)
+	}
+	return fmt.Sprintf("on host: generate the %s sevenz fixture corpus with the official 7zz", corpus)
 }
