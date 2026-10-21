@@ -1171,6 +1171,88 @@ func TestTurboConfigValidation(t *testing.T) {
 	}
 }
 
+// A sevenz fixture image replaces per-host generation with an in-region pull,
+// keeps the provenance check that rewrites stale archives, and publishes a
+// freshly generated corpus only when nothing was pulled.
+func TestSevenzFixturesImage(t *testing.T) {
+	const image = "651588424025.dkr.ecr.us-east-1.amazonaws.com/sevenz-turbo-fixtures:fleet-7zz2604-x86_64"
+	pick := func(config Config) Machine {
+		for _, machine := range config.Machines {
+			if machine.Name == "ec2-zen4-turbo" {
+				return machine
+			}
+		}
+		t.Fatal("expected the EC2 turbo example machine")
+		return Machine{}
+	}
+	example := loadExample(t)
+	plain := pick(example)
+	script := RunScript(plain, example.Fleet.Defaults, "fleet-testrun", LayoutFor(plain, "fleet-testrun"), nil)
+	for _, forbidden := range []string{"corpus fetch", "corpus push", sevenzFixturesTokenFile} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("without an image the script must not contain %q", forbidden)
+		}
+	}
+	if !strings.Contains(sevenzFixturesStep(plain), "generate the") {
+		t.Fatalf("unexpected plan line: %s", sevenzFixturesStep(plain))
+	}
+
+	config, err := loadMutatedExample(t, "timeout_minutes = 60                     # per-case",
+		"sevenz_fixtures_image = \""+image+"\"\ntimeout_minutes = 60                     # per-case")
+	if err != nil {
+		t.Fatal(err)
+	}
+	machine := pick(config)
+	if machine.Turbo.SevenzFixturesImage != image {
+		t.Fatalf("image not parsed: %+v", machine.Turbo)
+	}
+	layout := LayoutFor(machine, "fleet-testrun")
+	script = RunScript(machine, config.Fleet.Defaults, "fleet-testrun", layout, nil)
+	fetch := strings.Index(script, "corpus fetch --image \"$SZ_FIX_IMAGE\"")
+	generate := strings.Index(script, "sevenz-turbo-bench\" fixtures --profile")
+	run := strings.Index(script, "sevenz-turbo-bench\" run --dir")
+	push := strings.Index(script, "corpus push --root \"$SZ_FIX\"")
+	if fetch < 0 || generate < fetch || run < generate || push < run {
+		t.Fatalf("expected fetch, then the provenance-checking fixtures step, then the run, then the push: %d %d %d %d", fetch, generate, run, push)
+	}
+	for _, expected := range []string{
+		shellQuote(image), shellQuote(joinPosix(layout.Base, sevenzFixturesTokenFile)),
+		"warn sevenz-fixtures-image-stale", "warn sevenz-fixtures-push",
+		`[ "$SZ_FIX_OK" = 1 ] && [ "$SZ_FIX_PULLED" = 0 ]`,
+		// The push stages a ~corpus-sized tar; it goes on the run volume.
+		`TMPDIR="$W"`,
+	} {
+		if !strings.Contains(script, expected) {
+			t.Fatalf("image script is missing %q", expected)
+		}
+	}
+	if !strings.Contains(sevenzFixturesStep(machine), image) {
+		t.Fatalf("the plan line names the image: %s", sevenzFixturesStep(machine))
+	}
+
+	cases := []struct{ name, old, new, want string }{
+		{"suite", `suites = ["lzma-turbo", "sevenz-turbo"]`, `suites = ["lzma-turbo"]`, "does not run the sevenz-turbo suite"},
+		{"ref", image, "not a ref", "turbo.sevenz_fixtures_image:"},
+	}
+	for _, tc := range cases {
+		data, err := os.ReadFile(examplePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mutated := strings.Replace(string(data), "timeout_minutes = 60                     # per-case",
+			"sevenz_fixtures_image = \""+image+"\"\ntimeout_minutes = 60                     # per-case", 1)
+		mutated = strings.Replace(mutated, tc.old, tc.new, 1)
+		path := filepath.Join(t.TempDir(), "fleet.toml")
+		if err := os.WriteFile(path, []byte(mutated), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, err = LoadConfig(path)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("%s: expected an error containing %q, got %v", tc.name, tc.want, err)
+		}
+	}
+}
+
 // A run's bundles carry only the turbo checkouts its selected machines use,
 // so only those name the bundle and only those have to be checkouts.
 func TestTurboTreeIDCoversOnlyTheSuitesInUse(t *testing.T) {

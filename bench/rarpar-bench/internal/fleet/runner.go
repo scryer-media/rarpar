@@ -281,6 +281,31 @@ func (orch *orchestrator) preflight(ctx context.Context) error {
 		}
 		orch.log("preflight: corpus image %s present", ref)
 	}
+	// A sevenz fixture image may be absent: the host then writes the corpus
+	// and publishes it. Preflight only proves the token works and says which.
+	for _, machine := range orch.options.Config.Machines {
+		image := machine.Turbo.SevenzFixturesImage
+		if image == "" || !machine.hasSuite(SuiteSevenzTurbo) {
+			continue
+		}
+		token, err := orch.ecrToken(ctx, image)
+		if err != nil {
+			return fmt.Errorf("machine %s: %w", machine.Name, err)
+		}
+		ref, err := oci.ParseImageRef(image)
+		if err != nil {
+			return fmt.Errorf("machine %s: %w", machine.Name, err)
+		}
+		exists, err := (&oci.Client{Ref: ref, Token: token}).ManifestExists(ctx)
+		if err != nil {
+			return fmt.Errorf("machine %s: checking sevenz fixture image: %w", machine.Name, err)
+		}
+		if exists {
+			orch.log("preflight: sevenz fixture corpus %s present; the host pulls it", ref)
+		} else {
+			orch.log("preflight: sevenz fixture corpus %s absent; the host generates it and publishes it after the run", ref)
+		}
+	}
 	if orch.hasCloud() {
 		orch.log("preflight: AWS credentials")
 		if _, err := orch.aws.CheckCredentials(ctx, orch.options.Config.Fleet.AWS.Account); err != nil {
@@ -706,6 +731,31 @@ func (orch *orchestrator) runMachine(ctx context.Context, machine Machine, hostS
 		orch.log("machine %s: staging ECR pull token; corpus %s pulls in-region on the instance", machine.Name, corpusImage)
 		stage := fmt.Sprintf("umask 077 && printf '%%s' %s > %s\n",
 			shellQuote(token), shellQuote(joinPosix(layout.Base, "ecr-token")))
+		if _, _, err := transport.RunScript(ctx, stage); err != nil {
+			return err
+		}
+	}
+	if image := machine.Turbo.SevenzFixturesImage; image != "" && machine.hasSuite(SuiteSevenzTurbo) {
+		// Same staging as the corpus image. The token both pulls the cached
+		// sevenz corpus and, when the tag is absent, publishes the one the
+		// host writes after its run, so it is minted fresh here rather than
+		// taken from the preflight cache: a later wave's host must not start
+		// with a token that expires (12 hours) before its run ends.
+		ref, err := oci.ParseImageRef(image)
+		if err != nil {
+			return err
+		}
+		region, err := oci.ECRRegion(ref.Registry)
+		if err != nil {
+			return err
+		}
+		token, err := orch.aws.ECRAuthToken(ctx, region)
+		if err != nil {
+			return err
+		}
+		orch.log("machine %s: staging ECR token for the sevenz fixture corpus %s", machine.Name, image)
+		stage := fmt.Sprintf("umask 077 && printf '%%s' %s > %s\n",
+			shellQuote(token), shellQuote(joinPosix(layout.Base, sevenzFixturesTokenFile)))
 		if _, _, err := transport.RunScript(ctx, stage); err != nil {
 			return err
 		}

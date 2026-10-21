@@ -264,3 +264,32 @@ func TestPAR3RunAcceptsTheFleetPerfFlags(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+// corpus push publishes a rarpar corpus or a sevenz-turbo fixture corpus and
+// nothing else.
+func TestCorpusRootAcceptsBothCorpusKinds(t *testing.T) {
+	write := func(name, body string) string {
+		root := t.TempDir()
+		if name != "" {
+			if err := os.WriteFile(filepath.Join(root, name), []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return root
+	}
+	if err := corpusRoot(write("corpus.json", "{}")); err != nil {
+		t.Fatalf("a rarpar corpus root is publishable: %v", err)
+	}
+	if err := corpusRoot(write("fixtures.json", `{"schema":"sevenz-turbo-bench/fixtures/1","fixtures":[]}`)); err != nil {
+		t.Fatalf("a sevenz fixture root is publishable: %v", err)
+	}
+	for name, root := range map[string]string{
+		"empty":        write("", ""),
+		"other schema": write("fixtures.json", `{"schema":"something-else/1"}`),
+		"not json":     write("fixtures.json", "nope"),
+	} {
+		if err := corpusRoot(root); err == nil {
+			t.Fatalf("%s: expected the root to be refused", name)
+		}
+	}
+}

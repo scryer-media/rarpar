@@ -523,6 +523,7 @@ sevenz_profile = "fleet"
 # sevenz_repeats = 0
 # pin_cpus = "0-7"                # sevenz --pin-cpus
 timeout_minutes = 60              # per case
+# sevenz_fixtures_image = "<account>.dkr.ecr.<region>.amazonaws.com/sevenz-turbo-fixtures:fleet-7zz2604-x86_64"
 ```
 
 Unlike the rarpar suites, the candidates are built **on the host**. Both
@@ -547,13 +548,41 @@ On the host, the run script:
    `fixtures`, then `run --profile <lzma_profile>` into `results/lzma-turbo/`;
 4. for `sevenz-turbo`: clones the bundle, verifies the commit, builds
    `decode-bench` twice (`aws-lc-rs` and `native-crypto`), generates the
-   fixture corpus with the official `7zz`, records the toolchain, then
-   `run --profile <sevenz_profile>` into `results/sevenz-turbo/`.
+   fixture corpus with the official `7zz` (or pulls it, below), records the
+   toolchain, then `run --profile <sevenz_profile>` into
+   `results/sevenz-turbo/`.
 
 Setup logs live under `results/turbo/`. Each stage that fails records a
 `fail` marker and skips the rest of that suite; the other suite and the
 manifest still run. The host needs `build-essential`, `cmake`, `pkg-config`,
 `git`, `curl`, `xz-utils` and `perl`; EC2 user-data installs them.
+
+### Sevenz fixture image
+
+Writing the sevenz `fleet` corpus (about 21 GB, mostly `7zz a`) takes about
+24 minutes of every host's setup. On an `aws-ec2` machine,
+`turbo.sevenz_fixtures_image` caches it in ECR instead:
+
+- **Pull.** The orchestrator mints an ECR token for the image's region at
+  staging, and the host fetches the image in-region with
+  `rarpar-bench corpus fetch` (digest-verified). The harness's `fixtures` step
+  still runs over the pulled corpus: it keeps every source and archive whose
+  recipe and oracle provenance match, rewrites anything that does not, and the
+  run raises `warn sevenz-fixtures-image-stale` when it had to rewrite
+  something, so a stale tag is visible rather than silently slow.
+- **Seed.** When the tag is absent (the preflight says so) or the fetch
+  fails, the host generates the corpus as before and, after the run,
+  publishes it with `rarpar-bench corpus push` (a tar staged on the run
+  volume, so size `ec2.volume_gb` for twice the corpus). A failed push raises
+  `warn sevenz-fixtures-push` and leaves the results alone.
+
+The archives' provenance is the `7zz` build that wrote them, which differs
+per architecture, so tag one image per profile, `7zz` version and
+architecture (`fleet-7zz2604-x86_64`, `fleet-7zz2604-aarch64`) and change the
+tag when any of them changes. The repository must exist (`aws ecr
+create-repository`); the layer is an uncompressed tar, so each image stores about the corpus size. `corpus
+push` accepts a root holding a rarpar `corpus.json` or a sevenz-turbo
+`fixtures.json` (`sevenz-turbo-bench/fixtures/1`) and nothing else.
 
 Budget the session for the profile. The sevenz `fleet` profile is the full
 corpus at three repeats and runs for hours on a 16-thread host; set
