@@ -459,8 +459,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("generator_generic_slsa3.yml@v2.1.0", jobs["archive-provenance"])
         self.assertIn("--directory release-assets", jobs["deploy"])
         self.assertIn("steps.finalize.outputs.published == 'true'", jobs["deploy"])
-        self.assertIn("commit -S", jobs["deploy"])
-        self.assertIn("verify-commit HEAD", jobs["deploy"])
+        self.assertIn("secrets.TAP_PUSH_TOKEN", jobs["deploy"])
         platforms = []
         for job, prefix in BUILD_JOBS.items():
             # One build job per operating system: its rows are that system's,

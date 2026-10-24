@@ -13,6 +13,8 @@ documented in each crate's own changelog so those notes ship with the crate.
   the CRC tier instead.
 - Requires `lzma-turbo` 0.10.2, which takes its CRCs from `crc-turbo`, so
   `crc-fast` is no longer in the binary.
+- Builds with `ctutils` 0.4.4, which fixes non-constant-time mask generation
+  and `u128` comparisons (RUSTSEC-2026-0385) in the SHA-2 and HMAC code.
 
 ## rarpar 0.9.2
 
