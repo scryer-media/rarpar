@@ -51,11 +51,10 @@ this workflow never repairs historical public releases or overwrites their asset
 Expired workflow artifacts require rerunning their producing jobs as well.
 
 The optional Homebrew hook runs only after a newly finalized binary release.
-If its push token or signing key is absent, it reports a notice and skips the
-tap update while completing the verified binary release.
-If enabled, it needs `TAP_PUSH_TOKEN` and `TAP_SIGNING_KEY`; the latter is an SSH
-private signing key whose public key is trusted by `allowed_signers`. Commits are
-signed and verified before pushing. There is no unsigned fallback.
+If its push token is absent, it skips the tap update while completing the
+verified binary release. If enabled, it needs `TAP_PUSH_TOKEN` and pushes an
+unsigned formula commit. Homebrew does not check tap commit signatures; the
+formula pins each archive's SHA-256 from the verified release assets.
 
 ## Scorecard
 
