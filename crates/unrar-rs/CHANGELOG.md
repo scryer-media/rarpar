@@ -1060,8 +1060,7 @@ or something else. The runtime escape hatches lose their former owner's name.
   | `WEAVER_RAR4_DEBUG_DUMP_PATH`      | `UNRAR_RS_RAR4_DEBUG_DUMP_PATH` |
 
   `RARPAR_CRC32_VPCLMUL` takes the workspace prefix because the CRC kernel it
-  lives in is shared byte for byte with `par2-rs`, which renames it in the
-  same release (0.9.0).
+  lives in is shared byte for byte with other crates in the workspace.
 - `limits::WEAVER_MAX_MEMBER_DATA_SIZE` is renamed to
   `limits::MAX_MEMBER_DATA_SIZE`; the value is unchanged.
 

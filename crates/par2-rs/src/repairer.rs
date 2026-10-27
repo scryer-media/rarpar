@@ -3465,6 +3465,7 @@ impl RepairState {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<(FileId, Vec<SliceChecksum>)>()),
             )
+            .saturating_add(set.unicode_names.estimated_retained_bytes())
             .saturating_add(self.hash_table.estimated_retained_bytes());
         for file in &self.files {
             bytes = bytes
@@ -9313,6 +9314,7 @@ mod tests {
             slice_checksums,
             recovery_slices: BTreeMap::new(),
             creator: None,
+            unicode_names: Default::default(),
         }
     }
 

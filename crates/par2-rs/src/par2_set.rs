@@ -52,9 +52,19 @@ impl FileDescription {
 /// and the File Description's decoded name when there is none. Two packets
 /// that disagree for one file ID leave the File Description's name standing,
 /// whichever of them arrived first.
-#[derive(Debug, Default)]
-struct UnicodeNames {
+///
+/// [`Par2FileSet`] keeps this state so that [`Par2FileSet::merge_packets`]
+/// reaches the same names as one scan of every packet: a name merged before
+/// its File Description is applied when the description arrives, and a later
+/// disagreeing packet restores the File Description's spelling. Sets built by
+/// hand start from [`UnicodeNames::default`].
+#[derive(Debug, Clone, Default)]
+pub struct UnicodeNames {
+    /// Agreed spelling per file ID; `None` once two packets disagree.
     names: HashMap<FileId, Option<String>>,
+    /// The File Description's `(par2_name, filename)` for each file that
+    /// took a Unicode spelling, so a later disagreement can restore it.
+    originals: HashMap<FileId, (String, String)>,
 }
 
 impl UnicodeNames {
@@ -95,13 +105,50 @@ impl UnicodeNames {
     }
 
     /// Give every described file the spelling its Unicode Filename packets
-    /// agree on.
-    fn apply(&self, files: &mut HashMap<FileId, FileDescription>) {
-        for (file_id, name) in &self.names {
-            if let (Some(name), Some(description)) = (name, files.get_mut(file_id)) {
-                description.adopt_unicode_name(name);
+    /// agree on, and the File Description's own spelling back to any file
+    /// whose packets have since disagreed.
+    fn apply(&mut self, files: &mut HashMap<FileId, FileDescription>) {
+        let Self { names, originals } = self;
+        for (file_id, name) in names.iter() {
+            let Some(description) = files.get_mut(file_id) else {
+                continue;
+            };
+            match name {
+                Some(name) if description.par2_name != *name => {
+                    originals.entry(*file_id).or_insert_with(|| {
+                        (description.par2_name.clone(), description.filename.clone())
+                    });
+                    description.adopt_unicode_name(name);
+                }
+                Some(_) => {}
+                None => {
+                    if let Some((par2_name, filename)) = originals.remove(file_id) {
+                        description.par2_name = par2_name;
+                        description.filename = filename;
+                    }
+                }
             }
         }
+    }
+
+    /// Approximate heap bytes this state holds.
+    pub(crate) fn estimated_retained_bytes(&self) -> usize {
+        let names = self
+            .names
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(FileId, Option<String>)>())
+            .saturating_add(self.names.values().flatten().map(String::capacity).sum());
+        let originals = self
+            .originals
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(FileId, (String, String))>())
+            .saturating_add(
+                self.originals
+                    .values()
+                    .map(|(par2_name, filename)| par2_name.capacity() + filename.capacity())
+                    .sum(),
+            );
+        names.saturating_add(originals)
     }
 }
 
@@ -134,6 +181,8 @@ pub struct Par2FileSet {
     pub recovery_slices: BTreeMap<RecoveryExponent, RecoverySlice>,
     /// Creator application identifier, if found.
     pub creator: Option<String>,
+    /// Unicode Filename agreement carried across merges.
+    pub unicode_names: UnicodeNames,
 }
 
 /// Incremental disk scan of one recovery set, with a shared packet budget.
@@ -416,7 +465,6 @@ impl Par2FileSet {
 
         let mut new_recovery_slices = 0u32;
         let mut duplicates_ignored = 0u32;
-        let mut unicode_names = UnicodeNames::default();
 
         for packet in packets {
             match packet {
@@ -472,14 +520,14 @@ impl Par2FileSet {
                     }
                 }
                 Packet::UnicodeFilename(name) => {
-                    if unicode_names.add(name) == PacketAdmission::Duplicate {
+                    if self.unicode_names.add(name) == PacketAdmission::Duplicate {
                         duplicates_ignored += 1;
                     }
                 }
                 Packet::Unknown { .. } => {}
             }
         }
-        unicode_names.apply(&mut self.files);
+        self.unicode_names.apply(&mut self.files);
 
         Ok(MergeResult {
             new_recovery_slices,
@@ -836,6 +884,7 @@ impl Par2FileSetBuilder {
             slice_checksums,
             recovery_slices,
             creator: self.creator,
+            unicode_names: self.unicode_names,
         })
     }
 }
@@ -938,6 +987,7 @@ mod tests {
             slice_checksums: std::collections::HashMap::from([(file_id, checksums)]),
             recovery_slices: std::collections::BTreeMap::new(),
             creator: None,
+            unicode_names: Default::default(),
         };
         (set, file_id)
     }
@@ -1111,6 +1161,69 @@ mod tests {
         ))
         .unwrap();
         set.merge_packets(vec![Packet::UnicodeFilename(packet)])
+            .unwrap();
+        assert_eq!(
+            set.file_description(&file_id).unwrap().filename,
+            "Bj\u{f6}rk.mkv"
+        );
+    }
+
+    fn unicode_packet(name: &str) -> Packet {
+        Packet::UnicodeFilename(
+            crate::packet::UnicodeFilenamePacket::parse(&make_unicode_filename_body(
+                [0x07; 16], name,
+            ))
+            .unwrap(),
+        )
+    }
+
+    fn description_packet(name: &str) -> Packet {
+        Packet::FileDescription(
+            crate::packet::FileDescriptionPacket::parse(&make_file_desc_body(
+                [0x07; 16], [0xAA; 16], [0xAA; 16], 4, name,
+            ))
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_disagreeing_unicode_name_in_a_later_merge_restores_the_file_description_name() {
+        let file_id = FileId::from_bytes([0x07; 16]);
+        let stream = unicode_stream("Bjork.mkv", &["Bj\u{f6}rk.mkv"], false);
+        let mut set = Par2FileSet::from_files(&[&stream]).unwrap();
+        assert_eq!(
+            set.file_description(&file_id).unwrap().filename,
+            "Bj\u{f6}rk.mkv"
+        );
+
+        set.merge_packets(vec![unicode_packet("Bj\u{e4}rk.mkv")])
+            .unwrap();
+        let fd = set.file_description(&file_id).unwrap();
+        assert_eq!(fd.filename, "Bjork.mkv");
+        assert_eq!(fd.par2_name, "Bjork.mkv");
+
+        // A combined scan of the same packets agrees.
+        let combined = unicode_stream("Bjork.mkv", &["Bj\u{f6}rk.mkv", "Bj\u{e4}rk.mkv"], false);
+        let combined = Par2FileSet::from_files(&[&combined]).unwrap();
+        assert_eq!(
+            combined.file_description(&file_id).unwrap().filename,
+            "Bjork.mkv"
+        );
+    }
+
+    #[test]
+    fn a_unicode_name_merged_before_its_file_description_is_applied_when_it_arrives() {
+        let file_id = FileId::from_bytes([0x07; 16]);
+        // The index carries the Main packet only.
+        let main_body = make_main_body(4096, &[[0x07; 16]]);
+        let rsid = compute_rsid(&main_body);
+        let stream = make_full_packet(header::TYPE_MAIN, &main_body, rsid);
+        let mut set = Par2FileSet::from_files(&[&stream]).unwrap();
+        assert!(set.file_description(&file_id).is_none());
+
+        set.merge_packets(vec![unicode_packet("Bj\u{f6}rk.mkv")])
+            .unwrap();
+        set.merge_packets(vec![description_packet("Bjork.mkv")])
             .unwrap();
         assert_eq!(
             set.file_description(&file_id).unwrap().filename,

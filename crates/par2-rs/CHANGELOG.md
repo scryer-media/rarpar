@@ -21,13 +21,22 @@
   names disagree only by encoding; a packet that does not decode, is empty, or
   carries an interior NUL is refused and the File Description's spelling
   stands. The set builder and `merge_packets` both apply them, in either
-  packet order.
+  packet order. `Par2FileSet` keeps that agreement in its new
+  `unicode_names` field, so merging volumes one at a time reaches the same
+  names as scanning them together: a name merged before its File Description
+  applies when the description arrives, and a later disagreeing packet
+  restores the File Description's spelling.
+- `Par2RepairSession::merge_recovery_paths` rebuilds its repair paths when a
+  merged Unicode Filename packet renames a file, so repair writes under the
+  new name.
 
 ### Breaking
 
-- `Packet` and `PacketType` gain the `UnicodeFilename` variant, and
-  `FileDescriptionPacket` gains `par2_name_bytes`. Exhaustive matches on
-  either enum and struct literals of `FileDescriptionPacket` must name them.
+- `Packet` and `PacketType` gain the `UnicodeFilename` variant,
+  `FileDescriptionPacket` gains `par2_name_bytes`, and `Par2FileSet` gains
+  `unicode_names` (a `UnicodeNames`; hand-built sets use
+  `UnicodeNames::default()`). Exhaustive matches on either enum and struct
+  literals of `FileDescriptionPacket` or `Par2FileSet` must name them.
 
 ## 0.10.13
 

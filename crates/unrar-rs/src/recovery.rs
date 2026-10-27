@@ -1,9 +1,9 @@
 //! Repair from the recovery data RAR writes: recovery volumes and recovery
 //! records.
 //!
-//! Recovery volumes (`.rev`) rebuild whole data volumes of a set. They are
-//! not PAR2 files: RAR5 uses GF(2^16) Cauchy matrix semantics, while legacy
-//! RAR3 uses a byte-wise GF(2^8) erasure coder. [`restore_volumes_from_paths`]
+//! Recovery volumes (`.rev`) rebuild whole data volumes of a set. RAR5 uses
+//! GF(2^16) Cauchy matrix semantics, while legacy RAR3 uses a byte-wise
+//! GF(2^8) erasure coder. [`restore_volumes_from_paths`]
 //! works from files on disk, [`restore_volume_set`] from a [`VolumeSource`].
 //!
 //! A recovery record (`-rr`) is the parity a volume carries for itself, and

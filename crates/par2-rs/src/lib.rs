@@ -193,6 +193,7 @@ pub use packet::{
 };
 pub use par2_set::{
     FileDescription, MergeResult, Par2Diagnostic, Par2FileSet, Par2ParseResult, RecoverySlice,
+    UnicodeNames,
 };
 pub use path::{translate_par2_name_to_local_path, translate_par2_name_to_relative};
 pub use placement::{PlacementEntry, PlacementPlan, apply_placement_plan, scan_placement};

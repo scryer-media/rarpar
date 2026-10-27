@@ -1436,6 +1436,7 @@ mod tests {
                 slice_checksums: HashMap::new(),
                 recovery_slices: BTreeMap::new(),
                 creator: None,
+                unicode_names: Default::default(),
             },
         )
     }
@@ -1473,6 +1474,7 @@ mod tests {
             slice_checksums: HashMap::from([(file_id, checksums)]),
             recovery_slices: BTreeMap::new(),
             creator: None,
+            unicode_names: Default::default(),
         }
     }
 
@@ -1980,6 +1982,7 @@ mod tests {
                 slice_checksums,
                 recovery_slices: BTreeMap::new(),
                 creator: None,
+                unicode_names: Default::default(),
             },
         );
         let evidence =
@@ -2067,6 +2070,7 @@ mod tests {
                 slice_checksums,
                 recovery_slices,
                 creator: None,
+                unicode_names: Default::default(),
             },
         );
 
@@ -2117,6 +2121,7 @@ mod tests {
                 slice_checksums: HashMap::new(),
                 recovery_slices: BTreeMap::new(),
                 creator: None,
+                unicode_names: Default::default(),
             },
         );
         let ambiguous = CommittedFileEvidence::from_full_md5_path(
@@ -2294,6 +2299,7 @@ mod tests {
             slice_checksums,
             recovery_slices: BTreeMap::new(),
             creator: None,
+            unicode_names: Default::default(),
         };
 
         let preflight = RepairState::estimated_retained_bytes_from_set(Path::new("."), &set);

@@ -6630,6 +6630,7 @@ pub(crate) mod tests {
             slice_checksums: HashMap::new(),
             recovery_slices,
             creator: None,
+            unicode_names: Default::default(),
         };
         let result = VerificationResult {
             files: verifications,
