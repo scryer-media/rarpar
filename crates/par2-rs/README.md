@@ -8,7 +8,7 @@ and no `par2` program needed.
 
 ```toml
 [dependencies]
-par2-rs = "0.10"
+par2-rs = "0.11"
 ```
 
 ## Usage
@@ -83,7 +83,7 @@ default backend is fast assembly:
   the results are the same.
 
 ```toml
-par2-rs = { version = "0.10", default-features = false, features = ["crypto-rust"] }
+par2-rs = { version = "0.11", default-features = false, features = ["crypto-rust"] }
 ```
 
 Strict single-read verification interleaves the independent file and slice

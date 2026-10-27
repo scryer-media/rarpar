@@ -3,6 +3,14 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.9.4
+
+- PAR2 file names written in a Windows code page, or in decomposed Unicode,
+  are read as the producer spelled them, and Unicode Filename packets are
+  honoured, through par2-rs 0.11.0. Before, such a name arrived with
+  replacement characters, so `par2 verify` and `par2 repair` looked for a
+  file that did not exist.
+
 ## rarpar 0.9.3
 
 - CRCs come from `crc-turbo`, the maintained fork of `crc-fast`, through

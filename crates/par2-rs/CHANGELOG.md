@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.11.0
+
+### Changed
+
+- File Description names are decoded instead of read lossily. Bytes that are
+  valid UTF-8 stay UTF-8; any other name is read as ISO-8859-1, so a name a
+  producer wrote in a Windows code page keeps one character per byte instead
+  of collapsing into U+FFFD. Every decoded name is NFC-normalised, so one name
+  has one spelling whichever form its producer wrote. `decode_par2_name` is
+  the public form of that rule.
+- `FileDescriptionPacket` keeps the name bytes exactly as the packet carried
+  them in the new `par2_name_bytes` field. The file ID hashes those bytes, so
+  they are the form to match on; `par2_name` is the decoded text.
+- Unicode Filename packets (`PAR 2.0\0UniFileN`) are parsed into
+  `UnicodeFilenamePacket` and reach `Packet::UnicodeFilename` and
+  `PacketType::UnicodeFilename` instead of `Packet::Unknown`. A set's
+  `FileDescription` takes the UTF-16 spelling for its file ID when the two
+  names disagree only by encoding; a packet that does not decode, is empty, or
+  carries an interior NUL is refused and the File Description's spelling
+  stands. The set builder and `merge_packets` both apply them, in either
+  packet order.
+
+### Breaking
+
+- `Packet` and `PacketType` gain the `UnicodeFilename` variant, and
+  `FileDescriptionPacket` gains `par2_name_bytes`. Exhaustive matches on
+  either enum and struct literals of `FileDescriptionPacket` must name them.
+
 ## 0.10.13
 
 ### Changed
