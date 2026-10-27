@@ -13,6 +13,11 @@
   filters (x86, Itanium, delta, RGB, audio) beside RAR5's. `RecoveryOptions`,
   `RecoveryReport` and `RevTestResult::status` are documented, and the
   `recovery` module's docs cover records as well as volumes.
+- Test tooling only: the `wasmtime` dev-dependency behind the wasm host
+  tests no longer enables its on-disk compilation `cache` feature, which
+  pulled `zstd` 0.13 and its RustSec advisories (RUSTSEC-2026-0391 and
+  related `zstd-safe`/`zstd-sys` advisories) into the lockfile. The
+  published library's dependencies are unchanged.
 
 ## 0.14.1
 

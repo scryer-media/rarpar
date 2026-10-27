@@ -102,9 +102,39 @@ tracing-subscriber.workspace = true
 # import. Those deps (wasmtime + WASI preview1 + a RustCrypto reference AES)
 # are native-only tooling for that harness and, like criterion, MUST stay off
 # the wasm example build — hence this same non-wasm target gate.
+#
+# wasmtime's default features minus `cache`: the harness never uses the
+# on-disk compilation cache, and that feature pulls `zstd` 0.13, which carries
+# RustSec advisories with no fixed 0.13 release (RUSTSEC-2026-0391 and others).
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 criterion = "0.8"
-wasmtime = "48.0.7"
+wasmtime = { version = "48.0.7", default-features = false, features = [
+  "anyhow",
+  "async",
+  "backtrace",
+  "gc",
+  "gc-copying",
+  "gc-drc",
+  "gc-null",
+  "wat",
+  "profiling",
+  "parallel-compilation",
+  "cranelift",
+  "pooling-allocator",
+  "demangle",
+  "addr2line",
+  "coredump",
+  "debug-builtins",
+  "runtime",
+  "component-model",
+  "component-model-async",
+  "threads",
+  "stack-switching",
+  "std",
+  "debug",
+  "compile-time-builtins",
+  "wit-parser",
+] }
 wasmtime-wasi = "48.0.7"
 aes = { workspace = true }
 cbc = { workspace = true }
