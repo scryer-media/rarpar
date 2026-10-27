@@ -1,9 +1,17 @@
-//! RAR recovery-volume restore support.
+//! Repair from the recovery data RAR writes: recovery volumes and recovery
+//! records.
 //!
-//! RAR recovery volumes are not PAR2 files. RAR5 uses GF(2^16) Cauchy matrix
-//! semantics, while legacy RAR3 uses a byte-wise GF(2^8) erasure coder. This
-//! module keeps that restore logic separate from archive extraction so existing
-//! extraction APIs remain unchanged.
+//! Recovery volumes (`.rev`) rebuild whole data volumes of a set. They are
+//! not PAR2 files: RAR5 uses GF(2^16) Cauchy matrix semantics, while legacy
+//! RAR3 uses a byte-wise GF(2^8) erasure coder. [`restore_volumes_from_paths`]
+//! works from files on disk, [`restore_volume_set`] from a [`VolumeSource`].
+//!
+//! A recovery record (`-rr`) is the parity a volume carries for itself, and
+//! rebuilds damaged bytes inside that one volume: [`locate_recovery_record`],
+//! [`assess_recovery_record`] and [`repair_from_recovery_record`].
+//!
+//! Both are kept separate from archive extraction so the extraction APIs
+//! stay unchanged. Nothing here creates recovery data or alters a record.
 
 use rayon::prelude::*;
 use std::collections::HashSet;
@@ -50,9 +58,18 @@ const RAR5_TOTAL_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 const RAR3_PADDING_PROBE: u64 = 8192;
 
 #[derive(Debug, Clone)]
+/// How [`restore_volumes_from_paths`] writes what it rebuilds.
 pub struct RecoveryOptions {
+    /// Where rebuilt volumes are written. `None` writes them beside the set,
+    /// in the first given path's directory.
     pub output_dir: Option<PathBuf>,
+    /// Replace an existing file at a rebuilt volume's output name, or at
+    /// the `.bad` name an invalid volume is set aside under. Off, the restore
+    /// refuses and leaves every file where it was.
     pub overwrite_existing: bool,
+    /// Check each rebuilt RAR5 volume's CRC32 against the `.rev` table and
+    /// fail the restore on a mismatch. A RAR3 set states no such CRC for a
+    /// rebuilt volume, so this has no effect there.
     pub verify_restored: bool,
 }
 
@@ -66,11 +83,17 @@ impl Default for RecoveryOptions {
     }
 }
 
+/// What [`restore_volumes_from_paths`] rebuilt.
 #[derive(Debug, Clone)]
 pub struct RecoveryReport {
+    /// The set's format.
     pub format: ArchiveFormat,
+    /// The rebuilt volumes, as written, in volume order.
     pub restored_paths: Vec<PathBuf>,
+    /// The recovery volumes the rebuild read.
     pub used_recovery_paths: Vec<PathBuf>,
+    /// The volumes that were rebuilt, in the set's own numbering, in the
+    /// same order as [`restored_paths`](Self::restored_paths).
     pub missing_volume_numbers: Vec<usize>,
 }
 
@@ -115,6 +138,7 @@ pub struct RevTestResult {
     /// `Rar5` for a RAR5 header, `Rar4` for a RAR3 footer or a RAR 3.0-style
     /// name, else `None`.
     pub format: Option<ArchiveFormat>,
+    /// What the test found.
     pub status: RevTestStatus,
 }
 

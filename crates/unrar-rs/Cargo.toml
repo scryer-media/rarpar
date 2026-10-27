@@ -1,8 +1,8 @@
 [package]
 name = "unrar-rs"
-description = "RAR archive reading, decompression, and streaming extraction only"
+description = "RAR archive reading, decompression, streaming extraction, and repair from recovery volumes and recovery records; no writer"
 readme = "README.md"
-version = "0.14.1"
+version = "0.14.2"
 edition.workspace = true
 license-file = "LICENSE"
 repository.workspace = true

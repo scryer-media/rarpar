@@ -3,18 +3,21 @@
 [![crates.io](https://img.shields.io/crates/v/unrar-rs.svg)](https://crates.io/crates/unrar-rs)
 [![docs.rs](https://docs.rs/unrar-rs/badge.svg)](https://docs.rs/unrar-rs)
 
-Read and extract RAR archives in Rust, with no C bindings and no `unrar`
-program needed.
+Read, extract and repair RAR archives in Rust, with no C bindings and no
+`unrar` program needed.
 
 ```toml
 [dependencies]
 unrar-rs = "0.14"
 ```
 
-It reads archives. It cannot create them, write or compress members, for the
-licensing reason given [below](#license). The one change it makes to an
-existing RAR5 archive is adding or removing a service record you name and
-fill (`container::Rar5Container`), copying every member and other header
+It reads archives and puts damaged ones back from the recovery data RAR
+wrote for them. It cannot create archives, or write or compress members, for
+the licensing reason given [below](#license). Every byte it writes into an
+archive is one RAR already wrote: a repair restores the bytes the recovery
+data vouches for, and the one edit it makes to an existing RAR5 archive is
+adding or removing a service record you name and fill
+(`container::Rar5Container`), copying every member and other header
 unchanged; under encrypted headers (`-hp`) the record header is encrypted
 like the others, with the archive's password.
 
@@ -123,6 +126,51 @@ than extract them: it derives a member's key, checks a password before
 decrypting (`Verified`, `Wrong` or `Unverifiable`), and decrypts or
 re-encrypts any range.
 
+## Recovery
+
+RAR writes two kinds of recovery data, and both are read and used, for RAR5
+and RAR 2.9-4.x alike.
+
+Recovery volumes (`.rev`, from `rar rv` or `rar a -rv`) rebuild volumes of
+a set that are missing or fail their check. `restore_volumes_from_paths`
+finds the set beside the paths you give it, rebuilds every missing or
+invalid data volume and writes it as a file, setting an invalid one aside
+as `<name>.bad`. `plan_volume_restore` says what that restore would do
+without writing anything, and `test_recovery_volumes` checks `.rev` files
+the way `unrar t` does. `restore_volume_set` and `assess_volume_set` do the
+same for volumes that are not files, reading through a `VolumeSource` and
+handing rebuilt bytes to a sink.
+
+```rust
+use unrar_rs::{RecoveryOptions, restore_volumes_from_paths};
+
+let paths = vec![std::path::PathBuf::from("release.part01.rar")];
+let report = restore_volumes_from_paths(&paths, &RecoveryOptions::default())?;
+for path in &report.restored_paths {
+    println!("rebuilt {}", path.display());
+}
+```
+
+A recovery record (the `RR` block `rar a -rr` and `rar rr` add) is parity
+a volume carries for itself, and rebuilds damaged bytes inside that one
+volume with no other file needed. `locate_recovery_record` finds it,
+`assess_recovery_record` checks the volume against it and says what it can
+rebuild, and `repair_from_recovery_record` rebuilds every damaged unit,
+each confirmed against the checksum the record keeps for it. The repair
+only reads; what it returns writes the rebuilt bytes into the volume
+(`write_in_place`) or into a repaired copy (`write_repaired_copy`). A
+record that cannot rebuild every damaged unit is an error, and nothing is
+written. The record itself is never rebuilt or rewritten.
+
+```rust
+use unrar_rs::repair_from_recovery_record;
+
+let mut volume = std::fs::OpenOptions::new().read(true).write(true).open("release.part03.rar")?;
+if let Some(repair) = repair_from_recovery_record(&mut volume, None)? {
+    repair.write_in_place(&mut volume)?;
+}
+```
+
 ## Errors
 
 Failures are typed (`RarError`), and the `io::Error` a reader returns carries
@@ -138,6 +186,8 @@ the original error, so `io::Error::downcast` gives back the `RarError` or the
   audio).
 - Encrypted data and headers.
 - Multi-volume sets, with members that span volumes.
+- Recovery volumes (`.rev`) and recovery records (`-rr`), to rebuild
+  missing or damaged volumes.
 - Hostile archives: names that would escape the output directory are
   cleaned, and sizes declared in headers are capped before anything is
   allocated.

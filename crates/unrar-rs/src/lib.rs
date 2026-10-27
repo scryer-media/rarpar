@@ -1,4 +1,4 @@
-//! `unrar-rs` -- RAR archive reader and extractor.
+//! `unrar-rs` -- RAR archive reader, extractor and repairer.
 //!
 //! UnRAR source code may be used in any software to handle
 //! RAR archives without limitations free of charge, but cannot be
@@ -11,11 +11,15 @@
 //! is not available, and in source code comments of resulting package.
 //!
 //! This crate provides reading, decompression, and extraction of existing RAR
-//! archives. It intentionally exposes no archive writer, builder, compressor,
-//! or creation API, and never creates or rewrites a member — the restriction
-//! above is why. The one change it makes to an existing RAR5 archive is
-//! adding or removing a caller-named service record whose payload the caller
-//! supplies, copying every member and other header verbatim
+//! archives, and puts damaged or missing volumes back from the recovery data
+//! RAR wrote for them: recovery volumes (`.rev`) and a volume's own recovery
+//! record (`-rr`). It intentionally exposes no archive writer, builder,
+//! compressor, or creation API, and never creates or rewrites a member — the
+//! restriction above is why. Every byte it writes into a RAR archive is one
+//! the archiver already wrote: a repair restores a volume to the bytes its
+//! recovery data vouches for, and the one edit it makes to an existing RAR5
+//! archive is adding or removing a caller-named service record whose payload
+//! the caller supplies, copying every member and other header verbatim
 //! ([`container`]).
 //!
 //! # Listing an archive
@@ -164,6 +168,66 @@
 //! part that carries it rather than at the end of the member. `-htb` archives
 //! replace CRC32 with BLAKE2sp entirely rather than adding it.
 //!
+//! # Recovery
+//!
+//! Both kinds of recovery data RAR writes are read and used, for RAR5 and
+//! RAR 2.9-4.x alike. Everything lives in [`recovery`].
+//!
+//! **Recovery volumes** (`.rev`, from `rar rv` or `rar a -rv`) rebuild
+//! volumes of a multi-volume set that are missing or fail their check.
+//! [`restore_volumes_from_paths`] finds the set beside the given paths,
+//! rebuilds every missing or invalid data volume and writes it as a file,
+//! setting an invalid one aside as `<name>.bad`; [`plan_volume_restore`]
+//! says what that restore would do without writing anything, and
+//! [`test_recovery_volumes`] checks `.rev` files the way reference UnRAR
+//! tests them. For volumes that are not files, [`restore_volume_set`] and
+//! [`assess_volume_set`] read through a [`VolumeSource`] and hand rebuilt
+//! bytes to a sink.
+//!
+//! ```no_run
+//! use unrar_rs::{RecoveryOptions, restore_volumes_from_paths};
+//!
+//! # fn main() -> unrar_rs::RarResult<()> {
+//! let paths = vec![std::path::PathBuf::from("release.part01.rar")];
+//! let report = restore_volumes_from_paths(&paths, &RecoveryOptions::default())?;
+//! for path in &report.restored_paths {
+//!     println!("rebuilt {}", path.display());
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! **Recovery records** (the `RR` service block `rar a -rr` and `rar rr`
+//! add) rebuild damaged bytes inside one volume from the parity the volume
+//! carries for itself, with no other file needed. [`locate_recovery_record`]
+//! finds the record and gives its [`RecoveryRecordLayout`],
+//! [`assess_recovery_record`] checks the volume against it and says what
+//! the record can rebuild, and [`repair_from_recovery_record`] rebuilds every
+//! damaged unit, each confirmed against the checksum the record keeps for it.
+//! The repair only reads; its [`RecoveryRecordRepair`] writes the rebuilt
+//! bytes into the volume itself or into a repaired copy. A record that
+//! cannot rebuild every damaged unit is
+//! [`RarError::RecoveryRecordInsufficient`], and nothing is written: a
+//! partial repair is not offered. The record itself is never rebuilt or
+//! rewritten, and nothing here adds one.
+//!
+//! ```no_run
+//! use unrar_rs::repair_from_recovery_record;
+//!
+//! # fn main() -> unrar_rs::RarResult<()> {
+//! let mut volume = std::fs::OpenOptions::new()
+//!     .read(true)
+//!     .write(true)
+//!     .open("release.part03.rar")?;
+//! match repair_from_recovery_record(&mut volume, None)? {
+//!     Some(repair) if repair.patches.is_empty() => println!("undamaged"),
+//!     Some(repair) => repair.write_in_place(&mut volume)?,
+//!     None => println!("no recovery record"),
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Safety
 //!
 //! [`sanitize_path`] is applied to member names so a hostile archive cannot
@@ -179,8 +243,13 @@
 //! - SFX (self-extracting) archives
 //! - Store, LZ (methods 1–5) with Huffman decoding and a sliding window, and
 //!   PPMd variant H
-//! - Post-decompression filters: Delta, E8, E8E9, ARM
+//! - Post-decompression filters: RAR5's delta, x86 (E8 and E8E9) and ARM;
+//!   RAR4's x86, Itanium, delta, RGB and audio
 //! - Multi-volume topology tracking
+//! - Recovery volumes (`.rev`), RAR5 and RAR 2.9-4.x, read and used to
+//!   rebuild data volumes
+//! - Recovery records (`-rr`), RAR5 and RAR 2.9-4.x, read and used to rebuild
+//!   damaged bytes of a volume
 //!
 //! # Feature flags
 //!
@@ -339,6 +408,9 @@ pub use limits::Limits;
 pub use path::sanitize_path;
 pub use probe::{ProbeFile, VolumeProbe, probe_volume};
 pub use progress::{NoProgress, ProgressHandler};
+/// Recovery volumes (`.rev`): rebuild missing or invalid data volumes of a
+/// set from the recovery volumes RAR wrote beside it, from files on disk or
+/// through a [`VolumeSource`].
 pub use recovery::{
     DataVolumePlan, DataVolumeState, DataVolumeStatus, FileVolumeSource, RecoveryOptions,
     RecoveryReport, RecoveryVolumePlan, RecoveryVolumeState, RestorePlan, RestoreSet,
@@ -347,6 +419,8 @@ pub use recovery::{
     assess_volume_set, plan_volume_restore, restore_volume_set, restore_volumes_from_paths,
     test_recovery_volumes,
 };
+/// Recovery records (`-rr`): find the record a volume carries for itself,
+/// check the volume against it, and rebuild the damaged bytes it can.
 pub use recovery::{
     RecoveryRecordAssessment, RecoveryRecordLayout, RecoveryRecordPatch, RecoveryRecordRepair,
     assess_recovery_record, locate_recovery_record, repair_from_recovery_record,

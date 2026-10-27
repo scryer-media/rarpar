@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.14.2
+
+### Changed
+
+- Documentation only; no code changes. The crate documentation, README and
+  package description now say that the crate reads and uses both kinds of
+  recovery data RAR writes, recovery volumes (`.rev`) and a volume's own
+  recovery record (`-rr`), for RAR5 and RAR 2.9-4.x, with a `# Recovery`
+  section and examples for each, and that every byte a repair writes is one
+  the archiver already wrote. The supported-formats list names the RAR4
+  filters (x86, Itanium, delta, RGB, audio) beside RAR5's. `RecoveryOptions`,
+  `RecoveryReport` and `RevTestResult::status` are documented, and the
+  `recovery` module's docs cover records as well as volumes.
+
 ## 0.14.1
 
 ### Changed
