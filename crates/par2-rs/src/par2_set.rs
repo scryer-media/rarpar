@@ -8,8 +8,9 @@ use crate::error::{Par2Error, Result};
 use crate::packet::budget::packet_retained_bytes;
 use crate::packet::{
     MAX_RECOVERY_EXPONENT, Packet, PacketScanBudget, PacketScanLimits, PacketSink,
-    RecoverySliceData, scan_packets_bounded, scan_packets_from_path_bounded,
+    RecoverySliceData, UnicodeFilenamePacket, scan_packets_bounded, scan_packets_from_path_bounded,
 };
+use crate::path::translate_par2_name_to_relative;
 use crate::types::{FileId, MAX_FILES_PER_SET, RecoveryExponent, RecoverySetId, SliceChecksum};
 
 /// Description of a single file in the PAR2 set.
@@ -21,6 +22,87 @@ pub struct FileDescription {
     pub length: u64,
     pub par2_name: String,
     pub filename: String,
+}
+
+impl FileDescription {
+    /// Take a Unicode Filename packet's spelling in place of the File
+    /// Description's.
+    ///
+    /// Only the name changes: the file ID and the hashes are the File
+    /// Description's own. A spelling that cannot be translated to a safe
+    /// relative path leaves the File Description's name standing.
+    fn adopt_unicode_name(&mut self, name: &str) {
+        match translate_par2_name_to_relative(name) {
+            Ok(filename) => {
+                self.par2_name = name.to_owned();
+                self.filename = filename;
+            }
+            Err(error) => warn!(
+                file = %self.filename,
+                %error,
+                "unicode filename cannot be translated, keeping the file description's name"
+            ),
+        }
+    }
+}
+
+/// The Unicode Filename spellings a set's packets carry, keyed by file ID.
+///
+/// A file's name is the one spelling its Unicode Filename packets agree on,
+/// and the File Description's decoded name when there is none. Two packets
+/// that disagree for one file ID leave the File Description's name standing,
+/// whichever of them arrived first.
+#[derive(Debug, Default)]
+struct UnicodeNames {
+    names: HashMap<FileId, Option<String>>,
+}
+
+impl UnicodeNames {
+    fn would_duplicate(&self, packet: &UnicodeFilenamePacket) -> bool {
+        match self.names.get(&packet.file_id) {
+            Some(Some(name)) => *name == packet.name,
+            Some(None) => true,
+            None => false,
+        }
+    }
+
+    fn would_retain(&self, packet: &UnicodeFilenamePacket) -> bool {
+        !self.names.contains_key(&packet.file_id) && self.names.len() < MAX_FILES_PER_SET
+    }
+
+    fn add(&mut self, packet: UnicodeFilenamePacket) -> PacketAdmission {
+        let full = self.names.len() >= MAX_FILES_PER_SET;
+        match self.names.get_mut(&packet.file_id) {
+            Some(Some(name)) if *name == packet.name => PacketAdmission::Duplicate,
+            Some(agreed @ Some(_)) => {
+                warn!(
+                    file_id = %packet.file_id,
+                    "unicode filename packets disagree, keeping the file description's name"
+                );
+                *agreed = None;
+                PacketAdmission::Rejected
+            }
+            Some(None) => PacketAdmission::Duplicate,
+            None if full => {
+                warn!("discarding unicode filename beyond the {MAX_FILES_PER_SET}-file set limit");
+                PacketAdmission::Rejected
+            }
+            None => {
+                self.names.insert(packet.file_id, Some(packet.name));
+                PacketAdmission::Retained
+            }
+        }
+    }
+
+    /// Give every described file the spelling its Unicode Filename packets
+    /// agree on.
+    fn apply(&self, files: &mut HashMap<FileId, FileDescription>) {
+        for (file_id, name) in &self.names {
+            if let (Some(name), Some(description)) = (name, files.get_mut(file_id)) {
+                description.adopt_unicode_name(name);
+            }
+        }
+    }
 }
 
 /// A recovery slice: exponent + data.
@@ -334,6 +416,7 @@ impl Par2FileSet {
 
         let mut new_recovery_slices = 0u32;
         let mut duplicates_ignored = 0u32;
+        let mut unicode_names = UnicodeNames::default();
 
         for packet in packets {
             match packet {
@@ -388,9 +471,15 @@ impl Par2FileSet {
                         duplicates_ignored += 1;
                     }
                 }
+                Packet::UnicodeFilename(name) => {
+                    if unicode_names.add(name) == PacketAdmission::Duplicate {
+                        duplicates_ignored += 1;
+                    }
+                }
                 Packet::Unknown { .. } => {}
             }
         }
+        unicode_names.apply(&mut self.files);
 
         Ok(MergeResult {
             new_recovery_slices,
@@ -503,6 +592,7 @@ pub(crate) struct Par2FileSetBuilder {
     slice_checksums: HashMap<FileId, Vec<SliceChecksum>>,
     recovery_slices: BTreeMap<RecoveryExponent, RecoverySlice>,
     creator: Option<String>,
+    unicode_names: UnicodeNames,
 }
 
 impl Par2FileSetBuilder {
@@ -513,6 +603,7 @@ impl Par2FileSetBuilder {
             slice_checksums: HashMap::new(),
             recovery_slices: BTreeMap::new(),
             creator: None,
+            unicode_names: UnicodeNames::default(),
         }
     }
 
@@ -529,6 +620,7 @@ impl Par2FileSetBuilder {
             }
             Packet::RecoverySlice(slice) => self.recovery_slices.contains_key(&slice.exponent),
             Packet::Creator(_) => self.creator.is_some(),
+            Packet::UnicodeFilename(name) => self.unicode_names.would_duplicate(name),
             Packet::Unknown { .. } => false,
         }
     }
@@ -555,6 +647,7 @@ impl Par2FileSetBuilder {
                     && !self.recovery_slices.contains_key(&slice.exponent)
             }
             Packet::Creator(_) => self.creator.is_none(),
+            Packet::UnicodeFilename(name) => self.unicode_names.would_retain(name),
             Packet::Unknown { .. } => false,
         }
     }
@@ -682,6 +775,7 @@ impl Par2FileSetBuilder {
                     PacketAdmission::Duplicate
                 }
             }
+            Packet::UnicodeFilename(name) => self.unicode_names.add(name),
             Packet::Unknown { packet_type, .. } => {
                 warn!("ignoring unknown packet type: {packet_type:02x?}");
                 PacketAdmission::Rejected
@@ -689,8 +783,9 @@ impl Par2FileSetBuilder {
         })
     }
 
-    pub(crate) fn build(self) -> Result<Par2FileSet> {
+    pub(crate) fn build(mut self) -> Result<Par2FileSet> {
         let main = self.main_packet.ok_or(Par2Error::NoMainPacket)?;
+        self.unicode_names.apply(&mut self.files);
 
         // Validate recovery block data lengths against slice_size.
         // PAR2 spec requires each recovery block to be exactly slice_size bytes.
@@ -905,6 +1000,122 @@ mod tests {
 
         assert_eq!(set.creator.as_deref(), Some("TestApp"));
         assert_eq!(set.recovery_block_count(), 0);
+    }
+
+    fn make_unicode_filename_body(file_id: [u8; 16], name: &str) -> Vec<u8> {
+        let mut body = file_id.to_vec();
+        for unit in name.encode_utf16() {
+            body.extend_from_slice(&unit.to_le_bytes());
+        }
+        while !body.len().is_multiple_of(4) {
+            body.push(0);
+        }
+        body
+    }
+
+    /// A Main packet naming one file, its File Description spelled `ascii`,
+    /// and one Unicode Filename packet per entry of `unicode`, in the order
+    /// given, before or after the File Description.
+    fn unicode_stream(ascii: &str, unicode: &[&str], unicode_first: bool) -> Vec<u8> {
+        let file_id = [0x07; 16];
+        let main_body = make_main_body(4096, &[file_id]);
+        let rsid = compute_rsid(&main_body);
+        let description = make_full_packet(
+            header::TYPE_FILE_DESC,
+            &make_file_desc_body(file_id, [0xAA; 16], [0xAA; 16], 4, ascii),
+            rsid,
+        );
+        let names: Vec<u8> = unicode
+            .iter()
+            .flat_map(|name| {
+                make_full_packet(
+                    header::TYPE_UNICODE_FILENAME,
+                    &make_unicode_filename_body(file_id, name),
+                    rsid,
+                )
+            })
+            .collect();
+        let mut stream = make_full_packet(header::TYPE_MAIN, &main_body, rsid);
+        if unicode_first {
+            stream.extend_from_slice(&names);
+            stream.extend_from_slice(&description);
+        } else {
+            stream.extend_from_slice(&description);
+            stream.extend_from_slice(&names);
+        }
+        stream
+    }
+
+    #[test]
+    fn a_unicode_filename_packet_overrides_a_lossy_file_description_spelling() {
+        let dir = tempdir().unwrap();
+        for unicode_first in [false, true] {
+            let stream = unicode_stream("Bjork.mkv", &["Bj\u{f6}rk.mkv"], unicode_first);
+            let path = dir.path().join(format!("set-{unicode_first}.par2"));
+            std::fs::write(&path, &stream).unwrap();
+            for set in [
+                Par2FileSet::from_files(&[&stream]).unwrap(),
+                Par2FileSet::from_paths(&[&path]).unwrap(),
+            ] {
+                let fd = set
+                    .file_description(&FileId::from_bytes([0x07; 16]))
+                    .unwrap();
+                assert_eq!(
+                    fd.par2_name, "Bj\u{f6}rk.mkv",
+                    "unicode_first={unicode_first}"
+                );
+                assert_eq!(
+                    fd.filename, "Bj\u{f6}rk.mkv",
+                    "unicode_first={unicode_first}"
+                );
+                // Only the name changes.
+                assert_eq!(fd.hash_full, [0xAA; 16]);
+                assert_eq!(fd.length, 4);
+            }
+        }
+    }
+
+    #[test]
+    fn disagreeing_unicode_filename_packets_leave_the_file_description_name() {
+        for unicode_first in [false, true] {
+            for names in [
+                ["\u{dc}n\u{f6}.mkv", "\u{dc}n\u{e4}.mkv"],
+                ["\u{dc}n\u{e4}.mkv", "\u{dc}n\u{f6}.mkv"],
+            ] {
+                let stream = unicode_stream("ascii.mkv", &names, unicode_first);
+                let set = Par2FileSet::from_files(&[&stream]).unwrap();
+                let fd = set
+                    .file_description(&FileId::from_bytes([0x07; 16]))
+                    .unwrap();
+                assert_eq!(
+                    fd.filename, "ascii.mkv",
+                    "{names:?} unicode_first={unicode_first}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merging_a_unicode_filename_packet_renames_a_described_file() {
+        let stream = unicode_stream("Bjork.mkv", &[], false);
+        let mut set = Par2FileSet::from_files(&[&stream]).unwrap();
+        let file_id = FileId::from_bytes([0x07; 16]);
+        assert_eq!(
+            set.file_description(&file_id).unwrap().filename,
+            "Bjork.mkv"
+        );
+
+        let packet = crate::packet::UnicodeFilenamePacket::parse(&make_unicode_filename_body(
+            [0x07; 16],
+            "Bj\u{f6}rk.mkv",
+        ))
+        .unwrap();
+        set.merge_packets(vec![Packet::UnicodeFilename(packet)])
+            .unwrap();
+        assert_eq!(
+            set.file_description(&file_id).unwrap().filename,
+            "Bj\u{f6}rk.mkv"
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@
 name = "par2-rs"
 description = "PAR2 parity verification and repair"
 readme = "README.md"
-version = "0.10.13"
+version = "0.10.14"
 edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0"
@@ -61,6 +61,7 @@ bytes = { workspace = true }
 crc-turbo = { workspace = true }
 rayon = { workspace = true, default-features = false }
 libc = { workspace = true }
+unicode-normalization = { workspace = true }
 
 # Native-only dependencies.
 #

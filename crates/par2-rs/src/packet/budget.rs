@@ -383,7 +383,8 @@ pub(crate) fn packet_retained_bytes(packet: &Packet) -> usize {
         ),
         Packet::FileDescription(desc) => size_of::<super::FileDescriptionPacket>()
             .saturating_add(desc.filename.len())
-            .saturating_add(desc.par2_name.len()),
+            .saturating_add(desc.par2_name.len())
+            .saturating_add(desc.par2_name_bytes.len()),
         Packet::InputFileSliceChecksum(ifsc) => size_of::<super::IfscPacket>().saturating_add(
             ifsc.checksums
                 .len()
@@ -392,6 +393,9 @@ pub(crate) fn packet_retained_bytes(packet: &Packet) -> usize {
         Packet::RecoverySlice(_) => size_of::<super::RecoverySlicePacket>(),
         Packet::Creator(creator) => {
             size_of::<super::CreatorPacket>().saturating_add(creator.creator_id.len())
+        }
+        Packet::UnicodeFilename(name) => {
+            size_of::<super::UnicodeFilenamePacket>().saturating_add(name.name.len())
         }
         Packet::Unknown { body, .. } => size_of::<Packet>().saturating_add(body.len()),
     };

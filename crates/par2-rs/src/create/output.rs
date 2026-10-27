@@ -2099,7 +2099,7 @@ fn validate_expected_packet(
                 || packet.hash_full != source.hash_full
                 || packet.hash_16k != source.hash_16k
                 || packet.file_length != source.file_length
-                || packet.par2_name != source.par2_name
+                || packet.par2_name_bytes != source.par2_name.as_bytes()
             {
                 return Err(validation_error(
                     path,

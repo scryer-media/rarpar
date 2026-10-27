@@ -14,6 +14,7 @@ pub const TYPE_FILE_DESC: &[u8; 16] = b"PAR 2.0\x00FileDesc";
 pub const TYPE_IFSC: &[u8; 16] = b"PAR 2.0\x00IFSC\x00\x00\x00\x00";
 pub const TYPE_RECOVERY: &[u8; 16] = b"PAR 2.0\x00RecvSlic";
 pub const TYPE_CREATOR: &[u8; 16] = b"PAR 2.0\x00Creator\x00";
+pub const TYPE_UNICODE_FILENAME: &[u8; 16] = b"PAR 2.0\x00UniFileN";
 
 /// The type of a PAR2 packet, determined by the 16-byte type signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +24,7 @@ pub enum PacketType {
     InputFileSliceChecksum,
     RecoverySlice,
     Creator,
+    UnicodeFilename,
     Unknown([u8; 16]),
 }
 
@@ -34,6 +36,7 @@ impl PacketType {
             s if s == TYPE_IFSC => PacketType::InputFileSliceChecksum,
             s if s == TYPE_RECOVERY => PacketType::RecoverySlice,
             s if s == TYPE_CREATOR => PacketType::Creator,
+            s if s == TYPE_UNICODE_FILENAME => PacketType::UnicodeFilename,
             other => PacketType::Unknown(*other),
         }
     }
@@ -170,6 +173,7 @@ mod tests {
             (TYPE_IFSC, PacketType::InputFileSliceChecksum),
             (TYPE_RECOVERY, PacketType::RecoverySlice),
             (TYPE_CREATOR, PacketType::Creator),
+            (TYPE_UNICODE_FILENAME, PacketType::UnicodeFilename),
         ] {
             let data = make_header(sig, &[]);
             let header = PacketHeader::parse(&data, 0).unwrap();
