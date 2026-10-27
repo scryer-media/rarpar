@@ -1,7 +1,7 @@
 #![cfg(feature = "slow-tests")]
 
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -11,15 +11,10 @@ use par2_rs::{
 };
 use tempfile::TempDir;
 
-const TEST_PASSWORD: &str = "testpass123";
 const HEAVY_DAMAGE_SLICE_SIZE: u64 = 65536;
 
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
-}
-
-fn source_bytes() -> Vec<u8> {
-    fs::read(fixture_root().join("source/generated_sample_clip.mkv")).unwrap()
 }
 
 fn copy_fixture_dir(name: &str) -> TempDir {
@@ -65,28 +60,20 @@ fn load_par2_set(paths: &[PathBuf]) -> Par2FileSet {
     Par2FileSet::from_files(&refs).unwrap()
 }
 
-fn open_archive(paths: &[PathBuf]) -> unrar_rs::RarArchive {
-    let readers: Vec<Box<dyn unrar_rs::ReadSeek>> = paths
-        .iter()
-        .map(|path| Box::new(File::open(path).unwrap()) as Box<dyn unrar_rs::ReadSeek>)
-        .collect();
-    unrar_rs::RarArchive::open_volumes(readers).unwrap()
-}
-
-fn extract_and_assert(dir: &Path, prefix: &str, expected: &[u8], password: Option<&str>) {
-    let volume_paths = collect_paths(dir, prefix, "rar");
-    let mut archive = open_archive(&volume_paths);
-    if let Some(password) = password {
-        archive.set_password(password);
+fn assert_volumes_match_fixture(dir: &Path, fixture: &str, prefix: &str) {
+    // PAR2 verification already proved every protected file by MD5; this also
+    // checks the repaired volumes against the untouched fixture copies.
+    let pristine_paths = collect_paths(&fixture_root().join(fixture), prefix, "rar");
+    let repaired_paths = collect_paths(dir, prefix, "rar");
+    assert_eq!(repaired_paths.len(), pristine_paths.len());
+    for (pristine, repaired) in pristine_paths.iter().zip(&repaired_paths) {
+        assert_eq!(pristine.file_name(), repaired.file_name());
+        assert!(
+            fs::read(pristine).unwrap() == fs::read(repaired).unwrap(),
+            "{} differs from the fixture after repair",
+            repaired.display()
+        );
     }
-    archive.set_verify(true);
-    let mut extracted = Vec::new();
-    archive
-        .by_index(0)
-        .unwrap()
-        .copy_to(&mut extracted)
-        .unwrap();
-    assert_eq!(extracted, expected);
 }
 
 fn assert_repairable(result: &par2_rs::VerificationResult, context: &str) {
@@ -132,9 +119,8 @@ fn swap_files(left: &Path, right: &Path) {
 }
 
 #[test]
-fn repairs_missing_middle_volume_and_extracts_rar5_lz() {
+fn repairs_missing_middle_volume_rar5_lz() {
     let temp = copy_fixture_dir("rar5_lz_plain");
-    let expected = source_bytes();
     let prefix = "fixture_rar5_lz_plain";
     let volume_paths = collect_paths(temp.path(), prefix, "rar");
     let par2_paths = collect_paths(temp.path(), "fixture_rar5_lz_plain_repair", "par2");
@@ -163,13 +149,12 @@ fn repairs_missing_middle_volume_and_extracts_rar5_lz() {
 
     let repaired = verify_all(&par2_set, &access);
     assert_not_needed(&repaired, "missing middle volume repaired");
-    extract_and_assert(temp.path(), prefix, &expected, None);
+    assert_volumes_match_fixture(temp.path(), "rar5_lz_plain", prefix);
 }
 
 #[test]
 fn repairs_corrupted_encrypted_rar4_store_volume() {
     let temp = copy_fixture_dir("rar4_store_enc");
-    let expected = source_bytes();
     let prefix = "fixture_rar4_store_enc";
     let volume_paths = collect_paths(temp.path(), prefix, "rar");
     let par2_paths = collect_paths(temp.path(), "fixture_rar4_store_enc_repair", "par2");
@@ -200,13 +185,12 @@ fn repairs_corrupted_encrypted_rar4_store_volume() {
 
     let repaired = verify_all(&par2_set, &access);
     assert_not_needed(&repaired, "corrupted encrypted volume repaired");
-    extract_and_assert(temp.path(), prefix, &expected, Some(TEST_PASSWORD));
+    assert_volumes_match_fixture(temp.path(), "rar4_store_enc", prefix);
 }
 
 #[test]
 fn repairs_missing_volume_with_swapped_valid_names() {
     let temp = copy_fixture_dir("rar5_lz_plain");
-    let expected = source_bytes();
     let prefix = "fixture_rar5_lz_plain";
     let volume_paths = collect_paths(temp.path(), prefix, "rar");
     let par2_paths = collect_paths(temp.path(), "fixture_rar5_lz_plain_repair", "par2");
@@ -230,7 +214,7 @@ fn repairs_missing_volume_with_swapped_valid_names() {
     let access = DiskFileAccess::new(temp.path().to_path_buf(), &par2_set);
     let repaired = verify_all(&par2_set, &access);
     assert_not_needed(&repaired, "swapped-plus-missing set repaired");
-    extract_and_assert(temp.path(), prefix, &expected, None);
+    assert_volumes_match_fixture(temp.path(), "rar5_lz_plain", prefix);
 }
 
 /// Heavy damage: 28 corrupted regions spread across a ~73MB RAR archive.
@@ -290,21 +274,5 @@ fn repairs_heavy_damage_28_regions_rar5() {
     let repaired = verify_all(&par2_set, &access);
     assert_not_needed(&repaired, "heavy damage 28 regions repaired");
 
-    // Extract and verify the file is byte-identical to the original.
-    let volume_paths = collect_paths(temp.path(), prefix, "rar");
-    let mut archive = unrar_rs::RarArchive::open_volumes(
-        volume_paths
-            .iter()
-            .map(|p| Box::new(File::open(p).unwrap()) as Box<dyn unrar_rs::ReadSeek>)
-            .collect(),
-    )
-    .unwrap();
-    archive.set_verify(true);
-    archive
-        .by_index(0)
-        .unwrap()
-        .copy_to(&mut std::io::sink())
-        .unwrap();
-    // Completing the verified extraction confirms the member CRC.
-    eprintln!("heavy damage: extract verified OK");
+    assert_volumes_match_fixture(temp.path(), "rar5_heavy_damage", prefix);
 }

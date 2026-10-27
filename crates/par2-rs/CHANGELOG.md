@@ -34,6 +34,10 @@
   adopting its name can allocate (the name, its copy, and a translated path
   up to three times its length), so a set with long Unicode names returns
   `ResourceLimitExceeded` instead of retaining more than the limit.
+- Test tooling only: the crate no longer has an `unrar-rs` dev-dependency.
+  The real-world repair tests prove a repair by PAR2 verification and by
+  comparing every repaired volume byte for byte with the untouched fixture,
+  instead of extracting the archive.
 
 ### Breaking
 
