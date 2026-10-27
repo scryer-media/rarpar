@@ -779,6 +779,15 @@ impl Par2RepairSession {
         let merged_paths = new_paths.len() as u32;
         let mut candidate_set = self.state.set.clone();
         let result = candidate_set.merge_packets(packets)?;
+        // A Unicode Filename packet can rename an already-described file; the
+        // repair paths cached in the state must then be rebuilt.
+        metadata_changed |= candidate_set.files.iter().any(|(file_id, description)| {
+            self.state
+                .set
+                .files
+                .get(file_id)
+                .is_some_and(|previous| previous.filename != description.filename)
+        });
         if metadata_changed {
             let mut candidate_state = RepairState::from_set(&self.options.base_dir, candidate_set)?;
             for evidence in &self.committed {
@@ -1893,6 +1902,40 @@ mod tests {
         assert!(session.merged_recovery_paths.is_empty());
         assert_eq!(session.diagnostics().recovery_paths_merged, 0);
         assert_eq!(session.estimated_retained_bytes(), before);
+    }
+
+    #[test]
+    fn a_merged_unicode_filename_rebuilds_the_repair_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let recovery_set_id = RecoverySetId::from_bytes([7; 16]);
+        let file_id = FileId::from_bytes([2; 16]);
+        let mut session = session_from_set(
+            Par2RepairSessionOptions {
+                base_dir: dir.path().to_path_buf(),
+                ..Par2RepairSessionOptions::default()
+            },
+            single_file_set(recovery_set_id, file_id, "Bjork.mkv", b"payload!", 4),
+        );
+        let mut body = file_id.as_bytes().to_vec();
+        for unit in "Bj\u{f6}rk.mkv".encode_utf16() {
+            body.extend_from_slice(&unit.to_le_bytes());
+        }
+        while !body.len().is_multiple_of(4) {
+            body.push(0);
+        }
+        let path = dir.path().join("names.vol.par2");
+        write_packet(
+            &path,
+            recovery_set_id,
+            crate::packet::header::TYPE_UNICODE_FILENAME,
+            &body,
+        );
+
+        session.merge_recovery_paths([&path]).unwrap();
+
+        let entry = &session.state.files[0];
+        assert_eq!(entry.safe_name, "Bj\u{f6}rk.mkv");
+        assert_eq!(entry.safe_path, dir.path().join("Bj\u{f6}rk.mkv"));
     }
 
     #[test]

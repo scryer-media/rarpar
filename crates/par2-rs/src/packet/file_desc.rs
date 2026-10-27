@@ -1,5 +1,3 @@
-use unicode_normalization::UnicodeNormalization;
-
 use crate::error::{Par2Error, Result};
 use crate::path::translate_par2_name_to_relative;
 use crate::types::FileId;
@@ -33,19 +31,15 @@ pub struct FileDescriptionPacket {
 /// The field declares no encoding. Bytes that are valid UTF-8 are read as
 /// UTF-8; anything else is read as ISO-8859-1, which maps every byte to a
 /// character, so a name written in a Windows code page keeps one character per
-/// byte instead of collapsing into replacement characters. Either way the text
-/// is NFC-normalised, so one name has one spelling whichever form its producer
-/// wrote.
+/// byte instead of collapsing into replacement characters. The text is not
+/// Unicode-normalised: filesystems such as ext4 treat composed and decomposed
+/// spellings as different names, so the decoded spelling is the one to look
+/// up on disk.
 pub fn decode_par2_name(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
-        Ok(text) => normalize_name(text),
-        Err(_) => bytes.iter().map(|&byte| char::from(byte)).nfc().collect(),
+        Ok(text) => text.to_owned(),
+        Err(_) => bytes.iter().map(|&byte| char::from(byte)).collect(),
     }
-}
-
-/// NFC-normalise a decoded PAR2 name.
-pub(crate) fn normalize_name(text: &str) -> String {
-    text.nfc().collect()
 }
 
 impl FileDescriptionPacket {
@@ -217,14 +211,14 @@ mod tests {
     }
 
     #[test]
-    fn an_nfd_utf8_name_becomes_nfc() {
-        // "Été.mkv" decomposed: E + U+0301, e + U+0301.
+    fn an_nfd_utf8_name_keeps_its_spelling() {
+        // "Été.mkv" decomposed: E + U+0301, e + U+0301. On ext4 this and the
+        // composed spelling are different files, so the name must not change.
         let nfd = "E\u{301}te\u{301}.mkv";
         let body = make_file_desc_body([0; 16], [0; 16], [0; 16], 0, nfd.as_bytes());
         let pkt = FileDescriptionPacket::parse(&body).unwrap();
-        assert_eq!(pkt.par2_name, "\u{c9}t\u{e9}.mkv");
-        assert_eq!(pkt.filename, "\u{c9}t\u{e9}.mkv");
-        // The raw bytes, which the file ID hashes, keep the producer's form.
+        assert_eq!(pkt.par2_name, nfd);
+        assert_eq!(pkt.filename, nfd);
         assert_eq!(pkt.par2_name_bytes, nfd.as_bytes());
     }
 

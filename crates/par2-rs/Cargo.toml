@@ -61,7 +61,6 @@ bytes = { workspace = true }
 crc-turbo = { workspace = true }
 rayon = { workspace = true, default-features = false }
 libc = { workspace = true }
-unicode-normalization = { workspace = true }
 
 # Native-only dependencies.
 #

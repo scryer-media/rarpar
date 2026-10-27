@@ -1,5 +1,4 @@
 use crate::error::{Par2Error, Result};
-use crate::packet::file_desc::normalize_name;
 use crate::types::FileId;
 
 /// File ID (16) plus the largest name a File Description packet may carry,
@@ -16,7 +15,8 @@ pub(crate) const MAX_UNICODE_FILENAME_BODY_BYTES: usize = 16 + 2 * 100_000;
 pub struct UnicodeFilenamePacket {
     /// The file this name belongs to.
     pub file_id: FileId,
-    /// The name, decoded and NFC-normalised.
+    /// The name, decoded but not Unicode-normalised, so it matches the
+    /// spelling on disk.
     pub name: String,
 }
 
@@ -75,7 +75,7 @@ impl UnicodeFilenamePacket {
         }
         Ok(UnicodeFilenamePacket {
             file_id,
-            name: normalize_name(name),
+            name: name.to_owned(),
         })
     }
 }
@@ -120,9 +120,9 @@ mod tests {
     }
 
     #[test]
-    fn normalises_to_nfc() {
+    fn keeps_a_decomposed_spelling() {
         let packet = UnicodeFilenamePacket::parse(&body([7; 16], "E\u{301}t\u{e9}.mkv")).unwrap();
-        assert_eq!(packet.name, "\u{c9}t\u{e9}.mkv");
+        assert_eq!(packet.name, "E\u{301}t\u{e9}.mkv");
     }
 
     #[test]

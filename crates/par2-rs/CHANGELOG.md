@@ -7,9 +7,10 @@
 - File Description names are decoded instead of read lossily. Bytes that are
   valid UTF-8 stay UTF-8; any other name is read as ISO-8859-1, so a name a
   producer wrote in a Windows code page keeps one character per byte instead
-  of collapsing into U+FFFD. Every decoded name is NFC-normalised, so one name
-  has one spelling whichever form its producer wrote. `decode_par2_name` is
-  the public form of that rule.
+  of collapsing into U+FFFD. Decoded names are not Unicode-normalised:
+  filesystems such as ext4 treat composed and decomposed spellings as
+  different names, so a name keeps the spelling its producer wrote and still
+  finds the file on disk. `decode_par2_name` is the public form of that rule.
 - `FileDescriptionPacket` keeps the name bytes exactly as the packet carried
   them in the new `par2_name_bytes` field. The file ID hashes those bytes, so
   they are the form to match on; `par2_name` is the decoded text.
