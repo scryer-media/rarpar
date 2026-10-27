@@ -31,17 +31,23 @@ impl FileDescription {
     /// Only the name changes: the file ID and the hashes are the File
     /// Description's own. A spelling that cannot be translated to a safe
     /// relative path leaves the File Description's name standing.
-    fn adopt_unicode_name(&mut self, name: &str) {
+    ///
+    /// Returns the replaced `(par2_name, filename)`, moved out rather than
+    /// copied, or `None` when the name stands.
+    fn adopt_unicode_name(&mut self, name: &str) -> Option<(String, String)> {
         match translate_par2_name_to_relative(name) {
-            Ok(filename) => {
-                self.par2_name = name.to_owned();
-                self.filename = filename;
+            Ok(filename) => Some((
+                std::mem::replace(&mut self.par2_name, name.to_owned()),
+                std::mem::replace(&mut self.filename, filename),
+            )),
+            Err(error) => {
+                warn!(
+                    file = %self.filename,
+                    %error,
+                    "unicode filename cannot be translated, keeping the file description's name"
+                );
+                None
             }
-            Err(error) => warn!(
-                file = %self.filename,
-                %error,
-                "unicode filename cannot be translated, keeping the file description's name"
-            ),
         }
     }
 }
@@ -115,10 +121,9 @@ impl UnicodeNames {
             };
             match name {
                 Some(name) if description.par2_name != *name => {
-                    originals.entry(*file_id).or_insert_with(|| {
-                        (description.par2_name.clone(), description.filename.clone())
-                    });
-                    description.adopt_unicode_name(name);
+                    if let Some(previous) = description.adopt_unicode_name(name) {
+                        originals.entry(*file_id).or_insert(previous);
+                    }
                 }
                 Some(_) => {}
                 None => {
@@ -1710,6 +1715,40 @@ mod tests {
         let set = Par2FileSet::from_files_with_limits(&[&stream], limits).unwrap();
         assert_eq!(set.files.len(), 1);
         assert_eq!(set.slice_checksums.len(), 1);
+    }
+
+    /// A Unicode name is charged for what adopting it allocates, so a long
+    /// name beside a short File Description name cannot slip past the limit.
+    #[test]
+    fn adopting_a_long_unicode_name_is_charged_to_the_metadata_budget() {
+        let long = format!("{}.mkv", "\u{1}".repeat(4096));
+        let stream = unicode_stream("a.mkv", &[&long], false);
+        let fits = Par2FileSet::from_files(&[&stream]).unwrap();
+        let fd = fits
+            .file_description(&FileId::from_bytes([0x07; 16]))
+            .unwrap();
+        // Control characters escape to three bytes each.
+        assert_eq!(fd.filename.len(), 3 * 4096 + 4);
+
+        let without_name = unicode_stream("a.mkv", &[], false);
+        let mut limit = 1usize;
+        while Par2FileSet::from_files_with_limits(
+            &[&without_name],
+            PacketScanLimits::default().with_max_retained_metadata_bytes(limit),
+        )
+        .is_err()
+        {
+            limit *= 2;
+        }
+        // Room for the File Description and the stored name, not for adopting it.
+        let limit = limit + long.len() * 2;
+        assert!(matches!(
+            Par2FileSet::from_files_with_limits(
+                &[&stream],
+                PacketScanLimits::default().with_max_retained_metadata_bytes(limit),
+            ),
+            Err(Par2Error::ResourceLimitExceeded { .. })
+        ));
     }
 
     /// One budget spans every input, so redundancy spread across volumes is

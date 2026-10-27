@@ -394,9 +394,13 @@ pub(crate) fn packet_retained_bytes(packet: &Packet) -> usize {
         Packet::Creator(creator) => {
             size_of::<super::CreatorPacket>().saturating_add(creator.creator_id.len())
         }
-        Packet::UnicodeFilename(name) => {
-            size_of::<super::UnicodeFilenamePacket>().saturating_add(name.name.len())
-        }
+        // Charged for the most adopting the name can allocate, before it is
+        // adopted: the stored name, the copy that becomes the description's
+        // `par2_name`, and the translated `filename`, which percent-escaping
+        // grows to at most three bytes per name byte. The description's own
+        // spelling moves aside rather than being copied.
+        Packet::UnicodeFilename(name) => size_of::<super::UnicodeFilenamePacket>()
+            .saturating_add(name.name.len().saturating_mul(5)),
         Packet::Unknown { body, .. } => size_of::<Packet>().saturating_add(body.len()),
     };
     contents.saturating_add(RETAINED_SLOT_OVERHEAD_BYTES)

@@ -28,7 +28,12 @@
   restores the File Description's spelling.
 - `Par2RepairSession::merge_recovery_paths` rebuilds its repair paths when a
   merged Unicode Filename packet renames a file, so repair writes under the
-  new name.
+  new name. Any rebuild of that state on merge now keeps the session's
+  source-access handle, so access-backed sessions still read their sources.
+- The packet scan budget charges a Unicode Filename packet for everything
+  adopting its name can allocate (the name, its copy, and a translated path
+  up to three times its length), so a set with long Unicode names returns
+  `ResourceLimitExceeded` instead of retaining more than the limit.
 
 ### Breaking
 

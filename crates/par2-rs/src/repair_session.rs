@@ -789,7 +789,11 @@ impl Par2RepairSession {
                 .is_some_and(|previous| previous.filename != description.filename)
         });
         if metadata_changed {
-            let mut candidate_state = RepairState::from_set(&self.options.base_dir, candidate_set)?;
+            let mut candidate_state = RepairState::from_set_with_access(
+                &self.options.base_dir,
+                candidate_set,
+                self.options.source_access.clone(),
+            )?;
             for evidence in &self.committed {
                 apply_committed_evidence_to_state(&mut candidate_state, evidence);
             }
@@ -1914,6 +1918,7 @@ mod tests {
         let mut session = session_from_set(
             Par2RepairSessionOptions {
                 base_dir: dir.path().to_path_buf(),
+                source_access: Some(Arc::new(MemoryFileAccess::new())),
                 ..Par2RepairSessionOptions::default()
             },
             single_file_set(recovery_set_id, file_id, "Bjork.mkv", b"payload!", 4),
@@ -1938,6 +1943,8 @@ mod tests {
         let entry = &session.state.files[0];
         assert_eq!(entry.safe_name, "Bj\u{f6}rk.mkv");
         assert_eq!(entry.safe_path, dir.path().join("Bj\u{f6}rk.mkv"));
+        // The rebuilt state keeps the session's source-access handle.
+        assert!(session.state.source_access.is_some());
     }
 
     #[test]
