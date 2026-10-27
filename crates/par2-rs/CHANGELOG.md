@@ -605,7 +605,7 @@ set them scans exactly what it scanned before.
 ### Changed
 
 - The optional `native-crypto` backend requires `aws-lc-sys` 0.45 rather than
-  0.44. The workspace moved to 0.45 when `unrar-rs` 0.9.1 was published, but
+  0.44. The workspace moved to 0.45 when a sibling crate was published, but
   this crate was not republished, so the copy of 0.9.0 on crates.io still asked
   for 0.44 while its sibling asked for 0.45. Those are incompatible ranges, so
   anything depending on both resolved two `aws-lc-sys` builds and linked two
@@ -618,8 +618,8 @@ set them scans exactly what it scanned before.
 
 - The VPCLMULQDQ CRC tier override is renamed from `WEAVER_CRC32_VPCLMUL` to
   `RARPAR_CRC32_VPCLMUL`; values and semantics are unchanged and there is no
-  alias. The knob sits in the CRC kernel shared byte for byte with `unrar-rs`,
-  which makes the same rename in its 0.8.0.
+  alias. The knob sits in the CRC kernel shared byte for byte with other
+  crates in the workspace, which make the same rename.
 
 ## 0.8.0
 

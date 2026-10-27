@@ -617,9 +617,8 @@ struct StagedOutputs {
 ///
 /// # Deliberately stronger than the reference tools
 ///
-/// Neither reference implementation has any of this. par2cmdline repairs purely
-/// by name, and unrar creates with `O_CREAT|O_TRUNC` after an exists-prompt —
-/// both would happily write through an inode swap. This machinery exists to
+/// The reference implementation has none of this. par2cmdline repairs purely
+/// by name and would happily write through an inode swap. This machinery exists to
 /// serve the never-lose-data invariant, not to match oracle shape, so do not
 /// "simplify" it back toward the reference behavior.
 #[derive(Debug)]

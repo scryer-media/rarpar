@@ -12,9 +12,8 @@
 //!   3. REPAIR: repair the damaged copy and assert the repaired, PAR2-protected
 //!      file is byte-identical to a pristine copy captured before corruption —
 //!      i.e. repair produced the correct bytes, not merely "no error". (The
-//!      protected payload here is the RAR volume the PAR2 set covers; comparing
-//!      it byte-for-byte is a strict content check that does not need a RAR
-//!      decoder in the guest.)
+//!      protected payload here is a file the PAR2 set covers; comparing it
+//!      byte-for-byte is a strict content check.)
 //!
 //!      SCOPE, precisely: a case's [`ReferenceStash`] decides *which* repair
 //!      path it covers, because the repairer scans every file in its base
