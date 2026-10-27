@@ -779,8 +779,21 @@ impl Par2RepairSession {
         let merged_paths = new_paths.len() as u32;
         let mut candidate_set = self.state.set.clone();
         let result = candidate_set.merge_packets(packets)?;
+        // A Unicode Filename packet can rename an already-described file; the
+        // repair paths cached in the state must then be rebuilt.
+        metadata_changed |= candidate_set.files.iter().any(|(file_id, description)| {
+            self.state
+                .set
+                .files
+                .get(file_id)
+                .is_some_and(|previous| previous.filename != description.filename)
+        });
         if metadata_changed {
-            let mut candidate_state = RepairState::from_set(&self.options.base_dir, candidate_set)?;
+            let mut candidate_state = RepairState::from_set_with_access(
+                &self.options.base_dir,
+                candidate_set,
+                self.options.source_access.clone(),
+            )?;
             for evidence in &self.committed {
                 apply_committed_evidence_to_state(&mut candidate_state, evidence);
             }
@@ -1427,6 +1440,7 @@ mod tests {
                 slice_checksums: HashMap::new(),
                 recovery_slices: BTreeMap::new(),
                 creator: None,
+                unicode_names: Default::default(),
             },
         )
     }
@@ -1464,6 +1478,7 @@ mod tests {
             slice_checksums: HashMap::from([(file_id, checksums)]),
             recovery_slices: BTreeMap::new(),
             creator: None,
+            unicode_names: Default::default(),
         }
     }
 
@@ -1896,6 +1911,43 @@ mod tests {
     }
 
     #[test]
+    fn a_merged_unicode_filename_rebuilds_the_repair_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let recovery_set_id = RecoverySetId::from_bytes([7; 16]);
+        let file_id = FileId::from_bytes([2; 16]);
+        let mut session = session_from_set(
+            Par2RepairSessionOptions {
+                base_dir: dir.path().to_path_buf(),
+                source_access: Some(Arc::new(MemoryFileAccess::new())),
+                ..Par2RepairSessionOptions::default()
+            },
+            single_file_set(recovery_set_id, file_id, "Bjork.mkv", b"payload!", 4),
+        );
+        let mut body = file_id.as_bytes().to_vec();
+        for unit in "Bj\u{f6}rk.mkv".encode_utf16() {
+            body.extend_from_slice(&unit.to_le_bytes());
+        }
+        while !body.len().is_multiple_of(4) {
+            body.push(0);
+        }
+        let path = dir.path().join("names.vol.par2");
+        write_packet(
+            &path,
+            recovery_set_id,
+            crate::packet::header::TYPE_UNICODE_FILENAME,
+            &body,
+        );
+
+        session.merge_recovery_paths([&path]).unwrap();
+
+        let entry = &session.state.files[0];
+        assert_eq!(entry.safe_name, "Bj\u{f6}rk.mkv");
+        assert_eq!(entry.safe_path, dir.path().join("Bj\u{f6}rk.mkv"));
+        // The rebuilt state keeps the session's source-access handle.
+        assert!(session.state.source_access.is_some());
+    }
+
+    #[test]
     fn strong_slice_evidence_uses_its_explicit_path() {
         let dir = tempfile::tempdir().unwrap();
         let payload = b"live";
@@ -1937,6 +1989,7 @@ mod tests {
                 slice_checksums,
                 recovery_slices: BTreeMap::new(),
                 creator: None,
+                unicode_names: Default::default(),
             },
         );
         let evidence =
@@ -2024,6 +2077,7 @@ mod tests {
                 slice_checksums,
                 recovery_slices,
                 creator: None,
+                unicode_names: Default::default(),
             },
         );
 
@@ -2074,6 +2128,7 @@ mod tests {
                 slice_checksums: HashMap::new(),
                 recovery_slices: BTreeMap::new(),
                 creator: None,
+                unicode_names: Default::default(),
             },
         );
         let ambiguous = CommittedFileEvidence::from_full_md5_path(
@@ -2251,6 +2306,7 @@ mod tests {
             slice_checksums,
             recovery_slices: BTreeMap::new(),
             creator: None,
+            unicode_names: Default::default(),
         };
 
         let preflight = RepairState::estimated_retained_bytes_from_set(Path::new("."), &set);

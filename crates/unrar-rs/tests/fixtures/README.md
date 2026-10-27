@@ -70,8 +70,8 @@ license permits unrar's code, and knowledge of it, to be used to *read* RAR
 archives, never to create them, so a hand-assembled container is not something
 this corpus may hold — and a shape RARLAB's writer cannot emit is a shape the
 corpus does not carry. Never use `unrar` — the binary or its source — to author,
-stamp or complete a fixture. (PAR2, Matroska and the plain inputs are open
-formats and follow the ordinary pinned-toolchain rules.)
+stamp or complete a fixture. (Matroska and the plain inputs are open formats
+and follow the ordinary pinned-toolchain rules.)
 
 `rar4/rar4_hp_long_password.rar` is the one thing here that is **not** corpus
 content: the test that reads it is `#[ignore]`d, and it has no ledger entry, so

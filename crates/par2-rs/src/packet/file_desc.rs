@@ -16,10 +16,30 @@ pub struct FileDescriptionPacket {
     pub hash_16k: [u8; 16],
     /// File length in bytes.
     pub file_length: u64,
-    /// Filename (ASCII/UTF-8, without null terminator).
+    /// Filesystem-safe relative path translated from [`Self::par2_name`].
     pub filename: String,
-    /// Original PAR2 filename before filesystem-safe translation.
+    /// The PAR2 filename decoded by [`decode_par2_name`], before
+    /// filesystem-safe translation.
     pub par2_name: String,
+    /// The name bytes exactly as the packet carried them, up to the first NUL.
+    /// The file ID hashes these bytes, so they are the form to match on.
+    pub par2_name_bytes: Vec<u8>,
+}
+
+/// Decode a PAR2 name field into text.
+///
+/// The field declares no encoding. Bytes that are valid UTF-8 are read as
+/// UTF-8; anything else is read as ISO-8859-1, which maps every byte to a
+/// character, so a name written in a Windows code page keeps one character per
+/// byte instead of collapsing into replacement characters. The text is not
+/// Unicode-normalised: filesystems such as ext4 treat composed and decomposed
+/// spellings as different names, so the decoded spelling is the one to look
+/// up on disk.
+pub fn decode_par2_name(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_owned(),
+        Err(_) => bytes.iter().map(|&byte| char::from(byte)).collect(),
+    }
 }
 
 impl FileDescriptionPacket {
@@ -62,7 +82,8 @@ impl FileDescriptionPacket {
                 reason: "filename is empty".to_string(),
             });
         }
-        let par2_name = String::from_utf8_lossy(&name_bytes[..name_end]).into_owned();
+        let par2_name_bytes = name_bytes[..name_end].to_vec();
+        let par2_name = decode_par2_name(&par2_name_bytes);
         let filename = translate_par2_name_to_relative(&par2_name)?;
 
         Ok(FileDescriptionPacket {
@@ -72,6 +93,7 @@ impl FileDescriptionPacket {
             file_length,
             filename,
             par2_name,
+            par2_name_bytes,
         })
     }
 }
@@ -165,6 +187,39 @@ mod tests {
             translate_par2_name_to_relative("normal.par2").unwrap(),
             "normal.par2"
         );
+    }
+
+    #[test]
+    fn a_cp1252_name_decodes_as_iso_8859_1() {
+        // "Été.mkv" in Windows-1252: 0xC9 and 0xE9 are not valid UTF-8 here.
+        let raw = b"\xC9t\xE9.mkv";
+        let body = make_file_desc_body([0; 16], [0; 16], [0; 16], 0, raw);
+        let pkt = FileDescriptionPacket::parse(&body).unwrap();
+        assert_eq!(pkt.par2_name, "\u{c9}t\u{e9}.mkv");
+        assert_eq!(pkt.filename, "\u{c9}t\u{e9}.mkv");
+        assert!(!pkt.par2_name.contains('\u{fffd}'));
+        assert_eq!(pkt.par2_name_bytes, raw);
+    }
+
+    #[test]
+    fn a_valid_utf8_name_is_unchanged() {
+        let name = "Bj\u{f6}rk \u{2013} \u{65e5}\u{672c}.mkv";
+        let body = make_file_desc_body([0; 16], [0; 16], [0; 16], 0, name.as_bytes());
+        let pkt = FileDescriptionPacket::parse(&body).unwrap();
+        assert_eq!(pkt.par2_name, name);
+        assert_eq!(pkt.par2_name_bytes, name.as_bytes());
+    }
+
+    #[test]
+    fn an_nfd_utf8_name_keeps_its_spelling() {
+        // "Été.mkv" decomposed: E + U+0301, e + U+0301. On ext4 this and the
+        // composed spelling are different files, so the name must not change.
+        let nfd = "E\u{301}te\u{301}.mkv";
+        let body = make_file_desc_body([0; 16], [0; 16], [0; 16], 0, nfd.as_bytes());
+        let pkt = FileDescriptionPacket::parse(&body).unwrap();
+        assert_eq!(pkt.par2_name, nfd);
+        assert_eq!(pkt.filename, nfd);
+        assert_eq!(pkt.par2_name_bytes, nfd.as_bytes());
     }
 
     #[test]

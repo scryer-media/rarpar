@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.11.0
+
+### Changed
+
+- File Description names are decoded instead of read lossily. Bytes that are
+  valid UTF-8 stay UTF-8; any other name is read as ISO-8859-1, so a name a
+  producer wrote in a Windows code page keeps one character per byte instead
+  of collapsing into U+FFFD. Decoded names are not Unicode-normalised:
+  filesystems such as ext4 treat composed and decomposed spellings as
+  different names, so a name keeps the spelling its producer wrote and still
+  finds the file on disk. `decode_par2_name` is the public form of that rule.
+- `FileDescriptionPacket` keeps the name bytes exactly as the packet carried
+  them in the new `par2_name_bytes` field. The file ID hashes those bytes, so
+  they are the form to match on; `par2_name` is the decoded text.
+- Unicode Filename packets (`PAR 2.0\0UniFileN`) are parsed into
+  `UnicodeFilenamePacket` and reach `Packet::UnicodeFilename` and
+  `PacketType::UnicodeFilename` instead of `Packet::Unknown`. A set's
+  `FileDescription` takes the UTF-16 spelling for its file ID when the two
+  names disagree only by encoding; a packet that does not decode, is empty, or
+  carries an interior NUL is refused and the File Description's spelling
+  stands. The set builder and `merge_packets` both apply them, in either
+  packet order. `Par2FileSet` keeps that agreement in its new
+  `unicode_names` field, so merging volumes one at a time reaches the same
+  names as scanning them together: a name merged before its File Description
+  applies when the description arrives, and a later disagreeing packet
+  restores the File Description's spelling.
+- `Par2RepairSession::merge_recovery_paths` rebuilds its repair paths when a
+  merged Unicode Filename packet renames a file, so repair writes under the
+  new name. Any rebuild of that state on merge now keeps the session's
+  source-access handle, so access-backed sessions still read their sources.
+- The packet scan budget charges a Unicode Filename packet for everything
+  adopting its name can allocate (the name, its copy, and a translated path
+  up to three times its length), so a set with long Unicode names returns
+  `ResourceLimitExceeded` instead of retaining more than the limit.
+- Test tooling only: the crate no longer has an `unrar-rs` dev-dependency.
+  The real-world repair tests prove a repair by PAR2 verification and by
+  comparing every repaired volume byte for byte with the untouched fixture,
+  instead of extracting the archive.
+
+### Breaking
+
+- `Packet` and `PacketType` gain the `UnicodeFilename` variant,
+  `FileDescriptionPacket` gains `par2_name_bytes`, and `Par2FileSet` gains
+  `unicode_names` (a `UnicodeNames`; hand-built sets use
+  `UnicodeNames::default()`). Exhaustive matches on either enum and struct
+  literals of `FileDescriptionPacket` or `Par2FileSet` must name them.
+
 ## 0.10.13
 
 ### Changed
@@ -562,7 +609,7 @@ set them scans exactly what it scanned before.
 ### Changed
 
 - The optional `native-crypto` backend requires `aws-lc-sys` 0.45 rather than
-  0.44. The workspace moved to 0.45 when `unrar-rs` 0.9.1 was published, but
+  0.44. The workspace moved to 0.45 when a sibling crate was published, but
   this crate was not republished, so the copy of 0.9.0 on crates.io still asked
   for 0.44 while its sibling asked for 0.45. Those are incompatible ranges, so
   anything depending on both resolved two `aws-lc-sys` builds and linked two
@@ -575,8 +622,8 @@ set them scans exactly what it scanned before.
 
 - The VPCLMULQDQ CRC tier override is renamed from `WEAVER_CRC32_VPCLMUL` to
   `RARPAR_CRC32_VPCLMUL`; values and semantics are unchanged and there is no
-  alias. The knob sits in the CRC kernel shared byte for byte with `unrar-rs`,
-  which makes the same rename in its 0.8.0.
+  alias. The knob sits in the CRC kernel shared byte for byte with other
+  crates in the workspace, which make the same rename.
 
 ## 0.8.0
 

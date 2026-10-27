@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.14.2
+
+### Changed
+
+- Documentation only; no code changes. The crate documentation, README and
+  package description now say that the crate reads and uses both kinds of
+  recovery data RAR writes, recovery volumes (`.rev`) and a volume's own
+  recovery record (`-rr`), for RAR5 and RAR 2.9-4.x, with a `# Recovery`
+  section and examples for each, and that every byte a repair writes is one
+  the archiver already wrote. The supported-formats list names the RAR4
+  filters (x86, Itanium, delta, RGB, audio) beside RAR5's. `RecoveryOptions`,
+  `RecoveryReport` and `RevTestResult::status` are documented, and the
+  `recovery` module's docs cover records as well as volumes.
+- Test tooling only: the `wasmtime` dev-dependency behind the wasm host
+  tests no longer enables its on-disk compilation `cache` feature, which
+  pulled `zstd` 0.13 and its RustSec advisories (RUSTSEC-2026-0391 and
+  related `zstd-safe`/`zstd-sys` advisories) into the lockfile. The
+  published library's dependencies are unchanged.
+
 ## 0.14.1
 
 ### Changed
@@ -1041,8 +1060,7 @@ or something else. The runtime escape hatches lose their former owner's name.
   | `WEAVER_RAR4_DEBUG_DUMP_PATH`      | `UNRAR_RS_RAR4_DEBUG_DUMP_PATH` |
 
   `RARPAR_CRC32_VPCLMUL` takes the workspace prefix because the CRC kernel it
-  lives in is shared byte for byte with `par2-rs`, which renames it in the
-  same release (0.9.0).
+  lives in is shared byte for byte with other crates in the workspace.
 - `limits::WEAVER_MAX_MEMBER_DATA_SIZE` is renamed to
   `limits::MAX_MEMBER_DATA_SIZE`; the value is unchanged.
 

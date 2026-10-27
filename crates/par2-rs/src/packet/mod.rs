@@ -6,6 +6,7 @@ pub mod file_verify;
 pub mod header;
 pub mod main;
 pub mod recovery;
+pub mod unicode_filename;
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
@@ -37,6 +38,7 @@ pub use file_verify::IfscPacket;
 pub use header::{HEADER_SIZE, MAGIC, PacketHeader, PacketType};
 pub use main::MainPacket;
 pub use recovery::{RecoverySliceData, RecoverySlicePacket};
+pub use unicode_filename::UnicodeFilenamePacket;
 
 /// A parsed PAR2 packet (any type).
 #[derive(Debug, Clone)]
@@ -46,6 +48,7 @@ pub enum Packet {
     InputFileSliceChecksum(IfscPacket),
     RecoverySlice(RecoverySlicePacket),
     Creator(CreatorPacket),
+    UnicodeFilename(UnicodeFilenamePacket),
     Unknown {
         packet_type: [u8; 16],
         body: Vec<u8>,
@@ -198,6 +201,10 @@ fn parse_packet_internal(
             debug!("parsed Creator packet at offset {offset}");
             Packet::Creator(CreatorPacket::parse(body)?)
         }
+        PacketType::UnicodeFilename => {
+            debug!("parsed UnicodeFilename packet at offset {offset}");
+            Packet::UnicodeFilename(UnicodeFilenamePacket::parse(body)?)
+        }
         PacketType::Unknown(sig) => {
             debug!("parsed Unknown packet type at offset {offset}");
             Packet::Unknown {
@@ -225,6 +232,9 @@ fn parse_packet_body(header: &PacketHeader, body: Vec<u8>) -> Result<Packet> {
         }
         PacketType::RecoverySlice => Packet::RecoverySlice(RecoverySlicePacket::parse(&body)?),
         PacketType::Creator => Packet::Creator(CreatorPacket::parse(&body)?),
+        PacketType::UnicodeFilename => {
+            Packet::UnicodeFilename(UnicodeFilenamePacket::parse(&body)?)
+        }
         PacketType::Unknown(sig) => Packet::Unknown {
             packet_type: sig,
             body,
@@ -468,6 +478,7 @@ fn max_buffered_non_recovery_body_len(packet_type: PacketType) -> Option<usize> 
         PacketType::FileDescription => Some(MAX_FILE_DESC_BODY_BYTES),
         PacketType::InputFileSliceChecksum => Some(MAX_IFSC_BODY_BYTES),
         PacketType::Creator => Some(MAX_CREATOR_BODY_BYTES),
+        PacketType::UnicodeFilename => Some(unicode_filename::MAX_UNICODE_FILENAME_BODY_BYTES),
         PacketType::RecoverySlice | PacketType::Unknown(_) => None,
     }
 }
@@ -1016,6 +1027,26 @@ mod tests {
                 assert_eq!(b.len(), 16);
             }
             other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unicode_filename_packet() {
+        let mut body = [0x42u8; 16].to_vec();
+        for unit in "\u{c9}t\u{e9}.mkv".encode_utf16() {
+            body.extend_from_slice(&unit.to_le_bytes());
+        }
+        // Seven code units: one NUL unit pads the packet to four bytes.
+        body.extend_from_slice(&[0, 0]);
+        let data = make_full_packet(header::TYPE_UNICODE_FILENAME, &body, [0; 16]);
+
+        let (packet, _) = parse_packet(&data, 0).unwrap();
+        match packet {
+            Packet::UnicodeFilename(name) => {
+                assert_eq!(*name.file_id.as_bytes(), [0x42; 16]);
+                assert_eq!(name.name, "\u{c9}t\u{e9}.mkv");
+            }
+            other => panic!("expected UnicodeFilename, got {other:?}"),
         }
     }
 

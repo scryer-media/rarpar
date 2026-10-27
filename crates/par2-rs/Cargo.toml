@@ -2,7 +2,7 @@
 name = "par2-rs"
 description = "PAR2 parity verification and repair"
 readme = "README.md"
-version = "0.10.13"
+version = "0.11.0"
 edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0"
@@ -98,15 +98,7 @@ md-5 = { workspace = true }
 # `criterion` hard-`compile_error!`s on wasm (wasi) targets, and building the
 # `wasm_par2_check` example for wasm compiles the crate's dev-dependencies, so
 # it is scoped to non-wasm targets; the `par2_repair` bench only runs natively.
-# `unrar-rs` is native test-suite tooling (differential RAR extraction
-# checks) and is not needed by the wasm harness, so it stays off the wasm build.
-# Deliberately path-only (no `version`): cargo strips path-only
-# dev-dependencies from the published manifest, so the crates.io package
-# carries no unrar-rs (and no UnRAR license-restriction) reference.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
-unrar-rs = { path = "../unrar-rs", default-features = false, features = [
-    "crypto-aws-lc",
-] }
 criterion = "0.8"
 # Lets the bench surface the crate's own tier logs under `RUST_LOG` — the only
 # way to confirm which compute tier (streaming vs in-memory, CPU vs GPU) a

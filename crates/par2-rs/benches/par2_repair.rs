@@ -131,6 +131,7 @@ fn synthetic_par2_file(filename: &str, data: &[u8], slice_size: u64) -> (Par2Fil
             slice_checksums,
             recovery_slices: BTreeMap::new(),
             creator: None,
+            unicode_names: Default::default(),
         },
         file_id,
     )
