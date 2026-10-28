@@ -888,6 +888,10 @@ fn decode_rar4_plain_name(data: &[u8]) -> String {
     crate::header::common::decode_utf8_prefix_until_nul(data)
 }
 
+/// Trailing zero bytes UnRAR accepts in a rebuilt volume's end-of-archive
+/// header (arcread.cpp:527-534).
+const RECOVERED_VOLUME_ZERO_TAIL: usize = 7;
+
 /// Read one raw RAR4 header from an encrypted stream.
 ///
 /// RAR4 header-level encryption (`-hp`) encrypts all headers after the archive
@@ -909,6 +913,10 @@ pub fn read_raw_header_encrypted<R: Read>(
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(RarError::from(e)),
     }
+    // The header's last on-disk bytes, before decryption: see the
+    // recovered-volume rule below.
+    let mut raw_tail = [0u8; RECOVERED_VOLUME_ZERO_TAIL];
+    raw_tail.copy_from_slice(&block[16 - RECOVERED_VOLUME_ZERO_TAIL..]);
     decryptor.decrypt_blocks(&mut block);
 
     // Parse the 7-byte common header from decrypted data.
@@ -945,6 +953,7 @@ pub fn read_raw_header_encrypted<R: Read>(
         let remaining = aligned_size - 16;
         let mut more = vec![0u8; remaining];
         reader.read_exact(&mut more).map_err(RarError::from)?;
+        raw_tail.copy_from_slice(&more[remaining - RECOVERED_VOLUME_ZERO_TAIL..]);
         decryptor.decrypt_blocks(&mut more);
         decrypted.extend_from_slice(&more);
     }
@@ -954,7 +963,16 @@ pub fn read_raw_header_encrypted<R: Read>(
 
     let expected_crc = read_u16(&data, 0);
     let actual_crc = rar4_header_crc16(&data);
-    if actual_crc != expected_crc {
+    // A volume `rar rc` rebuilt from .rev files ends in zeroes where the
+    // .rev file kept its own volume information, so its end-of-archive header
+    // fails its CRC. UnRAR accepts that header when it states REV_SPACE and
+    // the last seven bytes it read are zero (arcread.cpp:524-535); any other
+    // CRC failure under header encryption is a wrong password
+    // (arcread.cpp:536-546).
+    let recovered_volume_end = header_type == Rar4HeaderType::EndArchive
+        && flags & end_flags::REV_SPACE != 0
+        && raw_tail.iter().all(|byte| *byte == 0);
+    if actual_crc != expected_crc && !recovered_volume_end {
         return Err(RarError::InvalidPassword);
     }
 
