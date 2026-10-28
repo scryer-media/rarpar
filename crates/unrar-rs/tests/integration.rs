@@ -3714,6 +3714,22 @@ fn test_extract_member_rejects_rar5_link_without_file_target() {
 }
 
 #[test]
+fn test_entry_copy_to_rejects_rar5_link_without_file_target() {
+    // The probe found attached copy_to reading a symlink member's absent data
+    // and failing with an unexpected EOF; refuse it like every other writer
+    // route.
+    let extra = redirection_extra(1, "target.txt");
+    let archive_bytes = build_stored_archive_with_extra("link", b"", &extra);
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    let mut out = Vec::new();
+
+    let err = archive.by_index(0).unwrap().copy_to(&mut out).unwrap_err();
+
+    assert!(out.is_empty());
+    assert_unsupported_link_without_file_target(err, "link");
+}
+
+#[test]
 fn test_extract_member_streaming_rejects_rar5_link_without_file_target() {
     let extra = redirection_extra(4, "target.txt");
     let archive_bytes = build_stored_archive_with_extra("hardlink", b"", &extra);
