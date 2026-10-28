@@ -713,6 +713,14 @@ impl RarArchive {
             .map(|s| s.volume_index)
             .unwrap_or(first_vol);
         let total_compressed: u64 = entry.segments.iter().map(|s| s.data_size).sum();
+        // Only a final part states the whole-member checksums; while the
+        // record's header is an earlier part's, its fields describe that
+        // volume's packed bytes and name nothing about the member.
+        let (crc32, hash) = if fh.split_after {
+            (None, None)
+        } else {
+            (fh.data_crc32, entry.hash.clone())
+        };
 
         let rar4_unix_symlink = self.format == ArchiveFormat::Rar4
             && matches!(fh.host_os, crate::types::HostOs::Unix)
@@ -746,7 +754,7 @@ impl RarArchive {
             unpacked_size: fh.unpacked_size,
             compressed_size: total_compressed,
             is_directory: fh.is_directory,
-            crc32: fh.data_crc32,
+            crc32,
             mtime: fh.mtime,
             ctime: fh.ctime,
             atime: fh.atime,
@@ -754,7 +762,7 @@ impl RarArchive {
             host_os: fh.host_os,
             compression: fh.compression,
             is_encrypted: entry.is_encrypted,
-            hash: entry.hash.clone(),
+            hash,
             attributes: fh.attributes,
             owner: entry.owner.clone(),
             volumes: VolumeSpan {

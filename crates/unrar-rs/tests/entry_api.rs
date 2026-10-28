@@ -1001,13 +1001,13 @@ fn crc_only_split_store_verifies_when_opened_from_the_first_volume() {
 
     // Opened from the first volume only.
     let mut archive = RarArchive::open(File::open(&paths[0]).unwrap()).unwrap();
-    let info = archive.entries().next().expect("one member");
+    let header = &archive.export_headers().members[0];
     assert!(
-        info.crc32.is_some(),
+        header.data_crc32.is_some(),
         "the fixture's first header must carry a CRC"
     );
     assert!(
-        info.hash.is_none(),
+        header.blake2_hash.is_none(),
         "the fixture must carry no BLAKE2sp digest"
     );
 
@@ -1021,4 +1021,187 @@ fn crc_only_split_store_verifies_when_opened_from_the_first_volume() {
 
     assert_eq!(written as usize, expected.len());
     assert_eq!(actual, expected);
+}
+
+/// The checksums one volume's header states for the member it holds, as
+/// that header alone reads.
+fn header_checksums(path: &PathBuf) -> (Option<u32>, Option<[u8; 32]>) {
+    let archive = RarArchive::open(File::open(path).unwrap()).unwrap();
+    let headers = archive.export_headers();
+    assert_eq!(headers.members.len(), 1, "{}", path.display());
+    (
+        headers.members[0].data_crc32,
+        headers.members[0].blake2_hash,
+    )
+}
+
+fn split_set_paths(dir: &str, set: &str, parts: usize) -> Option<Vec<PathBuf>> {
+    let paths: Vec<PathBuf> = (1..=parts)
+        .map(|part| {
+            fixture_root()
+                .join(dir)
+                .join(format!("{set}.part{part}.rar"))
+        })
+        .collect();
+    if paths.iter().any(|path| !path.exists()) {
+        eprintln!("skipping test: {set} fixtures not present");
+        return None;
+    }
+    Some(paths)
+}
+
+/// How a split-member test consumes the entry it takes through the provider.
+#[derive(Clone, Copy)]
+enum Consume {
+    CopyTo,
+    CopyToVolumes,
+}
+
+/// A split member's listing states the member's own checksum, never a
+/// part's: nothing while only an earlier part's header has been read, and
+/// the final part's once extraction through a provider has read it.
+fn split_member_states_its_own_checksum(dir: &str, set: &str, parts: usize, consume: Consume) {
+    let Some(paths) = split_set_paths(dir, set, parts) else {
+        return;
+    };
+
+    // The member as the whole chain states it.
+    let readers: Vec<Box<dyn unrar_rs::ReadSeek>> = paths
+        .iter()
+        .map(|path| Box::new(File::open(path).unwrap()) as Box<dyn unrar_rs::ReadSeek>)
+        .collect();
+    let whole = RarArchive::open_volumes(readers)
+        .unwrap()
+        .member_info(0)
+        .unwrap();
+    let first_part = header_checksums(&paths[0]);
+    let final_part = header_checksums(&paths[parts - 1]);
+    assert_eq!(
+        (
+            whole.crc32,
+            whole.hash.as_ref().map(|hash| match hash {
+                unrar_rs::FileHash::Blake2sp(value) => *value,
+            })
+        ),
+        final_part,
+        "{set}: a complete chain lists the final part's checksums"
+    );
+    assert_ne!(
+        first_part, final_part,
+        "{set}: the first part's header must state its own packed checksum"
+    );
+
+    // Opened from the first volume only: no header read so far states the
+    // member's checksum.
+    let mut archive = RarArchive::open(File::open(&paths[0]).unwrap()).unwrap();
+    let listed = archive.member_info(0).unwrap();
+    assert_eq!(listed.crc32, None, "{set}: crc32 before the final part");
+    assert_eq!(listed.hash, None, "{set}: hash before the final part");
+    assert_eq!(
+        archive.by_index(0).unwrap().info().crc32,
+        None,
+        "{set}: the entry lists what the archive lists"
+    );
+
+    let provider = StaticVolumeProvider::from_ordered(paths.clone());
+    let mut produced = Vec::new();
+    match consume {
+        Consume::CopyTo => {
+            archive
+                .by_index_via(0, &provider)
+                .unwrap()
+                .copy_to(&mut produced)
+                .unwrap();
+        }
+        Consume::CopyToVolumes => {
+            let chunks = RefCell::new(Vec::new());
+            archive
+                .by_index_via(0, &provider)
+                .unwrap()
+                .copy_to_volumes(|_| Ok(ChunkWriter(&chunks)))
+                .unwrap();
+            produced = chunks.into_inner();
+        }
+    }
+
+    let learned = archive.member_info(0).unwrap();
+    assert_eq!(learned.crc32, whole.crc32, "{set}: crc32 after extraction");
+    assert_eq!(learned.hash, whole.hash, "{set}: hash after extraction");
+    assert_eq!(learned.unpacked_size, whole.unpacked_size);
+    assert_eq!(learned.volumes, whole.volumes);
+    if let Some(crc32) = learned.crc32 {
+        assert_eq!(
+            crc_turbo::crc32_iso_hdlc(&produced),
+            crc32,
+            "{set}: listed crc32"
+        );
+    }
+    assert_eq!(
+        archive.by_index(0).unwrap().info().crc32,
+        whole.crc32,
+        "{set}: a later entry lists the learned checksum"
+    );
+
+    // The volumes the extraction read arrive afterwards: each header is
+    // integrated once, so the member stays one member and still reads.
+    for (index, path) in paths.iter().enumerate().skip(1) {
+        archive
+            .add_volume(index, Box::new(File::open(path).unwrap()))
+            .unwrap();
+    }
+    assert_eq!(archive.len(), 1, "{set}: one member after adding volumes");
+    let attached = archive.member_info(0).unwrap();
+    assert_eq!(attached.crc32, whole.crc32);
+    assert_eq!(attached.hash, whole.hash);
+    assert_eq!(attached.volumes, whole.volumes);
+    let mut reread = Vec::new();
+    archive.by_index(0).unwrap().copy_to(&mut reread).unwrap();
+    assert_eq!(reread, produced, "{set}: attached re-read");
+}
+
+struct ChunkWriter<'a>(&'a RefCell<Vec<u8>>);
+
+impl Write for ChunkWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_split_rar4_lz_member_lists_its_own_crc_once_its_final_part_is_read() {
+    split_member_states_its_own_checksum(
+        "rar4",
+        "generated_matrix_rar4_lz_plain",
+        7,
+        Consume::CopyTo,
+    );
+}
+
+#[test]
+fn a_split_rar5_lz_member_lists_its_own_crc_once_its_final_part_is_read() {
+    split_member_states_its_own_checksum(
+        "rar5",
+        "generated_matrix_rar5_lz_plain",
+        7,
+        Consume::CopyTo,
+    );
+}
+
+#[test]
+fn a_split_rar5_lz_member_lists_its_own_crc_after_a_chunked_copy() {
+    split_member_states_its_own_checksum(
+        "rar5",
+        "generated_matrix_rar5_lz_plain",
+        7,
+        Consume::CopyToVolumes,
+    );
+}
+
+#[test]
+fn a_split_rar5_htb_member_lists_its_own_blake2_once_its_final_part_is_read() {
+    split_member_states_its_own_checksum("rar5", "rar5_mv_store_blake2", 6, Consume::CopyTo);
 }

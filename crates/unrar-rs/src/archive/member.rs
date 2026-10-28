@@ -3564,11 +3564,13 @@ impl RarArchive {
             if skip_fh.compression.method != CompressionMethod::Store {
                 let skip_unpacked = self.target_unpacked_size(&skip_fh);
                 let (segments, _) = Self::sorted_member_segments(&skip_entry.segments);
+                let continuations = Rc::new(RefCell::new(ContinuationMetadata::default()));
                 let base_reader = ChainedSegmentReader::new(&segments, provider)
                     .with_member_name(&skip_fh.name)
                     .with_max_data_segment(self.limits.max_data_segment)
                     .with_continuation(skip_fh.split_after, self.format, effective_password.clone())
-                    .with_kdf_cache(Arc::clone(&self.kdf_cache));
+                    .with_kdf_cache(Arc::clone(&self.kdf_cache))
+                    .with_metadata_sink(Rc::clone(&continuations));
 
                 if skip_entry.is_encrypted {
                     let password = effective_password
@@ -3628,6 +3630,7 @@ impl RarArchive {
                     )?;
                     self.enforce_unknown_lz_output_limit(&skip_fh, written)?;
                 }
+                self.learn_continuations(skip_idx, continuations.take().parts);
             }
 
             self.solid_next_index += 1;
@@ -5955,6 +5958,21 @@ impl RarArchive {
         provider: &dyn VolumeProvider,
         writer: &mut W,
     ) -> RarResult<u64> {
+        let continuations = Rc::new(RefCell::new(ContinuationMetadata::default()));
+        let result =
+            self.extract_member_streaming_via(index, options, provider, writer, &continuations);
+        self.learn_continuations(index, continuations.take().parts);
+        result
+    }
+
+    fn extract_member_streaming_via<W: Write>(
+        &mut self,
+        index: usize,
+        options: &ExtractOptions,
+        provider: &dyn VolumeProvider,
+        writer: &mut W,
+        continuations: &Rc<RefCell<ContinuationMetadata>>,
+    ) -> RarResult<u64> {
         let entry = self
             .members
             .get(index)
@@ -5997,6 +6015,7 @@ impl RarArchive {
                 file_encryption.as_ref(),
                 rar4_salt,
                 entry.file_header.split_after,
+                continuations,
             );
         }
 
@@ -6028,6 +6047,7 @@ impl RarArchive {
                 file_encryption.as_ref(),
                 rar4_salt,
                 split_after,
+                continuations,
             );
         }
 
@@ -6058,6 +6078,7 @@ impl RarArchive {
             file_encryption.as_ref(),
             rar4_salt,
             split_after,
+            continuations,
         )
     }
 
@@ -6079,6 +6100,7 @@ impl RarArchive {
         file_encryption: Option<&FileEncryptionInfo>,
         rar4_salt: Option<[u8; 8]>,
         split_after: bool,
+        continuations: &Rc<RefCell<ContinuationMetadata>>,
     ) -> RarResult<u64> {
         let rar5_crypto = if self.format == ArchiveFormat::Rar5 {
             password
@@ -6103,6 +6125,7 @@ impl RarArchive {
                 file_encryption,
                 rar4_salt,
                 split_after,
+                continuations,
             );
         }
 
@@ -6119,8 +6142,6 @@ impl RarArchive {
             streaming_hash_plan(expected_crc, expected_blake, options.verify, split_after);
 
         self.advance_solid_cursor_to_streaming(index, fh, provider, options.password.as_deref())?;
-
-        let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
         let chained = ChainedSegmentReader::new(&segments, provider)
             .with_member_name(&fh.name)
             .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
@@ -6133,7 +6154,7 @@ impl RarArchive {
                     .or_else(|| self.password.clone()),
             )
             .with_kdf_cache(Arc::clone(&self.kdf_cache))
-            .with_metadata_sink(Rc::clone(&cont_meta));
+            .with_metadata_sink(Rc::clone(continuations));
         let unpacked_size = self.target_unpacked_size(fh);
 
         // Hashing runs off-thread for large members (see hash_pipeline).
@@ -6199,17 +6220,17 @@ impl RarArchive {
             (written, actual_crc, actual_blake)
         };
 
-        let final_meta = cont_meta.borrow();
-        let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
+        let final_meta = continuations.borrow();
+        let effective_crc = final_meta.data_crc32().or(fh.data_crc32);
         let effective_blake = continuation_blake2_expectation(
             &fh.name,
             expected_crc,
             expected_blake,
-            final_meta.blake2_hash,
+            final_meta.blake2_hash(),
             hash_plan,
             options.verify,
         )?;
-        let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac;
+        let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac();
         drop(final_meta);
 
         Self::verify_member_crc32(
@@ -6245,6 +6266,7 @@ impl RarArchive {
         file_encryption: Option<&FileEncryptionInfo>,
         rar4_salt: Option<[u8; 8]>,
         split_after: bool,
+        continuations: &Rc<RefCell<ContinuationMetadata>>,
     ) -> RarResult<u64> {
         let rar5_crypto = if self.format == ArchiveFormat::Rar5 {
             password
@@ -6253,7 +6275,6 @@ impl RarArchive {
         } else {
             None
         };
-        let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
         let chained = ChainedSegmentReader::new(segments, provider)
             .with_member_name(&fh.name)
             .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
@@ -6266,7 +6287,7 @@ impl RarArchive {
                     .or_else(|| self.password.clone()),
             )
             .with_kdf_cache(Arc::clone(&self.kdf_cache))
-            .with_metadata_sink(Rc::clone(&cont_meta));
+            .with_metadata_sink(Rc::clone(continuations));
         let use_hash_mac = file_encryption.is_some_and(|enc| enc.use_hash_mac);
         let expected_crc = if options.verify { fh.data_crc32 } else { None };
         let expected_blake = if options.verify {
@@ -6335,17 +6356,17 @@ impl RarArchive {
         writer.flush().map_err(RarError::from)?;
 
         // Use final volume's CRC and HMAC flag if continuations were discovered.
-        let final_meta = cont_meta.borrow();
-        let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
+        let final_meta = continuations.borrow();
+        let effective_crc = final_meta.data_crc32().or(fh.data_crc32);
         let effective_blake = continuation_blake2_expectation(
             &fh.name,
             expected_crc,
             expected_blake,
-            final_meta.blake2_hash,
+            final_meta.blake2_hash(),
             hash_plan,
             options.verify,
         )?;
-        let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac;
+        let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac();
         drop(final_meta);
 
         let stream_outputs = stream_hash.finalize().map_err(RarError::from)?;
@@ -6388,6 +6409,7 @@ impl RarArchive {
         file_encryption: Option<&FileEncryptionInfo>,
         rar4_salt: Option<[u8; 8]>,
         split_after: bool,
+        continuations: &Rc<RefCell<ContinuationMetadata>>,
     ) -> RarResult<u64> {
         let rar5_crypto = if self.format == ArchiveFormat::Rar5 {
             password
@@ -6399,7 +6421,6 @@ impl RarArchive {
         let use_hash_mac = file_encryption.is_some_and(|enc| enc.use_hash_mac);
         // Both RAR5 and RAR4 (including PPM) consume this stream through their
         // bounded input buffers; neither needs the whole packed member first.
-        let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
         let chained = ChainedSegmentReader::new(segments, provider)
             .with_member_name(&fh.name)
             .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
@@ -6412,7 +6433,7 @@ impl RarArchive {
                     .or_else(|| self.password.clone()),
             )
             .with_kdf_cache(Arc::clone(&self.kdf_cache))
-            .with_metadata_sink(Rc::clone(&cont_meta));
+            .with_metadata_sink(Rc::clone(continuations));
 
         // Wrap in DecryptingReader if encrypted.
         let inner: Box<dyn Read + '_> = if let Some(pwd) = password {
@@ -6485,17 +6506,17 @@ impl RarArchive {
         hash_writer.flush().map_err(RarError::from)?;
 
         // Use final volume's CRC and HMAC flag if continuations were discovered.
-        let final_meta = cont_meta.borrow();
-        let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
+        let final_meta = continuations.borrow();
+        let effective_crc = final_meta.data_crc32().or(fh.data_crc32);
         let effective_blake = continuation_blake2_expectation(
             &fh.name,
             expected_crc,
             expected_blake,
-            final_meta.blake2_hash,
+            final_meta.blake2_hash(),
             hash_plan,
             options.verify,
         )?;
-        let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac;
+        let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac();
         drop(final_meta);
 
         let (actual_crc, actual_blake) = finalize_shared_hash(stream_hash)?;
@@ -6545,6 +6566,30 @@ impl RarArchive {
         W: Write,
         F: FnMut(usize) -> RarResult<W>,
     {
+        let continuations = Rc::new(RefCell::new(ContinuationMetadata::default()));
+        let result = self.extract_member_streaming_chunked_via(
+            index,
+            options,
+            provider,
+            writer_factory,
+            &continuations,
+        );
+        self.learn_continuations(index, continuations.take().parts);
+        result
+    }
+
+    fn extract_member_streaming_chunked_via<F, W>(
+        &mut self,
+        index: usize,
+        options: &ExtractOptions,
+        provider: &dyn VolumeProvider,
+        writer_factory: F,
+        continuations: &Rc<RefCell<ContinuationMetadata>>,
+    ) -> RarResult<Vec<(usize, u64)>>
+    where
+        W: Write,
+        F: FnMut(usize) -> RarResult<W>,
+    {
         let entry = self
             .members
             .get(index)
@@ -6587,6 +6632,7 @@ impl RarArchive {
                 file_encryption.as_ref(),
                 rar4_salt,
                 entry.file_header.split_after,
+                continuations,
             );
         }
 
@@ -6616,6 +6662,7 @@ impl RarArchive {
                 file_encryption.as_ref(),
                 rar4_salt,
                 split_after,
+                continuations,
             );
         }
 
@@ -6640,6 +6687,7 @@ impl RarArchive {
             file_encryption.as_ref(),
             rar4_salt,
             split_after,
+            continuations,
         )
     }
 
@@ -6659,6 +6707,7 @@ impl RarArchive {
         file_encryption: Option<&FileEncryptionInfo>,
         rar4_salt: Option<[u8; 8]>,
         split_after: bool,
+        continuations: &Rc<RefCell<ContinuationMetadata>>,
     ) -> RarResult<Vec<(usize, u64)>>
     where
         W: Write,
@@ -6673,7 +6722,6 @@ impl RarArchive {
         };
         let use_hash_mac = file_encryption.is_some_and(|enc| enc.use_hash_mac);
         let volume_tracker = Arc::new(AtomicUsize::new(first_vol));
-        let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
         let chained = ChainedSegmentReader::new(segments, provider)
             .with_member_name(&fh.name)
             .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
@@ -6686,7 +6734,7 @@ impl RarArchive {
                     .or_else(|| self.password.clone()),
             )
             .with_kdf_cache(Arc::clone(&self.kdf_cache))
-            .with_metadata_sink(Rc::clone(&cont_meta))
+            .with_metadata_sink(Rc::clone(continuations))
             .with_volume_tracker(Arc::clone(&volume_tracker));
         let expected_crc = if options.verify { fh.data_crc32 } else { None };
         let expected_blake = if options.verify {
@@ -6771,17 +6819,17 @@ impl RarArchive {
         }
 
         // Verify CRC32.
-        let final_meta = cont_meta.borrow();
-        let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
+        let final_meta = continuations.borrow();
+        let effective_crc = final_meta.data_crc32().or(fh.data_crc32);
         let effective_blake = continuation_blake2_expectation(
             &fh.name,
             expected_crc,
             expected_blake,
-            final_meta.blake2_hash,
+            final_meta.blake2_hash(),
             hash_plan,
             options.verify,
         )?;
-        let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac;
+        let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac();
         drop(final_meta);
 
         let stream_outputs = stream_hash.finalize().map_err(RarError::from)?;
@@ -6818,6 +6866,7 @@ impl RarArchive {
         file_encryption: Option<&FileEncryptionInfo>,
         rar4_salt: Option<[u8; 8]>,
         split_after: bool,
+        continuations: &Rc<RefCell<ContinuationMetadata>>,
     ) -> RarResult<Vec<(usize, u64)>>
     where
         W: Write,
@@ -6847,6 +6896,7 @@ impl RarArchive {
                 file_encryption,
                 rar4_salt,
                 split_after,
+                continuations,
             );
         }
 
@@ -6854,7 +6904,6 @@ impl RarArchive {
 
         let volume_tracker = Arc::new(AtomicUsize::new(first_vol));
         let shared_transitions = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
         let chained = ChainedSegmentReader::new(&segments, provider)
             .with_member_name(&fh.name)
             .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
@@ -6867,7 +6916,7 @@ impl RarArchive {
                     .or_else(|| self.password.clone()),
             )
             .with_kdf_cache(Arc::clone(&self.kdf_cache))
-            .with_metadata_sink(Rc::clone(&cont_meta))
+            .with_metadata_sink(Rc::clone(continuations))
             .with_volume_tracker(Arc::clone(&volume_tracker));
         let tracking_reader = VolumeTrackingReader::new(chained, volume_tracker)
             .with_shared_transitions(Arc::clone(&shared_transitions));
@@ -6948,17 +6997,17 @@ impl RarArchive {
         };
         self.enforce_unknown_lz_chunk_limit(fh, &chunks)?;
 
-        let final_meta = cont_meta.borrow();
-        let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
+        let final_meta = continuations.borrow();
+        let effective_crc = final_meta.data_crc32().or(fh.data_crc32);
         let effective_blake = continuation_blake2_expectation(
             &fh.name,
             expected_crc,
             expected_blake,
-            final_meta.blake2_hash,
+            final_meta.blake2_hash(),
             hash_plan,
             options.verify,
         )?;
-        let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac;
+        let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac();
         drop(final_meta);
 
         let (actual_crc, actual_blake) = finalize_shared_hash(shared_hash)?;
@@ -6998,6 +7047,7 @@ impl RarArchive {
         file_encryption: Option<&FileEncryptionInfo>,
         rar4_salt: Option<[u8; 8]>,
         split_after: bool,
+        continuations: &Rc<RefCell<ContinuationMetadata>>,
     ) -> RarResult<Vec<(usize, u64)>>
     where
         W: Write,
@@ -7012,7 +7062,6 @@ impl RarArchive {
         };
         let use_hash_mac = file_encryption.is_some_and(|enc| enc.use_hash_mac);
         let volume_tracker = Arc::new(AtomicUsize::new(first_vol));
-        let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
         let chained = ChainedSegmentReader::new(segments, provider)
             .with_member_name(&fh.name)
             .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
@@ -7025,7 +7074,7 @@ impl RarArchive {
                     .or_else(|| self.password.clone()),
             )
             .with_kdf_cache(Arc::clone(&self.kdf_cache))
-            .with_metadata_sink(Rc::clone(&cont_meta))
+            .with_metadata_sink(Rc::clone(continuations))
             .with_volume_tracker(Arc::clone(&volume_tracker));
 
         // Build reader chain, wrapping in DecryptingReader if encrypted.
@@ -7134,17 +7183,17 @@ impl RarArchive {
         self.enforce_unknown_lz_chunk_limit(fh, &chunks)?;
 
         // Verify CRC32.
-        let final_meta = cont_meta.borrow();
-        let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
+        let final_meta = continuations.borrow();
+        let effective_crc = final_meta.data_crc32().or(fh.data_crc32);
         let effective_blake = continuation_blake2_expectation(
             &fh.name,
             expected_crc,
             expected_blake,
-            final_meta.blake2_hash,
+            final_meta.blake2_hash(),
             hash_plan,
             options.verify,
         )?;
-        let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac;
+        let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac();
         drop(final_meta);
 
         let (actual_crc, actual_blake) = finalize_shared_hash(shared_hash)?;
@@ -7446,20 +7495,44 @@ fn volume_provider_io_error(error: crate::volume::VolumeProviderError) -> std::i
     std::io::Error::other(error)
 }
 
-/// Metadata captured from continuation headers discovered during streaming.
+/// Continuation headers discovered during streaming.
 ///
-/// As `ChainedSegmentReader` discovers continuation volumes, it updates
-/// this with the latest header's CRC and encryption flags. After all
-/// segments are consumed, the values here are from the final volume —
-/// which is authoritative for whole-file CRC verification.
+/// As `ChainedSegmentReader` discovers continuation volumes, it records each
+/// continuation as the member record that volume's header describes. After
+/// all segments are consumed, the last part is the final volume's, which is
+/// authoritative for whole-file CRC verification. The archive merges the
+/// parts into the member's own record once extraction returns.
 #[derive(Debug, Clone, Default)]
 pub(super) struct ContinuationMetadata {
+    /// One record per discovered continuation, in volume order.
+    parts: Vec<MemberEntry>,
+}
+
+impl ContinuationMetadata {
     /// CRC32 from the most recently discovered continuation header.
-    data_crc32: Option<u32>,
+    fn data_crc32(&self) -> Option<u32> {
+        self.parts
+            .last()
+            .and_then(|part| part.file_header.data_crc32)
+    }
+
     /// BLAKE2sp from the most recently discovered continuation header.
-    blake2_hash: Option<[u8; 32]>,
+    fn blake2_hash(&self) -> Option<[u8; 32]> {
+        self.parts
+            .last()
+            .and_then(|part| part.hash.as_ref())
+            .map(|hash| match hash {
+                FileHash::Blake2sp(value) => *value,
+            })
+    }
+
     /// Whether the most recently discovered continuation has HASHMAC set.
-    use_hash_mac: bool,
+    fn use_hash_mac(&self) -> bool {
+        self.parts
+            .last()
+            .and_then(|part| part.file_encryption.as_ref())
+            .is_some_and(|encryption| encryption.use_hash_mac)
+    }
 }
 
 /// A `Read` adapter that chains data segments across volumes.
@@ -7754,6 +7827,17 @@ impl<'a> ChainedSegmentReader<'a> {
         Ok(true)
     }
 
+    /// Read on into the continuation `part` found in volume `vol_idx`, and
+    /// hand its record to the metadata sink.
+    fn accept_continuation(&mut self, vol_idx: usize, part: MemberEntry) {
+        self.segments.push(part.segments[0].clone());
+        self.split_after = part.file_header.split_after;
+        self.next_discover_vol = vol_idx + 1;
+        if let Some(ref sink) = self.metadata_sink {
+            sink.borrow_mut().parts.push(part);
+        }
+    }
+
     /// Fetch the next volume, parse its headers, and extract the continuation segment.
     fn discover_next_segment(&mut self) -> std::io::Result<bool> {
         let vol_idx = self.next_discover_vol;
@@ -7796,23 +7880,9 @@ impl<'a> ChainedSegmentReader<'a> {
                         )
                         .into_io());
                     }
-                    let file_header =
-                        RarArchive::rar4_to_file_header(fh, parsed.archive_header.is_solid);
-                    self.segments.push(DataSegment::with_packed_hashes(
-                        vol_idx,
-                        fh.data_offset,
-                        fh.packed_size,
-                        RarArchive::packed_hashes_for_split_segment(&file_header, None),
-                        false,
-                    ));
-                    self.split_after = fh.split_after;
-                    self.next_discover_vol = vol_idx + 1;
-                    if let Some(ref sink) = self.metadata_sink {
-                        let mut meta = sink.borrow_mut();
-                        meta.data_crc32 = Some(fh.crc32);
-                        meta.blake2_hash = None;
-                        meta.use_hash_mac = false; // RAR4 has no HMAC
-                    }
+                    let part =
+                        RarArchive::rar4_member_entry(vol_idx, fh, parsed.archive_header.is_solid);
+                    self.accept_continuation(vol_idx, part);
                     return Ok(true);
                 }
             }
@@ -7829,7 +7899,7 @@ impl<'a> ChainedSegmentReader<'a> {
             )
             .map_err(RarError::into_io)?;
             // Find the first file header with split_before.
-            for pf in &parsed.files {
+            for pf in parsed.files {
                 if pf.header.split_before
                     && (!self.member_name_known
                         || pf.header.name.is_empty()
@@ -7844,32 +7914,8 @@ impl<'a> ChainedSegmentReader<'a> {
                         )
                         .into_io());
                     }
-                    let packed_hashes =
-                        RarArchive::packed_hashes_for_split_segment(&pf.header, pf.hash.as_ref());
-                    let packed_hash_uses_mac = pf
-                        .file_encryption
-                        .as_ref()
-                        .is_some_and(|fe| fe.use_hash_mac);
-                    self.segments.push(DataSegment::with_packed_hashes(
-                        vol_idx,
-                        pf.header.data_offset,
-                        pf.header.data_size,
-                        packed_hashes,
-                        packed_hash_uses_mac,
-                    ));
-                    self.split_after = pf.header.split_after;
-                    self.next_discover_vol = vol_idx + 1;
-                    if let Some(ref sink) = self.metadata_sink {
-                        let mut meta = sink.borrow_mut();
-                        meta.data_crc32 = pf.header.data_crc32;
-                        meta.blake2_hash = pf.hash.as_ref().map(|hash| match hash {
-                            FileHash::Blake2sp(value) => *value,
-                        });
-                        meta.use_hash_mac = pf
-                            .file_encryption
-                            .as_ref()
-                            .is_some_and(|fe| fe.use_hash_mac);
-                    }
+                    let part = RarArchive::rar5_member_entry(vol_idx, pf);
+                    self.accept_continuation(vol_idx, part);
                     return Ok(true);
                 }
             }

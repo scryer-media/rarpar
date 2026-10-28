@@ -2211,6 +2211,35 @@ fn build_two_volume_rar4_stored_archive(
     (vol0, vol1)
 }
 
+/// A member that is not split lists the CRC its one header states.
+#[test]
+fn an_unsplit_member_lists_its_crc_at_listing() {
+    let content = b"one header states this member's crc";
+    let archive =
+        unrar_rs::RarArchive::open(Cursor::new(build_stored_rar5_archive("whole.txt", content)))
+            .unwrap();
+    assert_eq!(
+        archive.member_info(0).unwrap().crc32,
+        Some(crc32fast::hash(content))
+    );
+}
+
+/// A split member lists no CRC while only its first part's header is known,
+/// and the member's own CRC once the volume holding its final part is added.
+#[test]
+fn a_split_member_lists_its_crc_once_the_final_volume_is_added() {
+    let content: Vec<u8> = (0..4096u32).map(|i| (i * 7 + 3) as u8).collect();
+    let (vol0, vol1) = build_two_volume_rar4_stored_archive("split.bin", &content, 1500);
+    let mut archive = unrar_rs::RarArchive::open(Cursor::new(vol0)).unwrap();
+    assert_eq!(archive.member_info(0).unwrap().crc32, None);
+
+    archive.add_volume(1, Box::new(Cursor::new(vol1))).unwrap();
+    assert_eq!(
+        archive.member_info(0).unwrap().crc32,
+        Some(crc32fast::hash(&content))
+    );
+}
+
 #[test]
 fn test_rar4_multivolume_open_volumes() {
     let content = b"RAR4 multi-volume stored file content spanning two volumes!";

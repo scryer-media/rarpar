@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.14.3
+
+### Fixed
+
+- `MemberInfo::crc32` and `MemberInfo::hash` for a split member state the
+  member's own checksum, never a part's. Only a final part's header states
+  the whole-member CRC32 or BLAKE2sp; every earlier part's states the
+  checksum of that volume's packed bytes. The listing used to report the
+  first part's, so a RAR4 LZ member split over four parts whose headers
+  carry `3376f01c`, `35c71b14`, `706971b0` and `06b19020` was listed with
+  `3376f01c`, which names nothing; only `06b19020` is the member's CRC. Both
+  fields are now `None` until the final part's header has been read, as
+  `unpacked_size` already was, and carry that header's values from then on.
+- A member extracted through a volume provider (`by_index_via`) now records
+  the continuation headers the extraction read, so once `copy_to` or
+  `copy_to_volumes` returns, `member_info` lists the member's checksum, size
+  and volume span as the final part states them. A solid member decoded on
+  the way to a later one is recorded the same way.
+- A volume holding a member's first part, added after a volume holding a
+  later part, no longer marks the member as continuing past that later
+  part.
+
 ## 0.14.2
 
 ### Changed
