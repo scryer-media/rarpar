@@ -75,32 +75,7 @@ impl RarArchive {
 
         // Process file headers from this volume.
         for pf in parsed.files {
-            let packed_hashes = Self::packed_hashes_for_split_segment(&pf.header, pf.hash.as_ref());
-            let packed_hash_uses_mac = pf
-                .file_encryption
-                .as_ref()
-                .is_some_and(|enc| enc.use_hash_mac);
-            let segment = DataSegment::with_packed_hashes(
-                vol_num,
-                pf.header.data_offset,
-                pf.header.data_size,
-                packed_hashes,
-                packed_hash_uses_mac,
-            );
-
-            let mut file_header = pf.header;
-            file_header.is_encrypted = pf.is_encrypted;
-            let entry = MemberEntry {
-                file_header,
-                is_encrypted: pf.is_encrypted,
-                file_encryption: pf.file_encryption.map(Self::file_encryption_info),
-                rar4_salt: None,
-                hash: pf.hash,
-                redirection: pf.redirection,
-                owner: pf.owner,
-                segments: vec![segment],
-            };
-
+            let entry = Self::rar5_member_entry(vol_num, pf);
             self.integrate_member(vol_num, entry);
         }
 
@@ -212,9 +187,16 @@ impl RarArchive {
             .expect("prefix scan creates a cursor");
         cursor.volume = index;
         let count = cursor.file_headers;
+        let mut members = prefix.members;
+        if self.format.is_rar4_family() {
+            for entry in &mut members {
+                entry.segments[0].volume_index = index;
+            }
+        }
+        members.retain(|entry| !self.holds_member_segment(&entry.segments[0]));
         // Validate the complete delta before mutating the live catalog. A bad
         // later header in a multi-header extension must leave retry idempotent.
-        for (position, entry) in prefix.members.iter().enumerate() {
+        for (position, entry) in members.iter().enumerate() {
             if !self.format.is_rar4_family() && entry.segments[0].volume_index != index {
                 return Err(RarError::CorruptArchive {
                     detail: "RAR prefix declared an unexpected volume number".into(),
@@ -237,11 +219,7 @@ impl RarArchive {
                 });
             }
         }
-        for mut entry in prefix.members {
-            let segment = &mut entry.segments[0];
-            if self.format.is_rar4_family() {
-                segment.volume_index = index;
-            }
+        for entry in members {
             // Prefixes are ordered. Only the last logical member can continue
             // into the next volume; no catalog-wide reconciliation is needed.
             if entry.file_header.split_before {
@@ -332,26 +310,7 @@ impl RarArchive {
             self.more_volumes = false;
         }
         for fh in &parsed.files {
-            let file_header = Self::rar4_to_file_header(fh, parsed.archive_header.is_solid);
-            let segment = DataSegment::with_packed_hashes(
-                vol_num,
-                fh.data_offset,
-                fh.packed_size,
-                Self::packed_hashes_for_split_segment(&file_header, None),
-                false,
-            );
-
-            let entry = MemberEntry {
-                file_header,
-                is_encrypted: fh.is_encrypted,
-                file_encryption: None,
-                rar4_salt: fh.salt,
-                hash: None,
-                redirection: None,
-                owner: fh.owner.clone(),
-                segments: vec![segment],
-            };
-
+            let entry = Self::rar4_member_entry(vol_num, fh, parsed.archive_header.is_solid);
             self.integrate_member(vol_num, entry);
         }
 
@@ -395,6 +354,92 @@ impl RarArchive {
         Ok(())
     }
 
+    /// The member record a RAR5 file header in volume `vol_num` describes:
+    /// the header's own fields and the one data segment it names.
+    pub(super) fn rar5_member_entry(vol_num: usize, pf: header::ParsedFile) -> MemberEntry {
+        let packed_hashes = Self::packed_hashes_for_split_segment(&pf.header, pf.hash.as_ref());
+        let packed_hash_uses_mac = pf
+            .file_encryption
+            .as_ref()
+            .is_some_and(|enc| enc.use_hash_mac);
+        let segment = DataSegment::with_packed_hashes(
+            vol_num,
+            pf.header.data_offset,
+            pf.header.data_size,
+            packed_hashes,
+            packed_hash_uses_mac,
+        );
+
+        let mut file_header = pf.header;
+        file_header.is_encrypted = pf.is_encrypted;
+        MemberEntry {
+            file_header,
+            is_encrypted: pf.is_encrypted,
+            file_encryption: pf.file_encryption.map(Self::file_encryption_info),
+            rar4_salt: None,
+            hash: pf.hash,
+            redirection: pf.redirection,
+            owner: pf.owner,
+            segments: vec![segment],
+        }
+    }
+
+    /// The member record a RAR4 file header in volume `vol_num` describes:
+    /// the header's own fields and the one data segment it names.
+    pub(super) fn rar4_member_entry(
+        vol_num: usize,
+        fh: &crate::rar4::types::Rar4FileHeader,
+        archive_solid: bool,
+    ) -> MemberEntry {
+        let file_header = Self::rar4_to_file_header(fh, archive_solid);
+        let segment = DataSegment::with_packed_hashes(
+            vol_num,
+            fh.data_offset,
+            fh.packed_size,
+            Self::packed_hashes_for_split_segment(&file_header, None),
+            false,
+        );
+        MemberEntry {
+            file_header,
+            is_encrypted: fh.is_encrypted,
+            file_encryption: None,
+            rar4_salt: fh.salt,
+            hash: None,
+            redirection: None,
+            owner: fh.owner.clone(),
+            segments: vec![segment],
+        }
+    }
+
+    /// Whether a member record already holds the data segment `segment`
+    /// names: the header naming it was integrated before, by an earlier
+    /// volume add or by an extraction that read it through a provider.
+    fn holds_member_segment(&self, segment: &DataSegment) -> bool {
+        self.members.iter().any(|member| {
+            member.segments.iter().any(|held| {
+                held.volume_index == segment.volume_index && held.data_offset == segment.data_offset
+            })
+        })
+    }
+
+    /// Record continuation parts of member `index` that extraction read from
+    /// a volume provider.
+    ///
+    /// Each part is merged exactly as `add_volume` merges a continuation, so
+    /// once the final part has been read the member's record carries the
+    /// whole-member checksum, size and segment chain that header states.
+    /// Discovery starts past the record's last known volume, so every part
+    /// is one the record does not hold yet.
+    pub(super) fn learn_continuations(&mut self, index: usize, parts: Vec<MemberEntry>) {
+        let Some(existing) = self.members.get_mut(index) else {
+            return;
+        };
+        for part in parts {
+            let segment = part.segments[0].clone();
+            Self::merge_continuation(existing, &part, segment);
+        }
+    }
+
     /// Integrate a member entry from a new volume into the unified member list.
     ///
     /// Handles split_before/split_after reconciliation for files spanning volumes.
@@ -402,6 +447,9 @@ impl RarArchive {
     /// names, so we match by split state and volume adjacency, not by name.
     pub(super) fn integrate_member(&mut self, vol_num: usize, entry: MemberEntry) {
         let segment = entry.segments[0].clone();
+        if self.holds_member_segment(&segment) {
+            return;
+        }
 
         if entry.file_header.split_before {
             // Continuation segment — find the existing member that expects a
@@ -437,8 +485,12 @@ impl RarArchive {
                     (!existing.file_header.split_after).then(|| existing.hash.clone());
                 let authoritative_encryption =
                     (!existing.file_header.split_after).then(|| existing.file_encryption.clone());
+                // The new segment goes in front, so the chain still ends
+                // where the later part said it does.
+                let tail_split_after = existing.file_header.split_after;
                 existing.segments.insert(0, segment);
                 existing.file_header = entry.file_header;
+                existing.file_header.split_after = tail_split_after;
                 existing.is_encrypted = entry.is_encrypted;
                 existing.file_encryption = entry.file_encryption;
                 existing.rar4_salt = entry.rar4_salt;
@@ -1173,6 +1225,7 @@ mod tests {
 
         archive.integrate_member(1, first);
 
+        assert!(!archive.members[0].file_header.split_after);
         assert_eq!(archive.members[0].file_header.data_crc32, Some(0x2222_2222));
         assert_eq!(
             archive.members[0].file_header.data_hash,
@@ -1182,6 +1235,9 @@ mod tests {
             archive.members[0].hash,
             Some(FileHash::Blake2sp(final_hash))
         );
+        let info = archive.member_info(0).unwrap();
+        assert_eq!(info.crc32, Some(0x2222_2222));
+        assert_eq!(info.hash, Some(FileHash::Blake2sp(final_hash)));
     }
 
     #[test]

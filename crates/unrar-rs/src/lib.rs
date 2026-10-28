@@ -34,9 +34,13 @@
 //! # fn main() -> unrar_rs::RarResult<()> {
 //! let archive = RarArchive::open(std::fs::File::open("release.part01.rar")?)?;
 //! for member in archive.entries() {
-//!     // `unpacked_size` is `None` until the header that states it arrives,
-//!     // which for a split member is its final part.
-//!     println!("{} ({:?} bytes)", member.name, member.unpacked_size);
+//!     // `unpacked_size`, `crc32` and `hash` are `None` until the header
+//!     // that states them arrives, which for a split member is its final
+//!     // part.
+//!     println!(
+//!         "{} ({:?} bytes, crc {:?})",
+//!         member.name, member.unpacked_size, member.crc32
+//!     );
 //! }
 //! # Ok(())
 //! # }

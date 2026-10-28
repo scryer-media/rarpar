@@ -186,6 +186,13 @@ pub struct MemberInfo {
     pub unpacked_size: Option<u64>,
     pub compressed_size: u64,
     pub is_directory: bool,
+    /// The member's own CRC32, as its final part's header states it.
+    ///
+    /// `None` until that header has been read: for a split member, a header
+    /// that is not the final part's states the CRC of that volume's packed
+    /// bytes, which names nothing about the member. The archive reads the
+    /// final part's header when that volume is added, or, for a member
+    /// extracted through a volume provider, during that extraction.
     pub crc32: Option<u32>,
     pub mtime: Option<SystemTime>,
     pub ctime: Option<SystemTime>,
@@ -195,6 +202,9 @@ pub struct MemberInfo {
     pub host_os: HostOs,
     pub compression: CompressionInfo,
     pub is_encrypted: bool,
+    /// The member's own hash (BLAKE2sp under `-htb`), as its final part's
+    /// header states it. `None` until that header has been read, exactly as
+    /// for [`crc32`](Self::crc32).
     pub hash: Option<FileHash>,
     pub attributes: FileAttributes,
     pub owner: Option<UnixOwnerInfo>,
