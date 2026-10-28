@@ -762,6 +762,10 @@ impl RarArchive {
             host_os: fh.host_os,
             compression: fh.compression,
             is_encrypted: entry.is_encrypted,
+            data_hash_uses_mac: entry
+                .file_encryption
+                .as_ref()
+                .is_some_and(|encryption| encryption.use_hash_mac),
             hash,
             attributes: fh.attributes,
             owner: entry.owner.clone(),
@@ -1268,6 +1272,67 @@ mod tests {
             Err(RarError::UnsupportedEncryption { version: 1 }) => {}
             Err(err) => panic!("expected unsupported encryption version, got {err}"),
             Ok(_) => panic!("expected unsupported encryption version, got success"),
+        }
+    }
+
+    #[test]
+    fn member_info_distinguishes_encrypted_plain_hashes_from_macs() {
+        for use_hash_mac in [false, true] {
+            let mut archive = archive_with_member(ArchiveFormat::Rar5, HostOs::Unix, "payload.bin");
+            let member = &mut archive.members[0];
+            member.is_encrypted = true;
+            member.file_header.data_crc32 = Some(0x1234_5678);
+            member.hash = Some(FileHash::Blake2sp([0x5a; 32]));
+            member.file_encryption = Some(FileEncryptionInfo {
+                version: 0,
+                kdf_count: 0,
+                salt: [0; 16],
+                iv: [0; 16],
+                check_data: None,
+                psw_check_present: false,
+                use_hash_mac,
+            });
+
+            let entry_info = archive.by_index(0).unwrap().info().clone();
+            let infos = [
+                archive.member_info(0).unwrap(),
+                archive.entry_info(0).unwrap(),
+                archive.metadata().members.remove(0),
+                archive.indexed_member_infos().remove(0).info,
+                archive.entries().next().unwrap(),
+                entry_info,
+            ];
+            for info in infos {
+                assert!(info.is_encrypted);
+                assert_eq!(info.data_hash_uses_mac, use_hash_mac);
+                assert_eq!(info.crc32, Some(0x1234_5678));
+                assert_eq!(info.hash, Some(FileHash::Blake2sp([0x5a; 32])));
+            }
+
+            // An incomplete split still states the flag, but never exposes
+            // a part's packed checksum as the whole member's checksum.
+            archive.members[0].file_header.split_after = true;
+            let info = archive.member_info(0).unwrap();
+            assert_eq!(info.data_hash_uses_mac, use_hash_mac);
+            assert_eq!(info.crc32, None);
+            assert_eq!(info.hash, None);
+        }
+    }
+
+    #[test]
+    fn member_info_without_rar5_encryption_has_plain_hashes() {
+        for (format, encrypted) in [
+            (ArchiveFormat::Rar5, false),
+            (ArchiveFormat::Rar4, false),
+            (ArchiveFormat::Rar4, true),
+        ] {
+            let mut archive = archive_with_member(format, HostOs::Unix, "payload.bin");
+            archive.members[0].is_encrypted = encrypted;
+            archive.members[0].file_header.data_crc32 = Some(0x1234_5678);
+            let info = archive.member_info(0).unwrap();
+            assert_eq!(info.is_encrypted, encrypted);
+            assert!(!info.data_hash_uses_mac);
+            assert_eq!(info.crc32, Some(0x1234_5678));
         }
     }
 

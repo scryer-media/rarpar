@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.15.0 (unreleased)
+
+### Added
+
+- `MemberInfo::data_hash_uses_mac` exposes the RAR5 file-encryption record's
+  independent hash-MAC flag. Encrypted members can carry plain CRC32 and
+  BLAKE2sp checksums, so callers must not infer MAC use from `is_encrypted`.
+  Older RAR formats report `false`. Split members retain the final part's
+  flag with its whole-member checksums; incomplete members still withhold
+  those checksums. Keyed verification remains in the library.
+
+### Breaking
+
+- Adding this public field requires downstream `MemberInfo` struct literals
+  to provide `data_hash_uses_mac`. This source compatibility change advances
+  the crate's minor version while it is at 0.x.
+
 ## 0.14.3
 
 ### Fixed

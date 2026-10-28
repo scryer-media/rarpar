@@ -202,6 +202,12 @@ pub struct MemberInfo {
     pub host_os: HostOs,
     pub compression: CompressionInfo,
     pub is_encrypted: bool,
+    /// Whether the RAR5 file-encryption record marks the member's CRC32 and
+    /// BLAKE2sp hash as hash-key MACs instead of ordinary checksums. This is
+    /// independent of encryption: an encrypted member may carry plain hashes.
+    /// False for older RAR formats and members without this flag. The flag
+    /// does not imply that a checksum is present or has been verified.
+    pub data_hash_uses_mac: bool,
     /// The member's own hash (BLAKE2sp under `-htb`), as its final part's
     /// header states it. `None` until that header has been read, exactly as
     /// for [`crc32`](Self::crc32).
