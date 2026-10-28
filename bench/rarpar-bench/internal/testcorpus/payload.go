@@ -281,16 +281,39 @@ func (e *env) rar(image, host, sub string) rarWriter {
 // and `sub` is the working directory under it, so every argument is a bare name
 // and no host path ever reaches the command line.
 func (w rarWriter) add(ctx context.Context, args ...string) error {
+	return w.run(ctx, nil, append([]string{"a", "-idq"}, args...)...)
+}
+
+// addStdin runs `rar a …` with the host file `stdin`, a path under `sub`, on
+// rar's standard input. That is what `-si` reads: rar starts the member without
+// knowing its size, the one way it writes a member of unknown size.
+func (w rarWriter) addStdin(ctx context.Context, stdin string, args ...string) error {
+	input, err := os.Open(filepath.Join(w.host, filepath.FromSlash(w.sub), filepath.FromSlash(stdin)))
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	return w.run(ctx, input, append([]string{"a", "-idq"}, args...)...)
+}
+
+// command runs another rar command inside the image, such as `rn` or `rc`:
+// still RARLAB's writer working on what it wrote.
+func (w rarWriter) command(ctx context.Context, args ...string) error {
+	return w.run(ctx, nil, args...)
+}
+
+func (w rarWriter) run(ctx context.Context, stdin io.Reader, args ...string) error {
 	work := "/work"
 	if w.sub != "" {
 		work = "/work/" + w.sub
 	}
-	command := []string{
-		"run", "--rm", "--platform", "linux/amd64",
-		"-v", w.host + ":/work", "-w", work, w.image, "a", "-idq",
+	command := []string{"run", "--rm", "--platform", "linux/amd64"}
+	if stdin != nil {
+		command = append(command, "-i")
 	}
+	command = append(command, "-v", w.host+":/work", "-w", work, w.image)
 	command = append(command, args...)
-	return runDocker(ctx, w.environment, command...)
+	return runDockerStdin(ctx, w.environment, stdin, command...)
 }
 
 func (w rarWriter) requireRAR5Solid(ctx context.Context, archive string) error {
@@ -343,7 +366,12 @@ func (e *env) par3Run(ctx context.Context, host, sub string, args ...string) err
 }
 
 func runDocker(ctx context.Context, e *env, args ...string) error {
+	return runDockerStdin(ctx, e, nil, args...)
+}
+
+func runDockerStdin(ctx context.Context, e *env, stdin io.Reader, args ...string) error {
 	command := exec.CommandContext(ctx, e.docker, args...)
+	command.Stdin = stdin
 	command.Stdout = io.Discard
 	var stderr strings.Builder
 	command.Stderr = &stderr
