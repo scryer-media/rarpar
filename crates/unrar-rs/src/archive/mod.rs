@@ -190,13 +190,72 @@ impl RarArchive {
 
         if file_header.compression.format.is_rar4_family() && file_header.compression.version >= 20
         {
+            // UnRAR skips the packed CRC of a split RAR 2.0+ part when it is
+            // 0xffffffff (volume.cpp:21-22): rar writes that value when it
+            // has no packed CRC for the part.
             return PackedDataHashes {
-                crc32: file_header.data_crc32,
+                crc32: file_header
+                    .data_crc32
+                    .filter(|crc| *crc != PACKED_CRC32_NOT_STORED),
                 blake2sp: None,
             };
         }
 
         PackedDataHashes::default()
+    }
+}
+
+/// The packed CRC a RAR 2.0+ split part carries when it stores none; UnRAR
+/// does not check it (volume.cpp:21-22).
+const PACKED_CRC32_NOT_STORED: u32 = 0xffff_ffff;
+
+#[cfg(test)]
+mod packed_hash_tests {
+    use super::*;
+
+    fn rar4_split_part(data_crc32: u32) -> FileHeader {
+        FileHeader {
+            name: "part.bin".to_string(),
+            name_raw: None,
+            unpacked_size: Some(4096),
+            attributes: crate::types::FileAttributes(0o644),
+            mtime: None,
+            ctime: None,
+            atime: None,
+            data_crc32: Some(data_crc32),
+            data_hash: None,
+            compression: crate::types::CompressionInfo {
+                format: ArchiveFormat::Rar4,
+                version: 29,
+                solid: false,
+                method: CompressionMethod::Store,
+                dict_size: 4 * 1024 * 1024,
+            },
+            host_os: crate::types::HostOs::Unix,
+            is_directory: false,
+            file_flags: 0,
+            data_size: 1024,
+            split_before: false,
+            split_after: true,
+            data_offset: 0,
+            is_encrypted: false,
+            version: None,
+            service_subdata: None,
+        }
+    }
+
+    #[test]
+    fn rar4_packed_crc_of_all_ones_is_not_checked_like_unrar() {
+        let hashes =
+            RarArchive::packed_hashes_for_split_segment(&rar4_split_part(0xffff_ffff), None);
+        assert_eq!(hashes.crc32, None);
+    }
+
+    #[test]
+    fn rar4_packed_crc_is_checked_otherwise() {
+        let hashes =
+            RarArchive::packed_hashes_for_split_segment(&rar4_split_part(0x1234_5678), None);
+        assert_eq!(hashes.crc32, Some(0x1234_5678));
     }
 }
 
