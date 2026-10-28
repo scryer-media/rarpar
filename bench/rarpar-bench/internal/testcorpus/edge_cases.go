@@ -13,8 +13,9 @@ var longFixtureName = strings.Repeat("a", 200) + ".txt"
 
 // generateEdgeCases writes the edge-case sets — multi-file, directories, empty
 // members, unicode names, recovery records, comments, tiny volumes, the
-// best-compression set, long names and the symlink set — and the `originals/`
-// inputs the sibling recipes read.
+// best-compression set, long names, the symlink set, a solid stream opening
+// with an empty member, a `-si` encrypted split set and split sets renamed with
+// `rar rn` — and the `originals/` inputs the sibling recipes read.
 //
 // It is stage 0 for that second reason: random_4k.bin, random_512.bin and
 // zeros_64k.bin are inputs elsewhere.
@@ -88,14 +89,38 @@ func generateEdgeCases(ctx context.Context, e *env) error {
 		{"rar5_best", []string{"-m5", "../out/rar5_best.rar", "zeros_64k.bin"}},
 		{"rar5_longname", []string{"-m0", "../out/rar5_longname.rar", longFixtureName}},
 		{"rar5_symlink", []string{"-m0", "-ol", "../out/rar5_symlink.rar", "link_to_hello.txt", "hello.txt"}},
+		// A solid stream that opens with an empty member: rar keeps the block
+		// header and tables in the empty member's packed data, and the next
+		// member's first block carries none.
+		{"rar5_solid_empty_member", []string{"-m3", "-s", "../out/rar5_solid_empty_member.rar", "empty.txt", "hello.txt", "second.txt"}},
+		// Renamed below in its first volume only; the later volumes keep the
+		// old name.
+		{"rar5_renamed_split", []string{"-m0", "-v1k", "../out/rar5_renamed_split.rar", "hello.txt", "random_4k.bin"}},
 	}
 	for _, set := range rar5Sets {
 		if err := rar5.add(ctx, set.args...); err != nil {
 			return fmt.Errorf("%s: %w", set.name, err)
 		}
 	}
-	if err := expectVolumes(out, "rar5_tiny_volumes", 5); err != nil {
-		return err
+	// A member read from standard input, so rar does not know its size: its
+	// last block is followed by the AES padding of the encrypted data.
+	if err := rar5.addStdin(ctx, "random_4k.bin",
+		"-m3", "-p"+testPassword, "-v1k", "-sirandom_4k.bin", "../out/rar5_si_encrypted.rar"); err != nil {
+		return fmt.Errorf("rar5_si_encrypted: %w", err)
+	}
+	// `rar rn` renames a split member in the volume it is given and nowhere
+	// else, so a reader must chain the continuation by its split flag.
+	if err := rar5.command(ctx, "rn", "-idq",
+		"../out/rar5_renamed_split.part1.rar", "random_4k.bin", "renamed_4k.bin"); err != nil {
+		return fmt.Errorf("rar5_renamed_split: %w", err)
+	}
+	for _, want := range []struct {
+		stem  string
+		count int
+	}{{"rar5_tiny_volumes", 5}, {"rar5_renamed_split", 5}, {"rar5_si_encrypted", 6}} {
+		if err := expectVolumes(out, want.stem, want.count); err != nil {
+			return err
+		}
 	}
 
 	// rar5_solid.rar and rar4_solid.rar belong to large_sets, which holds every
@@ -115,14 +140,22 @@ func generateEdgeCases(ctx context.Context, e *env) error {
 		// 1 KiB volumes, so the two formats' volume chains are comparable.
 		// tools/rarpar/tests/cli.rs drives the compat extractor across it.
 		{"rar4_tiny_volumes", []string{"-ma4", "-m0", "-v1k", "../out/rar4_tiny_volumes.rar", "random_4k.bin"}},
+		// The RAR4 twin of rar5_renamed_split.
+		{"rar4_renamed_split", []string{"-ma4", "-m0", "-v1k", "../out/rar4_renamed_split.rar", "hello.txt", "random_4k.bin"}},
 	}
 	for _, set := range rar4Sets {
 		if err := rar4.add(ctx, set.args...); err != nil {
 			return fmt.Errorf("%s: %w", set.name, err)
 		}
 	}
-	if err := expectVolumes(out, "rar4_tiny_volumes", 5); err != nil {
-		return err
+	if err := rar4.command(ctx, "rn", "-idq",
+		"../out/rar4_renamed_split.part1.rar", "random_4k.bin", "renamed_4k.bin"); err != nil {
+		return fmt.Errorf("rar4_renamed_split: %w", err)
+	}
+	for _, stem := range []string{"rar4_tiny_volumes", "rar4_renamed_split"} {
+		if err := expectVolumes(out, stem, 5); err != nil {
+			return err
+		}
 	}
 
 	// The long-password KDF set is deliberately NOT corpus content: it has no
@@ -147,6 +180,9 @@ func generateEdgeCases(ctx context.Context, e *env) error {
 		filepath.Join(e.unrarPath("rar5"), "rar5_best.rar"),
 		filepath.Join(e.unrarPath("rar5"), "rar5_longname.rar"),
 		filepath.Join(e.unrarPath("rar5"), "rar5_symlink.rar"),
+		filepath.Join(e.unrarPath("rar5"), "rar5_solid_empty_member.rar"),
+		filepath.Join(e.unrarPath("rar5"), "rar5_renamed_split.part*.rar"),
+		filepath.Join(e.unrarPath("rar5"), "rar5_si_encrypted.part*.rar"),
 		filepath.Join(e.unrarPath("rar4"), "rar4_multifile_store.rar"),
 		filepath.Join(e.unrarPath("rar4"), "rar4_multifile_lz.rar"),
 		filepath.Join(e.unrarPath("rar4"), "rar4_dirs.rar"),
@@ -155,6 +191,7 @@ func generateEdgeCases(ctx context.Context, e *env) error {
 		filepath.Join(e.unrarPath("rar4"), "rar4_comment.rar"),
 		filepath.Join(e.unrarPath("rar4"), "rar4_longname.rar"),
 		filepath.Join(e.unrarPath("rar4"), "rar4_tiny_volumes.part*.rar"),
+		filepath.Join(e.unrarPath("rar4"), "rar4_renamed_split.part*.rar"),
 	); err != nil {
 		return err
 	}

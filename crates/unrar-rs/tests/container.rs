@@ -31,7 +31,8 @@ fn volume_set(stem: &str, parts: usize, width: usize) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Every member's bytes, CRC-verified, from one archive or volume set.
+/// Every member's bytes, CRC-verified, or a link's target, from one archive or
+/// volume set.
 fn members(volumes: &[Vec<u8>], password: Option<&str>) -> Vec<(String, Vec<u8>)> {
     let mut archive = match password {
         // Encrypted headers need the password before the first volume opens.
@@ -57,11 +58,20 @@ fn members(volumes: &[Vec<u8>], password: Option<&str>) -> Vec<(String, Vec<u8>)
         .metadata()
         .members
         .iter()
-        .map(|member| (member.name.clone(), member.is_directory))
+        .map(|member| {
+            let link = (member.is_symlink || member.is_hardlink || member.is_file_copy)
+                .then(|| member.link_target_bytes.clone().unwrap_or_default());
+            (member.name.clone(), member.is_directory, link)
+        })
         .collect();
     let mut out = Vec::new();
-    for (index, (name, directory)) in listed.into_iter().enumerate() {
+    for (index, (name, directory, link)) in listed.into_iter().enumerate() {
         if directory {
+            continue;
+        }
+        // A link stores its target, not data, and copy_to refuses it.
+        if let Some(target) = link {
+            out.push((name, target));
             continue;
         }
         let mut bytes = Vec::new();

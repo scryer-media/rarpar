@@ -4957,6 +4957,11 @@ impl RarArchive {
         };
 
         let fh = entry.file_header.clone();
+        // A link's member data is not the file it names: a RAR5 link stores
+        // none against its declared size. Refuse it the way the provider and
+        // solid routes do rather than copy bytes that are not there;
+        // extracting to a file creates the link.
+        self.reject_link_member_without_file_target(entry, &fh)?;
         let hash = entry.hash.clone();
         let file_enc = entry.file_encryption.clone();
         let rar4_salt = entry.rar4_salt;
@@ -7548,7 +7553,6 @@ pub struct ChainedSegmentReader<'a> {
     segments: Vec<DataSegment>,
     provider: &'a dyn VolumeProvider,
     member_name: String,
-    member_name_known: bool,
     max_data_segment: u64,
     current_seg: usize,
     current_reader: Option<Box<dyn ReadSeek>>,
@@ -7716,7 +7720,6 @@ impl<'a> ChainedSegmentReader<'a> {
             segments: segments.to_vec(),
             provider,
             member_name: "RAR member".to_string(),
-            member_name_known: false,
             max_data_segment: crate::limits::Limits::default().max_data_segment,
             current_seg: 0,
             current_reader: None,
@@ -7740,7 +7743,6 @@ impl<'a> ChainedSegmentReader<'a> {
 
     fn with_member_name(mut self, member_name: &str) -> Self {
         self.member_name = member_name.to_string();
-        self.member_name_known = true;
         self
     }
 
@@ -7864,13 +7866,12 @@ impl<'a> ChainedSegmentReader<'a> {
                 &mut None,
             )
             .map_err(RarError::into_io)?;
-            // Find the first file with split_before (continuation).
+            // The first file header continuing a file is the continuation,
+            // whatever name it carries: UnRAR takes the next volume's first
+            // file header (volume.cpp:158-159, arcread.cpp:48-61), and `rar rn`
+            // renames a split file in one volume only.
             for fh in &parsed.files {
-                if fh.split_before
-                    && (!self.member_name_known
-                        || fh.name.is_empty()
-                        || fh.name == self.member_name)
-                {
+                if fh.split_before {
                     if fh.packed_size > self.max_data_segment {
                         return Err(RarError::resource_limit(
                             crate::error::LimitKind::DataSegment,
@@ -7898,13 +7899,10 @@ impl<'a> ChainedSegmentReader<'a> {
                 scan,
             )
             .map_err(RarError::into_io)?;
-            // Find the first file header with split_before.
+            // The first file header continuing a file, whatever its name, as
+            // for RAR4 above.
             for pf in parsed.files {
-                if pf.header.split_before
-                    && (!self.member_name_known
-                        || pf.header.name.is_empty()
-                        || pf.header.name == self.member_name)
-                {
+                if pf.header.split_before {
                     if pf.header.data_size > self.max_data_segment {
                         return Err(RarError::resource_limit(
                             crate::error::LimitKind::DataSegment,

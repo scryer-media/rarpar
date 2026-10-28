@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.15.0 (unreleased)
+## 0.15.0
 
 ### Added
 
@@ -16,6 +16,28 @@
 - Adding this public field requires downstream `MemberInfo` struct literals
   to provide `data_hash_uses_mac`. This source compatibility change advances
   the crate's minor version while it is at 0.x.
+
+### Fixed
+
+- A split RAR 2.0+ part whose packed CRC is `0xffffffff` is no longer
+  checked against its data, as UnRAR skips it (volume.cpp:21-22).
+- A RAR4 `-hp` volume rebuilt by `rar rc` opens again. Its encrypted end
+  header carries the recovery-space flag and ends in zero bytes that fail the
+  header CRC; UnRAR accepts that end header and so does unrar-rs
+  (arcread.cpp:524-535). Any other CRC failure still reads as a wrong password
+  (arcread.cpp:536-546).
+- A RAR5 member with no unpacked data still has its block header and tables
+  read, so the next member of a solid archive decodes with the tables UnRAR
+  uses (unpack50.cpp:14-16, extract.cpp:899-922).
+- Decoding stops after the last block of a member, so the AES padding that
+  follows the last block of a member stored with unknown size (`-si`) is no
+  longer read as a block header (unpack50.cpp:38-42).
+- A continuation volume is taken by its first split file header, not by
+  name, so a set renamed with `rar rn` reads on (volume.cpp:158-159,
+  arcread.cpp:48-61).
+- `Entry::copy_to` on a link member from attached volumes refuses with
+  `UnsupportedLinkType`, as the provider and solid routes do, instead of
+  failing with an unexpected end of file.
 
 ## 0.14.3
 

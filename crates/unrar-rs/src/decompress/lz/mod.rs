@@ -63,6 +63,10 @@ const NUM_LENGTH_SLOTS: usize = 44;
 /// Number of entries in the last-distance cache.
 const DIST_CACHE_SIZE: usize = 4;
 
+/// Bytes of an empty member's packed data read for its tables: UnRAR's
+/// `BitInput::MAX_SIZE` (getbits.hpp:7).
+const EMPTY_MEMBER_TABLE_READ_LIMIT: u64 = 0x8000;
+
 /// Maximum number of pending filters to hold before treating the archive as invalid.
 /// Defensive RAR filter queue bound.
 const MAX_PENDING_FILTERS: usize = 8192;
@@ -256,6 +260,9 @@ impl LzDecoder {
     }
 
     fn begin_file_decode(&mut self, unpacked_size: u64) {
+        // Every member opens with a block header of its own
+        // (unpack50.cpp:14-15), so no earlier member's last block ends this one.
+        self.is_last_block = false;
         self.pending_filters.clear();
         self.current_file_base_total = self.window.total_written();
         self.current_file_written_size = 0;
@@ -264,6 +271,52 @@ impl LzDecoder {
         self.window.mark_flushed(self.current_file_base_total);
         self.parallel_mode_exhausted = false;
         self.recompute_flush_border();
+    }
+
+    /// Read the block header and Huffman tables of a member that owes no
+    /// output.
+    ///
+    /// UnRAR's `Unpack5` reads the member's first block header and tables
+    /// before it looks at the size it owes (unpack50.cpp:6-16), and its loop
+    /// reads every further table-only block up to the last one
+    /// (unpack50.cpp:34-45). `ExtractCurrentFile` runs it for every
+    /// compressed member, empty ones included (extract.cpp:899-922). In a
+    /// solid stream rar stores the tables in an empty member's packed data
+    /// and the next member's first block carries none, so skipping them
+    /// leaves that member with no tables.
+    ///
+    /// A malformed header or table makes `Unpack5` return with no error of
+    /// its own (unpack50.cpp:14-16); the empty member's hash then decides it,
+    /// and the next member that needs the tables fails. The same holds here:
+    /// a read failure leaves the tables as they were.
+    fn read_tables_of_empty_member(&mut self, input: &[u8]) {
+        if input.is_empty() {
+            return;
+        }
+        let mut reader = BitReader::new(input);
+        loop {
+            if self.read_block_header(&mut reader).is_err() {
+                return;
+            }
+            if self.is_last_block || self.block_bits_remaining > 0 || reader.bits_remaining() < 16 {
+                return;
+            }
+        }
+    }
+
+    /// Reader form of [`Self::read_tables_of_empty_member`].
+    ///
+    /// Reads at most the 32 KiB UnRAR's first `UnpReadBuf` fills
+    /// (getbits.hpp:7, unpack50.cpp:263-264). That is far more than one block
+    /// header and its tables take, and a hostile packed size cannot make an
+    /// empty member buffer more.
+    fn read_tables_of_empty_member_from<Rd: Read>(&mut self, input: Rd) -> RarResult<()> {
+        let mut head = Vec::new();
+        input
+            .take(EMPTY_MEMBER_TABLE_READ_LIMIT)
+            .read_to_end(&mut head)?;
+        self.read_tables_of_empty_member(&head);
+        Ok(())
     }
 
     #[inline]
@@ -623,6 +676,7 @@ impl LzDecoder {
     /// Returns the decompressed data.
     pub fn decompress(&mut self, input: &[u8], unpacked_size: u64) -> RarResult<Vec<u8>> {
         if unpacked_size == 0 {
+            self.read_tables_of_empty_member(input);
             return Ok(Vec::new());
         }
 
@@ -1005,6 +1059,7 @@ impl LzDecoder {
     ) -> RarResult<u64> {
         phase_diagnostics::emit_zero(phase_diagnostics::Phase::Staging);
         if unpacked_size == 0 {
+            self.read_tables_of_empty_member(input);
             return Ok(0);
         }
 
@@ -1023,7 +1078,7 @@ impl LzDecoder {
 
         while output_size < self.decode_limit() {
             if self.block_bits_remaining <= 0 {
-                if reader.bits_remaining() < 16 {
+                if self.is_last_block || reader.bits_remaining() < 16 {
                     break;
                 }
                 self.read_block_header(&mut reader)?;
@@ -1049,6 +1104,7 @@ impl LzDecoder {
     ) -> RarResult<u64> {
         if unpacked_size == 0 {
             phase_diagnostics::emit_zero(phase_diagnostics::Phase::Staging);
+            self.read_tables_of_empty_member_from(input)?;
             return Ok(0);
         }
 
@@ -1178,6 +1234,13 @@ impl LzDecoder {
                 }
             }
 
+            // The member's last block is done: what follows is no block
+            // (unpack50.cpp:38-42), such as the AES padding of an encrypted
+            // member whose unpacked size is unknown.
+            if self.is_last_block {
+                break;
+            }
+
             // Only accept block headers that start clear of the unreliable
             // staging tail (header plus tables always fit in the margin).
             let header_limit = if reached_eof {
@@ -1263,7 +1326,7 @@ impl LzDecoder {
 
         while output_size < self.decode_limit() {
             if self.block_bits_remaining <= 0 {
-                if reader.bits_remaining() < 16 {
+                if self.is_last_block || reader.bits_remaining() < 16 {
                     break;
                 }
                 self.read_block_header(&mut reader)?;
@@ -1298,6 +1361,7 @@ impl LzDecoder {
         F: FnMut(usize) -> RarResult<W>,
     {
         if unpacked_size == 0 {
+            self.read_tables_of_empty_member(input);
             return Ok(Vec::new());
         }
 
@@ -1314,7 +1378,7 @@ impl LzDecoder {
 
         while output_size < self.decode_limit() {
             if self.block_bits_remaining <= 0 {
-                if reader.bits_remaining() < 16 {
+                if self.is_last_block || reader.bits_remaining() < 16 {
                     break;
                 }
                 self.read_block_header(&mut reader)?;
@@ -1374,6 +1438,7 @@ impl LzDecoder {
         F: FnMut(usize) -> RarResult<W>,
     {
         if unpacked_size == 0 {
+            self.read_tables_of_empty_member_from(input)?;
             return Ok(Vec::new());
         }
 
@@ -1576,6 +1641,12 @@ impl LzDecoder {
                 }
             }
 
+            // The member's last block is done: what follows is no block
+            // (unpack50.cpp:38-42).
+            if self.is_last_block {
+                break;
+            }
+
             // Block-parallel decode of headers starting before the next
             // volume boundary and clear of the unreliable staging tail. A
             // block whose data crosses the boundary still decodes here and
@@ -1683,7 +1754,7 @@ impl LzDecoder {
 
         while output_size < self.decode_limit() {
             if self.block_bits_remaining <= 0 {
-                if reader.bits_remaining() < 16 {
+                if self.is_last_block || reader.bits_remaining() < 16 {
                     break;
                 }
                 self.read_block_header(&mut reader)?;

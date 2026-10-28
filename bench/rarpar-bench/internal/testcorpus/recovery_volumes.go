@@ -8,7 +8,8 @@ import (
 )
 
 // generateRecoveryVolumes writes the four standalone `.rev` recovery-volume
-// sets driven by tests/integration.rs, src/recovery.rs and the CLI's repair lane.
+// sets driven by tests/integration.rs, src/recovery.rs and the CLI's repair lane,
+// and one RAR4 `-hp` set with a volume rar rebuilt from its `.rev` files.
 //
 // All are `rar a … -rv2`, which writes the data volumes and two recovery
 // volumes in one pass — RARLAB's writer produces the `.rev` files, exactly as it
@@ -45,6 +46,14 @@ import (
 //     0.5.1 build still reproduces it — 512 KiB volumes do too, so 1 MiB is
 //     comfortably past the threshold rather than on it.
 //
+//   - rar4_hp_rc_rebuilt is a RAR4 `-hp` set of five 4 KiB volumes whose third
+//     volume rar itself rebuilt: the recipe writes the set with -rv2, removes
+//     part3, runs `rar rc`, and keeps only the data volumes. A rebuilt volume
+//     ends in zeroes where the .rev file kept its own volume information, so
+//     its encrypted end-of-archive header fails its CRC; UnRAR accepts that
+//     header (arcread.cpp:524-535). No byte is edited: deleting a volume and
+//     letting rar restore it is RARLAB's writer at work, as `rar a` is.
+//
 // rar names recovery volumes from the first archive name onwards, so two of them
 // are .part1.rev and .part2.rev (.part01/.part02 for the ten-volume RAR5 set).
 //
@@ -61,7 +70,8 @@ func generateRecoveryVolumes(ctx context.Context, e *env) error {
 	rar4LargeWork := filepath.Join(work, "rar4-large")
 	rar5Work := filepath.Join(work, "rar5")
 	rar5HpWork := filepath.Join(work, "rar5-hp")
-	for _, dir := range []string{rar4Work, rar4LargeWork, rar5Work, rar5HpWork} {
+	rar4HpRcWork := filepath.Join(work, "rar4-hp-rc")
+	for _, dir := range []string{rar4Work, rar4LargeWork, rar5Work, rar5HpWork, rar4HpRcWork} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
 		}
@@ -87,6 +97,10 @@ func generateRecoveryVolumes(ctx context.Context, e *env) error {
 	if err := writeFile(filepath.Join(rar5HpWork, "payload.bin"), ramp(16384, 13, 5)); err != nil {
 		return err
 	}
+	// RAR4 rebuilt -hp set: the same 16 KiB ramp in 4 KiB volumes.
+	if err := writeFile(filepath.Join(rar4HpRcWork, "payload.bin"), ramp(16384, 13, 5)); err != nil {
+		return err
+	}
 
 	// RAR4 large set: 3.5 MiB of (i * 29 + 7) mod 256, in 1 MiB volumes — four
 	// data volumes (the last one half full) and two recovery volumes.
@@ -110,6 +124,11 @@ func generateRecoveryVolumes(ctx context.Context, e *env) error {
 		"-m0", "-v4k", "-hp"+hpPassword, "-rv2", "rar5_hp_recovery_volumes.rar", "payload.bin"); err != nil {
 		return err
 	}
+	rar4HpRc := e.rar(e.rar4.Image, work, "rar4-hp-rc")
+	if err := rar4HpRc.add(ctx,
+		"-ma4", "-m0", "-v4k", "-hp"+hpPassword, "-rv2", "rar4_hp_rc_rebuilt.rar", "payload.bin"); err != nil {
+		return err
+	}
 
 	for _, want := range []struct {
 		dir, stem, suffix string
@@ -123,6 +142,8 @@ func generateRecoveryVolumes(ctx context.Context, e *env) error {
 		{rar5Work, "rar5_recovery_volumes.part", ".rev", 2},
 		{rar5HpWork, "rar5_hp_recovery_volumes.part", ".rar", 5},
 		{rar5HpWork, "rar5_hp_recovery_volumes.part", ".rev", 2},
+		{rar4HpRcWork, "rar4_hp_rc_rebuilt.part", ".rar", 5},
+		{rar4HpRcWork, "rar4_hp_rc_rebuilt.part", ".rev", 2},
 	} {
 		got, err := countMatching(want.dir, want.stem, want.suffix)
 		if err != nil {
@@ -131,6 +152,19 @@ func generateRecoveryVolumes(ctx context.Context, e *env) error {
 		if got != want.count {
 			return fmt.Errorf("%s*%s: produced %d file(s), expected %d", want.stem, want.suffix, got, want.count)
 		}
+	}
+
+	if err := os.Remove(filepath.Join(rar4HpRcWork, "rar4_hp_rc_rebuilt.part3.rar")); err != nil {
+		return err
+	}
+	if err := rar4HpRc.command(ctx, "rc", "-idq", "-y", "-p"+hpPassword, "rar4_hp_rc_rebuilt.part1.rar"); err != nil {
+		return fmt.Errorf("rar4_hp_rc_rebuilt: %w", err)
+	}
+	if err := expectVolumes(rar4HpRcWork, "rar4_hp_rc_rebuilt", 5); err != nil {
+		return err
+	}
+	if err := removeGlob(filepath.Join(rar4HpRcWork, "rar4_hp_rc_rebuilt.part*.rev")); err != nil {
+		return err
 	}
 
 	rar4Dir, rar5Dir := e.unrarPath("rar4"), e.unrarPath("rar5")
@@ -143,6 +177,7 @@ func generateRecoveryVolumes(ctx context.Context, e *env) error {
 		filepath.Join(rar5Dir, "rar5_recovery_volumes.part*.rev"),
 		filepath.Join(rar5Dir, "rar5_hp_recovery_volumes.part*.rar"),
 		filepath.Join(rar5Dir, "rar5_hp_recovery_volumes.part*.rev"),
+		filepath.Join(rar4Dir, "rar4_hp_rc_rebuilt.part*.rar"),
 	); err != nil {
 		return err
 	}
@@ -155,6 +190,9 @@ func generateRecoveryVolumes(ctx context.Context, e *env) error {
 	if _, err := collect(rar5Work, rar5Dir, "rar5_recovery_volumes."); err != nil {
 		return err
 	}
-	_, err = collect(rar5HpWork, rar5Dir, "rar5_hp_recovery_volumes.")
+	if _, err := collect(rar5HpWork, rar5Dir, "rar5_hp_recovery_volumes."); err != nil {
+		return err
+	}
+	_, err = collect(rar4HpRcWork, rar4Dir, "rar4_hp_rc_rebuilt.")
 	return err
 }
