@@ -8797,6 +8797,137 @@ fn test_rar4_tiny_volumes_batch() {
     assert_eq!(result, original("random_4k.bin"));
 }
 
+// -- Shapes rar makes after writing: rn, rc, -si ------------------------------
+
+/// The volumes `<stem>.part1.rar` to `<stem>.part<count>.rar`, or `None` when
+/// the set is not hydrated: these sets are pending first publication.
+fn volume_set(dir: &str, stem: &str, count: usize) -> Option<Vec<std::path::PathBuf>> {
+    let paths: Vec<_> = (1..=count)
+        .map(|part| fixture(dir, &format!("{stem}.part{part}.rar")))
+        .collect();
+    if paths.iter().all(|path| path.exists()) {
+        Some(paths)
+    } else {
+        let bundle = if dir == "rar4" { "rar34" } else { "rar57" };
+        eprintln!("skipping test: {bundle} {stem} fixtures not present");
+        None
+    }
+}
+
+fn copy_attached(archive: &mut unrar_rs::RarArchive, index: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    archive.by_index(index).unwrap().copy_to(&mut out).unwrap();
+    out
+}
+
+/// Member `index` read through a provider by an archive opened on the first
+/// volume alone, so every later volume is one the provider opens.
+fn copy_via(paths: &[std::path::PathBuf], password: Option<&str>, index: usize) -> Vec<u8> {
+    let first = std::fs::File::open(&paths[0]).unwrap();
+    let mut archive = match password {
+        Some(password) => unrar_rs::RarArchive::open_with_password(first, password).unwrap(),
+        None => unrar_rs::RarArchive::open(first).unwrap(),
+    };
+    let provider = unrar_rs::StaticVolumeProvider::from_ordered(paths.to_vec());
+    let mut out = Vec::new();
+    archive
+        .by_index_via(index, &provider)
+        .unwrap()
+        .copy_to(&mut out)
+        .unwrap();
+    out
+}
+
+/// `rar a -m3 -s empty.txt hello.txt second.txt`: the solid stream's block
+/// header and tables sit in the empty member's packed data, so the next member
+/// decodes only if they were read (unpack50.cpp:14-16, extract.cpp:899-922).
+#[test]
+fn test_rar5_solid_empty_member_hands_its_tables_to_the_next_member() {
+    if !fixture("rar5", "rar5_solid_empty_member.rar").exists() {
+        eprintln!("skipping test: rar57 rar5_solid_empty_member fixtures not present");
+        return;
+    }
+    let mut archive = open_single("rar5", "rar5_solid_empty_member.rar");
+    assert!(archive.is_solid());
+    assert_eq!(
+        archive.member_names(),
+        ["empty.txt", "hello.txt", "second.txt"]
+    );
+
+    for (index, name) in ["empty.txt", "hello.txt", "second.txt"].iter().enumerate() {
+        assert_eq!(copy_attached(&mut archive, index), original(name), "{name}");
+    }
+}
+
+/// `rar a -m3 -p -v1k -si`: a member of unknown size, whose last block is
+/// followed by the AES padding of the encrypted data. Decoding stops at the
+/// last block (unpack50.cpp:38-42) instead of reading the padding as a header.
+#[test]
+fn test_rar5_si_encrypted_split_stops_at_the_last_block() {
+    let Some(paths) = volume_set("rar5", "rar5_si_encrypted", 6) else {
+        return;
+    };
+    let mut archive = open_multi_paths(&paths);
+    archive.set_password(TEST_PASSWORD);
+    assert_eq!(archive.member_names(), ["random_4k.bin"]);
+
+    assert_eq!(copy_attached(&mut archive, 0), original("random_4k.bin"));
+    assert_eq!(
+        copy_via(&paths, Some(TEST_PASSWORD), 0),
+        original("random_4k.bin")
+    );
+}
+
+/// `rar rn` renames a split member in the volume it is given only, so the later
+/// volumes carry the old name. The continuation is the next volume's first
+/// split file header, whatever its name (volume.cpp:158-159).
+fn assert_renamed_split_reads(dir: &str, stem: &str) {
+    let Some(paths) = volume_set(dir, stem, 5) else {
+        return;
+    };
+    let mut archive = open_multi_paths(&paths);
+    assert_eq!(archive.member_names(), ["hello.txt", "renamed_4k.bin"]);
+
+    assert_eq!(copy_attached(&mut archive, 1), original("random_4k.bin"));
+    assert_eq!(copy_via(&paths, None, 1), original("random_4k.bin"));
+}
+
+#[test]
+fn test_rar5_split_renamed_in_its_first_volume_reads_on() {
+    assert_renamed_split_reads("rar5", "rar5_renamed_split");
+}
+
+#[test]
+fn test_rar4_split_renamed_in_its_first_volume_reads_on() {
+    assert_renamed_split_reads("rar4", "rar4_renamed_split");
+}
+
+/// A RAR4 `-hp` set whose part3 `rar rc` rebuilt from the .rev files. The
+/// rebuilt volume ends in zeroes, so its encrypted end-of-archive header fails
+/// its CRC; UnRAR accepts it because it states REV_SPACE (arcread.cpp:524-535).
+#[test]
+fn test_rar4_hp_volume_rebuilt_by_rc_opens() {
+    let Some(paths) = volume_set("rar4", "rar4_hp_rc_rebuilt", 5) else {
+        return;
+    };
+    let rebuilt = std::fs::read(&paths[2]).unwrap();
+    assert!(rebuilt.ends_with(&[0; 7]), "part3 is not the rebuilt shape");
+    let payload: Vec<u8> = (0..16384usize)
+        .map(|index| (index as u8).wrapping_mul(13).wrapping_add(5))
+        .collect();
+
+    let first = std::fs::File::open(&paths[0]).unwrap();
+    let mut archive = unrar_rs::RarArchive::open_with_password(first, "secretpass").unwrap();
+    for (index, path) in paths.iter().enumerate().skip(1) {
+        archive
+            .add_volume(index, Box::new(std::fs::File::open(path).unwrap()))
+            .unwrap();
+    }
+    assert_eq!(archive.member_names(), ["payload.bin"]);
+    assert_eq!(copy_attached(&mut archive, 0), payload);
+    assert_eq!(copy_via(&paths, Some("secretpass"), 0), payload);
+}
+
 // -- Long filenames (200 chars) -----------------------------------------------
 
 #[test]
