@@ -882,6 +882,7 @@ pub fn to_member_info_with_archive_solid(
             dict_size: fh.dict_size,
         },
         is_encrypted: fh.is_encrypted,
+        data_hash_uses_mac: false,
         hash: None,
         attributes: crate::types::FileAttributes(fh.attributes as u64),
         owner: fh.owner.clone(),
@@ -1298,6 +1299,13 @@ mod tests {
         let mi = to_member_info(&vol.files[0], 0);
         assert_eq!(mi.name, "file.dat");
         assert_eq!(mi.unpacked_size, Some(4));
+        assert!(!mi.data_hash_uses_mac);
+        let mut encrypted = vol.files[0].clone();
+        encrypted.is_encrypted = true;
+        let info = to_member_info(&encrypted, 0);
+        assert!(info.is_encrypted);
+        assert!(!info.data_hash_uses_mac);
+        assert_eq!(info.crc32, mi.crc32);
     }
 
     #[test]

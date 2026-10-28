@@ -5089,6 +5089,45 @@ fn test_rar5_encrypted_no_password_fails() {
 }
 
 #[test]
+fn encrypted_split_member_lists_the_final_hash_mac_flag() {
+    let mut archive = open_single("rar5", "rar5_enc_mv_store.part1.rar");
+    let first = archive.member_info(0).unwrap();
+    assert!(first.is_encrypted);
+    assert!(!first.data_hash_uses_mac);
+    assert_eq!(first.crc32, None);
+
+    for volume in 1..5 {
+        let name = format!("rar5_enc_mv_store.part{}.rar", volume + 1);
+        archive
+            .add_volume(
+                volume,
+                Box::new(std::fs::File::open(fixture("rar5", &name)).unwrap()),
+            )
+            .unwrap();
+    }
+    let final_info = archive.member_info(0).unwrap();
+    assert!(final_info.is_encrypted);
+    assert!(final_info.data_hash_uses_mac);
+    assert!(final_info.crc32.is_some());
+
+    let cached = unrar_rs::RarArchive::deserialize_headers_with_password(
+        &archive.serialize_headers(),
+        Some(TEST_PASSWORD.to_string()),
+    )
+    .unwrap();
+    assert!(cached.member_info(0).unwrap().data_hash_uses_mac);
+    assert_eq!(cached.member_info(0).unwrap().crc32, final_info.crc32);
+
+    let options = unrar_rs::ExtractOptions {
+        verify: true,
+        password: Some(TEST_PASSWORD.to_string()),
+        restore_owners: false,
+    };
+    let extracted = archive.extract_member(0, &options, None).unwrap();
+    assert_eq!(extracted.into_bytes().unwrap(), original("binary.bin"));
+}
+
+#[test]
 fn test_cached_headers_resume_encrypted_out_of_order_multivolume_topology() {
     let first = std::fs::File::open(fixture("rar5", "rar5_enc_mv_store.part1.rar")).unwrap();
     let archive = unrar_rs::RarArchive::open_with_password(first, TEST_PASSWORD).unwrap();
