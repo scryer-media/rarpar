@@ -314,10 +314,12 @@ func runCorpusImage(ctx context.Context, verb, root, out, image, tokenFile strin
 		if root == "" {
 			return fmt.Errorf("--root is required")
 		}
-		// Refuse to publish anything that is not a corpus root; the manifest
-		// check mirrors the fleet's corpus_source preflight.
-		if _, err := os.Stat(filepath.Join(workspacePath(root), "corpus.json")); err != nil {
-			return fmt.Errorf("--root is not a corpus root: %w", err)
+		// Refuse to publish anything that is not a corpus root: rarpar's
+		// (corpus.json, the fleet's corpus_source check) or a sevenz-turbo
+		// fixture corpus (fixtures.json, what turbo.sevenz_fixtures_image
+		// caches).
+		if err := corpusRoot(workspacePath(root)); err != nil {
+			return err
 		}
 		_, err := client.PushDir(ctx, workspacePath(root), logf)
 		return err
@@ -329,6 +331,28 @@ func runCorpusImage(ctx context.Context, verb, root, out, image, tokenFile strin
 	default:
 		return fmt.Errorf("unknown corpus image verb %q", verb)
 	}
+}
+
+// sevenzFixturesSchema is the manifest schema sevenz-turbo-bench writes as
+// fixtures.json at the root of its fixture corpus.
+const sevenzFixturesSchema = "sevenz-turbo-bench/fixtures/1"
+
+// corpusRoot says whether root is a corpus `corpus push` may publish.
+func corpusRoot(root string) error {
+	if _, err := os.Stat(filepath.Join(root, "corpus.json")); err == nil {
+		return nil
+	}
+	raw, err := os.ReadFile(filepath.Join(root, "fixtures.json"))
+	if err != nil {
+		return fmt.Errorf("--root is neither a rarpar corpus (corpus.json) nor a sevenz-turbo fixture corpus (fixtures.json): %w", err)
+	}
+	var manifest struct {
+		Schema string `json:"schema"`
+	}
+	if err := json.Unmarshal(raw, &manifest); err != nil || manifest.Schema != sevenzFixturesSchema {
+		return fmt.Errorf("--root has a fixtures.json that is not a %s manifest", sevenzFixturesSchema)
+	}
+	return nil
 }
 
 func runPlan(args []string) error {

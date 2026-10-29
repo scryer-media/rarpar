@@ -518,6 +518,12 @@ sevenz_profile = "fleet"                 # quick | full | fleet
 # sevenz_repeats = 0
 # pin_cpus = "0-7"                       # sevenz --pin-cpus (taskset list)
 timeout_minutes = 60                     # per-case harness timeout
+# ECR image caching the sevenz fixture corpus (aws-ec2 only). Pulled
+# in-region instead of writing ~21 GB with 7zz on every host; when the tag is
+# absent the host generates the corpus and publishes it after the run. The
+# archives' provenance is the 7zz build, so tag per profile, 7zz version and
+# arch, e.g. ".../sevenz-turbo-fixtures:fleet-7zz2604-x86_64".
+# sevenz_fixtures_image = "651588424025.dkr.ecr.us-east-1.amazonaws.com/sevenz-turbo-fixtures:fleet-7zz2604-x86_64"
 
 [machines.ec2]
 instance_type = "c7a.4xlarge"
