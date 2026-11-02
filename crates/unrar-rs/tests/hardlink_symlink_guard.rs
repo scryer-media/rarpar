@@ -65,7 +65,10 @@ fn assert_refused(result: unrar_rs::RarResult<u64>) {
             assert_eq!(member, "hardlink.txt");
             assert_eq!(target, "file.txt");
         }
-        other => panic!("expected UnsafeLinkTarget, got {other:?}"),
+        // Neither arm prints the error itself: some variants carry
+        // password-derived context that must not reach a log.
+        Ok(written) => panic!("expected UnsafeLinkTarget, got Ok({written})"),
+        Err(_) => panic!("expected UnsafeLinkTarget, got a different error"),
     }
 }
 
