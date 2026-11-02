@@ -108,7 +108,7 @@ tracing-subscriber.workspace = true
 # RustSec advisories with no fixed 0.13 release (RUSTSEC-2026-0391 and others).
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 criterion = "0.8"
-wasmtime = { version = "48.0.7", default-features = false, features = [
+wasmtime = { version = "50.0.1", default-features = false, features = [
   "anyhow",
   "async",
   "backtrace",
@@ -135,7 +135,7 @@ wasmtime = { version = "48.0.7", default-features = false, features = [
   "compile-time-builtins",
   "wit-parser",
 ] }
-wasmtime-wasi = "48.0.7"
+wasmtime-wasi = "50.0.1"
 aes = { workspace = true }
 cbc = { workspace = true }
 

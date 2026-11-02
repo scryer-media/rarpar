@@ -20,7 +20,7 @@
 //!     -p unrar-rs --no-default-features --features crypto-rust \
 //!     --target wasm32-wasip1 --example wasm_extract_check
 //!
-//! Run (wasmtime 47; host::guest preopens):
+//! Run (wasmtime 50; host::guest preopens):
 //!   wasmtime run --dir <fixtures>::/fixtures --dir <tmp>::/tmp --env TMPDIR=/tmp \
 //!     target/wasm32-wasip1/release/examples/wasm_extract_check.wasm /fixtures
 //!

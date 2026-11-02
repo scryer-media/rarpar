@@ -25,6 +25,10 @@
   existing output is left in place. Unlike UnRAR there is no switch to
   allow it.
 
+### Changed
+
+- Native WebAssembly conformance tests use Wasmtime 50.0.1.
+
 ## 0.15.0
 
 ### Added
