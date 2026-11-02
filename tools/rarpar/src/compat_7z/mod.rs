@@ -74,6 +74,7 @@ pub(super) struct Session {
 }
 
 fn write_to(target: u8, text: &str) {
+    let text = crate::term::terminal_safe(text);
     match target {
         1 => {
             let mut stdout = io::stdout().lock();

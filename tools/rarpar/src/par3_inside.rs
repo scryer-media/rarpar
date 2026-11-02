@@ -41,7 +41,7 @@ const EXPERIMENTAL_NOTICE: &str = "rarpar: par3 inside is EXPERIMENTAL: the on-d
 
 pub fn run(cli: &Cli, command: Par3InsideCommand) -> Result<u8, RarparError> {
     if !cli.quiet {
-        eprintln!("{EXPERIMENTAL_NOTICE}");
+        safe_eprintln!("{EXPERIMENTAL_NOTICE}");
     }
     let (success, mut report) = match command {
         Par3InsideCommand::Insert(args) => insert(cli, &args)?,
@@ -65,20 +65,20 @@ pub fn run(cli: &Cli, command: Par3InsideCommand) -> Result<u8, RarparError> {
 }
 
 fn print_human(report: &Value) {
-    println!(
+    safe_println!(
         "{}: {}",
         report["operation"].as_str().unwrap_or("par3_inside"),
         report["status"].as_str().unwrap_or("")
     );
     for set in report["sets"].as_array().into_iter().flatten() {
-        println!(
+        safe_println!(
             "  set {} ({} layout): {}",
             set["set_id"].as_str().unwrap_or(""),
             set["layout"].as_str().unwrap_or(""),
             set["status"].as_str().unwrap_or("")
         );
         for host in set["hosts"].as_array().into_iter().flatten() {
-            println!(
+            safe_println!(
                 "    {}: data {}, region {} ({}/{} packets){}",
                 host["name"].as_str().unwrap_or(""),
                 if host["complete"] == true {
@@ -100,7 +100,7 @@ fn print_human(report: &Value) {
             );
         }
         if set["additional"].as_u64().unwrap_or(0) != 0 {
-            println!("    {} more recovery block(s) needed", set["additional"]);
+            safe_println!("    {} more recovery block(s) needed", set["additional"]);
         }
     }
     for name in report["unprotected_missing_volumes"]
@@ -108,16 +108,16 @@ fn print_human(report: &Value) {
         .into_iter()
         .flatten()
     {
-        println!(
+        safe_println!(
             "  {} is missing and no embedded set covers it",
             name.as_str().unwrap_or("")
         );
     }
     for output in report["outputs"].as_array().into_iter().flatten() {
         if let Some(path) = output.as_str() {
-            println!("  wrote {path}");
+            safe_println!("  wrote {path}");
         } else {
-            println!("  wrote {}", output["path"].as_str().unwrap_or(""));
+            safe_println!("  wrote {}", output["path"].as_str().unwrap_or(""));
         }
     }
 }

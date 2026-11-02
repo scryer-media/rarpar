@@ -122,7 +122,7 @@ fn prompt_password(prompt: &str) -> Result<Option<String>, RarparError> {
         return Ok(None);
     }
 
-    eprint!("{prompt}");
+    safe_eprint!("{prompt}");
     io::stderr().flush()?;
     let _ = Command::new("stty").arg("-echo").status();
     let mut line = String::new();

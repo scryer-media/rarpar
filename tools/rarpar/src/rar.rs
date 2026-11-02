@@ -93,7 +93,7 @@ pub fn list_archive(
             .collect::<Vec<_>>())
     })?;
     for name in names {
-        println!("{name}");
+        safe_println!("{name}");
     }
     Ok(EXIT_SUCCESS)
 }
@@ -146,7 +146,7 @@ pub fn extract_set(
         for (index, member) in members.iter().enumerate() {
             let out_path = output_dir.join(&member.name);
             if !cli.json && !cli.quiet {
-                println!(
+                safe_println!(
                     "{}  {}",
                     if member.is_directory {
                         "Creating"

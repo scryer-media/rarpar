@@ -42,6 +42,18 @@ documented in each crate's own changelog so those notes ship with the crate.
   does. No CVE had been assigned when this entry was written. A symlink
   that appears at the output path while a member is being extracted now
   fails that member instead of having its target overwritten.
+- Security: every human-readable line `rarpar` prints, including the
+  `unrar`, `7z` and `par3` compatibility front ends, error messages and
+  the password prompt, shows terminal control characters escaped as
+  `\xNN`, as
+  [UnRAR 7.30 beta 2 (October 27, 2026), security fix 1(b)](https://www.rarlab.com/rarnew.htm)
+  does for its console and log output. No CVE had been assigned when this
+  entry was written. Before, an archive member name or a PAR2 or PAR3 file
+  name was printed raw, so a crafted name could move the cursor, rewrite
+  earlier lines or reorder text. Escaped are backspace, a carriage return
+  not followed by a line feed, SUB, ESC, DEL, the C1 controls U+0080 to
+  U+009F and the bidirectional embeddings and overrides U+202A to U+202E.
+  `--json` output is unchanged.
 
 ## rarpar 0.9.3
 

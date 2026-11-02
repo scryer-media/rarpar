@@ -571,7 +571,7 @@ fn emit(cli: &Cli, report: &Value) -> Result<(), RarparError> {
     if cli.json {
         println!("{}", serde_json::to_string_pretty(report)?);
     } else if !cli.quiet {
-        println!(
+        safe_println!(
             "{}: {}{}",
             report["operation"].as_str().unwrap_or("PAR3"),
             report["status"].as_str().unwrap_or("created"),
@@ -583,14 +583,14 @@ fn emit(cli: &Cli, report: &Value) -> Result<(), RarparError> {
         );
         if report["operation"] == "par3_archive" {
             if report["dry_run"] != true {
-                println!(
+                safe_println!(
                     "  {}: {} member(s), {} bytes, {} protected",
                     report["archive"].as_str().unwrap_or_default(),
                     report["members"],
                     report["archive_bytes"],
                     report["protected_bytes"]
                 );
-                println!(
+                safe_println!(
                     "  {} block(s) of {} bytes, {} recovery block(s), {} set {}",
                     report["blocks"],
                     report["block_size"],
@@ -603,15 +603,17 @@ fn emit(cli: &Cli, report: &Value) -> Result<(), RarparError> {
                 );
             }
             for path in report["outputs"].as_array().into_iter().flatten() {
-                println!("  {}", path.as_str().unwrap_or_default());
+                safe_println!("  {}", path.as_str().unwrap_or_default());
             }
         } else if let Some(outputs) = report["outputs"].as_array() {
-            println!(
+            safe_println!(
                 "  {} block(s), {} cohort(s), {} scratch bytes",
-                report["blocks"], report["cohorts"], report["scratch_bytes"]
+                report["blocks"],
+                report["cohorts"],
+                report["scratch_bytes"]
             );
             for (index, path) in outputs.iter().enumerate() {
-                println!(
+                safe_println!(
                     "  {}: {} bytes",
                     path.as_str().unwrap_or_default(),
                     report["output_sizes"][index]
@@ -620,7 +622,7 @@ fn emit(cli: &Cli, report: &Value) -> Result<(), RarparError> {
         }
         if let Some(files) = report["files"].as_array() {
             for file in files {
-                println!(
+                safe_println!(
                     "  {}: {}, verified prefix {} bytes",
                     file["path"].as_str().unwrap_or_default(),
                     if file["complete"] == true {
@@ -634,15 +636,16 @@ fn emit(cli: &Cli, report: &Value) -> Result<(), RarparError> {
         }
         if let Some(needs) = report["requirements"].as_array() {
             for need in needs {
-                println!(
+                safe_println!(
                     "  cohort {}: {} additional recovery packet(s) needed",
-                    need["cohort"], need["additional"]
+                    need["cohort"],
+                    need["additional"]
                 );
             }
         }
         if let Some(installed) = report["installed"].as_array() {
             for file in installed {
-                println!("  installed {}", file["path"].as_str().unwrap_or_default());
+                safe_println!("  installed {}", file["path"].as_str().unwrap_or_default());
             }
         }
     }
