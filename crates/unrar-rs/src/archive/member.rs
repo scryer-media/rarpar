@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::io::{BufReader, BufWriter, Write};
 use std::rc::Rc;
 use std::sync::Arc;
-#[cfg(any(unix, windows))]
+#[cfg(windows)]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -132,20 +132,6 @@ struct WindowsHostMetadata {
     mtime: Option<std::time::SystemTime>,
     ctime: Option<std::time::SystemTime>,
     atime: Option<std::time::SystemTime>,
-}
-
-#[cfg(unix)]
-fn current_umask() -> u32 {
-    static UMASK: OnceLock<u32> = OnceLock::new();
-    *UMASK.get_or_init(|| {
-        // `umask` is the only portable way to read the current mask. Restore it
-        // immediately after reading it.
-        let mask = unsafe { libc::umask(0o022) };
-        unsafe {
-            libc::umask(mask);
-        }
-        mask as u32
-    })
 }
 
 struct Rar5ReaderCrypto {
@@ -3098,10 +3084,11 @@ impl RarArchive {
         Ok(uid_matches && gid_matches)
     }
 
-    /// The mode an extracted member is given on disk: the header's mode
-    /// (or the host default), with set-user-ID and set-group-ID dropped
-    /// unless the process runs as root. Every place a header mode reaches
-    /// `chmod` or `fchmod`, including the hard-link path, goes through here.
+    /// The mode an extracted member is given on disk: the header's mode,
+    /// with set-user-ID and set-group-ID dropped unless the process runs as
+    /// root, or `None` (no `chmod` at all) for a member archived on another
+    /// OS. Every place a header mode reaches `chmod` or `fchmod`, including
+    /// the hard-link path, goes through here.
     #[cfg(unix)]
     fn unix_output_mode(fh: &FileHeader) -> Option<u32> {
         // SAFETY: `geteuid` has no preconditions and cannot fail.
@@ -3138,23 +3125,16 @@ impl RarArchive {
                 let mode = fh.attributes.unix_mode() & 0o7777;
                 Some(mode)
             }
-            crate::types::HostOs::Windows => {
-                let mode = if fh.is_directory || fh.attributes.is_directory_attr() {
-                    0o777
-                } else if fh.attributes.is_readonly() {
-                    0o444
-                } else {
-                    0o666
-                };
-                Some(mode & !current_umask())
-            }
-            crate::types::HostOs::Darwin | crate::types::HostOs::Unknown(_) => {
-                // RAR4 `HSYS_MACOS` is a legacy Mac marker, not POSIX mode
-                // storage. Treat it like other non-Unix legacy hosts, so only
-                // real Unix archive origins preserve raw mode bits here.
-                let mode = if fh.is_directory { 0o777 } else { 0o666 };
-                Some(mode & !current_umask())
-            }
+            // Windows, unknown hosts and the RAR4 `HSYS_MACOS` legacy marker
+            // store no POSIX mode. The member keeps the mode the OS gave it
+            // at creation (0o666 or 0o777 less the process umask), with no
+            // `chmod`: converting their attributes would mean reading the
+            // umask, which `umask(2)` only allows by setting it, racing
+            // other threads that create files. RAR stopped converting them
+            // for the same reason.
+            crate::types::HostOs::Windows
+            | crate::types::HostOs::Darwin
+            | crate::types::HostOs::Unknown(_) => None,
         }
     }
 
@@ -8701,80 +8681,77 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unix_output_mode_converts_windows_attributes_like_rar_behavior() {
-        let mask = current_umask();
+    fn unix_output_mode_sets_no_mode_for_windows_origin() {
         let mut fh = test_rar3_symlink_header(None);
         fh.host_os = HostOs::Windows;
 
         fh.is_directory = true;
         fh.attributes = FileAttributes(0x10);
-        assert_eq!(RarArchive::unix_output_mode(&fh), Some(0o777 & !mask));
+        assert_eq!(RarArchive::unix_output_mode(&fh), None);
 
+        // Read-only is no longer turned into 0o444.
         fh.is_directory = false;
         fh.attributes = FileAttributes(0x01);
-        assert_eq!(RarArchive::unix_output_mode(&fh), Some(0o444 & !mask));
+        assert_eq!(RarArchive::unix_output_mode(&fh), None);
 
         fh.attributes = FileAttributes(0x20);
-        assert_eq!(RarArchive::unix_output_mode(&fh), Some(0o666 & !mask));
+        assert_eq!(RarArchive::unix_output_mode(&fh), None);
     }
 
     #[cfg(unix)]
     #[test]
-    fn unix_output_mode_uses_rar_behavior_default_for_unsupported_hosts() {
-        let mask = current_umask();
+    fn unix_output_mode_sets_no_mode_for_unsupported_hosts() {
         let mut fh = test_rar3_symlink_header(None);
         fh.host_os = HostOs::Unknown(0);
 
         fh.is_directory = false;
-        assert_eq!(RarArchive::unix_output_mode(&fh), Some(0o666 & !mask));
+        assert_eq!(RarArchive::unix_output_mode(&fh), None);
 
         fh.is_directory = true;
-        assert_eq!(RarArchive::unix_output_mode(&fh), Some(0o777 & !mask));
+        assert_eq!(RarArchive::unix_output_mode(&fh), None);
 
+        // RAR4 `HSYS_MACOS` is a legacy marker, not POSIX mode storage.
         fh.host_os = HostOs::Darwin;
         fh.compression.format = ArchiveFormat::Rar4;
         fh.attributes = FileAttributes(0o100750);
         fh.is_directory = false;
-        assert_eq!(RarArchive::unix_output_mode(&fh), Some(0o666 & !mask));
+        assert_eq!(RarArchive::unix_output_mode(&fh), None);
     }
 
     #[cfg(unix)]
     #[test]
-    fn apply_unix_permissions_uses_supported_os_conversion_on_disk() {
+    fn apply_unix_permissions_leaves_other_os_members_at_their_creation_mode() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("mode.bin");
-        std::fs::write(&path, b"mode").unwrap();
+        let mode_of =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
 
         let mut fh = test_rar3_symlink_header(None);
         fh.host_os = HostOs::Unix;
         fh.attributes = FileAttributes(0o100750);
         fh.is_directory = false;
+        let unix_path = temp.path().join("unix.bin");
+        std::fs::write(&unix_path, b"mode").unwrap();
+        RarArchive::apply_unix_permissions(&fh, &unix_path).unwrap();
+        assert_eq!(mode_of(&unix_path), 0o750);
 
-        RarArchive::apply_unix_permissions(&fh, &path).unwrap();
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o750
-        );
-
+        // A Windows read-only file keeps what `File::create` produced.
+        let path = temp.path().join("windows.bin");
+        std::fs::write(&path, b"mode").unwrap();
+        let created = mode_of(&path);
         fh.host_os = HostOs::Windows;
         fh.attributes = FileAttributes(0x01);
         RarArchive::apply_unix_permissions(&fh, &path).unwrap();
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o444 & !current_umask()
-        );
+        assert_eq!(mode_of(&path), created);
 
         let dir = temp.path().join("dir");
         std::fs::create_dir(&dir).unwrap();
+        let created = mode_of(&dir);
         fh.is_directory = true;
         fh.attributes = FileAttributes(0x10);
         RarArchive::apply_unix_permissions(&fh, &dir).unwrap();
-        assert_eq!(
-            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
-            0o777 & !current_umask()
-        );
+        assert_eq!(mode_of(&dir), created);
     }
 
     #[cfg(unix)]

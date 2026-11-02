@@ -59,7 +59,9 @@ with no buffering in memory and no temporary file.
 `unpack_to` and `unpack_in` write the member to disk with what the archive
 records about it: times, permissions, Windows attributes, symlinks and
 hardlinks. On Unix a process that is not root does not restore
-set-user-ID, or set-group-ID on a file. `unpack_in` uses the member's own
+set-user-ID, or set-group-ID on a file, and a member archived on another
+OS, such as Windows, keeps the mode the OS gives a new file (no `chmod`;
+its read-only attribute is not mapped). `unpack_in` uses the member's own
 name, cleaned so it cannot escape the directory.
 
 ```rust

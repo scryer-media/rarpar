@@ -54,6 +54,11 @@ documented in each crate's own changelog so those notes ship with the crate.
   not followed by a line feed, SUB, ESC, DEL, the C1 controls U+0080 to
   U+009F and the bidirectional embeddings and overrides U+202A to U+202E.
   `--json` output is unchanged.
+- On Unix, RAR extraction of a member archived on Windows or another
+  non-Unix OS no longer sets its mode, through unrar-rs 0.15.1, as
+  [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
+  does: the file keeps the mode the OS gives it at creation, so a Windows
+  read-only member is no longer made 0o444.
 
 ## rarpar 0.9.3
 

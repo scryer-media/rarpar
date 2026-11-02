@@ -64,6 +64,19 @@
 ### Changed
 
 - Native WebAssembly conformance tests use Wasmtime 50.0.1.
+- On Unix, a member archived on another OS — Windows, an unknown host, or
+  the RAR 4.x legacy Mac marker — gets no `chmod`: it keeps the mode the OS
+  gave it at creation, 0o666 for a file or 0o777 for a directory less the
+  process umask. Before, unrar-rs converted its attributes, turning a
+  Windows read-only file into 0o444, and to apply the umask it read it
+  with `umask(2)`, which can only read the mask by setting it and so raced
+  other threads of the process creating files. A Windows read-only member
+  is therefore writable after extraction on Unix now. This follows
+  [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm),
+  which stopped converting other-OS attributes for the same thread-safety
+  reason. Unix-origin members, and RAR5 members with a Darwin host, keep
+  their stored mode (less set-user-ID and set-group-ID as above), and on
+  Windows the read-only attribute is still set.
 
 ## 0.15.0
 
