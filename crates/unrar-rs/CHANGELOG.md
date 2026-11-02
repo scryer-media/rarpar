@@ -60,6 +60,15 @@
   placed there between that removal and the open was followed and the file
   it pointed to truncated and overwritten. Now that open fails with
   `RarError::Io` (`ELOOP`) and the file is left alone.
+- Every Windows junction member is `RarError::UnsafeLinkTarget`, on every
+  host, before anything is created, as
+  [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
+  refuses junctions unless absolute links are allowed: a junction is
+  absolute in practice, and a relative one does not resolve once created.
+  No CVE had been assigned when this entry was written. Before, a junction
+  whose target passed the relative-link checks was created as a junction
+  on Windows and as a symlink on Unix. unrar-rs has no option to allow
+  absolute links, so there is no way to extract one.
 
 ### Changed
 

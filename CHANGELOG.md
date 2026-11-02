@@ -59,6 +59,12 @@ documented in each crate's own changelog so those notes ship with the crate.
   [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
   does: the file keeps the mode the OS gives it at creation, so a Windows
   read-only member is no longer made 0o444.
+- Security: RAR extraction refuses every Windows junction member with
+  `unsafe link target`, on every platform, through unrar-rs 0.15.1, as
+  [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
+  does unless absolute links are allowed. No CVE had been assigned when
+  this entry was written. Before, a junction with a relative target was
+  created as a junction on Windows and a symlink elsewhere.
 
 ## rarpar 0.9.3
 

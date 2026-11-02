@@ -46,7 +46,7 @@ const OUTPUT_WRITE_BUFFER_BYTES: usize = 512 * 1024;
 const DECODE_INPUT_BUFFER_BYTES: usize = 256 * 1024;
 const MAX_LINK_TARGET_BYTES: usize = 0x10000;
 const MAX_COMMENT_BYTES: u64 = 0x1000000;
-#[cfg(any(windows, test))]
+#[cfg(test)]
 const WINDOWS_IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
 #[cfg(any(windows, test))]
 const WINDOWS_IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
@@ -2032,74 +2032,6 @@ impl RarArchive {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn create_windows_junction_output(
-        fh: &FileHeader,
-        owner: Option<&crate::types::UnixOwnerInfo>,
-        options: &ExtractOptions,
-        member_name: &str,
-        raw_member_name: &str,
-        safety_target: &str,
-        reparse_target: &str,
-        out_path: &std::path::Path,
-    ) -> RarResult<u64> {
-        Self::ensure_output_parent_dir_for_member(member_name, out_path)?;
-        Self::ensure_safe_symlink_target(
-            fh,
-            member_name,
-            safety_target,
-            raw_member_name,
-            out_path,
-        )?;
-        Self::remove_existing_link_output(out_path)?;
-
-        #[cfg(windows)]
-        {
-            let _ = owner;
-            let _ = options;
-
-            Self::create_windows_junction_reparse_point(reparse_target, out_path, raw_member_name)?;
-            Self::apply_symlink_times(fh, out_path)?;
-            Ok(0)
-        }
-
-        #[cfg(unix)]
-        {
-            let _ = reparse_target;
-            let target = std::ffi::OsStr::new(safety_target);
-            std::os::unix::fs::symlink(target, out_path).map_err(RarError::from)?;
-            Self::apply_symlink_times(fh, out_path)?;
-            if options.restore_owners {
-                Self::apply_unix_owner(owner, out_path, false)?;
-            }
-            Ok(0)
-        }
-
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = fh;
-            let _ = owner;
-            let _ = options;
-            let _ = reparse_target;
-            let _ = out_path;
-            Err(RarError::UnsupportedLinkType {
-                member: raw_member_name.to_string(),
-                link_type: "WindowsJunction".to_string(),
-            })
-        }
-    }
-
-    #[cfg(windows)]
-    fn create_windows_junction_reparse_point(
-        target: &str,
-        out_path: &std::path::Path,
-        member: &str,
-    ) -> RarResult<()> {
-        Self::ensure_safe_windows_reparse_target(target, member)?;
-        let buffer = Self::windows_junction_reparse_buffer(target)?;
-        Self::create_windows_reparse_point(out_path, true, buffer)
-    }
-
     #[cfg(windows)]
     fn create_windows_symlink_reparse_point(
         target: &str,
@@ -2322,7 +2254,9 @@ impl RarArchive {
         };
     }
 
-    #[cfg(any(windows, test))]
+    /// Junction members are always refused; this builds a junction only so
+    /// Windows tests can plant one in the output tree as a hostile condition.
+    #[cfg(test)]
     fn windows_junction_reparse_buffer(target: &str) -> RarResult<Vec<u8>> {
         let substitute_name = Self::windows_junction_substitute_name(target);
         let print_name = Self::windows_reparse_print_name(&substitute_name);
@@ -2443,7 +2377,7 @@ impl RarArchive {
         Ok(buffer)
     }
 
-    #[cfg(any(windows, test))]
+    #[cfg(test)]
     fn windows_junction_substitute_name(target: &str) -> String {
         if let Some(rest) = target.strip_prefix("/??/") {
             format!("\\??\\{}", rest.replace('/', "\\"))
@@ -3446,17 +3380,15 @@ impl RarArchive {
                     )
                     .map(Some)
                 }
-                header::RedirectionType::WindowsJunction => Self::create_windows_junction_output(
-                    fh,
-                    owner,
-                    options,
-                    &member_name,
-                    &fh.name,
-                    &target,
-                    &redir.target,
-                    out_path,
-                )
-                .map(Some),
+                // Every junction is refused before anything is created, on
+                // every host. A junction is absolute in practice, and a
+                // relative one does not resolve once created, so there is
+                // no safe one to extract; RAR refuses them too unless
+                // absolute links are allowed, which unrar-rs never allows.
+                header::RedirectionType::WindowsJunction => Err(RarError::UnsafeLinkTarget {
+                    member: fh.name.clone(),
+                    target: redir.target.clone(),
+                }),
                 header::RedirectionType::Hardlink => {
                     Self::create_hardlink_output(fh, &member_name, &fh.name, &target, out_path)
                         .map(Some)
@@ -9504,41 +9436,48 @@ mod tests {
         assert_eq!(link.as_os_str().as_bytes(), b"safe\xed\xa0\x80target");
     }
 
-    #[cfg(unix)]
     #[test]
-    fn rar5_windows_junction_extracts_as_symlink_on_unix_like_rar_behavior() {
-        use std::os::unix::ffi::OsStrExt;
+    fn rar5_windows_junction_is_refused_before_anything_is_created() {
+        // Relative or absolute, a junction is refused on every host.
+        for target in ["safe\\target", "\\??\\C:\\target", "dir/target"] {
+            let temp = tempfile::tempdir().unwrap();
+            let out_path = temp.path().join("sub").join("junction");
 
-        let temp = tempfile::tempdir().unwrap();
-        let out_path = temp.path().join("junction");
+            let mut archive = empty_rar5_archive();
+            let mut fh = test_rar3_symlink_header(None);
+            fh.name = "sub/junction".to_string();
+            fh.attributes = FileAttributes(0);
+            fh.host_os = HostOs::Windows;
+            fh.compression.format = ArchiveFormat::Rar5;
+            fh.is_directory = true;
 
-        let mut archive = empty_rar5_archive();
-        let mut fh = test_rar3_symlink_header(None);
-        fh.name = "junction".to_string();
-        fh.attributes = FileAttributes(0);
-        fh.host_os = HostOs::Windows;
-        fh.compression.format = ArchiveFormat::Rar5;
-        fh.is_directory = true;
-
-        let written = archive
-            .extract_link_member_to_file(
+            let result = archive.extract_link_member_to_file(
                 0,
                 &ExtractOptions::default(),
                 &fh,
                 None,
                 Some(header::Redirection {
                     redir_type: header::RedirectionType::WindowsJunction,
-                    target: "safe\\target".to_string(),
-                    target_raw: Some(b"safe\\target".to_vec()),
+                    target: target.to_string(),
+                    target_raw: Some(target.as_bytes().to_vec()),
                     target_is_directory: true,
                 }),
                 &out_path,
-            )
-            .unwrap();
+            );
 
-        assert_eq!(written, Some(0));
-        let link = std::fs::read_link(out_path).unwrap();
-        assert_eq!(link.as_os_str().as_bytes(), b"safe/target");
+            match result {
+                Err(RarError::UnsafeLinkTarget {
+                    member,
+                    target: refused,
+                }) => {
+                    assert_eq!(member, "sub/junction");
+                    assert_eq!(refused, target);
+                }
+                other => panic!("expected UnsafeLinkTarget for {target:?}, got {other:?}"),
+            }
+            // Not even the parent directory is made.
+            assert!(!temp.path().join("sub").exists());
+        }
     }
 
     fn empty_rar5_archive() -> RarArchive {
