@@ -25,6 +25,8 @@
   existing output is left in place. Unlike UnRAR there is no switch to
   allow it.
 
+## 0.15.0
+
 ### Added
 
 - `MemberInfo::data_hash_uses_mac` exposes the RAR5 file-encryption record's
