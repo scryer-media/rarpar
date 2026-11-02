@@ -152,6 +152,10 @@ pub enum RarError {
     )]
     SolidOrderViolation { required: String, requested: String },
 
+    /// A link member's target is refused: it would land outside the output
+    /// directory, or, for a hard link or file copy, its path beneath the
+    /// output directory passes through a symlink, junction or other reparse
+    /// point.
     #[error("unsafe link target for {member}: {target}")]
     UnsafeLinkTarget { member: String, target: String },
 

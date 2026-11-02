@@ -190,7 +190,11 @@ the original error, so `io::Error::downcast` gives back the `RarError` or the
   missing or damaged volumes.
 - Hostile archives: names that would escape the output directory are
   cleaned, and sizes declared in headers are capped before anything is
-  allocated.
+  allocated. A hard-link or file-copy target is resolved beneath the
+  output directory without following symlinks: one whose path passes
+  through a symlink, junction or other reparse point, even one that points
+  back inside, is refused with `RarError::UnsafeLinkTarget`, as UnRAR 7.30
+  refuses it.
 
 ## Encryption backend
 

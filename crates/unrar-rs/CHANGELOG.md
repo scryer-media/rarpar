@@ -1,6 +1,29 @@
 # Changelog
 
-## 0.15.0
+## 0.15.1
+
+### Security
+
+- A hard-link or file-copy target that passes through a symlink is refused,
+  as [UnRAR 7.30 beta 2 (October 27, 2026), security fix 1(d)](https://www.rarlab.com/rarnew.htm)
+  refuses it: "hard link extraction is blocked by default if hard link
+  target includes symlinks". No CVE had been assigned when this entry was
+  written. Before, a target such as `dir/file.bin` was resolved as a path,
+  so a `dir` symlink already in the output directory, or one extracted
+  earlier from the same archive, linked a file outside the output
+  directory into it and then changed that file's mode or attributes. A
+  file copy read the outside file the same way. Now every target
+  component is opened beneath the extraction root without following
+  symlinks — on Unix with `openat(O_NOFOLLOW | O_DIRECTORY)`, linked with
+  `linkat` through the held directory handles and its mode set through a
+  descriptor checked to be the file just linked; on Windows by opening
+  each component with `FILE_FLAG_OPEN_REPARSE_POINT` and holding the
+  directories without delete sharing until the link is made. A symlink,
+  junction or other reparse point anywhere in the target, including one
+  that points back inside the output directory, or a directory component
+  that is not a directory, is `RarError::UnsafeLinkTarget`, and the
+  existing output is left in place. Unlike UnRAR there is no switch to
+  allow it.
 
 ### Added
 

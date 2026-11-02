@@ -10,6 +10,16 @@ documented in each crate's own changelog so those notes ship with the crate.
   honoured, through par2-rs 0.11.0. Before, such a name arrived with
   replacement characters, so `par2 verify` and `par2 repair` looked for a
   file that did not exist.
+- Security: RAR extraction refuses a hard-link or file-copy target that
+  passes through a symlink, junction or other reparse point, through
+  unrar-rs 0.15.1, as
+  [UnRAR 7.30 beta 2 (October 27, 2026), security fix 1(d)](https://www.rarlab.com/rarnew.htm)
+  does: "hard link extraction is blocked by default if hard link target
+  includes symlinks". No CVE had been assigned when this entry was
+  written. Before, `x -o-` over a destination whose kept `file.txt` was a
+  symlink to a file elsewhere linked that file in as the archive's hard
+  link and changed its mode. The refused member now fails extraction with
+  `unsafe link target`.
 
 ## rarpar 0.9.3
 
