@@ -61,13 +61,16 @@ impl Outside {
 
 fn assert_refused(result: unrar_rs::RarResult<u64>) {
     match result {
+        // No arm prints anything taken from the result: some error variants
+        // carry password-derived context that must not reach a log, and
+        // CodeQL treats every value out of an extraction result alike.
         Err(RarError::UnsafeLinkTarget { member, target }) => {
-            assert_eq!(member, "hardlink.txt");
-            assert_eq!(target, "file.txt");
+            assert!(
+                member == "hardlink.txt" && target == "file.txt",
+                "UnsafeLinkTarget named a different member or target"
+            );
         }
-        // Neither arm prints the error itself: some variants carry
-        // password-derived context that must not reach a log.
-        Ok(written) => panic!("expected UnsafeLinkTarget, got Ok({written})"),
+        Ok(_) => panic!("expected UnsafeLinkTarget, got Ok"),
         Err(_) => panic!("expected UnsafeLinkTarget, got a different error"),
     }
 }
