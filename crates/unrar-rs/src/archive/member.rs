@@ -1871,7 +1871,22 @@ impl RarArchive {
         Self::ensure_output_parent_dir_for_member(member_name, out_path)?;
         Self::remove_existing_regular_output_symlink(out_path)?;
         Self::clear_windows_readonly_before_overwrite(out_path)?;
-        std::fs::File::create(out_path).map_err(RarError::from)
+        Self::open_regular_output_file(out_path)
+    }
+
+    /// Creates or truncates `out_path` for writing. On Unix the open does
+    /// not follow a symlink in the final component, so one planted after
+    /// `remove_existing_regular_output_symlink` ran fails the open (`ELOOP`)
+    /// instead of truncating the file it points to.
+    fn open_regular_output_file(out_path: &std::path::Path) -> RarResult<std::fs::File> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::custom_flags(
+            &mut options,
+            libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        );
+        options.open(out_path).map_err(RarError::from)
     }
 
     fn create_regular_output_file_for_member(
@@ -8760,6 +8775,37 @@ mod tests {
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
             0o777 & !current_umask()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_regular_output_file_does_not_follow_a_final_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside.txt");
+        std::fs::write(&outside, b"outside bytes").unwrap();
+        let out_path = temp.path().join("out.bin");
+        std::os::unix::fs::symlink(&outside, &out_path).unwrap();
+
+        // A symlink that appears after the removal step is not followed.
+        let err = RarArchive::open_regular_output_file(&out_path).unwrap_err();
+        assert!(matches!(err, RarError::Io(_)));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside bytes");
+        assert!(
+            std::fs::symlink_metadata(&out_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        // A regular file is still created, then truncated on reopen.
+        let regular = temp.path().join("regular.bin");
+        std::io::Write::write_all(
+            &mut RarArchive::open_regular_output_file(&regular).unwrap(),
+            b"first",
+        )
+        .unwrap();
+        drop(RarArchive::open_regular_output_file(&regular).unwrap());
+        assert_eq!(std::fs::read(&regular).unwrap(), b"");
     }
 
     #[cfg(unix)]

@@ -52,6 +52,14 @@
   longer recreated on Unix as a literal `C:/...` link. No CVE had been
   assigned when this entry was written. Hard-link and file-copy targets,
   which resolve beneath the output directory, are unchanged.
+- On Unix a regular member's output file is opened with `O_NOFOLLOW`, as
+  [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
+  added "as the additional protection against overwriting the link
+  target". No CVE had been assigned when this entry was written. A symlink
+  already at the output path was, and still is, removed first; before, one
+  placed there between that removal and the open was followed and the file
+  it pointed to truncated and overwritten. Now that open fails with
+  `RarError::Io` (`ELOOP`) and the file is left alone.
 
 ### Changed
 

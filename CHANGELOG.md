@@ -36,6 +36,12 @@ documented in each crate's own changelog so those notes ship with the crate.
   unrar-rs 0.15.1. [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
   refuses it on Windows, where it resolves outside the destination. No CVE
   had been assigned when this entry was written.
+- Security: on Unix, RAR extraction opens each output file without
+  following a symlink, through unrar-rs 0.15.1, as
+  [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
+  does. No CVE had been assigned when this entry was written. A symlink
+  that appears at the output path while a member is being extracted now
+  fails that member instead of having its target overwritten.
 
 ## rarpar 0.9.3
 

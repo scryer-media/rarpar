@@ -1,5 +1,6 @@
-//! Hard-link targets that pass through a symlink are refused, as UnRAR 7.30
-//! beta 2 refuses them.
+//! Hard-link targets that pass through a symlink are refused, and a regular
+//! member never writes through a symlink at its output path, as UnRAR 7.30
+//! beta 2 guards both.
 //!
 //! The archive is libarchive's `test_read_format_rar5_hardlink.rar`: member
 //! 0 is `file.txt`, member 1 is `hardlink.txt`, a hard link whose target is
@@ -174,4 +175,33 @@ fn hardlink_to_a_kept_existing_regular_file_still_links() {
         std::fs::metadata(root.join("hardlink.txt")).unwrap().ino(),
         std::fs::metadata(root.join("file.txt")).unwrap().ino()
     );
+}
+
+/// A symlink already sitting at a regular member's output path is replaced
+/// by the member, never written through: the file it points to keeps its
+/// bytes and mode. The output file is opened with `O_NOFOLLOW`, so a
+/// symlink that appears after the replacement step fails the open instead
+/// (covered by `archive::member`'s unit tests).
+#[test]
+fn regular_member_over_an_output_symlink_leaves_the_outside_file_alone() {
+    let Some(fixture) = fixture() else { return };
+    let temp = tempfile::tempdir().unwrap();
+    let outside = Outside::new(temp.path());
+    let root = temp.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    std::os::unix::fs::symlink(&outside.file, root.join("file.txt")).unwrap();
+
+    let mut archive = open(&fixture);
+    archive
+        .by_index(0)
+        .unwrap()
+        .unpack_to(root.join("file.txt"))
+        .unwrap();
+    let extracted = std::fs::symlink_metadata(root.join("file.txt")).unwrap();
+    assert!(extracted.file_type().is_file());
+    assert_ne!(
+        std::fs::read(root.join("file.txt")).unwrap(),
+        b"outside bytes"
+    );
+    outside.assert_untouched();
 }
