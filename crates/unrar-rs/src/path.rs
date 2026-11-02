@@ -249,20 +249,46 @@ pub(crate) fn is_safe_symlink_target_for_archive_member(
     raw_member_path: &str,
     target: &str,
 ) -> bool {
+    is_safe_symlink_target_for_archive_member_on_host(
+        format,
+        member_path,
+        raw_member_path,
+        target,
+        cfg!(windows),
+    )
+}
+
+/// `windows_host` says whether the link is created on Windows. There a
+/// symlink or junction target starting with a drive letter (`C:..\x`,
+/// `c:foo`) resolves against that drive's current directory, outside the
+/// output, and is refused, as RAR refuses it. On Unix the same string is a
+/// relative path (`C:..` is a file name) and is accepted, as RAR accepts it.
+/// Hard links and file copies resolve beneath the root and accept it on
+/// every host.
+fn is_safe_symlink_target_for_archive_member_on_host(
+    format: ArchiveFormat,
+    member_path: &str,
+    raw_member_path: &str,
+    target: &str,
+    windows_host: bool,
+) -> bool {
     let raw_member_backslash_is_separator = !matches!(format, ArchiveFormat::Rar5);
-    // A symlink or junction target starting with a drive letter (`C:..\x`,
-    // `c:foo`) is refused on every host: on Windows it resolves against
-    // that drive's current directory, outside the output. Hard links and
-    // file copies resolve beneath the root and keep accepting it.
-    is_safe_link_target_inner(member_path, target, false, false, false, false)
-        && is_safe_link_target_inner(
-            raw_member_path,
-            target,
-            false,
-            raw_member_backslash_is_separator,
-            false,
-            false,
-        )
+    let allow_drive_relative = !windows_host;
+    is_safe_link_target_inner(
+        member_path,
+        target,
+        allow_drive_relative,
+        false,
+        false,
+        false,
+    ) && is_safe_link_target_inner(
+        raw_member_path,
+        target,
+        allow_drive_relative,
+        raw_member_backslash_is_separator,
+        false,
+        false,
+    )
 }
 
 fn is_safe_link_target_inner(
@@ -778,8 +804,25 @@ mod tests {
         ));
     }
 
+    #[cfg(not(windows))]
     #[test]
-    fn archive_symlink_target_drive_letter_is_refused_on_every_host() {
+    fn archive_symlink_target_drive_letter_is_relative_like_rar_behavior_on_unix() {
+        assert!(is_safe_symlink_target_for_archive_member(
+            ArchiveFormat::Rar5,
+            "link",
+            "link",
+            "C:\\literal"
+        ));
+    }
+
+    #[test]
+    fn archive_symlink_target_drive_letter_is_refused_like_rar_behavior_on_windows() {
+        // Runs on every host by asking for the Windows rule directly.
+        let on_windows = |format, target| {
+            is_safe_symlink_target_for_archive_member_on_host(
+                format, "dir/link", "dir/link", target, true,
+            )
+        };
         for format in [ArchiveFormat::Rar5, ArchiveFormat::Rar4] {
             for target in [
                 "C:\\literal",
@@ -790,9 +833,7 @@ mod tests {
                 "C:/target",
             ] {
                 assert!(
-                    !is_safe_symlink_target_for_archive_member(
-                        format, "dir/link", "dir/link", target
-                    ),
+                    !on_windows(format, target),
                     "expected {target:?} to be refused"
                 );
             }
@@ -800,15 +841,20 @@ mod tests {
         // Only a letter and a colon as the first two bytes count.
         for target in ["dir/C:x", "1:x", "::x", "C", "Cx:y"] {
             assert!(
-                is_safe_symlink_target_for_archive_member(
-                    ArchiveFormat::Rar5,
-                    "dir/link",
-                    "dir/link",
-                    target
-                ),
+                on_windows(ArchiveFormat::Rar5, target),
                 "expected {target:?} to be accepted"
             );
         }
+        // The public check follows the host it runs on.
+        assert_eq!(
+            is_safe_symlink_target_for_archive_member(
+                ArchiveFormat::Rar5,
+                "dir/link",
+                "dir/link",
+                "C:..\\..\\x"
+            ),
+            !cfg!(windows)
+        );
     }
 
     #[test]

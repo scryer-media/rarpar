@@ -8431,16 +8431,15 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
-    fn rar5_windows_absolute_symlink_is_refused_after_unix_normalization() {
+    fn rar5_windows_absolute_symlink_is_relative_after_unix_normalization_like_rar_behavior() {
         let target = RarArchive::normalized_rar5_redirection_target(
             header::RedirectionType::WindowsSymlink,
             "\\??\\C:\\target",
         );
 
-        // Normalisation leaves `C:/target`, which starts with a drive letter.
-        assert_eq!(target, "C:/target");
-        assert!(!crate::path::is_safe_symlink_target_for_archive_member(
+        assert!(crate::path::is_safe_symlink_target_for_archive_member(
             ArchiveFormat::Rar5,
             "link",
             "link",

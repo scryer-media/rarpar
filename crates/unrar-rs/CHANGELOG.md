@@ -43,15 +43,14 @@
   doubled separator anywhere in the name — `//`, or for RAR 4.x and older
   names `\\` and `\/` — allows no `..` at all, and such a link is
   `RarError::UnsafeLinkTarget`. The name itself is still kept as written.
-- A symlink or junction target that starts with a drive letter, such as
-  `C:..\..\x` or `c:foo`, is `RarError::UnsafeLinkTarget` on every host.
+- On Windows, a symlink or junction target that starts with a drive letter,
+  such as `C:..\..\x` or `c:foo`, is `RarError::UnsafeLinkTarget`, as
   [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
-  added this refusal for Windows builds, where such a target resolves
-  against that drive's current directory, outside the output directory;
-  unrar-rs applies it on Unix too, so a Windows `\??\C:\...` symlink is no
-  longer recreated on Unix as a literal `C:/...` link. No CVE had been
-  assigned when this entry was written. Hard-link and file-copy targets,
-  which resolve beneath the output directory, are unchanged.
+  refuses it: there it resolves against that drive's current directory,
+  outside the output directory. No CVE had been assigned when this entry
+  was written. On Unix such a target is a relative path (`C:..` is a file
+  name) and is created as before, as UnRAR does. Hard-link and file-copy
+  targets, which resolve beneath the output directory, are unchanged.
 - On Unix a regular member's output file is opened with `O_NOFOLLOW`, as
   [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
   added "as the additional protection against overwriting the link
