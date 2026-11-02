@@ -20,7 +20,7 @@ env:
   WASM_CACHE_VERSION: v2
   # Pinned: the wasm harness lanes are only comparable with each other if they
   # all executed on the same runtime. Bump deliberately, not incidentally.
-  WASMTIME_VERSION: 48.0.6
+  WASMTIME_VERSION: 50.0.1
   # Pinned: the corpus signature is verified by the same cosign release the
   # publish workflow signs with. Bump both together.
   COSIGN_VERSION: v3.1.3

@@ -3923,7 +3923,7 @@ fn test_extract_member_to_file_restores_rar5_unix_permissions() {
 
 #[test]
 #[cfg(unix)]
-fn test_extract_member_to_file_maps_rar5_windows_readonly_to_unix_mode() {
+fn test_extract_member_to_file_leaves_rar5_windows_readonly_at_creation_mode() {
     use std::os::unix::fs::PermissionsExt;
 
     let archive_bytes =
@@ -3938,9 +3938,13 @@ fn test_extract_member_to_file_maps_rar5_windows_readonly_to_unix_mode() {
         .unwrap();
 
     assert_eq!(written, b"readonly bytes".len() as u64);
-    let mode = std::fs::metadata(&out_path).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode & 0o222, 0, "Windows readonly should clear write bits");
-    assert_ne!(mode & 0o444, 0, "readonly file should remain readable");
+    // A Windows-origin member gets no chmod on Unix: it keeps the mode a
+    // plain `File::create` gives, read-only attribute or not.
+    let reference = temp_dir.path().join("reference.txt");
+    std::fs::File::create(&reference).unwrap();
+    let mode_of =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode_of(&out_path), mode_of(&reference));
 }
 
 #[test]

@@ -229,9 +229,10 @@ impl ProgressLatch {
             return;
         }
         self.printed = Some(line);
-        eprintln!(
+        safe_eprintln!(
             "create {stage:?}: {current}/{} ({} bytes)",
-            self.total, self.bytes
+            self.total,
+            self.bytes
         );
     }
 }
@@ -316,7 +317,7 @@ const PAR2CMDLINE_INVALID_COMMAND_LINE: u8 = 3;
 /// are refused with par2cmdline's invalid-command-line code.
 pub fn dispatch_par2cmdline_compat(args: &[OsString]) -> Option<u8> {
     if let Some(message) = refused_par2cmdline_invocation(args) {
-        eprintln!("{message}");
+        safe_eprintln!("{message}");
         return Some(PAR2CMDLINE_INVALID_COMMAND_LINE);
     }
     let input = parse_par2cmdline_repair_input(args)?;
@@ -324,8 +325,8 @@ pub fn dispatch_par2cmdline_compat(args: &[OsString]) -> Option<u8> {
     {
         Ok(resolved) => resolved,
         Err(error) => {
-            eprintln!("rarpar: {error}");
-            println!("Repair Failed.");
+            safe_eprintln!("rarpar: {error}");
+            safe_println!("Repair Failed.");
             return Some(error.exit_code());
         }
     };
@@ -340,8 +341,8 @@ pub fn dispatch_par2cmdline_compat(args: &[OsString]) -> Option<u8> {
             })
         }
         Err(error) => {
-            eprintln!("rarpar: {error}");
-            println!("Repair Failed.");
+            safe_eprintln!("rarpar: {error}");
+            safe_println!("Repair Failed.");
             Some(error.exit_code())
         }
     }
@@ -483,17 +484,17 @@ fn resolve_compat_input(
 fn emit_par2cmdline_outcome(outcome: &ParOutcome) {
     if outcome.success {
         if outcome.repaired {
-            println!("Repair is required");
-            println!("Repair is possible");
-            println!("Repair complete");
+            safe_println!("Repair is required");
+            safe_println!("Repair is possible");
+            safe_println!("Repair complete");
         } else {
-            println!("All files are correct");
+            safe_println!("All files are correct");
         }
     } else if let Some(blocks) = outcome.recovery_blocks_needed {
-        println!("Repair is required.");
-        println!("You need {blocks} more recovery blocks to be able to repair.");
+        safe_println!("Repair is required.");
+        safe_println!("You need {blocks} more recovery blocks to be able to repair.");
     } else {
-        println!("Repair Failed.");
+        safe_println!("Repair Failed.");
     }
 }
 
@@ -648,13 +649,13 @@ fn run_flow(
             && (!plan.swaps.is_empty() || !plan.renames.is_empty())
             && !quiet
         {
-            println!(
+            safe_println!(
                 "dry-run: would normalize file placement for {} file(s)",
                 plan.swaps.len() + plan.renames.len()
             );
         }
         if !quiet {
-            println!(
+            safe_println!(
                 "dry-run: would repair {} slice(s) using {} recovery block(s)",
                 repair_plan.missing_slices.len(),
                 repair_plan.recovery_exponents.len()
@@ -680,12 +681,12 @@ fn run_flow(
     {
         let moved = par2_rs::apply_placement_plan(&resolved.primary_dir, plan)?;
         if !quiet {
-            println!("normalized file placement before repair: moved {moved} file(s)");
+            safe_println!("normalized file placement before repair: moved {moved} file(s)");
         }
     }
 
     if !quiet {
-        println!(
+        safe_println!(
             "repairing {} slice(s) using {} recovery block(s)",
             repair_plan.missing_slices.len(),
             repair_plan.recovery_exponents.len()
@@ -1069,23 +1070,23 @@ fn verify_stream(cli: &Cli, args: &ParArgs, name: &str) -> Result<u8, RarparErro
                 "repairable":needed <= available && trailing == 0}});
         println!("{}", serde_json::to_string(&report)?);
     } else if !cli.quiet {
-        println!("rarpar par verify (standard input as {name})");
+        safe_println!("rarpar par verify (standard input as {name})");
         if by_md5 {
-            println!(
+            safe_println!(
                 "  {} of {expected} bytes, checked by the whole-file MD5",
                 received + trailing
             );
         } else {
-            println!(
+            safe_println!(
                 "  {} of {expected} bytes, {slices} slice(s) of {slice_size} bytes",
                 received + trailing
             );
         }
         if !damaged.is_empty() {
             let list: Vec<String> = damaged.iter().map(usize::to_string).collect();
-            println!("  damaged slices: {}", list.join(", "));
+            safe_println!("  damaged slices: {}", list.join(", "));
         }
-        println!("{message}");
+        safe_println!("{message}");
     }
     Ok(if success {
         EXIT_SUCCESS
@@ -1554,13 +1555,13 @@ fn build_repair_access(
 }
 
 fn print_context(action: &str, resolved: &ResolvedPar2Input, par2_set: &par2_rs::Par2FileSet) {
-    println!("rarpar par {action}");
-    println!("par2 files: {}", resolved.par2_paths.len());
-    println!("working dir: {}", resolved.primary_dir.display());
+    safe_println!("rarpar par {action}");
+    safe_println!("par2 files: {}", resolved.par2_paths.len());
+    safe_println!("working dir: {}", resolved.primary_dir.display());
     if !resolved.search_dirs.is_empty() {
-        println!("search dirs: {}", resolved.search_dirs.len());
+        safe_println!("search dirs: {}", resolved.search_dirs.len());
     }
-    println!(
+    safe_println!(
         "par2 set: files={}, slice_size={}, recovery_blocks={}",
         par2_set.files.len(),
         par2_set.slice_size,
@@ -1574,7 +1575,7 @@ fn print_verification_report(
     par2_set: &par2_rs::Par2FileSet,
 ) {
     if let Some(plan) = placement_plan {
-        println!(
+        safe_println!(
             "placement: exact={}, renames={}, swaps={}, unresolved={}, conflicts={}",
             plan.exact.len(),
             plan.renames.len(),
@@ -1592,48 +1593,55 @@ fn print_verification_report(
             par2_rs::FileStatus::Complete => complete += 1,
             par2_rs::FileStatus::Damaged(bad_slices) => {
                 damaged += 1;
-                println!("  damaged: {} ({} bad slice(s))", file.filename, bad_slices);
+                safe_println!("  damaged: {} ({} bad slice(s))", file.filename, bad_slices);
             }
             par2_rs::FileStatus::Missing => {
                 missing += 1;
-                println!(
+                safe_println!(
                     "  missing: {} ({} slice(s))",
-                    file.filename, file.missing_slice_count
+                    file.filename,
+                    file.missing_slice_count
                 );
             }
             par2_rs::FileStatus::Renamed(path) => {
-                println!("  renamed: {} -> {}", file.filename, path.display());
+                safe_println!("  renamed: {} -> {}", file.filename, path.display());
             }
         }
     }
 
-    println!(
+    safe_println!(
         "summary: {} complete, {} damaged, {} missing",
-        complete, damaged, missing
+        complete,
+        damaged,
+        missing
     );
-    println!(
+    safe_println!(
         "missing blocks: {}, recovery blocks available: {}",
-        verification.total_missing_blocks, verification.recovery_blocks_available
+        verification.total_missing_blocks,
+        verification.recovery_blocks_available
     );
     match &verification.repairable {
-        par2_rs::Repairability::NotNeeded => println!("repairability: not needed"),
+        par2_rs::Repairability::NotNeeded => safe_println!("repairability: not needed"),
         par2_rs::Repairability::Repairable {
             blocks_needed,
             blocks_available,
-        } => println!(
+        } => safe_println!(
             "repairability: repairable (need {}, have {})",
-            blocks_needed, blocks_available
+            blocks_needed,
+            blocks_available
         ),
         par2_rs::Repairability::Insufficient {
             blocks_needed,
             blocks_available,
             deficit,
-        } => println!(
+        } => safe_println!(
             "repairability: insufficient (need {}, have {}, deficit {})",
-            blocks_needed, blocks_available, deficit
+            blocks_needed,
+            blocks_available,
+            deficit
         ),
         par2_rs::Repairability::ResourceLimited { reason } => {
-            println!("repairability: resource-limited ({reason})")
+            safe_println!("repairability: resource-limited ({reason})")
         }
     }
 

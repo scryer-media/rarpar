@@ -401,18 +401,21 @@ pub fn emit_discovery(cli: &Cli, report: &DiscoveryReport) -> Result<(), RarparE
         return Ok(());
     }
 
-    println!("rarpar discovery");
-    println!("  roots: {}", report.roots.len());
-    println!("  recursive: {}", report.recursive);
-    println!("  files inspected: {}", report.files.len());
+    safe_println!("rarpar discovery");
+    safe_println!("  roots: {}", report.roots.len());
+    safe_println!("  recursive: {}", report.recursive);
+    safe_println!("  files inspected: {}", report.files.len());
     for set in &report.sets {
-        println!(
+        safe_println!(
             "  set {}: rar={}, rev={}, par2={}",
-            set.label, set.rar_volumes, set.rar_recovery_volumes, set.par2_files
+            set.label,
+            set.rar_volumes,
+            set.rar_recovery_volumes,
+            set.par2_files
         );
     }
     for set in &report.par3_sets {
-        println!(
+        safe_println!(
             "  PAR3 set {}: {} carrier(s), {} protected file(s), metadata complete={}",
             set.id,
             set.paths.len(),
@@ -421,11 +424,11 @@ pub fn emit_discovery(cli: &Cli, report: &DiscoveryReport) -> Result<(), RarparE
         );
     }
     for action in &report.planned_actions {
-        println!("  plan {}: {}", action.action, action.reason);
+        safe_println!("  plan {}: {}", action.action, action.reason);
     }
     for cleanup in &report.cleanup_candidates {
         if !cleanup.candidates.is_empty() {
-            println!("  cleanup candidates: {}", cleanup.candidates.len());
+            safe_println!("  cleanup candidates: {}", cleanup.candidates.len());
         }
     }
     // A dry run records the restores it planned, none of which it ran.
@@ -438,11 +441,11 @@ pub fn emit_discovery(cli: &Cli, report: &DiscoveryReport) -> Result<(), RarparE
         } else {
             "ok"
         };
-        println!("  {ran} {} [{}]: {}", action.action, status, action.message);
+        safe_println!("  {ran} {} [{}]: {}", action.action, status, action.message);
     }
     for cleanup in &report.cleanup_results {
         let status = if cleanup.success { "ok" } else { "failed" };
-        println!(
+        safe_println!(
             "  cleanup [{}]: {} candidate(s), {}",
             status,
             cleanup.candidates.len(),
@@ -459,7 +462,7 @@ pub fn emit_par_create_plan(cli: &Cli, plan: &Par2CreatePlan) -> Result<(), Rarp
     // report's `skipped_empty_files`, where a machine consumer will look.
     if !cli.json {
         for path in &plan.skipped_empty {
-            eprintln!(
+            safe_eprintln!(
                 "rarpar: skipping empty file (a PAR2 set cannot protect it): {}",
                 path.display()
             );
@@ -492,7 +495,7 @@ pub fn emit_par_create_outcome(
         };
         println!("{}", serde_json::to_string(&report)?);
     } else if !cli.quiet {
-        eprintln!(
+        safe_eprintln!(
             "  {}",
             if outcome.dry_run {
                 "dry-run complete"
@@ -500,15 +503,15 @@ pub fn emit_par_create_outcome(
                 "creation complete"
             }
         );
-        eprintln!(
+        safe_eprintln!(
             "  backend requested: {}",
             backend_name(outcome.requested_backend)
         );
-        eprintln!(
+        safe_eprintln!(
             "  backend selected: {}",
             backend_name(outcome.selected_backend)
         );
-        eprintln!(
+        safe_eprintln!(
             "  {}: {}",
             if outcome.dry_run {
                 "outputs planned"
@@ -517,7 +520,7 @@ pub fn emit_par_create_outcome(
             },
             outcome.output_paths.len()
         );
-        eprintln!("  bytes written: {}", outcome.bytes_written);
+        safe_eprintln!("  bytes written: {}", outcome.bytes_written);
     }
     Ok(())
 }
@@ -538,7 +541,7 @@ pub fn emit_rar_restore(cli: &Cli, outcome: &RarRestoreOutcome) -> Result<(), Ra
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else if !cli.quiet {
-        println!("{}", outcome.message);
+        safe_println!("{}", outcome.message);
     }
     Ok(())
 }
@@ -577,24 +580,24 @@ pub fn emit_rar_test_volumes(
                 // library debug-prints it.
                 ref status => format!("{status:?}"),
             };
-            println!("{}: {status}", result.path.display());
+            safe_println!("{}: {status}", result.path.display());
         }
     }
     Ok(())
 }
 
 fn print_plan_summary(plan: &Par2CreatePlan) {
-    eprintln!("rarpar par create");
-    eprintln!("  output: {}", plan.main_path.display());
-    eprintln!("  base path: {}", plan.base_path.display());
-    eprintln!("  source files: {}", plan.file_count());
-    eprintln!("  source slices: {}", plan.source_slice_count);
-    eprintln!("  slice size: {} bytes", plan.slice_size);
-    eprintln!("  recovery slices: {}", plan.recovery_count);
-    eprintln!("  recovery volumes: {}", plan.volume_count());
-    eprintln!("  backend requested: {}", backend_name(plan.backend));
+    safe_eprintln!("rarpar par create");
+    safe_eprintln!("  output: {}", plan.main_path.display());
+    safe_eprintln!("  base path: {}", plan.base_path.display());
+    safe_eprintln!("  source files: {}", plan.file_count());
+    safe_eprintln!("  source slices: {}", plan.source_slice_count);
+    safe_eprintln!("  slice size: {} bytes", plan.slice_size);
+    safe_eprintln!("  recovery slices: {}", plan.recovery_count);
+    safe_eprintln!("  recovery volumes: {}", plan.volume_count());
+    safe_eprintln!("  backend requested: {}", backend_name(plan.backend));
     if plan.dry_run {
-        eprintln!("  dry-run: no files written");
+        safe_eprintln!("  dry-run: no files written");
     }
 }
 

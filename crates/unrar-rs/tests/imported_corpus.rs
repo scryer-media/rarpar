@@ -10,7 +10,9 @@ use std::process::Command;
 
 use crc_turbo::crc32_iso_hdlc as crc32;
 use tempfile::TempDir;
-use unrar_rs::{ArchiveFormat, ExtractOptions, FileHash, RarArchive, ReadSeek, UnixOwnerInfo};
+use unrar_rs::{
+    ArchiveFormat, ExtractOptions, FileHash, HostOs, RarArchive, ReadSeek, UnixOwnerInfo,
+};
 
 const LIBARCHIVE_PASSWORD: &str = "password";
 const GENERATED_FIXTURE_PASSWORD: &str = "testpass123";
@@ -815,6 +817,70 @@ fn try_weaver_technical_entries(
         .collect())
 }
 
+/// Output names of members archived on another OS, whose mode unrar-rs
+/// leaves at the OS creation default, as UnRAR 7.30 beta 2 does: only a
+/// Unix-origin member (or a RAR5 Darwin one, which stores a POSIX mode)
+/// gets a `chmod`. The CI oracle is an older UnRAR that still converts
+/// Windows attributes, so for these the mode is checked on its own rather
+/// than against the oracle.
+fn other_os_paths(paths: &[PathBuf], password: Option<&str>) -> BTreeSet<String> {
+    let metadata = open_oracle_archive(paths, password).metadata();
+    let format = metadata.format;
+    metadata
+        .members
+        .into_iter()
+        .filter(|member| member.version.is_none())
+        .filter(|member| match member.host_os {
+            HostOs::Unix => false,
+            HostOs::Darwin => format != ArchiveFormat::Rar5,
+            HostOs::Windows | HostOs::Unknown(_) => true,
+        })
+        .map(|member| {
+            normalized_output_path(&member.name)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect()
+}
+
+/// Takes the mode out of each snapshot entry named in `names`, returning
+/// the modes taken from files and directories, by name.
+fn take_modes(
+    snapshot: &mut [FsSnapshotEntry],
+    names: &BTreeSet<String>,
+) -> BTreeMap<String, (bool, Option<u32>)> {
+    let mut taken = BTreeMap::new();
+    for entry in snapshot.iter_mut() {
+        match entry {
+            FsSnapshotEntry::Directory { name, mode, .. } if names.contains(name.as_str()) => {
+                taken.insert(name.clone(), (true, mode.take()));
+            }
+            FsSnapshotEntry::File { name, mode, .. } if names.contains(name.as_str()) => {
+                taken.insert(name.clone(), (false, mode.take()));
+            }
+            _ => {}
+        }
+    }
+    taken
+}
+
+/// The mode a new file or directory gets from the OS in this process:
+/// 0o666 or 0o777 less the umask, read from a fresh file and directory.
+#[cfg(unix)]
+fn creation_modes() -> (u32, u32) {
+    use std::os::unix::fs::MetadataExt;
+
+    let probe = TempDir::new().unwrap();
+    let file = probe.path().join("file");
+    let dir = probe.path().join("dir");
+    std::fs::write(&file, b"").unwrap();
+    std::fs::create_dir(&dir).unwrap();
+    (
+        std::fs::metadata(&file).unwrap().mode() & 0o7777,
+        std::fs::metadata(&dir).unwrap().mode() & 0o7777,
+    )
+}
+
 fn archived_mtime_paths(paths: &[PathBuf], password: Option<&str>) -> BTreeSet<String> {
     let members = open_oracle_archive(paths, password).metadata().members;
     let output_members: Vec<_> = members
@@ -1378,8 +1444,28 @@ fn imported_filesystem_outputs_match_unrar_when_available() {
         extract_weaver_to_filesystem(&paths, password, weaver_out.path());
 
         let compare_mtime_paths = archived_mtime_paths(&paths, password);
-        let unrar_snapshot = snapshot_filesystem(unrar_out.path(), &compare_mtime_paths);
-        let weaver_snapshot = snapshot_filesystem(weaver_out.path(), &compare_mtime_paths);
+        let mut unrar_snapshot = snapshot_filesystem(unrar_out.path(), &compare_mtime_paths);
+        let mut weaver_snapshot = snapshot_filesystem(weaver_out.path(), &compare_mtime_paths);
+
+        // Other-OS members: everything but the mode is compared with the
+        // oracle; the mode must be what the OS gave the new entry.
+        let other_os = other_os_paths(&paths, password);
+        take_modes(&mut unrar_snapshot, &other_os);
+        #[cfg_attr(not(unix), allow(unused_variables))]
+        let weaver_modes = take_modes(&mut weaver_snapshot, &other_os);
+        #[cfg(unix)]
+        {
+            let (file_mode, dir_mode) = creation_modes();
+            for (name, (is_directory, mode)) in &weaver_modes {
+                let expected = if *is_directory { dir_mode } else { file_mode };
+                assert_eq!(
+                    *mode,
+                    Some(expected),
+                    "{label}: other-OS member {name} should keep its creation mode"
+                );
+            }
+        }
+
         assert_eq!(
             weaver_snapshot, unrar_snapshot,
             "filesystem extraction mismatch for {label}"

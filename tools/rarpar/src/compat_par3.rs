@@ -208,10 +208,10 @@ impl Failure {
 
     fn emit(&self) {
         for line in &self.lines {
-            println!("{line}");
+            safe_println!("{line}");
         }
         for line in &self.stderr {
-            eprintln!("{line}");
+            safe_eprintln!("{line}");
         }
     }
 }
@@ -328,7 +328,7 @@ fn run(args: &[String]) -> u8 {
     let invocation = match parse(args) {
         Ok(Parsed::Exit(code, lines)) => {
             for line in lines {
-                println!("{line}");
+                safe_println!("{line}");
             }
             return code;
         }
@@ -339,7 +339,7 @@ fn run(args: &[String]) -> u8 {
         }
     };
     for line in &invocation.notices {
-        println!("{line}");
+        safe_println!("{line}");
     }
     let result = match prepare(&invocation) {
         Ok(context) => execute(&invocation, &context),
@@ -890,80 +890,80 @@ fn print_option_summary(invocation: &Invocation) {
     if options.memory_limit != 0 {
         let limit = options.memory_limit;
         if limit & ((1 << 30) - 1) == 0 {
-            println!("memory_limit = {} GB", limit >> 30);
+            safe_println!("memory_limit = {} GB", limit >> 30);
         } else if limit & ((1 << 20) - 1) == 0 {
-            println!("memory_limit = {} MB", limit >> 20);
+            safe_println!("memory_limit = {} MB", limit >> 20);
         } else if limit & ((1 << 10) - 1) == 0 {
-            println!("memory_limit = {} KB", limit >> 10);
+            safe_println!("memory_limit = {} KB", limit >> 10);
         } else {
-            println!("memory_limit = {limit} Bytes");
+            safe_println!("memory_limit = {limit} Bytes");
         }
     }
     if options.search_limit != 0 {
-        println!("search_limit = {} ms", options.search_limit);
+        safe_println!("search_limit = {} ms", options.search_limit);
     }
     if options.block_count != 0 {
-        println!("Specified block count = {}", options.block_count);
+        safe_println!("Specified block count = {}", options.block_count);
     }
     if options.block_size != 0 {
-        println!("Specified block size = {}", options.block_size);
+        safe_println!("Specified block size = {}", options.block_size);
     }
     if options.redundancy != 0 {
-        println!("Specified redundancy = {} %", options.redundancy);
+        safe_println!("Specified redundancy = {} %", options.redundancy);
     }
     if options.max_redundancy != 0 {
-        println!("max_redundancy_size = {}", options.max_redundancy);
+        safe_println!("max_redundancy_size = {}", options.max_redundancy);
     }
     if options.recovery_count != 0 {
-        println!("recovery_block_count = {}", options.recovery_count);
+        safe_println!("recovery_block_count = {}", options.recovery_count);
     }
     if options.first_recovery != 0 {
-        println!("First recovery block number = {}", options.first_recovery);
+        safe_println!("First recovery block number = {}", options.first_recovery);
     }
     if options.max_recovery != 0 {
-        println!("max_recovery_block = {}", options.max_recovery);
+        safe_println!("max_recovery_block = {}", options.max_recovery);
     }
     if options.file_count != 0 {
-        println!(
+        safe_println!(
             "Specified number of recovery files = {}",
             options.file_count
         );
     }
     match options.file_scheme {
-        -1 => println!("Recovery file sizing = uniform"),
-        -2 => println!("Recovery file sizing = limit"),
-        limit if limit > 0 => println!("Recovery file sizing = limit to {limit}"),
+        -1 => safe_println!("Recovery file sizing = uniform"),
+        -2 => safe_println!("Recovery file sizing = limit"),
+        limit if limit > 0 => safe_println!("Recovery file sizing = limit to {limit}"),
         _ => {}
     }
     if options.ecc != 0 {
-        println!("Error Correction Codes = {}", options.ecc);
+        safe_println!("Error Correction Codes = {}", options.ecc);
     }
     if options.interleave != 0 && options.ecc == 8 {
-        println!("Specified interleaving times = {}", options.interleave);
+        safe_println!("Specified interleaving times = {}", options.interleave);
     }
     if options.file_system != 0 {
-        println!("File System Packet = 0x{:X}", options.file_system);
+        safe_println!("File System Packet = 0x{:X}", options.file_system);
     }
     if options.dedup != 0 {
-        println!("deduplication = level {}", options.dedup as char);
+        safe_println!("deduplication = level {}", options.dedup as char);
     }
     if options.recursive {
-        println!("recursive search = enable");
+        safe_println!("recursive search = enable");
     }
     if options.absolute != 0 {
-        println!("Absolute path = enable");
+        safe_println!("Absolute path = enable");
     }
     if options.data_packets {
-        println!("Data packet = store");
+        safe_println!("Data packet = store");
     }
     if options.repetition_limit != 0 {
-        println!("Max packet repetition = {}", options.repetition_limit);
+        safe_println!("Max packet repetition = {}", options.repetition_limit);
     }
     if !options.base_path.is_empty() {
-        println!("Base path = \"{}\"", options.base_path);
+        safe_println!("Base path = \"{}\"", options.base_path);
     }
-    println!("PAR file = \"{}\"", invocation.par_filename);
-    println!();
+    safe_println!("PAR file = \"{}\"", invocation.par_filename);
+    safe_println!();
 }
 
 /// Everything par3cmdline accepts that the engine cannot honour, refused
@@ -1286,7 +1286,7 @@ fn load_carriers(
     let mut selected = None;
     for (index, (_, shown)) in carriers.iter().enumerate() {
         if noise >= -1 {
-            println!("Loading \"{shown}\".");
+            safe_println!("Loading \"{shown}\".");
         }
         let scanner = PacketScanner::new(
             access.clone(),
@@ -1302,7 +1302,7 @@ fn load_carriers(
                 return Err(engine_failure(error, trailer));
             }
             Err(_) => {
-                println!("Failed to open \"{shown}\", skip to next file.");
+                safe_println!("Failed to open \"{shown}\", skip to next file.");
                 continue;
             }
         };
@@ -1323,13 +1323,13 @@ fn load_carriers(
                     return Err(engine_failure(error, trailer));
                 }
                 Ok(ScanEvent::NeedData { .. }) | Err(_) => {
-                    println!("Failed to read \"{shown}\", skip to next file.");
+                    safe_println!("Failed to read \"{shown}\", skip to next file.");
                     break;
                 }
             }
         }
         if noise >= 0 {
-            println!("Loaded {new} new packets (found {found} packets)");
+            safe_println!("Loaded {new} new packets (found {found} packets)");
         }
     }
     Ok(Loaded { sets, selected })
@@ -1409,21 +1409,21 @@ fn print_partial_header(packets: &[IngestedPacket], noise: i32) -> bool {
         par3_rs::PacketBody::Creator(creator) => Some(creator.text().into_owned()),
         _ => None,
     }) {
-        println!();
-        println!("Creator text:");
-        println!("{}", text.trim_end_matches([' ', '\n', '\r', '\t']));
+        safe_println!();
+        safe_println!("Creator text:");
+        safe_println!("{}", text.trim_end_matches([' ', '\n', '\r', '\t']));
     }
     if let Some(text) = bodies().find_map(|body| match body {
         par3_rs::PacketBody::Comment(comment) => Some(comment.text().into_owned()),
         _ => None,
     }) {
         let text = text.trim_end_matches([' ', '\n', '\r', '\t']);
-        println!();
+        safe_println!();
         if text.contains('\n') {
-            println!("Comment text:");
-            println!("{text}");
+            safe_println!("Comment text:");
+            safe_println!("{text}");
         } else {
-            println!("Comment text: {text}");
+            safe_println!("Comment text: {text}");
         }
     }
     let start = bodies().find_map(|body| match body {
@@ -1437,15 +1437,15 @@ fn print_partial_header(packets: &[IngestedPacket], noise: i32) -> bool {
             generator: 0,
         },
     ));
-    println!();
-    println!("Block size = {block_size}");
+    safe_println!();
+    safe_println!("Block size = {block_size}");
     if noise >= 1 {
-        println!("Galois field size = {}", field.size);
-        println!("Galois field generator = {}", generator_text(field));
+        safe_println!("Galois field size = {}", field.size);
+        safe_println!("Galois field generator = {}", generator_text(field));
     }
     if let Some(root) = &root {
-        println!("Block count = {}", root.lowest_unused_block_index);
-        println!("Root attribute = {}", root.attributes);
+        safe_println!("Block count = {}", root.lowest_unused_block_index);
+        safe_println!("Root attribute = {}", root.attributes);
     }
     root.is_some()
 }
@@ -1474,9 +1474,9 @@ fn print_matrix_solve(set: &Par3Set, started: Instant) {
         Some(par3_rs::PacketBody::CauchyMatrix(_))
     );
     if cauchy && set.galois_field().size == 2 {
-        println!();
-        println!("Computing Reed Solomon matrix:");
-        println!("done in {:.1} seconds.", started.elapsed().as_secs_f64());
+        safe_println!();
+        safe_println!("Computing Reed Solomon matrix:");
+        safe_println!("done in {:.1} seconds.", started.elapsed().as_secs_f64());
     }
 }
 
@@ -1485,36 +1485,36 @@ fn print_header(set: &Par3Set, file_order: &[usize], noise: i32, block_map: bool
         return;
     }
     for text in set.creator_texts() {
-        println!();
-        println!("Creator text:");
-        println!("{}", text.trim_end_matches([' ', '\n', '\r', '\t']));
+        safe_println!();
+        safe_println!("Creator text:");
+        safe_println!("{}", text.trim_end_matches([' ', '\n', '\r', '\t']));
     }
     for text in set.comments() {
         let text = text.trim_end_matches([' ', '\n', '\r', '\t']);
-        println!();
+        safe_println!();
         if text.contains('\n') {
-            println!("Comment text:");
-            println!("{text}");
+            safe_println!("Comment text:");
+            safe_println!("{text}");
         } else {
-            println!("Comment text: {text}");
+            safe_println!("Comment text: {text}");
         }
     }
-    println!();
-    println!("Block size = {}", set.block_size());
+    safe_println!();
+    safe_println!("Block size = {}", set.block_size());
     if noise >= 1 {
         let field = set.galois_field();
-        println!("Galois field size = {}", field.size);
-        println!("Galois field generator = {}", generator_text(field));
+        safe_println!("Galois field size = {}", field.size);
+        safe_println!("Galois field generator = {}", generator_text(field));
     }
-    println!("Block count = {}", set.block_count());
-    println!("Root attribute = {}", set.root().attributes);
-    println!(
+    safe_println!("Block count = {}", set.block_count());
+    safe_println!("Root attribute = {}", set.root().attributes);
+    safe_println!(
         "Number of input file = {}, directory = {}",
         set.files().len(),
         set.directories().len()
     );
     let chunks: usize = set.files().iter().map(|file| file.chunks().len()).sum();
-    println!("Number of chunk description = {chunks}");
+    safe_println!("Number of chunk description = {chunks}");
     if !file_order.is_empty() {
         let total: u64 = set.files().iter().map(par3_rs::Par3File::size).sum();
         let largest = set
@@ -1523,12 +1523,12 @@ fn print_header(set: &Par3Set, file_order: &[usize], noise: i32, block_map: bool
             .map(par3_rs::Par3File::size)
             .max()
             .unwrap_or(0);
-        println!("Total file size = {total}");
-        println!("Max file size = {largest}");
+        safe_println!("Total file size = {total}");
+        safe_println!("Max file size = {largest}");
         // Only verify and repair map the blocks, and print what they found.
         if block_map {
             let (packed, deduplicated) = tail_packing(set);
-            println!("Tail packing = {packed}, Deduplication = {deduplicated}");
+            safe_println!("Tail packing = {packed}, Deduplication = {deduplicated}");
         }
     }
 }
@@ -1667,33 +1667,33 @@ fn print_listing(set: &Par3Set, file_order: &[usize], directory_order: &[usize],
             .max()
             .unwrap_or(0)
             .max(8);
-        println!();
+        safe_println!();
         let dashes = match detail {
             0 => {
-                println!(" File ({})", file_order.len());
-                print!(" ");
+                safe_println!(" File ({})", file_order.len());
+                safe_print!(" ");
                 longest.min(119)
             }
             1 => {
-                println!(" Size (Bytes)  File ({})", file_order.len());
-                print!(" ------------  ");
+                safe_println!(" Size (Bytes)  File ({})", file_order.len());
+                safe_print!(" ------------  ");
                 longest.min(104)
             }
             _ => {
-                println!(
+                safe_println!(
                     " Size (Bytes)            BLAKE3 Hash            File ({})",
                     file_order.len()
                 );
-                print!(" ------------ --------------------------------  ");
+                safe_print!(" ------------ --------------------------------  ");
                 longest.min(71)
             }
         };
-        println!("{}", "-".repeat(dashes));
+        safe_println!("{}", "-".repeat(dashes));
         for &index in file_order {
             let file = &set.files()[index];
             match detail {
-                0 => println!("\"{}\"", file.path()),
-                1 => println!("{:13} \"{}\"", file.size(), file.path()),
+                0 => safe_println!("\"{}\"", file.path()),
+                1 => safe_println!("{:13} \"{}\"", file.size(), file.path()),
                 _ => {
                     let hash: String = file
                         .fingerprint()
@@ -1701,7 +1701,7 @@ fn print_listing(set: &Par3Set, file_order: &[usize], directory_order: &[usize],
                         .iter()
                         .map(|byte| format!("{byte:02x}"))
                         .collect();
-                    println!("{:13} {hash} \"{}\"", file.size(), file.path());
+                    safe_println!("{:13} {hash} \"{}\"", file.size(), file.path());
                 }
             }
         }
@@ -1713,14 +1713,14 @@ fn print_listing(set: &Par3Set, file_order: &[usize], directory_order: &[usize],
             .max()
             .unwrap_or(0)
             .clamp(13, 119);
-        println!();
-        println!(" Directory ({})", directory_order.len());
-        println!(" {}", "-".repeat(longest));
+        safe_println!();
+        safe_println!(" Directory ({})", directory_order.len());
+        safe_println!(" {}", "-".repeat(longest));
         for &index in directory_order {
-            println!("\"{}\"", set.directories()[index].path());
+            safe_println!("\"{}\"", set.directories()[index].path());
         }
     }
-    println!();
+    safe_println!();
 }
 
 /// Join a name the PAR3 set supplies onto `root`, refusing anything but plain
@@ -1838,7 +1838,7 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
             _ => {}
         }
         if noise >= -1 {
-            println!("Listed");
+            safe_println!("Listed");
         }
         return Ok(());
     }
@@ -1856,9 +1856,9 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
     let mut missing_directories = Vec::new();
     if !directory_order.is_empty() {
         if noise >= -1 {
-            println!();
-            println!("Verifying input directories:");
-            println!();
+            safe_println!();
+            safe_println!("Verifying input directories:");
+            safe_println!();
         }
         for &index in &directory_order {
             let name = set.directories()[index].path();
@@ -1873,7 +1873,7 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
                 missing_directories.push((name.to_owned(), path));
             }
             if noise >= -1 {
-                println!("Target: \"{name}\"{state}");
+                safe_println!("Target: \"{name}\"{state}");
             }
         }
     }
@@ -1983,9 +1983,9 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
     let mut embedded: BTreeMap<String, Vec<std::ops::Range<u64>>> = BTreeMap::new();
 
     if noise >= 0 {
-        println!();
-        println!("Verifying input files:");
-        println!();
+        safe_println!();
+        safe_println!("Verifying input files:");
+        safe_println!();
     }
     let mut states = Vec::new();
     for &index in &file_order {
@@ -2033,18 +2033,18 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
             }
         };
         if noise >= 0 && matches!(state, FileState::Complete | FileState::Damaged { .. }) {
-            println!("Opening: \"{}\"", file.path());
+            safe_println!("Opening: \"{}\"", file.path());
         }
         if noise >= -1 {
             match state {
-                FileState::Missing => println!("Target: \"{}\" - missing.", file.path()),
-                FileState::NotFile => println!("Target: \"{}\" - not file.", file.path()),
-                FileState::Found => println!("Target: \"{}\" - found.", file.path()),
+                FileState::Missing => safe_println!("Target: \"{}\" - missing.", file.path()),
+                FileState::NotFile => safe_println!("Target: \"{}\" - not file.", file.path()),
+                FileState::Found => safe_println!("Target: \"{}\" - found.", file.path()),
                 FileState::Complete if embedded.contains_key(file.path()) => {
-                    println!("Target: \"{}\" - protected data is complete.", file.path())
+                    safe_println!("Target: \"{}\" - protected data is complete.", file.path())
                 }
-                FileState::Complete => println!("Target: \"{}\" - complete.", file.path()),
-                FileState::Damaged { available, size } => println!(
+                FileState::Complete => safe_println!("Target: \"{}\" - complete.", file.path()),
+                FileState::Damaged { available, size } => safe_println!(
                     "Target: \"{}\" - damaged. {available} of {size} bytes available.",
                     file.path()
                 ),
@@ -2067,40 +2067,40 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
         && (status == RepairStatus::Complete || !embedded.is_empty())
     {
         if noise >= -1 {
-            println!();
-            println!("All files are correct, repair is not required.");
+            safe_println!();
+            safe_println!("All files are correct, repair is not required.");
         }
         return Ok(());
     }
     if noise >= -1 {
-        println!();
-        println!("Repair is required.");
+        safe_println!();
+        safe_println!("Repair is required.");
     }
     let block_count = set.block_count();
     let available = block_count.saturating_sub(lost_blocks);
     if noise >= 0 {
         let directories = directory_order.len();
         if !missing_directories.is_empty() {
-            println!("{} directories are missing.", missing_directories.len());
+            safe_println!("{} directories are missing.", missing_directories.len());
         }
         if directories > missing_directories.len() {
-            println!(
+            safe_println!(
                 "{} directories are ok.",
                 directories - missing_directories.len()
             );
         }
         if missing_files > 0 {
-            println!("{missing_files} files are missing.");
+            safe_println!("{missing_files} files are missing.");
         }
         if damaged_files > 0 {
-            println!("{damaged_files} files exist but are damaged.");
+            safe_println!("{damaged_files} files exist but are damaged.");
         }
         let ok = states.len() - missing_files - damaged_files;
         if ok > 0 {
-            println!("{ok} files are ok.");
+            safe_println!("{ok} files are ok.");
         }
         if missing_files + damaged_files > 0 {
-            println!("You have {available} out of {block_count} input blocks available.");
+            safe_println!("You have {available} out of {block_count} input blocks available.");
         }
         // par3cmdline reports the count for each Matrix packet it holds,
         // once it holds any Recovery Data packet.
@@ -2109,7 +2109,7 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
                 Some(par3_rs::PacketBody::FftMatrix(_)) => "FFT based Reed-Solomon Codes",
                 _ => "Cauchy Reed-Solomon Codes",
             };
-            println!("You have {recovery_blocks} recovery blocks available for {codes}.");
+            safe_println!("You have {recovery_blocks} recovery blocks available for {codes}.");
         }
     }
     let possible = matches!(status, RepairStatus::Ready | RepairStatus::Complete);
@@ -2117,16 +2117,16 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
         let lack: u64 = requirements.iter().map(|(additional, _)| additional).sum();
         let cohorts = requirements.first().map_or(1, |(_, cohorts)| *cohorts);
         if noise >= -1 {
-            println!("Repair is not possible.");
+            safe_println!("Repair is not possible.");
             if cohorts <= 1 {
-                println!("You need {lack} more recovery blocks to be able to repair.");
+                safe_println!("You need {lack} more recovery blocks to be able to repair.");
             } else {
                 let volumes = requirements
                     .iter()
                     .map(|(additional, _)| *additional)
                     .max()
                     .unwrap_or(0);
-                println!(
+                safe_println!(
                     "You need {lack} more recovery blocks ({volumes} volumes) to be able to repair."
                 );
             }
@@ -2134,19 +2134,19 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
         return Ok(());
     }
     if noise >= -1 {
-        println!("Repair is possible.");
+        safe_println!("Repair is possible.");
     }
     if noise >= 0 {
         if lost_blocks == 0 {
-            println!("None of the recovery blocks will be used for the repair.");
+            safe_println!("None of the recovery blocks will be used for the repair.");
         } else {
             if recovery_blocks > lost_blocks {
-                println!(
+                safe_println!(
                     "You have an excess of {} recovery blocks.",
                     recovery_blocks - lost_blocks
                 );
             }
-            println!("{lost_blocks} recovery blocks will be used to repair.");
+            safe_println!("{lost_blocks} recovery blocks will be used to repair.");
         }
     }
     if operation != Operation::Repair {
@@ -2192,9 +2192,9 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
             .map_err(session_failure)?;
             if noise >= 0 && lost_blocks > 0 {
                 print_matrix_solve(&set, started);
-                println!();
-                println!("Recovering lost input blocks:");
-                println!("done in {:.1} seconds.", started.elapsed().as_secs_f64());
+                safe_println!();
+                safe_println!("Recovering lost input blocks:");
+                safe_println!("done in {:.1} seconds.", started.elapsed().as_secs_f64());
             }
             if installed {
                 repaired.push(name);
@@ -2203,9 +2203,9 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
             let report = session.repair(base, true).map_err(session_failure)?;
             if noise >= 0 && lost_blocks > 0 {
                 print_matrix_solve(&set, started);
-                println!();
-                println!("Recovering lost input blocks:");
-                println!("done in {:.1} seconds.", started.elapsed().as_secs_f64());
+                safe_println!();
+                safe_println!("Recovering lost input blocks:");
+                safe_println!("done in {:.1} seconds.", started.elapsed().as_secs_f64());
             }
             for installed in report.installed {
                 let name = destinations
@@ -2218,13 +2218,13 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
         }
     }
     if noise >= 0 {
-        println!();
-        println!("Verifying repaired files:");
-        println!();
+        safe_println!();
+        safe_println!("Verifying repaired files:");
+        safe_println!();
         for (name, state) in &states {
             if !matches!(state, FileState::Complete | FileState::Found) {
                 let fixed = repaired.contains(name);
-                println!(
+                safe_println!(
                     "Target: \"{name}\" - {}.",
                     match (fixed, embedded.contains_key(name)) {
                         (false, _) => "failed",
@@ -2239,11 +2239,11 @@ fn verify(invocation: &Invocation, context: &Context) -> Result<(), Failure> {
         .iter()
         .filter(|(_, state)| !matches!(state, FileState::Complete | FileState::Found))
         .all(|(name, _)| repaired.contains(name));
-    println!();
+    safe_println!();
     if all_fixed {
-        println!("Repair complete.");
+        safe_println!("Repair complete.");
     } else {
-        println!("Repair failed.");
+        safe_println!("Repair failed.");
     }
     Ok(())
 }

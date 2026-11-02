@@ -1,3 +1,6 @@
+// First, so its output macros are in scope in every module below.
+#[macro_use]
+mod term;
 #[cfg(feature = "sevenz")]
 mod archive;
 mod cleanup;
@@ -60,7 +63,7 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
-            eprintln!("rarpar: {error}");
+            safe_eprintln!("rarpar: {error}");
             ExitCode::from(error.exit_code())
         }
     }

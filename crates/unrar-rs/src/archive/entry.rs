@@ -247,6 +247,12 @@ impl<'a> Entry<'a> {
     /// members create the directory; symlinks, hardlinks and file copies are
     /// created as such.
     ///
+    /// A hardlink or file-copy target is resolved beneath the extraction root
+    /// (`path` with the member's name taken off) without following symlinks.
+    /// A target whose path passes through a symlink, junction or other
+    /// reparse point is refused with [`RarError::UnsafeLinkTarget`], even
+    /// when the link points back inside the root.
+    ///
     /// Returns the number of bytes written.
     pub fn unpack_to<P: AsRef<Path>>(self, path: P) -> RarResult<u64> {
         let _decode = self.archive.decode_mode.enter();

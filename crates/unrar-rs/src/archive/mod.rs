@@ -7,6 +7,7 @@ mod cache;
 mod entry;
 mod facts;
 mod legacy;
+mod link_anchor;
 mod member;
 mod parse;
 mod volume;

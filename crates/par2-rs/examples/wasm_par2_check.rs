@@ -60,7 +60,7 @@
 //!   cargo build --release -p par2-rs --no-default-features \
 //!     --target wasm32-wasip1 --example wasm_par2_check
 //!
-//! Run (wasmtime 47; host::guest preopens):
+//! Run (wasmtime 50; host::guest preopens):
 //!   wasmtime run \
 //!     --dir crates/par2-rs/tests/fixtures::/fixtures \
 //!     --dir <writable-scratch>::/scratch \

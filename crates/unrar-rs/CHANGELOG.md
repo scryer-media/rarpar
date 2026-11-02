@@ -1,5 +1,91 @@
 # Changelog
 
+## 0.15.1
+
+### Security
+
+- A hard-link or file-copy target that passes through a symlink is refused,
+  as [UnRAR 7.30 beta 2 (October 27, 2026), security fix 1(d)](https://www.rarlab.com/rarnew.htm)
+  refuses it: "hard link extraction is blocked by default if hard link
+  target includes symlinks". No CVE had been assigned when this entry was
+  written. Before, a target such as `dir/file.bin` was resolved as a path,
+  so a `dir` symlink already in the output directory, or one extracted
+  earlier from the same archive, linked a file outside the output
+  directory into it and then changed that file's mode or attributes. A
+  file copy read the outside file the same way. Now every target
+  component is opened beneath the extraction root without following
+  symlinks — on Unix with `openat(O_NOFOLLOW | O_DIRECTORY)`, linked with
+  `linkat` through the held directory handles and its mode set through a
+  descriptor checked to be the file just linked; on Windows by opening
+  each component with `FILE_FLAG_OPEN_REPARSE_POINT` and holding the
+  directories without delete sharing until the link is made. A symlink,
+  junction or other reparse point anywhere in the target, including one
+  that points back inside the output directory, or a directory component
+  that is not a directory, is `RarError::UnsafeLinkTarget`, and the
+  existing output is left in place. Unlike UnRAR there is no switch to
+  allow it.
+- On Unix, a process that is not root no longer restores set-user-ID or
+  set-group-ID from the archive, as
+  [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
+  stopped doing. No CVE had been assigned when this entry was written.
+  Before, a Unix-origin member's mode was applied as stored, so an archive
+  could leave a set-user-ID executable owned by the extracting user. Now
+  an extracted file loses both bits and a directory loses set-user-ID but
+  keeps set-group-ID; the same mode is used when a hard link's mode is set
+  through its descriptor. Root keeps the stored mode.
+- A link member whose name has a doubled separator, such as `a//b/link`,
+  may no longer climb out of its directory with `..`, as
+  [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
+  refuses it. No CVE had been assigned when this entry was written.
+  Before, every separator counted as a directory level, so `a//b/link`
+  was allowed three `..` while the OS resolves it two deep, and a target
+  `../../../x` landed one level outside the output directory. Now a
+  doubled separator anywhere in the name — `//`, or for RAR 4.x and older
+  names `\\` and `\/` — allows no `..` at all, and such a link is
+  `RarError::UnsafeLinkTarget`. The name itself is still kept as written.
+- On Windows, a symlink or junction target that starts with a drive letter,
+  such as `C:..\..\x` or `c:foo`, is `RarError::UnsafeLinkTarget`, as
+  [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
+  refuses it: there it resolves against that drive's current directory,
+  outside the output directory. No CVE had been assigned when this entry
+  was written. On Unix such a target is a relative path (`C:..` is a file
+  name) and is created as before, as UnRAR does. Hard-link and file-copy
+  targets, which resolve beneath the output directory, are unchanged.
+- On Unix a regular member's output file is opened with `O_NOFOLLOW`, as
+  [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
+  added "as the additional protection against overwriting the link
+  target". No CVE had been assigned when this entry was written. A symlink
+  already at the output path was, and still is, removed first; before, one
+  placed there between that removal and the open was followed and the file
+  it pointed to truncated and overwritten. Now that open fails with
+  `RarError::Io` (`ELOOP`) and the file is left alone.
+- Every Windows junction member is `RarError::UnsafeLinkTarget`, on every
+  host, before anything is created, as
+  [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
+  refuses junctions unless absolute links are allowed: a junction is
+  absolute in practice, and a relative one does not resolve once created.
+  No CVE had been assigned when this entry was written. Before, a junction
+  whose target passed the relative-link checks was created as a junction
+  on Windows and as a symlink on Unix. unrar-rs has no option to allow
+  absolute links, so there is no way to extract one.
+
+### Changed
+
+- Native WebAssembly conformance tests use Wasmtime 50.0.1.
+- On Unix, a member archived on another OS — Windows, an unknown host, or
+  the RAR 4.x legacy Mac marker — gets no `chmod`: it keeps the mode the OS
+  gave it at creation, 0o666 for a file or 0o777 for a directory less the
+  process umask. Before, unrar-rs converted its attributes, turning a
+  Windows read-only file into 0o444, and to apply the umask it read it
+  with `umask(2)`, which can only read the mask by setting it and so raced
+  other threads of the process creating files. A Windows read-only member
+  is therefore writable after extraction on Unix now. This follows
+  [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm),
+  which stopped converting other-OS attributes for the same thread-safety
+  reason. Unix-origin members, and RAR5 members with a Darwin host, keep
+  their stored mode (less set-user-ID and set-group-ID as above), and on
+  Windows the read-only attribute is still set.
+
 ## 0.15.0
 
 ### Added

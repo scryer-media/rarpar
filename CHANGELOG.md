@@ -10,6 +10,62 @@ documented in each crate's own changelog so those notes ship with the crate.
   honoured, through par2-rs 0.11.0. Before, such a name arrived with
   replacement characters, so `par2 verify` and `par2 repair` looked for a
   file that did not exist.
+- Security: RAR extraction refuses a hard-link or file-copy target that
+  passes through a symlink, junction or other reparse point, through
+  unrar-rs 0.15.1, as
+  [UnRAR 7.30 beta 2 (October 27, 2026), security fix 1(d)](https://www.rarlab.com/rarnew.htm)
+  does: "hard link extraction is blocked by default if hard link target
+  includes symlinks". No CVE had been assigned when this entry was
+  written. Before, `x -o-` over a destination whose kept `file.txt` was a
+  symlink to a file elsewhere linked that file in as the archive's hard
+  link and changed its mode. The refused member now fails extraction with
+  `unsafe link target`.
+- Security: on Unix, RAR extraction run by a user other than root no longer
+  restores set-user-ID or set-group-ID from the archive, through unrar-rs
+  0.15.1, as [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
+  does. No CVE had been assigned when this entry was written. Files lose
+  both bits; directories lose set-user-ID and keep set-group-ID.
+- Security: RAR extraction refuses a link member with a doubled separator
+  in its name, such as `a//b/link`, whose target climbs with `..`, through
+  unrar-rs 0.15.1, as [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
+  does. No CVE had been assigned when this entry was written. Before, the
+  doubled separator counted as an extra directory level, so a target
+  could point one level outside the destination.
+- Security: on Windows, RAR extraction refuses a symlink or junction whose
+  target starts with a drive letter, such as `C:..\..\x`, through unrar-rs
+  0.15.1, as [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
+  does: it resolves outside the destination. No CVE had been assigned when
+  this entry was written. On Unix such a target is a relative path and is
+  created as before.
+- Security: on Unix, RAR extraction opens each output file without
+  following a symlink, through unrar-rs 0.15.1, as
+  [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
+  does. No CVE had been assigned when this entry was written. A symlink
+  that appears at the output path while a member is being extracted now
+  fails that member instead of having its target overwritten.
+- Security: every human-readable line `rarpar` prints, including the
+  `unrar`, `7z` and `par3` compatibility front ends, error messages and
+  the password prompt, shows terminal control characters escaped as
+  `\xNN`, as
+  [UnRAR 7.30 beta 2 (October 27, 2026), security fix 1(b)](https://www.rarlab.com/rarnew.htm)
+  does for its console and log output. No CVE had been assigned when this
+  entry was written. Before, an archive member name or a PAR2 or PAR3 file
+  name was printed raw, so a crafted name could move the cursor, rewrite
+  earlier lines or reorder text. Escaped are backspace, a carriage return
+  not followed by a line feed, SUB, ESC, DEL, the C1 controls U+0080 to
+  U+009F and the bidirectional embeddings and overrides U+202A to U+202E.
+  `--json` output is unchanged.
+- On Unix, RAR extraction of a member archived on Windows or another
+  non-Unix OS no longer sets its mode, through unrar-rs 0.15.1, as
+  [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
+  does: the file keeps the mode the OS gives it at creation, so a Windows
+  read-only member is no longer made 0o444.
+- Security: RAR extraction refuses every Windows junction member with
+  `unsafe link target`, on every platform, through unrar-rs 0.15.1, as
+  [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
+  does unless absolute links are allowed. No CVE had been assigned when
+  this entry was written. Before, a junction with a relative target was
+  created as a junction on Windows and a symlink elsewhere.
 
 ## rarpar 0.9.3
 

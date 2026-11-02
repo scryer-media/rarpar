@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::io::{BufReader, BufWriter, Write};
 use std::rc::Rc;
 use std::sync::Arc;
-#[cfg(any(unix, windows))]
+#[cfg(windows)]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -46,7 +46,7 @@ const OUTPUT_WRITE_BUFFER_BYTES: usize = 512 * 1024;
 const DECODE_INPUT_BUFFER_BYTES: usize = 256 * 1024;
 const MAX_LINK_TARGET_BYTES: usize = 0x10000;
 const MAX_COMMENT_BYTES: u64 = 0x1000000;
-#[cfg(any(windows, test))]
+#[cfg(test)]
 const WINDOWS_IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
 #[cfg(any(windows, test))]
 const WINDOWS_IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
@@ -132,20 +132,6 @@ struct WindowsHostMetadata {
     mtime: Option<std::time::SystemTime>,
     ctime: Option<std::time::SystemTime>,
     atime: Option<std::time::SystemTime>,
-}
-
-#[cfg(unix)]
-fn current_umask() -> u32 {
-    static UMASK: OnceLock<u32> = OnceLock::new();
-    *UMASK.get_or_init(|| {
-        // `umask` is the only portable way to read the current mask. Restore it
-        // immediately after reading it.
-        let mask = unsafe { libc::umask(0o022) };
-        unsafe {
-            libc::umask(mask);
-        }
-        mask as u32
-    })
 }
 
 struct Rar5ReaderCrypto {
@@ -1871,7 +1857,22 @@ impl RarArchive {
         Self::ensure_output_parent_dir_for_member(member_name, out_path)?;
         Self::remove_existing_regular_output_symlink(out_path)?;
         Self::clear_windows_readonly_before_overwrite(out_path)?;
-        std::fs::File::create(out_path).map_err(RarError::from)
+        Self::open_regular_output_file(out_path)
+    }
+
+    /// Creates or truncates `out_path` for writing. On Unix the open does
+    /// not follow a symlink in the final component, so one planted after
+    /// `remove_existing_regular_output_symlink` ran fails the open (`ELOOP`)
+    /// instead of truncating the file it points to.
+    fn open_regular_output_file(out_path: &std::path::Path) -> RarResult<std::fs::File> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::custom_flags(
+            &mut options,
+            libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        );
+        options.open(out_path).map_err(RarError::from)
     }
 
     fn create_regular_output_file_for_member(
@@ -2029,74 +2030,6 @@ impl RarArchive {
                 link_type: "symlink".to_string(),
             })
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn create_windows_junction_output(
-        fh: &FileHeader,
-        owner: Option<&crate::types::UnixOwnerInfo>,
-        options: &ExtractOptions,
-        member_name: &str,
-        raw_member_name: &str,
-        safety_target: &str,
-        reparse_target: &str,
-        out_path: &std::path::Path,
-    ) -> RarResult<u64> {
-        Self::ensure_output_parent_dir_for_member(member_name, out_path)?;
-        Self::ensure_safe_symlink_target(
-            fh,
-            member_name,
-            safety_target,
-            raw_member_name,
-            out_path,
-        )?;
-        Self::remove_existing_link_output(out_path)?;
-
-        #[cfg(windows)]
-        {
-            let _ = owner;
-            let _ = options;
-
-            Self::create_windows_junction_reparse_point(reparse_target, out_path, raw_member_name)?;
-            Self::apply_symlink_times(fh, out_path)?;
-            Ok(0)
-        }
-
-        #[cfg(unix)]
-        {
-            let _ = reparse_target;
-            let target = std::ffi::OsStr::new(safety_target);
-            std::os::unix::fs::symlink(target, out_path).map_err(RarError::from)?;
-            Self::apply_symlink_times(fh, out_path)?;
-            if options.restore_owners {
-                Self::apply_unix_owner(owner, out_path, false)?;
-            }
-            Ok(0)
-        }
-
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = fh;
-            let _ = owner;
-            let _ = options;
-            let _ = reparse_target;
-            let _ = out_path;
-            Err(RarError::UnsupportedLinkType {
-                member: raw_member_name.to_string(),
-                link_type: "WindowsJunction".to_string(),
-            })
-        }
-    }
-
-    #[cfg(windows)]
-    fn create_windows_junction_reparse_point(
-        target: &str,
-        out_path: &std::path::Path,
-        member: &str,
-    ) -> RarResult<()> {
-        Self::ensure_safe_windows_reparse_target(target, member)?;
-        let buffer = Self::windows_junction_reparse_buffer(target)?;
-        Self::create_windows_reparse_point(out_path, true, buffer)
     }
 
     #[cfg(windows)]
@@ -2321,7 +2254,9 @@ impl RarArchive {
         };
     }
 
-    #[cfg(any(windows, test))]
+    /// Junction members are always refused; this builds a junction only so
+    /// Windows tests can plant one in the output tree as a hostile condition.
+    #[cfg(test)]
     fn windows_junction_reparse_buffer(target: &str) -> RarResult<Vec<u8>> {
         let substitute_name = Self::windows_junction_substitute_name(target);
         let print_name = Self::windows_reparse_print_name(&substitute_name);
@@ -2442,7 +2377,7 @@ impl RarArchive {
         Ok(buffer)
     }
 
-    #[cfg(any(windows, test))]
+    #[cfg(test)]
     fn windows_junction_substitute_name(target: &str) -> String {
         if let Some(rest) = target.strip_prefix("/??/") {
             format!("\\??\\{}", rest.replace('/', "\\"))
@@ -3083,8 +3018,38 @@ impl RarArchive {
         Ok(uid_matches && gid_matches)
     }
 
+    /// The mode an extracted member is given on disk: the header's mode,
+    /// with set-user-ID and set-group-ID dropped unless the process runs as
+    /// root, or `None` (no `chmod` at all) for a member archived on another
+    /// OS. Every place a header mode reaches `chmod` or `fchmod`, including
+    /// the hard-link path, goes through here.
     #[cfg(unix)]
     fn unix_output_mode(fh: &FileHeader) -> Option<u32> {
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let is_root = unsafe { libc::geteuid() } == 0;
+        Self::unix_header_mode(fh)
+            .map(|mode| Self::strip_privileged_mode_bits(mode, fh.is_directory, is_root))
+    }
+
+    /// Drops set-user-ID and set-group-ID from a file mode, and set-user-ID
+    /// from a directory mode, for a process that is not root. A directory
+    /// keeps set-group-ID, which only makes new entries inherit the
+    /// directory's group. RAR's own extractor applies the same rule.
+    #[cfg(unix)]
+    fn strip_privileged_mode_bits(mode: u32, is_directory: bool, is_root: bool) -> u32 {
+        const SET_USER_ID: u32 = 0o4000;
+        const SET_GROUP_ID: u32 = 0o2000;
+        if is_root {
+            mode
+        } else if is_directory {
+            mode & !SET_USER_ID
+        } else {
+            mode & !(SET_USER_ID | SET_GROUP_ID)
+        }
+    }
+
+    #[cfg(unix)]
+    fn unix_header_mode(fh: &FileHeader) -> Option<u32> {
         match fh.host_os {
             crate::types::HostOs::Unix => {
                 let mode = fh.attributes.unix_mode() & 0o7777;
@@ -3094,23 +3059,16 @@ impl RarArchive {
                 let mode = fh.attributes.unix_mode() & 0o7777;
                 Some(mode)
             }
-            crate::types::HostOs::Windows => {
-                let mode = if fh.is_directory || fh.attributes.is_directory_attr() {
-                    0o777
-                } else if fh.attributes.is_readonly() {
-                    0o444
-                } else {
-                    0o666
-                };
-                Some(mode & !current_umask())
-            }
-            crate::types::HostOs::Darwin | crate::types::HostOs::Unknown(_) => {
-                // RAR4 `HSYS_MACOS` is a legacy Mac marker, not POSIX mode
-                // storage. Treat it like other non-Unix legacy hosts, so only
-                // real Unix archive origins preserve raw mode bits here.
-                let mode = if fh.is_directory { 0o777 } else { 0o666 };
-                Some(mode & !current_umask())
-            }
+            // Windows, unknown hosts and the RAR4 `HSYS_MACOS` legacy marker
+            // store no POSIX mode. The member keeps the mode the OS gave it
+            // at creation (0o666 or 0o777 less the process umask), with no
+            // `chmod`: converting their attributes would mean reading the
+            // umask, which `umask(2)` only allows by setting it, racing
+            // other threads that create files. RAR stopped converting them
+            // for the same reason.
+            crate::types::HostOs::Windows
+            | crate::types::HostOs::Darwin
+            | crate::types::HostOs::Unknown(_) => None,
         }
     }
 
@@ -3137,14 +3095,91 @@ impl RarArchive {
     ) -> RarResult<u64> {
         Self::ensure_output_parent_dir_for_member(member_name, out_path)?;
         Self::ensure_safe_link_target(member_name, target, raw_member_name, out_path)?;
-        Self::remove_existing_link_output(out_path)?;
-        let target_path = Self::redirection_target_path(member_name, target, out_path);
-        std::fs::hard_link(&target_path, out_path).map_err(RarError::from)?;
-        // Set attributes for hardlinks after creation because deleting or
-        // replacing the output link can affect the shared target metadata.
-        Self::apply_unix_permissions(fh, out_path)?;
-        Self::apply_windows_attributes(fh, out_path)?;
-        Ok(0)
+
+        // The target is resolved beneath the extraction root without
+        // following a symlink or reparse point, and the link is made through
+        // the handles that resolution holds (see `link_anchor`). Attributes
+        // are set after creation, on the file just linked, because deleting
+        // or replacing the output link can affect the shared target metadata.
+        #[cfg(any(unix, windows))]
+        {
+            let anchor_error = |error| Self::link_anchor_error(error, raw_member_name, target);
+            let root = Self::redirection_target_root(member_name, out_path);
+            let relative = crate::path::sanitize_file_redirection_path(target);
+            let anchored = super::link_anchor::AnchoredTarget::resolve(&root, &relative)
+                .map_err(anchor_error)?;
+            Self::remove_existing_link_output(out_path)?;
+            #[cfg(unix)]
+            {
+                let out = super::link_anchor::OutputDir::open(&root, member_name, out_path)
+                    .map_err(anchor_error)?;
+                anchored
+                    .hard_link_into(&out, Self::unix_output_mode(fh))
+                    .map_err(anchor_error)?;
+            }
+            #[cfg(windows)]
+            anchored
+                .hard_link_to(out_path, Self::windows_output_attributes(fh))
+                .map_err(anchor_error)?;
+            Ok(0)
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            Self::remove_existing_link_output(out_path)?;
+            let target_path = Self::redirection_target_path(member_name, target, out_path);
+            std::fs::hard_link(&target_path, out_path).map_err(RarError::from)?;
+            Self::apply_unix_permissions(fh, out_path)?;
+            Self::apply_windows_attributes(fh, out_path)?;
+            Ok(0)
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn link_anchor_error(
+        error: super::link_anchor::AnchorError,
+        raw_member_name: &str,
+        target: &str,
+    ) -> RarError {
+        match error {
+            super::link_anchor::AnchorError::Unsafe => RarError::UnsafeLinkTarget {
+                member: raw_member_name.to_string(),
+                target: target.to_string(),
+            },
+            super::link_anchor::AnchorError::Io(error) => RarError::from(error),
+        }
+    }
+
+    /// Copies a file-copy source resolved by `link_anchor` into a new
+    /// `out_path`, reading through the checked handle.
+    #[cfg(any(unix, windows))]
+    fn copy_anchored_filecopy_source(
+        source: &super::link_anchor::AnchoredTarget,
+        raw_member_name: &str,
+        target: &str,
+        out_path: &std::path::Path,
+    ) -> RarResult<u64> {
+        let mut input = source
+            .open_read()
+            .map_err(|error| Self::link_anchor_error(error, raw_member_name, target))?;
+        let permissions = input.metadata().map_err(RarError::from)?.permissions();
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Owner-only until the bytes are in and the source mode is applied,
+        // so a restrictive source is never readable by others mid-copy.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut output = options.open(out_path).map_err(RarError::from)?;
+        let copied = std::io::copy(&mut input, &mut output)
+            .and_then(|written| output.set_permissions(permissions).map(|()| written));
+        match copied {
+            Ok(written) => Ok(written),
+            Err(error) => {
+                drop(output);
+                let _ = std::fs::remove_file(out_path);
+                Err(RarError::from(error))
+            }
+        }
     }
 
     fn copy_existing_filecopy_source(
@@ -3200,6 +3235,32 @@ impl RarArchive {
             });
         }
 
+        // An on-disk source is resolved beneath the extraction root without
+        // following a symlink or reparse point, as hard-link targets are;
+        // a missing one falls back to the archive member it names.
+        #[cfg(any(unix, windows))]
+        {
+            let root = Self::redirection_target_root(member_name, out_path);
+            let relative = crate::path::sanitize_file_redirection_path(target);
+            match super::link_anchor::AnchoredTarget::resolve(&root, &relative) {
+                Ok(source) => {
+                    Self::remove_existing_link_output(out_path)?;
+                    let written = Self::copy_anchored_filecopy_source(
+                        &source,
+                        raw_member_name,
+                        target,
+                        out_path,
+                    )?;
+                    Self::apply_output_metadata(fh, owner, options, out_path)?;
+                    return Ok(written);
+                }
+                Err(super::link_anchor::AnchorError::Io(error))
+                    if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(Self::link_anchor_error(error, raw_member_name, target)),
+            }
+        }
+
+        #[cfg(not(any(unix, windows)))]
         if target_path.exists() {
             Self::remove_existing_link_output(out_path)?;
             let written = Self::copy_existing_filecopy_source(&target_path, out_path)?;
@@ -3319,17 +3380,15 @@ impl RarArchive {
                     )
                     .map(Some)
                 }
-                header::RedirectionType::WindowsJunction => Self::create_windows_junction_output(
-                    fh,
-                    owner,
-                    options,
-                    &member_name,
-                    &fh.name,
-                    &target,
-                    &redir.target,
-                    out_path,
-                )
-                .map(Some),
+                // Every junction is refused before anything is created, on
+                // every host. A junction is absolute in practice, and a
+                // relative one does not resolve once created, so there is
+                // no safe one to extract; RAR refuses them too unless
+                // absolute links are allowed, which unrar-rs never allows.
+                header::RedirectionType::WindowsJunction => Err(RarError::UnsafeLinkTarget {
+                    member: fh.name.clone(),
+                    target: redir.target.clone(),
+                }),
                 header::RedirectionType::Hardlink => {
                     Self::create_hardlink_output(fh, &member_name, &fh.name, &target, out_path)
                         .map(Some)
@@ -8372,6 +8431,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn rar5_windows_absolute_symlink_is_relative_after_unix_normalization_like_rar_behavior() {
         let target = RarArchive::normalized_rar5_redirection_target(
@@ -8552,80 +8612,176 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unix_output_mode_converts_windows_attributes_like_rar_behavior() {
-        let mask = current_umask();
+    fn unix_output_mode_sets_no_mode_for_windows_origin() {
         let mut fh = test_rar3_symlink_header(None);
         fh.host_os = HostOs::Windows;
 
         fh.is_directory = true;
         fh.attributes = FileAttributes(0x10);
-        assert_eq!(RarArchive::unix_output_mode(&fh), Some(0o777 & !mask));
+        assert_eq!(RarArchive::unix_output_mode(&fh), None);
 
+        // Read-only is no longer turned into 0o444.
         fh.is_directory = false;
         fh.attributes = FileAttributes(0x01);
-        assert_eq!(RarArchive::unix_output_mode(&fh), Some(0o444 & !mask));
+        assert_eq!(RarArchive::unix_output_mode(&fh), None);
 
         fh.attributes = FileAttributes(0x20);
-        assert_eq!(RarArchive::unix_output_mode(&fh), Some(0o666 & !mask));
+        assert_eq!(RarArchive::unix_output_mode(&fh), None);
     }
 
     #[cfg(unix)]
     #[test]
-    fn unix_output_mode_uses_rar_behavior_default_for_unsupported_hosts() {
-        let mask = current_umask();
+    fn unix_output_mode_sets_no_mode_for_unsupported_hosts() {
         let mut fh = test_rar3_symlink_header(None);
         fh.host_os = HostOs::Unknown(0);
 
         fh.is_directory = false;
-        assert_eq!(RarArchive::unix_output_mode(&fh), Some(0o666 & !mask));
+        assert_eq!(RarArchive::unix_output_mode(&fh), None);
 
         fh.is_directory = true;
-        assert_eq!(RarArchive::unix_output_mode(&fh), Some(0o777 & !mask));
+        assert_eq!(RarArchive::unix_output_mode(&fh), None);
 
+        // RAR4 `HSYS_MACOS` is a legacy marker, not POSIX mode storage.
         fh.host_os = HostOs::Darwin;
         fh.compression.format = ArchiveFormat::Rar4;
         fh.attributes = FileAttributes(0o100750);
         fh.is_directory = false;
-        assert_eq!(RarArchive::unix_output_mode(&fh), Some(0o666 & !mask));
+        assert_eq!(RarArchive::unix_output_mode(&fh), None);
     }
 
     #[cfg(unix)]
     #[test]
-    fn apply_unix_permissions_uses_supported_os_conversion_on_disk() {
+    fn apply_unix_permissions_leaves_other_os_members_at_their_creation_mode() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("mode.bin");
-        std::fs::write(&path, b"mode").unwrap();
+        let mode_of =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
 
         let mut fh = test_rar3_symlink_header(None);
         fh.host_os = HostOs::Unix;
         fh.attributes = FileAttributes(0o100750);
         fh.is_directory = false;
+        let unix_path = temp.path().join("unix.bin");
+        std::fs::write(&unix_path, b"mode").unwrap();
+        RarArchive::apply_unix_permissions(&fh, &unix_path).unwrap();
+        assert_eq!(mode_of(&unix_path), 0o750);
 
-        RarArchive::apply_unix_permissions(&fh, &path).unwrap();
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o750
-        );
-
+        // A Windows read-only file keeps what `File::create` produced.
+        let path = temp.path().join("windows.bin");
+        std::fs::write(&path, b"mode").unwrap();
+        let created = mode_of(&path);
         fh.host_os = HostOs::Windows;
         fh.attributes = FileAttributes(0x01);
         RarArchive::apply_unix_permissions(&fh, &path).unwrap();
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o444 & !current_umask()
-        );
+        assert_eq!(mode_of(&path), created);
 
         let dir = temp.path().join("dir");
         std::fs::create_dir(&dir).unwrap();
+        let created = mode_of(&dir);
         fh.is_directory = true;
         fh.attributes = FileAttributes(0x10);
         RarArchive::apply_unix_permissions(&fh, &dir).unwrap();
-        assert_eq!(
-            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
-            0o777 & !current_umask()
+        assert_eq!(mode_of(&dir), created);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_regular_output_file_does_not_follow_a_final_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside.txt");
+        std::fs::write(&outside, b"outside bytes").unwrap();
+        let out_path = temp.path().join("out.bin");
+        std::os::unix::fs::symlink(&outside, &out_path).unwrap();
+
+        // A symlink that appears after the removal step is not followed.
+        let err = RarArchive::open_regular_output_file(&out_path).unwrap_err();
+        assert!(matches!(err, RarError::Io(_)));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside bytes");
+        assert!(
+            std::fs::symlink_metadata(&out_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
+
+        // A regular file is still created, then truncated on reopen.
+        let regular = temp.path().join("regular.bin");
+        std::io::Write::write_all(
+            &mut RarArchive::open_regular_output_file(&regular).unwrap(),
+            b"first",
+        )
+        .unwrap();
+        drop(RarArchive::open_regular_output_file(&regular).unwrap());
+        assert_eq!(std::fs::read(&regular).unwrap(), b"");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strip_privileged_mode_bits_follows_rar_behavior() {
+        // Files lose both bits, directories only set-user-ID, root keeps all.
+        let strip = RarArchive::strip_privileged_mode_bits;
+        assert_eq!(strip(0o4755, false, false), 0o755);
+        assert_eq!(strip(0o2755, false, false), 0o755);
+        assert_eq!(strip(0o6755, false, false), 0o755);
+        assert_eq!(strip(0o1777, false, false), 0o1777);
+        assert_eq!(strip(0o6755, true, false), 0o2755);
+        assert_eq!(strip(0o2775, true, false), 0o2775);
+        assert_eq!(strip(0o6755, false, true), 0o6755);
+        assert_eq!(strip(0o6755, true, true), 0o6755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_output_mode_strips_set_id_bits_unless_root() {
+        let is_root = unsafe { libc::geteuid() } == 0;
+        let mut fh = test_rar3_symlink_header(None);
+        fh.host_os = HostOs::Unix;
+
+        fh.is_directory = false;
+        for (header, stripped) in [(0o4755_u32, 0o755), (0o2755, 0o755), (0o6755, 0o755)] {
+            fh.attributes = FileAttributes(u64::from(0o100000 | header));
+            let expected = if is_root { header } else { stripped };
+            assert_eq!(RarArchive::unix_output_mode(&fh), Some(expected));
+        }
+
+        fh.is_directory = true;
+        fh.attributes = FileAttributes(0o040000 | 0o6755);
+        let expected = if is_root { 0o6755 } else { 0o2755 };
+        assert_eq!(RarArchive::unix_output_mode(&fh), Some(expected));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_unix_permissions_strips_set_id_bits_on_disk_unless_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let is_root = unsafe { libc::geteuid() } == 0;
+        let temp = tempfile::tempdir().unwrap();
+        let mut fh = test_rar3_symlink_header(None);
+        fh.host_os = HostOs::Unix;
+
+        fh.is_directory = false;
+        for (index, header) in [0o4755_u32, 0o2755, 0o6755].into_iter().enumerate() {
+            let path = temp.path().join(format!("setid-{index}.bin"));
+            std::fs::write(&path, b"mode").unwrap();
+            fh.attributes = FileAttributes(u64::from(0o100000 | header));
+            RarArchive::apply_unix_permissions(&fh, &path).unwrap();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode, if is_root { header } else { 0o755 });
+        }
+
+        // A non-root user may not be able to set set-group-ID on a directory
+        // whose group it is not in; the temp dir is created with the user's
+        // own group, so the bit sticks when it is kept.
+        let dir = temp.path().join("setid-dir");
+        std::fs::create_dir(&dir).unwrap();
+        fh.is_directory = true;
+        fh.attributes = FileAttributes(0o040000 | 0o6755);
+        RarArchive::apply_unix_permissions(&fh, &dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode & 0o4000, if is_root { 0o4000 } else { 0 });
+        assert_eq!(mode & 0o777, 0o755);
     }
 
     #[test]
@@ -8883,6 +9039,296 @@ mod tests {
         );
     }
 
+    /// An extraction root holding `dir -> outside` (a pre-existing or
+    /// earlier-extracted directory symlink), `chain -> dir`, and an in-root
+    /// `alias -> real`, plus an outside file with mode 0600.
+    #[cfg(unix)]
+    struct SymlinkedTargetTree {
+        _temp: tempfile::TempDir,
+        root: std::path::PathBuf,
+        outside: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl SymlinkedTargetTree {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            let outside = temp.path().join("outside");
+            std::fs::create_dir_all(root.join("real")).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::write(outside.join("file.bin"), b"outside bytes").unwrap();
+            std::fs::set_permissions(
+                outside.join("file.bin"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            std::fs::write(root.join("real/file.bin"), b"inside bytes").unwrap();
+            std::os::unix::fs::symlink(&outside, root.join("dir")).unwrap();
+            std::os::unix::fs::symlink(root.join("dir"), root.join("chain")).unwrap();
+            std::os::unix::fs::symlink("real", root.join("alias")).unwrap();
+            Self {
+                _temp: temp,
+                root,
+                outside,
+            }
+        }
+
+        fn assert_outside_untouched(&self) {
+            use std::os::unix::fs::MetadataExt;
+
+            let metadata = std::fs::metadata(self.outside.join("file.bin")).unwrap();
+            assert_eq!(metadata.mode() & 0o7777, 0o600);
+            assert_eq!(metadata.nlink(), 1);
+            assert_eq!(
+                std::fs::read(self.outside.join("file.bin")).unwrap(),
+                b"outside bytes"
+            );
+            let names: Vec<_> = std::fs::read_dir(&self.outside)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(names, vec![std::ffi::OsString::from("file.bin")]);
+        }
+    }
+
+    #[cfg(unix)]
+    fn unix_mode_header(mode: u64) -> FileHeader {
+        let mut fh = test_rar3_symlink_header(None);
+        fh.attributes = FileAttributes(mode);
+        fh.host_os = HostOs::Unix;
+        fh.compression.format = ArchiveFormat::Rar5;
+        fh
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlink_target_through_a_symlink_is_refused_like_unrar_7_30() {
+        let tree = SymlinkedTargetTree::new();
+        let fh = unix_mode_header(0o100777);
+        for target in ["dir/file.bin", "chain/file.bin", "alias/file.bin"] {
+            let out_path = tree.root.join("link.bin");
+            let err =
+                RarArchive::create_hardlink_output(&fh, "link.bin", "link.bin", target, &out_path)
+                    .unwrap_err();
+            assert!(
+                matches!(&err, RarError::UnsafeLinkTarget { member, target: t }
+                    if member == "link.bin" && t == target),
+                "{target}: {err:?}"
+            );
+            assert!(std::fs::symlink_metadata(&out_path).is_err(), "{target}");
+            tree.assert_outside_untouched();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refused_hardlink_keeps_an_existing_output() {
+        let tree = SymlinkedTargetTree::new();
+        let out_path = tree.root.join("link.bin");
+        std::fs::write(&out_path, b"existing").unwrap();
+        let err = RarArchive::create_hardlink_output(
+            &unix_mode_header(0o100644),
+            "link.bin",
+            "link.bin",
+            "dir/file.bin",
+            &out_path,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RarError::UnsafeLinkTarget { .. }));
+        assert_eq!(std::fs::read(&out_path).unwrap(), b"existing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_hardlink_through_real_directories_still_links() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let tree = SymlinkedTargetTree::new();
+        std::fs::create_dir(tree.root.join("sub")).unwrap();
+        let out_path = tree.root.join("sub/link.bin");
+        RarArchive::create_hardlink_output(
+            &unix_mode_header(0o100640),
+            "sub/link.bin",
+            "sub/link.bin",
+            "real/file.bin",
+            &out_path,
+        )
+        .unwrap();
+        let link = std::fs::metadata(&out_path).unwrap();
+        let source = std::fs::metadata(tree.root.join("real/file.bin")).unwrap();
+        assert_eq!(link.ino(), source.ino());
+        assert_eq!(source.nlink(), 2);
+        assert_eq!(source.permissions().mode() & 0o7777, 0o640);
+        tree.assert_outside_untouched();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlink_dotdot_target_still_resolves_from_the_root() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tree = SymlinkedTargetTree::new();
+        std::fs::create_dir(tree.root.join("sub")).unwrap();
+        let out_path = tree.root.join("sub/link.bin");
+        RarArchive::create_hardlink_output(
+            &unix_mode_header(0o100644),
+            "sub/link.bin",
+            "sub/link.bin",
+            "sub/../real/file.bin",
+            &out_path,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&out_path).unwrap().ino(),
+            std::fs::metadata(tree.root.join("real/file.bin"))
+                .unwrap()
+                .ino()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filecopy_source_through_a_symlink_is_refused() {
+        let tree = SymlinkedTargetTree::new();
+        let mut archive = empty_rar5_archive();
+        let mut fh = unix_mode_header(0o100644);
+        fh.name = "copy.bin".to_string();
+        for target in ["dir/file.bin", "chain/file.bin", "alias/file.bin"] {
+            let out_path = tree.root.join("copy.bin");
+            let err = archive
+                .extract_link_member_to_file(
+                    0,
+                    &ExtractOptions::default(),
+                    &fh,
+                    None,
+                    Some(header::Redirection {
+                        redir_type: header::RedirectionType::FileCopy,
+                        target: target.to_string(),
+                        target_raw: Some(target.as_bytes().to_vec()),
+                        target_is_directory: false,
+                    }),
+                    &out_path,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(err, RarError::UnsafeLinkTarget { .. }),
+                "{target}: {err:?}"
+            );
+            assert!(std::fs::symlink_metadata(&out_path).is_err(), "{target}");
+            tree.assert_outside_untouched();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filecopy_source_through_real_directories_still_copies() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tree = SymlinkedTargetTree::new();
+        let mut archive = empty_rar5_archive();
+        let mut fh = unix_mode_header(0o100644);
+        fh.name = "copy.bin".to_string();
+        let out_path = tree.root.join("copy.bin");
+        let written = archive
+            .extract_link_member_to_file(
+                0,
+                &ExtractOptions::default(),
+                &fh,
+                None,
+                Some(header::Redirection {
+                    redir_type: header::RedirectionType::FileCopy,
+                    target: "real/file.bin".to_string(),
+                    target_raw: Some(b"real/file.bin".to_vec()),
+                    target_is_directory: false,
+                }),
+                &out_path,
+            )
+            .unwrap();
+        assert_eq!(written, Some(b"inside bytes".len() as u64));
+        assert_eq!(std::fs::read(&out_path).unwrap(), b"inside bytes");
+        assert_ne!(
+            std::fs::metadata(&out_path).unwrap().ino(),
+            std::fs::metadata(tree.root.join("real/file.bin"))
+                .unwrap()
+                .ino()
+        );
+        assert_eq!(std::fs::metadata(&out_path).unwrap().mode() & 0o7777, 0o644);
+    }
+
+    /// Windows: a directory junction or directory symlink in a hard-link
+    /// target path is a reparse point and is refused.
+    #[cfg(windows)]
+    #[test]
+    fn hardlink_target_through_a_junction_or_dir_symlink_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("file.bin"), b"outside bytes").unwrap();
+
+        let mut fh = test_rar3_symlink_header(None);
+        fh.host_os = HostOs::Windows;
+        fh.attributes = FileAttributes(0x20);
+        fh.compression.format = ArchiveFormat::Rar5;
+
+        let mut cases = Vec::new();
+        // Junctions need no privilege; build one with the crate's own
+        // mount-point writer, aimed at the absolute outside directory.
+        let junction_target = format!("/??/{}", outside.display().to_string().replace('\\', "/"));
+        let junction =
+            RarArchive::windows_junction_reparse_buffer(&junction_target).and_then(|buffer| {
+                RarArchive::create_windows_reparse_point(&root.join("junction"), true, buffer)
+            });
+        junction.expect("create a directory junction");
+        cases.push("junction/file.bin");
+        // Directory symlinks need Developer Mode or the symlink privilege.
+        if std::os::windows::fs::symlink_dir(&outside, root.join("dirlink")).is_ok() {
+            cases.push("dirlink/file.bin");
+        }
+        for target in cases {
+            let out_path = root.join("link.bin");
+            let err =
+                RarArchive::create_hardlink_output(&fh, "link.bin", "link.bin", target, &out_path)
+                    .unwrap_err();
+            assert!(
+                matches!(err, RarError::UnsafeLinkTarget { .. }),
+                "{target}: {err:?}"
+            );
+            assert!(std::fs::symlink_metadata(&out_path).is_err(), "{target}");
+            assert_eq!(
+                std::fs::read(outside.join("file.bin")).unwrap(),
+                b"outside bytes"
+            );
+            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hardlink_through_real_directories_still_links_on_windows() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::write(root.join("real/file.bin"), b"inside bytes").unwrap();
+        let mut fh = test_rar3_symlink_header(None);
+        fh.host_os = HostOs::Windows;
+        fh.attributes = FileAttributes(0x20);
+        fh.compression.format = ArchiveFormat::Rar5;
+        let out_path = root.join("link.bin");
+        RarArchive::create_hardlink_output(&fh, "link.bin", "link.bin", "real/file.bin", &out_path)
+            .unwrap();
+        assert_eq!(std::fs::read(&out_path).unwrap(), b"inside bytes");
+        std::fs::write(&out_path, b"changed").unwrap();
+        assert_eq!(
+            std::fs::read(root.join("real/file.bin")).unwrap(),
+            b"changed"
+        );
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn rar5_file_reference_drive_prefix_is_relative_like_rar_behavior_on_unix() {
@@ -8989,41 +9435,51 @@ mod tests {
         assert_eq!(link.as_os_str().as_bytes(), b"safe\xed\xa0\x80target");
     }
 
-    #[cfg(unix)]
     #[test]
-    fn rar5_windows_junction_extracts_as_symlink_on_unix_like_rar_behavior() {
-        use std::os::unix::ffi::OsStrExt;
+    fn rar5_windows_junction_is_refused_before_anything_is_created() {
+        // Relative or absolute, a junction is refused on every host.
+        for target in ["safe\\target", "\\??\\C:\\target", "dir/target"] {
+            let temp = tempfile::tempdir().unwrap();
+            let out_path = temp.path().join("sub").join("junction");
 
-        let temp = tempfile::tempdir().unwrap();
-        let out_path = temp.path().join("junction");
+            let mut archive = empty_rar5_archive();
+            let mut fh = test_rar3_symlink_header(None);
+            fh.name = "sub/junction".to_string();
+            fh.attributes = FileAttributes(0);
+            fh.host_os = HostOs::Windows;
+            fh.compression.format = ArchiveFormat::Rar5;
+            fh.is_directory = true;
 
-        let mut archive = empty_rar5_archive();
-        let mut fh = test_rar3_symlink_header(None);
-        fh.name = "junction".to_string();
-        fh.attributes = FileAttributes(0);
-        fh.host_os = HostOs::Windows;
-        fh.compression.format = ArchiveFormat::Rar5;
-        fh.is_directory = true;
-
-        let written = archive
-            .extract_link_member_to_file(
+            let result = archive.extract_link_member_to_file(
                 0,
                 &ExtractOptions::default(),
                 &fh,
                 None,
                 Some(header::Redirection {
                     redir_type: header::RedirectionType::WindowsJunction,
-                    target: "safe\\target".to_string(),
-                    target_raw: Some(b"safe\\target".to_vec()),
+                    target: target.to_string(),
+                    target_raw: Some(target.as_bytes().to_vec()),
                     target_is_directory: true,
                 }),
                 &out_path,
-            )
-            .unwrap();
+            );
 
-        assert_eq!(written, Some(0));
-        let link = std::fs::read_link(out_path).unwrap();
-        assert_eq!(link.as_os_str().as_bytes(), b"safe/target");
+            match result {
+                Err(RarError::UnsafeLinkTarget {
+                    member,
+                    target: refused,
+                }) => {
+                    assert_eq!(member, "sub/junction");
+                    assert_eq!(refused, target);
+                }
+                // Nothing from the result is printed: some error variants
+                // carry password-derived context that must not reach a log.
+                Ok(_) => panic!("expected UnsafeLinkTarget for {target:?}, got Ok"),
+                Err(_) => panic!("expected UnsafeLinkTarget for {target:?}, got another error"),
+            }
+            // Not even the parent directory is made.
+            assert!(!temp.path().join("sub").exists());
+        }
     }
 
     fn empty_rar5_archive() -> RarArchive {

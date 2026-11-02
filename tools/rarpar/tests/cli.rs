@@ -3435,3 +3435,174 @@ fn rar_restore_volumes_dry_run_foresees_a_dangling_symlink_at_the_output() {
     );
     assert_eq!(listing(&out_dir).len(), 1);
 }
+
+/// libarchive's RAR5 hard-link fixture: `file.txt`, then `hardlink.txt`, a
+/// hard link whose target is `file.txt`.
+#[cfg(unix)]
+fn rar5_hardlink_fixture() -> PathBuf {
+    fixture(&[
+        "crates",
+        "unrar-rs",
+        "tests",
+        "fixtures",
+        "rar5",
+        "test_read_format_rar5_hardlink.rar",
+    ])
+}
+
+/// An outside directory with one 0600 file, for the hard-link symlink tests.
+#[cfg(unix)]
+fn outside_secret(base: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let outside = base.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let secret = outside.join("secret.txt");
+    std::fs::write(&secret, b"outside bytes").unwrap();
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+    secret
+}
+
+#[cfg(unix)]
+fn assert_outside_secret_untouched(secret: &Path) {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(secret).unwrap();
+    assert_eq!(std::fs::read(secret).unwrap(), b"outside bytes");
+    assert_eq!(metadata.mode() & 0o7777, 0o600);
+    assert_eq!(metadata.nlink(), 1);
+    assert_eq!(
+        std::fs::read_dir(secret.parent().unwrap()).unwrap().count(),
+        1
+    );
+}
+
+/// `x -o-` keeps an existing `file.txt`; when that name is a symlink to a
+/// file outside the destination, the hard link `hardlink.txt` must not be
+/// made to it (UnRAR 7.30 beta 2 blocks hard-link targets through
+/// symlinks), and the outside file keeps its bytes, mode and link count.
+#[cfg(unix)]
+#[test]
+fn compat_unrar_keep_existing_refuses_hardlink_through_symlink() {
+    let temp = tempfile::tempdir().unwrap();
+    let secret = outside_secret(temp.path());
+    let out_dir = temp.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+    std::os::unix::fs::symlink(&secret, out_dir.join("file.txt")).unwrap();
+
+    let output = run(&[
+        OsStr::new("x"),
+        OsStr::new("-o-"),
+        rar5_hardlink_fixture().as_os_str(),
+        out_dir.as_os_str(),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(2), "stdout={stdout}");
+    assert!(
+        stdout.contains("unsafe link target for hardlink.txt: file.txt"),
+        "stdout={stdout}"
+    );
+    assert!(std::fs::symlink_metadata(out_dir.join("hardlink.txt")).is_err());
+    assert_outside_secret_untouched(&secret);
+}
+
+/// `x -o-` with a real existing `file.txt`: unchanged, it is kept and the
+/// hard link is made to it.
+#[cfg(unix)]
+#[test]
+fn compat_unrar_keep_existing_still_links_to_a_real_file() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let out_dir = temp.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+    std::fs::write(out_dir.join("file.txt"), b"kept").unwrap();
+
+    let output = run(&[
+        OsStr::new("x"),
+        OsStr::new("-o-"),
+        rar5_hardlink_fixture().as_os_str(),
+        out_dir.as_os_str(),
+    ]);
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(out_dir.join("file.txt")).unwrap(), b"kept");
+    assert_eq!(
+        std::fs::metadata(out_dir.join("hardlink.txt"))
+            .unwrap()
+            .ino(),
+        std::fs::metadata(out_dir.join("file.txt")).unwrap().ino()
+    );
+}
+
+/// A fresh `rar extract` still produces a hard link sharing `file.txt`'s
+/// inode.
+#[cfg(unix)]
+#[test]
+fn rar_extract_hardlink_shares_the_extracted_inode() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let out_dir = temp.path().join("out");
+    let output = run(&[
+        OsStr::new("rar"),
+        OsStr::new("extract"),
+        rar5_hardlink_fixture().as_os_str(),
+        out_dir.as_os_str(),
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let file = std::fs::metadata(out_dir.join("file.txt")).unwrap();
+    assert_eq!(
+        std::fs::metadata(out_dir.join("hardlink.txt"))
+            .unwrap()
+            .ino(),
+        file.ino()
+    );
+    assert_eq!(file.nlink(), 2);
+}
+
+/// `rar extract --overwrite` over a destination whose `file.txt` is a
+/// symlink to an outside file replaces the symlink with the extracted file
+/// before the hard link is made, so the link lands inside and the outside
+/// file is untouched.
+#[cfg(unix)]
+#[test]
+fn rar_extract_overwrite_never_links_through_a_destination_symlink() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let secret = outside_secret(temp.path());
+    let out_dir = temp.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+    std::os::unix::fs::symlink(&secret, out_dir.join("file.txt")).unwrap();
+
+    let output = run(&[
+        OsStr::new("--overwrite"),
+        OsStr::new("rar"),
+        OsStr::new("extract"),
+        rar5_hardlink_fixture().as_os_str(),
+        out_dir.as_os_str(),
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let file = std::fs::symlink_metadata(out_dir.join("file.txt")).unwrap();
+    assert!(file.file_type().is_file());
+    assert_eq!(
+        std::fs::metadata(out_dir.join("hardlink.txt"))
+            .unwrap()
+            .ino(),
+        file.ino()
+    );
+    assert_outside_secret_untouched(&secret);
+}

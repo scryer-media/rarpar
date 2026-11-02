@@ -97,9 +97,9 @@ impl CompatFailure {
 
     fn emit(&self) {
         if self.stderr {
-            eprintln!("{}", self.message);
+            safe_eprintln!("{}", self.message);
         } else {
-            println!("{}", self.message);
+            safe_println!("{}", self.message);
         }
     }
 }
@@ -324,14 +324,14 @@ fn run_extract(invocation: &Invocation) -> Result<(), CompatFailure> {
             let mut archive = open_set(&set, password.as_deref())?;
             if invocation.suppression.shows_status_lines() {
                 for path in ordered_volume_paths(&set) {
-                    println!("Extracting from {}", path.display());
+                    safe_println!("Extracting from {}", path.display());
                 }
             }
             let mut extracted = BTreeSet::new();
             let members = extract_all_ready(invocation, &mut archive, &mut extracted)?;
             ensure_all_members_done(&archive, &members, &extracted)?;
             if invocation.suppression.shows_status_lines() {
-                println!("All OK");
+                safe_println!("All OK");
             }
         }
     }
@@ -385,7 +385,7 @@ fn run_incremental_extract(invocation: &Invocation, set: &RarSet) -> Result<(), 
     let password = password_candidate(&invocation.password);
     let mut archive = open_first_volume(first_path, password.as_deref())?;
     if invocation.suppression.shows_status_lines() {
-        println!("Extracting from {}", first_path.display());
+        safe_println!("Extracting from {}", first_path.display());
     }
 
     let mut extracted = BTreeSet::new();
@@ -406,7 +406,7 @@ fn run_incremental_extract(invocation: &Invocation, set: &RarSet) -> Result<(), 
             .max()
             .map_or(1, |volume| volume + 1);
         let next_path = next_volume_path(first_path, next_index);
-        print!(
+        safe_print!(
             "Insert disk with {} [C]ontinue, [Q]uit ",
             next_path.display()
         );
@@ -418,7 +418,7 @@ fn run_incremental_extract(invocation: &Invocation, set: &RarSet) -> Result<(), 
         io::stdin()
             .read_line(&mut answer)
             .map_err(|error| CompatFailure::stdout(EXIT_FATAL, format!("Read error: {error}")))?;
-        println!();
+        safe_println!();
         if answer.trim_start().starts_with(['q', 'Q']) {
             return Err(CompatFailure::stdout(EXIT_FATAL, "User break"));
         }
@@ -439,12 +439,12 @@ fn run_incremental_extract(invocation: &Invocation, set: &RarSet) -> Result<(), 
             ));
         }
         if invocation.suppression.shows_status_lines() {
-            println!("Extracting from {}", next_path.display());
+            safe_println!("Extracting from {}", next_path.display());
         }
     }
 
     if invocation.suppression.shows_status_lines() {
-        println!("All OK");
+        safe_println!("All OK");
     }
     Ok(())
 }
@@ -464,7 +464,7 @@ fn run_test(invocation: &Invocation) -> Result<(), CompatFailure> {
         let mut archive = open_set(&set, password.as_deref())?;
         if invocation.suppression.shows_status_lines() {
             for path in ordered_volume_paths(&set) {
-                println!("Testing from {}", path.display());
+                safe_println!("Testing from {}", path.display());
             }
         }
         let mut tested = BTreeSet::new();
@@ -490,7 +490,7 @@ fn run_test(invocation: &Invocation) -> Result<(), CompatFailure> {
         ensure_all_members_done(&archive, &members, &tested)?;
     }
     if invocation.suppression.shows_status_lines() {
-        println!("All OK");
+        safe_println!("All OK");
     }
     Ok(())
 }
@@ -505,7 +505,7 @@ fn run_list(invocation: &Invocation) -> Result<(), CompatFailure> {
         let password = password_candidate(&invocation.password);
         let archive = open_set(&set, password.as_deref())?;
         for member in archive.indexed_member_infos() {
-            println!("{}", member.info.name);
+            safe_println!("{}", member.info.name);
         }
     }
     Ok(())
@@ -547,7 +547,7 @@ fn test_all_ready(
                 .and_then(|entry| entry.copy_to(&mut io::sink()))
                 .map_err(map_rar_error)?;
             if invocation.suppression.shows_member_lines() {
-                println!("Testing  {} OK", member.info.name);
+                safe_println!("Testing  {} OK", member.info.name);
             }
         }
         tested.insert(member.index);
@@ -633,7 +633,7 @@ fn print_member_ok(member: &unrar_rs::MemberInfo, out_path: &Path) {
     } else {
         "Extracting"
     };
-    println!("{verb}  {} OK", out_path.display());
+    safe_println!("{verb}  {} OK", out_path.display());
 }
 
 fn ensure_all_members_done(

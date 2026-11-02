@@ -15,7 +15,7 @@ shown below by byte comparison rather than by timing.
 | --- | --- |
 | wasm and native aarch64 | Apple M5 Max, macOS 26.0 (Darwin 25.6.0), 18 cores |
 | native x86-64 | Alder Lake host, 12th Gen Intel Core i5-1240P, 16 threads, Ubuntu |
-| runtime | wasmtime 47.0.3 — the version `ci.yml` pins as `WASMTIME_VERSION` |
+| runtime | wasmtime 47.0.3, the `WASMTIME_VERSION` pin in `ci.yml` when these numbers were taken |
 | toolchain | rustc 1.97.1, the `rust-toolchain.toml` pin, on both hosts |
 | target | `wasm32-wasip1`, release profile (`lto = "fat"`, one codegen unit) |
 | corpus | the published PAR3 fixture corpus, `xtask test-corpus hydrate --profile par3` |
