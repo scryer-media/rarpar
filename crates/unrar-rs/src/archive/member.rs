@@ -9472,7 +9472,10 @@ mod tests {
                     assert_eq!(member, "sub/junction");
                     assert_eq!(refused, target);
                 }
-                other => panic!("expected UnsafeLinkTarget for {target:?}, got {other:?}"),
+                // Nothing from the result is printed: some error variants
+                // carry password-derived context that must not reach a log.
+                Ok(_) => panic!("expected UnsafeLinkTarget for {target:?}, got Ok"),
+                Err(_) => panic!("expected UnsafeLinkTarget for {target:?}, got another error"),
             }
             // Not even the parent directory is made.
             assert!(!temp.path().join("sub").exists());
