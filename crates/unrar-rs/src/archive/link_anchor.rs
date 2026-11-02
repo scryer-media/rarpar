@@ -635,7 +635,9 @@ mod unix {
             let temp = tempfile::tempdir().unwrap();
             std::fs::write(temp.path().join("file.bin"), b"one").unwrap();
             let target = AnchoredTarget::resolve(temp.path(), "file.bin").unwrap();
-            std::fs::remove_file(temp.path().join("file.bin")).unwrap();
+            // Create the replacement while the original still holds its
+            // inode, so a filesystem that recycles freed inodes cannot hand
+            // the replacement the original's identity.
             std::fs::write(temp.path().join("other.bin"), b"two").unwrap();
             std::fs::rename(temp.path().join("other.bin"), temp.path().join("file.bin")).unwrap();
             assert!(matches!(target.open_read(), Err(AnchorError::Unsafe)));
@@ -659,14 +661,15 @@ mod unix {
 mod windows {
     use super::{AnchorError, Part, not_regular_file, split_final};
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::path::{Path, PathBuf};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
         FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
         FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FileBasicInfo, GetFileInformationByHandle,
-        SetFileInformationByHandle,
+        ReOpenFile, SetFileInformationByHandle,
     };
 
     fn open(path: &Path, access: u32, share: u32, follow: bool) -> std::io::Result<std::fs::File> {
@@ -756,10 +759,12 @@ mod windows {
             path.push(name);
             // `CreateHardLinkW` opens the source for delete, so the file
             // handle must share delete; the identity check after the link
-            // covers a swap of this last name.
+            // covers a swap of this last name. Attribute access only: a
+            // hard link never reads the data, so an ACL that denies reading
+            // must not refuse it. `open_read` asks for data access itself.
             let file = open(
                 &path,
-                FILE_GENERIC_READ,
+                FILE_READ_ATTRIBUTES,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 false,
             )?;
@@ -777,9 +782,28 @@ mod windows {
             })
         }
 
-        /// The checked file itself, for reading.
+        /// The checked file itself, reopened for reading. `ReOpenFile`
+        /// opens the same file object as the checked handle, never a path,
+        /// so a swapped name cannot redirect it.
         pub(in crate::archive) fn open_read(&self) -> Result<std::fs::File, AnchorError> {
-            Ok(self.file.try_clone()?)
+            // SAFETY: `self.file` is an open handle owned by `self`.
+            let handle = unsafe {
+                ReOpenFile(
+                    self.file.as_raw_handle() as _,
+                    FILE_GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    FILE_FLAG_OPEN_REPARSE_POINT,
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                return Err(AnchorError::Io(std::io::Error::last_os_error()));
+            }
+            // SAFETY: `handle` is a valid handle we now own.
+            let file = unsafe { std::fs::File::from_raw_handle(handle as _) };
+            if identity(&file)? != identity(&self.file)? {
+                return Err(AnchorError::Unsafe);
+            }
+            Ok(file)
         }
 
         /// Hard-links the target at `out_path` and sets `attributes` on the
