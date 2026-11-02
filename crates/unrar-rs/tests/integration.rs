@@ -4109,7 +4109,9 @@ fn test_extract_member_to_file_rejects_unsafe_rar5_link_target() {
 
 #[test]
 #[cfg(unix)]
-fn test_extract_member_to_file_creates_unrar_style_windows_device_rar5_symlink() {
+fn test_extract_member_to_file_rejects_windows_device_rar5_symlink() {
+    // `\??\C:\Windows\system32` normalises to `C:/Windows/system32`, whose
+    // leading drive letter is refused for symlinks on every host.
     let extra = redirection_extra(2, "\\??\\C:\\Windows\\system32");
     let archive_bytes = build_stored_archive_with_extra("link", b"", &extra);
     let cursor = Cursor::new(archive_bytes);
@@ -4117,15 +4119,12 @@ fn test_extract_member_to_file_creates_unrar_style_windows_device_rar5_symlink()
     let temp_dir = tempfile::tempdir().unwrap();
     let out_path = temp_dir.path().join("link");
 
-    let written = archive
+    let err = archive
         .extract_member_to_file(0, &unrar_rs::ExtractOptions::default(), None, &out_path)
-        .unwrap();
+        .unwrap_err();
 
-    assert_eq!(written, 0);
-    assert_eq!(
-        std::fs::read_link(&out_path).unwrap(),
-        std::path::Path::new("C:/Windows/system32")
-    );
+    assert!(matches!(err, unrar_rs::RarError::UnsafeLinkTarget { .. }));
+    assert!(std::fs::symlink_metadata(&out_path).is_err());
 }
 
 #[test]

@@ -250,11 +250,15 @@ pub(crate) fn is_safe_symlink_target_for_archive_member(
     target: &str,
 ) -> bool {
     let raw_member_backslash_is_separator = !matches!(format, ArchiveFormat::Rar5);
-    is_safe_link_target_inner(member_path, target, true, false, false, false)
+    // A symlink or junction target starting with a drive letter (`C:..\x`,
+    // `c:foo`) is refused on every host: on Windows it resolves against
+    // that drive's current directory, outside the output. Hard links and
+    // file copies resolve beneath the root and keep accepting it.
+    is_safe_link_target_inner(member_path, target, false, false, false, false)
         && is_safe_link_target_inner(
             raw_member_path,
             target,
-            true,
+            false,
             raw_member_backslash_is_separator,
             false,
             false,
@@ -775,12 +779,43 @@ mod tests {
     }
 
     #[test]
-    fn archive_symlink_target_drive_letter_is_relative_like_rar_behavior_on_unix() {
-        assert!(is_safe_symlink_target_for_archive_member(
-            ArchiveFormat::Rar5,
-            "link",
-            "link",
-            "C:\\literal"
+    fn archive_symlink_target_drive_letter_is_refused_on_every_host() {
+        for format in [ArchiveFormat::Rar5, ArchiveFormat::Rar4] {
+            for target in [
+                "C:\\literal",
+                "C:..\\..\\x",
+                "C:../../x",
+                "c:foo",
+                "z:",
+                "C:/target",
+            ] {
+                assert!(
+                    !is_safe_symlink_target_for_archive_member(
+                        format, "dir/link", "dir/link", target
+                    ),
+                    "expected {target:?} to be refused"
+                );
+            }
+        }
+        // Only a letter and a colon as the first two bytes count.
+        for target in ["dir/C:x", "1:x", "::x", "C", "Cx:y"] {
+            assert!(
+                is_safe_symlink_target_for_archive_member(
+                    ArchiveFormat::Rar5,
+                    "dir/link",
+                    "dir/link",
+                    target
+                ),
+                "expected {target:?} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn file_redirection_drive_relative_target_is_still_accepted() {
+        // Hard links and file copies keep the existing behaviour.
+        assert!(is_safe_symlink_target_for_member(
+            "dir/link", "dir/link", "C:..\\x", true
         ));
     }
 

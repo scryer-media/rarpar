@@ -31,6 +31,11 @@ documented in each crate's own changelog so those notes ship with the crate.
   does. No CVE had been assigned when this entry was written. Before, the
   doubled separator counted as an extra directory level, so a target
   could point one level outside the destination.
+- Security: RAR extraction refuses a symlink or junction whose target starts
+  with a drive letter, such as `C:..\..\x`, on every platform, through
+  unrar-rs 0.15.1. [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
+  refuses it on Windows, where it resolves outside the destination. No CVE
+  had been assigned when this entry was written.
 
 ## rarpar 0.9.3
 
