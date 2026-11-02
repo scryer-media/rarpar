@@ -33,6 +33,16 @@
   an extracted file loses both bits and a directory loses set-user-ID but
   keeps set-group-ID; the same mode is used when a hard link's mode is set
   through its descriptor. Root keeps the stored mode.
+- A link member whose name has a doubled separator, such as `a//b/link`,
+  may no longer climb out of its directory with `..`, as
+  [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
+  refuses it. No CVE had been assigned when this entry was written.
+  Before, every separator counted as a directory level, so `a//b/link`
+  was allowed three `..` while the OS resolves it two deep, and a target
+  `../../../x` landed one level outside the output directory. Now a
+  doubled separator anywhere in the name — `//`, or for RAR 4.x and older
+  names `\\` and `\/` — allows no `..` at all, and such a link is
+  `RarError::UnsafeLinkTarget`. The name itself is still kept as written.
 
 ### Changed
 

@@ -315,12 +315,20 @@ fn is_full_root_path(path: &str, windows_drive_is_root: bool) -> bool {
             && path.as_bytes()[1] == b':')
 }
 
+/// How many `..` a link member at `member_path` may climb: one per
+/// directory it sits in. A doubled separator (`a//b/link`) grants none: the
+/// OS reads it as one separator, so counting each `/` would allow one `..`
+/// more than the real depth. RAR does the same rather than collapse the
+/// separators, which the member name keeps as written.
 fn allowed_link_source_depth(member_path: &str) -> usize {
     let bytes = member_path.as_bytes();
     let mut depth = 0i32;
     for i in 0..bytes.len() {
         if bytes[i] != b'/' {
             continue;
+        }
+        if bytes.get(i + 1) == Some(&b'/') {
+            return 0;
         }
         let dot = i + 1 < bytes.len()
             && bytes[i + 1] == b'.'
@@ -796,6 +804,62 @@ mod tests {
     fn unsafe_deep_traversal() {
         // a/b/c/link -> ../../../../escape
         assert!(!is_safe_link_target("a/b/c/link", "../../../../escape"));
+    }
+
+    #[test]
+    fn doubled_separator_in_member_grants_no_parent_depth() {
+        // `a//b/link` sits two directories deep, not three.
+        assert!(!is_safe_symlink_target_for_archive_member(
+            ArchiveFormat::Rar5,
+            "a//b/link",
+            "a//b/link",
+            "../../x"
+        ));
+        assert!(!is_safe_symlink_target_for_archive_member(
+            ArchiveFormat::Rar5,
+            "a//b/link",
+            "a//b/link",
+            "../../../x"
+        ));
+        assert!(!is_safe_link_target("a//b/link", "../x"));
+        // A target without `..` still needs no depth.
+        assert!(is_safe_symlink_target_for_archive_member(
+            ArchiveFormat::Rar5,
+            "a//b/link",
+            "a//b/link",
+            "sibling"
+        ));
+    }
+
+    #[test]
+    fn single_separator_member_keeps_parent_depth() {
+        assert!(is_safe_symlink_target_for_archive_member(
+            ArchiveFormat::Rar5,
+            "a/b/link",
+            "a/b/link",
+            "../../x"
+        ));
+        assert!(is_safe_link_target("a/b/link", "../../x"));
+    }
+
+    #[test]
+    fn rar4_doubled_backslash_member_grants_no_parent_depth() {
+        // RAR4 names use `\` as a separator, so `a\\b\link` is doubled too,
+        // as is a mixed `a\/b\link`.
+        for raw in ["a\\\\b\\link", "a\\/b\\link"] {
+            assert!(!is_safe_symlink_target_for_archive_member(
+                ArchiveFormat::Rar4,
+                "a/b/link",
+                raw,
+                "../x"
+            ));
+        }
+        assert!(is_safe_symlink_target_for_archive_member(
+            ArchiveFormat::Rar4,
+            "a/b/link",
+            "a\\b\\link",
+            "../../x"
+        ));
     }
 
     #[test]

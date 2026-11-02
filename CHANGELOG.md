@@ -25,6 +25,12 @@ documented in each crate's own changelog so those notes ship with the crate.
   0.15.1, as [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
   does. No CVE had been assigned when this entry was written. Files lose
   both bits; directories lose set-user-ID and keep set-group-ID.
+- Security: RAR extraction refuses a link member with a doubled separator
+  in its name, such as `a//b/link`, whose target climbs with `..`, through
+  unrar-rs 0.15.1, as [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
+  does. No CVE had been assigned when this entry was written. Before, the
+  doubled separator counted as an extra directory level, so a target
+  could point one level outside the destination.
 
 ## rarpar 0.9.3
 
