@@ -58,8 +58,9 @@ with no buffering in memory and no temporary file.
 
 `unpack_to` and `unpack_in` write the member to disk with what the archive
 records about it: times, permissions, Windows attributes, symlinks and
-hardlinks. `unpack_in` uses the member's own name, cleaned so it cannot
-escape the directory.
+hardlinks. On Unix a process that is not root does not restore
+set-user-ID, or set-group-ID on a file. `unpack_in` uses the member's own
+name, cleaned so it cannot escape the directory.
 
 ```rust
 use unrar_rs::RarArchive;

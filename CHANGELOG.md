@@ -20,6 +20,11 @@ documented in each crate's own changelog so those notes ship with the crate.
   symlink to a file elsewhere linked that file in as the archive's hard
   link and changed its mode. The refused member now fails extraction with
   `unsafe link target`.
+- Security: on Unix, RAR extraction run by a user other than root no longer
+  restores set-user-ID or set-group-ID from the archive, through unrar-rs
+  0.15.1, as [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
+  does. No CVE had been assigned when this entry was written. Files lose
+  both bits; directories lose set-user-ID and keep set-group-ID.
 
 ## rarpar 0.9.3
 

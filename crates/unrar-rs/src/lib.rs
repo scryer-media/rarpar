@@ -81,7 +81,8 @@
 //!
 //! To land a member on disk with the metadata the archive carries — times,
 //! permissions, Windows attributes, and symlinks and hardlinks as such — use
-//! [`unpack_to`](Entry::unpack_to):
+//! [`unpack_to`](Entry::unpack_to). On Unix a process that is not root does
+//! not restore set-user-ID, or set-group-ID on a file:
 //!
 //! ```no_run
 //! use unrar_rs::RarArchive;

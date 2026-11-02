@@ -3083,8 +3083,37 @@ impl RarArchive {
         Ok(uid_matches && gid_matches)
     }
 
+    /// The mode an extracted member is given on disk: the header's mode
+    /// (or the host default), with set-user-ID and set-group-ID dropped
+    /// unless the process runs as root. Every place a header mode reaches
+    /// `chmod` or `fchmod`, including the hard-link path, goes through here.
     #[cfg(unix)]
     fn unix_output_mode(fh: &FileHeader) -> Option<u32> {
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let is_root = unsafe { libc::geteuid() } == 0;
+        Self::unix_header_mode(fh)
+            .map(|mode| Self::strip_privileged_mode_bits(mode, fh.is_directory, is_root))
+    }
+
+    /// Drops set-user-ID and set-group-ID from a file mode, and set-user-ID
+    /// from a directory mode, for a process that is not root. A directory
+    /// keeps set-group-ID, which only makes new entries inherit the
+    /// directory's group. RAR's own extractor applies the same rule.
+    #[cfg(unix)]
+    fn strip_privileged_mode_bits(mode: u32, is_directory: bool, is_root: bool) -> u32 {
+        const SET_USER_ID: u32 = 0o4000;
+        const SET_GROUP_ID: u32 = 0o2000;
+        if is_root {
+            mode
+        } else if is_directory {
+            mode & !SET_USER_ID
+        } else {
+            mode & !(SET_USER_ID | SET_GROUP_ID)
+        }
+    }
+
+    #[cfg(unix)]
+    fn unix_header_mode(fh: &FileHeader) -> Option<u32> {
         match fh.host_os {
             crate::types::HostOs::Unix => {
                 let mode = fh.attributes.unix_mode() & 0o7777;
@@ -8729,6 +8758,74 @@ mod tests {
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
             0o777 & !current_umask()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strip_privileged_mode_bits_follows_rar_behavior() {
+        // Files lose both bits, directories only set-user-ID, root keeps all.
+        let strip = RarArchive::strip_privileged_mode_bits;
+        assert_eq!(strip(0o4755, false, false), 0o755);
+        assert_eq!(strip(0o2755, false, false), 0o755);
+        assert_eq!(strip(0o6755, false, false), 0o755);
+        assert_eq!(strip(0o1777, false, false), 0o1777);
+        assert_eq!(strip(0o6755, true, false), 0o2755);
+        assert_eq!(strip(0o2775, true, false), 0o2775);
+        assert_eq!(strip(0o6755, false, true), 0o6755);
+        assert_eq!(strip(0o6755, true, true), 0o6755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_output_mode_strips_set_id_bits_unless_root() {
+        let is_root = unsafe { libc::geteuid() } == 0;
+        let mut fh = test_rar3_symlink_header(None);
+        fh.host_os = HostOs::Unix;
+
+        fh.is_directory = false;
+        for (header, stripped) in [(0o4755_u32, 0o755), (0o2755, 0o755), (0o6755, 0o755)] {
+            fh.attributes = FileAttributes(u64::from(0o100000 | header));
+            let expected = if is_root { header } else { stripped };
+            assert_eq!(RarArchive::unix_output_mode(&fh), Some(expected));
+        }
+
+        fh.is_directory = true;
+        fh.attributes = FileAttributes(0o040000 | 0o6755);
+        let expected = if is_root { 0o6755 } else { 0o2755 };
+        assert_eq!(RarArchive::unix_output_mode(&fh), Some(expected));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_unix_permissions_strips_set_id_bits_on_disk_unless_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let is_root = unsafe { libc::geteuid() } == 0;
+        let temp = tempfile::tempdir().unwrap();
+        let mut fh = test_rar3_symlink_header(None);
+        fh.host_os = HostOs::Unix;
+
+        fh.is_directory = false;
+        for (index, header) in [0o4755_u32, 0o2755, 0o6755].into_iter().enumerate() {
+            let path = temp.path().join(format!("setid-{index}.bin"));
+            std::fs::write(&path, b"mode").unwrap();
+            fh.attributes = FileAttributes(u64::from(0o100000 | header));
+            RarArchive::apply_unix_permissions(&fh, &path).unwrap();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode, if is_root { header } else { 0o755 });
+        }
+
+        // A non-root user may not be able to set set-group-ID on a directory
+        // whose group it is not in; the temp dir is created with the user's
+        // own group, so the bit sticks when it is kept.
+        let dir = temp.path().join("setid-dir");
+        std::fs::create_dir(&dir).unwrap();
+        fh.is_directory = true;
+        fh.attributes = FileAttributes(0o040000 | 0o6755);
+        RarArchive::apply_unix_permissions(&fh, &dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode & 0o4000, if is_root { 0o4000 } else { 0 });
+        assert_eq!(mode & 0o777, 0o755);
     }
 
     #[test]

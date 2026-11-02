@@ -24,6 +24,15 @@
   that is not a directory, is `RarError::UnsafeLinkTarget`, and the
   existing output is left in place. Unlike UnRAR there is no switch to
   allow it.
+- On Unix, a process that is not root no longer restores set-user-ID or
+  set-group-ID from the archive, as
+  [UnRAR 7.30 beta 2 (October 27, 2026)](https://www.rarlab.com/rarnew.htm)
+  stopped doing. No CVE had been assigned when this entry was written.
+  Before, a Unix-origin member's mode was applied as stored, so an archive
+  could leave a set-user-ID executable owned by the extracting user. Now
+  an extracted file loses both bits and a directory loses set-user-ID but
+  keeps set-group-ID; the same mode is used when a hard link's mode is set
+  through its descriptor. Root keeps the stored mode.
 
 ### Changed
 
