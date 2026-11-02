@@ -165,14 +165,15 @@ mod unix {
         let path = c_name(root.as_os_str().as_bytes())?;
         // The extraction root is the caller's choice and may itself be
         // reached through a symlink; only the components beneath it are
-        // archive-controlled.
+        // archive-controlled, so no O_NOFOLLOW here. On Linux and Android
+        // O_PATH needs only search permission, so a write-and-search root
+        // without read permission still extracts, as it did before.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
         // SAFETY: `path` is NUL-terminated.
-        let fd = unsafe {
-            libc::open(
-                path.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        };
+        let fd = unsafe { libc::open(path.as_ptr(), flags) };
         if fd < 0 {
             return Err(AnchorError::Io(std::io::Error::last_os_error()));
         }
@@ -496,6 +497,21 @@ mod unix {
             AnchoredTarget::resolve(temp.path(), "dir/sub/../sub/file.bin").unwrap();
         }
 
+        /// A root with write and search permission but no read permission
+        /// still resolves, since `O_PATH` needs only search permission.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[test]
+        fn resolves_beneath_a_root_without_read_permission() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            std::fs::create_dir_all(root.join("dir")).unwrap();
+            std::fs::write(root.join("dir/file.bin"), b"x").unwrap();
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o300)).unwrap();
+            let result = AnchoredTarget::resolve(&root, "dir/file.bin");
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+            result.unwrap();
+        }
+
         #[test]
         fn refuses_a_climb_above_the_root() {
             let temp = tempfile::tempdir().unwrap();
@@ -701,6 +717,13 @@ mod windows {
         ) -> Result<Self, AnchorError> {
             let (walk, name) = split_final(relative)?;
             let pin = FILE_SHARE_READ | FILE_SHARE_WRITE;
+            // An output path with no directory part extracts into the
+            // current directory, as the Unix side does.
+            let root = if root.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                root
+            };
             // The root is the caller's choice and may be a junction itself.
             let mut dirs = vec![open(root, FILE_READ_ATTRIBUTES, pin, true)?];
             let mut path = root.to_path_buf();

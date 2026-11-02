@@ -3205,16 +3205,23 @@ impl RarArchive {
             .open_read()
             .map_err(|error| Self::link_anchor_error(error, raw_member_name, target))?;
         let permissions = input.metadata().map_err(RarError::from)?.permissions();
-        let mut output = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(out_path)
-            .map_err(RarError::from)?;
-        let written = std::io::copy(&mut input, &mut output).map_err(RarError::from)?;
-        output
-            .set_permissions(permissions)
-            .map_err(RarError::from)?;
-        Ok(written)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Owner-only until the bytes are in and the source mode is applied,
+        // so a restrictive source is never readable by others mid-copy.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut output = options.open(out_path).map_err(RarError::from)?;
+        let copied = std::io::copy(&mut input, &mut output)
+            .and_then(|written| output.set_permissions(permissions).map(|()| written));
+        match copied {
+            Ok(written) => Ok(written),
+            Err(error) => {
+                drop(output);
+                let _ = std::fs::remove_file(out_path);
+                Err(RarError::from(error))
+            }
+        }
     }
 
     fn copy_existing_filecopy_source(
