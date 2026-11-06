@@ -880,300 +880,573 @@ impl RarArchive {
     /// [`FactsWalkOutcome::strict`] re-raises the error a decode-bound parse of
     /// the same bytes raises, so `parse_volume_facts` fails on a truncated
     /// volume exactly as it always has.
+    ///
+    /// A walk from the signature is [`Self::facts_step`] with nothing to
+    /// resume, so a [`RarVolumeFactsCursor`] and the one-shot walk share every
+    /// line of the walk.
     fn facts_walk_boxed(
-        mut reader: Box<dyn ReadSeek>,
+        reader: Box<dyn ReadSeek>,
         password: Option<&str>,
         kdf_cache: std::sync::Arc<crate::crypto::KdfCache>,
     ) -> RarResult<FactsWalkOutcome> {
+        Self::facts_step(reader, password, kdf_cache, None).0
+    }
+
+    /// One facts walk, from the signature when `resume` is `None` and from
+    /// where an earlier walk stopped otherwise, with what the next walk can
+    /// resume from: `None` when it has to begin at the signature again.
+    ///
+    /// A walk that fails at a header still hands back where it began, or for
+    /// RAR4 the header it failed at with that header's effect undone. A walk
+    /// from the signature fails there in the same way over the same bytes, so
+    /// the next walk may begin there once the failing bytes change.
+    fn facts_step(
+        mut reader: Box<dyn ReadSeek>,
+        password: Option<&str>,
+        kdf_cache: std::sync::Arc<crate::crypto::KdfCache>,
+        resume: Option<FactsResume>,
+    ) -> (RarResult<FactsWalkOutcome>, Option<FactsResume>) {
         use std::io::{Seek, SeekFrom};
 
-        reader.seek(SeekFrom::Start(0))?;
-        let format = signature::read_signature(&mut reader)?;
         // Set by the walks below when the staged image ended underneath them;
         // left `None` when the walk stopped on an end-of-archive record.
         let mut short: Option<ShortRead> = None;
-
-        if format.is_rar4_family() {
-            // The `_for_facts` walks accept a reader with no known length — a
-            // sparse image of a volume still arriving — because the result is
-            // reported and never decoded from; every extraction-bound parse
-            // still refuses one.
-            let parsed = if format == ArchiveFormat::Rar14 {
-                crate::rar4::parse_rar14_headers_for_facts(&mut reader, &mut short)?
-            } else {
-                crate::rar4::parse_rar4_headers_for_facts_with_kdf_cache(
+        let resume = match resume {
+            Some(resume) => resume,
+            None => {
+                let format = reader
+                    .seek(SeekFrom::Start(0))
+                    .map_err(crate::error::RarError::from)
+                    .and_then(|_| signature::read_signature(&mut reader))
+                    .and_then(|format| Ok((format, reader.stream_position()?)));
+                match format {
+                    Err(error) => return (Err(error), None),
+                    // A RAR 1.4 volume is walked whole every time: its headers
+                    // are few and the format is long gone from the wild.
+                    Ok((ArchiveFormat::Rar14, _)) => {
+                        // The `_for_facts` walks accept a reader with no known
+                        // length — a sparse image of a volume still arriving —
+                        // because the result is reported and never decoded
+                        // from; every extraction-bound parse still refuses one.
+                        let outcome =
+                            crate::rar4::parse_rar14_headers_for_facts(&mut reader, &mut short)
+                                .and_then(|parsed| {
+                                    Self::rar4_facts(
+                                        reader,
+                                        password,
+                                        &kdf_cache,
+                                        ArchiveFormat::Rar14,
+                                        &parsed,
+                                        short,
+                                    )
+                                });
+                        return (outcome, None);
+                    }
+                    Ok((ArchiveFormat::Rar4, at)) => {
+                        FactsResume::Rar4(crate::rar4::Rar4Walk::starting_at(at))
+                    }
+                    Ok((ArchiveFormat::Rar5, at)) => FactsResume::Rar5(Rar5Resume::starting_at(at)),
+                }
+            }
+        };
+        match resume {
+            FactsResume::Rar4(mut walk) => {
+                let walked = reader
+                    .seek(SeekFrom::Start(walk.at()))
+                    .map_err(crate::error::RarError::from)
+                    .and_then(|_| {
+                        crate::rar4::walk_rar4_headers_for_facts(
+                            &mut reader,
+                            password,
+                            &kdf_cache,
+                            &mut short,
+                            &mut walk,
+                        )
+                    })
+                    .and_then(|()| walk.take_volume(true));
+                let outcome = match walked {
+                    Ok(parsed) => {
+                        let outcome = Self::rar4_facts(
+                            reader,
+                            password,
+                            &kdf_cache,
+                            ArchiveFormat::Rar4,
+                            &parsed,
+                            short,
+                        );
+                        walk.give_back(parsed);
+                        outcome
+                    }
+                    Err(error) => {
+                        walk.rewind();
+                        Err(error)
+                    }
+                };
+                (outcome, Some(FactsResume::Rar4(walk)))
+            }
+            FactsResume::Rar5(mut state) => {
+                let mut stop = state.at;
+                let parsed = match crate::header::resume_headers_for_facts(
                     &mut reader,
                     password,
                     &kdf_cache,
+                    crate::header::HeaderParseOptions::default(),
                     &mut short,
-                )?
-            };
-            let volume_number = parsed
-                .end
-                .as_ref()
-                .and_then(|end| end.volume_number)
-                .map(u32::from);
-            let more_volumes = parsed.end.as_ref().is_some_and(|end| end.more_volumes)
-                || (format == ArchiveFormat::Rar14 && parsed.files.iter().any(|f| f.split_after));
-            let has_rar4_uowner_payload =
-                parsed.services.iter().any(|service| service.name == "UOW")
-                    || parsed.old_services.iter().any(|service| {
-                        matches!(
-                            &service.data,
-                            crate::rar4::types::Rar4OldServiceData::UnixOwner
-                        )
-                    });
-            let member_owner_facts: Vec<_> = if has_rar4_uowner_payload {
-                let archive = Self::open_rar4_parsed(
-                    reader,
-                    password,
-                    std::sync::Arc::clone(&kdf_cache),
-                    format,
-                    parsed.clone(),
-                )?;
-                archive
-                    .members
-                    .iter()
-                    .map(|member| unix_owner_facts(member.owner.clone()))
-                    .collect()
-            } else {
-                parsed
-                    .files
-                    .iter()
-                    .map(|fh| unix_owner_facts(fh.owner.clone()))
-                    .collect()
-            };
-            let members = parsed
+                    state.at,
+                    state.main.clone(),
+                    state.encryption.clone(),
+                    &mut stop,
+                ) {
+                    Ok(parsed) => parsed,
+                    Err(error) => return (Err(error), Some(FactsResume::Rar5(state))),
+                };
+                if parsed.headers_from_quick_open {
+                    // An answer from the Quick Open cache holds every header
+                    // at once; the next walk asks the cache again from the
+                    // signature, as a walk without a cursor does.
+                    let outcome = FactsWalkOutcome::new(
+                        short,
+                        rar5_volume_facts(
+                            parsed.main.as_ref(),
+                            parsed.end.as_ref(),
+                            parsed.is_encrypted,
+                            true,
+                            rar5_member_facts(0, parsed.files),
+                            rar5_service_facts(0, parsed.services),
+                        ),
+                    );
+                    return (Ok(outcome), None);
+                }
+                let services = rar5_service_facts(state.services.len(), parsed.services);
+                state.services.extend(services);
+                let members = rar5_member_facts(state.members.len(), parsed.files);
+                state.members.extend(members);
+                let facts = rar5_volume_facts(
+                    parsed.main.as_ref(),
+                    parsed.end.as_ref(),
+                    parsed.is_encrypted,
+                    false,
+                    state.members.clone(),
+                    state.services.clone(),
+                );
+                state.main = parsed.main;
+                state.encryption = parsed.encryption;
+                state.at = stop;
+                (
+                    Ok(FactsWalkOutcome::new(short, facts)),
+                    Some(FactsResume::Rar5(state)),
+                )
+            }
+        }
+    }
+
+    /// The facts a RAR4-family walk's headers state.
+    fn rar4_facts(
+        reader: Box<dyn ReadSeek>,
+        password: Option<&str>,
+        kdf_cache: &std::sync::Arc<crate::crypto::KdfCache>,
+        format: ArchiveFormat,
+        parsed: &crate::rar4::Rar4ParsedVolume,
+        short: Option<ShortRead>,
+    ) -> RarResult<FactsWalkOutcome> {
+        let volume_number = parsed
+            .end
+            .as_ref()
+            .and_then(|end| end.volume_number)
+            .map(u32::from);
+        let more_volumes = parsed.end.as_ref().is_some_and(|end| end.more_volumes)
+            || (format == ArchiveFormat::Rar14 && parsed.files.iter().any(|f| f.split_after));
+        let has_rar4_uowner_payload = parsed.services.iter().any(|service| service.name == "UOW")
+            || parsed.old_services.iter().any(|service| {
+                matches!(
+                    &service.data,
+                    crate::rar4::types::Rar4OldServiceData::UnixOwner
+                )
+            });
+        let member_owner_facts: Vec<_> = if has_rar4_uowner_payload {
+            let archive = Self::open_rar4_parsed(
+                reader,
+                password,
+                std::sync::Arc::clone(kdf_cache),
+                format,
+                parsed.clone(),
+            )?;
+            archive
+                .members
+                .iter()
+                .map(|member| unix_owner_facts(member.owner.clone()))
+                .collect()
+        } else {
+            parsed
                 .files
                 .iter()
-                .enumerate()
-                .map(|(order, fh)| {
-                    let file_header =
-                        RarArchive::rar4_to_file_header(fh, parsed.archive_header.is_solid);
-                    let packed_hashes =
-                        RarArchive::packed_hashes_for_split_segment(&file_header, None);
-                    RarVolumeMemberFacts {
-                        order: order as u32,
-                        name: fh.name.clone(),
-                        name_raw: fh.name_raw.clone(),
-                        unpacked_size: fh.unpacked_size,
-                        data_crc32: (!fh.is_rar14).then_some(fh.crc32),
-                        data_blake2_hash: None,
-                        version: file_header.version,
-                        packed_crc32: packed_hashes.crc32,
-                        packed_blake2_hash: packed_hashes.blake2sp,
-                        packed_hash_uses_mac: false,
-                        split_before: fh.split_before,
-                        split_after: fh.split_after,
-                        is_directory: fh.is_directory,
-                        is_encrypted: fh.is_encrypted,
-                        encryption: None,
-                        rar4_salt: fh.salt,
-                        host_os: supported_rar4_host_os(fh.host_os),
-                        attributes: Some(u64::from(fh.attributes)),
-                        owner: member_owner_facts.get(order).cloned().flatten(),
-                        mtime_ns: encode_system_time(file_header.mtime),
-                        ctime_ns: encode_system_time(file_header.ctime),
-                        atime_ns: encode_system_time(file_header.atime),
-                        data_offset: fh.data_offset,
-                        data_size: fh.packed_size,
-                        compression_method: file_header.compression.method.code(),
-                        compression_version: fh.unpack_version,
-                        compression_solid: RarArchive::rar4_effective_solid(
-                            fh,
-                            parsed.archive_header.is_solid,
-                        ),
-                        dict_size: fh.dict_size,
-                        use_hash_mac: false,
-                        redirection_type: None,
-                        redirection_target: None,
-                        redirection_target_raw: None,
-                        redirection_target_is_directory: false,
-                    }
-                })
-                .collect();
-            let mut services: Vec<_> = parsed
-                .services
-                .iter()
-                .enumerate()
-                .map(|(order, service)| RarVolumeServiceFacts::from_rar4_service(order, service))
-                .collect();
-            let base_order = services.len();
-            services.extend(parsed.comments.iter().enumerate().map(|(order, comment)| {
-                RarVolumeServiceFacts::from_rar4_comment(base_order + order, comment)
-            }));
-            let base_order = services.len();
-            services.extend(
-                parsed
-                    .old_services
-                    .iter()
-                    .enumerate()
-                    .map(|(order, service)| {
-                        RarVolumeServiceFacts::from_rar4_old_service(base_order + order, service)
-                    }),
-            );
-            return Ok(FactsWalkOutcome::new(
-                short,
-                RarVolumeFacts {
-                    format: if format == ArchiveFormat::Rar14 {
-                        14
-                    } else {
-                        4
-                    },
-                    volume_number,
-                    more_volumes,
-                    is_solid: parsed.archive_header.is_solid,
-                    is_encrypted: parsed.archive_header.is_encrypted,
-                    is_volume: parsed.archive_header.is_volume,
-                    has_recovery_record: parsed.archive_header.has_recovery_record,
-                    is_locked: parsed.archive_header.is_locked,
-                    has_authenticity_verification: parsed
-                        .archive_header
-                        .has_authenticity_verification,
-                    has_locator: false,
-                    quick_open_offset: None,
-                    // RAR4 and RAR1.4 have no Quick Open cache; this walk is
-                    // physical by construction.
-                    headers_from_quick_open: false,
-                    recovery_record_offset: None,
-                    original_name: None,
-                    original_name_raw: None,
-                    original_creation_time_ns: None,
-                    members,
-                    services,
-                },
-            ));
-        }
-
-        let parsed = crate::header::parse_all_headers_for_facts(
-            &mut reader,
-            password,
-            &kdf_cache,
-            crate::header::HeaderParseOptions::default(),
-            &mut short,
-        )?;
-        let main = parsed.main.as_ref();
-        let volume_number = main
-            .and_then(|main| main.volume_number)
-            .map(|value| value as u32);
-        let more_volumes = parsed.end.as_ref().is_some_and(|end| end.more_volumes);
-        let is_solid = main.is_some_and(|main| main.is_solid);
-        let is_volume = main.is_some_and(|main| main.is_volume);
-        let has_recovery_record = main.is_some_and(|main| main.has_recovery_record);
-        let is_locked = main.is_some_and(|main| main.is_locked);
-        let has_locator = main.is_some_and(|main| main.has_locator);
-        let quick_open_offset = main.and_then(|main| main.quick_open_offset);
-        // Provenance, not the mere presence of a locator: a volume can carry
-        // `quick_open_offset` and still be answered by the physical walk when
-        // its `QO` block was rejected.
-        let headers_from_quick_open = parsed.headers_from_quick_open;
-        let recovery_record_offset = main.and_then(|main| main.recovery_record_offset);
-        let original_name = main.and_then(|main| main.original_name.clone());
-        let original_name_raw = main.and_then(|main| main.original_name_raw.clone());
-        let original_creation_time_ns =
-            encode_system_time(main.and_then(|main| main.original_creation_time));
-        let services = parsed
-            .services
-            .into_iter()
-            .enumerate()
-            .map(|(order, service)| RarVolumeServiceFacts::from_rar5_service(order, service))
-            .collect();
+                .map(|fh| unix_owner_facts(fh.owner.clone()))
+                .collect()
+        };
         let members = parsed
             .files
-            .into_iter()
+            .iter()
             .enumerate()
-            .map(|(order, parsed_file)| {
-                let packed_hashes = RarArchive::packed_hashes_for_split_segment(
-                    &parsed_file.header,
-                    parsed_file.hash.as_ref(),
-                );
-                let packed_hash_uses_mac = packed_hashes.is_present()
-                    && parsed_file
-                        .file_encryption
-                        .as_ref()
-                        .is_some_and(|info| info.use_hash_mac);
+            .map(|(order, fh)| {
+                let file_header =
+                    RarArchive::rar4_to_file_header(fh, parsed.archive_header.is_solid);
+                let packed_hashes = RarArchive::packed_hashes_for_split_segment(&file_header, None);
                 RarVolumeMemberFacts {
                     order: order as u32,
-                    name: parsed_file.header.name,
-                    name_raw: parsed_file.header.name_raw,
-                    unpacked_size: parsed_file.header.unpacked_size,
-                    data_crc32: parsed_file.header.data_crc32,
-                    data_blake2_hash: file_hash_blake2(parsed_file.hash.as_ref()),
-                    version: parsed_file.header.version,
+                    name: fh.name.clone(),
+                    name_raw: fh.name_raw.clone(),
+                    unpacked_size: fh.unpacked_size,
+                    data_crc32: (!fh.is_rar14).then_some(fh.crc32),
+                    data_blake2_hash: None,
+                    version: file_header.version,
                     packed_crc32: packed_hashes.crc32,
                     packed_blake2_hash: packed_hashes.blake2sp,
-                    packed_hash_uses_mac,
-                    split_before: parsed_file.header.split_before,
-                    split_after: parsed_file.header.split_after,
-                    is_directory: parsed_file.header.is_directory,
-                    is_encrypted: parsed_file.is_encrypted,
-                    encryption: member_encryption_facts(parsed_file.file_encryption.as_ref()),
-                    rar4_salt: None,
-                    host_os: supported_host_os(parsed_file.header.host_os),
-                    attributes: Some(parsed_file.header.attributes.0),
-                    owner: unix_owner_facts(parsed_file.owner),
-                    mtime_ns: encode_system_time(parsed_file.header.mtime),
-                    ctime_ns: encode_system_time(parsed_file.header.ctime),
-                    atime_ns: encode_system_time(parsed_file.header.atime),
-                    data_offset: parsed_file.header.data_offset,
-                    data_size: parsed_file.header.data_size,
-                    compression_method: parsed_file.header.compression.method.code(),
-                    compression_version: parsed_file.header.compression.version,
-                    compression_solid: parsed_file.header.compression.solid,
-                    dict_size: parsed_file.header.compression.dict_size,
-                    use_hash_mac: parsed_file
-                        .file_encryption
-                        .as_ref()
-                        .is_some_and(|info| info.use_hash_mac),
-                    redirection_type: parsed_file.redirection.as_ref().map(|redir| {
-                        match redir.redir_type {
-                            crate::header::RedirectionType::UnixSymlink => 1,
-                            crate::header::RedirectionType::WindowsSymlink => 2,
-                            crate::header::RedirectionType::WindowsJunction => 3,
-                            crate::header::RedirectionType::Hardlink => 4,
-                            crate::header::RedirectionType::FileCopy => 5,
-                            crate::header::RedirectionType::Unknown(value) => value,
-                        }
-                    }),
-                    redirection_target: parsed_file
-                        .redirection
-                        .as_ref()
-                        .map(|redir| redir.target.clone()),
-                    redirection_target_raw: parsed_file
-                        .redirection
-                        .as_ref()
-                        .and_then(|redir| redir.target_raw.clone()),
-                    redirection_target_is_directory: parsed_file
-                        .redirection
-                        .as_ref()
-                        .is_some_and(|redir| redir.target_is_directory),
+                    packed_hash_uses_mac: false,
+                    split_before: fh.split_before,
+                    split_after: fh.split_after,
+                    is_directory: fh.is_directory,
+                    is_encrypted: fh.is_encrypted,
+                    encryption: None,
+                    rar4_salt: fh.salt,
+                    host_os: supported_rar4_host_os(fh.host_os),
+                    attributes: Some(u64::from(fh.attributes)),
+                    owner: member_owner_facts.get(order).cloned().flatten(),
+                    mtime_ns: encode_system_time(file_header.mtime),
+                    ctime_ns: encode_system_time(file_header.ctime),
+                    atime_ns: encode_system_time(file_header.atime),
+                    data_offset: fh.data_offset,
+                    data_size: fh.packed_size,
+                    compression_method: file_header.compression.method.code(),
+                    compression_version: fh.unpack_version,
+                    compression_solid: RarArchive::rar4_effective_solid(
+                        fh,
+                        parsed.archive_header.is_solid,
+                    ),
+                    dict_size: fh.dict_size,
+                    use_hash_mac: false,
+                    redirection_type: None,
+                    redirection_target: None,
+                    redirection_target_raw: None,
+                    redirection_target_is_directory: false,
                 }
             })
             .collect();
-
+        let mut services: Vec<_> = parsed
+            .services
+            .iter()
+            .enumerate()
+            .map(|(order, service)| RarVolumeServiceFacts::from_rar4_service(order, service))
+            .collect();
+        let base_order = services.len();
+        services.extend(parsed.comments.iter().enumerate().map(|(order, comment)| {
+            RarVolumeServiceFacts::from_rar4_comment(base_order + order, comment)
+        }));
+        let base_order = services.len();
+        services.extend(
+            parsed
+                .old_services
+                .iter()
+                .enumerate()
+                .map(|(order, service)| {
+                    RarVolumeServiceFacts::from_rar4_old_service(base_order + order, service)
+                }),
+        );
         Ok(FactsWalkOutcome::new(
             short,
             RarVolumeFacts {
-                format: 5,
+                format: if format == ArchiveFormat::Rar14 {
+                    14
+                } else {
+                    4
+                },
                 volume_number,
                 more_volumes,
-                is_solid,
-                is_encrypted: parsed.is_encrypted,
-                is_volume,
-                has_recovery_record,
-                is_locked,
-                has_authenticity_verification: false,
-                has_locator,
-                quick_open_offset,
-                headers_from_quick_open,
-                recovery_record_offset,
-                original_name,
-                original_name_raw,
-                original_creation_time_ns,
+                is_solid: parsed.archive_header.is_solid,
+                is_encrypted: parsed.archive_header.is_encrypted,
+                is_volume: parsed.archive_header.is_volume,
+                has_recovery_record: parsed.archive_header.has_recovery_record,
+                is_locked: parsed.archive_header.is_locked,
+                has_authenticity_verification: parsed.archive_header.has_authenticity_verification,
+                has_locator: false,
+                quick_open_offset: None,
+                // RAR4 and RAR1.4 have no Quick Open cache; this walk is
+                // physical by construction.
+                headers_from_quick_open: false,
+                recovery_record_offset: None,
+                original_name: None,
+                original_name_raw: None,
+                original_creation_time_ns: None,
                 members,
                 services,
             },
         ))
+    }
+}
+
+/// A volume-facts walk that can be continued over a grown image of the same
+/// volume, from the header the previous walk stopped at.
+///
+/// A caller staging a volume as its pieces arrive reads its facts again after
+/// each piece. [`RarArchive::parse_volume_facts_walk_with_shared_kdf_cache`]
+/// reads every header from the signature each time, so a volume with many
+/// headers costs a walk of all of them per piece. [`Self::step`] reads from
+/// the header the last step stopped at and keeps what the headers before it
+/// said.
+///
+/// **A step returns exactly what the one-shot walk returns** over the same
+/// bytes — the same facts in the same order, the same
+/// [`RarVolumeFactsWalk::short_at`], the same error — provided no byte before
+/// [`Self::resumes_at`] changed since the last step. That proviso is the
+/// caller's to keep, because only the caller knows which of its bytes
+/// changed: when one before that offset did (a repaired piece, a damaged one
+/// it now lets the walk read), call [`Self::restart`] first. Bytes at or past
+/// it may change or arrive freely: a hole at the cursor filled, a damaged
+/// header at it repaired in place, more of the volume staged. So may a byte
+/// arriving before it where the image held none: the walk read nothing
+/// before the cursor but whole headers, and seeked over the data between
+/// them, so a byte it never had is one it never read. Only a byte the image
+/// held, changed, calls for the restart. A step with a different password
+/// than the last begins at the signature on its own.
+///
+/// A change before [`Self::resumes_at`] without [`Self::restart`] is a bug
+/// in the caller, and the cursor does not detect it: the step keeps what the
+/// headers before the cursor said when they were read and adds what the bytes
+/// from the cursor on say now, so it can report a header the image no longer
+/// holds, miss one it now does, or fail where a walk from the signature
+/// would not.
+///
+/// A step that fails keeps the cursor where that walk began, or for RAR4 at
+/// the header it failed at: a walk from the signature fails there the same
+/// way, so the step after the failing bytes change continues from there.
+///
+/// RAR5 and RAR4 volumes resume, `-hp` header encryption included. A RAR 1.4
+/// volume and a RAR5 volume the Quick Open cache answered leave nothing to
+/// resume: the next step begins at the signature.
+///
+/// The cursor holds the headers read so far as facts and the password the
+/// walk was keyed with, and nothing derived from it.
+#[derive(Default)]
+pub struct RarVolumeFactsCursor {
+    state: Option<(Option<zeroize::Zeroizing<String>>, FactsResume)>,
+}
+
+/// What a walk carries to the next one over the same volume.
+enum FactsResume {
+    Rar4(crate::rar4::Rar4Walk),
+    Rar5(Rar5Resume),
+}
+
+struct Rar5Resume {
+    /// The start of the header the last walk stopped at: the one it ran short
+    /// in, or the end-of-archive record. Every header before it was read
+    /// whole.
+    at: u64,
+    main: Option<crate::header::main_archive::MainArchiveHeader>,
+    encryption: Option<crate::header::encryption::EncryptionHeader>,
+    members: Vec<RarVolumeMemberFacts>,
+    services: Vec<RarVolumeServiceFacts>,
+}
+
+impl Rar5Resume {
+    fn starting_at(at: u64) -> Self {
+        Self {
+            at,
+            main: None,
+            encryption: None,
+            members: Vec::new(),
+            services: Vec::new(),
+        }
+    }
+}
+
+impl FactsResume {
+    fn at(&self) -> u64 {
+        match self {
+            Self::Rar4(walk) => walk.at(),
+            Self::Rar5(state) => state.at,
+        }
+    }
+}
+
+impl RarVolumeFactsCursor {
+    /// A cursor whose first step walks from the signature.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Walk the volume's headers from where the last step stopped, or from
+    /// the signature on the first step, after [`Self::restart`], or under a
+    /// different password than the last step's.
+    ///
+    /// The result is the one
+    /// [`RarArchive::parse_volume_facts_walk_with_shared_kdf_cache`] gives
+    /// for the same reader, password and cache; see the type's documentation
+    /// for the one condition on the caller.
+    pub fn step(
+        &mut self,
+        reader: impl std::io::Read + std::io::Seek + Send + 'static,
+        password: Option<&str>,
+        kdf_cache: std::sync::Arc<crate::crypto::KdfCache>,
+    ) -> RarResult<RarVolumeFactsWalk> {
+        let resume = self
+            .state
+            .take()
+            .filter(|(keyed, _)| keyed.as_deref().map(String::as_str) == password)
+            .map(|(_, resume)| resume);
+        let (outcome, resume) =
+            RarArchive::facts_step(Box::new(reader), password, kdf_cache, resume);
+        self.state = resume.map(|resume| {
+            (
+                password.map(|password| zeroize::Zeroizing::new(password.to_owned())),
+                resume,
+            )
+        });
+        Ok(outcome?.walk)
+    }
+
+    /// The offset the next step begins at, or `None` when it begins at the
+    /// signature. A change to any byte before it calls for [`Self::restart`].
+    pub fn resumes_at(&self) -> Option<u64> {
+        self.state.as_ref().map(|(_, resume)| resume.at())
+    }
+
+    /// Walk from the signature on the next step.
+    pub fn restart(&mut self) {
+        self.state = None;
+    }
+}
+
+impl std::fmt::Debug for RarVolumeFactsCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RarVolumeFactsCursor")
+            .field("resumes_at", &self.resumes_at())
+            .finish_non_exhaustive()
+    }
+}
+
+fn rar5_service_facts(
+    first: usize,
+    services: Vec<crate::header::ParsedService>,
+) -> Vec<RarVolumeServiceFacts> {
+    services
+        .into_iter()
+        .enumerate()
+        .map(|(order, service)| RarVolumeServiceFacts::from_rar5_service(first + order, service))
+        .collect()
+}
+
+fn rar5_member_facts(
+    first: usize,
+    files: Vec<crate::header::ParsedFile>,
+) -> Vec<RarVolumeMemberFacts> {
+    files
+        .into_iter()
+        .enumerate()
+        .map(|(order, parsed_file)| {
+            let order = first + order;
+            let packed_hashes = RarArchive::packed_hashes_for_split_segment(
+                &parsed_file.header,
+                parsed_file.hash.as_ref(),
+            );
+            let packed_hash_uses_mac = packed_hashes.is_present()
+                && parsed_file
+                    .file_encryption
+                    .as_ref()
+                    .is_some_and(|info| info.use_hash_mac);
+            RarVolumeMemberFacts {
+                order: order as u32,
+                name: parsed_file.header.name,
+                name_raw: parsed_file.header.name_raw,
+                unpacked_size: parsed_file.header.unpacked_size,
+                data_crc32: parsed_file.header.data_crc32,
+                data_blake2_hash: file_hash_blake2(parsed_file.hash.as_ref()),
+                version: parsed_file.header.version,
+                packed_crc32: packed_hashes.crc32,
+                packed_blake2_hash: packed_hashes.blake2sp,
+                packed_hash_uses_mac,
+                split_before: parsed_file.header.split_before,
+                split_after: parsed_file.header.split_after,
+                is_directory: parsed_file.header.is_directory,
+                is_encrypted: parsed_file.is_encrypted,
+                encryption: member_encryption_facts(parsed_file.file_encryption.as_ref()),
+                rar4_salt: None,
+                host_os: supported_host_os(parsed_file.header.host_os),
+                attributes: Some(parsed_file.header.attributes.0),
+                owner: unix_owner_facts(parsed_file.owner),
+                mtime_ns: encode_system_time(parsed_file.header.mtime),
+                ctime_ns: encode_system_time(parsed_file.header.ctime),
+                atime_ns: encode_system_time(parsed_file.header.atime),
+                data_offset: parsed_file.header.data_offset,
+                data_size: parsed_file.header.data_size,
+                compression_method: parsed_file.header.compression.method.code(),
+                compression_version: parsed_file.header.compression.version,
+                compression_solid: parsed_file.header.compression.solid,
+                dict_size: parsed_file.header.compression.dict_size,
+                use_hash_mac: parsed_file
+                    .file_encryption
+                    .as_ref()
+                    .is_some_and(|info| info.use_hash_mac),
+                redirection_type: parsed_file.redirection.as_ref().map(|redir| {
+                    match redir.redir_type {
+                        crate::header::RedirectionType::UnixSymlink => 1,
+                        crate::header::RedirectionType::WindowsSymlink => 2,
+                        crate::header::RedirectionType::WindowsJunction => 3,
+                        crate::header::RedirectionType::Hardlink => 4,
+                        crate::header::RedirectionType::FileCopy => 5,
+                        crate::header::RedirectionType::Unknown(value) => value,
+                    }
+                }),
+                redirection_target: parsed_file
+                    .redirection
+                    .as_ref()
+                    .map(|redir| redir.target.clone()),
+                redirection_target_raw: parsed_file
+                    .redirection
+                    .as_ref()
+                    .and_then(|redir| redir.target_raw.clone()),
+                redirection_target_is_directory: parsed_file
+                    .redirection
+                    .as_ref()
+                    .is_some_and(|redir| redir.target_is_directory),
+            }
+        })
+        .collect()
+}
+
+fn rar5_volume_facts(
+    main: Option<&crate::header::main_archive::MainArchiveHeader>,
+    end: Option<&crate::header::end_archive::EndArchiveHeader>,
+    is_encrypted: bool,
+    headers_from_quick_open: bool,
+    members: Vec<RarVolumeMemberFacts>,
+    services: Vec<RarVolumeServiceFacts>,
+) -> RarVolumeFacts {
+    RarVolumeFacts {
+        format: 5,
+        volume_number: main
+            .and_then(|main| main.volume_number)
+            .map(|value| value as u32),
+        more_volumes: end.is_some_and(|end| end.more_volumes),
+        is_solid: main.is_some_and(|main| main.is_solid),
+        is_encrypted,
+        is_volume: main.is_some_and(|main| main.is_volume),
+        has_recovery_record: main.is_some_and(|main| main.has_recovery_record),
+        is_locked: main.is_some_and(|main| main.is_locked),
+        has_authenticity_verification: false,
+        has_locator: main.is_some_and(|main| main.has_locator),
+        quick_open_offset: main.and_then(|main| main.quick_open_offset),
+        // Provenance, not the mere presence of a locator: a volume can carry
+        // `quick_open_offset` and still be answered by the physical walk when
+        // its `QO` block was rejected.
+        headers_from_quick_open,
+        recovery_record_offset: main.and_then(|main| main.recovery_record_offset),
+        original_name: main.and_then(|main| main.original_name.clone()),
+        original_name_raw: main.and_then(|main| main.original_name_raw.clone()),
+        original_creation_time_ns: encode_system_time(
+            main.and_then(|main| main.original_creation_time),
+        ),
+        members,
+        services,
     }
 }
 
@@ -2000,6 +2273,717 @@ mod tests {
                 "reported offset {short_at} must be past the {staged} staged bytes"
             );
             assert_eq!(walk.facts.members.len(), whole.facts.members.len());
+        }
+    }
+
+    /// The resumable walk against the one-shot walk it is built on: every
+    /// step over every image a caller can stage, compared with a fresh walk
+    /// from the signature over the same bytes.
+    mod resumable {
+        use super::*;
+        use crate::short_read::header_reads;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::ops::Range;
+
+        /// A volume image as a caller stages it: the volume's bytes, and
+        /// which of them it holds so far.
+        struct Image {
+            bytes: Vec<u8>,
+            have: Vec<bool>,
+        }
+
+        impl Image {
+            fn empty(bytes: &[u8]) -> Self {
+                Self {
+                    bytes: bytes.to_vec(),
+                    have: vec![false; bytes.len()],
+                }
+            }
+
+            fn whole(bytes: &[u8]) -> Self {
+                let mut image = Self::empty(bytes);
+                image.stage(0..bytes.len());
+                image
+            }
+
+            fn stage(&mut self, range: Range<usize>) {
+                self.have[range].fill(true);
+            }
+
+            fn unstage(&mut self, range: Range<usize>) {
+                self.have[range].fill(false);
+            }
+
+            /// Overwrite one byte the image holds: a damaged article, or its
+            /// repair.
+            fn put(&mut self, at: usize, byte: u8) {
+                self.bytes[at] = byte;
+            }
+
+            fn reader(&self, view: View) -> Staged {
+                match view {
+                    View::Sparse => Staged {
+                        bytes: self.bytes.clone(),
+                        have: self.have.clone(),
+                        pos: 0,
+                        len: None,
+                    },
+                    View::Prefix => {
+                        let held = self.have.iter().take_while(|held| **held).count();
+                        Staged {
+                            bytes: self.bytes[..held].to_vec(),
+                            have: vec![true; held],
+                            pos: 0,
+                            len: Some(held as u64),
+                        }
+                    }
+                }
+            }
+        }
+
+        /// The two ways a caller hands the walk a partial volume.
+        #[derive(Debug, Clone, Copy)]
+        enum View {
+            /// Every byte held so far at its own offset; a byte not held reads
+            /// as the end of the stream, and the length is unknown.
+            Sparse,
+            /// The bytes held from the signature up to the first one not held,
+            /// with that length known, as a `Cursor` over them states it.
+            Prefix,
+        }
+
+        struct Staged {
+            bytes: Vec<u8>,
+            have: Vec<bool>,
+            pos: u64,
+            len: Option<u64>,
+        }
+
+        impl Read for Staged {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let from = usize::try_from(self.pos).unwrap_or(usize::MAX);
+                let mut read = 0;
+                while read < buf.len() && from + read < self.bytes.len() && self.have[from + read] {
+                    buf[read] = self.bytes[from + read];
+                    read += 1;
+                }
+                self.pos += read as u64;
+                Ok(read)
+            }
+        }
+
+        impl Seek for Staged {
+            fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+                let pos = match to {
+                    SeekFrom::Start(at) => Some(at),
+                    SeekFrom::Current(delta) => self.pos.checked_add_signed(delta),
+                    SeekFrom::End(delta) => match self.len {
+                        Some(len) => len.checked_add_signed(delta),
+                        None => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Unsupported,
+                                "a sparse image has no known end",
+                            ));
+                        }
+                    },
+                };
+                self.pos = pos.ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek before start")
+                })?;
+                Ok(self.pos)
+            }
+        }
+
+        fn same(
+            what: &str,
+            resumed: &RarResult<RarVolumeFactsWalk>,
+            fresh: &RarResult<RarVolumeFactsWalk>,
+        ) {
+            match (resumed, fresh) {
+                (Ok(resumed), Ok(fresh)) => assert_eq!(resumed, fresh, "{what}"),
+                (Err(resumed), Err(fresh)) => {
+                    assert_eq!(format!("{resumed:?}"), format!("{fresh:?}"), "{what}")
+                }
+                _ => panic!("{what}: resumed {resumed:?}, fresh {fresh:?}"),
+            }
+        }
+
+        fn fresh(
+            image: &Image,
+            view: View,
+            password: Option<&str>,
+            cache: &Arc<crate::crypto::KdfCache>,
+        ) -> RarResult<RarVolumeFactsWalk> {
+            RarArchive::parse_volume_facts_walk_with_shared_kdf_cache(
+                image.reader(view),
+                password,
+                Arc::clone(cache),
+            )
+        }
+
+        /// One cursor stepped over an image, each step checked against a
+        /// fresh walk, with the headers each side read counted.
+        struct Run {
+            cursor: RarVolumeFactsCursor,
+            cache: Arc<crate::crypto::KdfCache>,
+            password: Option<&'static str>,
+            view: View,
+            steps: usize,
+            resumed_headers: usize,
+            fresh_headers: usize,
+        }
+
+        impl Run {
+            fn new(password: Option<&'static str>, view: View) -> Self {
+                Self {
+                    cursor: RarVolumeFactsCursor::new(),
+                    cache: Arc::new(crate::crypto::KdfCache::new()),
+                    password,
+                    view,
+                    steps: 0,
+                    resumed_headers: 0,
+                    fresh_headers: 0,
+                }
+            }
+
+            /// Step without comparing: the caller asserts what it expects.
+            fn step_only(&mut self, image: &Image) -> RarResult<RarVolumeFactsWalk> {
+                self.cursor.step(
+                    image.reader(self.view),
+                    self.password,
+                    Arc::clone(&self.cache),
+                )
+            }
+
+            fn step(&mut self, image: &Image, what: &str) -> RarResult<RarVolumeFactsWalk> {
+                let from = self.cursor.resumes_at();
+                header_reads::take();
+                let resumed = self.step_only(image);
+                let read = header_reads::take();
+                if let Some(from) = from {
+                    assert!(
+                        read.iter().all(|at| *at >= from),
+                        "{what}: a step resuming at {from} read headers at {read:?}"
+                    );
+                }
+                self.steps += 1;
+                self.resumed_headers += read.len();
+                let fresh = fresh(image, self.view, self.password, &self.cache);
+                self.fresh_headers += header_reads::take().len();
+                same(what, &resumed, &fresh);
+                resumed
+            }
+        }
+
+        fn gcd(a: usize, b: usize) -> usize {
+            if b == 0 { a } else { gcd(b, a % b) }
+        }
+
+        /// The volume cut into `piece`-byte pieces, in the orders a caller
+        /// can come to hold them in.
+        fn schedules(len: usize, piece: usize) -> Vec<(&'static str, Vec<Range<usize>>)> {
+            let pieces: Vec<Range<usize>> = (0..len)
+                .step_by(piece)
+                .map(|start| start..(start + piece).min(len))
+                .collect();
+            let n = pieces.len();
+            let stride = (n / 3 + 1..n).find(|k| gcd(*k, n) == 1).unwrap_or(1);
+            vec![
+                ("in order", pieces.clone()),
+                ("reversed", pieces.iter().rev().cloned().collect()),
+                (
+                    "even then odd",
+                    pieces
+                        .iter()
+                        .step_by(2)
+                        .chain(pieces.iter().skip(1).step_by(2))
+                        .cloned()
+                        .collect(),
+                ),
+                (
+                    "strided",
+                    (0..n).map(|i| pieces[(i * stride) % n].clone()).collect(),
+                ),
+            ]
+        }
+
+        /// Feed `bytes` piece by piece under every schedule and both views,
+        /// stepping after each piece with no restart, and check every step
+        /// against a fresh walk and the last against the whole volume's walk.
+        /// Returns the in-order sparse run, for its header counts.
+        fn feed(name: &str, bytes: &[u8], password: Option<&'static str>, piece: usize) -> Run {
+            let cache = Arc::new(crate::crypto::KdfCache::new());
+            let whole = fresh(&Image::whole(bytes), View::Sparse, password, &cache)
+                .unwrap_or_else(|err| panic!("{name}: the whole volume walks: {err:?}"));
+            assert_eq!(whole.short_at, None, "{name}: the volume is complete");
+            let mut kept = None;
+            for view in [View::Sparse, View::Prefix] {
+                for (order, pieces) in schedules(bytes.len(), piece) {
+                    let mut image = Image::empty(bytes);
+                    let mut run = Run::new(password, view);
+                    let mut last = None;
+                    for (index, range) in pieces.into_iter().enumerate() {
+                        image.stage(range.clone());
+                        last = Some(run.step(
+                            &image,
+                            &format!("{name}, {view:?}, {order}, piece {index} at {range:?}"),
+                        ));
+                    }
+                    let last = last.expect("a volume has a piece").unwrap();
+                    assert_eq!(last, whole, "{name}, {view:?}, {order}: the whole volume");
+                    if kept.is_none() {
+                        kept = Some(run);
+                    }
+                }
+            }
+            kept.expect("the in-order sparse run")
+        }
+
+        /// The header starts a fresh walk over the whole volume reads, in
+        /// order.
+        fn header_starts(bytes: &[u8], password: Option<&str>) -> Vec<usize> {
+            header_reads::take();
+            fresh(
+                &Image::whole(bytes),
+                View::Sparse,
+                password,
+                &Arc::new(crate::crypto::KdfCache::new()),
+            )
+            .expect("the whole volume walks");
+            header_reads::take()
+                .into_iter()
+                .map(|at| at as usize)
+                .collect()
+        }
+
+        /// A synthetic volume and where each of its member headers starts.
+        struct Synthetic {
+            bytes: Vec<u8>,
+            members: Vec<usize>,
+            headers: usize,
+        }
+
+        impl Synthetic {
+            /// The offset of the `index`th member's name, which only that
+            /// header holds.
+            fn name_at(&self, index: usize) -> usize {
+                let name = member_name(index);
+                let from = self.members[index];
+                from + self.bytes[from..]
+                    .windows(name.len())
+                    .position(|window| window == name.as_bytes())
+                    .expect("the header holds its name")
+            }
+        }
+
+        fn member_name(index: usize) -> String {
+            format!("Lantern.Bay.S01E{index:02}.mkv")
+        }
+
+        fn rar5_store_block(header_type: u64, name: &str, data_len: u64) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.extend_from_slice(&crate::vint::encode_vint(0)); // file flags.
+            body.extend_from_slice(&crate::vint::encode_vint(data_len)); // unpacked.
+            body.extend_from_slice(&crate::vint::encode_vint(0o644)); // attributes.
+            body.extend_from_slice(&crate::vint::encode_vint(0)); // RAR5 Store.
+            body.extend_from_slice(&crate::vint::encode_vint(1)); // Unix host OS.
+            body.extend_from_slice(&crate::vint::encode_vint(name.len() as u64));
+            body.extend_from_slice(name.as_bytes());
+            let mut block = build_rar5_block(
+                header_type,
+                crate::header::common::flags::DATA_AREA,
+                &[data_len],
+                &body,
+            );
+            block.extend(std::iter::repeat_n(0x5A, data_len as usize));
+            block
+        }
+
+        /// A RAR5 volume of `files` stored members with a comment service
+        /// among them and an end record stating more volumes follow.
+        fn synthetic_rar5(files: usize) -> Synthetic {
+            let mut bytes = crate::signature::RAR5_SIGNATURE.to_vec();
+            bytes.extend_from_slice(&build_rar5_block(
+                1,
+                0,
+                &[],
+                &crate::vint::encode_vint(crate::header::main_archive::flags::VOLUME),
+            ));
+            let mut members = Vec::new();
+            let mut headers = 1;
+            for index in 0..files {
+                members.push(bytes.len());
+                bytes.extend_from_slice(&rar5_store_block(
+                    2,
+                    &member_name(index),
+                    (index * 13 + 5) as u64,
+                ));
+                headers += 1;
+                if index == 2 {
+                    bytes.extend_from_slice(&rar5_store_block(3, "CMT", 24));
+                    headers += 1;
+                }
+            }
+            bytes.extend_from_slice(&build_rar5_block(5, 0, &[], &crate::vint::encode_vint(1)));
+            Synthetic {
+                bytes,
+                members,
+                headers: headers + 1,
+            }
+        }
+
+        fn rar4_store_body(name: &[u8], data_len: u32, trailer: &[u8]) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.extend_from_slice(&data_len.to_le_bytes()); // packed.
+            body.extend_from_slice(&data_len.to_le_bytes()); // unpacked.
+            body.push(3); // Unix host OS.
+            body.extend_from_slice(&0u32.to_le_bytes()); // data CRC32.
+            body.extend_from_slice(&0u32.to_le_bytes()); // time.
+            body.push(29); // version.
+            body.push(0x30); // Store.
+            body.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes()); // attributes.
+            body.extend_from_slice(name);
+            body.extend_from_slice(trailer);
+            body
+        }
+
+        /// A RAR4 first volume of `files` stored members, an owner service
+        /// after the second, a comment service after the fourth, and an end
+        /// record stating more volumes follow.
+        fn synthetic_rar4(files: usize) -> Synthetic {
+            let mut bytes = crate::signature::RAR4_SIGNATURE.to_vec();
+            bytes.extend_from_slice(&build_rar4_main_header(0x0001 | 0x0100, 0, 0));
+            let mut members = Vec::new();
+            let mut headers = 1;
+            for index in 0..files {
+                let len = (index * 13 + 5) as u32;
+                members.push(bytes.len());
+                bytes.extend_from_slice(&build_rar4_header(
+                    0x74,
+                    0x8000,
+                    &rar4_store_body(member_name(index).as_bytes(), len, &[]),
+                ));
+                bytes.extend(std::iter::repeat_n(0x5A, len as usize));
+                headers += 1;
+                if index == 1 {
+                    bytes.extend_from_slice(&build_rar4_header(
+                        0x7A,
+                        0x4000,
+                        &rar4_store_body(b"UOW", 0, b"harbour\0crew"),
+                    ));
+                    headers += 1;
+                }
+                if index == 3 {
+                    bytes.extend_from_slice(&build_rar4_header(
+                        0x7A,
+                        0x8000 | 0x4000,
+                        &rar4_store_body(b"CMT", 24, &[]),
+                    ));
+                    bytes.extend(std::iter::repeat_n(0x43, 24));
+                    headers += 1;
+                }
+            }
+            bytes.extend_from_slice(&build_rar4_header(0x7b, 0x0001, &[]));
+            Synthetic {
+                bytes,
+                members,
+                headers: headers + 1,
+            }
+        }
+
+        fn synthetics() -> [(&'static str, Synthetic); 2] {
+            [("RAR5", synthetic_rar5(24)), ("RAR4", synthetic_rar4(24))]
+        }
+
+        #[test]
+        fn synthetic_volumes_fed_in_any_order_step_to_what_a_fresh_walk_reads() {
+            for (name, volume) in synthetics() {
+                for piece in [5, 11, 37] {
+                    let run = feed(&format!("{name} / {piece}"), &volume.bytes, None, piece);
+                    // Each step reads the header it resumes at again and what
+                    // the new bytes let it reach, never one before the cursor
+                    // (checked per step in `Run::step`).
+                    assert!(
+                        run.resumed_headers <= volume.headers + run.steps,
+                        "{name} / {piece}: {} headers over {} steps of a {}-header volume",
+                        run.resumed_headers,
+                        run.steps,
+                        volume.headers
+                    );
+                    assert!(
+                        run.resumed_headers * 4 < run.fresh_headers,
+                        "{name} / {piece}: resumed {} vs fresh {}",
+                        run.resumed_headers,
+                        run.fresh_headers
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn corpus_volumes_fed_in_any_order_step_to_what_a_fresh_walk_reads() {
+            let volumes: [(&str, &str, Option<&'static str>); 19] = [
+                ("rar4", "rar4_multifile_store.rar", None),
+                ("rar4", "rar4_multifile_lz.rar", None),
+                ("rar4", "rar4_dirs.rar", None),
+                ("rar4", "rar4_comment.rar", None),
+                ("rar4", "rar4_enc_store.rar", Some("testpass123")),
+                ("rar4", "rar4_hp_store.rar", Some("secretpass")),
+                ("rar4", "rar4_hp_lz.rar", Some("secretpass")),
+                ("rar4", "generated_matrix_rar4_store_plain.part1.rar", None),
+                (
+                    "rar4",
+                    "generated_matrix_rar4_store_enc.part1.rar",
+                    Some("testpass123"),
+                ),
+                (
+                    "rar4",
+                    "generated_matrix_rar4_lz_enc.part2.rar",
+                    Some("testpass123"),
+                ),
+                ("rar5", "rar5_best.rar", None),
+                ("rar5", "rar5_comment.rar", None),
+                ("rar5", "rar5_dirs.rar", None),
+                ("rar5", "rar5_hp_store.rar", Some("secretpass")),
+                ("rar5", "rar5_enc_store_pair.rar", Some("testpass123")),
+                ("rar5", "generated_matrix_rar5_store_plain.part1.rar", None),
+                (
+                    "rar5",
+                    "generated_matrix_rar5_store_enc.part1.rar",
+                    Some("testpass123"),
+                ),
+                ("rar5", "generated_matrix_rar5_lz_plain.part1.rar", None),
+                (
+                    "rar5",
+                    "generated_matrix_rar5_lz_enc.part2.rar",
+                    Some("testpass123"),
+                ),
+            ];
+            for (dir, file, password) in volumes {
+                let Some(bytes) = corpus_fixture(&["tests", "fixtures", dir, file]) else {
+                    continue;
+                };
+                let pieces: &[usize] = if bytes.len() < 4096 {
+                    &[7, 61]
+                } else {
+                    &[997, 16411]
+                };
+                for piece in pieces {
+                    let run = feed(&format!("{file} / {piece}"), &bytes, password, *piece);
+                    assert!(
+                        run.resumed_headers <= run.fresh_headers,
+                        "{file} / {piece}: resumed {} vs fresh {}",
+                        run.resumed_headers,
+                        run.fresh_headers
+                    );
+                }
+            }
+        }
+
+        /// A step over an image missing bytes of the header at `header`
+        /// stopped there, short. Where the one-shot walk fails over that
+        /// image instead (a RAR4 archive header cut, or a hole reaching into
+        /// the bytes the signature check reads past the RAR4 signature), the
+        /// step failed the same way (`Run::step` compared them) and the
+        /// cursor resumes no later than the header.
+        fn stopped_at(name: &str, held: &RarResult<RarVolumeFactsWalk>, run: &Run, header: usize) {
+            match held {
+                Ok(walk) => {
+                    assert!(walk.short_at.is_some(), "{name}: short at {header}");
+                    assert_eq!(run.cursor.resumes_at(), Some(header as u64), "{name}");
+                }
+                Err(_) => assert!(
+                    run.cursor.resumes_at() <= Some(header as u64),
+                    "{name}: a failed step at {header} resumes at {:?}",
+                    run.cursor.resumes_at()
+                ),
+            }
+        }
+
+        /// Every header of a volume with a hole over its first bytes, then
+        /// one cut by the image ending inside it: the step stops at it, and
+        /// once the bytes arrive the next step, with no restart, reads on
+        /// from it.
+        fn hole_and_split_at_each_header(name: &str, bytes: &[u8], password: Option<&'static str>) {
+            let starts = header_starts(bytes, password);
+            let whole = fresh(
+                &Image::whole(bytes),
+                View::Sparse,
+                password,
+                &Arc::new(crate::crypto::KdfCache::new()),
+            )
+            .unwrap();
+            for window in starts.windows(2) {
+                let (header, next) = (window[0], window[1]);
+                for view in [View::Sparse, View::Prefix] {
+                    // A hole at the cursor, filled later.
+                    let mut image = Image::whole(bytes);
+                    image.unstage(header..(header + 3).min(next));
+                    let mut run = Run::new(password, view);
+                    let held = run.step(&image, &format!("{name}: hole at {header}"));
+                    stopped_at(name, &held, &run, header);
+                    image.stage(0..bytes.len());
+                    let filled = run.step(&image, &format!("{name}: hole at {header} filled"));
+                    assert_eq!(filled.unwrap(), whole, "{name}: hole at {header} filled");
+
+                    // A header split across two pieces: the image ends five
+                    // bytes into it, inside its fixed block, then the rest of
+                    // it arrives.
+                    let cut = (header + 5).min(next - 1);
+                    let mut image = Image::empty(bytes);
+                    image.stage(0..cut);
+                    let mut run = Run::new(password, view);
+                    let held = run.step(&image, &format!("{name}: cut at {cut}"));
+                    stopped_at(name, &held, &run, header);
+                    image.stage(cut..bytes.len());
+                    let rest = run.step(&image, &format!("{name}: cut at {cut} completed"));
+                    assert_eq!(rest.unwrap(), whole, "{name}: cut at {cut} completed");
+                }
+            }
+        }
+
+        #[test]
+        fn a_hole_or_cut_at_the_cursor_resumes_there_once_filled() {
+            for (name, volume) in synthetics() {
+                hole_and_split_at_each_header(name, &volume.bytes, None);
+            }
+            for (dir, file, password) in [
+                ("rar5", "rar5_hp_store.rar", Some("secretpass")),
+                ("rar4", "rar4_hp_store.rar", Some("secretpass")),
+                ("rar4", "rar4_multifile_store.rar", None),
+            ] {
+                if let Some(bytes) = corpus_fixture(&["tests", "fixtures", dir, file]) {
+                    hole_and_split_at_each_header(file, &bytes, password);
+                }
+            }
+        }
+
+        /// Case 1: a header the walk read damaged — its CRC fails, the walk
+        /// parses it anyway — is repaired once the cursor is past it. The
+        /// caller restarts and the next step is the fresh walk; without the
+        /// restart the cursor keeps the damaged name, undetected.
+        #[test]
+        fn a_repair_behind_the_cursor_takes_a_restart() {
+            for (name, volume) in synthetics() {
+                let damaged_at = volume.name_at(5);
+                let original = volume.bytes[damaged_at];
+                let staged = volume.members[9] + 3;
+                for view in [View::Sparse, View::Prefix] {
+                    for restart in [true, false] {
+                        let mut image = Image::empty(&volume.bytes);
+                        image.stage(0..staged);
+                        image.put(damaged_at, b'#');
+                        let mut run = Run::new(None, view);
+                        let damaged = run.step(&image, &format!("{name}: damaged")).unwrap();
+                        assert!(
+                            damaged.facts.members[5].name.starts_with('#'),
+                            "{name}: the walk reads the damaged header as it is"
+                        );
+                        assert!(run.cursor.resumes_at() > Some(volume.members[5] as u64));
+
+                        image.put(damaged_at, original);
+                        let fresh_now = fresh(&image, view, None, &run.cache).unwrap();
+                        assert_eq!(fresh_now.facts.members[5].name, member_name(5));
+                        if restart {
+                            run.cursor.restart();
+                            run.step(&image, &format!("{name}: repaired, restarted"))
+                                .unwrap();
+                            image.stage(0..volume.bytes.len());
+                            run.step(&image, &format!("{name}: repaired, rest staged"))
+                                .unwrap();
+                        } else {
+                            let stale = run.step_only(&image).unwrap();
+                            assert_ne!(stale, fresh_now, "{name}: not detected");
+                            assert!(
+                                stale.facts.members[5].name.starts_with('#'),
+                                "{name}: the facts before the cursor are kept as read"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Case 2: the header at the cursor arrives damaged so that it cannot
+        /// be parsed. The failing step returns what a fresh walk returns for
+        /// that image; the header is repaired in place and the next step,
+        /// with no restart, is the fresh walk.
+        #[test]
+        fn a_header_at_the_cursor_repaired_in_place_steps_on_without_a_restart() {
+            for (name, volume) in synthetics() {
+                let header = volume.members[6];
+                // The header-size field, zeroed: RAR5 states it as the vint
+                // after the CRC32, RAR4 as the u16 after CRC16, type and flags.
+                let field = if name == "RAR5" {
+                    header + 4
+                } else {
+                    header + 5
+                };
+                let damage = 0;
+                let original = volume.bytes[field];
+                for view in [View::Sparse, View::Prefix] {
+                    let mut image = Image::empty(&volume.bytes);
+                    image.stage(0..header);
+                    let mut run = Run::new(None, view);
+                    run.step(&image, &format!("{name}: up to member 6"))
+                        .unwrap();
+                    assert_eq!(run.cursor.resumes_at(), Some(header as u64), "{name}");
+
+                    image.stage(header..volume.members[8]);
+                    image.put(field, damage);
+                    let failed = run.step(&image, &format!("{name}: member 6 damaged"));
+                    assert!(
+                        failed.is_err(),
+                        "{name}: the damaged header fails: {failed:?}"
+                    );
+                    assert!(
+                        run.cursor.resumes_at() <= Some(header as u64),
+                        "{name}: a failed step keeps the cursor at or before the header"
+                    );
+
+                    image.put(field, original);
+                    run.step(&image, &format!("{name}: member 6 repaired"))
+                        .unwrap();
+                    image.stage(0..volume.bytes.len());
+                    let whole = run.step(&image, &format!("{name}: whole")).unwrap();
+                    assert_eq!(whole.facts.members.len(), 24, "{name}");
+                    assert_eq!(whole.short_at, None, "{name}");
+                }
+            }
+        }
+
+        /// A different password begins at the signature on its own.
+        #[test]
+        fn a_new_password_walks_from_the_signature() {
+            let Some(bytes) = corpus_fixture(&["tests", "fixtures", "rar5", "rar5_hp_store.rar"])
+            else {
+                return;
+            };
+            let cache = Arc::new(crate::crypto::KdfCache::new());
+            let mut cursor = RarVolumeFactsCursor::new();
+            let image = Image::whole(&bytes);
+            let wrong = cursor.step(
+                image.reader(View::Sparse),
+                Some("not-it"),
+                Arc::clone(&cache),
+            );
+            same(
+                "wrong password",
+                &wrong,
+                &fresh(&image, View::Sparse, Some("not-it"), &cache),
+            );
+            let right = cursor.step(
+                image.reader(View::Sparse),
+                Some("secretpass"),
+                Arc::clone(&cache),
+            );
+            same(
+                "right password",
+                &right,
+                &fresh(&image, View::Sparse, Some("secretpass"), &cache),
+            );
+            assert!(right.is_ok());
         }
     }
 }
