@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.15.2
+
+A caller that walks a volume's facts each time more of the volume lands no
+longer re-reads every header from the signature on each walk. A store volume
+holds its headers between its members' payloads, so a volume arriving piece by
+piece was walked from the signature once per piece, each walk reading every
+header the last one had already read.
+
+### Added
+
+- `RarVolumeFactsCursor` holds a facts walk between calls: `step` reads on from
+  the header the last step stopped at, `resumes_at` says where that is, and
+  `restart` begins the next step at the signature. Each step returns exactly
+  what `RarArchive::parse_volume_facts_walk_with_shared_kdf_cache` returns for
+  the same bytes, error included, provided no byte the image held before
+  `resumes_at` changed since the last step; a caller that repairs or replaces
+  such a byte calls `restart` first. A change there without it is not
+  detected. Bytes at or past `resumes_at`, and bytes arriving before it where
+  the image held none, need no restart. RAR5 and RAR4 volumes resume, `-hp`
+  included; a RAR 1.4 volume and a RAR5 volume answered from its Quick Open
+  cache begin at the signature each step. The one-shot walk is now this
+  cursor's first step and is otherwise unchanged.
+
 ## 0.15.1
 
 ### Security

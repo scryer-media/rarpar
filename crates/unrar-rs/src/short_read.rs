@@ -117,6 +117,27 @@ pub(crate) fn absorb_short_read<R: Seek, T>(
     }
 }
 
+/// Under test, where each header walk on this thread began reading a header:
+/// the RAR5 plaintext and `-hp` walks and the RAR4 plaintext and `-hp` walks
+/// each note every header start before reading it.
+#[cfg(test)]
+pub(crate) mod header_reads {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static STARTS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn note(at: u64) {
+        STARTS.with(|starts| starts.borrow_mut().push(at));
+    }
+
+    /// Every header start noted on this thread since the last take.
+    pub(crate) fn take() -> Vec<u64> {
+        STARTS.with(|starts| std::mem::take(&mut *starts.borrow_mut()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

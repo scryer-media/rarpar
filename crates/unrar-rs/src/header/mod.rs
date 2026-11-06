@@ -300,7 +300,7 @@ pub(crate) fn resume_headers_with_scan<R: Read + Seek>(
         result.is_encrypted = true;
         let password = password.ok_or(RarError::EncryptedArchive)?;
         let mut key = kdf_cache.derive_key_rar5(password, &enc.salt, enc.kdf_count)?;
-        let parsed = parse_encrypted_headers(reader, &key, &mut result, scan, &mut None);
+        let parsed = parse_encrypted_headers(reader, &key, &mut result, scan, &mut None, &mut 0);
         key.zeroize();
         parsed?;
         return Ok(result);
@@ -315,6 +315,7 @@ pub(crate) fn resume_headers_with_scan<R: Read + Seek>(
         scan,
         &mut None,
         result,
+        &mut 0,
     )? {
         HeaderWalk::Parsed(parsed) => Ok(parsed),
         HeaderWalk::HeaderEncrypted(_) => Err(RarError::EncryptedArchive),
@@ -333,21 +334,75 @@ pub(crate) fn resume_headers_with_scan<R: Read + Seek>(
 /// have raised — when it ended inside a header. See
 /// [`RarVolumeFactsWalk::short_at`] for what a caller does with the offset.
 ///
+/// The walk begins at `at`. From the signature, `at` is the offset right
+/// after it and `main` and `encryption` are `None`; to continue an earlier
+/// walk over the same stream, `at` is the header that walk stopped at and
+/// `main` and `encryption` are the main and archive encryption headers it
+/// read before it.
+///
+/// Over a stream whose bytes before `at` are the ones the earlier walk read,
+/// the result holds exactly the headers a walk from the signature would have
+/// found at or after `at`, in the same order, with the same `short`: every
+/// header before `at` was read whole, and nothing the walk reads at or after
+/// it depends on those headers but the main and encryption records passed
+/// in. The two things that do are replayed. A plaintext walk asks the Quick
+/// Open cache again, as a walk from the signature asks it right after the
+/// main header, because the cache's bytes may have arrived since; a `-hp`
+/// walk checks the password again against the encryption record, as a walk
+/// from the signature checks it on reading that record.
+///
+/// `stop` is left where [`walk_headers_from`] leaves it. The result's
+/// `files` and `services` are only those at or after `at`.
+///
 /// [`RarVolumeFactsWalk::short_at`]: crate::RarVolumeFactsWalk::short_at
-pub(crate) fn parse_all_headers_for_facts<R: Read + Seek>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resume_headers_for_facts<R: Read + Seek>(
     reader: &mut R,
     password: Option<&str>,
     kdf_cache: &crate::crypto::KdfCache,
     options: HeaderParseOptions,
     short: &mut Option<ShortRead>,
+    at: u64,
+    main: Option<main_archive::MainArchiveHeader>,
+    encryption: Option<encryption::EncryptionHeader>,
+    stop: &mut u64,
 ) -> RarResult<ParsedHeaders> {
-    match walk_all_headers(
+    let mut result = empty_parsed_headers();
+    result.main = main;
+    result.encryption = encryption;
+    *stop = at;
+    if let Some(enc) = result.encryption.clone() {
+        result.is_encrypted = true;
+        let password = password.ok_or(RarError::EncryptedArchive)?;
+        if let Some(check_data) = enc.check_data
+            && !kdf_cache.verify_password_rar5(password, &enc.salt, enc.kdf_count, &check_data)
+        {
+            return Err(RarError::InvalidPassword);
+        }
+        let mut key = kdf_cache.derive_key_rar5(password, &enc.salt, enc.kdf_count)?;
+        reader.seek(SeekFrom::Start(at)).map_err(RarError::from)?;
+        let parsed =
+            parse_encrypted_headers(reader, &key, &mut result, HeaderScan::ForFacts, short, stop);
+        key.zeroize();
+        parsed?;
+        return Ok(result);
+    }
+    if options.allow_quick_open
+        && let Some(quick_open) =
+            try_parse_quick_open_headers(reader, &result, password, kdf_cache)?
+    {
+        return Ok(quick_open);
+    }
+    reader.seek(SeekFrom::Start(at)).map_err(RarError::from)?;
+    match walk_headers_from(
         reader,
         password,
         kdf_cache,
         options,
         HeaderScan::ForFacts,
         short,
+        result,
+        stop,
     )? {
         HeaderWalk::Parsed(parsed) => Ok(parsed),
         HeaderWalk::HeaderEncrypted(_) => Err(RarError::EncryptedArchive),
@@ -431,9 +486,17 @@ fn walk_all_headers<R: Read + Seek>(
         scan,
         short,
         empty_parsed_headers(),
+        &mut 0,
     )
 }
 
+/// The plaintext walk from wherever `reader` stands, adding to `result`.
+///
+/// `stop` is left at the start of the header the walk stopped at: the one it
+/// ran short in, the end-of-archive record, or the main header a Quick Open
+/// answer came from. Every header `result` gained lies wholly before it, so a
+/// walk begun there again over the same bytes adds exactly what this one
+/// would have added past it.
 #[allow(clippy::too_many_arguments)]
 fn walk_headers_from<R: Read + Seek>(
     reader: &mut R,
@@ -443,10 +506,14 @@ fn walk_headers_from<R: Read + Seek>(
     scan: HeaderScan,
     short: &mut Option<ShortRead>,
     mut result: ParsedHeaders,
+    stop: &mut u64,
 ) -> RarResult<HeaderWalk> {
     // Parse plaintext headers until we hit an encryption header or end.
     loop {
         let header_start = reader.stream_position().map_err(RarError::from)?;
+        *stop = header_start;
+        #[cfg(test)]
+        crate::short_read::header_reads::note(header_start);
         // The least the next header can occupy: its CRC32, a header-size vint
         // and a one-byte body.
         let floor = header_start + MIN_RAR5_HEADER_BYTES;
@@ -505,7 +572,7 @@ fn walk_headers_from<R: Read + Seek>(
 
                 // Parse remaining headers — each has its own IV + padded encryption.
                 let encrypted_result =
-                    parse_encrypted_headers(reader, &key, &mut result, scan, short);
+                    parse_encrypted_headers(reader, &key, &mut result, scan, short, stop);
                 key.zeroize();
                 encrypted_result?;
                 return Ok(HeaderWalk::Parsed(result));
@@ -552,15 +619,22 @@ fn walk_headers_from<R: Read + Seek>(
 /// Each encrypted header has its own layout:
 ///   [16-byte IV] [header data padded to 16-byte boundary]
 /// The header data is AES-256-CBC encrypted using the archive key and per-header IV.
+///
+/// `stop` is left at the start of the header the walk stopped at, as
+/// [`walk_headers_from`] leaves it.
 fn parse_encrypted_headers<R: Read + Seek>(
     reader: &mut R,
     key: &[u8; 32],
     result: &mut ParsedHeaders,
     scan: HeaderScan,
     short: &mut Option<ShortRead>,
+    stop: &mut u64,
 ) -> RarResult<()> {
     loop {
         let header_start = reader.stream_position().map_err(RarError::from)?;
+        *stop = header_start;
+        #[cfg(test)]
+        crate::short_read::header_reads::note(header_start);
         // Nothing short of the IV plus one cipher block can carry the next
         // header, so that is the least a re-read could learn anything from.
         let floor = header_start + MIN_RAR5_ENCRYPTED_HEADER_BYTES;
@@ -2189,6 +2263,7 @@ mod tests {
             &mut parsed,
             HeaderScan::ForDecode,
             &mut None,
+            &mut 0,
         );
         assert!(
             matches!(result, Err(RarError::CorruptArchive { ref detail }) if detail.contains("header size vint")),
