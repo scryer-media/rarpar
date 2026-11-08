@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.15.3
+
+An audit of the published RAR advisories, in UnRAR, WinRAR, 7-Zip,
+libarchive, junrar and the other RAR readers, found no gap to fix in the
+crate. Each advisory class now has a regression test in `tests/advisories.rs`,
+built from hand-assembled archives so that one field lies at a time.
+
+### Added
+
+- Tests for member names that climb out of the extraction root, in either
+  separator, with drive, UNC or NTFS stream prefixes; symlinks that point out;
+  a member written under an extracted or pre-existing symlink; hard links and
+  file copies naming a target outside the root; set-user-ID and set-group-ID
+  bits for an unprivileged extraction; RAR5 headers whose sizes do not fit;
+  dictionaries past the limit; random packed data in every RAR5 method and
+  every RAR 1.5, 2.0, 2.6 and 2.9 method, alone and solid, including a PPMd
+  model asking for the largest arena; malformed RAR4 Unicode names; a split
+  member without its next volume; an oversized KDF count; and a RAR5 recovery
+  volume from another set or naming a slot past it.
+
 ## 0.15.2
 
 A caller that walks a volume's facts each time more of the volume lands no
