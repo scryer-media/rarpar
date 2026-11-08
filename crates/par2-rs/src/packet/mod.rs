@@ -145,17 +145,15 @@ fn parse_packet_internal(
     recovery_path: Option<&Arc<Path>>,
 ) -> Result<(Packet, usize)> {
     let header = PacketHeader::parse(data, offset)?;
-    let total_len =
-        usize::try_from(header.length).map_err(|_| Par2Error::ResourceLimitExceeded {
-            reason: format!("packet length {} exceeds addressable memory", header.length),
-        })?;
-
-    if data.len() < total_len {
+    // Checked against the data before narrowing, so a length that no slice
+    // could hold is a packet that does not fit, never a resource error.
+    if (data.len() as u64) < header.length {
         return Err(Par2Error::PacketTooShort {
             expected: header.length,
             actual: data.len() as u64,
         });
     }
+    let total_len = header.length as usize;
 
     // Validate packet hash
     header.validate_hash(&data[..total_len], offset)?;
@@ -297,6 +295,7 @@ fn scan_packets_internal(
     sink: &mut dyn PacketSink,
 ) -> Result<()> {
     let mut pos = 0;
+    let mut rejected = budget::RejectedHashMeter::new(data.len() as u64);
 
     while pos + HEADER_SIZE <= data.len() {
         budget.check_cancelled()?;
@@ -329,6 +328,12 @@ fn scan_packets_internal(
             }
             Err(Par2Error::Cancelled) => return Err(Par2Error::Cancelled),
             Err(_) => {
+                // A candidate that fit the data was hashed before it failed.
+                if let Ok(header) = PacketHeader::parse(&data[pos..], offset)
+                    && header.length <= (data.len() - pos) as u64
+                {
+                    rejected.charge(header.length)?;
+                }
                 // Scan forward to find the next magic sequence
                 match find_next_magic(&data[pos + 1..]) {
                     Some(skip) => {
@@ -675,6 +680,7 @@ pub fn scan_packets_from_path_bounded(
     }
     let mut interned_path_charged = false;
     let mut offset = 0u64;
+    let mut rejected = budget::RejectedHashMeter::new(file_len);
 
     while let Some(packet_offset) = find_next_magic_in_reader(&mut reader, &mut offset, budget)? {
         budget.check_cancelled()?;
@@ -746,6 +752,7 @@ pub fn scan_packets_from_path_bounded(
             Err(Par2Error::Cancelled) => return Err(Par2Error::Cancelled),
             Err(error @ Par2Error::ResourceLimitExceeded { .. }) => return Err(error),
             Err(_) => {
+                rejected.charge(header.length)?;
                 reader
                     .seek(SeekFrom::Start(packet_offset + 1))
                     .map_err(Par2Error::Io)?;
