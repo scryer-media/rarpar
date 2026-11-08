@@ -14,7 +14,7 @@ use std::path::{Component, Path, PathBuf};
 use par2_rs::checksum::{SliceChecksumState, md5};
 use par2_rs::packet::header;
 use par2_rs::{
-    Par2FileSet, Par2RepairStatus, Par2Repairer, Par2RepairerOptions, gf_pow,
+    Par2Error, Par2FileSet, Par2RepairStatus, Par2Repairer, Par2RepairerOptions, gf_pow,
     input_slice_constants, mul_acc_region, scan_for_renames, translate_par2_name_to_relative,
 };
 use tempfile::tempdir;
@@ -455,4 +455,76 @@ fn hostile_packets_before_a_valid_set_are_skipped() {
             source.data
         );
     }
+}
+
+/// Offsets of the packets in a well-formed stream.
+fn packet_offsets(stream: &[u8]) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    let mut offset = 0;
+    while offset < stream.len() {
+        offsets.push(offset);
+        offset += u64::from_le_bytes(stream[offset + 8..offset + 16].try_into().unwrap()) as usize;
+    }
+    offsets
+}
+
+#[test]
+fn fake_headers_running_to_the_end_are_refused() {
+    // Every fake header claims to run to the end of the input, so each one is
+    // hashed in full before it fails: quadratic work in the input's length.
+    // The scan refuses the input once that work passes a fixed multiple of
+    // its length.
+    let layout = Layout::new();
+    let sources = [Source::new("kept.bin", 31)];
+    let mut stream = vec![0x5a; 1 << 20];
+    for offset in (0..stream.len()).step_by(64) {
+        let length = ((stream.len() - offset) as u64) & !3;
+        stream[offset..offset + 8].copy_from_slice(header::MAGIC);
+        stream[offset + 8..offset + 16].copy_from_slice(&length.to_le_bytes());
+    }
+    stream.extend(par2_stream(&sources));
+    let par2 = layout.base.join("set.par2");
+    fs::write(&par2, &stream).unwrap();
+
+    assert!(matches!(
+        Par2FileSet::from_files(&[&stream]),
+        Err(Par2Error::ResourceLimitExceeded { .. })
+    ));
+    assert!(matches!(
+        par2_rs::packet::scan_packets_from_path(&par2),
+        Err(Par2Error::ResourceLimitExceeded { .. })
+    ));
+}
+
+#[test]
+fn damaged_lengths_that_still_fit_cost_one_pass_each() {
+    // Honest damage: three recovery packets whose length fields now reach the
+    // end of the volume. Each costs one wasted pass, well inside the bound,
+    // and the rest of the set loads and repairs.
+    let layout = Layout::new();
+    let sources = [Source::new("kept.bin", 41), Source::new("lost.bin", 42)];
+    let mut stream = par2_stream(&sources);
+    let recovery: Vec<usize> = packet_offsets(&stream)
+        .into_iter()
+        .filter(|&offset| &stream[offset + 48..offset + 64] == header::TYPE_RECOVERY)
+        .collect();
+    assert_eq!(recovery.len(), 6);
+    for &offset in &recovery[..3] {
+        let length = ((stream.len() - offset) as u64) & !3;
+        stream[offset + 8..offset + 16].copy_from_slice(&length.to_le_bytes());
+    }
+    let par2 = layout.base.join("set.par2");
+    fs::write(&par2, &stream).unwrap();
+
+    let set = Par2FileSet::from_files(&[&stream]).unwrap();
+    assert_eq!(set.files.len(), 2);
+    assert_eq!(set.recovery_slices.len(), 3);
+
+    fs::write(layout.base.join("kept.bin"), &sources[0].data).unwrap();
+    let outcome = repair(&layout.base, &par2).unwrap();
+    assert_eq!(outcome.status, Par2RepairStatus::Repaired);
+    assert_eq!(
+        fs::read(layout.base.join("lost.bin")).unwrap(),
+        sources[1].data
+    );
 }

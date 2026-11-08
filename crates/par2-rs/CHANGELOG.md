@@ -3,9 +3,25 @@
 ## 0.11.1
 
 An audit of the published PAR2 advisories, in par2cmdline-turbo and SABnzbd,
-found no gap to fix in the crate. Each advisory class now
-has a regression test in `tests/advisories.rs`, built from hand-assembled sets
-so that one field lies at a time.
+found no gap in the crate for any of them. Each advisory class now has a
+regression test in `tests/advisories.rs`, built from hand-assembled sets so
+that one field lies at a time. The audit did find one gap no advisory names,
+fixed here.
+
+### Fixed
+
+- A volume packed with fake packet headers, each claiming to run to the end
+  of the volume, no longer costs quadratic work. Every candidate whose length
+  fits is hashed before it can be rejected, so such a volume was hashed once
+  per header: about 10 s for 1 MiB, and 4 times as long for each doubling.
+  One scan of one input now hashes at most 16 times the input's length for
+  candidates that fail, and past that the load returns
+  `Par2Error::ResourceLimitExceeded`, as the other packet-scan limits do. An
+  honest volume pays one wasted pass only for a damaged length field that
+  still fits the volume, far inside that bound.
+- On a 32-bit target, a packet header claiming more bytes than the address
+  space now reads as a packet that does not fit and the scan moves on,
+  instead of failing the load with `ResourceLimitExceeded`.
 
 ### Added
 
@@ -16,7 +32,8 @@ so that one field lies at a time.
   that is a dangling symlink pointing out (GHSA-j5pc-g362-c5xp), a live
   symlink to a file outside, and a symlinked parent directory; and packets
   ahead of a valid set whose length, slice size, file-ID count, IFSC count,
-  name or UTF-16 name do not fit.
+  name or UTF-16 name do not fit. Tests for the fake-header bound and for
+  damaged length fields that still fit.
 
 ## 0.11.0
 
