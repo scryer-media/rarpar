@@ -3,6 +3,36 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.9.5
+
+- PAR2 loading bounds the work spent on fake packet headers, through
+  par2-rs 0.11.1. A volume packed with headers that each claimed to run to
+  the end of the file was hashed once per header, so its cost grew with the
+  square of its size: 9.8 s for 1 MiB. A scan now stops with a resource-limit
+  error once it has hashed 16 times the file's length in rejected
+  candidates. A damaged length field in an honest set costs one pass, and
+  the set still loads and repairs.
+- An audit of the published RAR and PAR2 advisories (UnRAR, WinRAR, 7-Zip,
+  libarchive, SABnzbd's CVE-2021-29488, par2cmdline-turbo's
+  GHSA-j5pc-g362-c5xp and others) found no other gap. unrar-rs 0.15.3 and
+  par2-rs 0.11.1 carry a regression test for each advisory class.
+- 7z goes through sevenz-turbo 0.29.6:
+  - BZip2 members are decoded by `bzip2-turbo`, a translation of the 7-Zip
+    26.04 codec, in place of the `bzip2` crate, and can decode on a second
+    thread. A BZip2 coder reads exactly one stream through its trailer:
+    output short of its declared size or past it is an error.
+  - `rarpar par3 archive` writes a 7z whose empty file is followed by
+    directories with a header that reads back. Before, it did not.
+  - A corrupt block with no packed streams, a coder with no or several
+    outputs, or a coder chain past 64 is refused as corrupt instead of
+    panicking. A block that decodes to more than its declared size is
+    refused as invalid data instead of its surplus being dropped.
+  - Pack and unpack sizes above 4 GiB are no longer truncated on 32-bit
+    targets.
+- Every other dependency is at its latest compatible release, among them
+  aws-lc-rs 1.19, zip 9.4 and serde_json 1.0.154. No direct dependency has a
+  newer major release.
+
 ## rarpar 0.9.4
 
 - PAR2 file names written in a Windows code page, or in decomposed Unicode,

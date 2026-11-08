@@ -370,6 +370,49 @@ pub(crate) fn interned_path_bytes(path: &Path) -> usize {
     path.as_os_str().len() + 2 * size_of::<usize>()
 }
 
+/// How many times its own length one input may be hashed for packet candidates
+/// that fail.
+///
+/// Every candidate whose length fits the input is hashed before it can be
+/// rejected, and a rejected candidate resumes the scan one byte on. An input
+/// packed with fake headers, each claiming to run to its end, is therefore
+/// hashed once per header: quadratic in its length, about 10 s for 1 MiB. An
+/// honest volume pays a wasted pass only where damage left a length field that
+/// still fits the volume, once per damaged packet; sixteen whole-volume passes
+/// is far past that and still linear.
+pub(crate) const REJECTED_HASH_INPUT_MULTIPLE: u64 = 16;
+
+/// Bytes one scan of one input has hashed for candidates that failed, against
+/// [`REJECTED_HASH_INPUT_MULTIPLE`] times the input's length.
+pub(crate) struct RejectedHashMeter {
+    spent: u64,
+    limit: u64,
+}
+
+impl RejectedHashMeter {
+    pub(crate) fn new(input_len: u64) -> Self {
+        Self {
+            spent: 0,
+            limit: input_len.saturating_mul(REJECTED_HASH_INPUT_MULTIPLE),
+        }
+    }
+
+    /// Charge a rejected candidate that claimed `length` bytes.
+    pub(crate) fn charge(&mut self, length: u64) -> Result<()> {
+        self.spent = self.spent.saturating_add(length);
+        if self.spent > self.limit {
+            return Err(Par2Error::ResourceLimitExceeded {
+                reason: format!(
+                    "hashed {} bytes of rejected PAR2 packet candidates, limit is {} \
+                     ({REJECTED_HASH_INPUT_MULTIPLE} times the input)",
+                    self.spent, self.limit
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Heap a retained packet holds, including its container slot.
 ///
 /// Recovery payloads are excluded; see the module docs.
