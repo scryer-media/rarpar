@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.11.1
+
+An audit of the published PAR2 advisories, in par2cmdline-turbo and SABnzbd,
+found no gap to fix in the crate. Each advisory class now
+has a regression test in `tests/advisories.rs`, built from hand-assembled sets
+so that one field lies at a time.
+
+### Added
+
+- Tests for File Description and Unicode Filename names that climb out of the
+  job with parent components, a leading root, an absolute path or backslash
+  separators, both when the files are rebuilt from recovery slices and when
+  obfuscated copies are renamed into place (CVE-2021-29488); a repair target
+  that is a dangling symlink pointing out (GHSA-j5pc-g362-c5xp), a live
+  symlink to a file outside, and a symlinked parent directory; and packets
+  ahead of a valid set whose length, slice size, file-ID count, IFSC count,
+  name or UTF-16 name do not fit.
+
 ## 0.11.0
 
 ### Changed
