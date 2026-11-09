@@ -1,17 +1,20 @@
 #![no_main]
 
-//! The lent LZ window against the heap window.
+//! The lent LZ window and the lent PPMd model arena against the decoder's
+//! own memory.
 //!
 //! Every input is extracted twice: once with the decoder's own zeroed heap
-//! window, once with every window lent by a [`WindowAllocator`] whose memory
-//! is filled with junk. The two runs must write the same bytes and fail with
-//! the same error, member by member. A difference means the decoder read a
-//! window byte it had not written, which on lent memory leaks whatever the
-//! caller's scratch space held; a crash or a sanitizer report means the lent
-//! path broke the memory contract.
+//! window and arena, once with every window and every RAR 2.9 PPMd arena lent
+//! by a [`WindowAllocator`] whose memory is filled with junk. The two runs
+//! must write the same bytes and fail with the same error, member by member.
+//! A difference means the decoder read a window or arena byte it had not
+//! written, which on lent memory leaks whatever the caller's scratch space
+//! held; a crash or a sanitizer report means the lent path broke the memory
+//! contract.
 //!
-//! Both runs refuse a dictionary above [`MAX_WINDOW`], so one input cannot
-//! make the allocator fill gigabytes, and refuse it the same way.
+//! Both runs refuse a dictionary above [`MAX_WINDOW`] and an arena above
+//! [`MAX_PPMD_ARENA`], so one input cannot make the allocator fill gigabytes,
+//! and refuse them the same way.
 
 use std::io::{self, Cursor, Write};
 use std::sync::Arc;
@@ -27,6 +30,8 @@ const MAX_MEMBERS: usize = 32;
 const MAX_OUTPUT_BYTES: usize = 16 << 20;
 /// Largest dictionary either run accepts.
 const MAX_WINDOW: u64 = 16 << 20;
+/// Largest PPMd model arena either run accepts.
+const MAX_PPMD_ARENA: u64 = 16 << 20;
 /// Below every real window (the smallest is 256 KiB), so every window of the
 /// lent run comes from the allocator.
 const HEAP_LIMIT_WHEN_LENT: u64 = 64 << 10;
@@ -113,19 +118,22 @@ fuzz_target!(|data: &[u8]| {
 
     let mut heap = Limits::default();
     heap.max_dict_size = MAX_WINDOW;
+    heap.max_ppmd_arena_size = MAX_PPMD_ARENA;
     let Some(expected) = extract(data, heap) else {
         return;
     };
 
     let mut lent = Limits::default();
     lent.max_dict_size = HEAP_LIMIT_WHEN_LENT;
+    lent.max_ppmd_arena_size = MAX_PPMD_ARENA;
     let lent = lent
         .with_window_allocator(Arc::new(JunkAllocator))
-        .with_max_allocated_dict_size(MAX_WINDOW);
+        .with_max_allocated_dict_size(MAX_WINDOW)
+        .with_max_heap_ppmd_arena_size(0);
     let actual = extract(data, lent).expect("the archive opened the first time");
 
     assert!(
         actual == expected,
-        "lent window decoded differently from the heap window"
+        "lent memory decoded differently from the decoder's own"
     );
 });

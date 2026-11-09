@@ -2132,9 +2132,9 @@ dependencies = [
 
 [[package]]
 name = "ppmd-turbo"
-version = "0.2.0"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f79f9e9a62828a7cefa4885bc3223b2f3f3ac8cb4b4de2cab4835982dcb6194"
+checksum = "87b394d314ab49627003873ff55e00b05f0667a738ddfa176f59717994553937"
 
 [[package]]
 name = "presser"
@@ -2915,7 +2915,7 @@ checksum = "ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557"
 
 [[package]]
 name = "unrar-rs"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "aes",
  "aws-lc-rs",

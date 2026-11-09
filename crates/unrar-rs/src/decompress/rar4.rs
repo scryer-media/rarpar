@@ -12,7 +12,7 @@
 //! - 271-298: inline length codes with extra bits (distance from DD/LDD tables)
 
 use std::io::Write;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use tracing::trace;
 
@@ -20,6 +20,7 @@ use super::lz::bitstream::{BitRead, BitReader, LzSpan, StreamingBitReader};
 use super::lz::block_reader::{BitCursor, cursor_read_bits, cursor_refill};
 use super::lz::huffman::HuffmanTable;
 use super::lz::window::{Window, WindowSource};
+use super::ppm_arena::{ArenaLender, lent_arena_error};
 use crate::error::{LimitKind, RarError, RarResult};
 use ppmd_turbo::{
     ErrorKind as PpmErrorKind, Params as PpmParams, RarPpmd, RarStatus, Symbol as PpmSymbol,
@@ -123,11 +124,16 @@ fn ppm_fault(ppm: &RarPpmd, err: ppmd_turbo::Error, output_size: u64) -> RarResu
 }
 
 /// A PPMd model refused for its memory is a resource limit, and one the
-/// allocator refused an allocation failure. A fault inside the codec itself
-/// is internal; any other model or coder fault is a corrupt archive. Converted here rather than through
+/// allocator refused an allocation failure. An arena the caller's window
+/// allocator did not supply is [`RarError::WindowAllocatorFailed`], as for a
+/// window. A fault inside the codec itself is internal; any other model or
+/// coder fault is a corrupt archive. Converted here rather than through
 /// `From`, so `ppmd-turbo` stays out of the public API.
 #[cold]
 fn ppm_error(err: ppmd_turbo::Error) -> RarError {
+    if let Some(lent) = lent_arena_error(err.kind) {
+        return lent;
+    }
     match err.kind {
         PpmErrorKind::MemoryLimit {
             required, limit, ..
@@ -145,6 +151,22 @@ fn new_ppm() -> RarPpmd {
     let mut ppm = RarPpmd::new();
     ppm.set_padding_allowance(PPM_MAX_ZERO_BYTES_PAST_EOF);
     ppm
+}
+
+/// A PPMd decoder with RAR's padding allowance whose arena comes from
+/// `source`: the decoder's own memory up to the source's in-RAM limit, the
+/// window allocator above it, up to the format's ceiling until
+/// [`Rar4LzDecoder::set_ppm_arena_limit`] lowers it. Without an allocator the
+/// decoder is [`new_ppm`]'s, and no lender is returned.
+fn new_ppm_in(source: &WindowSource) -> (RarPpmd, Option<Arc<ArenaLender>>) {
+    let mut ppm = new_ppm();
+    let Some((allocator, max_owned)) = source.ppmd_arena_lender() else {
+        return (ppm, None);
+    };
+    let lender = Arc::new(ArenaLender::new(Arc::clone(allocator)));
+    ppm.set_arena_allocator(max_owned, lender.clone());
+    ppm.set_arena_max_lent(crate::limits::RAR_PPMD_MAX_ARENA_SIZE);
+    (ppm, Some(lender))
 }
 
 fn rar4_debug_filters_enabled() -> bool {
@@ -1249,8 +1271,11 @@ pub struct Rar4LzDecoder {
     block_type: BlockType,
     /// PPMd model and coder (persist across PPMd blocks and solid members).
     ppm: RarPpmd,
+    /// The caller's window allocator as `ppm` asks it for arenas, set when
+    /// the decoder was built with one.
+    ppm_lender: Option<Arc<ArenaLender>>,
     /// Largest model arena, in bytes, a PPMd block header may declare
-    /// ([`crate::Limits::max_ppmd_arena_size`]).
+    /// ([`crate::Limits::max_ppmd_arena_size`]), lent or not.
     ppm_arena_limit: u64,
     /// Model arena, in bytes, the reset header behind the live PPMd model
     /// declared (0 without a model). A model continued across a member
@@ -1341,9 +1366,24 @@ impl Rar4LzDecoder {
     }
 
     /// Set the largest model arena, in bytes, a PPMd block header may
-    /// declare. A header above it fails before the arena is allocated.
+    /// declare. A header above it fails before the arena is allocated. It
+    /// is also the largest arena the window allocator is asked for.
     pub(crate) fn set_ppm_arena_limit(&mut self, bytes: u64) {
         self.ppm_arena_limit = bytes;
+        if self.ppm_lender.is_some() {
+            self.ppm.set_arena_max_lent(bytes);
+        }
+    }
+
+    /// The error for a `ppmd-turbo` error from starting or restarting a
+    /// model, with a refusing window allocator's own error.
+    #[cold]
+    fn ppm_start_error(&self, err: ppmd_turbo::Error) -> RarError {
+        let err = ppm_error(err);
+        match &self.ppm_lender {
+            Some(lender) => lender.error(err),
+            None => err,
+        }
     }
 
     /// Fallibly create a new RAR4 LZ decoder with the specified dictionary size.
@@ -1351,9 +1391,11 @@ impl Rar4LzDecoder {
         Self::try_new_in(dict_size, &WindowSource::default())
     }
 
-    /// Fallibly create a new RAR4 LZ decoder whose window comes from `source`.
+    /// Fallibly create a new RAR4 LZ decoder whose window, and PPMd model
+    /// arena, come from `source`.
     pub(crate) fn try_new_in(dict_size: usize, source: &WindowSource) -> RarResult<Self> {
         let (ddecode, dbits) = build_ddecode_tables();
+        let (ppm, ppm_lender) = new_ppm_in(source);
         Ok(Self {
             window: Window::try_new_in(dict_size, source)?,
             dist_cache: [usize::MAX; 4],
@@ -1370,7 +1412,8 @@ impl Rar4LzDecoder {
             low_dist_rep_count: 0,
             prev_low_dist: 0,
             block_type: BlockType::Lz,
-            ppm: new_ppm(),
+            ppm,
+            ppm_lender,
             ppm_arena_limit: crate::limits::RAR_PPMD_MAX_ARENA_SIZE,
             ppm_arena_declared: 0,
             ppm_block_symbols: 0,
@@ -3810,7 +3853,9 @@ impl Rar4LzDecoder {
             None
         };
         self.ppm_block_symbols = 0;
-        self.ppm.start_block(params).map_err(ppm_error)?;
+        if let Err(err) = self.ppm.start_block(params) {
+            return Err(self.ppm_start_error(err));
+        }
 
         Ok(())
     }
@@ -4094,7 +4139,9 @@ impl Rar4LzDecoder {
             // and fall back to the more fail-proof LZ mode. The oracle's
             // caller then breaks out of the unpack loop, so the member ends
             // with the output decoded so far instead of an error.
-            ppm.cleanup().map_err(ppm_error)?;
+            if let Err(err) = ppm.cleanup() {
+                return Err(self.ppm_start_error(err));
+            }
             // `cleanup` restarts the model over a one-MiB arena.
             self.ppm_arena_declared = 1 << 20;
             self.block_type = BlockType::Lz;

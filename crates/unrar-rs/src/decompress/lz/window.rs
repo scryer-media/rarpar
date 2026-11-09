@@ -357,10 +357,11 @@ impl WindowStorage {
     }
 }
 
-/// Where a [`Window`] gets its bytes, taken from [`Limits`](crate::Limits).
+/// Where a [`Window`] gets its bytes, taken from [`Limits`](crate::Limits),
+/// and where a RAR 2.9 decoder built alongside it gets its PPMd model arena.
 ///
-/// The default puts every window on the heap, which is what a window built
-/// without limits always did.
+/// The default puts every window and every arena in the decoder's own memory,
+/// which is what a decoder built without limits always did.
 #[derive(Clone)]
 pub(crate) struct WindowSource {
     /// Largest window allocated on the heap when an allocator is set.
@@ -368,6 +369,9 @@ pub(crate) struct WindowSource {
     allocator: Option<Arc<dyn WindowAllocator>>,
     /// Largest window the allocator is asked for.
     max_allocated: u64,
+    /// Largest PPMd model arena kept in the decoder's own memory when an
+    /// allocator is set.
+    max_owned_ppmd_arena: u64,
 }
 
 impl Default for WindowSource {
@@ -376,6 +380,7 @@ impl Default for WindowSource {
             max_owned: u64::MAX,
             allocator: None,
             max_allocated: 0,
+            max_owned_ppmd_arena: u64::MAX,
         }
     }
 }
@@ -390,7 +395,22 @@ impl WindowSource {
             max_owned,
             allocator,
             max_allocated,
+            max_owned_ppmd_arena: u64::MAX,
         }
+    }
+
+    /// Lend PPMd model arenas above `bytes` from the allocator, if one is set.
+    #[must_use]
+    pub(crate) fn with_max_owned_ppmd_arena(mut self, bytes: u64) -> Self {
+        self.max_owned_ppmd_arena = bytes;
+        self
+    }
+
+    /// The allocator and the in-RAM limit PPMd model arenas are lent under,
+    /// or `None` when every arena stays in the decoder's own memory.
+    pub(crate) fn ppmd_arena_lender(&self) -> Option<(&Arc<dyn WindowAllocator>, u64)> {
+        let allocator = self.allocator.as_ref()?;
+        Some((allocator, self.max_owned_ppmd_arena))
     }
 
     /// Largest dictionary this source admits: the in-RAM limit, or with an

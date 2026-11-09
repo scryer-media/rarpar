@@ -2575,7 +2575,7 @@ jobs:
             # interpreted, each runs well past ten minutes.
             cargo +nightly-2026-09-01 miri nextest list --locked -p unrar-rs --lib \
               --no-default-features --features crypto-rust --message-format json \
-              -E 'test(/^decompress::lz::(window|block_reader)::tests::/) & !test(/copy_matrix_matches_reference/)' \
+              -E 'test(/^decompress::(lz::(window|block_reader)|ppm_arena)::tests::/) & !test(/copy_matrix_matches_reference/)' \
               > "$RUNNER_TEMP/miri-unrar.json"
             listings+=("unrar-rs=$RUNNER_TEMP/miri-unrar.json")
           fi
