@@ -1003,12 +1003,12 @@ impl RarArchive {
                 &fh.name,
             )?
         } else if fh.compression.format == ArchiveFormat::Rar5 {
-            let written = crate::decompress::lz::decompress_lz_reader_to_writer_with_max_dict_size(
+            let written = crate::decompress::lz::decompress_lz_reader_to_writer_with_window(
                 reader,
                 unpacked_size,
                 &fh.compression,
                 &mut hash_writer,
-                self.limits.max_dict_size,
+                &self.limits.window_source(),
             )?;
             self.enforce_unknown_lz_output_limit(fh, written)?;
             written
@@ -1021,6 +1021,7 @@ impl RarArchive {
                 fh.compression.dict_size,
                 &mut hash_writer,
                 self.limits.max_ppmd_arena_size,
+                &self.limits.window_source(),
             )?;
             self.enforce_unknown_lz_output_limit(fh, written)?;
             written
@@ -3720,10 +3721,11 @@ impl RarArchive {
         }
 
         let dict_size = Self::effective_member_dict_size(fh);
-        if dict_size > self.limits.max_dict_size {
+        let max_dict_size = self.limits.dict_size_ceiling();
+        if dict_size > max_dict_size {
             return Err(RarError::DictionaryTooLarge {
                 size: dict_size,
-                max: self.limits.max_dict_size,
+                max: max_dict_size,
             });
         }
 
@@ -4539,11 +4541,8 @@ impl RarArchive {
 
             let (actual_crc, actual_blake) = {
                 let segments = self.members[index].segments.clone();
-                let decoder = Self::prepare_rar5_member_decoder(
-                    &mut self.solid_decoder,
-                    &fh,
-                    self.limits.max_dict_size,
-                )?;
+                let decoder =
+                    Self::prepare_rar5_member_decoder(&mut self.solid_decoder, &fh, &self.limits)?;
                 let base_reader =
                     ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
                         .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
@@ -5164,11 +5163,8 @@ impl RarArchive {
             };
 
             let segments = self.members[index].segments.clone();
-            let decoder = Self::prepare_rar5_member_decoder(
-                &mut self.solid_decoder,
-                &fh,
-                self.limits.max_dict_size,
-            )?;
+            let decoder =
+                Self::prepare_rar5_member_decoder(&mut self.solid_decoder, &fh, &self.limits)?;
             let base_reader =
                 ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
                     .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
@@ -5834,16 +5830,24 @@ impl RarArchive {
     fn prepare_rar5_member_decoder<'a>(
         solid_decoder: &'a mut Option<LzDecoder>,
         fh: &FileHeader,
-        max_dict_size: u64,
+        limits: &Limits,
     ) -> RarResult<&'a mut LzDecoder> {
-        let dict_size =
-            crate::decompress::lz::checked_lz_dict_size(&fh.compression, max_dict_size)?;
+        let dict_size = crate::decompress::lz::checked_lz_dict_size(
+            &fh.compression,
+            limits.dict_size_ceiling(),
+        )?;
         let version = fh.compression.version;
         match solid_decoder {
             // A non-solid member starts from an empty history, so a dictionary
             // change in either direction is fine here.
             Some(decoder) => decoder.prepare_reuse(dict_size, version)?,
-            None => *solid_decoder = Some(LzDecoder::try_new(dict_size, version)?),
+            None => {
+                *solid_decoder = Some(LzDecoder::try_new_in(
+                    dict_size,
+                    version,
+                    &limits.window_source(),
+                )?)
+            }
         }
         Ok(solid_decoder.as_mut().expect("RAR5 decoder prepared above"))
     }
@@ -5878,10 +5882,11 @@ impl RarArchive {
         writer: &mut W,
     ) -> RarResult<u64> {
         let dict_size = Self::effective_member_dict_size(fh);
-        if dict_size > limits.max_dict_size {
+        let max_dict_size = limits.dict_size_ceiling();
+        if dict_size > max_dict_size {
             return Err(RarError::DictionaryTooLarge {
                 size: dict_size,
-                max: limits.max_dict_size,
+                max: max_dict_size,
             });
         }
 
@@ -5897,6 +5902,7 @@ impl RarArchive {
                 fh.compression.version,
                 fh.compression.method.code(),
                 limits.max_ppmd_arena_size,
+                &limits.window_source(),
             )?;
             decoder.decompress_reader_to_writer(compressed, unpacked_size, writer)
         } else {
@@ -5905,7 +5911,11 @@ impl RarArchive {
                 decoder.prepare_solid_continuation();
                 decoder
             } else {
-                solid_decoder.insert(LzDecoder::try_new(dict_size, fh.compression.version)?)
+                solid_decoder.insert(LzDecoder::try_new_in(
+                    dict_size,
+                    fh.compression.version,
+                    &limits.window_source(),
+                )?)
             };
             decoder.decompress_reader_to_writer(compressed, unpacked_size, writer)
         }
@@ -5929,10 +5939,11 @@ impl RarArchive {
         F: FnMut(usize) -> RarResult<W>,
     {
         let dict_size = Self::effective_member_dict_size(fh);
-        if dict_size > limits.max_dict_size {
+        let max_dict_size = limits.dict_size_ceiling();
+        if dict_size > max_dict_size {
             return Err(RarError::DictionaryTooLarge {
                 size: dict_size,
-                max: limits.max_dict_size,
+                max: max_dict_size,
             });
         }
 
@@ -5948,6 +5959,7 @@ impl RarArchive {
                 fh.compression.version,
                 fh.compression.method.code(),
                 limits.max_ppmd_arena_size,
+                &limits.window_source(),
             )?;
             let hash_clone = shared_hash.clone();
             decoder.decompress_reader_to_writer_chunked(
@@ -5971,7 +5983,11 @@ impl RarArchive {
                 decoder.prepare_solid_continuation();
                 decoder
             } else {
-                solid_decoder.insert(LzDecoder::try_new(dict_size, fh.compression.version)?)
+                solid_decoder.insert(LzDecoder::try_new_in(
+                    dict_size,
+                    fh.compression.version,
+                    &limits.window_source(),
+                )?)
             };
             let hash_clone = shared_hash.clone();
             decoder.decompress_reader_to_writer_chunked(
@@ -6547,11 +6563,8 @@ impl RarArchive {
 
         let written = if self.format == ArchiveFormat::Rar5 {
             let mut buf_reader = BufReader::with_capacity(DECODE_INPUT_BUFFER_BYTES, inner);
-            let decoder = Self::prepare_rar5_member_decoder(
-                &mut self.solid_decoder,
-                fh,
-                self.limits.max_dict_size,
-            )?;
+            let decoder =
+                Self::prepare_rar5_member_decoder(&mut self.solid_decoder, fh, &self.limits)?;
             decoder.decompress_reader_to_writer(&mut buf_reader, unpacked_size, &mut hash_writer)?
         } else {
             let mut buf_reader = BufReader::with_capacity(DECODE_INPUT_BUFFER_BYTES, inner);
@@ -7192,11 +7205,8 @@ impl RarArchive {
             .with_shared_transitions(Arc::clone(&shared_transitions));
 
             let hash_clone = shared_hash.clone();
-            let decoder = Self::prepare_rar5_member_decoder(
-                &mut self.solid_decoder,
-                fh,
-                self.limits.max_dict_size,
-            )?;
+            let decoder =
+                Self::prepare_rar5_member_decoder(&mut self.solid_decoder, fh, &self.limits)?;
             decoder.decompress_reader_to_writer_chunked(
                 tracking_reader,
                 unpacked_size,

@@ -346,6 +346,7 @@ pub mod stored_layout;
 pub mod types;
 pub(crate) mod vint;
 pub mod volume;
+pub mod window_memory;
 
 /// Internals exposed for this crate's own benches and examples.
 ///
@@ -441,3 +442,4 @@ pub use types::{
     MemberInfo, TopologyMemberInfo, UnixOwnerInfo, VolumeSpan,
 };
 pub use volume::{StaticVolumeProvider, VolumeProvider, VolumeProviderError, VolumeSet};
+pub use window_memory::{WindowAllocator, WindowMemory};

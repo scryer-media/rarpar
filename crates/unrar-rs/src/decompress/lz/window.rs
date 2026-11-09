@@ -5,9 +5,11 @@
 //! when it reaches the dictionary size.
 
 use std::io::Write;
-use std::ptr;
+use std::ptr::{self, NonNull};
+use std::sync::Arc;
 
 use crate::error::{RarError, RarResult};
+use crate::window_memory::{WindowAllocator, WindowMemory};
 
 /// Maximum incremental match length used by RAR LZ decoding.
 const MAX_INC_LZ_MATCH: usize = 0x1004;
@@ -154,8 +156,43 @@ unsafe fn copy_chunked(src: *const u8, dst: *mut u8, gap: usize, length: usize) 
 // Weaver only targets 64-bit, so the dictionary is always one contiguous
 // allocation; the fragmented-window fallback for 32-bit address spaces is
 // intentionally not ported.
+//
+// The bytes are addressed through `ptr`/`len` whichever owner holds them, so
+// every accessor below is the same code for the heap and for caller memory and
+// the hot paths carry no branch on the owner.
 struct WindowStorage {
-    buf: Vec<u8>,
+    ptr: NonNull<u8>,
+    len: usize,
+    owner: StorageOwner,
+}
+
+enum StorageOwner {
+    /// From the global allocator through `alloc_zeroed`, freed with
+    /// `Layout::array::<u8>(len)`.
+    Heap,
+    /// From a [`WindowAllocator`]; dropping it releases the memory.
+    Caller(#[allow(dead_code)] Box<dyn WindowMemory>),
+}
+
+// SAFETY: the storage exclusively owns the bytes behind `ptr` (the global
+// allocation, or caller memory whose `WindowMemory` contract makes it exclusive
+// to the decoder and whose owner is `Send + Sync`). It is the same ownership a
+// `Vec<u8>` has, so it is sent and shared on the same terms.
+unsafe impl Send for WindowStorage {}
+// SAFETY: see `Send`; `&WindowStorage` only reads the bytes.
+unsafe impl Sync for WindowStorage {}
+
+impl Drop for WindowStorage {
+    fn drop(&mut self) {
+        if let StorageOwner::Heap = self.owner {
+            let layout =
+                std::alloc::Layout::array::<u8>(self.len).expect("layout was valid at allocation");
+            // SAFETY: `ptr` came from `alloc_zeroed` with this exact layout and
+            // has not been freed.
+            unsafe { std::alloc::dealloc(self.ptr.as_ptr(), layout) };
+        }
+        // A `Caller` owner frees its memory in its own `Drop`.
+    }
 }
 
 impl WindowStorage {
@@ -166,37 +203,96 @@ impl WindowStorage {
         // back lazy zero pages: a RAR7-scale dictionary (>4 GiB) reserves
         // address space up front but commits physical pages only as the
         // window fills. Vec::resize(len, 0) would memset-commit the whole
-        // declared size before the first decoded byte. Window reads of
-        // never-written areas must still observe zeros.
+        // declared size before the first decoded byte.
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        if ptr.is_null() {
+        let Some(ptr) = NonNull::new(ptr) else {
             return Err(format!("allocation of {len} bytes failed"));
+        };
+        Ok(Self {
+            ptr,
+            len,
+            owner: StorageOwner::Heap,
+        })
+    }
+
+    /// Take `len` bytes from a caller's allocator.
+    ///
+    /// The memory is not zeroed and need not be: see [`Window::reset_for_reuse`]
+    /// for why no decoder reads a byte it has not written since the reset.
+    fn try_from_allocator(len: usize, allocator: &dyn WindowAllocator) -> RarResult<Self> {
+        debug_assert!(len > 0);
+        let failed = |error: std::io::Error| RarError::WindowAllocatorFailed {
+            bytes: len as u64,
+            error,
+        };
+        let mut memory = allocator.allocate(len).map_err(failed)?;
+        if memory.len() < len {
+            return Err(failed(std::io::Error::other(format!(
+                "allocator returned {} bytes",
+                memory.len()
+            ))));
         }
-        // SAFETY: ptr came from the global allocator with the exact layout
-        // Vec<u8> uses to deallocate len == capacity bytes, and every byte is
-        // initialized (zeroed).
-        let buf = unsafe { Vec::from_raw_parts(ptr, len, len) };
-        Ok(Self { buf })
+        let Some(ptr) = NonNull::new(memory.as_mut_ptr()) else {
+            return Err(failed(std::io::Error::other(
+                "allocator returned a null pointer",
+            )));
+        };
+        Ok(Self {
+            ptr,
+            len,
+            owner: StorageOwner::Caller(memory),
+        })
+    }
+
+    /// Bytes for a `len`-byte window: the heap up to `source.max_owned`, the
+    /// source's allocator above it.
+    fn try_for(len: usize, source: &WindowSource) -> RarResult<Self> {
+        if let Some(allocator) = source.allocator.as_deref()
+            && len as u64 > source.max_owned
+        {
+            if len as u64 > source.max_allocated {
+                return Err(RarError::DictionaryTooLarge {
+                    size: len as u64,
+                    max: source.max_allocated,
+                });
+            }
+            return Self::try_from_allocator(len, allocator);
+        }
+        Self::try_contiguous(len).map_err(|_| RarError::AllocationFailed { bytes: len as u64 })
     }
 
     #[inline(always)]
     fn len(&self) -> usize {
-        self.buf.len()
+        self.len
+    }
+
+    #[inline(always)]
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: `ptr` addresses `len` initialized bytes this storage owns
+        // exclusively (zeroed heap memory, or caller memory, which the
+        // `WindowMemory` contract makes readable for its whole length).
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    #[inline(always)]
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: as `as_slice`, and `&mut self` makes the borrow unique.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 
     #[inline(always)]
     fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.buf.as_mut_ptr()
+        self.ptr.as_ptr()
     }
 
     #[inline(always)]
     fn get(&self, idx: usize) -> u8 {
-        self.buf[idx]
+        self.as_slice()[idx]
     }
 
     #[inline(always)]
     fn set(&mut self, idx: usize, value: u8) {
-        self.buf[idx] = value;
+        self.as_mut_slice()[idx] = value;
     }
 
     /// Store one byte without the slice bounds check.
@@ -206,24 +302,24 @@ impl WindowStorage {
     /// `idx` must be `< self.len()`.
     #[inline(always)]
     unsafe fn set_unchecked(&mut self, idx: usize, value: u8) {
-        debug_assert!(idx < self.buf.len());
-        unsafe { *self.buf.as_mut_ptr().add(idx) = value };
+        debug_assert!(idx < self.len);
+        unsafe { *self.ptr.as_ptr().add(idx) = value };
     }
 
     fn copy_from_slice(&mut self, start: usize, bytes: &[u8]) {
-        self.buf[start..start + bytes.len()].copy_from_slice(bytes);
+        self.as_mut_slice()[start..start + bytes.len()].copy_from_slice(bytes);
     }
 
     fn fill(&mut self, start: usize, len: usize, value: u8) {
-        self.buf[start..start + len].fill(value);
+        self.as_mut_slice()[start..start + len].fill(value);
     }
 
     fn fill_all(&mut self, value: u8) {
-        self.buf.fill(value);
+        self.as_mut_slice().fill(value);
     }
 
     fn extend_from_range(&self, start: usize, len: usize, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.buf[start..start + len]);
+        out.extend_from_slice(&self.as_slice()[start..start + len]);
     }
 
     fn write_range_to_writer<W: Write + ?Sized>(
@@ -232,7 +328,59 @@ impl WindowStorage {
         len: usize,
         writer: &mut W,
     ) -> std::io::Result<()> {
-        writer.write_all(&self.buf[start..start + len])
+        writer.write_all(&self.as_slice()[start..start + len])
+    }
+
+    #[cfg(test)]
+    fn is_caller_memory(&self) -> bool {
+        matches!(self.owner, StorageOwner::Caller(_))
+    }
+}
+
+/// Where a [`Window`] gets its bytes, taken from [`Limits`](crate::Limits).
+///
+/// The default puts every window on the heap, which is what a window built
+/// without limits always did.
+#[derive(Clone)]
+pub(crate) struct WindowSource {
+    /// Largest window allocated on the heap when an allocator is set.
+    max_owned: u64,
+    allocator: Option<Arc<dyn WindowAllocator>>,
+    /// Largest window the allocator is asked for.
+    max_allocated: u64,
+}
+
+impl Default for WindowSource {
+    fn default() -> Self {
+        Self {
+            max_owned: u64::MAX,
+            allocator: None,
+            max_allocated: 0,
+        }
+    }
+}
+
+impl WindowSource {
+    pub(crate) fn new(
+        max_owned: u64,
+        allocator: Option<Arc<dyn WindowAllocator>>,
+        max_allocated: u64,
+    ) -> Self {
+        Self {
+            max_owned,
+            allocator,
+            max_allocated,
+        }
+    }
+
+    /// Largest dictionary this source admits: the in-RAM limit, or with an
+    /// allocator the larger of it and the allocator's ceiling.
+    pub(crate) fn max_dict_size(&self) -> u64 {
+        if self.allocator.is_some() {
+            self.max_owned.max(self.max_allocated)
+        } else {
+            self.max_owned
+        }
     }
 }
 
@@ -242,6 +390,8 @@ pub struct Window {
     /// `dict_size` after a shrinking reuse — see [`Window::ensure_capacity`].
     /// Nothing outside `[0, dict_size)` is ever read or written.
     buf: WindowStorage,
+    /// Where `buf` came from, and where a larger one comes from.
+    source: WindowSource,
     /// Logical dictionary size, mirroring the oracle's `MaxWinSize` (which is
     /// likewise distinct from its `AllocWinSize`, unpack.cpp:107-157). Every
     /// ring/wrap computation uses this, never `buf.len()`.
@@ -296,21 +446,22 @@ impl Window {
     /// Use fallible allocation on production paths so a crafted large-window
     /// archive cannot abort the daemon through Rust's infallible Vec allocation.
     pub fn try_new(dict_size: usize) -> RarResult<Self> {
+        Self::try_new_in(dict_size, &WindowSource::default())
+    }
+
+    /// Fallibly create a new window whose bytes come from `source`: the heap
+    /// up to its in-RAM limit, its allocator above it. The source is kept for
+    /// [`Window::ensure_capacity`].
+    pub(crate) fn try_new_in(dict_size: usize, source: &WindowSource) -> RarResult<Self> {
         if dict_size == 0 {
             return Err(RarError::DictionaryTooLarge { size: 0, max: 0 });
         }
 
-        let buf = match WindowStorage::try_contiguous(dict_size) {
-            Ok(buf) => buf,
-            Err(_) => {
-                return Err(RarError::AllocationFailed {
-                    bytes: dict_size as u64,
-                });
-            }
-        };
+        let buf = WindowStorage::try_for(dict_size, source)?;
 
         Ok(Self {
             buf,
+            source: source.clone(),
             dict_size,
             pos: 0,
             first_win_done: false,
@@ -326,8 +477,9 @@ impl Window {
     /// Mirrors the oracle's `AllocWinSize` handling (unpack.cpp:107-157): a
     /// request that fits the current allocation only re-points the logical
     /// size — window contents are left untouched and no memory is faulted in.
-    /// A larger request allocates a fresh zeroed buffer, which necessarily
-    /// discards the previous history, so callers that grow must follow with
+    /// A larger request allocates a fresh buffer (zeroed on the heap, as the
+    /// caller left it from a window allocator), which necessarily discards the
+    /// previous history, so callers that grow must follow with
     /// [`Window::reset_for_reuse`] (or start a fresh non-solid member).
     pub fn ensure_capacity(&mut self, dict_size: usize) -> RarResult<()> {
         if dict_size == 0 {
@@ -335,14 +487,9 @@ impl Window {
         }
 
         if dict_size > self.buf.len() {
-            match WindowStorage::try_contiguous(dict_size) {
-                Ok(buf) => self.buf = buf,
-                Err(_) => {
-                    return Err(RarError::AllocationFailed {
-                        bytes: dict_size as u64,
-                    });
-                }
-            }
+            // The old storage, caller memory included, is dropped once the new
+            // one is in place.
+            self.buf = WindowStorage::try_for(dict_size, &self.source)?;
         }
 
         self.dict_size = dict_size;
@@ -370,6 +517,15 @@ impl Window {
     /// bytes have been rewritten. Skipping the memset keeps a multi-gigabyte
     /// RAR7 dictionary from being re-committed once per member.
     ///
+    /// The same guard is why window memory from a
+    /// [`WindowAllocator`] needs no zeroing: a new window starts in exactly
+    /// this state, so no decoder reads a byte of it before writing that byte.
+    /// The other readers are bounded the same way: output and filter reads
+    /// (`try_copy_output`, `copy_output_into`, `write_range_to_writer`) only
+    /// reach the last `dict_size` bytes of `total_written`, and a distance-0
+    /// copy, which would advance over unwritten bytes, comes from no decoder
+    /// (RAR 1.5 zero-fills it, every other format decodes distances from 1).
+    ///
     /// `get_byte` is the one accessor without that guard; it is used by tests
     /// only and must not be used to read pre-reset history.
     pub fn reset_for_reuse(&mut self, dict_size: usize) -> RarResult<()> {
@@ -388,6 +544,12 @@ impl Window {
     /// Always `>= dict_size()`; they differ only after a shrinking reuse.
     pub fn allocated_size(&self) -> usize {
         self.buf.len()
+    }
+
+    /// Whether the ring buffer came from a [`WindowAllocator`].
+    #[cfg(test)]
+    pub(crate) fn uses_caller_memory(&self) -> bool {
+        self.buf.is_caller_memory()
     }
 
     /// Record a dictionary-only advance: bytes in `[start_total,
@@ -835,7 +997,8 @@ impl Window {
     /// Unlike `copy`, this has no `first_win_done` guard, so a distance beyond
     /// what has been written since the last reset reads whatever the buffer
     /// holds there. That is zero after [`Window::try_new`] / [`Window::reset`]
-    /// but stale after [`Window::reset_for_reuse`]; no decoder uses it.
+    /// but stale after [`Window::reset_for_reuse`], and whatever the caller
+    /// left in memory from a [`WindowAllocator`]; no decoder uses it.
     #[inline]
     pub fn get_byte(&self, distance: usize) -> u8 {
         let dict_size = self.dict_size;
@@ -1163,7 +1326,7 @@ impl Window {
     /// against a reference model (this is what catches a wildcopy overrun).
     #[cfg(test)]
     fn logical_buffer(&self) -> &[u8] {
-        &self.buf.buf[..self.dict_size]
+        &self.buf.as_slice()[..self.dict_size]
     }
 }
 
@@ -1488,6 +1651,203 @@ mod tests {
         );
 
         assert_eq!(scripted_decode(&mut reused), expected);
+    }
+
+    /// Heap memory handed out as caller memory, filled with junk so a read of
+    /// an unwritten byte shows up, and counted while it lives.
+    struct JunkMemory {
+        bytes: Box<[u8]>,
+        live: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    // SAFETY: the boxed slice is a stable heap buffer of `len` bytes owned by
+    // this value alone.
+    unsafe impl WindowMemory for JunkMemory {
+        fn as_mut_ptr(&mut self) -> *mut u8 {
+            self.bytes.as_mut_ptr()
+        }
+
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+    }
+
+    impl Drop for JunkMemory {
+        fn drop(&mut self) {
+            self.live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Default)]
+    struct JunkAllocator {
+        live: Arc<std::sync::atomic::AtomicUsize>,
+        calls: std::sync::Mutex<Vec<usize>>,
+        /// Hand back this many bytes instead of the request.
+        short: Option<usize>,
+        fail: bool,
+    }
+
+    impl JunkAllocator {
+        fn live(&self) -> usize {
+            self.live.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl WindowAllocator for JunkAllocator {
+        fn allocate(&self, len: usize) -> std::io::Result<Box<dyn WindowMemory>> {
+            self.calls.lock().unwrap().push(len);
+            if self.fail {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
+                    "scratch file full",
+                ));
+            }
+            let len = self.short.unwrap_or(len);
+            let bytes: Box<[u8]> = (0..len).map(|i| junk_byte(i) | 1).collect();
+            self.live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(JunkMemory {
+                bytes,
+                live: Arc::clone(&self.live),
+            }))
+        }
+    }
+
+    fn source_with(
+        allocator: &Arc<JunkAllocator>,
+        max_owned: u64,
+        max_allocated: u64,
+    ) -> WindowSource {
+        let allocator: Arc<dyn WindowAllocator> = allocator.clone();
+        WindowSource::new(max_owned, Some(allocator), max_allocated)
+    }
+
+    #[test]
+    fn junk_filled_caller_memory_decodes_like_a_zeroed_heap_window() {
+        let mut fresh = Window::new(64);
+        let expected = scripted_decode(&mut fresh);
+
+        let allocator = Arc::new(JunkAllocator::default());
+        let mut window = Window::try_new_in(64, &source_with(&allocator, 32, 1 << 20)).unwrap();
+        assert!(window.buf.is_caller_memory());
+        assert!(
+            window.logical_buffer().iter().all(|&b| b != 0),
+            "the caller memory starts out as junk, not zeros"
+        );
+
+        assert_eq!(scripted_decode(&mut window), expected);
+        assert_eq!(*allocator.calls.lock().unwrap(), vec![64]);
+        drop(window);
+        assert_eq!(allocator.live(), 0);
+    }
+
+    #[test]
+    fn window_at_the_in_ram_limit_stays_on_the_heap() {
+        let allocator = Arc::new(JunkAllocator::default());
+        let window = Window::try_new_in(64, &source_with(&allocator, 64, 1 << 20)).unwrap();
+        assert!(!window.buf.is_caller_memory());
+        assert!(allocator.calls.lock().unwrap().is_empty());
+        assert!(!Window::new(64).buf.is_caller_memory());
+    }
+
+    #[test]
+    fn growth_moves_into_caller_memory_and_drops_the_old_owner() {
+        let allocator = Arc::new(JunkAllocator::default());
+        let mut window = Window::try_new_in(32, &source_with(&allocator, 32, 1 << 20)).unwrap();
+        assert!(!window.buf.is_caller_memory());
+
+        window.reset_for_reuse(64).unwrap();
+        assert!(window.buf.is_caller_memory());
+        assert_eq!(allocator.live(), 1);
+
+        window.reset_for_reuse(128).unwrap();
+        assert_eq!(window.allocated_size(), 128);
+        assert_eq!(
+            allocator.live(),
+            1,
+            "the 64-byte owner is dropped on growth"
+        );
+
+        // A shrink keeps the allocation, as on the heap.
+        window.reset_for_reuse(48).unwrap();
+        assert_eq!(window.allocated_size(), 128);
+        assert_eq!(*allocator.calls.lock().unwrap(), vec![64, 128]);
+
+        let mut fresh = Window::new(48);
+        let expected = scripted_decode_sized(&mut fresh);
+        assert_eq!(scripted_decode_sized(&mut window), expected);
+
+        drop(window);
+        assert_eq!(allocator.live(), 0);
+    }
+
+    /// `scripted_decode` for a window of any size at least 48 bytes.
+    fn scripted_decode_sized(window: &mut Window) -> Vec<u8> {
+        window.copy(40, 6).unwrap();
+        window.put_bytes(b"hello");
+        window.copy(5, 12).unwrap();
+        for i in 0..200 {
+            window.put_byte(junk_byte(i * 3));
+        }
+        window.copy(48, 20).unwrap();
+        let total = window.total_written();
+        window.copy_output(total - 48, 48)
+    }
+
+    #[test]
+    fn window_over_the_allocator_ceiling_is_refused() {
+        let allocator = Arc::new(JunkAllocator::default());
+        let err = Window::try_new_in(256, &source_with(&allocator, 32, 128))
+            .err()
+            .unwrap();
+        assert!(matches!(
+            err,
+            RarError::DictionaryTooLarge {
+                size: 256,
+                max: 128
+            }
+        ));
+        assert!(allocator.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn allocator_failure_and_short_memory_are_window_allocator_errors() {
+        let failing = Arc::new(JunkAllocator {
+            fail: true,
+            ..Default::default()
+        });
+        let err = Window::try_new_in(64, &source_with(&failing, 32, 1 << 20))
+            .err()
+            .unwrap();
+        match err {
+            RarError::WindowAllocatorFailed { bytes, error } => {
+                assert_eq!(bytes, 64);
+                assert_eq!(error.kind(), std::io::ErrorKind::OutOfMemory);
+            }
+            other => panic!("expected WindowAllocatorFailed, got {other:?}"),
+        }
+
+        let short = Arc::new(JunkAllocator {
+            short: Some(63),
+            ..Default::default()
+        });
+        let err = Window::try_new_in(64, &source_with(&short, 32, 1 << 20))
+            .err()
+            .unwrap();
+        assert!(matches!(
+            err,
+            RarError::WindowAllocatorFailed { bytes: 64, .. }
+        ));
+        assert_eq!(short.live(), 0, "short memory is released, not kept");
+
+        // A failed growth leaves the window as it was.
+        let mut window = Window::try_new_in(32, &source_with(&failing, 32, 1 << 20)).unwrap();
+        window.put_bytes(b"ABCD");
+        assert!(matches!(
+            window.ensure_capacity(64),
+            Err(RarError::WindowAllocatorFailed { .. })
+        ));
+        assert_eq!(window.dict_size(), 32);
+        assert_eq!(window.copy_output(0, 4), b"ABCD");
     }
 
     #[test]

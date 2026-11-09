@@ -1,3 +1,8 @@
+use std::sync::Arc;
+
+use crate::decompress::lz::window::WindowSource;
+use crate::window_memory::WindowAllocator;
+
 /// Minimum LZ window allocation used by modern RAR unpackers.
 ///
 /// RAR5 headers can declare 128 KiB, but the extraction window uses at least
@@ -58,7 +63,7 @@ pub fn checked_volume_number(declared: u64) -> crate::error::RarResult<usize> {
 }
 
 /// Configurable limits for archive processing to prevent resource exhaustion.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Limits {
     /// Maximum header body size in bytes (default 2 MiB).
     pub max_header_size: u64,
@@ -66,8 +71,26 @@ pub struct Limits {
     pub max_data_segment: u64,
     /// Maximum unpacked output size in bytes.
     pub max_unpacked_size: u64,
-    /// Maximum dictionary size in bytes (default 256 MB).
+    /// Maximum dictionary size in bytes (default 256 MB) the decoder allocates
+    /// on the heap.
+    ///
+    /// Without a [`window_allocator`](Self::window_allocator), a larger
+    /// dictionary fails with
+    /// [`RarError::DictionaryTooLarge`](crate::RarError::DictionaryTooLarge).
     pub max_dict_size: u64,
+    /// Supplies the LZ window for a dictionary larger than
+    /// [`max_dict_size`](Self::max_dict_size), up to
+    /// [`max_allocated_dict_size`](Self::max_allocated_dict_size), instead of
+    /// refusing it (default `None`). See [`crate::window_memory`] for the
+    /// memory contract.
+    pub window_allocator: Option<Arc<dyn WindowAllocator>>,
+    /// Largest dictionary, in bytes, the
+    /// [`window_allocator`](Self::window_allocator) is asked for (default
+    /// [`RAR_UNPACK_MAX_DICT_SIZE`], the format's 64 GiB maximum). A larger
+    /// dictionary fails with
+    /// [`RarError::DictionaryTooLarge`](crate::RarError::DictionaryTooLarge).
+    /// Unused without an allocator.
+    pub max_allocated_dict_size: u64,
     /// Maximum PPMd model arena, in bytes, a RAR3 PPMd block header may ask
     /// for (default [`RAR_PPMD_MAX_ARENA_SIZE`], the format's 256 MiB
     /// ceiling, so the default admits every valid archive).
@@ -87,8 +110,44 @@ impl Default for Limits {
             max_data_segment: MAX_MEMBER_DATA_SIZE,
             max_unpacked_size: MAX_MEMBER_DATA_SIZE,
             max_dict_size: 256 * 1024 * 1024, // 256 MB
+            window_allocator: None,
+            max_allocated_dict_size: RAR_UNPACK_MAX_DICT_SIZE,
             max_ppmd_arena_size: RAR_PPMD_MAX_ARENA_SIZE,
         }
+    }
+}
+
+impl std::fmt::Debug for Limits {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Limits")
+            .field("max_header_size", &self.max_header_size)
+            .field("max_data_segment", &self.max_data_segment)
+            .field("max_unpacked_size", &self.max_unpacked_size)
+            .field("max_dict_size", &self.max_dict_size)
+            .field(
+                "window_allocator",
+                &self.window_allocator.as_ref().map(|_| "<allocator>"),
+            )
+            .field("max_allocated_dict_size", &self.max_allocated_dict_size)
+            .field("max_ppmd_arena_size", &self.max_ppmd_arena_size)
+            .finish()
+    }
+}
+
+impl Limits {
+    /// Largest dictionary these limits admit: [`Self::max_dict_size`], or
+    /// with an allocator also [`Self::max_allocated_dict_size`].
+    pub(crate) fn dict_size_ceiling(&self) -> u64 {
+        self.window_source().max_dict_size()
+    }
+
+    /// Where the decoder's LZ window comes from under these limits.
+    pub(crate) fn window_source(&self) -> WindowSource {
+        WindowSource::new(
+            self.max_dict_size,
+            self.window_allocator.clone(),
+            self.max_allocated_dict_size,
+        )
     }
 }
 
@@ -105,6 +164,10 @@ mod tests {
         assert_eq!(limits.max_dict_size, 256 * 1024 * 1024);
         assert_eq!(limits.max_ppmd_arena_size, RAR_PPMD_MAX_ARENA_SIZE);
         assert_eq!(RAR_PPMD_MAX_ARENA_SIZE, 256 << 20);
+        assert!(limits.window_allocator.is_none());
+        assert_eq!(limits.max_allocated_dict_size, RAR_UNPACK_MAX_DICT_SIZE);
+        // Without an allocator the allocator ceiling admits nothing more.
+        assert_eq!(limits.dict_size_ceiling(), limits.max_dict_size);
     }
 
     #[test]
@@ -122,6 +185,7 @@ mod tests {
             max_unpacked_size: 4096,
             max_dict_size: 8192,
             max_ppmd_arena_size: 1 << 20,
+            ..Limits::default()
         };
         assert_eq!(limits.max_header_size, 1024);
         assert_eq!(limits.max_data_segment, 2048);

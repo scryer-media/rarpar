@@ -131,6 +131,13 @@ pub enum RarError {
     #[error("failed to allocate {bytes} bytes")]
     AllocationFailed { bytes: u64 },
 
+    /// The [`WindowAllocator`](crate::WindowAllocator) set in
+    /// [`Limits::window_allocator`](crate::Limits::window_allocator) did not
+    /// supply a dictionary window: it returned an error, or memory that does
+    /// not keep its contract. The archive is not at fault.
+    #[error("window allocator could not supply {bytes} bytes: {error}")]
+    WindowAllocatorFailed { bytes: u64, error: io::Error },
+
     /// A worker thread panicked or stopped early, or an invariant of this
     /// crate's own failed. Neither the archive nor the caller is at fault.
     #[error("internal error: {detail}")]
@@ -280,6 +287,7 @@ impl RarError {
             | Self::InvalidHuffmanTable => io::ErrorKind::InvalidData,
             Self::MissingVolume { .. } => io::ErrorKind::NotFound,
             Self::AllocationFailed { .. } => io::ErrorKind::OutOfMemory,
+            Self::WindowAllocatorFailed { error, .. } => error.kind(),
             _ => io::ErrorKind::Other,
         };
         io::Error::new(kind, self)

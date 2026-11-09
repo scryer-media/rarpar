@@ -19,7 +19,7 @@ use tracing::trace;
 use super::lz::bitstream::{BitRead, BitReader, LzSpan, StreamingBitReader};
 use super::lz::block_reader::{BitCursor, cursor_read_bits, cursor_refill};
 use super::lz::huffman::HuffmanTable;
-use super::lz::window::Window;
+use super::lz::window::{Window, WindowSource};
 use crate::error::{LimitKind, RarError, RarResult};
 use ppmd_turbo::{
     ErrorKind as PpmErrorKind, Params as PpmParams, RarPpmd, RarStatus, Symbol as PpmSymbol,
@@ -1348,9 +1348,14 @@ impl Rar4LzDecoder {
 
     /// Fallibly create a new RAR4 LZ decoder with the specified dictionary size.
     pub fn try_new(dict_size: usize) -> RarResult<Self> {
+        Self::try_new_in(dict_size, &WindowSource::default())
+    }
+
+    /// Fallibly create a new RAR4 LZ decoder whose window comes from `source`.
+    pub(crate) fn try_new_in(dict_size: usize, source: &WindowSource) -> RarResult<Self> {
         let (ddecode, dbits) = build_ddecode_tables();
         Ok(Self {
-            window: Window::try_new(dict_size)?,
+            window: Window::try_new_in(dict_size, source)?,
             dist_cache: [usize::MAX; 4],
             last_length: 0,
             carried_old_dist_ptr: 0,

@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use super::lz::bitstream::{BitRead, BitReader, StreamingBitReader};
 use super::lz::huffman::HuffmanTable;
-use super::lz::window::Window;
+use super::lz::window::{Window, WindowSource};
 use super::rar4::Rar4LzDecoder;
 use crate::error::{RarError, RarResult};
 
@@ -136,12 +136,29 @@ impl Rar4SharedLzState<'_> {
 }
 
 impl Rar4Decoder {
+    #[cfg(test)]
     pub(crate) fn new(version: u8, dict_size: usize, method: u8) -> RarResult<Self> {
+        Self::new_in(version, dict_size, method, &WindowSource::default())
+    }
+
+    /// Build the decoder for `version`, its window coming from `source`.
+    pub(crate) fn new_in(
+        version: u8,
+        dict_size: usize,
+        method: u8,
+        source: &WindowSource,
+    ) -> RarResult<Self> {
         let dict_size = old_rar_window_size(dict_size);
         match version {
-            13..=15 => Ok(Self::V15(Box::new(Rar15Decoder::try_new(dict_size)?))),
-            20 | 26 => Ok(Self::V20(Box::new(Rar20Decoder::try_new(dict_size)?))),
-            29 => Ok(Self::V29(Box::new(Rar4LzDecoder::try_new(dict_size)?))),
+            13..=15 => Ok(Self::V15(Box::new(Rar15Decoder::try_new_in(
+                dict_size, source,
+            )?))),
+            20 | 26 => Ok(Self::V20(Box::new(Rar20Decoder::try_new_in(
+                dict_size, source,
+            )?))),
+            29 => Ok(Self::V29(Box::new(Rar4LzDecoder::try_new_in(
+                dict_size, source,
+            )?))),
             _ => Err(RarError::UnsupportedCompression { method, version }),
         }
     }
@@ -195,14 +212,18 @@ impl Rar4Decoder {
     /// cached decoder follows a limit changed between members. A PPMd model
     /// the member continues without a reset header is checked against it
     /// when the member first decodes with that model.
-    pub(crate) fn prepare_slot(
-        slot: &mut Option<Self>,
+    ///
+    /// `window` is where a decoder built here gets its window; a cached
+    /// decoder keeps the source it was built with.
+    pub(crate) fn prepare_slot<'a>(
+        slot: &'a mut Option<Self>,
         solid: bool,
         dict_size: usize,
         version: u8,
         method: u8,
         max_ppmd_arena_size: u64,
-    ) -> RarResult<&mut Self> {
+        window: &WindowSource,
+    ) -> RarResult<&'a mut Self> {
         if slot
             .as_ref()
             .is_some_and(|decoder| !decoder.supports_version(version))
@@ -210,7 +231,7 @@ impl Rar4Decoder {
             // Built before the hand-over so an unsupported version leaves the
             // cached decoder untouched. Its fresh window is what the outgoing
             // decoder keeps, and is dropped with it.
-            let mut next = Self::new(version, dict_size, method)?;
+            let mut next = Self::new_in(version, dict_size, method, window)?;
             {
                 let previous = slot.as_mut().expect("slot is occupied");
                 let mut incoming = next.shared_lz_state();
@@ -221,7 +242,7 @@ impl Rar4Decoder {
 
         match slot.as_mut() {
             Some(decoder) => decoder.prepare_member(solid, dict_size)?,
-            None => *slot = Some(Self::new(version, dict_size, method)?),
+            None => *slot = Some(Self::new_in(version, dict_size, method, window)?),
         }
 
         let decoder = slot.as_mut().expect("RAR4 decoder prepared above");
@@ -315,6 +336,7 @@ pub(crate) fn ensure_supported_rar4_version(version: u8, method: u8) -> RarResul
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decompress_rar4_to_writer<W: Write>(
     input: &[u8],
     unpacked_size: u64,
@@ -323,9 +345,10 @@ pub(crate) fn decompress_rar4_to_writer<W: Write>(
     dict_size: u64,
     writer: &mut W,
     max_ppmd_arena_size: u64,
+    window: &WindowSource,
 ) -> RarResult<u64> {
     check_dict_size(dict_size)?;
-    let mut decoder = Rar4Decoder::new(version, dict_size as usize, method)?;
+    let mut decoder = Rar4Decoder::new_in(version, dict_size as usize, method, window)?;
     decoder.set_ppmd_arena_limit(max_ppmd_arena_size);
     decoder.decompress_to_writer(input, unpacked_size, writer)
 }
@@ -336,6 +359,7 @@ pub(crate) fn decompress_rar4_to_writer<W: Write>(
 /// slot now; this remains for the service/subdata path, which is not part of
 /// the solid stream and must never disturb the cached decoder.
 #[cfg(any(windows, test))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decompress_rar4_reader_to_writer<R: Read, W: Write>(
     input: R,
     unpacked_size: u64,
@@ -344,9 +368,10 @@ pub(crate) fn decompress_rar4_reader_to_writer<R: Read, W: Write>(
     dict_size: u64,
     writer: &mut W,
     max_ppmd_arena_size: u64,
+    window: &WindowSource,
 ) -> RarResult<u64> {
     check_dict_size(dict_size)?;
-    let mut decoder = Rar4Decoder::new(version, dict_size as usize, method)?;
+    let mut decoder = Rar4Decoder::new_in(version, dict_size as usize, method, window)?;
     decoder.set_ppmd_arena_limit(max_ppmd_arena_size);
     decoder.decompress_reader_to_writer(input, unpacked_size, writer)
 }
@@ -362,13 +387,14 @@ pub(crate) fn decompress_rar4_to_writer_chunked<F, W>(
     boundaries: &[super::VolumeTransition],
     writer_factory: F,
     max_ppmd_arena_size: u64,
+    window: &WindowSource,
 ) -> RarResult<Vec<(usize, u64)>>
 where
     W: Write,
     F: FnMut(usize) -> RarResult<W>,
 {
     check_dict_size(dict_size)?;
-    let mut decoder = Rar4Decoder::new(version, dict_size as usize, method)?;
+    let mut decoder = Rar4Decoder::new_in(version, dict_size as usize, method, window)?;
     decoder.set_ppmd_arena_limit(max_ppmd_arena_size);
     match &mut decoder {
         Rar4Decoder::V15(decoder) => decoder.decompress_to_writer_chunked(
@@ -514,9 +540,14 @@ pub(crate) struct Rar20Decoder {
 }
 
 impl Rar20Decoder {
+    #[cfg(test)]
     fn try_new(dict_size: usize) -> RarResult<Self> {
+        Self::try_new_in(dict_size, &WindowSource::default())
+    }
+
+    fn try_new_in(dict_size: usize, source: &WindowSource) -> RarResult<Self> {
         Ok(Self {
-            window: Window::try_new(dict_size)?,
+            window: Window::try_new_in(dict_size, source)?,
             old_dist: [usize::MAX; 4],
             old_dist_ptr: 0,
             last_dist: usize::MAX,
@@ -1183,9 +1214,14 @@ pub(crate) struct Rar15Decoder {
 }
 
 impl Rar15Decoder {
+    #[cfg(test)]
     fn try_new(dict_size: usize) -> RarResult<Self> {
+        Self::try_new_in(dict_size, &WindowSource::default())
+    }
+
+    fn try_new_in(dict_size: usize, source: &WindowSource) -> RarResult<Self> {
         let mut decoder = Self {
-            window: Window::try_new(dict_size)?,
+            window: Window::try_new_in(dict_size, source)?,
             old_dist: [usize::MAX; 4],
             old_dist_ptr: 0,
             last_dist: usize::MAX,
@@ -1992,8 +2028,16 @@ mod tests {
     #[test]
     fn direct_rar4_dictionary_limit_uses_effective_window_size() {
         let mut out = Vec::new();
-        let result =
-            decompress_rar4_to_writer(&[], 0, 29, 3, 128 * 1024, &mut out, RAR_PPMD_MAX_ARENA_SIZE);
+        let result = decompress_rar4_to_writer(
+            &[],
+            0,
+            29,
+            3,
+            128 * 1024,
+            &mut out,
+            RAR_PPMD_MAX_ARENA_SIZE,
+            &WindowSource::default(),
+        );
 
         assert!(result.is_ok());
 
@@ -2005,6 +2049,7 @@ mod tests {
             MAX_DICT_SIZE + 1,
             &mut out,
             RAR_PPMD_MAX_ARENA_SIZE,
+            &WindowSource::default(),
         );
 
         assert!(matches!(
@@ -2185,8 +2230,16 @@ mod tests {
     fn rar4_decoder_slot_rebuilds_only_on_a_version_switch() {
         let mut slot: Option<Rar4Decoder> = None;
 
-        Rar4Decoder::prepare_slot(&mut slot, false, 0x40000, 29, 3, RAR_PPMD_MAX_ARENA_SIZE)
-            .unwrap();
+        Rar4Decoder::prepare_slot(
+            &mut slot,
+            false,
+            0x40000,
+            29,
+            3,
+            RAR_PPMD_MAX_ARENA_SIZE,
+            &WindowSource::default(),
+        )
+        .unwrap();
         assert!(matches!(slot, Some(Rar4Decoder::V29(_))));
         if let Some(Rar4Decoder::V29(decoder)) = slot.as_mut() {
             decoder
@@ -2195,17 +2248,41 @@ mod tests {
         }
 
         // Same version: reused in place.
-        Rar4Decoder::prepare_slot(&mut slot, false, 0x40000, 29, 3, RAR_PPMD_MAX_ARENA_SIZE)
-            .unwrap();
+        Rar4Decoder::prepare_slot(
+            &mut slot,
+            false,
+            0x40000,
+            29,
+            3,
+            RAR_PPMD_MAX_ARENA_SIZE,
+            &WindowSource::default(),
+        )
+        .unwrap();
         assert!(matches!(slot, Some(Rar4Decoder::V29(_))));
 
         // Version switch: the boxed variant has to be rebuilt.
-        Rar4Decoder::prepare_slot(&mut slot, false, 0x40000, 20, 3, RAR_PPMD_MAX_ARENA_SIZE)
-            .unwrap();
+        Rar4Decoder::prepare_slot(
+            &mut slot,
+            false,
+            0x40000,
+            20,
+            3,
+            RAR_PPMD_MAX_ARENA_SIZE,
+            &WindowSource::default(),
+        )
+        .unwrap();
         assert!(matches!(slot, Some(Rar4Decoder::V20(_))));
 
-        Rar4Decoder::prepare_slot(&mut slot, false, 0x40000, 15, 3, RAR_PPMD_MAX_ARENA_SIZE)
-            .unwrap();
+        Rar4Decoder::prepare_slot(
+            &mut slot,
+            false,
+            0x40000,
+            15,
+            3,
+            RAR_PPMD_MAX_ARENA_SIZE,
+            &WindowSource::default(),
+        )
+        .unwrap();
         assert!(matches!(slot, Some(Rar4Decoder::V15(_))));
     }
 
@@ -2219,8 +2296,16 @@ mod tests {
     #[test]
     fn solid_version_switch_hands_over_the_shared_lz_state() {
         let mut slot: Option<Rar4Decoder> = None;
-        Rar4Decoder::prepare_slot(&mut slot, false, 0x40000, 20, 3, RAR_PPMD_MAX_ARENA_SIZE)
-            .unwrap();
+        Rar4Decoder::prepare_slot(
+            &mut slot,
+            false,
+            0x40000,
+            20,
+            3,
+            RAR_PPMD_MAX_ARENA_SIZE,
+            &WindowSource::default(),
+        )
+        .unwrap();
 
         let written = {
             let state = slot.as_mut().expect("built above").shared_lz_state();
@@ -2233,8 +2318,16 @@ mod tests {
         };
         assert_ne!(written, 0);
 
-        Rar4Decoder::prepare_slot(&mut slot, true, 0x40000, 29, 3, RAR_PPMD_MAX_ARENA_SIZE)
-            .unwrap();
+        Rar4Decoder::prepare_slot(
+            &mut slot,
+            true,
+            0x40000,
+            29,
+            3,
+            RAR_PPMD_MAX_ARENA_SIZE,
+            &WindowSource::default(),
+        )
+        .unwrap();
         assert!(matches!(slot, Some(Rar4Decoder::V29(_))));
         {
             let state = slot.as_mut().expect("switched above").shared_lz_state();
@@ -2244,8 +2337,16 @@ mod tests {
         }
 
         // Switching back restores the two members only 1.5/2.0 look at.
-        Rar4Decoder::prepare_slot(&mut slot, true, 0x40000, 15, 3, RAR_PPMD_MAX_ARENA_SIZE)
-            .unwrap();
+        Rar4Decoder::prepare_slot(
+            &mut slot,
+            true,
+            0x40000,
+            15,
+            3,
+            RAR_PPMD_MAX_ARENA_SIZE,
+            &WindowSource::default(),
+        )
+        .unwrap();
         assert!(matches!(slot, Some(Rar4Decoder::V15(_))));
         {
             let state = slot.as_mut().expect("switched above").shared_lz_state();
@@ -2256,8 +2357,16 @@ mod tests {
 
         // A non-solid member after the switch restarts everything, exactly as
         // `UnpInitData(false)` does.
-        Rar4Decoder::prepare_slot(&mut slot, false, 0x40000, 29, 3, RAR_PPMD_MAX_ARENA_SIZE)
-            .unwrap();
+        Rar4Decoder::prepare_slot(
+            &mut slot,
+            false,
+            0x40000,
+            29,
+            3,
+            RAR_PPMD_MAX_ARENA_SIZE,
+            &WindowSource::default(),
+        )
+        .unwrap();
         let state = slot.as_mut().expect("switched above").shared_lz_state();
         assert_eq!(state.window.total_written(), 0);
         assert_eq!(*state.old_dist, [usize::MAX; 4]);
@@ -2276,8 +2385,16 @@ mod tests {
     #[test]
     fn rar20_rejects_truncated_table_instead_of_rar29_dispatch() {
         let mut out = Vec::new();
-        let result =
-            decompress_rar4_to_writer(&[], 1, 20, 3, 128 * 1024, &mut out, RAR_PPMD_MAX_ARENA_SIZE);
+        let result = decompress_rar4_to_writer(
+            &[],
+            1,
+            20,
+            3,
+            128 * 1024,
+            &mut out,
+            RAR_PPMD_MAX_ARENA_SIZE,
+            &WindowSource::default(),
+        );
         assert!(matches!(result, Err(RarError::CorruptArchive { .. })));
     }
 

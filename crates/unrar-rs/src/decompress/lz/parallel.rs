@@ -4170,6 +4170,102 @@ mod tests {
         assert!(dispatch_count() > 0);
     }
 
+    /// Heap memory handed out as caller memory, junk-filled, counted while it
+    /// lives.
+    struct JunkWindow {
+        bytes: Box<[u8]>,
+        live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    // SAFETY: a heap buffer of `len` bytes owned by this value alone.
+    unsafe impl crate::WindowMemory for JunkWindow {
+        fn as_mut_ptr(&mut self) -> *mut u8 {
+            self.bytes.as_mut_ptr()
+        }
+
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+    }
+
+    impl Drop for JunkWindow {
+        fn drop(&mut self) {
+            self.live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Default)]
+    struct JunkWindows {
+        live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        requests: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::WindowAllocator for JunkWindows {
+        fn allocate(&self, len: usize) -> std::io::Result<Box<dyn crate::WindowMemory>> {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(JunkWindow {
+                bytes: (0..len)
+                    .map(|i| (i as u8).wrapping_mul(29) | 0x41)
+                    .collect(),
+                live: std::sync::Arc::clone(&self.live),
+            }))
+        }
+    }
+
+    /// The parallel decoder writes into a window from a
+    /// [`crate::WindowAllocator`] exactly as into a heap window: workers never
+    /// touch the window, the controller thread applies their output to it.
+    #[test]
+    fn parallel_extraction_into_an_allocator_window_matches_the_heap() {
+        if rar_decode_worker_count() <= 1 || !rar5_solid_hydrated() {
+            return;
+        }
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rar5/rar5_solid.rar");
+        let allocator = std::sync::Arc::new(JunkWindows::default());
+        let shared: std::sync::Arc<dyn crate::WindowAllocator> = allocator.clone();
+        let mut heap = crate::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+        let mut archive = crate::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+        archive.set_limits(crate::Limits {
+            max_dict_size: 64 * 1024,
+            window_allocator: Some(shared),
+            ..crate::Limits::default()
+        });
+
+        let mut dispatched = false;
+        for member_index in 0..archive.len() {
+            let mut expected = Vec::new();
+            heap.by_index(member_index)
+                .unwrap()
+                .copy_to(&mut expected)
+                .unwrap();
+            reset_dispatch_count();
+            let mut actual = Vec::new();
+            archive
+                .by_index(member_index)
+                .unwrap()
+                .copy_to(&mut actual)
+                .unwrap();
+            dispatched |= dispatch_count() > 0;
+            assert!(
+                actual == expected,
+                "member {member_index} differs from the heap extraction"
+            );
+            if dispatched {
+                break;
+            }
+        }
+        assert!(dispatched, "the parallel controller never ran");
+        assert_eq!(
+            allocator.requests.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        drop(archive);
+        assert_eq!(allocator.live.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn staged_straddles_stay_on_the_fast_block_path() {
         // 83 MB of compressed data against a 4 MiB stage: every refill leaves a
