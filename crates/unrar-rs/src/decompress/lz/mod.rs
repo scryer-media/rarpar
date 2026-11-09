@@ -41,7 +41,7 @@ use bitstream::{BitRead, BitReader, StreamingBitReader};
 use filter::{FilterType, PendingFilter};
 use huffman::HuffmanTable;
 use staged_input::StagedInput;
-use window::Window;
+use window::{Window, WindowSource};
 
 /// Hand the decode loop a type-erased view of the caller's writer.
 ///
@@ -192,10 +192,19 @@ impl LzDecoder {
 
     /// Fallibly create a new LZ decoder with the specified dictionary size.
     pub fn try_new(dict_size: usize, version: u8) -> RarResult<Self> {
+        Self::try_new_in(dict_size, version, &WindowSource::default())
+    }
+
+    /// Fallibly create a new LZ decoder whose window comes from `source`.
+    pub(crate) fn try_new_in(
+        dict_size: usize,
+        version: u8,
+        source: &WindowSource,
+    ) -> RarResult<Self> {
         let extra_dist = Self::extra_dist_for_version(version)?;
         let total_symbols = huffman::total_symbols(extra_dist);
         let mut decoder = Self {
-            window: Window::try_new(dict_size)?,
+            window: Window::try_new_in(dict_size, source)?,
             dist_cache: [usize::MAX; DIST_CACHE_SIZE],
             last_length: 0,
             nc_table: None,
@@ -2042,17 +2051,22 @@ pub fn decompress_lz(
     unpacked_size: u64,
     info: &CompressionInfo,
 ) -> RarResult<Vec<u8>> {
-    decompress_lz_with_max_dict_size(input, unpacked_size, info, Limits::default().max_dict_size)
+    decompress_lz_with_window(
+        input,
+        unpacked_size,
+        info,
+        &Limits::default().window_source(),
+    )
 }
 
-pub(crate) fn decompress_lz_with_max_dict_size(
+pub(crate) fn decompress_lz_with_window(
     input: &[u8],
     unpacked_size: u64,
     info: &CompressionInfo,
-    max_dict_size: u64,
+    window: &WindowSource,
 ) -> RarResult<Vec<u8>> {
-    let dict_size = checked_lz_dict_size(info, max_dict_size)?;
-    let mut decoder = LzDecoder::try_new(dict_size, info.version)?;
+    let dict_size = checked_lz_dict_size(info, window.max_dict_size())?;
+    let mut decoder = LzDecoder::try_new_in(dict_size, info.version, window)?;
     decoder.decompress(input, unpacked_size)
 }
 
@@ -2066,24 +2080,24 @@ pub fn decompress_lz_to_writer<W: Write>(
     info: &CompressionInfo,
     writer: &mut W,
 ) -> RarResult<u64> {
-    decompress_lz_to_writer_with_max_dict_size(
+    decompress_lz_to_writer_with_window(
         input,
         unpacked_size,
         info,
         writer,
-        Limits::default().max_dict_size,
+        &Limits::default().window_source(),
     )
 }
 
-pub(crate) fn decompress_lz_to_writer_with_max_dict_size<W: Write>(
+pub(crate) fn decompress_lz_to_writer_with_window<W: Write>(
     input: &[u8],
     unpacked_size: u64,
     info: &CompressionInfo,
     writer: &mut W,
-    max_dict_size: u64,
+    window: &WindowSource,
 ) -> RarResult<u64> {
-    let dict_size = checked_lz_dict_size(info, max_dict_size)?;
-    let mut decoder = LzDecoder::try_new(dict_size, info.version)?;
+    let dict_size = checked_lz_dict_size(info, window.max_dict_size())?;
+    let mut decoder = LzDecoder::try_new_in(dict_size, info.version, window)?;
     decoder.decompress_to_writer(input, unpacked_size, writer)
 }
 
@@ -2093,24 +2107,24 @@ pub fn decompress_lz_reader_to_writer<Rd: std::io::Read, W: Write>(
     info: &CompressionInfo,
     writer: &mut W,
 ) -> RarResult<u64> {
-    decompress_lz_reader_to_writer_with_max_dict_size(
+    decompress_lz_reader_to_writer_with_window(
         input,
         unpacked_size,
         info,
         writer,
-        Limits::default().max_dict_size,
+        &Limits::default().window_source(),
     )
 }
 
-pub(crate) fn decompress_lz_reader_to_writer_with_max_dict_size<Rd: std::io::Read, W: Write>(
+pub(crate) fn decompress_lz_reader_to_writer_with_window<Rd: std::io::Read, W: Write>(
     input: Rd,
     unpacked_size: u64,
     info: &CompressionInfo,
     writer: &mut W,
-    max_dict_size: u64,
+    window: &WindowSource,
 ) -> RarResult<u64> {
-    let dict_size = checked_lz_dict_size(info, max_dict_size)?;
-    let mut decoder = LzDecoder::try_new(dict_size, info.version)?;
+    let dict_size = checked_lz_dict_size(info, window.max_dict_size())?;
+    let mut decoder = LzDecoder::try_new_in(dict_size, info.version, window)?;
     decoder.decompress_reader_to_writer(input, unpacked_size, writer)
 }
 
@@ -2126,32 +2140,32 @@ where
     W: Write,
     F: FnMut(usize) -> RarResult<W>,
 {
-    decompress_lz_reader_to_writer_chunked_with_max_dict_size(
+    decompress_lz_reader_to_writer_chunked_with_window(
         input,
         unpacked_size,
         info,
         first_volume_index,
         transitions,
         writer_factory,
-        Limits::default().max_dict_size,
+        &Limits::default().window_source(),
     )
 }
 
-pub(crate) fn decompress_lz_reader_to_writer_chunked_with_max_dict_size<Rd: std::io::Read, F, W>(
+pub(crate) fn decompress_lz_reader_to_writer_chunked_with_window<Rd: std::io::Read, F, W>(
     input: Rd,
     unpacked_size: u64,
     info: &CompressionInfo,
     first_volume_index: usize,
     transitions: std::sync::Arc<std::sync::Mutex<Vec<super::VolumeTransition>>>,
     writer_factory: F,
-    max_dict_size: u64,
+    window: &WindowSource,
 ) -> RarResult<Vec<(usize, u64)>>
 where
     W: Write,
     F: FnMut(usize) -> RarResult<W>,
 {
-    let dict_size = checked_lz_dict_size(info, max_dict_size)?;
-    let mut decoder = LzDecoder::try_new(dict_size, info.version)?;
+    let dict_size = checked_lz_dict_size(info, window.max_dict_size())?;
+    let mut decoder = LzDecoder::try_new_in(dict_size, info.version, window)?;
     decoder.decompress_reader_to_writer_chunked(
         input,
         unpacked_size,
@@ -2161,21 +2175,21 @@ where
     )
 }
 
-pub(crate) fn decompress_lz_to_writer_chunked_with_max_dict_size<F, W>(
+pub(crate) fn decompress_lz_to_writer_chunked_with_window<F, W>(
     input: &[u8],
     unpacked_size: u64,
     info: &CompressionInfo,
     first_volume_index: usize,
     boundaries: &[super::VolumeTransition],
     writer_factory: F,
-    max_dict_size: u64,
+    window: &WindowSource,
 ) -> RarResult<Vec<(usize, u64)>>
 where
     W: Write,
     F: FnMut(usize) -> RarResult<W>,
 {
-    let dict_size = checked_lz_dict_size(info, max_dict_size)?;
-    let mut decoder = LzDecoder::try_new(dict_size, info.version)?;
+    let dict_size = checked_lz_dict_size(info, window.max_dict_size())?;
+    let mut decoder = LzDecoder::try_new_in(dict_size, info.version, window)?;
     decoder.decompress_to_writer_chunked(
         input,
         unpacked_size,
@@ -2817,6 +2831,103 @@ mod tests {
         assert_eq!(reused.window.dict_size(), small);
         // One allocation covered both members.
         assert_eq!(reused.window.allocated_size(), large);
+    }
+
+    /// Heap memory handed out as caller memory, junk-filled, counted while it
+    /// lives.
+    struct JunkWindow {
+        bytes: Box<[u8]>,
+        live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    // SAFETY: a heap buffer of `len` bytes owned by this value alone.
+    unsafe impl crate::WindowMemory for JunkWindow {
+        fn as_mut_ptr(&mut self) -> *mut u8 {
+            self.bytes.as_mut_ptr()
+        }
+
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+    }
+
+    impl Drop for JunkWindow {
+        fn drop(&mut self) {
+            self.live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Default)]
+    struct JunkWindows {
+        live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        requests: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl crate::WindowAllocator for JunkWindows {
+        fn allocate(&self, len: usize) -> std::io::Result<Box<dyn crate::WindowMemory>> {
+            self.requests.lock().unwrap().push(len);
+            self.live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(JunkWindow {
+                bytes: (0..len)
+                    .map(|i| (i as u8).wrapping_mul(37) | 0x11)
+                    .collect(),
+                live: std::sync::Arc::clone(&self.live),
+            }))
+        }
+    }
+
+    /// A reused decoder whose dictionary grows past the in-RAM limit moves
+    /// its window into allocator memory, asks for each larger size, drops the
+    /// outgrown window, and decodes as fresh heap decoders do.
+    #[test]
+    fn reused_decoder_grows_into_allocator_memory() {
+        let Some(first) = fixture_member("test_read_format_rar5_win32.rar", "test.bin") else {
+            return;
+        };
+        let second =
+            fixture_member("test_read_format_rar5_win32.rar", "test1.bin").expect("second member");
+        let small = 128 * 1024usize;
+        let medium = 512 * 1024usize;
+        let large = 1024 * 1024usize;
+
+        let allocator = std::sync::Arc::new(JunkWindows::default());
+        let shared: std::sync::Arc<dyn crate::WindowAllocator> = allocator.clone();
+        let source = WindowSource::new(small as u64, Some(shared), large as u64);
+        let live = || allocator.live.load(std::sync::atomic::Ordering::SeqCst);
+
+        let mut reused = LzDecoder::try_new_in(small, first.version, &source).unwrap();
+        assert!(!reused.window.uses_caller_memory());
+        let small_first = decode_with(&mut reused, &first);
+
+        reused.prepare_reuse(medium, second.version).unwrap();
+        assert!(reused.window.uses_caller_memory());
+        assert_eq!(live(), 1);
+        let medium_second = decode_with(&mut reused, &second);
+
+        reused.prepare_reuse(large, first.version).unwrap();
+        assert_eq!(live(), 1, "the outgrown window is dropped");
+        let large_first = decode_with(&mut reused, &first);
+
+        assert!(matches!(
+            reused.prepare_reuse(2 * large, first.version),
+            Err(RarError::DictionaryTooLarge { max, .. }) if max == large as u64
+        ));
+        assert_eq!(*allocator.requests.lock().unwrap(), vec![medium, large]);
+
+        let expected_first = decode_with(
+            &mut LzDecoder::try_new(small, first.version).unwrap(),
+            &first,
+        );
+        let expected_second = decode_with(
+            &mut LzDecoder::try_new(medium, second.version).unwrap(),
+            &second,
+        );
+        assert_eq!(small_first, expected_first);
+        assert_eq!(large_first, expected_first);
+        assert_eq!(medium_second, expected_second);
+
+        drop(reused);
+        assert_eq!(live(), 0);
     }
 
     #[test]

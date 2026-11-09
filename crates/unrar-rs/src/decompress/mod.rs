@@ -89,14 +89,13 @@ pub fn decompress_with_limits(
             enforce_direct_dict_limit(info, limits)?;
             let capacity = direct_output_initial_capacity(input.len(), unpacked_size);
             let mut output = Vec::with_capacity(capacity);
-            decompress_to_writer_with_max_dict_size(
+            decompress_to_writer_with_limits(
                 input,
                 unpacked_size,
                 info,
                 expected_crc,
                 &mut output,
-                limits.max_dict_size,
-                limits.max_ppmd_arena_size,
+                limits,
             )?;
             Ok(output)
         }
@@ -153,10 +152,11 @@ fn enforce_direct_store_output_limit(input_len: usize, limits: &Limits) -> RarRe
 
 fn enforce_direct_dict_limit(info: &CompressionInfo, limits: &Limits) -> RarResult<()> {
     let dict_size = effective_direct_dict_size(info);
-    if dict_size > limits.max_dict_size {
+    let max_dict_size = limits.dict_size_ceiling();
+    if dict_size > max_dict_size {
         return Err(RarError::DictionaryTooLarge {
             size: dict_size,
-            max: limits.max_dict_size,
+            max: max_dict_size,
         });
     }
 
@@ -213,25 +213,23 @@ pub fn decompress_to_writer<W: Write>(
     expected_crc: Option<u32>,
     writer: &mut W,
 ) -> RarResult<u64> {
-    decompress_to_writer_with_max_dict_size(
+    decompress_to_writer_with_limits(
         input,
         unpacked_size,
         info,
         expected_crc,
         writer,
-        Limits::default().max_dict_size,
-        Limits::default().max_ppmd_arena_size,
+        &Limits::default(),
     )
 }
 
-fn decompress_to_writer_with_max_dict_size<W: Write>(
+fn decompress_to_writer_with_limits<W: Write>(
     input: &[u8],
     unpacked_size: u64,
     info: &CompressionInfo,
     expected_crc: Option<u32>,
     writer: &mut W,
-    max_dict_size: u64,
-    max_ppmd_arena_size: u64,
+    limits: &Limits,
 ) -> RarResult<u64> {
     enforce_supported_compression(info)?;
 
@@ -252,14 +250,15 @@ fn decompress_to_writer_with_max_dict_size<W: Write>(
                 info.method.code(),
                 info.dict_size,
                 writer,
-                max_ppmd_arena_size,
+                limits.max_ppmd_arena_size,
+                &limits.window_source(),
             ),
-            ArchiveFormat::Rar5 => lz::decompress_lz_to_writer_with_max_dict_size(
+            ArchiveFormat::Rar5 => lz::decompress_lz_to_writer_with_window(
                 input,
                 unpacked_size,
                 info,
                 writer,
-                max_dict_size,
+                &limits.window_source(),
             ),
         },
         CompressionMethod::Unknown(code) => Err(RarError::UnsupportedCompression {
@@ -310,16 +309,17 @@ where
                     boundaries,
                     writer_factory,
                     Limits::default().max_ppmd_arena_size,
+                    &Limits::default().window_source(),
                 )
             }
-            ArchiveFormat::Rar5 => lz::decompress_lz_to_writer_chunked_with_max_dict_size(
+            ArchiveFormat::Rar5 => lz::decompress_lz_to_writer_chunked_with_window(
                 input,
                 unpacked_size,
                 info,
                 first_volume_index,
                 boundaries,
                 writer_factory,
-                Limits::default().max_dict_size,
+                &Limits::default().window_source(),
             ),
         },
         CompressionMethod::Unknown(code) => Err(RarError::UnsupportedCompression {
@@ -647,5 +647,116 @@ mod tests {
         let result = decompress(&[], 1, &info, None);
 
         assert!(matches!(result, Err(RarError::CorruptArchive { .. })));
+    }
+
+    /// Junk-filled heap memory handed out as caller memory, counted while it
+    /// lives.
+    struct JunkWindow {
+        bytes: Box<[u8]>,
+        live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    // SAFETY: a heap buffer of `len` bytes owned by this value alone.
+    unsafe impl crate::WindowMemory for JunkWindow {
+        fn as_mut_ptr(&mut self) -> *mut u8 {
+            self.bytes.as_mut_ptr()
+        }
+
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+    }
+
+    impl Drop for JunkWindow {
+        fn drop(&mut self) {
+            self.live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Default)]
+    struct JunkWindows {
+        live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        requests: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::WindowAllocator for JunkWindows {
+        fn allocate(&self, len: usize) -> std::io::Result<Box<dyn crate::WindowMemory>> {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(JunkWindow {
+                bytes: (0..len)
+                    .map(|i| (i as u8).wrapping_mul(13) | 0x21)
+                    .collect(),
+                live: std::sync::Arc::clone(&self.live),
+            }))
+        }
+    }
+
+    /// A one-shot decode releases its allocator window before it returns,
+    /// whether it succeeds or fails, and its output matches the heap's.
+    #[test]
+    fn one_shot_decode_releases_the_allocator_window() {
+        for (dir, name) in [
+            ("rar5", "rar5_lz.rar"),
+            ("rar4", "rar4_lz.rar"),
+            ("rar4", "rar20_lz.rar"),
+            ("rar4", "rar15_lz.rar"),
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(dir)
+                .join(name);
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            if !bytes.starts_with(b"Rar!") {
+                continue;
+            }
+            let archive = crate::RarArchive::open(std::io::Cursor::new(bytes.clone())).unwrap();
+            let metadata = archive.metadata();
+            let index = metadata
+                .members
+                .iter()
+                .position(|member| {
+                    !member.is_directory && member.compression.method != CompressionMethod::Store
+                })
+                .expect("an LZ member");
+            let member = &metadata.members[index];
+            let mut packed = Vec::new();
+            for segment in archive.member_segments(index).unwrap() {
+                let start = segment.data_offset as usize;
+                packed.extend_from_slice(&bytes[start..start + segment.data_size as usize]);
+            }
+            let unpacked_size = member.unpacked_size.unwrap();
+            let info = &member.compression;
+
+            let allocator = std::sync::Arc::new(JunkWindows::default());
+            let shared: std::sync::Arc<dyn crate::WindowAllocator> = allocator.clone();
+            let limits = Limits {
+                max_dict_size: 32 * 1024,
+                window_allocator: Some(shared),
+                ..Limits::default()
+            };
+            let live = || allocator.live.load(std::sync::atomic::Ordering::SeqCst);
+            let requests = || allocator.requests.load(std::sync::atomic::Ordering::SeqCst);
+
+            let expected = decompress(&packed, unpacked_size, info, member.crc32).unwrap();
+            let actual =
+                decompress_with_limits(&packed, unpacked_size, info, member.crc32, &limits)
+                    .unwrap();
+            assert!(actual == expected, "{name}: output differs");
+            assert_eq!(requests(), 1, "{name}");
+            assert_eq!(live(), 0, "{name}: window kept after success");
+
+            let truncated = &packed[..packed.len() / 2];
+            assert!(
+                decompress_with_limits(truncated, unpacked_size, info, member.crc32, &limits)
+                    .is_err(),
+                "{name}: truncated input must fail"
+            );
+            assert_eq!(requests(), 2, "{name}");
+            assert_eq!(live(), 0, "{name}: window kept after an error");
+        }
     }
 }

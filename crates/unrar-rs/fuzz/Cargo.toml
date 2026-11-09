@@ -27,6 +27,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "rar_lent_window"
+path = "fuzz_targets/rar_lent_window.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "rar_recovery_restore"
 path = "fuzz_targets/rar_recovery_restore.rs"
 test = false

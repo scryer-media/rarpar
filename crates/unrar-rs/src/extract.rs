@@ -182,10 +182,11 @@ fn enforce_member_limits(file_header: &FileHeader, limits: &Limits) -> RarResult
     }
 
     let dict_size = effective_member_dict_size(file_header);
-    if dict_size > limits.max_dict_size {
+    let max_dict_size = limits.dict_size_ceiling();
+    if dict_size > max_dict_size {
         return Err(RarError::DictionaryTooLarge {
             size: dict_size,
-            max: limits.max_dict_size,
+            max: max_dict_size,
         });
     }
 
@@ -266,6 +267,7 @@ fn decompress_member_to_writer<W: Write>(
             info.dict_size,
             writer,
             limits.max_ppmd_arena_size,
+            &limits.window_source(),
         );
     }
 
@@ -275,12 +277,12 @@ fn decompress_member_to_writer<W: Write>(
             version: info.version,
         });
     }
-    decompress::lz::decompress_lz_to_writer_with_max_dict_size(
+    decompress::lz::decompress_lz_to_writer_with_window(
         input,
         unpacked_size,
         info,
         writer,
-        limits.max_dict_size,
+        &limits.window_source(),
     )
 }
 

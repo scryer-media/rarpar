@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.16.0
+
+A caller can lend the memory for a large LZ dictionary window, so a RAR5 or
+RAR7 dictionary above what it wants on the heap can live in, for example, a
+memory-mapped scratch file instead of being refused. A dictionary at or under
+`Limits::max_dict_size` stays on the heap as before; without an allocator
+nothing changes. The lent memory need not be zeroed.
+
+### Added
+
+- `WindowAllocator` and the unsafe `WindowMemory` trait, set with
+  `Limits::with_window_allocator`, and `Limits::max_allocated_dict_size`, set
+  with `Limits::with_max_allocated_dict_size`, the ceiling for a lent window.
+- `RarError::WindowAllocatorFailed`, for an allocator error or memory that
+  breaks the contract. The archive is not marked damaged.
+
+### Changed
+
+- `Limits` is `#[non_exhaustive]`. Build it from `Limits::default()` and set
+  fields or use the `with_*` setters; a struct literal no longer compiles
+  outside the crate.
+
 ## 0.15.3
 
 An audit of the published RAR advisories, in UnRAR, WinRAR, 7-Zip,
