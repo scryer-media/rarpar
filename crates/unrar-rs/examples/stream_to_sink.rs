@@ -47,10 +47,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(mib) = max_dict_mib {
-        let limits = Limits {
-            max_dict_size: mib * 1024 * 1024,
-            ..Limits::default()
-        };
+        let mut limits = Limits::default();
+        limits.max_dict_size = mib * 1024 * 1024;
         archive.set_limits(limits);
     }
 

@@ -30,6 +30,11 @@ POLICY = {
             "test_copy_overlapping",
             "test_copy_wraps_source_and_dest",
             "narrow_peeks_match_checked_model_at_every_offset",
+            # The lent window: caller memory read and written through the
+            # same unsafe accessors, grown, and refused on its length.
+            "junk_filled_caller_memory_decodes_like_a_zeroed_heap_window",
+            "growth_moves_into_caller_memory_and_drops_the_old_owner",
+            "lengths_above_isize_max_are_refused_before_any_slice",
         },
     },
     "reedsolomon-rs": {

@@ -761,10 +761,9 @@ fn archive_set(cli: &Cli, archive: &Path) -> Result<RarSet, RarparError> {
 /// so the CLI raises the cap to the format ceiling and leaves the library
 /// default alone.
 pub fn cli_extraction_limits() -> unrar_rs::Limits {
-    unrar_rs::Limits {
-        max_dict_size: unrar_rs::limits::RAR_UNPACK_MAX_DICT_SIZE,
-        ..unrar_rs::Limits::default()
-    }
+    let mut limits = unrar_rs::Limits::default();
+    limits.max_dict_size = unrar_rs::limits::RAR_UNPACK_MAX_DICT_SIZE;
+    limits
 }
 
 fn is_password_error(error: &RarparError) -> bool {

@@ -749,9 +749,10 @@ fn test_archive_limits_reject_declared_unpacked_size() {
     let file_header = build_file_header_ex("too-big.txt", 0, content.len() as u64, 5, None, 0);
     let archive_bytes = build_single_file_rar5_archive(file_header, content);
     let mut archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
-    archive.set_limits(unrar_rs::Limits {
-        max_unpacked_size: 4,
-        ..Default::default()
+    archive.set_limits({
+        let mut limits = unrar_rs::Limits::default();
+        limits.max_unpacked_size = 4;
+        limits
     });
 
     let result = archive.extract_member(0, &unrar_rs::ExtractOptions::default(), None);
@@ -769,9 +770,10 @@ fn test_archive_limits_reject_packed_data_size() {
         build_file_header_ex("packed-too-big.txt", 0, content.len() as u64, 5, None, 0);
     let archive_bytes = build_single_file_rar5_archive(file_header, content);
     let mut archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
-    archive.set_limits(unrar_rs::Limits {
-        max_data_segment: 4,
-        ..Default::default()
+    archive.set_limits({
+        let mut limits = unrar_rs::Limits::default();
+        limits.max_data_segment = 4;
+        limits
     });
 
     let result = archive.extract_member(0, &unrar_rs::ExtractOptions::default(), None);
@@ -796,9 +798,10 @@ fn test_archive_limits_reject_compressed_dictionary_size() {
     );
     let archive_bytes = build_single_file_rar5_archive(file_header, content);
     let mut archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
-    archive.set_limits(unrar_rs::Limits {
-        max_dict_size: 128 * 1024,
-        ..Default::default()
+    archive.set_limits({
+        let mut limits = unrar_rs::Limits::default();
+        limits.max_dict_size = 128 * 1024;
+        limits
     });
 
     let result = archive.extract_member(0, &unrar_rs::ExtractOptions::default(), None);
@@ -827,9 +830,10 @@ fn test_unknown_unpacked_size_uses_configured_output_ceiling() {
     );
     let archive_bytes = build_single_file_rar5_archive(file_header, content);
     let mut archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
-    archive.set_limits(unrar_rs::Limits {
-        max_unpacked_size: 4,
-        ..Default::default()
+    archive.set_limits({
+        let mut limits = unrar_rs::Limits::default();
+        limits.max_unpacked_size = 4;
+        limits
     });
 
     let result = archive.extract_member(0, &unrar_rs::ExtractOptions::default(), None);
@@ -859,9 +863,10 @@ fn test_streaming_unknown_unpacked_size_uses_configured_output_ceiling() {
     std::fs::write(&archive_path, &archive_bytes).unwrap();
 
     let mut archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
-    archive.set_limits(unrar_rs::Limits {
-        max_unpacked_size: 4,
-        ..Default::default()
+    archive.set_limits({
+        let mut limits = unrar_rs::Limits::default();
+        limits.max_unpacked_size = 4;
+        limits
     });
     let provider = unrar_rs::StaticVolumeProvider::from_ordered(vec![archive_path]);
     let mut output = Vec::new();
@@ -898,9 +903,10 @@ fn test_streaming_chunked_unknown_unpacked_size_uses_configured_output_ceiling()
     std::fs::write(&archive_path, &archive_bytes).unwrap();
 
     let mut archive = unrar_rs::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
-    archive.set_limits(unrar_rs::Limits {
-        max_unpacked_size: 4,
-        ..Default::default()
+    archive.set_limits({
+        let mut limits = unrar_rs::Limits::default();
+        limits.max_unpacked_size = 4;
+        limits
     });
     let provider = unrar_rs::StaticVolumeProvider::from_ordered(vec![archive_path]);
 
@@ -9143,9 +9149,10 @@ fn test_rar4_ppmd_classic_multivolume_payload() {
 #[test]
 fn test_archive_limits_reject_ppmd_arena_above_limit() {
     let mut archive = open_rar4_ppm_oldmv();
-    archive.set_limits(unrar_rs::Limits {
-        max_ppmd_arena_size: RAR4_PPM_OLDMV_ARENA - 1,
-        ..Default::default()
+    archive.set_limits({
+        let mut limits = unrar_rs::Limits::default();
+        limits.max_ppmd_arena_size = RAR4_PPM_OLDMV_ARENA - 1;
+        limits
     });
 
     let result = archive.extract_member(0, &unrar_rs::ExtractOptions::default(), None);
@@ -9168,9 +9175,10 @@ fn test_archive_limits_reject_ppmd_arena_above_limit() {
 #[test]
 fn test_archive_limits_ppmd_arena_at_declared_size_decodes_unchanged() {
     let mut archive = open_rar4_ppm_oldmv();
-    archive.set_limits(unrar_rs::Limits {
-        max_ppmd_arena_size: RAR4_PPM_OLDMV_ARENA,
-        ..Default::default()
+    archive.set_limits({
+        let mut limits = unrar_rs::Limits::default();
+        limits.max_ppmd_arena_size = RAR4_PPM_OLDMV_ARENA;
+        limits
     });
     assert_rar4_ppm_oldmv_payload(&mut archive);
 }

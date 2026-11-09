@@ -89,12 +89,9 @@ impl WindowAllocator for TestAllocator {
 }
 
 fn limits_with(allocator: &Arc<TestAllocator>) -> Limits {
-    let allocator: Arc<dyn WindowAllocator> = allocator.clone();
-    Limits {
-        max_dict_size: TINY_IN_RAM_LIMIT,
-        window_allocator: Some(allocator),
-        ..Limits::default()
-    }
+    let mut limits = Limits::default();
+    limits.max_dict_size = TINY_IN_RAM_LIMIT;
+    limits.with_window_allocator(allocator.clone())
 }
 
 fn fixture_paths(dir: &str, names: &[&str]) -> Option<Vec<PathBuf>> {
@@ -328,10 +325,9 @@ fn over_the_in_ram_limit_without_an_allocator_is_too_large() {
         return;
     };
     let mut archive = open(&paths);
-    archive.set_limits(Limits {
-        max_dict_size: TINY_IN_RAM_LIMIT,
-        ..Limits::default()
-    });
+    let mut limits = Limits::default();
+    limits.max_dict_size = TINY_IN_RAM_LIMIT;
+    archive.set_limits(limits);
     let err = extract_all(&mut archive).unwrap_err();
     assert!(
         matches!(err, RarError::DictionaryTooLarge { max, .. } if max == TINY_IN_RAM_LIMIT),
@@ -347,10 +343,7 @@ fn over_the_allocator_ceiling_is_too_large() {
         };
         let allocator = Arc::new(TestAllocator::default());
         let mut archive = open(&paths);
-        archive.set_limits(Limits {
-            max_allocated_dict_size: 128 * 1024,
-            ..limits_with(&allocator)
-        });
+        archive.set_limits(limits_with(&allocator).with_max_allocated_dict_size(128 * 1024));
         let err = extract_all(&mut archive).unwrap_err();
         assert!(
             matches!(err, RarError::DictionaryTooLarge { max, .. } if max == 128 * 1024),

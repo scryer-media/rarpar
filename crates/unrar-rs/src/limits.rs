@@ -63,7 +63,19 @@ pub fn checked_volume_number(declared: u64) -> crate::error::RarResult<usize> {
 }
 
 /// Configurable limits for archive processing to prevent resource exhaustion.
+///
+/// Start from [`Limits::default`] and change what you need: assign a public
+/// field, or use a `with_*` setter. The struct is `#[non_exhaustive]`, so a
+/// field added later does not break your code.
+///
+/// ```
+/// let mut limits = unrar_rs::Limits::default();
+/// limits.max_dict_size = 64 << 20;
+/// let limits = limits.with_max_allocated_dict_size(1 << 30);
+/// assert_eq!(limits.max_allocated_dict_size, 1 << 30);
+/// ```
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct Limits {
     /// Maximum header body size in bytes (default 2 MiB).
     pub max_header_size: u64,
@@ -81,8 +93,9 @@ pub struct Limits {
     /// Supplies the LZ window for a dictionary larger than
     /// [`max_dict_size`](Self::max_dict_size), up to
     /// [`max_allocated_dict_size`](Self::max_allocated_dict_size), instead of
-    /// refusing it (default `None`). See [`crate::window_memory`] for the
-    /// memory contract.
+    /// refusing it (default `None`). Set it with
+    /// [`with_window_allocator`](Self::with_window_allocator). See
+    /// [`crate::window_memory`] for the memory contract.
     pub window_allocator: Option<Arc<dyn WindowAllocator>>,
     /// Largest dictionary, in bytes, the
     /// [`window_allocator`](Self::window_allocator) is asked for (default
@@ -135,6 +148,24 @@ impl std::fmt::Debug for Limits {
 }
 
 impl Limits {
+    /// Lend the LZ window for dictionaries above
+    /// [`max_dict_size`](Self::max_dict_size), up to
+    /// [`max_allocated_dict_size`](Self::max_allocated_dict_size), from
+    /// `allocator`. See [`crate::window_memory`].
+    #[must_use]
+    pub fn with_window_allocator(mut self, allocator: Arc<dyn WindowAllocator>) -> Self {
+        self.window_allocator = Some(allocator);
+        self
+    }
+
+    /// Set the largest dictionary, in bytes, the
+    /// [`window_allocator`](Self::window_allocator) is asked for.
+    #[must_use]
+    pub fn with_max_allocated_dict_size(mut self, bytes: u64) -> Self {
+        self.max_allocated_dict_size = bytes;
+        self
+    }
+
     /// Largest dictionary these limits admit: [`Self::max_dict_size`], or
     /// with an allocator also [`Self::max_allocated_dict_size`].
     pub(crate) fn dict_size_ceiling(&self) -> u64 {
@@ -185,7 +216,7 @@ mod tests {
             max_unpacked_size: 4096,
             max_dict_size: 8192,
             max_ppmd_arena_size: 1 << 20,
-            ..Limits::default()
+            ..Default::default()
         };
         assert_eq!(limits.max_header_size, 1024);
         assert_eq!(limits.max_data_segment, 2048);

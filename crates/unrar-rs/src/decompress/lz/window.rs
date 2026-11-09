@@ -174,12 +174,18 @@ enum StorageOwner {
     Caller(#[allow(dead_code)] Box<dyn WindowMemory>),
 }
 
-// SAFETY: the storage exclusively owns the bytes behind `ptr` (the global
-// allocation, or caller memory whose `WindowMemory` contract makes it exclusive
-// to the decoder and whose owner is `Send + Sync`). It is the same ownership a
-// `Vec<u8>` has, so it is sent and shared on the same terms.
+// SAFETY: the storage exclusively owns the bytes behind `ptr`: the global
+// allocation, or caller memory that the `WindowMemory` contract makes exclusive
+// to the decoder until it is dropped. That is the ownership a `Vec<u8>` has, so
+// the bytes may move between threads with the storage; the caller owner itself
+// is `Send` by the trait's bound.
 unsafe impl Send for WindowStorage {}
-// SAFETY: see `Send`; `&WindowStorage` only reads the bytes.
+// SAFETY: a shared `&WindowStorage` reaches the bytes only for reads
+// (`as_slice`, `get`, `extend_from_range`, `write_range_to_writer`); every
+// write takes `&mut self`. The caller owner, which is `Send` but not required
+// to be `Sync`, is never touched through `&self`: after construction it is
+// only held, and then dropped through `&mut self`. So sharing the storage
+// shares nothing but bytes, which `u8` allows.
 unsafe impl Sync for WindowStorage {}
 
 impl Drop for WindowStorage {
@@ -225,11 +231,25 @@ impl WindowStorage {
             bytes: len as u64,
             error,
         };
+        // A slice cannot span more than `isize::MAX` bytes; refuse before
+        // asking, so no slice is ever built over such a length.
+        if len > isize::MAX as usize {
+            return Err(failed(std::io::Error::other(
+                "window length exceeds isize::MAX",
+            )));
+        }
         let mut memory = allocator.allocate(len).map_err(failed)?;
-        if memory.len() < len {
+        // `len` and `as_mut_ptr` are each called once, as the contract says.
+        // On every refusal below, `memory` is dropped and so released.
+        let supplied = memory.len();
+        if supplied < len {
             return Err(failed(std::io::Error::other(format!(
-                "allocator returned {} bytes",
-                memory.len()
+                "allocator returned {supplied} bytes"
+            ))));
+        }
+        if supplied > isize::MAX as usize {
+            return Err(failed(std::io::Error::other(format!(
+                "allocator returned {supplied} bytes, more than isize::MAX"
             ))));
         }
         let Some(ptr) = NonNull::new(memory.as_mut_ptr()) else {
@@ -1848,6 +1868,82 @@ mod tests {
         ));
         assert_eq!(window.dict_size(), 32);
         assert_eq!(window.copy_output(0, 4), b"ABCD");
+    }
+
+    /// Memory that claims more bytes than a slice can span. It holds none: the
+    /// decoder must refuse it on the length alone, without touching it.
+    struct OversizedMemory {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    // SAFETY: never handed a real buffer to read or write; the decoder must
+    // refuse it before using the pointer, which this test checks.
+    unsafe impl WindowMemory for OversizedMemory {
+        fn as_mut_ptr(&mut self) -> *mut u8 {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            NonNull::dangling().as_ptr()
+        }
+
+        fn len(&self) -> usize {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            usize::MAX
+        }
+    }
+
+    impl Drop for OversizedMemory {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Default)]
+    struct OversizedAllocator {
+        requests: std::sync::atomic::AtomicUsize,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl WindowAllocator for OversizedAllocator {
+        fn allocate(&self, _len: usize) -> std::io::Result<Box<dyn WindowMemory>> {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(OversizedMemory {
+                calls: Arc::clone(&self.calls),
+                dropped: Arc::clone(&self.dropped),
+            }))
+        }
+    }
+
+    #[test]
+    fn lengths_above_isize_max_are_refused_before_any_slice() {
+        let allocator = Arc::new(OversizedAllocator::default());
+        let shared: Arc<dyn WindowAllocator> = allocator.clone();
+        let source = WindowSource::new(32, Some(shared), u64::MAX);
+        let requests = || allocator.requests.load(std::sync::atomic::Ordering::SeqCst);
+
+        // A request above isize::MAX is refused without asking.
+        let huge = isize::MAX as usize + 1;
+        assert!(matches!(
+            Window::try_new_in(huge, &source),
+            Err(RarError::WindowAllocatorFailed { bytes, .. }) if bytes == huge as u64
+        ));
+        assert_eq!(requests(), 0);
+
+        // A returned length above isize::MAX is refused, its pointer never
+        // asked for, and the memory released.
+        assert!(matches!(
+            Window::try_new_in(64, &source),
+            Err(RarError::WindowAllocatorFailed { bytes: 64, .. })
+        ));
+        assert_eq!(requests(), 1);
+        assert_eq!(
+            allocator.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only `len` was called, once"
+        );
+        assert!(allocator.dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

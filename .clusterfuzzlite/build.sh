@@ -61,6 +61,7 @@ PYTHON
 
 build_target unrar-rs rar_headers rar.dict
 build_target unrar-rs rar_extract rar.dict
+build_target unrar-rs rar_lent_window rar.dict
 build_target unrar-rs rar_recovery_restore rar.dict
 
 build_target par2-rs par2_packets par2.dict
