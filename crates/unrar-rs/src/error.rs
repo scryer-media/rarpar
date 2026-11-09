@@ -133,8 +133,9 @@ pub enum RarError {
 
     /// The [`WindowAllocator`](crate::WindowAllocator) set in
     /// [`Limits::window_allocator`](crate::Limits::window_allocator) did not
-    /// supply a dictionary window: it returned an error, or memory that does
-    /// not keep its contract. The archive is not at fault.
+    /// supply a dictionary window or a PPMd model arena: it returned an
+    /// error, or memory that does not keep its contract. The archive is not
+    /// at fault.
     #[error("window allocator could not supply {bytes} bytes: {error}")]
     WindowAllocatorFailed { bytes: u64, error: io::Error },
 

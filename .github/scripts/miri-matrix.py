@@ -22,6 +22,7 @@ POLICY = {
         "prefixes": (
             "decompress::lz::window::tests::",
             "decompress::lz::block_reader::tests::",
+            "decompress::ppm_arena::tests::",
         ),
         # Exhaustive sweeps too slow to interpret; Memcheck and ASan run them.
         "excluded": ("copy_matrix_matches_reference",),
@@ -35,6 +36,10 @@ POLICY = {
             "junk_filled_caller_memory_decodes_like_a_zeroed_heap_window",
             "growth_moves_into_caller_memory_and_drops_the_old_owner",
             "lengths_above_isize_max_are_refused_before_any_slice",
+            # The lent PPMd arena: window memory handed to ppmd-turbo, decoded
+            # into, and refused on its length.
+            "junk_filled_lent_arena_decodes_like_an_owned_one",
+            "short_lent_memory_is_refused_and_released",
         },
     },
     "reedsolomon-rs": {

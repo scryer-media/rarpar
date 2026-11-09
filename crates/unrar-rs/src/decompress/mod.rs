@@ -19,6 +19,7 @@
 
 pub mod lz;
 pub(crate) mod policy;
+pub(crate) mod ppm_arena;
 pub mod rar4;
 pub(crate) mod rar4_old;
 pub mod store;

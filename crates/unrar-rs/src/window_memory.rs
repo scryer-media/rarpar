@@ -13,8 +13,25 @@
 //! being refused.
 //!
 //! This covers the LZ window of every format: RAR5/RAR7, RAR 2.9 LZ, and RAR
-//! 1.5 to 2.6. The RAR 2.9 PPMd model arena is separate and is not allocated
-//! here.
+//! 1.5 to 2.6.
+//!
+//! # The PPMd model arena
+//!
+//! The same allocator can also lend the RAR 2.9 PPMd model arena, which a
+//! block header may declare at up to 256 MiB. An arena at or under
+//! [`Limits::max_heap_ppmd_arena_size`] stays in the decoder's own memory, as
+//! without an allocator; that limit defaults to the format's 256 MiB
+//! ceiling, so no arena is lent until it is lowered. A larger one, up to
+//! [`Limits::max_ppmd_arena_size`], is asked of the allocator, under the
+//! contract below. Arena memory need not be zeroed either: the model never
+//! reads a byte of it that it has not written.
+//!
+//! The decoder asks for an arena when a block header resets the model and the
+//! arena in hand cannot back it (it is too small, or more than twice the
+//! size needed), and when a damaged PPMd block makes it restart the model
+//! over a 1 MiB arena. The arena, like the window, lives as long as the
+//! decoder, across members and solid members. A refusal, or memory shorter
+//! than asked, is [`RarError::WindowAllocatorFailed`], as for a window.
 //!
 //! # The memory contract
 //!
@@ -70,13 +87,15 @@
 //! [`Limits::max_dict_size`]: crate::Limits::max_dict_size
 //! [`Limits::with_window_allocator`]: crate::Limits::with_window_allocator
 //! [`Limits::max_allocated_dict_size`]: crate::Limits::max_allocated_dict_size
+//! [`Limits::max_heap_ppmd_arena_size`]: crate::Limits::max_heap_ppmd_arena_size
+//! [`Limits::max_ppmd_arena_size`]: crate::Limits::max_ppmd_arena_size
 //! [`RarError::DictionaryTooLarge`]: crate::RarError::DictionaryTooLarge
 //! [`RarError::WindowAllocatorFailed`]: crate::RarError::WindowAllocatorFailed
 
 use std::io;
 
-/// Memory for one LZ dictionary window, owned by the decoder until it drops
-/// the value.
+/// Memory for one LZ dictionary window or one PPMd model arena, owned by the
+/// decoder until it drops the value.
 ///
 /// # Safety
 ///
@@ -102,7 +121,9 @@ pub unsafe trait WindowMemory: Send {
 }
 
 /// Supplies window memory for dictionaries larger than
-/// [`Limits::max_dict_size`](crate::Limits::max_dict_size).
+/// [`Limits::max_dict_size`](crate::Limits::max_dict_size), and arena memory
+/// for PPMd models larger than
+/// [`Limits::max_heap_ppmd_arena_size`](crate::Limits::max_heap_ppmd_arena_size).
 ///
 /// One allocator can serve many extractions at once, on any thread, so it is
 /// shared through an `Arc` in [`Limits`](crate::Limits) and must be
@@ -113,7 +134,7 @@ pub unsafe trait WindowMemory: Send {
 /// the parallel decoder's workers are unchanged, and the workers never touch
 /// the window.
 pub trait WindowAllocator: Send + Sync {
-    /// Supply at least `len` bytes of window memory.
+    /// Supply at least `len` bytes of window or arena memory.
     ///
     /// An error fails the member's extraction with
     /// [`RarError::WindowAllocatorFailed`](crate::RarError::WindowAllocatorFailed),

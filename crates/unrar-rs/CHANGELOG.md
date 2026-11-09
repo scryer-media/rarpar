@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.16.1
+
+A caller can lend the memory for the RAR 2.9 PPMd model arena too, which a
+block header may declare at up to 256 MiB, through the same
+`WindowAllocator` that lends the LZ window. Set
+`Limits::max_heap_ppmd_arena_size` below 256 MiB and any larger arena, up to
+`Limits::max_ppmd_arena_size`, is asked of the allocator instead of the
+decoder allocating it. Its default is 256 MiB, so a caller that already sets a
+window allocator lends no arena until it lowers the limit, and without an
+allocator nothing changes. The lent arena need not be zeroed, lives as long as
+the decoder across members and solid members, and is lent again for the 1 MiB
+model the decoder restarts after damaged PPMd data.
+
+### Added
+
+- `Limits::max_heap_ppmd_arena_size`, set with
+  `Limits::with_max_heap_ppmd_arena_size`: the largest PPMd arena kept in the
+  decoder's own memory when a window allocator is set.
+
+### Changed
+
+- `Limits::max_ppmd_arena_size` also caps a lent arena: one above it fails
+  with `RarError::ResourceLimit` before the allocator is asked.
+- An allocator that refuses an arena, or returns memory shorter than asked,
+  fails the member with `RarError::WindowAllocatorFailed`, carrying the
+  allocator's own error, as for a window.
+- Built on `ppmd-turbo` 0.2.2, which can take its arena from a caller. No
+  `ppmd-turbo` type is in this crate's API.
+
 ## 0.16.0
 
 A caller can lend the memory for a large LZ dictionary window, so a RAR5 or

@@ -93,9 +93,10 @@ pub struct Limits {
     /// Supplies the LZ window for a dictionary larger than
     /// [`max_dict_size`](Self::max_dict_size), up to
     /// [`max_allocated_dict_size`](Self::max_allocated_dict_size), instead of
-    /// refusing it (default `None`). Set it with
-    /// [`with_window_allocator`](Self::with_window_allocator). See
-    /// [`crate::window_memory`] for the memory contract.
+    /// refusing it (default `None`), and the PPMd model arena for an arena
+    /// larger than [`max_heap_ppmd_arena_size`](Self::max_heap_ppmd_arena_size).
+    /// Set it with [`with_window_allocator`](Self::with_window_allocator).
+    /// See [`crate::window_memory`] for the memory contract.
     pub window_allocator: Option<Arc<dyn WindowAllocator>>,
     /// Largest dictionary, in bytes, the
     /// [`window_allocator`](Self::window_allocator) is asked for (default
@@ -113,7 +114,20 @@ pub struct Limits {
     /// fails with [`RarError::ResourceLimit`](crate::RarError::ResourceLimit)
     /// before the arena is allocated. The model's fixed tables come on top of
     /// the arena and are not counted here.
+    ///
+    /// The limit holds for every arena, lent or not: it is also the largest
+    /// arena the [`window_allocator`](Self::window_allocator) is asked for.
     pub max_ppmd_arena_size: u64,
+    /// Largest PPMd model arena, in bytes, the decoder keeps in its own
+    /// memory when a [`window_allocator`](Self::window_allocator) is set
+    /// (default [`RAR_PPMD_MAX_ARENA_SIZE`], so by default no arena is lent).
+    ///
+    /// A larger arena, up to [`max_ppmd_arena_size`](Self::max_ppmd_arena_size),
+    /// is asked of the window allocator, under the same memory contract as a
+    /// window (see [`crate::window_memory`]). Set it with
+    /// [`with_max_heap_ppmd_arena_size`](Self::with_max_heap_ppmd_arena_size).
+    /// Unused without an allocator.
+    pub max_heap_ppmd_arena_size: u64,
 }
 
 impl Default for Limits {
@@ -126,6 +140,7 @@ impl Default for Limits {
             window_allocator: None,
             max_allocated_dict_size: RAR_UNPACK_MAX_DICT_SIZE,
             max_ppmd_arena_size: RAR_PPMD_MAX_ARENA_SIZE,
+            max_heap_ppmd_arena_size: RAR_PPMD_MAX_ARENA_SIZE,
         }
     }
 }
@@ -143,6 +158,7 @@ impl std::fmt::Debug for Limits {
             )
             .field("max_allocated_dict_size", &self.max_allocated_dict_size)
             .field("max_ppmd_arena_size", &self.max_ppmd_arena_size)
+            .field("max_heap_ppmd_arena_size", &self.max_heap_ppmd_arena_size)
             .finish()
     }
 }
@@ -150,8 +166,11 @@ impl std::fmt::Debug for Limits {
 impl Limits {
     /// Lend the LZ window for dictionaries above
     /// [`max_dict_size`](Self::max_dict_size), up to
-    /// [`max_allocated_dict_size`](Self::max_allocated_dict_size), from
-    /// `allocator`. See [`crate::window_memory`].
+    /// [`max_allocated_dict_size`](Self::max_allocated_dict_size), and the
+    /// PPMd model arena for arenas above
+    /// [`max_heap_ppmd_arena_size`](Self::max_heap_ppmd_arena_size), up to
+    /// [`max_ppmd_arena_size`](Self::max_ppmd_arena_size), from `allocator`.
+    /// See [`crate::window_memory`].
     #[must_use]
     pub fn with_window_allocator(mut self, allocator: Arc<dyn WindowAllocator>) -> Self {
         self.window_allocator = Some(allocator);
@@ -166,19 +185,31 @@ impl Limits {
         self
     }
 
+    /// Set the largest PPMd model arena, in bytes, the decoder keeps in its
+    /// own memory; a larger one, up to
+    /// [`max_ppmd_arena_size`](Self::max_ppmd_arena_size), is asked of the
+    /// [`window_allocator`](Self::window_allocator).
+    #[must_use]
+    pub fn with_max_heap_ppmd_arena_size(mut self, bytes: u64) -> Self {
+        self.max_heap_ppmd_arena_size = bytes;
+        self
+    }
+
     /// Largest dictionary these limits admit: [`Self::max_dict_size`], or
     /// with an allocator also [`Self::max_allocated_dict_size`].
     pub(crate) fn dict_size_ceiling(&self) -> u64 {
         self.window_source().max_dict_size()
     }
 
-    /// Where the decoder's LZ window comes from under these limits.
+    /// Where the decoder's LZ window and PPMd model arena come from under
+    /// these limits.
     pub(crate) fn window_source(&self) -> WindowSource {
         WindowSource::new(
             self.max_dict_size,
             self.window_allocator.clone(),
             self.max_allocated_dict_size,
         )
+        .with_max_owned_ppmd_arena(self.max_heap_ppmd_arena_size)
     }
 }
 
@@ -197,6 +228,7 @@ mod tests {
         assert_eq!(RAR_PPMD_MAX_ARENA_SIZE, 256 << 20);
         assert!(limits.window_allocator.is_none());
         assert_eq!(limits.max_allocated_dict_size, RAR_UNPACK_MAX_DICT_SIZE);
+        assert_eq!(limits.max_heap_ppmd_arena_size, RAR_PPMD_MAX_ARENA_SIZE);
         // Without an allocator the allocator ceiling admits nothing more.
         assert_eq!(limits.dict_size_ceiling(), limits.max_dict_size);
     }
