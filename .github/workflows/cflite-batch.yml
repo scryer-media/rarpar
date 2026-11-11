@@ -192,10 +192,24 @@ jobs:
   # inputs that reach nothing the corpus did not already reach. Pruning keeps
   # the set minimal, which is what makes tomorrow's run spend its budget on new
   # ground instead of re-executing thousands of redundant inputs.
+  #
+  # The budget is a ceiling per target, not time spent: CIFuzz splits
+  # fuzz-seconds evenly across the targets and each merge stops when it has
+  # replayed its corpus, then raises TimeoutError — failing the job — if it
+  # has not. 600 s stopped being enough on 2026-11-06. With six targets that
+  # was 100 s each, seven now make it 85 s, and the rar_extract merge alone
+  # needs more than 100 s and grows with its corpus
+  # (7171 inputs on 2026-11-05: the first 4096 in 4 s, the larger tail at
+  # about 27 ms each under ASan, 87 s in all). That night passed because
+  # rar_extract was walked last and inherited the time the fast targets left
+  # over; every night since it has come first and timed out.
+  # 3600 s gives every target over 500 s; a normal night still finishes in a
+  # few minutes.
   prune:
     name: prune corpus
     runs-on: ubuntu-26.04
-    timeout-minutes: 60
+    # Build plus the full prune ceiling, with headroom.
+    timeout-minutes: 90
     needs: [coverage]
     if: ${{ !cancelled() }}
     steps:
@@ -213,5 +227,5 @@ jobs:
         uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          fuzz-seconds: 600
+          fuzz-seconds: 3600
           mode: prune
