@@ -1996,7 +1996,7 @@ dependencies = [
 
 [[package]]
 name = "par3-rs"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "blake3",
  "cap-std",

@@ -5,6 +5,12 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ## rarpar 0.9.5
 
+- PAR2 verify and repair no longer hash a slice for every byte of a long run
+  of identical bytes whose block is already placed, through par2-rs 0.12.0.
+  A sparse 96 MiB file of zeros beside a set declaring one 32 MiB zero slice
+  cost about 1 PiB of MD5.
+- A PAR3 repair no longer hashes zeros up to a block size a hostile Start
+  packet declares when it checks a Data packet, through par3-rs 0.8.2.
 - PAR2 loading bounds the work spent on fake packet headers, through
   par2-rs 0.12.0. A volume packed with headers that each claimed to run to
   the end of the file was hashed once per header, so its cost grew with the
