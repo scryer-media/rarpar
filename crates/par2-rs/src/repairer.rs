@@ -882,6 +882,8 @@ struct FileScanStats {
     mode: FileScanMode,
     bytes_scanned: u64,
     windows_stepped: u64,
+    /// Unaligned windows the ordered walk computed a slice-sized MD5 for.
+    windows_hashed: u64,
     jumps_taken: u64,
     max_consecutive_steps: u64,
     /// Bytes this file's scan seeked past instead of reading, because seeded
@@ -896,6 +898,7 @@ impl FileScanStats {
             mode,
             bytes_scanned,
             windows_stepped: 0,
+            windows_hashed: 0,
             jumps_taken: 0,
             max_consecutive_steps: 0,
             bytes_skipped_by_evidence: 0,
@@ -2689,6 +2692,25 @@ impl crate::verify::FileAccess for RepairExecutionAccess {
             io::Error::new(io::ErrorKind::NotFound, "staged writer handle not cached")
         })?;
         write_all_file_at(file, data, offset)
+    }
+
+    /// Provided recovery payloads come from the caller's handle, the same one
+    /// that serves access-backed sources. Without one, the default refusal.
+    fn read_recovery_range_into(
+        &self,
+        exponent: u32,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> io::Result<()> {
+        match self.source_access.as_deref() {
+            Some(access) => access.read_recovery_range_into(exponent, offset, dst),
+            None => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "recovery block {exponent} is provided by the caller, but the repair has no caller FileAccess"
+                ),
+            )),
+        }
     }
 }
 
@@ -6101,18 +6123,32 @@ impl<'a> RollingBlockScanner<'a> {
             let expected_block = preferred_next
                 .and_then(|position| ordered_full_blocks.get(position))
                 .copied();
-            let selected = self.scan_ordered_window(
-                OrderedWindowMatch {
-                    path,
-                    kind,
-                    target_file_id: &target_file.file_id,
-                    expected_block,
-                    data: cursor.data(),
-                    crc: cursor.crc(),
-                    offset: cursor.offset() as u64,
-                },
-                blocks,
-            );
+            // Hash only a window some block could still be selected for. A
+            // CRC hit on blocks that are all placed already selects nothing,
+            // and hashing it anyway costs a whole slice per byte stepped: a
+            // run of identical bytes longer than a slice would be hashed
+            // once for every byte in it.
+            let hashed = self.ordered_window_selectable(cursor.crc(), expected_block, path, blocks);
+            let selected = if hashed {
+                stats.windows_hashed += 1;
+                // A hash is a slice of work the step count does not see, so
+                // it counts towards the cancellation poll at its own size.
+                steps_since_poll = steps_since_poll.saturating_add(slice_size);
+                self.scan_ordered_window(
+                    OrderedWindowMatch {
+                        path,
+                        kind,
+                        target_file_id: &target_file.file_id,
+                        expected_block,
+                        data: cursor.data(),
+                        crc: cursor.crc(),
+                        offset: cursor.offset() as u64,
+                    },
+                    blocks,
+                )
+            } else {
+                None
+            };
 
             if let Some(selected) = selected {
                 if blocks.block(selected).file_id == target_file.file_id {
@@ -6207,6 +6243,25 @@ impl<'a> RollingBlockScanner<'a> {
             &matches,
             blocks,
         )
+    }
+
+    /// Whether a window with this CRC could select anything: some full-size
+    /// block of that CRC passes the gate [`Self::select_ordered_match`]
+    /// applies. When none does the selection is `None` whatever the MD5 says,
+    /// so the caller skips the hash.
+    fn ordered_window_selectable(
+        &self,
+        crc: u32,
+        expected_block: Option<usize>,
+        path: &Path,
+        blocks: &ScanBlockState<'_>,
+    ) -> bool {
+        self.table.by_crc.get(&crc).is_some_and(|candidates| {
+            candidates.iter().any(|block_index| {
+                blocks.block(*block_index).expected_len == self.table.slice_size
+                    && can_select_ordered_match(*block_index, expected_block, path, blocks)
+            })
+        })
     }
 
     /// Hashing half of the ordered window check: block indices whose CRC and
@@ -6655,10 +6710,18 @@ impl<'a> RollingBlockScanner<'a> {
                 .then(|| offset / slice_size);
             let selected = if let Some(window_index) = aligned_window {
                 self.select_ordered_match(selection, &resync.facts[window_index].matches, blocks)
-            } else {
+            } else if self.ordered_window_selectable(
+                cursor.crc(),
+                expected_block,
+                resync.path,
+                blocks,
+            ) {
+                stats.windows_hashed += 1;
                 let matches =
                     self.ordered_window_md5_matches(blocks.baseline(), cursor.data(), cursor.crc());
                 self.select_ordered_match(selection, &matches, blocks)
+            } else {
+                None
             };
 
             if let Some(selected) = selected {
@@ -11801,6 +11864,30 @@ mod tests {
         // covers, can never report less saved than the ring does.
         assert!(mapped_stats.bytes_skipped_by_evidence >= ring_stats.bytes_skipped_by_evidence);
         assert!(mapped_stats.bytes_skipped_by_evidence > 0);
+    }
+
+    // A run of identical bytes longer than its one declared slice: every
+    // window through the run has the block's CRC and MD5, and the block is
+    // placed by the first. The walk steps through the rest without hashing
+    // any of them, on either cursor.
+    #[test]
+    fn serial_walk_does_not_hash_windows_no_block_can_take() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64u64;
+        let declared = vec![0u8; slice_size as usize];
+        let set = synthetic_set(&[("zeros.bin", &declared)], slice_size);
+        let candidate = dir.path().join("zeros.bin");
+        fs::write(&candidate, vec![0u8; 3 * slice_size as usize]).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+        for cursor_kind in [WalkCursorKind::Ring, WalkCursorKind::Mapped] {
+            let (blocks, stats) = serial_walk_with_evidence(&state, &candidate, &[], cursor_kind);
+            assert_eq!(stats.jumps_taken, 1, "the first window places the block");
+            assert_eq!(stats.windows_stepped, slice_size);
+            assert_eq!(stats.windows_hashed, 1, "only the first window is hashed");
+            let (ring_blocks, _) =
+                serial_walk_with_evidence(&state, &candidate, &[], WalkCursorKind::Ring);
+            assert_eq!(blocks, ring_blocks);
+        }
     }
 
     #[test]

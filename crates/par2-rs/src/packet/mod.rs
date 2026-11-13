@@ -1348,7 +1348,7 @@ mod tests {
             .filter_map(|scanned| match &scanned.packet {
                 Packet::RecoverySlice(slice) => match &slice.data {
                     RecoverySliceData::FileBacked { path, .. } => Some(Arc::clone(path)),
-                    RecoverySliceData::InMemory(_) => None,
+                    RecoverySliceData::InMemory(_) | RecoverySliceData::Provided { .. } => None,
                 },
                 _ => None,
             })

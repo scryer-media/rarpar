@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.8.2
+
+### Fixed
+
+- A repair session no longer does work the size of a declared block when it
+  admits a Data packet. The check read and hashed every byte of each
+  described tail the layout places in the block, and compared two Data
+  packets for one block over the whole block, zero-filling whatever a trimmed
+  packet did not store. The lengths come from the Start and File packets, so
+  a few hundred bytes of hash-valid packets declaring a block near 2^64 kept
+  `Par3RepairSession::assess` hashing zeros without end. Now only stored
+  bytes are read. The zero padding of one tail is refused past 1 GiB with a
+  resource-limit error, the bound `DataPacket::matches_checksum` already
+  uses, and what is hashed is charged to `ExecutionOptions::scan_work`. Two
+  Data packets for one block are compared over the bytes they store. Honest
+  sets admit the same packets as before.
+
 ## 0.8.1
 
 - The PAR3 rolling hash (CRC-64/GO-ISO) and the PAR-inside CRC-32 come from

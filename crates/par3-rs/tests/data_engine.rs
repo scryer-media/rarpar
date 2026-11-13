@@ -292,3 +292,135 @@ fn the_data_cache_is_reported_as_a_delta_and_handed_back() {
     );
     assert_eq!(options.memory.used(), 0);
 }
+
+// A hand-made set of one block: a Start packet declaring `block_size`, one
+// file of `length` bytes that is a single described tail at the front of
+// block zero, the Root over it, and the given Data packets for block zero.
+// Every packet is hash-valid, as a hostile author's would be.
+fn tail_set_session(
+    block_size: u64,
+    length: u64,
+    fingerprint: par3_rs::Fingerprint,
+    data: &[&[u8]],
+) -> Par3RepairSession {
+    use par3_rs::{
+        ChunkDescription, ChunkTail, DataPacket, FilePacket, GaloisField, InputSetId, Packet,
+        PacketBody, RootPacket, StartPacket,
+    };
+    let id = InputSetId([7; 8]);
+    let start = Packet::new(
+        id,
+        PacketBody::Start(StartPacket {
+            parent_input_set_id: InputSetId::ZERO,
+            parent_root_hash: [0; 16],
+            block_size,
+            galois_field: GaloisField {
+                size: 1,
+                generator: 0x1D,
+            },
+            legacy_random: None,
+        }),
+    );
+    let file = Packet::new(
+        id,
+        PacketBody::File(FilePacket {
+            name: "tail.bin".into(),
+            quick_rolling_hash: 0,
+            fingerprint: [0; 16],
+            option_hashes: Vec::new(),
+            chunks: vec![ChunkDescription::Protected {
+                length,
+                first_block_index: None,
+                tail: ChunkTail::Described {
+                    rolling_hash: 0,
+                    fingerprint,
+                    block_index: 0,
+                    offset: 0,
+                },
+            }],
+        }),
+    );
+    let root = Packet::new(
+        id,
+        PacketBody::Root(RootPacket {
+            lowest_unused_block_index: 1,
+            attributes: 0,
+            option_hashes: Vec::new(),
+            children: vec![file.hash()],
+        }),
+    );
+    let mut carrier = Vec::new();
+    for packet in [&start, &file, &root] {
+        carrier.extend(packet.to_bytes());
+    }
+    for bytes in data {
+        let packet = Packet::new(
+            id,
+            PacketBody::Data(DataPacket {
+                block_index: 0,
+                data: bytes.to_vec(),
+            }),
+        );
+        carrier.extend(packet.to_bytes());
+    }
+    let mut access = MemorySourceAccess::default();
+    access.insert(SourceId(0), 1, carrier.into());
+    let access = Arc::new(access);
+    let options = ExecutionOptions::default();
+    let mut scanner = PacketScanner::new(
+        access,
+        SourceId(0),
+        options.clone(),
+        par3_rs::ScanLimits::default(),
+    )
+    .unwrap();
+    let mut session =
+        Par3RepairSession::new(id, Arc::new(MemorySourceAccess::default()), options).unwrap();
+    let mut merged = 0;
+    while let ScanEvent::Packet(packet) = scanner.poll().unwrap() {
+        session.merge(packet).unwrap();
+        merged += 1;
+    }
+    assert_eq!(merged, 3 + data.len(), "every hand-made packet scans");
+    session
+}
+
+// The layout, not the carrier, says how long a described tail is. An empty
+// Data packet under a Start packet declaring a block near `u64::MAX` must not
+// send the admission check off to hash that many zeros: it is refused at once.
+#[test]
+fn data_admission_refuses_padding_the_carrier_does_not_hold() {
+    use par3_rs::runtime::EngineError;
+    let block_size = 1u64 << 62;
+    let mut session = tail_set_session(block_size, block_size - 1, [0xAA; 16], &[&[]]);
+    let Err(EngineError::ResourceLimit(limit)) = session.assess() else {
+        panic!("a tail of 2^62 zeros over an empty Data packet is refused");
+    };
+    assert_eq!(limit.what, "Data extent padding");
+}
+
+// Two Data packets for one block that differ only in trailing zeros agree.
+// Comparing them follows the bytes they store, one here, not the 2^62-byte
+// block the Start packet declares.
+#[test]
+fn data_aliases_compare_stored_bytes_not_the_declared_block() {
+    let mut tail = par3_rs::FingerprintHasher::new();
+    tail.update(&[0; 40]);
+    let mut session = tail_set_session(1u64 << 62, 40, tail.finalize(), &[&[], &[0]]);
+    session.assess().unwrap();
+    assert_eq!(session.diagnostics().data_validations, 2);
+}
+
+// A trimmed Data packet still proves a tail that runs past its stored bytes:
+// the padding is hashed as zeros and charged as scanning work.
+#[test]
+fn data_admission_hashes_trimmed_padding_and_charges_it() {
+    let mut bytes = vec![0x5A; 16];
+    let mut tail = par3_rs::FingerprintHasher::new();
+    tail.update(&bytes);
+    tail.update(&[0; 84]);
+    bytes.truncate(16);
+    let mut session = tail_set_session(4096, 100, tail.finalize(), &[&bytes]);
+    session.assess().unwrap();
+    assert_eq!(session.diagnostics().data_validations, 1);
+}
