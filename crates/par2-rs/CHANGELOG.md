@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.12.0
+
+A caller can provide recovery payloads on demand instead of handing them over
+whole. A payload named `RecoverySliceData::Provided { len }` holds no bytes:
+repair asks the caller's `FileAccess` for each chunk it needs, as its memory
+limit allows, so neither side holds the payloads. Before this, a caller that
+could not give a file path loaded every payload into memory, outside the
+repair's memory limit: 390 blocks of 4,480,000 bytes is 1.7 GB.
+
+### Added
+
+- `RecoverySliceData::Provided { len }` and `RecoverySliceData::provided`. Its
+  `len()` is `len`, `as_bytes()` and `file_span()` are `None`, and
+  `validate_packet_hash` accepts it: the caller checks the packet hash before
+  naming a payload this way. `to_vec` and `read_range_padded` cannot read it
+  and return an `Unsupported` I/O error.
+- `FileAccess::read_recovery_range_into(&self, exponent, offset, dst)`, which
+  fills `dst` with the payload bytes of recovery block `exponent` from
+  `offset` on, never past the payload's end. Repair calls it on the thread
+  that called the repair. The default returns an `Unsupported` error, so a
+  repair given a provided payload through an access that cannot read one fails
+  before it writes anything.
+- A repair session built with a source access (`Par2RepairSessionOptions::
+  with_source_access` or `from_set`) reads provided payloads through that
+  access.
+
+### Changed
+
+- `RecoverySliceData` has a third variant, so a `match` on it that names every
+  variant must handle `Provided`.
+- `prepare_recovery_buffers` takes no `FileAccess`, so it fails on a provided
+  payload with an `Unsupported` I/O error.
+
 ## 0.11.1
 
 An audit of the published PAR2 advisories, in par2cmdline-turbo and SABnzbd,
