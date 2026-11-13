@@ -2690,6 +2690,25 @@ impl crate::verify::FileAccess for RepairExecutionAccess {
         })?;
         write_all_file_at(file, data, offset)
     }
+
+    /// Provided recovery payloads come from the caller's handle, the same one
+    /// that serves access-backed sources. Without one, the default refusal.
+    fn read_recovery_range_into(
+        &self,
+        exponent: u32,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> io::Result<()> {
+        match self.source_access.as_deref() {
+            Some(access) => access.read_recovery_range_into(exponent, offset, dst),
+            None => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "recovery block {exponent} is provided by the caller, but the repair has no caller FileAccess"
+                ),
+            )),
+        }
+    }
 }
 
 #[cfg(unix)]
