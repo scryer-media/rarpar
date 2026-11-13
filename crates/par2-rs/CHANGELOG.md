@@ -50,6 +50,17 @@ fixed here.
 
 ### Fixed
 
+- The ordered scan of a file no longer hashes a window that no block can
+  take. A window whose CRC matched was hashed with MD5 before the scan asked
+  whether any matching block was still unplaced. In a run of identical bytes
+  longer than a slice, every window matches the one block the first window
+  already placed, so the scan hashed a whole slice for each byte it stepped:
+  a sparse 96 MiB file of zeros under a set declaring one 32 MiB zero slice
+  cost about 1 PiB of MD5. The scan now checks first and steps on without
+  hashing. Blocks are placed exactly as before. A hash also counts towards
+  the cancellation poll at its own size, so a walk that does hash checks for
+  cancellation after every 1 MiB hashed, or after every slice when a slice
+  is larger, not once per million steps.
 - A volume packed with fake packet headers, each claiming to run to the end
   of the volume, no longer costs quadratic work. Every candidate whose length
   fits is hashed before it can be rejected, so such a volume was hashed once
