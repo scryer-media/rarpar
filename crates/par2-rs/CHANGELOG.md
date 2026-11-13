@@ -9,6 +9,12 @@ limit allows, so neither side holds the payloads. Before this, a caller that
 could not give a file path loaded every payload into memory, outside the
 repair's memory limit: 390 blocks of 4,480,000 bytes is 1.7 GB.
 
+An audit of the published PAR2 advisories, in par2cmdline-turbo and SABnzbd,
+found no gap in the crate for any of them. Each advisory class now has a
+regression test in `tests/advisories.rs`, built from hand-assembled sets so
+that one field lies at a time. The audit did find one gap no advisory names,
+fixed here.
+
 ### Added
 
 - `RecoverySliceData::Provided { len }` and `RecoverySliceData::provided`. Its
@@ -25,6 +31,15 @@ repair's memory limit: 390 blocks of 4,480,000 bytes is 1.7 GB.
 - A repair session built with a source access (`Par2RepairSessionOptions::
   with_source_access` or `from_set`) reads provided payloads through that
   access.
+- Tests for File Description and Unicode Filename names that climb out of the
+  job with parent components, a leading root, an absolute path or backslash
+  separators, both when the files are rebuilt from recovery slices and when
+  obfuscated copies are renamed into place (CVE-2021-29488); a repair target
+  that is a dangling symlink pointing out (GHSA-j5pc-g362-c5xp), a live
+  symlink to a file outside, and a symlinked parent directory; and packets
+  ahead of a valid set whose length, slice size, file-ID count, IFSC count,
+  name or UTF-16 name do not fit. Tests for the fake-header bound and for
+  damaged length fields that still fit.
 
 ### Changed
 
@@ -32,14 +47,6 @@ repair's memory limit: 390 blocks of 4,480,000 bytes is 1.7 GB.
   variant must handle `Provided`.
 - `prepare_recovery_buffers` takes no `FileAccess`, so it fails on a provided
   payload with an `Unsupported` I/O error.
-
-## 0.11.1
-
-An audit of the published PAR2 advisories, in par2cmdline-turbo and SABnzbd,
-found no gap in the crate for any of them. Each advisory class now has a
-regression test in `tests/advisories.rs`, built from hand-assembled sets so
-that one field lies at a time. The audit did find one gap no advisory names,
-fixed here.
 
 ### Fixed
 
@@ -55,18 +62,6 @@ fixed here.
 - On a 32-bit target, a packet header claiming more bytes than the address
   space now reads as a packet that does not fit and the scan moves on,
   instead of failing the load with `ResourceLimitExceeded`.
-
-### Added
-
-- Tests for File Description and Unicode Filename names that climb out of the
-  job with parent components, a leading root, an absolute path or backslash
-  separators, both when the files are rebuilt from recovery slices and when
-  obfuscated copies are renamed into place (CVE-2021-29488); a repair target
-  that is a dangling symlink pointing out (GHSA-j5pc-g362-c5xp), a live
-  symlink to a file outside, and a symlinked parent directory; and packets
-  ahead of a valid set whose length, slice size, file-ID count, IFSC count,
-  name or UTF-16 name do not fit. Tests for the fake-header bound and for
-  damaged length fields that still fit.
 
 ## 0.11.0
 

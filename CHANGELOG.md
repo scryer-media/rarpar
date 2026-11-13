@@ -6,7 +6,7 @@ documented in each crate's own changelog so those notes ship with the crate.
 ## rarpar 0.9.5
 
 - PAR2 loading bounds the work spent on fake packet headers, through
-  par2-rs 0.11.1. A volume packed with headers that each claimed to run to
+  par2-rs 0.12.0. A volume packed with headers that each claimed to run to
   the end of the file was hashed once per header, so its cost grew with the
   square of its size: 9.8 s for 1 MiB. A scan now stops with a resource-limit
   error once it has hashed 16 times the file's length in rejected
@@ -15,7 +15,7 @@ documented in each crate's own changelog so those notes ship with the crate.
 - An audit of the published RAR and PAR2 advisories (UnRAR, WinRAR, 7-Zip,
   libarchive, SABnzbd's CVE-2021-29488, par2cmdline-turbo's
   GHSA-j5pc-g362-c5xp and others) found no other gap. unrar-rs 0.15.3 and
-  par2-rs 0.11.1 carry a regression test for each advisory class.
+  par2-rs 0.12.0 carry a regression test for each advisory class.
 - 7z goes through sevenz-turbo 0.29.6:
   - BZip2 members are decoded by `bzip2-turbo`, a translation of the 7-Zip
     26.04 codec, in place of the `bzip2` crate, and can decode on a second
