@@ -364,7 +364,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
-          targets: wasm32-wasip1
+          targets: wasm32-wasip1,wasm32-unknown-unknown
       - name: Install native build dependencies
         run: |
           sudo apt-get update
@@ -404,6 +404,12 @@ jobs:
         env:
           RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=.
         run: cargo build --locked -p par2-rs --no-default-features --target wasm32-wasip1 --example wasm_par2_check
+      - name: Check unrar-rs for wasm32-unknown-unknown
+        # A browser build: no WASI, so no libc `mktime` (RAR4 DOS times are
+        # read as UTC there). Same linker note as above.
+        env:
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=.
+        run: cargo check --locked -p unrar-rs --no-default-features --features crypto-rust --target wasm32-unknown-unknown
       - name: Confirm the RustCrypto build links no AWS-LC
         run: |
           set -euo pipefail

@@ -1064,7 +1064,50 @@ pub(crate) fn dos_datetime_to_system_time(dos_dt: u32) -> Option<std::time::Syst
     local_datetime_to_system_time(year, month, day, hour, minute, second)
 }
 
-#[cfg(not(windows))]
+/// A date and time read as UTC: days from the civil date (proleptic
+/// Gregorian), then seconds. `None` before 1970.
+#[cfg_attr(
+    not(all(target_family = "wasm", target_os = "unknown")),
+    allow(dead_code)
+)]
+fn utc_datetime_to_system_time(
+    year: u32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Option<std::time::SystemTime> {
+    let (y, m) = if month <= 2 {
+        (i64::from(year) - 1, i64::from(month) + 9)
+    } else {
+        (i64::from(year), i64::from(month) - 3)
+    };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * m + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second);
+    let secs = u64::try_from(secs).ok()?;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+}
+
+/// wasm32-unknown-unknown (a browser) has no libc `mktime` and no time
+/// zone: the local time is read as UTC.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+fn local_datetime_to_system_time(
+    year: u32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Option<std::time::SystemTime> {
+    utc_datetime_to_system_time(year, month, day, hour, minute, second)
+}
+
+#[cfg(all(not(windows), not(all(target_family = "wasm", target_os = "unknown"))))]
 fn local_datetime_to_system_time(
     year: u32,
     month: u32,
@@ -1710,5 +1753,20 @@ mod tests {
             matches!(err, RarError::EncryptedArchive),
             "expected EncryptedArchive, got: {err}"
         );
+    }
+
+    #[test]
+    fn utc_datetime_matches_unix_time() {
+        let at = |y, mo, d, h, mi, s| {
+            utc_datetime_to_system_time(y, mo, d, h, mi, s)
+                .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs())
+        };
+        assert_eq!(at(1970, 1, 1, 0, 0, 0), Some(0));
+        // the DOS epoch, a leap day, a century not a leap year, 2000
+        assert_eq!(at(1980, 1, 1, 0, 0, 0), Some(315_532_800));
+        assert_eq!(at(2024, 2, 29, 12, 34, 56), Some(1_709_210_096));
+        assert_eq!(at(2100, 3, 1, 0, 0, 0), Some(4_107_542_400));
+        assert_eq!(at(2000, 12, 31, 23, 59, 58), Some(978_307_198));
+        assert_eq!(at(1969, 12, 31, 23, 59, 59), None);
     }
 }

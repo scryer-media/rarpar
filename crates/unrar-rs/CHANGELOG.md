@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.16.4
+
+No API changes.
+
+### Fixed
+
+- The crate builds for `wasm32-unknown-unknown` (a browser): RAR4 DOS
+  times there are read as UTC, as the target has no libc `mktime` and no
+  time zone. Other targets are unchanged; `wasm32-wasip1` keeps `mktime`.
+  CI checks the target on the RustCrypto backend.
+
 ## 0.16.3
 
 No API changes.
