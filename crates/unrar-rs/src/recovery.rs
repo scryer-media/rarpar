@@ -501,7 +501,7 @@ fn rev_read_format(candidate: &Candidate, read: Option<&RevRead>) -> Option<RevF
         RevRead::Rar5 { .. } => Some(RevFormat::Rar5),
         RevRead::Rar3 { .. } => Some(RevFormat::Rar3),
         RevRead::Rar3Old { .. } => {
-            parse_old_rar3_rev_name(&candidate.path).map(|_| RevFormat::Rar3)
+            old_rar3_rev_name_fits_a_set(&candidate.path).then_some(RevFormat::Rar3)
         }
         RevRead::BrokenRar5 | RevRead::Unrecognised => None,
     }
@@ -2876,15 +2876,8 @@ fn rar3_rev_membership(base: &str, path: &Path, read: &RevRead) -> Option<Option
     if ![data, rec, position].into_iter().all(all_digits) {
         return None;
     }
-    let params = (
-        parse_rar3_rev_param(data),
-        parse_rar3_rev_param(rec),
-        parse_rar3_rev_param(position),
-    );
-    Some(match (read, params) {
-        (RevRead::Rar3Old { .. }, (Some(data_count), Some(rec_count), Some(rec_position)))
-            if data_count + rec_count <= 255 && data_count + rec_position - 1 <= 255 =>
-        {
+    Some(match (read, old_rar3_rev_params(numbers)) {
+        (RevRead::Rar3Old { .. }, Some((data_count, rec_count, rec_position))) => {
             Some(Rar3RevHeader {
                 rec_position,
                 rec_count,
@@ -3569,23 +3562,47 @@ fn rar3_rev_uses_new_style_footer(path: &Path) -> bool {
     digit_groups < 2
 }
 
-fn parse_old_rar3_rev_name(path: &Path) -> Option<(usize, usize, usize)> {
-    let stem = path.file_stem()?.to_string_lossy();
-    let mut parts = stem.rsplitn(3, '_');
-    let rec_position = parse_rar3_rev_param(parts.next()?)?;
-    let rec_count = parse_rar3_rev_param(parts.next()?)?;
-    let data_part = parts.next()?;
-    let data_start = data_part
+/// Whether the RAR 3.0-style `.rev` name at `path` states numbers RAR could
+/// have written for some set. The name alone does not say where the set's
+/// base ends and the data count begins: `b713_02_01.rev` is set `b7` with 13
+/// data volumes, or set `b71` with 3, and never set `b` with 713. Reference
+/// UnRAR reads the data count only from the digits past the base name of the
+/// set's first volume, so each split of the digit run is tried here, and
+/// [`rar3_rev_membership`] reads the one the set's base gives.
+fn old_rar3_rev_name_fits_a_set(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().map(|stem| stem.to_string_lossy()) else {
+        return false;
+    };
+    let Some(head) = stem.rsplitn(3, '_').nth(2) else {
+        return false;
+    };
+    let digits_start = head
         .as_bytes()
         .iter()
         .rposition(|byte| !byte.is_ascii_digit())
         .map_or(0, |idx| idx + 1);
-    let data_count = parse_rar3_rev_param(&data_part[data_start..])?;
+    let tail = &stem[digits_start..];
+    (0..head.len() - digits_start).any(|skip| old_rar3_rev_params(&tail[skip..]).is_some())
+}
 
+/// The data count, recovery count and position a RAR 3.0-style `.rev` name
+/// states in `numbers`, the `<data>_<recovery>_<position>` after the set's
+/// base name: `None` when they are not three digit runs, or are numbers no
+/// set RAR writes could have (each 1 to 255, the data and recovery counts
+/// together at most 255, and the position within them).
+fn old_rar3_rev_params(numbers: &str) -> Option<(usize, usize, usize)> {
+    let mut parts = numbers.split('_');
+    let (Some(data), Some(rec), Some(position), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    let data_count = parse_rar3_rev_param(data)?;
+    let rec_count = parse_rar3_rev_param(rec)?;
+    let rec_position = parse_rar3_rev_param(position)?;
     if data_count + rec_count > 255 || data_count + rec_position - 1 > 255 {
         return None;
     }
-
     Some((data_count, rec_count, rec_position))
 }
 
@@ -5141,12 +5158,58 @@ mod tests {
     /// number. The `.rev` is the RAR3 Reed-Solomon parity of the volumes'
     /// bytes, byte by byte, then its footer.
     fn old_rar3_set_with_one_rev(dir: &Path, stem: &str) -> (Vec<PathBuf>, Vec<Vec<u8>>) {
+        let volumes = old_rar3_volumes(true);
+        let mut rev = rar3_parity(&volumes, 7);
+        // Three data volumes, one recovery volume, this one the first; each
+        // less one. Then the CRC32 of every byte before the CRC.
+        let len = rev.len();
+        rev[len - 7..len - 4].copy_from_slice(&[2, 0, 0]);
+        let crc = crc32fast::hash(&rev[..len - 4]);
+        rev[len - 4..].copy_from_slice(&crc.to_le_bytes());
+
+        let mut paths = Vec::new();
+        for (index, volume) in volumes.iter().enumerate() {
+            let path = dir.join(format!("{stem}.part{}.rar", index + 1));
+            std::fs::write(&path, volume).unwrap();
+            paths.push(path);
+        }
+        let rev_path = dir.join(format!("{stem}.part1.rev"));
+        std::fs::write(&rev_path, &rev).unwrap();
+        paths.push(rev_path);
+        (paths, volumes)
+    }
+
+    /// One recovery volume's RAR3 Reed-Solomon parity of `volumes`, byte by
+    /// byte, as long as the longest volume, with its last `footer` bytes left
+    /// zero for a footer.
+    fn rar3_parity(volumes: &[Vec<u8>], footer: usize) -> Vec<u8> {
+        let len = volumes.iter().map(Vec::len).max().unwrap();
+        let coder = Rar3RsCoder::new(1).unwrap();
+        let mut rev = vec![0u8; len];
+        for (position, parity) in rev.iter_mut().enumerate().take(len - footer) {
+            let column = volumes
+                .iter()
+                .map(|volume| volume.get(position).copied().unwrap_or(0))
+                .collect::<Vec<_>>();
+            let mut out = [0u8; 1];
+            coder.encode(&column, &mut out);
+            *parity = out[0];
+        }
+        rev
+    }
+
+    /// Three RAR 3.1.0 to 3.3.0 data volumes of one stored file, in the new
+    /// volume numbering when `new_numbering`, the old one otherwise.
+    fn old_rar3_volumes(new_numbering: bool) -> Vec<Vec<u8>> {
         use crate::rar4::types::{archive_flags, file_flags};
         let chunks: [&[u8]; 3] = [&[0x11; 40], &[0x22; 40], &[0x33; 9]];
         let mut volumes = Vec::new();
         for (index, chunk) in chunks.iter().enumerate() {
             let last = index + 1 == chunks.len();
-            let mut flags = archive_flags::VOLUME | archive_flags::NEW_NUMBERING;
+            let mut flags = archive_flags::VOLUME;
+            if new_numbering {
+                flags |= archive_flags::NEW_NUMBERING;
+            }
             if index == 0 {
                 flags |= archive_flags::FIRST_VOLUME;
             }
@@ -5170,35 +5233,7 @@ mod tests {
             bytes.extend_from_slice(&rar4_block(0x7B, end_flags, &end));
             volumes.push(bytes);
         }
-
-        let len = volumes.iter().map(Vec::len).max().unwrap();
-        let coder = Rar3RsCoder::new(1).unwrap();
-        let mut rev = vec![0u8; len];
-        for (position, parity) in rev.iter_mut().enumerate().take(len - 7) {
-            let column = volumes
-                .iter()
-                .map(|volume| volume.get(position).copied().unwrap_or(0))
-                .collect::<Vec<_>>();
-            let mut out = [0u8; 1];
-            coder.encode(&column, &mut out);
-            *parity = out[0];
-        }
-        // Three data volumes, one recovery volume, this one the first; each
-        // less one. Then the CRC32 of every byte before the CRC.
-        rev[len - 7..len - 4].copy_from_slice(&[2, 0, 0]);
-        let crc = crc32fast::hash(&rev[..len - 4]);
-        rev[len - 4..].copy_from_slice(&crc.to_le_bytes());
-
-        let mut paths = Vec::new();
-        for (index, volume) in volumes.iter().enumerate() {
-            let path = dir.join(format!("{stem}.part{}.rar", index + 1));
-            std::fs::write(&path, volume).unwrap();
-            paths.push(path);
-        }
-        let rev_path = dir.join(format!("{stem}.part1.rev"));
-        std::fs::write(&rev_path, &rev).unwrap();
-        paths.push(rev_path);
-        (paths, volumes)
+        volumes
     }
 
     /// A RAR 3.1.0-3.3.0 set rebuilds a lost data volume: its end records
@@ -5359,7 +5394,74 @@ mod tests {
             rar3_rev_membership("movie", &path, &read),
             Some(None)
         ));
-        assert_eq!(parse_old_rar3_rev_name(&path), None);
+        assert!(!old_rar3_rev_name_fits_a_set(&path));
+    }
+
+    /// A RAR 3.0-style name does not say where the set's base ends: the
+    /// digits before `_<recovery>_<position>` are read against the base the
+    /// set's first volume gives, as reference UnRAR reads them, and the name
+    /// alone fits some set when any split of them is numbers RAR writes.
+    #[test]
+    fn old_rar3_rev_name_is_read_against_the_set_base() {
+        let header = |base: &str, name: &str| {
+            rar3_rev_membership(base, Path::new(name), &RevRead::Rar3Old { len: 0 })
+                .map(|header| header.map(|h| (h.data_count, h.rec_count, h.rec_position)))
+        };
+        // Set `b7`, 13 data volumes: never 713, which no set can have.
+        assert_eq!(header("b7", "/x/b713_02_01.rev"), Some(Some((13, 2, 1))));
+        assert_eq!(header("b71", "/x/b713_02_01.rev"), Some(Some((3, 2, 1))));
+        assert_eq!(header("b", "/x/b713_02_01.rev"), Some(None));
+        assert_eq!(header("B7", "/x/b713_02_01.rev"), Some(Some((13, 2, 1))));
+        // Zero-padded numbers, as RAR 3.0 writes past 99 volumes.
+        assert_eq!(header("c", "/x/c128_002_001.rev"), Some(Some((128, 2, 1))));
+        assert_eq!(header("a", "/x/a33_03_01.rev"), Some(Some((33, 3, 1))));
+        // A data count with nothing past the base is not a RAR 3.0 name.
+        assert_eq!(header("b713", "/x/b713_02_01.rev"), None);
+
+        let fits = |name: &str| old_rar3_rev_name_fits_a_set(Path::new(name));
+        assert!(fits("/x/b713_02_01.rev"));
+        assert!(fits("/x/a33_03_01.rev"));
+        assert!(fits("/x/c128_002_001.rev"));
+        assert!(fits("/x/movie_5_3_2.rev"));
+        // 256 is out of range, but set `x2` with 56 is not.
+        assert!(fits("/x/x256_1_1.rev"));
+        // No split gives numbers RAR writes.
+        assert!(!fits("/x/movie5_0_1.rev"));
+        assert!(!fits("/x/movie200_100_1.rev"));
+        assert!(!fits("/x/movie_3_1.rev"));
+        assert!(!fits("/x/movie_0_3_1.rev"));
+        assert!(!fits("/x/movie5_3_x.rev"));
+    }
+
+    /// A RAR 3.0 set whose name ends in a digit rebuilds a lost volume from
+    /// its RAR 3.0-style `.rev`: `n7`'s `n73_1_1.rev` states 3 data volumes,
+    /// 1 recovery volume. Read without the set's base, its data count was
+    /// 73, and no recovery volume was found. The set is built in the test,
+    /// old-numbered (`n7.rar`, `n7.r00`, `n7.r01`); a RAR 3.0 `.rev` is the
+    /// parity alone, with no footer.
+    #[test]
+    fn rar3_0_set_whose_name_ends_in_a_digit_rebuilds_a_lost_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let volumes = old_rar3_volumes(false);
+        let mut paths = Vec::new();
+        for (index, volume) in volumes.iter().enumerate() {
+            let ext = match index.checked_sub(1) {
+                None => "rar".to_string(),
+                Some(after_first) => format!("r{after_first:02}"),
+            };
+            let path = dir.path().join(format!("n7.{ext}"));
+            std::fs::write(&path, volume).unwrap();
+            paths.push(path);
+        }
+        std::fs::write(dir.path().join("n73_1_1.rev"), rar3_parity(&volumes, 0)).unwrap();
+
+        let lost = paths.remove(1);
+        std::fs::remove_file(&lost).unwrap();
+        let report = restore_volumes_from_paths(&paths[..1], &RecoveryOptions::default()).unwrap();
+
+        assert_eq!(report.restored_paths, vec![lost.clone()]);
+        assert_eq!(std::fs::read(&lost).unwrap(), volumes[1]);
+        assert_eq!(stray_partials(dir.path(), &[]), Vec::<PathBuf>::new());
     }
 
     #[test]
