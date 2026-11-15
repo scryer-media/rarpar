@@ -60,8 +60,9 @@ documented in each crate's own changelog so those notes ship with the crate.
   place and failed with "Write error: unexpected EOF". They now report the
   missing volume, "Cannot find volume N", as UnRAR does.
 - Every other dependency is at its latest compatible release, among them
-  aws-lc-rs 1.19, zip 9.4 and serde_json 1.0.154. No direct dependency has a
-  newer major release.
+  aws-lc-rs 1.19, zip 9.6, sevenz-turbo 0.29.7 and serde_json 1.0.154.
+  sevenz-turbo 0.30 and lzma-turbo 0.12 are out and not taken in this
+  release.
 
 ## rarpar 0.9.4
 
