@@ -42,6 +42,11 @@ documented in each crate's own changelog so those notes ship with the crate.
   its checksum. In a solid RAR 2.9 to 4.x archive, a member that unpacks to
   nothing left the member after it failing, and every later one. A file's
   own comment was shown as the archive comment.
+- A RAR 3.0 set whose name ends in a digit rebuilds a lost volume from its
+  `.rev` files, through unrar-rs 0.16.3: `b713_02_01.rev` of set `b7` is
+  read as 13 data volumes, as reference UnRAR reads it, not 713. Before,
+  `rar restore-volumes` and `auto` failed with "no valid RAR recovery
+  volumes were found".
 - The `.rev` files of a RAR set with old-style volume names now join that
   set: RAR 3.0's `<set><data>_<recovery>_<position>.rev` (`arc33_03_01.rev`)
   and the `<set><number>.rev` later versions write (`arc01.rev`). Before,
