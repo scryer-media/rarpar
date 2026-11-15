@@ -1066,10 +1066,9 @@ pub(crate) fn dos_datetime_to_system_time(dos_dt: u32) -> Option<std::time::Syst
 
 /// A date and time read as UTC: days from the civil date (proleptic
 /// Gregorian), then seconds. `None` before 1970.
-#[cfg_attr(
-    not(all(target_family = "wasm", target_os = "unknown")),
-    allow(dead_code)
-)]
+///
+/// Built for tests on every target so the arithmetic is checked natively.
+#[cfg(any(test, not(any(unix, windows, target_os = "wasi"))))]
 fn utc_datetime_to_system_time(
     year: u32,
     month: u32,
@@ -1093,9 +1092,9 @@ fn utc_datetime_to_system_time(
     Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
 }
 
-/// wasm32-unknown-unknown (a browser) has no libc `mktime` and no time
-/// zone: the local time is read as UTC.
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+/// A target with no libc `mktime` has no time zone to ask either, so the
+/// local time is read as UTC. wasm32-unknown-unknown (a browser) is one.
+#[cfg(not(any(unix, windows, target_os = "wasi")))]
 fn local_datetime_to_system_time(
     year: u32,
     month: u32,
@@ -1107,7 +1106,9 @@ fn local_datetime_to_system_time(
     utc_datetime_to_system_time(year, month, day, hour, minute, second)
 }
 
-#[cfg(all(not(windows), not(all(target_family = "wasm", target_os = "unknown"))))]
+/// Unix and WASI have libc `mktime`, which applies the host's time zone
+/// (Emscripten's is the JavaScript host's; WASI has none and yields UTC).
+#[cfg(any(unix, target_os = "wasi"))]
 fn local_datetime_to_system_time(
     year: u32,
     month: u32,

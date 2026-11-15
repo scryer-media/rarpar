@@ -6,10 +6,22 @@ No API changes.
 
 ### Fixed
 
-- The crate builds for `wasm32-unknown-unknown` (a browser): RAR4 DOS
-  times there are read as UTC, as the target has no libc `mktime` and no
-  time zone. Other targets are unchanged; `wasm32-wasip1` keeps `mktime`.
-  CI checks the target on the RustCrypto backend.
+- The crate builds for `wasm32-unknown-unknown` (a browser), and for any
+  other target that is not Unix, Windows or WASI: a RAR 1.4-4.x DOS time
+  is read as UTC there, as such a target has no libc `mktime` and no time
+  zone to ask. Unix, Emscripten, Windows and WASI are unchanged; WASI's
+  `mktime` has no zone either, so it has always read these times as UTC.
+  `MemberInfo::mtime` documents which targets read which.
+
+### Tested
+
+- CI runs the extraction harness on `wasm32-wasip2` (as a component, under
+  wasmtime) and on `wasm32-unknown-emscripten` (under Node), beside
+  `wasm32-wasip1`, each with and without `simd128`, and checks the
+  `wasm32-unknown-unknown` build with `crypto-rust` and with
+  `crypto-host,crc-host`.
+- The harness digests cover each member's modification time, so a target
+  that reads a RAR4 time differently from the native UTC run fails.
 
 ## 0.16.3
 

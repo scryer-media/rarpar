@@ -1,0 +1,49 @@
+name: Set up Emscripten
+description: >
+  Install one pinned emsdk release and put emcc and the Node it ships on PATH
+  for the steps that follow.
+
+inputs:
+  version:
+    description: The emsdk release to install, such as 7.0.0.
+    required: true
+  commit:
+    description: The emsdk commit that release's tag names.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install emsdk
+      shell: bash
+      env:
+        EMSDK_VERSION: ${{ inputs.version }}
+        EMSDK_COMMIT: ${{ inputs.commit }}
+      run: |
+        set -euo pipefail
+        root="$RUNNER_TEMP/emsdk"
+        # Fetched by commit, not by tag: a tag can be moved, a commit cannot.
+        git init -q "$root"
+        git -C "$root" fetch -q --depth 1 \
+          https://github.com/emscripten-core/emsdk.git "$EMSDK_COMMIT"
+        git -C "$root" checkout -q FETCH_HEAD
+        "$root/emsdk" install "$EMSDK_VERSION"
+        "$root/emsdk" activate "$EMSDK_VERSION"
+        # emsdk_env.sh reads variables that may be unset.
+        set +u
+        # shellcheck disable=SC1091
+        source "$root/emsdk_env.sh"
+        set -u
+        emcc --version
+        # Assert the pin instead of trusting that the install resolved it.
+        emcc --version | head -n 1 | grep -qF "$EMSDK_VERSION"
+        node --version
+        {
+          echo "$EMSDK/upstream/emscripten"
+          dirname "$EMSDK_NODE"
+        } >> "$GITHUB_PATH"
+        {
+          echo "EMSDK=$EMSDK"
+          echo "EMSDK_NODE=$EMSDK_NODE"
+          echo "EM_CONFIG=$EMSDK/.emscripten"
+        } >> "$GITHUB_ENV"

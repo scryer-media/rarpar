@@ -8,7 +8,7 @@ Read, extract and repair RAR archives in Rust, with no C bindings and no
 
 ```toml
 [dependencies]
-unrar-rs = "0.14"
+unrar-rs = "0.16"
 ```
 
 It reads archives and puts damaged ones back from the recovery data RAR
@@ -207,7 +207,7 @@ the original error, so `io::Error::downcast` gives back the `RarError` or the
   WebAssembly. Decryption is slower; the output is the same.
 
 ```toml
-unrar-rs = { version = "0.14", default-features = false, features = ["crypto-rust"] }
+unrar-rs = { version = "0.16", default-features = false, features = ["crypto-rust"] }
 ```
 
 Turning on neither is a compile error. With both on, AWS-LC is used.
@@ -216,6 +216,31 @@ Turning on neither is a compile error. With both on, AWS-LC is used.
 On WebAssembly, `crypto-host` hands decryption, and `crc-host` the CRC-32
 checks, to the program that embeds the module. On other targets they do
 nothing.
+
+## WebAssembly
+
+Build with `crypto-rust`, or with `crypto-host` and `crc-host`. Decoding
+runs on one thread, and uses `simd128` when the module is built with it.
+
+| Target | Runs under | CI |
+|---|---|---|
+| `wasm32-wasip1` | a WASI 0.1 runtime | runs |
+| `wasm32-wasip2` | a component host | runs |
+| `wasm32-unknown-emscripten` | Emscripten's JavaScript | runs |
+| `wasm32-unknown-unknown` | a browser, your own host | builds |
+
+"Runs" means CI extracts the fixture archives on that target, with and
+without `simd128`, and compares each member with a native run:
+`wasm32-wasip1` and `wasm32-wasip2` under wasmtime, Emscripten under Node.
+"Builds" means CI compiles the crate for the target and runs nothing.
+
+A RAR 1.4-4.x archive stores local times with no zone. Emscripten converts
+them with the zone of its JavaScript host; the other three targets have no
+zone to ask and read them as UTC. RAR5 times are instants everywhere.
+
+On `wasm32-unknown-unknown` the standard library's filesystem calls all
+return errors, so anything that takes a path fails there; read the archive
+from memory and extract with `copy_to`.
 
 ## Speed
 
