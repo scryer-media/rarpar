@@ -118,6 +118,25 @@ pub enum Rar4Method {
     Unknown(u8),
 }
 
+impl Rar4Method {
+    /// The method of a RAR 1.4 file header, which stores it raw: 0 is store
+    /// and 1 to 5 the compressed levels, where RAR 1.5 and later store
+    /// 0x30 to 0x35 (UnRAR arcread.cpp `ReadHeader14` reads `Method` as the
+    /// byte; `ReadHeader15` subtracts 0x30). Any other byte is no method a
+    /// 1.4 writer used and stays unknown.
+    pub fn from_rar14(raw: u8) -> Self {
+        match raw {
+            0 => Self::Store,
+            1 => Self::Fastest,
+            2 => Self::Fast,
+            3 => Self::Normal,
+            4 => Self::Good,
+            5 => Self::Best,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
 impl From<u8> for Rar4Method {
     fn from(val: u8) -> Self {
         match val {
@@ -307,12 +326,15 @@ impl Rar4EncryptionMethod {
 pub mod end_flags {
     /// More volumes follow.
     pub const NEXT_VOLUME: u16 = 0x0001;
-    /// Data CRC and volume number are present after the header.
+    /// The record carries the archive data CRC32 (4 bytes, read first).
     pub const DATA_CRC: u16 = 0x0002;
-    /// Volume number is present.
-    pub const VOLUME_NUMBER: u16 = 0x0004;
-    /// Recovery record space is present at the end of the volume.
-    pub const REV_SPACE: u16 = 0x0008;
+    /// The record reserves 7 trailing bytes for the end of a .rev file's
+    /// volume record (UnRAR `EARC_REVSPACE`, headers.hpp). They follow every
+    /// optional field and carry nothing to read.
+    pub const REV_SPACE: u16 = 0x0004;
+    /// The record states the current volume number (2 bytes, read after the
+    /// data CRC; UnRAR `EARC_VOLNUMBER`, headers.hpp).
+    pub const VOLUME_NUMBER: u16 = 0x0008;
 }
 
 /// Parsed RAR4 end-of-archive header.

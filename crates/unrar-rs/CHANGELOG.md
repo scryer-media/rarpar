@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.16.2
+
+Fixes for archives written by old RAR versions, found by comparing the crate
+with reference UnRAR on the output of RAR 3.0 through 3.3. Two of them also
+affect archives from current writers: the solid fix covers RAR4 archives from
+RAR 3.0 through 5.00, and the comment fix any RAR4 archive with a file
+comment. No API changes.
+
+### Fixed
+
+- RAR4 end-of-archive record: the volume-number bit is 0x0008 and the
+  reserved-space bit 0x0004, as UnRAR defines them. They were swapped, so a
+  volume written by RAR 3.1 through 3.3, whose end record reserves space and
+  states no number, read as volume 0. Every volume of such a set claimed to
+  be the first, and rebuilding a lost volume from its `.rev` files failed
+  with "insufficient RAR3 recovery volumes". Sets from RAR 3.4 and later set
+  both bits and read the same as before. `rar4::end_flags::VOLUME_NUMBER` and
+  `REV_SPACE` change value.
+- RAR 1.4 file headers store the method raw, 0 for store and 1 to 5 for the
+  compressed levels. The reader used the RAR 1.5 codes (0x30 to 0x35), so a
+  stored RAR 1.4 member failed its checksum.
+- Solid RAR 2.9 to 4.x streams: a member that unpacks to nothing still
+  carries packed bytes, and they are now decoded. Skipping them left the next
+  member with stale tables, so it failed and every later member reported
+  `SolidStatePoisoned`.
+- `RarArchive::comment` returns only the archive comment, the `CMT` record
+  ahead of the first file. A file's own comment is no longer returned when
+  the archive has none.
+
 ## 0.16.1
 
 A caller can lend the memory for the RAR 2.9 PPMd model arena too, which a

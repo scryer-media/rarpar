@@ -1780,6 +1780,64 @@ mod tests {
         assert_eq!(facts.volume_number, None);
     }
 
+    /// One old-numbering RAR4 continuation volume (`.r00`), laid out as RAR
+    /// 3.3.0 writes one with `-m0 -vn`: a main header stating only VOLUME, a
+    /// stored member split on both sides (flags 0x90a3, with an extended-time
+    /// trailer), then the given end record.
+    fn old_style_rar4_continuation(end_flags: u16, end_body: &[u8]) -> Vec<u8> {
+        let name = b"bigfile.bin";
+        let payload = [0x5Au8; 64];
+        let mut file = Vec::new();
+        file.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // packed.
+        file.extend_from_slice(&1_300_000u32.to_le_bytes()); // unpacked.
+        file.push(3); // Unix host OS.
+        file.extend_from_slice(&0x0a1b_e825u32.to_le_bytes()); // data CRC32.
+        file.extend_from_slice(&0x5d6e_bedcu32.to_le_bytes()); // time.
+        file.push(20); // version.
+        file.push(0x30); // Store.
+        file.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        file.extend_from_slice(&0x81a4u32.to_le_bytes()); // attributes.
+        file.extend_from_slice(name);
+        file.extend_from_slice(&[0x00, 0xc0]); // extended time: mtime only.
+
+        let mut bytes = crate::signature::RAR4_SIGNATURE.to_vec();
+        bytes.extend_from_slice(&build_rar4_main_header(0x0001, 0, 0)); // VOLUME.
+        bytes.extend_from_slice(&build_rar4_header(0x74, 0x90a3, &file));
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(&build_rar4_header(0x7b, end_flags, end_body));
+        bytes
+    }
+
+    /// RAR 3.1.0 to 3.3.0 end every volume but the last with flags 0x4007
+    /// (next volume, data CRC, reserved space): a CRC and seven zero bytes,
+    /// header size 18, and no volume number: 0x0004 is the reserved space and 0x0008 the number (UnRAR
+    /// headers.hpp `EARC_REVSPACE`, `EARC_VOLNUMBER`).
+    #[test]
+    fn rar4_old_style_end_record_with_reserved_space_states_no_volume_number() {
+        let mut end = 0x1122_3344u32.to_le_bytes().to_vec();
+        end.extend_from_slice(&[0; 7]);
+        let bytes = old_style_rar4_continuation(0x4007, &end);
+        let facts = RarArchive::parse_volume_facts(Cursor::new(bytes), None).unwrap();
+
+        assert_eq!(facts.format, 4);
+        assert!(facts.more_volumes);
+        assert_eq!(facts.volume_number, None);
+        assert_eq!(facts.members.len(), 1);
+        assert!(facts.members[0].split_before);
+        assert!(facts.members[0].split_after);
+    }
+
+    #[test]
+    fn rar4_end_record_with_both_bits_states_its_volume_number() {
+        let mut end = 0x1122_3344u32.to_le_bytes().to_vec();
+        end.extend_from_slice(&3u16.to_le_bytes());
+        end.extend_from_slice(&[0; 7]);
+        let bytes = old_style_rar4_continuation(0x400f, &end);
+        let facts = RarArchive::parse_volume_facts(Cursor::new(bytes), None).unwrap();
+
+        assert_eq!(facts.volume_number, Some(3));
+    }
+
     /// Key material the encrypted synthetic archives below state. Distinct
     /// fills, so a test cannot pass by confusing the salt with the IV.
     const CRYPT_SALT: [u8; 16] = [0x5A; 16];

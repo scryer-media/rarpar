@@ -651,7 +651,7 @@ mod tests {
         buf.push(flags);
         buf.push(2); // RAR 1.3-compatible unpack version
         buf.push(name.len() as u8);
-        buf.push(0x30); // method = Store
+        buf.push(0); // method = Store, raw in a 1.4 header
         buf.extend_from_slice(name);
         buf
     }

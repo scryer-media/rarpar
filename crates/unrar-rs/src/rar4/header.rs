@@ -440,7 +440,7 @@ pub fn parse_rar14_file_header(data: &[u8], offset: u64) -> RarResult<Option<Rar
     let flags = u16::from(data[17]) | common_flags::HAS_DATA;
     let unpack_version = if data[18] == 2 { 13 } else { 10 };
     let name_len = usize::from(data[19]);
-    let method = Rar4Method::from(data[20]);
+    let method = Rar4Method::from_rar14(data[20]);
     if head_size_usize.saturating_sub(21) < name_len {
         return Err(RarError::TruncatedHeader { offset });
     }
@@ -626,9 +626,13 @@ pub fn parse_file_header(raw: &RawRar4Header) -> RarResult<Rar4FileHeader> {
 
 /// Parse a RAR4 end-of-archive header.
 ///
-/// The ENDARC header may contain optional data after the 7-byte common header:
+/// The ENDARC header may contain optional data after the 7-byte common header,
+/// read in this order (UnRAR arcread.cpp, `HEAD_ENDARC`):
 /// - If DATA_CRC flag (0x0002): 4 bytes archive data CRC
-/// - If VOLUME_NUMBER flag (0x0004): 2 bytes volume number (0-based)
+/// - If VOLUME_NUMBER flag (0x0008): 2 bytes volume number (0-based)
+///
+/// A REV_SPACE flag (0x0004) reserves 7 more bytes after those fields; they
+/// are padding, never a volume number.
 pub fn parse_end_header(raw: &RawRar4Header) -> Rar4EndHeader {
     let mut cursor = RawCursor::new(&raw.data, 7); // skip common header
 
@@ -1959,6 +1963,62 @@ mod tests {
         assert!(end.rev_space);
         assert_eq!(end.data_crc, Some(0xAABB_CCDD));
         assert_eq!(end.volume_number, Some(7));
+    }
+
+    /// An older RAR writes `SKIP_IF_UNKNOWN | REV_SPACE | DATA_CRC |
+    /// NEXT_VOLUME` (0x4007) with a CRC and seven reserved zero bytes and no
+    /// volume number. 0x0004 is `EARC_REVSPACE` and 0x0008 `EARC_VOLNUMBER`
+    /// (UnRAR headers.hpp), so the record states no number.
+    #[test]
+    fn test_end_header_rev_space_without_volume_number_states_no_number() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+        body.extend_from_slice(&[0; 7]);
+        let data = build_raw_header(0x7B, 0x4007, &body);
+        assert_eq!(data.len(), 18);
+        let mut cursor = Cursor::new(data);
+        let raw = read_raw_header(&mut cursor).unwrap().unwrap();
+        let end = parse_end_header(&raw);
+
+        assert!(end.more_volumes);
+        assert!(end.has_data_crc);
+        assert!(end.rev_space);
+        assert_eq!(end.data_crc, Some(0x1234_5678));
+        assert_eq!(end.volume_number, None);
+    }
+
+    /// A newer RAR sets both bits (0x400f): CRC, then the number, then the
+    /// seven reserved bytes.
+    #[test]
+    fn test_end_header_rev_space_with_volume_number_reads_the_number() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0xCAFE_F00Du32.to_le_bytes());
+        body.extend_from_slice(&3u16.to_le_bytes());
+        body.extend_from_slice(&[0; 7]);
+        let data = build_raw_header(0x7B, 0x400F, &body);
+        let mut cursor = Cursor::new(data);
+        let raw = read_raw_header(&mut cursor).unwrap().unwrap();
+        let end = parse_end_header(&raw);
+
+        assert!(end.rev_space);
+        assert_eq!(end.data_crc, Some(0xCAFE_F00D));
+        assert_eq!(end.volume_number, Some(3));
+    }
+
+    /// The number is read on 0x0008 alone, without the reserved space.
+    #[test]
+    fn test_end_header_volume_number_bit_without_rev_space_reads_the_number() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0BAD_BEEFu32.to_le_bytes());
+        body.extend_from_slice(&4u16.to_le_bytes());
+        let data = build_raw_header(0x7B, 0x0001 | 0x0002 | 0x0008, &body);
+        let mut cursor = Cursor::new(data);
+        let raw = read_raw_header(&mut cursor).unwrap().unwrap();
+        let end = parse_end_header(&raw);
+
+        assert!(!end.rev_space);
+        assert_eq!(end.data_crc, Some(0x0BAD_BEEF));
+        assert_eq!(end.volume_number, Some(4));
     }
 
     #[test]

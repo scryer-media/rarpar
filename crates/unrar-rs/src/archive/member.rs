@@ -183,14 +183,15 @@ impl StoreCopyLimit {
 }
 
 impl RarArchive {
-    /// Read the first modern archive comment (`CMT` service), if present.
+    /// Read the archive comment (`CMT` service), if present.
+    ///
+    /// The archive comment is a `CMT` service ahead of the first file header,
+    /// where RAR writes it. A `CMT` service after a file header is that
+    /// file's comment (`rar cf`), not the archive's: reference UnRAR marks
+    /// an archive commented only for a `CMT` service it reads before the
+    /// first file header (archive.cpp `IsArchive`).
     pub fn comment(&mut self) -> RarResult<Option<String>> {
-        let Some(service) = self
-            .services
-            .iter()
-            .find(|service| service.file_header.name == "CMT")
-            .cloned()
-        else {
+        let Some(service) = self.archive_comment_service().cloned() else {
             return Ok(None);
         };
 
@@ -201,6 +202,26 @@ impl RarArchive {
             Self::decode_rar5_comment_text(&payload)
         };
         Ok((!comment.is_empty()).then_some(comment))
+    }
+
+    /// The first `CMT` service whose data lies before the first file
+    /// member's: a header ahead of a file header has its data ahead of that
+    /// file's data, and one after it has its data after.
+    fn archive_comment_service(&self) -> Option<&ServiceEntry> {
+        let position = |segment: &DataSegment| (segment.volume_index, segment.data_offset);
+        let first_file = self
+            .members
+            .iter()
+            .filter_map(|member| member.segments.first().map(position))
+            .min();
+        self.services.iter().find(|service| {
+            service.file_header.name == "CMT"
+                && match (first_file, service.segments.first().map(position)) {
+                    (None, _) => true,
+                    (Some(file), Some(comment)) => comment < file,
+                    (Some(_), None) => false,
+                }
+        })
     }
 
     fn rar4_comment_is_raw_unicode(service: &ServiceEntry) -> bool {
