@@ -534,6 +534,18 @@ fn discover_named_rar_family(
     let mut entries = std::fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.path());
 
+    // The labels of the other sets in the directory that are longer than
+    // this one. A `.rev` whose name also continues one of them is that
+    // set's, as it is when the whole directory is grouped: `a901.rev`
+    // beside `a.rar` and `a9.rar` belongs to `a9`.
+    let longer_labels = entries
+        .iter()
+        .map(|entry| entry.path())
+        .filter(|path| !is_ext(path, "rev") && looks_rarish_by_name(path))
+        .filter_map(|path| set_hint(&path))
+        .filter(|other| other.len() > label.len())
+        .collect::<BTreeSet<_>>();
+
     let mut archive_identity = ArchiveIdentity::new(archive);
     let mut files = Vec::new();
     for entry in entries {
@@ -544,7 +556,10 @@ fn discover_named_rar_family(
 
         let path = entry.path();
         let is_archive = archive_identity.is(&path);
-        let is_family_candidate = in_named_family(&path, label);
+        let is_family_candidate = in_named_family(&path, label)
+            && !longer_labels
+                .iter()
+                .any(|other| recovery_volume_label(&path, other).is_some());
         if !is_archive && !is_family_candidate {
             continue;
         }
@@ -1576,6 +1591,44 @@ mod tests {
     /// its spelling, and only an entry that could carry the archive's real
     /// name is resolved: none here, and for an archive named through a link,
     /// the link once and its target once.
+    #[test]
+    fn named_discovery_leaves_a_rev_to_the_longer_label_it_continues() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["a.rar", "a.r00", "a01.rev", "a9.rar", "a9.r00", "a901.rev"] {
+            std::fs::write(temp.path().join(name), b"Rar!\x1a\x07\x00").unwrap();
+        }
+        let options = DiscoveryOptions {
+            working_dir: None,
+            recursive: false,
+            max_depth: 1,
+            max_files: 100,
+            par3_memory_mib: 256,
+            par3_workers: None,
+            par3_max_lost_blocks: 4096,
+        };
+        let family = |first: &str, label: &str| {
+            let archive = temp.path().join(first);
+            let mut names: Vec<String> =
+                discover_named_rar_family(&archive, classify_path(&archive), label, &options)
+                    .unwrap()
+                    .iter()
+                    .map(|file| {
+                        file.path
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect();
+            names.sort();
+            names
+        };
+
+        // `a901.rev` continues both labels; it is the longer one's.
+        assert_eq!(family("a.rar", "a"), ["a.r00", "a.rar", "a01.rev"]);
+        assert_eq!(family("a9.rar", "a9"), ["a9.r00", "a9.rar", "a901.rev"]);
+    }
+
     #[test]
     fn rar_family_discovery_resolves_only_what_could_be_the_archive() {
         let temp = tempfile::tempdir().unwrap();
