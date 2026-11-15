@@ -539,8 +539,10 @@ fn discover_named_rar_family(
     // set's, as it is when the whole directory is grouped: `a901.rev`
     // beside `a.rar` and `a9.rar` belongs to `a9`. A label in another case
     // owns it only where the filesystem holds the two spellings as one name.
+    // Only a file can be a volume, so a directory named like one owns nothing.
     let longer_labels = entries
         .iter()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
         .map(|entry| entry.path())
         .filter(|path| !is_ext(path, "rev") && looks_rarish_by_name(path))
         .filter_map(|path| set_hint(&path))
@@ -1624,6 +1626,9 @@ mod tests {
             names.sort();
             names
         };
+
+        // A directory named like a volume of a longer label owns nothing.
+        std::fs::create_dir(temp.path().join("a0.rar")).unwrap();
 
         // `a901.rev` continues both labels; it is the longer one's.
         assert_eq!(family("a.rar", "a"), ["a.r00", "a.rar", "a01.rev"]);
