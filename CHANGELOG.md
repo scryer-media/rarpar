@@ -35,6 +35,30 @@ documented in each crate's own changelog so those notes ship with the crate.
     refused as invalid data instead of its surplus being dropped.
   - Pack and unpack sizes above 4 GiB are no longer truncated on 32-bit
     targets.
+- RAR sets written by RAR versions before 3.4 read as reference UnRAR reads
+  them, through unrar-rs 0.16.2. Every volume of a RAR 3.1 to 3.3 set with
+  old-style names (`.rar`, `.r00`, ...) read as volume 0, so rebuilding a
+  lost volume from its `.rev` files failed. A stored RAR 1.4 member failed
+  its checksum. In a solid RAR 2.9 to 4.x archive, a member that unpacks to
+  nothing left the member after it failing, and every later one. A file's
+  own comment was shown as the archive comment.
+- The `.rev` files of a RAR set with old-style volume names now join that
+  set: RAR 3.0's `<set><data>_<recovery>_<position>.rev` (`arc33_03_01.rev`)
+  and the `<set><number>.rev` later versions write (`arc01.rev`). Before,
+  each `.rev` was a set of its own. `inspect` listed one set per `.rev`;
+  `auto -o DIR` extracted into `DIR/arc` instead of `DIR`; `cleanup` deleted
+  the data volumes, left the `.rev` files behind and failed with "no RAR
+  volumes provided"; and the `unrar` interface's `x` did not rebuild a lost
+  volume from them.
+- The `unrar` interface's `-vp` asks for an old-style set's volumes past
+  `.r99` by the names RAR gives them, `.s00` onward. Before, it asked for
+  `.r100` and stopped there, so a RAR 3.0 set of 119 volumes could not be
+  extracted one volume at a time.
+- A RAR set with a volume missing reads each remaining volume at its own
+  number. Before, the volumes after the gap moved up one place each, so the
+  `unrar` interface's `t` and `x` read the next volume in the missing one's
+  place and failed with "Write error: unexpected EOF". They now report the
+  missing volume, "Cannot find volume N", as UnRAR does.
 - Every other dependency is at its latest compatible release, among them
   aws-lc-rs 1.19, zip 9.4 and serde_json 1.0.154. No direct dependency has a
   newer major release.
