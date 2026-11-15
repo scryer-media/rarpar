@@ -12,6 +12,10 @@ No API changes.
   files of a set whose name ends in a digit were rejected (`b713_02_01.rev`
   of set `b7` read as 713 data volumes) and a lost volume could not be
   rebuilt: "no valid RAR recovery volumes were found".
+- A restore given a bare file name (`set.part1.rar`, no directory) looks in
+  the current directory for the set's other volumes and `.rev` files. It
+  looked nowhere, so the restore failed with "no valid RAR recovery volumes
+  were found" where `./set.part1.rar` worked.
 
 ## 0.16.2
 

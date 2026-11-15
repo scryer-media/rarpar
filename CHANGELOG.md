@@ -47,6 +47,10 @@ documented in each crate's own changelog so those notes ship with the crate.
   read as 13 data volumes, as reference UnRAR reads it, not 713. Before,
   `rar restore-volumes` and `auto` failed with "no valid RAR recovery
   volumes were found".
+- `rar restore-volumes set.part1.rar`, the archive named without a
+  directory, finds the set's `.rev` files beside it, through unrar-rs
+  0.16.3. Before, it failed with "no valid RAR recovery volumes were found"
+  unless the name was written `./set.part1.rar`.
 - The `.rev` files of a RAR set with old-style volume names now join that
   set: RAR 3.0's `<set><data>_<recovery>_<position>.rev` (`arc33_03_01.rev`)
   and the `<set><number>.rev` later versions write (`arc01.rev`). Before,

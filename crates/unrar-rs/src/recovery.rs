@@ -552,7 +552,7 @@ fn expand_recovery_paths(paths: &[PathBuf]) -> RarResult<Vec<Candidate>> {
         let Some(prefix) = recovery_discovery_prefix(path) else {
             continue;
         };
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let parent = directory_of(path);
         match directories.iter_mut().find(|(dir, _)| *dir == parent) {
             Some((_, prefixes)) => {
                 if !prefixes.contains(&prefix) {
@@ -3701,10 +3701,18 @@ fn recovery_output_dir(candidates: &[Candidate], options: &RecoveryOptions) -> P
     options.output_dir.clone().unwrap_or_else(|| {
         candidates
             .first()
-            .and_then(|candidate| candidate.path.parent())
-            .unwrap_or_else(|| Path::new("."))
+            .map_or_else(|| Path::new("."), |candidate| directory_of(&candidate.path))
             .to_path_buf()
     })
+}
+
+/// The directory `path` is in. A bare file name has an empty parent, which
+/// names no directory: it is in the current one, `.`.
+fn directory_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
 }
 
 fn is_rev_path(path: &Path) -> bool {
@@ -5395,6 +5403,17 @@ mod tests {
             Some(None)
         ));
         assert!(!old_rar3_rev_name_fits_a_set(&path));
+    }
+
+    /// A bare file name is in the current directory, where its set's other
+    /// volumes and `.rev` files are looked for and rebuilt volumes written.
+    #[test]
+    fn a_bare_file_name_is_in_the_current_directory() {
+        assert_eq!(directory_of(Path::new("set.rar")), Path::new("."));
+        assert_eq!(directory_of(Path::new("./set.rar")), Path::new("."));
+        assert_eq!(directory_of(Path::new("dir/set.rar")), Path::new("dir"));
+        assert_eq!(directory_of(Path::new("/set.rar")), Path::new("/"));
+        assert_eq!(directory_of(Path::new("")), Path::new("."));
     }
 
     /// A RAR 3.0-style name does not say where the set's base ends: the
