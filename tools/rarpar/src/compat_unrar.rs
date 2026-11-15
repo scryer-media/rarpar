@@ -785,22 +785,19 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 }
 
 fn ordered_volume_paths(set: &RarSet) -> Vec<PathBuf> {
-    let mut volumes = set.volumes.clone();
-    volumes.sort_by(|a, b| {
-        a.sort_index
-            .cmp(&b.sort_index)
-            .then_with(|| a.path.cmp(&b.path))
-    });
-    volumes.into_iter().map(|volume| volume.path).collect()
+    set.volume_slots()
+        .into_iter()
+        .map(|(_, path)| path.to_path_buf())
+        .collect()
 }
 
 fn open_set(set: &RarSet, password: Option<&str>) -> Result<unrar_rs::RarArchive, CompatFailure> {
-    let paths = ordered_volume_paths(set);
-    let Some(first) = paths.first() else {
+    let slots = set.volume_slots();
+    let Some((_, first)) = slots.first() else {
         return Err(CompatFailure::stdout(EXIT_NO_FILES, "No files to extract"));
     };
     let mut archive = open_first_volume(first, password)?;
-    for (index, path) in paths.iter().enumerate().skip(1) {
+    for &(index, path) in slots.iter().skip(1) {
         let file = File::open(path).map_err(|error| {
             CompatFailure::stdout(
                 EXIT_OPEN,

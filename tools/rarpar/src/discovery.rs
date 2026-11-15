@@ -140,6 +140,34 @@ impl RarSet {
         paths.dedup();
         paths
     }
+
+    /// The set's volumes in reading order, each with the slot a reader adds
+    /// it at: its number in the set, as its name or header gives it,
+    /// counted from the first volume present. A missing volume leaves its
+    /// slot empty, so the reader finds it missing instead of reading the
+    /// next volume in its place. A volume with no number of its own, or
+    /// sharing one with the volume before it, takes the slot after that
+    /// volume's.
+    pub fn volume_slots(&self) -> Vec<(usize, &Path)> {
+        let mut volumes = self.volumes.iter().collect::<Vec<_>>();
+        volumes.sort_by(|a, b| {
+            a.sort_index
+                .cmp(&b.sort_index)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        let first = volumes.first().map_or(0, |volume| volume.sort_index);
+        let mut slots = Vec::with_capacity(volumes.len());
+        for volume in volumes {
+            let next = slots.last().map_or(0, |(slot, _)| slot + 1);
+            let slot = if volume.sort_index == usize::MAX {
+                next
+            } else {
+                next.max(volume.sort_index - first)
+            };
+            slots.push((slot, volume.path.as_path()));
+        }
+        slots
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1865,6 +1893,58 @@ mod tests {
             let path = PathBuf::from(format!("movie.{extension}"));
             assert!(looks_rarish_by_name(&path), "{extension}");
             assert_eq!(filename_volume_index(&path), index, "{extension}");
+        }
+    }
+
+    /// A volume is read at its own number, counted from the first one
+    /// present, so a missing volume's slot stays empty: `a.r01` is volume
+    /// 2 whether or not `a.r00` is there. A volume without a number, or
+    /// with the number of the one before it, follows that one.
+    #[test]
+    fn volumes_keep_their_slots_around_a_missing_volume() {
+        let set = |volumes: &[(&str, usize)]| RarSet {
+            id: "dir:a".to_string(),
+            label: "a".to_string(),
+            base_dir: PathBuf::from("dir"),
+            volumes: volumes
+                .iter()
+                .map(|(name, sort_index)| RarVolume {
+                    path: PathBuf::from(name),
+                    volume_number: None,
+                    sort_index: *sort_index,
+                    is_first_volume: false,
+                })
+                .collect(),
+            recovery_volumes: Vec::new(),
+        };
+        for (volumes, slots) in [
+            (
+                &[("a.rar", 0), ("a.r01", 2), ("a.r02", 3)][..],
+                &[(0, "a.rar"), (2, "a.r01"), (3, "a.r02")][..],
+            ),
+            (
+                &[("a.r02", 3), ("a.r00", 1), ("a.r01", 2)][..],
+                &[(0, "a.r00"), (1, "a.r01"), (2, "a.r02")][..],
+            ),
+            (
+                &[("x.bin", usize::MAX), ("w.bin", usize::MAX)][..],
+                &[(0, "w.bin"), (1, "x.bin")][..],
+            ),
+            (
+                &[("a.r00", 0), ("a.rar", 0), ("a.r01", 0)][..],
+                &[(0, "a.r00"), (1, "a.r01"), (2, "a.rar")][..],
+            ),
+            (
+                &[("a.rar", 0), ("a.r00", 1), ("odd", usize::MAX)][..],
+                &[(0, "a.rar"), (1, "a.r00"), (2, "odd")][..],
+            ),
+        ] {
+            let set = set(volumes);
+            let expected = slots
+                .iter()
+                .map(|(slot, name)| (*slot, Path::new(name)))
+                .collect::<Vec<_>>();
+            assert_eq!(set.volume_slots(), expected, "{volumes:?}");
         }
     }
 
