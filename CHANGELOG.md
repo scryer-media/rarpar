@@ -68,6 +68,14 @@ documented in each crate's own changelog so those notes ship with the crate.
   `unrar` interface's `t` and `x` read the next volume in the missing one's
   place and failed with "Write error: unexpected EOF". They now report the
   missing volume, "Cannot find volume N", as UnRAR does.
+- An operation on one named archive leaves a `.rev` to the set whose label
+  it continues furthest, as a scan of the whole directory does. With `a.rar`
+  and `a9.rar` side by side, `a901.rev` is a recovery volume of `a9`; an
+  operation on `a.rar` took it too, and `--delete-sources` could then delete
+  the other set's recovery volume.
+- A volume whose name states a number above RAR's volume limit
+  (`set.part1000000000.rar`) is refused with a resource-limit error. Its
+  number sized the table of volumes, which could use up memory.
 - Every other dependency is at its latest compatible release, among them
   aws-lc-rs 1.19, zip 9.6, sevenz-turbo 0.29.7 and serde_json 1.0.154.
   sevenz-turbo 0.30 and lzma-turbo 0.12 are out and not taken in this

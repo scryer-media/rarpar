@@ -37,6 +37,10 @@ impl RarArchive {
     /// This parses the volume's headers and integrates its file entries into
     /// the unified member list. Supports both RAR5 and RAR4 volumes.
     pub fn add_volume(&mut self, index: usize, reader: Box<dyn ReadSeek>) -> RarResult<()> {
+        // The index is the volume's place when its headers state no number,
+        // and the volume table grows to hold it, so it meets the same limit
+        // as a number read from a header.
+        crate::limits::checked_volume_number(index as u64)?;
         let mut reader = reader;
 
         // Seek to start and read signature.
@@ -1053,6 +1057,27 @@ mod tests {
             matches!(err, RarError::CorruptArchive { ref detail } if detail.contains("volume 2")),
             "expected volume-specific mismatch, got {err:?}"
         );
+    }
+
+    #[test]
+    fn a_volume_index_above_the_volume_limit_is_refused_before_the_table_grows() {
+        let mut archive = empty_archive(Vec::new());
+        let index = crate::limits::RAR_MAX_VOLUME_NUMBER as usize + 1;
+        // The index is refused before the reader is touched.
+        let err = archive
+            .add_volume(index, Box::new(std::io::Cursor::new(Vec::new())))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RarError::ResourceLimit {
+                    kind: crate::error::LimitKind::VolumeNumber,
+                    ..
+                }
+            ),
+            "expected the volume number limit, got {err:?}"
+        );
+        assert!(archive.volumes.is_empty());
     }
 
     #[test]

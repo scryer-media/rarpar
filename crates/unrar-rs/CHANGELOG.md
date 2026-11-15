@@ -16,6 +16,10 @@ No API changes.
   the current directory for the set's other volumes and `.rev` files. It
   looked nowhere, so the restore failed with "no valid RAR recovery volumes
   were found" where `./set.part1.rar` worked.
+- `RarArchive::add_volume` refuses an index above `RAR_MAX_VOLUME_NUMBER`
+  with a `ResourceLimit` error, as it does a volume number read from a
+  header. The index is the volume's place when its headers state no number,
+  and the table of volumes grew to hold whatever the caller passed.
 
 ## 0.16.2
 
