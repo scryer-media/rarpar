@@ -1444,7 +1444,11 @@ pub(crate) fn old_rar_volume_extension(index: usize) -> Option<String> {
     let letter = u8::try_from(after_first / 100)
         .ok()
         .filter(|letter| *letter <= b'z' - b'r')?;
-    Some(format!("{}{:02}", char::from(b'r' + letter), after_first % 100))
+    Some(format!(
+        "{}{:02}",
+        char::from(b'r' + letter),
+        after_first % 100
+    ))
 }
 
 fn set_hint(path: &Path) -> Option<String> {
@@ -1825,7 +1829,10 @@ mod tests {
                     PathBuf::from("dir"),
                     "a",
                     3,
-                    vec![PathBuf::from("dir/a01.rev"), PathBuf::from("dir/a33_03_01.rev")]
+                    vec![
+                        PathBuf::from("dir/a01.rev"),
+                        PathBuf::from("dir/a33_03_01.rev")
+                    ]
                 ),
                 (
                     PathBuf::from("dir"),
