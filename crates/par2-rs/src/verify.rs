@@ -66,6 +66,31 @@ pub trait FileAccess {
 
     /// Write data to a file at the given offset.
     fn write_file_range(&mut self, file_id: &FileId, offset: u64, data: &[u8]) -> io::Result<()>;
+
+    /// Fill `dst` with the payload bytes of recovery block `exponent`, from
+    /// byte `offset` of its payload on: exactly `dst.len()` bytes, a range
+    /// that never reaches past the payload's end.
+    ///
+    /// A repair calls this only for payloads given as
+    /// [`RecoverySliceData::Provided`], one chunk at a time as its memory
+    /// limit allows, on the thread that called the repair. The library
+    /// zero-fills whatever lies past the payload's end. The default returns
+    /// an `Unsupported` error, which fails the repair before it writes.
+    ///
+    /// [`RecoverySliceData::Provided`]: crate::packet::RecoverySliceData::Provided
+    fn read_recovery_range_into(
+        &self,
+        exponent: u32,
+        _offset: u64,
+        _dst: &mut [u8],
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "recovery block {exponent} is provided by the caller, but this FileAccess does not read recovery data"
+            ),
+        ))
+    }
 }
 
 /// Simple in-memory file access for testing.

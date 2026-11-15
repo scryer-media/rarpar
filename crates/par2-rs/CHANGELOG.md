@@ -1,6 +1,13 @@
 # Changelog
 
-## 0.11.1
+## 0.12.0
+
+A caller can provide recovery payloads on demand instead of handing them over
+whole. A payload named `RecoverySliceData::Provided { len }` holds no bytes:
+repair asks the caller's `FileAccess` for each chunk it needs, as its memory
+limit allows, so neither side holds the payloads. Before this, a caller that
+could not give a file path loaded every payload into memory, outside the
+repair's memory limit: 390 blocks of 4,480,000 bytes is 1.7 GB.
 
 An audit of the published PAR2 advisories, in par2cmdline-turbo and SABnzbd,
 found no gap in the crate for any of them. Each advisory class now has a
@@ -8,8 +15,52 @@ regression test in `tests/advisories.rs`, built from hand-assembled sets so
 that one field lies at a time. The audit did find one gap no advisory names,
 fixed here.
 
+### Added
+
+- `RecoverySliceData::Provided { len }` and `RecoverySliceData::provided`. Its
+  `len()` is `len`, `as_bytes()` and `file_span()` are `None`, and
+  `validate_packet_hash` accepts it: the caller checks the packet hash before
+  naming a payload this way. `to_vec` and `read_range_padded` cannot read it
+  and return an `Unsupported` I/O error.
+- `FileAccess::read_recovery_range_into(&self, exponent, offset, dst)`, which
+  fills `dst` with the payload bytes of recovery block `exponent` from
+  `offset` on, never past the payload's end. Repair calls it on the thread
+  that called the repair. The default returns an `Unsupported` error, so a
+  repair given a provided payload through an access that cannot read one fails
+  before it writes anything.
+- A repair session built with a source access (`Par2RepairSessionOptions::
+  with_source_access` or `from_set`) reads provided payloads through that
+  access.
+- Tests for File Description and Unicode Filename names that climb out of the
+  job with parent components, a leading root, an absolute path or backslash
+  separators, both when the files are rebuilt from recovery slices and when
+  obfuscated copies are renamed into place (CVE-2021-29488); a repair target
+  that is a dangling symlink pointing out (GHSA-j5pc-g362-c5xp), a live
+  symlink to a file outside, and a symlinked parent directory; and packets
+  ahead of a valid set whose length, slice size, file-ID count, IFSC count,
+  name or UTF-16 name do not fit. Tests for the fake-header bound and for
+  damaged length fields that still fit.
+
+### Changed
+
+- `RecoverySliceData` has a third variant, so a `match` on it that names every
+  variant must handle `Provided`.
+- `prepare_recovery_buffers` takes no `FileAccess`, so it fails on a provided
+  payload with an `Unsupported` I/O error.
+
 ### Fixed
 
+- The ordered scan of a file no longer hashes a window that no block can
+  take. A window whose CRC matched was hashed with MD5 before the scan asked
+  whether any matching block was still unplaced. In a run of identical bytes
+  longer than a slice, every window matches the one block the first window
+  already placed, so the scan hashed a whole slice for each byte it stepped:
+  a sparse 96 MiB file of zeros under a set declaring one 32 MiB zero slice
+  cost about 1 PiB of MD5. The scan now checks first and steps on without
+  hashing. Blocks are placed exactly as before. A hash also counts towards
+  the cancellation poll at its own size, so a walk that does hash checks for
+  cancellation after every 1 MiB hashed, or after every slice when a slice
+  is larger, not once per million steps.
 - A volume packed with fake packet headers, each claiming to run to the end
   of the volume, no longer costs quadratic work. Every candidate whose length
   fits is hashed before it can be rejected, so such a volume was hashed once
@@ -22,18 +73,6 @@ fixed here.
 - On a 32-bit target, a packet header claiming more bytes than the address
   space now reads as a packet that does not fit and the scan moves on,
   instead of failing the load with `ResourceLimitExceeded`.
-
-### Added
-
-- Tests for File Description and Unicode Filename names that climb out of the
-  job with parent components, a leading root, an absolute path or backslash
-  separators, both when the files are rebuilt from recovery slices and when
-  obfuscated copies are renamed into place (CVE-2021-29488); a repair target
-  that is a dangling symlink pointing out (GHSA-j5pc-g362-c5xp), a live
-  symlink to a file outside, and a symlinked parent directory; and packets
-  ahead of a valid set whose length, slice size, file-ID count, IFSC count,
-  name or UTF-16 name do not fit. Tests for the fake-header bound and for
-  damaged length fields that still fit.
 
 ## 0.11.0
 

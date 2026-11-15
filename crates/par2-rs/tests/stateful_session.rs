@@ -963,3 +963,108 @@ fn repair_output_is_identical_with_and_without_the_scan_skip_policy() {
         "the scan policy must not reach the repaired bytes"
     );
 }
+
+/// Serves sources from memory and recovery payloads on request.
+struct ProvidedRecoveryAccess {
+    inner: MemoryFileAccess,
+    payloads: std::collections::HashMap<u32, Vec<u8>>,
+    recovery_reads: AtomicUsize,
+}
+
+impl FileAccess for ProvidedRecoveryAccess {
+    fn read_file_range(&self, file_id: &FileId, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+        self.inner.read_file_range(file_id, offset, len)
+    }
+
+    fn file_exists(&self, file_id: &FileId) -> bool {
+        self.inner.file_exists(file_id)
+    }
+
+    fn file_length(&self, file_id: &FileId) -> Option<u64> {
+        self.inner.file_length(file_id)
+    }
+
+    fn read_file(&self, file_id: &FileId) -> io::Result<Vec<u8>> {
+        self.inner.read_file(file_id)
+    }
+
+    fn write_file_range(
+        &mut self,
+        _file_id: &FileId,
+        _offset: u64,
+        _data: &[u8],
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "test access is read-only",
+        ))
+    }
+
+    fn read_recovery_range_into(
+        &self,
+        exponent: u32,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> io::Result<()> {
+        self.recovery_reads.fetch_add(1, Ordering::Relaxed);
+        let start = offset as usize;
+        dst.copy_from_slice(&self.payloads[&exponent][start..start + dst.len()]);
+        Ok(())
+    }
+}
+
+#[test]
+fn a_session_reads_provided_recovery_through_its_source_access() {
+    let payload: Vec<u8> = (0..48u8).map(|byte| byte.wrapping_mul(11)).collect();
+    let set = build_virtual_set(&payload, 16, 1);
+    let base_dir = set.temp.path().to_path_buf();
+
+    let mut file_set =
+        par2_rs::Par2FileSet::from_paths(std::slice::from_ref(&set.par2_path)).expect("parse set");
+    let payloads = file_set
+        .recovery_slices
+        .iter_mut()
+        .map(|(&exponent, slice)| {
+            let bytes = slice.data.to_vec().expect("read recovery payload");
+            slice.data = par2_rs::RecoverySliceData::provided(bytes.len());
+            (exponent, bytes)
+        })
+        .collect();
+
+    let mut served = payload.clone();
+    served[16..32].fill(0xAB);
+    let mut memory = MemoryFileAccess::new();
+    memory.add_file(set.file_id, served);
+    let access = Arc::new(ProvidedRecoveryAccess {
+        inner: memory,
+        payloads,
+        recovery_reads: AtomicUsize::new(0),
+    });
+
+    let mut session = Par2RepairSession::open(Par2RepairSessionOptions::from_set(
+        base_dir.clone(),
+        file_set,
+        access.clone(),
+    ))
+    .expect("open session over a parsed set");
+    for evidence in settled_evidence(&set, &payload, &[0, 2]) {
+        session
+            .add_slice_evidence_for_file(evidence)
+            .expect("retain slice evidence");
+    }
+    assert_eq!(
+        session.analyze().expect("analyze").status,
+        Par2RepairStatus::RepairPossible
+    );
+
+    let outcome = session.repair().expect("repair from provided recovery");
+    assert_eq!(outcome.status, Par2RepairStatus::Repaired);
+    assert_eq!(
+        fs::read(base_dir.join(&set.filename)).expect("read repaired file"),
+        payload
+    );
+    assert!(
+        access.recovery_reads.load(Ordering::Relaxed) > 0,
+        "the recovery bytes must come from the caller"
+    );
+}

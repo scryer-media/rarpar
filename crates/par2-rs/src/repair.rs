@@ -1407,7 +1407,8 @@ pub(crate) fn read_stream_source_chunk(
             .ok_or_else(|| Par2Error::ReedSolomonError {
                 reason: format!("recovery block with exponent {exp} not found"),
             })?;
-        fill_recovery_chunk(&rs.data, byte_start, dst, recovery_files).map_err(Par2Error::Io)?;
+        fill_recovery_chunk(&rs.data, exp, byte_start, dst, recovery_files, file_access)
+            .map_err(Par2Error::Io)?;
     }
     Ok(())
 }
@@ -3979,38 +3980,42 @@ fn read_exact_at_cached(
     file.read_exact(dst)
 }
 
+/// Fill `dst` with the payload bytes of recovery block `exponent` from
+/// `start`, zero past the payload's end: from memory, from its volume's file,
+/// or, for a [`RecoverySliceData::Provided`] payload, from the caller's
+/// `file_access`. This is the one place repair reads recovery bytes.
+///
+/// [`RecoverySliceData::Provided`]: crate::packet::RecoverySliceData::Provided
 fn fill_recovery_chunk(
     data: &crate::packet::RecoverySliceData,
+    exponent: u32,
     start: usize,
     dst: &mut [u8],
     file_cache: &mut HashMap<PathBuf, File>,
+    file_access: &dyn FileAccess,
 ) -> io::Result<()> {
-    dst.fill(0);
+    use crate::packet::RecoverySliceData;
 
-    if let Some(bytes) = data.as_bytes() {
-        if start >= bytes.len() {
-            return Ok(());
+    let read_len = dst.len().min(data.len().saturating_sub(start));
+    let (dst, tail) = dst.split_at_mut(read_len);
+    tail.fill(0);
+    if read_len == 0 {
+        return Ok(());
+    }
+    match data {
+        RecoverySliceData::InMemory(bytes) => {
+            dst.copy_from_slice(&bytes[start..start + read_len]);
+            Ok(())
         }
-        let end = (start + dst.len()).min(bytes.len());
-        let copy_len = end - start;
-        dst[..copy_len].copy_from_slice(&bytes[start..end]);
-        return Ok(());
+        RecoverySliceData::FileBacked {
+            path,
+            offset: base_offset,
+            ..
+        } => read_exact_at_cached(file_cache, path, base_offset + start as u64, dst),
+        RecoverySliceData::Provided { .. } => {
+            file_access.read_recovery_range_into(exponent, start as u64, dst)
+        }
     }
-
-    let Some((path, base_offset, len)) = data.file_span() else {
-        return Ok(());
-    };
-    if start >= len {
-        return Ok(());
-    }
-
-    let read_len = dst.len().min(len - start);
-    read_exact_at_cached(
-        file_cache,
-        path,
-        base_offset + start as u64,
-        &mut dst[..read_len],
-    )
 }
 
 /// Execute a repair plan, reading recovery data and writing repaired slices.
@@ -4030,6 +4035,10 @@ pub fn execute_repair(
 
 /// Load recovery block data into buffers, one per selected recovery exponent.
 /// Each buffer is resized to `plan.slice_size`.
+///
+/// This takes no [`FileAccess`], so a
+/// [`RecoverySliceData::Provided`](crate::packet::RecoverySliceData::Provided)
+/// payload fails with an `Unsupported` I/O error.
 pub fn prepare_recovery_buffers(
     plan: &RepairPlan,
     par2_set: &Par2FileSet,
@@ -5785,6 +5794,7 @@ fn run_in_memory_repair<S: RepairSolver + ?Sized>(
         }
     }
 
+    let mut recovery_files: HashMap<PathBuf, File> = HashMap::new();
     for (recovery_idx, &exp) in plan.recovery_exponents.iter().enumerate() {
         check_cancel(options)?;
         let rs = par2_set
@@ -5793,11 +5803,15 @@ fn run_in_memory_repair<S: RepairSolver + ?Sized>(
             .ok_or_else(|| Par2Error::ReedSolomonError {
                 reason: format!("recovery block with exponent {exp} not found"),
             })?;
-        let recovery_data = rs.data.to_vec().map_err(Par2Error::Io)?;
-        let copy_len = recovery_data.len().min(slice_size);
-        input_buffers[available_inputs + recovery_idx][..copy_len]
-            .copy_from_slice(&recovery_data[..copy_len]);
-        input_buffers[available_inputs + recovery_idx][copy_len..].fill(0);
+        fill_recovery_chunk(
+            &rs.data,
+            exp,
+            0,
+            &mut input_buffers[available_inputs + recovery_idx],
+            &mut recovery_files,
+            file_access,
+        )
+        .map_err(Par2Error::Io)?;
 
         if let Some(ref progress) = options.progress {
             let current = available_inputs + recovery_idx + 1;
@@ -6322,6 +6336,261 @@ pub(crate) mod tests {
             );
         }
         dir
+    }
+
+    /// Serves sources from memory and recovery payloads on request, logging
+    /// every recovery request as `(exponent, offset, len)`.
+    struct ProvidedRecoveryAccess {
+        inner: MemoryFileAccess,
+        payloads: HashMap<u32, Bytes>,
+        requests: std::cell::RefCell<Vec<(u32, u64, usize)>>,
+    }
+
+    impl FileAccess for ProvidedRecoveryAccess {
+        fn read_file_range(
+            &self,
+            file_id: &FileId,
+            offset: u64,
+            len: u64,
+        ) -> std::io::Result<Vec<u8>> {
+            self.inner.read_file_range(file_id, offset, len)
+        }
+
+        fn read_file_range_into(
+            &self,
+            file_id: &FileId,
+            offset: u64,
+            dst: &mut [u8],
+        ) -> std::io::Result<usize> {
+            self.inner.read_file_range_into(file_id, offset, dst)
+        }
+
+        fn file_exists(&self, file_id: &FileId) -> bool {
+            self.inner.file_exists(file_id)
+        }
+
+        fn file_length(&self, file_id: &FileId) -> Option<u64> {
+            self.inner.file_length(file_id)
+        }
+
+        fn read_file(&self, file_id: &FileId) -> std::io::Result<Vec<u8>> {
+            self.inner.read_file(file_id)
+        }
+
+        fn write_file_range(
+            &mut self,
+            file_id: &FileId,
+            offset: u64,
+            data: &[u8],
+        ) -> std::io::Result<()> {
+            self.inner.write_file_range(file_id, offset, data)
+        }
+
+        fn read_recovery_range_into(
+            &self,
+            exponent: u32,
+            offset: u64,
+            dst: &mut [u8],
+        ) -> std::io::Result<()> {
+            self.requests
+                .borrow_mut()
+                .push((exponent, offset, dst.len()));
+            let payload = &self.payloads[&exponent];
+            let start = offset as usize;
+            dst.copy_from_slice(&payload[start..start + dst.len()]);
+            Ok(())
+        }
+    }
+
+    /// Turn every recovery payload of `set` into a provided one, returning the
+    /// bytes the caller now holds.
+    fn provide_recovery_slices(set: &mut Par2FileSet) -> HashMap<u32, Bytes> {
+        set.recovery_slices
+            .iter_mut()
+            .map(|(&exp, slice)| {
+                let bytes = Bytes::from(slice.data.to_vec().unwrap());
+                slice.data = crate::packet::RecoverySliceData::provided(bytes.len());
+                (exp, bytes)
+            })
+            .collect()
+    }
+
+    fn damage(data: &[u8], slice_size: usize, slices: &[usize]) -> Vec<u8> {
+        let mut broken = data.to_vec();
+        for &slice in slices {
+            let end = ((slice + 1) * slice_size).min(broken.len());
+            broken[slice * slice_size..end].fill(0xA5);
+        }
+        broken
+    }
+
+    /// Plan and run one repair of `set` through `access` with the transform
+    /// arm forced to `arm`, returning the result and how many repairs the arm
+    /// completed.
+    fn repair_with_arm(
+        arm: crate::repair_transform::TransformArm,
+        set: &Par2FileSet,
+        access: &mut dyn FileAccess,
+        memory_limit: Option<usize>,
+    ) -> (Result<()>, u64) {
+        use crate::repair_transform::{set_transform_arm_override, transform_arm_stats};
+        let verification = verify::verify_all(set, &*access);
+        let plan = plan_repair_with_memory_limit(set, &verification, memory_limit).expect("plan");
+        set_transform_arm_override(Some(arm));
+        let before = transform_arm_stats().executed;
+        let result = execute_repair_with_options(
+            &plan,
+            set,
+            access,
+            &RepairOptions {
+                cancel: None,
+                progress: None,
+                memory_limit,
+            },
+        );
+        let executed = transform_arm_stats().executed - before;
+        set_transform_arm_override(None);
+        (result, executed)
+    }
+
+    #[test]
+    fn provided_recovery_is_read_in_chunks_the_memory_limit_allows() {
+        use crate::repair_transform::TransformArm;
+        // Three missing slices of 512 KiB under a 1 MiB limit: one chunk of
+        // every output cannot hold a whole slice, so both arms must walk each
+        // recovery payload in pieces.
+        let slice_size = 512 * 1024usize;
+        let limit = 1024 * 1024usize;
+        let damaged = [1usize, 4, 6];
+        let data: Vec<u8> = (0..slice_size * 8)
+            .map(|i| (i.wrapping_mul(31) ^ (i >> 9)) as u8)
+            .collect();
+        let (mut set, file_id) = setup_repairable_set(&data, slice_size as u64, 5);
+        let payloads = provide_recovery_slices(&mut set);
+
+        for arm in [TransformArm::Off, TransformArm::On] {
+            let mut inner = MemoryFileAccess::new();
+            inner.add_file(file_id, damage(&data, slice_size, &damaged));
+            let mut access = ProvidedRecoveryAccess {
+                inner,
+                payloads: payloads.clone(),
+                requests: std::cell::RefCell::new(Vec::new()),
+            };
+            let (result, executed) = repair_with_arm(arm, &set, &mut access, Some(limit));
+            result.expect("repair");
+            assert_eq!(executed, u64::from(arm == TransformArm::On), "{arm:?}");
+            assert_eq!(access.inner.read_file(&file_id).unwrap(), data, "{arm:?}");
+
+            let requests = access.requests.into_inner();
+            assert!(!requests.is_empty(), "{arm:?}");
+            let mut by_exponent: HashMap<u32, Vec<(u64, usize)>> = HashMap::new();
+            for &(exp, offset, len) in &requests {
+                assert!(len > 0, "{arm:?}: empty request");
+                assert!(
+                    len.saturating_mul(damaged.len()) <= limit,
+                    "{arm:?}: a {len} byte request leaves no room for {} outputs in {limit}",
+                    damaged.len()
+                );
+                assert!(
+                    offset as usize + len <= slice_size,
+                    "{arm:?}: request past the payload's end"
+                );
+                by_exponent.entry(exp).or_default().push((offset, len));
+            }
+            assert_eq!(by_exponent.len(), damaged.len(), "{arm:?}");
+            for (exp, mut ranges) in by_exponent {
+                ranges.sort_unstable();
+                let mut covered = 0u64;
+                for (offset, len) in ranges {
+                    assert!(offset <= covered, "{arm:?}: gap in exponent {exp}");
+                    covered = covered.max(offset + len as u64);
+                }
+                assert_eq!(covered, slice_size as u64, "{arm:?}: exponent {exp}");
+            }
+        }
+    }
+
+    #[test]
+    fn in_memory_file_backed_and_provided_recovery_repair_identically() {
+        use crate::repair_transform::TransformArm;
+        let slice_size = 4096usize;
+        let damaged = [0usize, 5, 9];
+        let data: Vec<u8> = (0..slice_size * 12 - 100)
+            .map(|i| (i.wrapping_mul(131) ^ (i >> 7)) as u8)
+            .collect();
+        let (in_memory, file_id) = setup_repairable_set(&data, slice_size as u64, 6);
+        let mut file_backed = in_memory.clone();
+        let _spill = spill_recovery_slices_to_disk_with_hashes(&mut file_backed);
+        let mut provided = in_memory.clone();
+        let payloads = provide_recovery_slices(&mut provided);
+
+        for arm in [TransformArm::Off, TransformArm::On] {
+            let mut outputs = Vec::new();
+            for set in [&in_memory, &file_backed, &provided] {
+                let mut inner = MemoryFileAccess::new();
+                inner.add_file(file_id, damage(&data, slice_size, &damaged));
+                let mut access = ProvidedRecoveryAccess {
+                    inner,
+                    payloads: payloads.clone(),
+                    requests: std::cell::RefCell::new(Vec::new()),
+                };
+                let (result, executed) = repair_with_arm(arm, set, &mut access, Some(1024 * 1024));
+                result.expect("repair");
+                assert_eq!(executed, u64::from(arm == TransformArm::On), "{arm:?}");
+                outputs.push(access.inner.read_file(&file_id).unwrap());
+            }
+            assert_eq!(outputs[0], data, "{arm:?}");
+            assert_eq!(outputs[1], outputs[0], "{arm:?}: file-backed");
+            assert_eq!(outputs[2], outputs[0], "{arm:?}: provided");
+        }
+    }
+
+    #[test]
+    fn provided_recovery_without_a_reader_fails_and_writes_nothing() {
+        use crate::repair_transform::TransformArm;
+        let slice_size = 4096usize;
+        let damaged = [2usize, 7];
+        let data: Vec<u8> = (0..slice_size * 10).map(|i| (i * 7 + 3) as u8).collect();
+        let (mut set, file_id) = setup_repairable_set(&data, slice_size as u64, 4);
+        provide_recovery_slices(&mut set);
+        let broken = damage(&data, slice_size, &damaged);
+
+        for arm in [TransformArm::Off, TransformArm::On] {
+            // A plain memory access: it would take any write, so an unchanged
+            // file proves the repair wrote nothing.
+            let mut access = MemoryFileAccess::new();
+            access.add_file(file_id, broken.clone());
+            let (result, _) = repair_with_arm(arm, &set, &mut access, Some(1024 * 1024));
+            match result {
+                Err(Par2Error::Io(error)) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported, "{arm:?}");
+                    assert!(
+                        error.to_string().contains("does not read recovery data"),
+                        "{arm:?}: {error}"
+                    );
+                }
+                other => panic!("{arm:?}: expected the unsupported read, got {other:?}"),
+            }
+            assert_eq!(access.read_file(&file_id).unwrap(), broken, "{arm:?}");
+        }
+    }
+
+    #[test]
+    fn prepare_recovery_buffers_refuses_provided_recovery() {
+        let slice_size = 64usize;
+        let data: Vec<u8> = (0..slice_size * 4).map(|i| i as u8).collect();
+        let (mut set, file_id) = setup_repairable_set(&data, slice_size as u64, 2);
+        provide_recovery_slices(&mut set);
+        let mut access = MemoryFileAccess::new();
+        access.add_file(file_id, damage(&data, slice_size, &[1]));
+        let verification = verify::verify_all(&set, &access);
+        let plan = plan_repair(&set, &verification).expect("a provided-only set plans");
+        match prepare_recovery_buffers(&plan, &set, &RepairOptions::default()) {
+            Err(Par2Error::Io(error)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+            }
+            other => panic!("expected the unsupported read, got {other:?}"),
+        }
     }
 
     #[test]

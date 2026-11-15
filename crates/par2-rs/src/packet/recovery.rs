@@ -27,6 +27,20 @@ pub enum RecoverySliceData {
         /// `None` means the payload was already validated (or is synthetic).
         packet_hash: Option<[u8; 16]>,
     },
+    /// A payload of `len` bytes the repair's caller provides on demand: the
+    /// repair asks the [`FileAccess`] it was given, through
+    /// [`FileAccess::read_recovery_range_into`], for each piece it needs, so
+    /// neither side holds the payload between pieces. The caller vouches for
+    /// the bytes: [`Self::validate_packet_hash`] accepts them as it does an
+    /// in-memory payload, so a caller checks the packet hash before it names a
+    /// payload this way. [`Self::to_vec`] and [`Self::read_range_padded`]
+    /// cannot read it and return an error.
+    ///
+    /// [`FileAccess`]: crate::verify::FileAccess
+    /// [`FileAccess::read_recovery_range_into`]: crate::verify::FileAccess::read_recovery_range_into
+    Provided {
+        len: usize,
+    },
 }
 
 /// Scanner authentications of file-backed payloads, keyed by the interned
@@ -204,6 +218,14 @@ impl RecoverySliceData {
         Self::file_backed_shared(Arc::from(path), offset, len, Some(packet_hash))
     }
 
+    /// A payload of `len` bytes the repair reads through the caller's
+    /// [`FileAccess::read_recovery_range_into`].
+    ///
+    /// [`FileAccess::read_recovery_range_into`]: crate::verify::FileAccess::read_recovery_range_into
+    pub fn provided(len: usize) -> Self {
+        Self::Provided { len }
+    }
+
     /// Build a file-backed slice over an already-interned path.
     pub fn file_backed_shared(
         path: Arc<Path>,
@@ -221,8 +243,9 @@ impl RecoverySliceData {
 
     /// Re-check the PAR2 packet hash covering this recovery slice.
     ///
-    /// In-memory payloads were hash-validated when the packet was parsed, and
-    /// file-backed payloads recorded without a hash are trusted as-is.
+    /// In-memory payloads were hash-validated when the packet was parsed,
+    /// provided payloads are vouched for by their caller, and file-backed
+    /// payloads recorded without a hash are trusted as-is.
     /// Other file-backed payloads are re-hashed from disk here: the packet
     /// hash covers `recovery_set_id || type || exponent || payload`.
     ///
@@ -303,7 +326,7 @@ impl RecoverySliceData {
     pub fn len(&self) -> usize {
         match self {
             Self::InMemory(data) => data.len(),
-            Self::FileBacked { len, .. } => *len,
+            Self::FileBacked { len, .. } | Self::Provided { len } => *len,
         }
     }
 
@@ -314,30 +337,37 @@ impl RecoverySliceData {
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
             Self::InMemory(data) => Some(data.as_ref()),
-            Self::FileBacked { .. } => None,
+            Self::FileBacked { .. } | Self::Provided { .. } => None,
         }
     }
 
     pub fn file_span(&self) -> Option<(&Path, u64, usize)> {
         match self {
-            Self::InMemory(_) => None,
+            Self::InMemory(_) | Self::Provided { .. } => None,
             Self::FileBacked {
                 path, offset, len, ..
             } => Some((path.as_ref(), *offset, *len)),
         }
     }
 
+    /// The whole payload. A [`Self::Provided`] payload is the caller's to
+    /// read, so this returns an `Unsupported` error for it.
     pub fn to_vec(&self) -> io::Result<Vec<u8>> {
+        if let Self::Provided { .. } = self {
+            return Err(provided_payload_unreadable());
+        }
         let mut out = vec![0u8; self.len()];
         self.read_range_padded(0, &mut out)?;
         Ok(out)
     }
 
+    /// The payload bytes from `start`, zero past its end. A
+    /// [`Self::Provided`] payload is the caller's to read, so this returns an
+    /// `Unsupported` error for it and leaves `dst` untouched.
     pub fn read_range_padded(&self, start: usize, dst: &mut [u8]) -> io::Result<()> {
-        dst.fill(0);
-
         match self {
             Self::InMemory(data) => {
+                dst.fill(0);
                 if start >= data.len() {
                     return Ok(());
                 }
@@ -349,6 +379,7 @@ impl RecoverySliceData {
             Self::FileBacked {
                 path, offset, len, ..
             } => {
+                dst.fill(0);
                 if start >= *len {
                     return Ok(());
                 }
@@ -369,8 +400,16 @@ impl RecoverySliceData {
                 );
                 Ok(())
             }
+            Self::Provided { .. } => Err(provided_payload_unreadable()),
         }
     }
+}
+
+fn provided_payload_unreadable() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "a provided recovery payload can only be read through the repair's FileAccess",
+    )
 }
 
 impl From<Bytes> for RecoverySliceData {
@@ -446,5 +485,24 @@ mod tests {
         let body = [0u8; 2];
         let err = RecoverySlicePacket::parse(&body).unwrap_err();
         assert!(matches!(err, Par2Error::InvalidRecoveryPacket { .. }));
+    }
+
+    #[test]
+    fn a_provided_payload_has_a_length_but_no_bytes_the_library_can_read() {
+        let data = RecoverySliceData::provided(4096);
+        assert_eq!(data.len(), 4096);
+        assert!(data.as_bytes().is_none());
+        assert!(data.file_span().is_none());
+        assert!(data.validate_packet_hash(&[7; 16], 3).unwrap());
+        assert_eq!(
+            data.to_vec().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        let mut dst = [0xEEu8; 8];
+        assert_eq!(
+            data.read_range_padded(0, &mut dst).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(dst, [0xEE; 8], "a refused read leaves the buffer alone");
     }
 }

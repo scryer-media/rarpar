@@ -150,14 +150,35 @@ fn validate_extents(
     let mut buffer = vec![0; size];
     for ((offset, length), expected) in expected {
         let mut hash = FingerprintHasher::new();
+        // Only the stored bytes are read. What a trimmed payload leaves out is
+        // zeros, and how many is the layout's word, not the carrier's: a Start
+        // packet may declare a block near `u64::MAX` over an empty Data
+        // packet. That padding is bounded as `DataPacket::matches_checksum`
+        // bounds it, and charged as scanning work, since no carrier byte
+        // stands behind it.
+        let stored = payload.len().saturating_sub(offset).min(length);
         let mut at = 0;
-        while at < length {
+        while at < stored {
             options.cancel.check()?;
-            let take = (length - at).min(size as u64) as usize;
-            buffer[..take].fill(0);
-            payload.read_at(offset + at, &mut buffer[..take])?;
+            let take = (stored - at).min(size as u64) as usize;
+            if payload.read_at(offset + at, &mut buffer[..take])? != take {
+                return Err(EngineError::InvalidState(
+                    "Data packet read came back short",
+                ));
+            }
             hash.update(&buffer[..take]);
             at += take as u64;
+        }
+        let mut padding = length - stored;
+        if padding > crate::ScanLimits::DEFAULT_MAX_PACKET_LEN {
+            return Err(EngineError::resource_limit("Data extent padding"));
+        }
+        while padding > 0 {
+            options.cancel.check()?;
+            let take = padding.min(size as u64);
+            options.scan_work.charge(take as usize)?;
+            hash.update_zeros(take);
+            padding -= take;
         }
         if hash.finalize() != expected {
             return Err(EngineError::InvalidState(
@@ -182,10 +203,14 @@ fn compare_aliases(
         .reserve_as(MemoryCategory::SourceScratch, size * 2)?;
     let mut a = vec![0; size];
     let mut b = vec![0; size];
+    // Past the longer payload both blocks are zero padding, so there is
+    // nothing left that could differ. The walk follows the stored bytes, not
+    // the declared block size.
+    let end = first.len().max(second.len()).min(block_size);
     let mut at = 0;
-    while at < block_size {
+    while at < end {
         options.cancel.check()?;
-        let take = (block_size - at).min(size as u64) as usize;
+        let take = (end - at).min(size as u64) as usize;
         a[..take].fill(0);
         b[..take].fill(0);
         first.read_at(at, &mut a[..take])?;
