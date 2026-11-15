@@ -2331,10 +2331,6 @@ impl Rar4LzDecoder {
 
     /// Decompress RAR4 LZ data, returning the decompressed output.
     pub fn decompress(&mut self, input: &[u8], unpacked_size: u64) -> RarResult<Vec<u8>> {
-        if unpacked_size == 0 {
-            return Ok(Vec::new());
-        }
-
         let mut reader = BitReader::new(input);
         self.decompress_with_reader(&mut reader, unpacked_size)
     }
@@ -2351,10 +2347,6 @@ impl Rar4LzDecoder {
 
     /// Decode a RAR4 solid member only to advance decoder state.
     pub fn replay(&mut self, input: &[u8], unpacked_size: u64) -> RarResult<u64> {
-        if unpacked_size == 0 {
-            return Ok(0);
-        }
-
         let mut reader = BitReader::new(input);
 
         self.replay_with_reader(&mut reader, unpacked_size)
@@ -2376,10 +2368,6 @@ impl Rar4LzDecoder {
         unpacked_size: u64,
         writer: &mut W,
     ) -> RarResult<u64> {
-        if unpacked_size == 0 {
-            return Ok(0);
-        }
-
         let mut reader = BitReader::new(input);
 
         self.decompress_to_writer_with_reader(&mut reader, unpacked_size, writer)
@@ -2391,10 +2379,6 @@ impl Rar4LzDecoder {
         unpacked_size: u64,
         writer: &mut W,
     ) -> RarResult<u64> {
-        if unpacked_size == 0 {
-            return Ok(0);
-        }
-
         // Each solid member's data area is an independent byte-aligned
         // bitstream: reset the bit input for every file (solid or not) and
         // discard any leftover from the previous area.
@@ -2417,6 +2401,7 @@ impl Rar4LzDecoder {
         writer: &mut W,
     ) -> RarResult<u64> {
         if unpacked_size == 0 {
+            self.decode_empty_member(reader)?;
             return Ok(0);
         }
 
@@ -2504,6 +2489,28 @@ impl Rar4LzDecoder {
         Ok(self.current_file_emitted)
     }
 
+    /// Decode the packed bytes of a member that unpacks to nothing.
+    ///
+    /// In a solid archive such a member still carries packed data: at least
+    /// the end-of-file code, whose new-table bit tells the next member to
+    /// read fresh tables. The reference decodes it like any other member
+    /// (extract.cpp unpacks every non-stored member, whatever its size, and
+    /// `Unpack29` runs until the end-of-file marker), so skipping it leaves
+    /// `tables_read` wrong and the next member decodes against stale tables.
+    /// A member with no packed bytes leaves the state untouched, as
+    /// `UnpReadBuf30` failing on empty input does.
+    fn decode_empty_member<R: BitRead>(&mut self, reader: &mut R) -> RarResult<()> {
+        if reader.bits_remaining() == 0 {
+            return Ok(());
+        }
+        if !self.tables_read {
+            self.read_tables(reader)?;
+        }
+        self.begin_file_decode(0);
+        while !self.member_decode_done && self.consume_solid_end_marker(reader)? {}
+        Ok(())
+    }
+
     /// The oracle's post-flush size stop: `WrittenFileSize > DestUnpSize`
     /// ends the member's decode (unpack30.cpp:64-65).
     ///
@@ -2530,10 +2537,6 @@ impl Rar4LzDecoder {
         W: Write,
         F: FnMut(usize) -> RarResult<W>,
     {
-        if unpacked_size == 0 {
-            return Ok(Vec::new());
-        }
-
         let mut reader = BitReader::new(input);
 
         self.decompress_to_writer_chunked_with_reader(
@@ -2557,10 +2560,6 @@ impl Rar4LzDecoder {
         W: Write,
         F: FnMut(usize) -> RarResult<W>,
     {
-        if unpacked_size == 0 {
-            return Ok(Vec::new());
-        }
-
         // Recycled input buffer, handed back on every exit path (see
         // `decompress_reader_to_writer`).
         let buf = self.take_input_buffer();
@@ -2589,6 +2588,7 @@ impl Rar4LzDecoder {
         F: FnMut(usize) -> RarResult<W>,
     {
         if unpacked_size == 0 {
+            self.decode_empty_member(reader)?;
             return Ok(Vec::new());
         }
 
@@ -2709,6 +2709,7 @@ impl Rar4LzDecoder {
         F: FnMut(usize) -> RarResult<W>,
     {
         if unpacked_size == 0 {
+            self.decode_empty_member(reader)?;
             return Ok(Vec::new());
         }
 
@@ -4966,6 +4967,181 @@ mod tests {
         // A non-solid member starts from an empty history, so it may grow.
         decoder.prepare_member(false, 0x80000).unwrap();
         assert_eq!(decoder.window.dict_size(), 0x80000);
+    }
+
+    /// MSB-first bit packer for the hand-built LZ members below.
+    #[derive(Default)]
+    struct EmptyMemberBits {
+        bytes: Vec<u8>,
+        bits: usize,
+    }
+
+    impl EmptyMemberBits {
+        fn put(&mut self, value: u32, count: usize) -> &mut Self {
+            for shift in (0..count).rev() {
+                if self.bits.is_multiple_of(8) {
+                    self.bytes.push(0);
+                }
+                if (value >> shift) & 1 != 0 {
+                    *self.bytes.last_mut().unwrap() |= 0x80 >> (self.bits % 8);
+                }
+                self.bits += 1;
+            }
+            self
+        }
+
+        /// An LZ table block whose main table holds exactly two codes of
+        /// length 1: `literal` ("0") and symbol 256 ("1"). Bit-length codes:
+        /// 1 = "0", 18 = "10", 19 = "11".
+        fn tables(&mut self, literal: usize) -> &mut Self {
+            self.put(0, 1).put(0, 1); // LZ block, old table cleared
+            // 20 bit-length nibbles: [0, 1, 0 x16, 2, 2]; 15 then 14 is a
+            // run of 16 zeros.
+            for nibble in [0, 1, 15, 14, 2, 2] {
+                self.put(nibble, 4);
+            }
+            let zeros = |bits: &mut Self, mut run: usize| {
+                while run >= 11 {
+                    let take = run.min(138);
+                    bits.put(0b11, 2).put((take - 11) as u32, 7);
+                    run -= take;
+                }
+                if run >= 3 {
+                    bits.put(0b10, 2).put((run - 3) as u32, 3);
+                    run = 0;
+                }
+                assert_eq!(run, 0, "the zero runs here are all >= 3");
+            };
+            zeros(self, literal);
+            self.put(0, 1); // length 1
+            zeros(self, 256 - literal - 1);
+            self.put(0, 1); // symbol 256, length 1
+            zeros(self, HUFF_TABLE_SIZE - 257);
+            self
+        }
+
+        /// Symbol 256 then the end-of-block bits: "00" is a new file with
+        /// the same tables, "01" a new file whose tables come with it.
+        fn end_of_file(&mut self, new_tables: bool) -> &mut Self {
+            self.put(1, 1).put(0, 1).put(u32::from(new_tables), 1)
+        }
+
+        fn literals(&mut self, count: usize) -> &mut Self {
+            self.put(0, count)
+        }
+
+        /// One member's packed bytes; the next member starts byte-aligned.
+        fn take(&mut self) -> Vec<u8> {
+            self.bits = 0;
+            std::mem::take(&mut self.bytes)
+        }
+    }
+
+    /// Decode the members of one solid stream in order; `(packed, size)`.
+    fn decode_solid_members(members: &[(Vec<u8>, u64)]) -> RarResult<Vec<Vec<u8>>> {
+        let mut decoder = Rar4LzDecoder::new(0x40000);
+        let mut out = Vec::new();
+        for (index, (packed, size)) in members.iter().enumerate() {
+            decoder.prepare_member(index > 0, 0x40000)?;
+            out.push(decoder.decompress(packed, *size)?);
+        }
+        Ok(out)
+    }
+
+    /// An empty member of a solid RAR 2.9 stream still carries packed bytes:
+    /// the end-of-file code whose new-table bit tells the next member to
+    /// read tables. RAR 3.0 to 5.00 write it for `rar a -s` over an empty
+    /// file (two packed bytes). Decoding it, as extract.cpp and `Unpack29`
+    /// do, is what keeps the member after it readable.
+    #[test]
+    fn empty_solid_member_between_two_members_carries_the_new_table_bit() {
+        let mut bits = EmptyMemberBits::default();
+        let first = bits
+            .tables(b'A' as usize)
+            .literals(3)
+            .end_of_file(false)
+            .take();
+        let empty = bits.end_of_file(true).take();
+        let last = bits
+            .tables(b'B' as usize)
+            .literals(2)
+            .end_of_file(false)
+            .take();
+
+        let out = decode_solid_members(&[(first, 3), (empty, 0), (last, 2)]).unwrap();
+        assert_eq!(out, [b"AAA".to_vec(), Vec::new(), b"BB".to_vec()]);
+    }
+
+    #[test]
+    fn two_empty_solid_members_in_a_row_pass_the_new_table_bit_on() {
+        let mut bits = EmptyMemberBits::default();
+        let first = bits
+            .tables(b'A' as usize)
+            .literals(1)
+            .end_of_file(false)
+            .take();
+        let keep = bits.end_of_file(false).take();
+        let renew = bits.end_of_file(true).take();
+        let last = bits
+            .tables(b'B' as usize)
+            .literals(2)
+            .end_of_file(false)
+            .take();
+
+        let out = decode_solid_members(&[(first, 1), (keep, 0), (renew, 0), (last, 2)]).unwrap();
+        assert_eq!(out, [b"A".to_vec(), Vec::new(), Vec::new(), b"BB".to_vec()]);
+    }
+
+    /// The first member of a solid stream is not solid itself, so an empty
+    /// one reads its own tables, and the next member may keep them.
+    #[test]
+    fn empty_first_solid_member_reads_the_tables_the_next_one_keeps() {
+        let mut bits = EmptyMemberBits::default();
+        let empty = bits.tables(b'C' as usize).end_of_file(false).take();
+        let next = bits.literals(4).end_of_file(false).take();
+
+        let out = decode_solid_members(&[(empty, 0), (next, 4)]).unwrap();
+        assert_eq!(out, [Vec::new(), b"CCCC".to_vec()]);
+    }
+
+    #[test]
+    fn empty_last_solid_member_decodes_its_end_of_file_code() {
+        let mut bits = EmptyMemberBits::default();
+        let first = bits
+            .tables(b'A' as usize)
+            .literals(2)
+            .end_of_file(true)
+            .take();
+        let empty = bits.tables(b'B' as usize).end_of_file(false).take();
+
+        let mut decoder = Rar4LzDecoder::new(0x40000);
+        decoder.prepare_member(false, 0x40000).unwrap();
+        assert_eq!(decoder.decompress(&first, 2).unwrap(), b"AA");
+        assert!(!decoder.tables_read);
+        decoder.prepare_member(true, 0x40000).unwrap();
+        assert!(decoder.decompress(&empty, 0).unwrap().is_empty());
+        assert!(decoder.tables_read);
+    }
+
+    /// A member with no packed bytes at all, solid or not, leaves the
+    /// decoder as it was.
+    #[test]
+    fn empty_member_without_packed_bytes_leaves_the_decoder_alone() {
+        let mut bits = EmptyMemberBits::default();
+        let first = bits
+            .tables(b'A' as usize)
+            .literals(1)
+            .end_of_file(false)
+            .take();
+        let next = bits.literals(2).end_of_file(false).take();
+
+        let out = decode_solid_members(&[(first, 1), (Vec::new(), 0), (next, 2)]).unwrap();
+        assert_eq!(out, [b"A".to_vec(), Vec::new(), b"AA".to_vec()]);
+
+        let mut decoder = Rar4LzDecoder::new(0x40000);
+        decoder.prepare_member(false, 0x40000).unwrap();
+        assert!(decoder.decompress(&[], 0).unwrap().is_empty());
+        assert!(!decoder.tables_read);
     }
 
     #[test]
