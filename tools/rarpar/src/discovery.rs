@@ -1404,6 +1404,21 @@ fn old_rar_volume_index(path: &Path) -> Option<usize> {
     Some(usize::from(prefix - b'r') * 100 + number + 1)
 }
 
+/// The extension old-style volume names give volume `index` of a set,
+/// counted from 0 for the first volume, `.rar`: `.r00` to `.r99` for
+/// volumes 1 to 100, then a hundred to a letter, `.s00` for volume 101,
+/// through `.z99`, volume 900, the last such a name can number.
+/// [`old_rar_volume_index`] reads these names back.
+pub(crate) fn old_rar_volume_extension(index: usize) -> Option<String> {
+    let Some(after_first) = index.checked_sub(1) else {
+        return Some("rar".to_string());
+    };
+    let letter = u8::try_from(after_first / 100)
+        .ok()
+        .filter(|letter| *letter <= b'z' - b'r')?;
+    Some(format!("{}{:02}", char::from(b'r' + letter), after_first % 100))
+}
+
 fn set_hint(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?.to_string();
     let lower = name.to_ascii_lowercase();
@@ -1823,6 +1838,33 @@ mod tests {
                 member,
                 "{name} in {label}"
             );
+        }
+    }
+
+    /// Every volume an old-style name can number gets the name RAR writes,
+    /// and reads back as that volume: `.s00` follows `.r99`, through `.z99`.
+    #[test]
+    fn old_style_volume_names_are_written_as_they_are_read() {
+        for (index, extension) in [
+            (0, Some("rar")),
+            (1, Some("r00")),
+            (100, Some("r99")),
+            (101, Some("s00")),
+            (118, Some("s17")),
+            (900, Some("z99")),
+            (901, None),
+        ] {
+            assert_eq!(
+                old_rar_volume_extension(index).as_deref(),
+                extension,
+                "volume {index}"
+            );
+        }
+        for index in 0..=900 {
+            let extension = old_rar_volume_extension(index).unwrap();
+            let path = PathBuf::from(format!("movie.{extension}"));
+            assert!(looks_rarish_by_name(&path), "{extension}");
+            assert_eq!(filename_volume_index(&path), index, "{extension}");
         }
     }
 

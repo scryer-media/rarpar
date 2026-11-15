@@ -405,7 +405,9 @@ fn run_incremental_extract(invocation: &Invocation, set: &RarSet) -> Result<(), 
             .into_iter()
             .max()
             .map_or(1, |volume| volume + 1);
-        let next_path = next_volume_path(first_path, next_index);
+        let Some(next_path) = next_volume_path(first_path, next_index) else {
+            return Err(missing_volume_failure(&archive, &members));
+        };
         safe_print!(
             "Insert disk with {} [C]ontinue, [Q]uit ",
             next_path.display()
@@ -875,9 +877,12 @@ fn auto_rename_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-fn next_volume_path(first_path: &Path, next_index: usize) -> PathBuf {
+/// The path of volume `next_index` of the set whose first volume is
+/// `first_path`, named as that volume is: `.partN.rar` or old-style. `None`
+/// past the last volume an old-style name can number.
+fn next_volume_path(first_path: &Path, next_index: usize) -> Option<PathBuf> {
     let Some(name) = first_path.file_name().and_then(OsStr::to_str) else {
-        return first_path.to_path_buf();
+        return Some(first_path.to_path_buf());
     };
     let lower = name.to_ascii_lowercase();
     let next_name = if let Some(part_start) = lower.rfind(".part") {
@@ -892,24 +897,24 @@ fn next_volume_path(first_path: &Path, next_index: usize) -> PathBuf {
                 let suffix = &name[digits_end..];
                 format!("{prefix}{number:0width$}{suffix}")
             } else {
-                old_style_next_name(name, next_index)
+                old_style_next_name(name, next_index)?
             }
         } else {
-            old_style_next_name(name, next_index)
+            old_style_next_name(name, next_index)?
         }
     } else {
-        old_style_next_name(name, next_index)
+        old_style_next_name(name, next_index)?
     };
-    first_path.with_file_name(next_name)
+    Some(first_path.with_file_name(next_name))
 }
 
-fn old_style_next_name(name: &str, next_index: usize) -> String {
+fn old_style_next_name(name: &str, next_index: usize) -> Option<String> {
     let base = name
         .strip_suffix(".rar")
         .or_else(|| name.strip_suffix(".RAR"))
         .unwrap_or(name);
-    let number = next_index.saturating_sub(1);
-    format!("{base}.r{number:02}")
+    let extension = discovery::old_rar_volume_extension(next_index)?;
+    Some(format!("{base}.{extension}"))
 }
 
 fn map_rar_error(error: unrar_rs::RarError) -> CompatFailure {
@@ -997,6 +1002,27 @@ mod tests {
             .collect();
         let error = Invocation::parse(&args).expect_err("-idz is not a known switch");
         assert_eq!(error.code, EXIT_COMMAND_LINE);
+    }
+
+    /// `-vp` asks for each next volume by the name RAR gave it: past
+    /// `.r99` an old-style set goes on at `.s00`, and past `.z99` there is
+    /// no name to ask for.
+    #[test]
+    fn next_volume_names_follow_the_first_volume() {
+        for (first, index, next) in [
+            ("dir/a.rar", 1, Some("dir/a.r00")),
+            ("dir/a.rar", 100, Some("dir/a.r99")),
+            ("dir/a.rar", 101, Some("dir/a.s00")),
+            ("dir/a.rar", 900, Some("dir/a.z99")),
+            ("dir/a.rar", 901, None),
+            ("dir/a.part001.rar", 101, Some("dir/a.part102.rar")),
+        ] {
+            assert_eq!(
+                next_volume_path(Path::new(first), index),
+                next.map(PathBuf::from),
+                "{first} volume {index}"
+            );
+        }
     }
 
     #[test]
