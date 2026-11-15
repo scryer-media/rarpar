@@ -72,7 +72,8 @@ documented in each crate's own changelog so those notes ship with the crate.
   it continues furthest, as a scan of the whole directory does. With `a.rar`
   and `a9.rar` side by side, `a901.rev` is a recovery volume of `a9`; an
   operation on `a.rar` took it too, and `--delete-sources` could then delete
-  the other set's recovery volume.
+  the other set's recovery volume. A label spelled in another case counts
+  only where the filesystem holds the two spellings as one name.
 - A volume whose name states a number above RAR's volume limit
   (`set.part1000000000.rar`) is refused with a resource-limit error. Its
   number sized the table of volumes, which could use up memory.

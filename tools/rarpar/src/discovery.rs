@@ -537,7 +537,8 @@ fn discover_named_rar_family(
     // The labels of the other sets in the directory that are longer than
     // this one. A `.rev` whose name also continues one of them is that
     // set's, as it is when the whole directory is grouped: `a901.rev`
-    // beside `a.rar` and `a9.rar` belongs to `a9`.
+    // beside `a.rar` and `a9.rar` belongs to `a9`. A label in another case
+    // owns it only where the filesystem holds the two spellings as one name.
     let longer_labels = entries
         .iter()
         .map(|entry| entry.path())
@@ -559,7 +560,7 @@ fn discover_named_rar_family(
         let is_family_candidate = in_named_family(&path, label)
             && !longer_labels
                 .iter()
-                .any(|other| recovery_volume_label(&path, other).is_some());
+                .any(|other| is_ext(&path, "rev") && in_named_family(&path, other));
         if !is_archive && !is_family_candidate {
             continue;
         }
@@ -1627,6 +1628,36 @@ mod tests {
         // `a901.rev` continues both labels; it is the longer one's.
         assert_eq!(family("a.rar", "a"), ["a.r00", "a.rar", "a01.rev"]);
         assert_eq!(family("a9.rar", "a9"), ["a9.r00", "a9.rar", "a901.rev"]);
+    }
+
+    #[test]
+    fn named_discovery_gives_a_rev_to_a_longer_label_in_another_case_only_where_names_fold() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["a.rar", "A1.rar", "a11.rev"] {
+            std::fs::write(temp.path().join(name), b"Rar!\x1a\x07\x00").unwrap();
+        }
+        let options = DiscoveryOptions {
+            working_dir: None,
+            recursive: false,
+            max_depth: 1,
+            max_files: 100,
+            par3_memory_mib: 256,
+            par3_workers: None,
+            par3_max_lost_blocks: 4096,
+        };
+        let takes_the_rev = |first: &str, label: &str| {
+            let archive = temp.path().join(first);
+            discover_named_rar_family(&archive, classify_path(&archive), label, &options)
+                .unwrap()
+                .iter()
+                .any(|file| file.path.file_name().unwrap() == "a11.rev")
+        };
+
+        // Where `a1` and `A1` are one name, `a11.rev` is volume 1 of `A1`,
+        // the longer label. Where they are two, only `a` can own it.
+        let folds = folds_case(temp.path());
+        assert_eq!(takes_the_rev("A1.rar", "A1"), folds);
+        assert_eq!(takes_the_rev("a.rar", "a"), !folds);
     }
 
     #[test]
