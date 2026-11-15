@@ -1284,12 +1284,25 @@ mod tests {
         build_rar14_store_archive_ex(name, data, checksum, 0, 2)
     }
 
+    /// A RAR 1.4 archive of one member, its method byte as RAR 1.4 writes
+    /// it: raw, 0 for store.
     fn build_rar14_store_archive_ex(
         name: &str,
         data: &[u8],
         checksum: Option<u16>,
         flags: u8,
         unpack_marker: u8,
+    ) -> Vec<u8> {
+        build_rar14_archive(name, data, checksum, flags, unpack_marker, 0)
+    }
+
+    fn build_rar14_archive(
+        name: &str,
+        data: &[u8],
+        checksum: Option<u16>,
+        flags: u8,
+        unpack_marker: u8,
+        method: u8,
     ) -> Vec<u8> {
         let checksum = checksum.unwrap_or_else(|| crate::rar4::header::checksum14_update(0, data));
         let name_bytes = name.as_bytes();
@@ -1310,7 +1323,7 @@ mod tests {
         out.push(flags);
         out.push(unpack_marker);
         out.push(name_bytes.len() as u8);
-        out.push(0x30); // Store
+        out.push(method);
         out.extend_from_slice(name_bytes);
         out.extend_from_slice(data);
         out
@@ -1404,6 +1417,75 @@ mod tests {
             .to_bytes()
             .unwrap();
         assert_eq!(extracted, plaintext);
+    }
+
+    /// RAR 1.4 stores the method raw: byte 0 is a stored member (UnRAR
+    /// arcread.cpp `ReadHeader14`; extract.cpp unstores `Method == 0`).
+    #[test]
+    fn rar14_member_with_raw_method_zero_is_stored_and_extracts() {
+        let bytes = build_rar14_store_archive("RAW0.TXT", b"stored by rar 1.4", None);
+        let mut archive = RarArchive::open(std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(
+            archive.members[0].file_header.compression.method,
+            crate::types::CompressionMethod::Store
+        );
+        let extracted = archive
+            .extract_member(0, &crate::extract::ExtractOptions::default(), None)
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        assert_eq!(extracted, b"stored by rar 1.4");
+    }
+
+    /// A raw method of 1 to 5 is compressed, and goes to the RAR 1.5
+    /// decoder (extract.cpp: `UnpVer <= 15` unpacks as 15), not refused as
+    /// an unknown method.
+    #[test]
+    fn rar14_member_with_raw_compressed_method_routes_to_the_rar15_decoder() {
+        use crate::types::CompressionMethod;
+        for (raw, method) in [
+            (1, CompressionMethod::Fastest),
+            (2, CompressionMethod::Fast),
+            (3, CompressionMethod::Normal),
+            (4, CompressionMethod::Good),
+            (5, CompressionMethod::Best),
+        ] {
+            let packed = [0u8; 16];
+            let bytes = build_rar14_archive("PACKED.TXT", &packed, Some(0), 0, 2, raw);
+            let mut archive = RarArchive::open(std::io::Cursor::new(bytes)).unwrap();
+            let compression = archive.members[0].file_header.compression;
+            assert_eq!(compression.method, method, "raw {raw}");
+            assert_eq!(compression.version, 13, "raw {raw}");
+            let decoder = crate::decompress::rar4_old::Rar4Decoder::new(
+                compression.version,
+                compression.dict_size as usize,
+                compression.method.code(),
+            )
+            .unwrap();
+            assert!(
+                matches!(decoder, crate::decompress::rar4_old::Rar4Decoder::V15(_)),
+                "raw {raw}"
+            );
+            // The bytes are no real 1.5 stream; what matters is that they are
+            // decoded, not refused as an unsupported method.
+            let result =
+                archive.extract_member(0, &crate::extract::ExtractOptions::default(), None);
+            assert!(
+                !matches!(result, Err(RarError::UnsupportedCompression { .. })),
+                "raw {raw}: {result:?}"
+            );
+        }
+    }
+
+    /// 0x30 is the RAR 1.5+ store byte, no method a 1.4 header states.
+    #[test]
+    fn rar14_member_with_a_rar15_method_byte_is_not_read_as_stored() {
+        let bytes = build_rar14_archive("ODD.TXT", b"abc", None, 0, 2, 0x30);
+        let archive = RarArchive::open(std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(
+            archive.members[0].file_header.compression.method,
+            crate::types::CompressionMethod::Unknown(0x30)
+        );
     }
 
     #[test]

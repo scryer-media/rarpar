@@ -118,6 +118,25 @@ pub enum Rar4Method {
     Unknown(u8),
 }
 
+impl Rar4Method {
+    /// The method of a RAR 1.4 file header, which stores it raw: 0 is store
+    /// and 1 to 5 the compressed levels, where RAR 1.5 and later store
+    /// 0x30 to 0x35 (UnRAR arcread.cpp `ReadHeader14` reads `Method` as the
+    /// byte; `ReadHeader15` subtracts 0x30). Any other byte is no method a
+    /// 1.4 writer used and stays unknown.
+    pub fn from_rar14(raw: u8) -> Self {
+        match raw {
+            0 => Self::Store,
+            1 => Self::Fastest,
+            2 => Self::Fast,
+            3 => Self::Normal,
+            4 => Self::Good,
+            5 => Self::Best,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
 impl From<u8> for Rar4Method {
     fn from(val: u8) -> Self {
         match val {

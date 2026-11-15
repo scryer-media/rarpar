@@ -440,7 +440,7 @@ pub fn parse_rar14_file_header(data: &[u8], offset: u64) -> RarResult<Option<Rar
     let flags = u16::from(data[17]) | common_flags::HAS_DATA;
     let unpack_version = if data[18] == 2 { 13 } else { 10 };
     let name_len = usize::from(data[19]);
-    let method = Rar4Method::from(data[20]);
+    let method = Rar4Method::from_rar14(data[20]);
     if head_size_usize.saturating_sub(21) < name_len {
         return Err(RarError::TruncatedHeader { offset });
     }
