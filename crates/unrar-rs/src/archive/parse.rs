@@ -1488,6 +1488,81 @@ mod tests {
         );
     }
 
+    /// One RAR 1.5-4.x block: CRC16, type, flags, size, then `body`.
+    fn rar4_block(header_type: u8, flags: u16, body: &[u8]) -> Vec<u8> {
+        let mut block = vec![0u8; 7];
+        block[2] = header_type;
+        block[3..5].copy_from_slice(&flags.to_le_bytes());
+        block[5..7].copy_from_slice(&((7 + body.len()) as u16).to_le_bytes());
+        block.extend_from_slice(body);
+        let crc = (crc32fast::hash(&block[2..]) & 0xFFFF) as u16;
+        block[0..2].copy_from_slice(&crc.to_le_bytes());
+        block
+    }
+
+    /// A stored file (0x74) or service (0x7a) header and its data.
+    fn rar4_stored_entry(header_type: u8, flags: u16, name: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&(data.len() as u32).to_le_bytes()); // packed
+        body.extend_from_slice(&(data.len() as u32).to_le_bytes()); // unpacked
+        body.push(3); // Unix
+        body.extend_from_slice(&crc32fast::hash(data).to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // time
+        body.push(29);
+        body.push(0x30); // store
+        body.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // attributes
+        body.extend_from_slice(name);
+        let mut entry = rar4_block(header_type, 0x8000 | flags, &body);
+        entry.extend_from_slice(data);
+        entry
+    }
+
+    /// A RAR 3.x archive: an optional archive comment after the main
+    /// header, one file, and an optional file comment after the file, the
+    /// way `rar c` and `rar cf` place them (the file comment's flags are
+    /// 0x8010).
+    fn rar4_archive_with_comments(archive: Option<&[u8]>, file: Option<&[u8]>) -> Vec<u8> {
+        let mut bytes = crate::signature::RAR4_SIGNATURE.to_vec();
+        bytes.extend_from_slice(&rar4_block(0x73, 0, &[0u8; 6]));
+        if let Some(text) = archive {
+            bytes.extend_from_slice(&rar4_stored_entry(0x7a, 0, b"CMT", text));
+        }
+        bytes.extend_from_slice(&rar4_stored_entry(0x74, 0, b"tiny.txt", b"tiny"));
+        if let Some(text) = file {
+            bytes.extend_from_slice(&rar4_stored_entry(0x7a, 0x0010, b"CMT", text));
+        }
+        bytes.extend_from_slice(&rar4_block(0x7b, 0x4000, &[]));
+        bytes
+    }
+
+    /// A `CMT` service after a file header is that file's comment, and the
+    /// archive has none (`unrar l` prints no archive comment for it).
+    #[test]
+    fn rar4_file_comment_is_not_the_archive_comment() {
+        let bytes = rar4_archive_with_comments(None, Some(b"File note.\n"));
+        let mut archive = RarArchive::open(std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(archive.member_names(), ["tiny.txt"]);
+        assert_eq!(archive.comment().unwrap(), None);
+    }
+
+    #[test]
+    fn rar4_archive_comment_is_read_beside_a_file_comment() {
+        let bytes = rar4_archive_with_comments(Some(b"Archive note.\n"), Some(b"File note.\n"));
+        let mut archive = RarArchive::open(std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(
+            archive.comment().unwrap().as_deref(),
+            Some("Archive note.\n")
+        );
+
+        let bytes = rar4_archive_with_comments(Some(b"Archive note.\n"), None);
+        let mut archive = RarArchive::open(std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(
+            archive.comment().unwrap().as_deref(),
+            Some("Archive note.\n")
+        );
+    }
+
     #[test]
     fn rar14_store_archive_rejects_checksum14_mismatch() {
         let bytes = build_rar14_store_archive("BAD.TXT", b"hello rar14", Some(0));
