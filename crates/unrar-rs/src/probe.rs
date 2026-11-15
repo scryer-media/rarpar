@@ -424,7 +424,7 @@ mod tests {
     fn test_probe_rar4_multi_volume_first() {
         // VOLUME + FIRST_VOLUME + NEW_NUMBERING, with volume number 0 in ENDARC
         let arch_flags = 0x0001 | 0x0100 | 0x0010;
-        let end_flags = 0x0001 | 0x0004; // NEXT_VOLUME + VOLUME_NUMBER
+        let end_flags = 0x0001 | 0x0008; // NEXT_VOLUME + VOLUME_NUMBER
         let data = build_probe_rar4(
             arch_flags,
             "movie.mkv",
@@ -446,7 +446,7 @@ mod tests {
     fn test_probe_rar4_multi_volume_continuation() {
         // VOLUME only (not first), volume number 2 in ENDARC
         let arch_flags = 0x0001;
-        let end_flags = 0x0001 | 0x0004; // NEXT_VOLUME + VOLUME_NUMBER
+        let end_flags = 0x0001 | 0x0008; // NEXT_VOLUME + VOLUME_NUMBER
         let data = build_probe_rar4(
             arch_flags,
             "movie.mkv",
@@ -465,7 +465,7 @@ mod tests {
     #[test]
     fn test_probe_rar4_last_volume() {
         let arch_flags = 0x0001;
-        let end_flags = 0x0004; // VOLUME_NUMBER only (no NEXT_VOLUME)
+        let end_flags = 0x0008; // VOLUME_NUMBER only (no NEXT_VOLUME)
         let data = build_probe_rar4(
             arch_flags,
             "movie.mkv",

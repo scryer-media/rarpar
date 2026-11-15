@@ -307,12 +307,15 @@ impl Rar4EncryptionMethod {
 pub mod end_flags {
     /// More volumes follow.
     pub const NEXT_VOLUME: u16 = 0x0001;
-    /// Data CRC and volume number are present after the header.
+    /// The record carries the archive data CRC32 (4 bytes, read first).
     pub const DATA_CRC: u16 = 0x0002;
-    /// Volume number is present.
-    pub const VOLUME_NUMBER: u16 = 0x0004;
-    /// Recovery record space is present at the end of the volume.
-    pub const REV_SPACE: u16 = 0x0008;
+    /// The record reserves 7 trailing bytes for the end of a .rev file's
+    /// volume record (UnRAR `EARC_REVSPACE`, headers.hpp). They follow every
+    /// optional field and carry nothing to read.
+    pub const REV_SPACE: u16 = 0x0004;
+    /// The record states the current volume number (2 bytes, read after the
+    /// data CRC; UnRAR `EARC_VOLNUMBER`, headers.hpp).
+    pub const VOLUME_NUMBER: u16 = 0x0008;
 }
 
 /// Parsed RAR4 end-of-archive header.
