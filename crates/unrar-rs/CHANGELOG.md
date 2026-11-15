@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.16.3
+
+No API changes.
+
+### Fixed
+
+- A RAR 3.0 `.rev` name, `<set><data>_<recovery>_<position>.rev`, is read
+  against the set's base name, as reference UnRAR reads it. The data count
+  was taken from every digit before the first underscore, so the `.rev`
+  files of a set whose name ends in a digit were rejected (`b713_02_01.rev`
+  of set `b7` read as 713 data volumes) and a lost volume could not be
+  rebuilt: "no valid RAR recovery volumes were found".
+- A restore given a bare file name (`set.part1.rar`, no directory) looks in
+  the current directory for the set's other volumes and `.rev` files. It
+  looked nowhere, so the restore failed with "no valid RAR recovery volumes
+  were found" where `./set.part1.rar` worked.
+- `RarArchive::add_volume` refuses an index above `RAR_MAX_VOLUME_NUMBER`
+  with a `ResourceLimit` error, as it does a volume number read from a
+  header. The index is the volume's place when its headers state no number,
+  and the table of volumes grew to hold whatever the caller passed.
+
 ## 0.16.2
 
 Fixes for archives written by old RAR versions, found by comparing the crate

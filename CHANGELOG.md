@@ -35,9 +35,52 @@ documented in each crate's own changelog so those notes ship with the crate.
     refused as invalid data instead of its surplus being dropped.
   - Pack and unpack sizes above 4 GiB are no longer truncated on 32-bit
     targets.
+- RAR sets written by RAR versions before 3.4 read as reference UnRAR reads
+  them, through unrar-rs 0.16.2. Every volume of a RAR 3.1 to 3.3 set with
+  old-style names (`.rar`, `.r00`, ...) read as volume 0, so rebuilding a
+  lost volume from its `.rev` files failed. A stored RAR 1.4 member failed
+  its checksum. In a solid RAR 2.9 to 4.x archive, a member that unpacks to
+  nothing left the member after it failing, and every later one. A file's
+  own comment was shown as the archive comment.
+- A RAR 3.0 set whose name ends in a digit rebuilds a lost volume from its
+  `.rev` files, through unrar-rs 0.16.3: `b713_02_01.rev` of set `b7` is
+  read as 13 data volumes, as reference UnRAR reads it, not 713. Before,
+  `rar restore-volumes` and `auto` failed with "no valid RAR recovery
+  volumes were found".
+- `rar restore-volumes set.part1.rar`, the archive named without a
+  directory, finds the set's `.rev` files beside it, through unrar-rs
+  0.16.3. Before, it failed with "no valid RAR recovery volumes were found"
+  unless the name was written `./set.part1.rar`.
+- The `.rev` files of a RAR set with old-style volume names now join that
+  set: RAR 3.0's `<set><data>_<recovery>_<position>.rev` (`arc33_03_01.rev`)
+  and the `<set><number>.rev` later versions write (`arc01.rev`). Before,
+  each `.rev` was a set of its own. `inspect` listed one set per `.rev`;
+  `auto -o DIR` extracted into `DIR/arc` instead of `DIR`; `cleanup` deleted
+  the data volumes, left the `.rev` files behind and failed with "no RAR
+  volumes provided"; and the `unrar` interface's `x` did not rebuild a lost
+  volume from them.
+- The `unrar` interface's `-vp` asks for an old-style set's volumes past
+  `.r99` by the names RAR gives them, `.s00` onward. Before, it asked for
+  `.r100` and stopped there, so a RAR 3.0 set of 119 volumes could not be
+  extracted one volume at a time.
+- A RAR set with a volume missing reads each remaining volume at its own
+  number. Before, the volumes after the gap moved up one place each, so the
+  `unrar` interface's `t` and `x` read the next volume in the missing one's
+  place and failed with "Write error: unexpected EOF". They now report the
+  missing volume, "Cannot find volume N", as UnRAR does.
+- An operation on one named archive leaves a `.rev` to the set whose label
+  it continues furthest, as a scan of the whole directory does. With `a.rar`
+  and `a9.rar` side by side, `a901.rev` is a recovery volume of `a9`; an
+  operation on `a.rar` took it too, and `--delete-sources` could then delete
+  the other set's recovery volume. A label spelled in another case counts
+  only where the filesystem holds the two spellings as one name.
+- A volume whose name states a number above RAR's volume limit
+  (`set.part1000000000.rar`) is refused with a resource-limit error. Its
+  number sized the table of volumes, which could use up memory.
 - Every other dependency is at its latest compatible release, among them
-  aws-lc-rs 1.19, zip 9.4 and serde_json 1.0.154. No direct dependency has a
-  newer major release.
+  aws-lc-rs 1.19, zip 9.6, sevenz-turbo 0.29.7 and serde_json 1.0.154.
+  sevenz-turbo 0.30 and lzma-turbo 0.12 are out and not taken in this
+  release.
 
 ## rarpar 0.9.4
 

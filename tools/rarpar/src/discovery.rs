@@ -140,6 +140,34 @@ impl RarSet {
         paths.dedup();
         paths
     }
+
+    /// The set's volumes in reading order, each with the slot a reader adds
+    /// it at: its number in the set, as its name or header gives it,
+    /// counted from the first volume present. A missing volume leaves its
+    /// slot empty, so the reader finds it missing instead of reading the
+    /// next volume in its place. A volume with no number of its own, or
+    /// sharing one with the volume before it, takes the slot after that
+    /// volume's.
+    pub fn volume_slots(&self) -> Vec<(usize, &Path)> {
+        let mut volumes = self.volumes.iter().collect::<Vec<_>>();
+        volumes.sort_by(|a, b| {
+            a.sort_index
+                .cmp(&b.sort_index)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        let first = volumes.first().map_or(0, |volume| volume.sort_index);
+        let mut slots = Vec::with_capacity(volumes.len());
+        for volume in volumes {
+            let next = slots.last().map_or(0, |(slot, _)| slot + 1);
+            let slot = if volume.sort_index == usize::MAX {
+                next
+            } else {
+                next.max(volume.sort_index - first)
+            };
+            slots.push((slot, volume.path.as_path()));
+        }
+        slots
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -506,6 +534,21 @@ fn discover_named_rar_family(
     let mut entries = std::fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.path());
 
+    // The labels of the other sets in the directory that are longer than
+    // this one. A `.rev` whose name also continues one of them is that
+    // set's, as it is when the whole directory is grouped: `a901.rev`
+    // beside `a.rar` and `a9.rar` belongs to `a9`. A label in another case
+    // owns it only where the filesystem holds the two spellings as one name.
+    // Only a file can be a volume, so a directory named like one owns nothing.
+    let longer_labels = entries
+        .iter()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .map(|entry| entry.path())
+        .filter(|path| !is_ext(path, "rev") && looks_rarish_by_name(path))
+        .filter_map(|path| set_hint(&path))
+        .filter(|other| other.len() > label.len())
+        .collect::<BTreeSet<_>>();
+
     let mut archive_identity = ArchiveIdentity::new(archive);
     let mut files = Vec::new();
     for entry in entries {
@@ -516,7 +559,10 @@ fn discover_named_rar_family(
 
         let path = entry.path();
         let is_archive = archive_identity.is(&path);
-        let is_family_candidate = in_named_family(&path, label);
+        let is_family_candidate = in_named_family(&path, label)
+            && !longer_labels
+                .iter()
+                .any(|other| is_ext(&path, "rev") && in_named_family(&path, other));
         if !is_archive && !is_family_candidate {
             continue;
         }
@@ -558,10 +604,14 @@ fn in_named_family_with(
     label: &str,
     same_file: impl Fn(&Path, &Path) -> bool,
 ) -> bool {
-    if !(looks_rarish_by_name(path) || is_ext(path, "rev")) {
+    let hint = if is_ext(path, "rev") {
+        recovery_volume_label(path, label).map(str::to_owned)
+    } else if looks_rarish_by_name(path) {
+        set_hint(path)
+    } else {
         return false;
-    }
-    let Some(hint) = set_hint(path) else {
+    };
+    let Some(hint) = hint else {
         return false;
     };
     if hint == label {
@@ -646,6 +696,63 @@ fn folds_case(dir: &Path) -> bool {
             Some(same_file_on_disk(&path, &dir.join(respelled)))
         })
         .unwrap_or(false)
+}
+
+/// The start of the name of `path`, a `.rev` file, that names its RAR set
+/// when that set is labelled `label`, spelled as the file spells it: the
+/// label up to case, followed by the numbering RAR gives a recovery volume,
+/// which is one of
+/// - the volume's number, after `.part` for a set with new-style names
+///   (`set.part1.rev`) and directly after the label for one with old-style
+///   names (`set1.rev`, `set01.rev`);
+/// - RAR 3.0's `<data>_<recovery>_<position>`, the same two ways, and
+///   optionally after an underscore (`set.part5_3_1.rev`, `set5_3_1.rev`,
+///   `set_5_3_1.rev`): five data volumes, three recovery volumes, the
+///   first of them. Each number is 1 to 255, the data and recovery
+///   volumes together at most 255, and the position at most 256 less the
+///   data volumes.
+///
+/// `None` when the name is not one of those for `label`. A set labelled
+/// with a longer name that also fits the file, `set1` for `set12.rev`, is
+/// for the caller to prefer.
+fn recovery_volume_label<'a>(path: &'a Path, label: &str) -> Option<&'a str> {
+    if label.is_empty() || !is_ext(path, "rev") {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    let prefix = stem.get(..label.len())?;
+    if fold_case(prefix) != fold_case(label) {
+        return None;
+    }
+    let rest = &stem[label.len()..];
+    let numbering = rest
+        .get(..".part".len())
+        .filter(|part| part.eq_ignore_ascii_case(".part"))
+        .map_or(rest, |part| &rest[part.len()..]);
+    let is_number = !numbering.is_empty() && numbering.bytes().all(|byte| byte.is_ascii_digit());
+    (is_number || rar30_recovery_numbering(numbering).is_some()).then_some(prefix)
+}
+
+/// RAR 3.0's numbering of a recovery volume, `<data>_<recovery>_<position>`
+/// with an optional leading underscore, as (data volumes, recovery volumes,
+/// position); `None` when `numbering` is not one RAR 3.0 can write (see
+/// [`recovery_volume_label`]).
+fn rar30_recovery_numbering(numbering: &str) -> Option<(usize, usize, usize)> {
+    let numbering = numbering.strip_prefix('_').unwrap_or(numbering);
+    let mut parts = numbering.split('_').map(|part| {
+        if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        part.parse::<usize>()
+            .ok()
+            .filter(|value| (1..=255).contains(value))
+    });
+    let (Some(Some(data)), Some(Some(recovery)), Some(Some(position)), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    (data + recovery <= 255 && data + position - 1 <= 255).then_some((data, recovery, position))
 }
 
 /// Whether `path` names a `.rev` file of `set`: one under the set's own
@@ -1018,6 +1125,7 @@ fn build_par2_sets(files: &[DiscoveredFile], reuse: &Par2Reuse) -> Vec<Par2Set> 
 fn build_rar_sets(files: &[DiscoveredFile]) -> Vec<RarSet> {
     let mut groups: BTreeMap<String, RarSetBuilder> = BTreeMap::new();
 
+    let mut recovery_volumes = Vec::new();
     for file in files {
         match &file.kind {
             DiscoveredKind::RarVolume(info) => {
@@ -1034,22 +1142,51 @@ fn build_rar_sets(files: &[DiscoveredFile]) -> Vec<RarSet> {
                     is_first_volume: info.is_first_volume,
                 });
             }
-            DiscoveredKind::RarRecoveryVolume => {
-                let key = format!(
-                    "{}:{}",
-                    parent_key(&file.path),
-                    file.set_hint
-                        .clone()
-                        .unwrap_or_else(|| fallback_set_key(&file.path))
-                );
-                let entry = groups
-                    .entry(key.clone())
-                    .or_insert_with(|| RarSetBuilder::new(&key, file));
-                entry.label = entry.label.clone().or_else(|| file.set_hint.clone());
-                entry.recovery_volumes.push(file.path.clone());
-            }
+            DiscoveredKind::RarRecoveryVolume => recovery_volumes.push(file),
             _ => {}
         }
+    }
+
+    // A `.rev` joins the set of data volumes beside it whose label its name
+    // continues, the longest such label when several do; the label alone
+    // cannot be read off an old-style name such as `set12_3_1.rev`.
+    let mut labels: BTreeMap<&Path, Vec<(&str, &str)>> = BTreeMap::new();
+    for (key, builder) in &groups {
+        if let Some(label) = builder.label.as_deref() {
+            labels
+                .entry(builder.base_dir.as_path())
+                .or_default()
+                .push((label, key.as_str()));
+        }
+    }
+    let rev_keys = recovery_volumes
+        .iter()
+        .map(|file| {
+            labels
+                .get(parent_directory(&file.path))
+                .into_iter()
+                .flatten()
+                .filter(|(label, _)| recovery_volume_label(&file.path, label) == Some(*label))
+                .max_by_key(|(label, _)| label.len())
+                .map(|(_, key)| (*key).to_owned())
+        })
+        .collect::<Vec<_>>();
+
+    for (file, key) in recovery_volumes.into_iter().zip(rev_keys) {
+        let key = key.unwrap_or_else(|| {
+            format!(
+                "{}:{}",
+                parent_key(&file.path),
+                file.set_hint
+                    .clone()
+                    .unwrap_or_else(|| fallback_set_key(&file.path))
+            )
+        });
+        let entry = groups
+            .entry(key.clone())
+            .or_insert_with(|| RarSetBuilder::new(&key, file));
+        entry.label = entry.label.clone().or_else(|| file.set_hint.clone());
+        entry.recovery_volumes.push(file.path.clone());
     }
 
     let mut sets = groups
@@ -1313,6 +1450,25 @@ fn old_rar_volume_index(path: &Path) -> Option<usize> {
     Some(usize::from(prefix - b'r') * 100 + number + 1)
 }
 
+/// The extension old-style volume names give volume `index` of a set,
+/// counted from 0 for the first volume, `.rar`: `.r00` to `.r99` for
+/// volumes 1 to 100, then a hundred to a letter, `.s00` for volume 101,
+/// through `.z99`, volume 900, the last such a name can number.
+/// [`old_rar_volume_index`] reads these names back.
+pub(crate) fn old_rar_volume_extension(index: usize) -> Option<String> {
+    let Some(after_first) = index.checked_sub(1) else {
+        return Some("rar".to_string());
+    };
+    let letter = u8::try_from(after_first / 100)
+        .ok()
+        .filter(|letter| *letter <= b'z' - b'r')?;
+    Some(format!(
+        "{}{:02}",
+        char::from(b'r' + letter),
+        after_first % 100
+    ))
+}
+
 fn set_hint(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?.to_string();
     let lower = name.to_ascii_lowercase();
@@ -1438,6 +1594,77 @@ mod tests {
     /// its spelling, and only an entry that could carry the archive's real
     /// name is resolved: none here, and for an archive named through a link,
     /// the link once and its target once.
+    #[test]
+    fn named_discovery_leaves_a_rev_to_the_longer_label_it_continues() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["a.rar", "a.r00", "a01.rev", "a9.rar", "a9.r00", "a901.rev"] {
+            std::fs::write(temp.path().join(name), b"Rar!\x1a\x07\x00").unwrap();
+        }
+        let options = DiscoveryOptions {
+            working_dir: None,
+            recursive: false,
+            max_depth: 1,
+            max_files: 100,
+            par3_memory_mib: 256,
+            par3_workers: None,
+            par3_max_lost_blocks: 4096,
+        };
+        let family = |first: &str, label: &str| {
+            let archive = temp.path().join(first);
+            let mut names: Vec<String> =
+                discover_named_rar_family(&archive, classify_path(&archive), label, &options)
+                    .unwrap()
+                    .iter()
+                    .map(|file| {
+                        file.path
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect();
+            names.sort();
+            names
+        };
+
+        // A directory named like a volume of a longer label owns nothing.
+        std::fs::create_dir(temp.path().join("a0.rar")).unwrap();
+
+        // `a901.rev` continues both labels; it is the longer one's.
+        assert_eq!(family("a.rar", "a"), ["a.r00", "a.rar", "a01.rev"]);
+        assert_eq!(family("a9.rar", "a9"), ["a9.r00", "a9.rar", "a901.rev"]);
+    }
+
+    #[test]
+    fn named_discovery_gives_a_rev_to_a_longer_label_in_another_case_only_where_names_fold() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["a.rar", "A1.rar", "a11.rev"] {
+            std::fs::write(temp.path().join(name), b"Rar!\x1a\x07\x00").unwrap();
+        }
+        let options = DiscoveryOptions {
+            working_dir: None,
+            recursive: false,
+            max_depth: 1,
+            max_files: 100,
+            par3_memory_mib: 256,
+            par3_workers: None,
+            par3_max_lost_blocks: 4096,
+        };
+        let takes_the_rev = |first: &str, label: &str| {
+            let archive = temp.path().join(first);
+            discover_named_rar_family(&archive, classify_path(&archive), label, &options)
+                .unwrap()
+                .iter()
+                .any(|file| file.path.file_name().unwrap() == "a11.rev")
+        };
+
+        // Where `a1` and `A1` are one name, `a11.rev` is volume 1 of `A1`,
+        // the longer label. Where they are two, only `a` can own it.
+        let folds = folds_case(temp.path());
+        assert_eq!(takes_the_rev("A1.rar", "A1"), folds);
+        assert_eq!(takes_the_rev("a.rar", "a"), !folds);
+    }
+
     #[test]
     fn rar_family_discovery_resolves_only_what_could_be_the_archive() {
         let temp = tempfile::tempdir().unwrap();
@@ -1590,6 +1817,231 @@ mod tests {
         assert!(!fixture_is_hydrated(&pointer));
 
         assert!(!fixture_is_hydrated(&temp.path().join("absent.rar")));
+    }
+
+    /// Recovery volume names as RAR writes them, for sets with new-style and
+    /// old-style volume names: RAR 3.0's `<data>_<recovery>_<position>`
+    /// (`b713_02_01.rev` is set `b7`, thirteen data volumes; `c128_002_001.rev`
+    /// pads to three digits), and the volume number later versions write.
+    #[test]
+    fn a_recovery_volume_name_is_read_against_the_set_label() {
+        for (name, label, prefix) in [
+            ("a33_03_01.rev", "a", Some("a")),
+            ("b713_02_01.rev", "b7", Some("b7")),
+            ("c128_002_001.rev", "c", Some("c")),
+            ("set_5_3_1.rev", "set", Some("set")),
+            ("a.part33_03_01.rev", "a", Some("a")),
+            ("a.part5_2_1.rev", "a", Some("a")),
+            ("a.part01.rev", "a", Some("a")),
+            ("e01.rev", "e", Some("e")),
+            ("A33_03_01.REV", "a", Some("A")),
+            ("a5_250_1.rev", "a", Some("a")),
+            ("a250_5_6.rev", "a", Some("a")),
+            // Out of what RAR 3.0 can write: a number past 255, more than
+            // 255 volumes, or a position past the last slot.
+            ("a256_1_1.rev", "a", None),
+            ("a200_56_1.rev", "a", None),
+            ("a250_5_7.rev", "a", None),
+            ("a0_3_1.rev", "a", None),
+            ("a5_3.rev", "a", None),
+            ("a5_3_1_1.rev", "a", None),
+            ("a.rev", "a", None),
+            ("ab01.rev", "a", None),
+            ("a01.rar", "a", None),
+            ("b01.rev", "a", None),
+        ] {
+            assert_eq!(
+                recovery_volume_label(Path::new(name), label),
+                prefix,
+                "{name} for {label}"
+            );
+        }
+    }
+
+    fn discovered(path: &str, kind: DiscoveredKind) -> DiscoveredFile {
+        let path = PathBuf::from(path);
+        DiscoveredFile {
+            set_hint: set_hint(&path),
+            path,
+            kind,
+            diagnostics: Vec::new(),
+            settled: None,
+        }
+    }
+
+    fn rar4_volume() -> DiscoveredKind {
+        DiscoveredKind::RarVolume(RarVolumeInfo {
+            format: "rar4".to_string(),
+            volume_number: None,
+            is_multi_volume: true,
+            has_next_volume: true,
+            is_header_encrypted: false,
+            has_encrypted_files: false,
+            is_solid: false,
+            is_first_volume: false,
+            files: vec!["payload.bin".to_string()],
+        })
+    }
+
+    /// A `.rev` joins the set beside it whose label its name continues,
+    /// the longest such label first, as RAR names them for old-style sets;
+    /// one that continues no set's label stays a set of its own.
+    #[test]
+    fn old_style_recovery_volumes_join_their_set() {
+        let files = [
+            discovered("dir/a.rar", rar4_volume()),
+            discovered("dir/a.r00", rar4_volume()),
+            discovered("dir/a.s00", rar4_volume()),
+            discovered("dir/a33_03_01.rev", DiscoveredKind::RarRecoveryVolume),
+            discovered("dir/a01.rev", DiscoveredKind::RarRecoveryVolume),
+            discovered("dir/a9.rar", rar4_volume()),
+            discovered("dir/a901.rev", DiscoveredKind::RarRecoveryVolume),
+            discovered("other/a02.rev", DiscoveredKind::RarRecoveryVolume),
+            discovered("dir/b01.rev", DiscoveredKind::RarRecoveryVolume),
+        ];
+        let sets = build_rar_sets(&files);
+        let summary = sets
+            .iter()
+            .map(|set| {
+                (
+                    set.base_dir.clone(),
+                    set.label.as_str(),
+                    set.volumes.len(),
+                    set.recovery_volumes.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            [
+                (
+                    PathBuf::from("dir"),
+                    "a",
+                    3,
+                    vec![
+                        PathBuf::from("dir/a01.rev"),
+                        PathBuf::from("dir/a33_03_01.rev")
+                    ]
+                ),
+                (
+                    PathBuf::from("dir"),
+                    "a9",
+                    1,
+                    vec![PathBuf::from("dir/a901.rev")]
+                ),
+                (
+                    PathBuf::from("dir"),
+                    "b01",
+                    0,
+                    vec![PathBuf::from("dir/b01.rev")]
+                ),
+                (
+                    PathBuf::from("other"),
+                    "a02",
+                    0,
+                    vec![PathBuf::from("other/a02.rev")]
+                ),
+            ]
+        );
+    }
+
+    /// An archive's family takes its old-style `.rev` files by name, as a
+    /// named archive's set is found without listing the whole directory.
+    #[test]
+    fn a_named_family_takes_old_style_recovery_volumes() {
+        for (name, label, member) in [
+            ("a33_03_01.rev", "a", true),
+            ("b713_02_01.rev", "b7", true),
+            ("e01.rev", "e", true),
+            ("e01.rev", "f", false),
+            ("a.s17", "a", true),
+        ] {
+            let path = Path::new("dir").join(name);
+            assert_eq!(
+                in_named_family_with(&path, label, |_, _| false),
+                member,
+                "{name} in {label}"
+            );
+        }
+    }
+
+    /// Every volume an old-style name can number gets the name RAR writes,
+    /// and reads back as that volume: `.s00` follows `.r99`, through `.z99`.
+    #[test]
+    fn old_style_volume_names_are_written_as_they_are_read() {
+        for (index, extension) in [
+            (0, Some("rar")),
+            (1, Some("r00")),
+            (100, Some("r99")),
+            (101, Some("s00")),
+            (118, Some("s17")),
+            (900, Some("z99")),
+            (901, None),
+        ] {
+            assert_eq!(
+                old_rar_volume_extension(index).as_deref(),
+                extension,
+                "volume {index}"
+            );
+        }
+        for index in 0..=900 {
+            let extension = old_rar_volume_extension(index).unwrap();
+            let path = PathBuf::from(format!("movie.{extension}"));
+            assert!(looks_rarish_by_name(&path), "{extension}");
+            assert_eq!(filename_volume_index(&path), index, "{extension}");
+        }
+    }
+
+    /// A volume is read at its own number, counted from the first one
+    /// present, so a missing volume's slot stays empty: `a.r01` is volume
+    /// 2 whether or not `a.r00` is there. A volume without a number, or
+    /// with the number of the one before it, follows that one.
+    #[test]
+    fn volumes_keep_their_slots_around_a_missing_volume() {
+        let set = |volumes: &[(&str, usize)]| RarSet {
+            id: "dir:a".to_string(),
+            label: "a".to_string(),
+            base_dir: PathBuf::from("dir"),
+            volumes: volumes
+                .iter()
+                .map(|(name, sort_index)| RarVolume {
+                    path: PathBuf::from(name),
+                    volume_number: None,
+                    sort_index: *sort_index,
+                    is_first_volume: false,
+                })
+                .collect(),
+            recovery_volumes: Vec::new(),
+        };
+        for (volumes, slots) in [
+            (
+                &[("a.rar", 0), ("a.r01", 2), ("a.r02", 3)][..],
+                &[(0, "a.rar"), (2, "a.r01"), (3, "a.r02")][..],
+            ),
+            (
+                &[("a.r02", 3), ("a.r00", 1), ("a.r01", 2)][..],
+                &[(0, "a.r00"), (1, "a.r01"), (2, "a.r02")][..],
+            ),
+            (
+                &[("x.bin", usize::MAX), ("w.bin", usize::MAX)][..],
+                &[(0, "w.bin"), (1, "x.bin")][..],
+            ),
+            (
+                &[("a.r00", 0), ("a.rar", 0), ("a.r01", 0)][..],
+                &[(0, "a.r00"), (1, "a.r01"), (2, "a.rar")][..],
+            ),
+            (
+                &[("a.rar", 0), ("a.r00", 1), ("odd", usize::MAX)][..],
+                &[(0, "a.rar"), (1, "a.r00"), (2, "odd")][..],
+            ),
+        ] {
+            let set = set(volumes);
+            let expected = slots
+                .iter()
+                .map(|(slot, name)| (*slot, Path::new(name)))
+                .collect::<Vec<_>>();
+            assert_eq!(set.volume_slots(), expected, "{volumes:?}");
+        }
     }
 
     #[test]

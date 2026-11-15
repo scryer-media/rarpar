@@ -248,32 +248,14 @@ pub fn open_set_with_password(
     set: &RarSet,
     password: Option<&str>,
 ) -> Result<unrar_rs::RarArchive, unrar_rs::RarError> {
-    let mut paths = set
-        .volumes
-        .iter()
-        .map(|volume| volume.path.clone())
-        .collect::<Vec<_>>();
-    paths.sort_by_key(|path| {
-        set.volumes
-            .iter()
-            .find(|volume| volume.path == *path)
-            .map(|volume| volume.sort_index)
-            .unwrap_or(usize::MAX)
-    });
-    open_paths_with_password(&paths, password)
-}
-
-fn open_paths_with_password(
-    paths: &[PathBuf],
-    password: Option<&str>,
-) -> Result<unrar_rs::RarArchive, unrar_rs::RarError> {
-    if paths.is_empty() {
+    let slots = set.volume_slots();
+    let Some((_, first)) = slots.first() else {
         return Err(unrar_rs::RarError::CorruptArchive {
             detail: "no RAR volumes provided".to_string(),
         });
-    }
+    };
 
-    let first = File::open(&paths[0]).map_err(unrar_rs::RarError::Io)?;
+    let first = File::open(first).map_err(unrar_rs::RarError::Io)?;
     let mut archive = if let Some(password) = password {
         unrar_rs::RarArchive::open_with_password(first, password)?
     } else {
@@ -284,9 +266,9 @@ fn open_paths_with_password(
         archive.set_password(password.to_string());
     }
 
-    for (index, path) in paths.iter().enumerate().skip(1) {
+    for &(slot, path) in slots.iter().skip(1) {
         let file = File::open(path).map_err(unrar_rs::RarError::Io)?;
-        archive.add_volume(index, Box::new(file) as Box<dyn unrar_rs::ReadSeek>)?;
+        archive.add_volume(slot, Box::new(file) as Box<dyn unrar_rs::ReadSeek>)?;
     }
     Ok(archive)
 }
