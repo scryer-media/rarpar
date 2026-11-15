@@ -5135,6 +5135,100 @@ mod tests {
         rar4_block(0x7B, 0, &[])
     }
 
+    /// RAR 3.1.0 to 3.3.0 volumes and one new-style `.rev`: every data
+    /// volume ends in flags 0x4007 (0x4006 on the last), a data CRC and the
+    /// seven reserved bytes the `.rev` footer takes, and states no volume
+    /// number. The `.rev` is the RAR3 Reed-Solomon parity of the volumes'
+    /// bytes, byte by byte, then its footer.
+    fn old_rar3_set_with_one_rev(dir: &Path, stem: &str) -> (Vec<PathBuf>, Vec<Vec<u8>>) {
+        use crate::rar4::types::{archive_flags, file_flags};
+        let chunks: [&[u8]; 3] = [&[0x11; 40], &[0x22; 40], &[0x33; 9]];
+        let mut volumes = Vec::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let last = index + 1 == chunks.len();
+            let mut flags = archive_flags::VOLUME | archive_flags::NEW_NUMBERING;
+            if index == 0 {
+                flags |= archive_flags::FIRST_VOLUME;
+            }
+            let mut bytes = rar4_volume_start(flags);
+            let mut file = rar4_stored_file_header(b"payload.bin", chunk.len() as u64);
+            let mut split = 0;
+            if index > 0 {
+                split |= file_flags::SPLIT_BEFORE;
+            }
+            if !last {
+                split |= file_flags::SPLIT_AFTER;
+            }
+            // The split bits sit in the header's flags, under its CRC16.
+            let header_flags = u16::from_le_bytes([file[3], file[4]]) | split;
+            file = rar4_block(0x74, header_flags, &file[7..]);
+            bytes.extend_from_slice(&file);
+            bytes.extend_from_slice(chunk);
+            let mut end = crc32fast::hash(&bytes).to_le_bytes().to_vec();
+            end.extend_from_slice(&[0u8; 7]);
+            let end_flags = if last { 0x4006 } else { 0x4007 };
+            bytes.extend_from_slice(&rar4_block(0x7B, end_flags, &end));
+            volumes.push(bytes);
+        }
+
+        let len = volumes.iter().map(Vec::len).max().unwrap();
+        let coder = Rar3RsCoder::new(1).unwrap();
+        let mut rev = vec![0u8; len];
+        for (position, parity) in rev.iter_mut().enumerate().take(len - 7) {
+            let column = volumes
+                .iter()
+                .map(|volume| volume.get(position).copied().unwrap_or(0))
+                .collect::<Vec<_>>();
+            let mut out = [0u8; 1];
+            coder.encode(&column, &mut out);
+            *parity = out[0];
+        }
+        // Three data volumes, one recovery volume, this one the first; each
+        // less one. Then the CRC32 of every byte before the CRC.
+        rev[len - 7..len - 4].copy_from_slice(&[2, 0, 0]);
+        let crc = crc32fast::hash(&rev[..len - 4]);
+        rev[len - 4..].copy_from_slice(&crc.to_le_bytes());
+
+        let mut paths = Vec::new();
+        for (index, volume) in volumes.iter().enumerate() {
+            let path = dir.join(format!("{stem}.part{}.rar", index + 1));
+            std::fs::write(&path, volume).unwrap();
+            paths.push(path);
+        }
+        let rev_path = dir.join(format!("{stem}.part1.rev"));
+        std::fs::write(&rev_path, &rev).unwrap();
+        paths.push(rev_path);
+        (paths, volumes)
+    }
+
+    /// A RAR 3.1.0-3.3.0 set rebuilds a lost data volume: its end records
+    /// state no volume number, so every volume holds its slot. Read with the
+    /// reserved-space bit as the number bit, every volume stated number 0
+    /// and the set had too few volumes to rebuild.
+    #[test]
+    fn rar3_set_whose_end_records_state_no_number_rebuilds_a_lost_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut paths, volumes) = old_rar3_set_with_one_rev(dir.path(), "old_rev");
+        for (index, path) in paths.iter().take(volumes.len()).enumerate() {
+            let scan = rar3_volume_scan_path(path).unwrap().unwrap();
+            assert_eq!(scan.status, DataVolumeStatus::Valid, "volume {index}");
+            assert_eq!(scan.end_volume_number, None, "volume {index}");
+            assert_eq!(
+                rar3_volume_status(&scan, index),
+                DataVolumeStatus::Valid,
+                "volume {index}"
+            );
+        }
+
+        let lost = paths.remove(1);
+        std::fs::remove_file(&lost).unwrap();
+        let report = restore_volumes_from_paths(&paths, &RecoveryOptions::default()).unwrap();
+
+        assert_eq!(report.restored_paths, vec![lost.clone()]);
+        assert_eq!(std::fs::read(&lost).unwrap(), volumes[1]);
+        assert_eq!(stray_partials(dir.path(), &[]), Vec::<PathBuf>::new());
+    }
+
     fn open_rw(path: &Path) -> File {
         OpenOptions::new()
             .read(true)
