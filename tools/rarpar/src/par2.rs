@@ -591,6 +591,11 @@ fn run_flow(
             }
             .into());
         }
+        // A file past the verifier's limits was never read: it has no missing
+        // blocks on record, and it is not verified either.
+        if let par2_rs::Repairability::ResourceLimited { reason } = &verification.repairable {
+            return Err(RarparError::Resource(reason.clone()));
+        }
         let success = verification.total_missing_blocks == 0;
         return Ok(ParOutcome {
             set_id: resolved.set_id.clone(),

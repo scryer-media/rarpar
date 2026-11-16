@@ -762,12 +762,18 @@ fn par_metadata_fixture(root: &Path, main_only: bool, keep_deferred: bool) {
         "{}",
         String::from_utf8_lossy(&created.stderr)
     );
-    for entry in std::fs::read_dir(root).unwrap() {
-        let path = entry.unwrap().path();
+    let paths: Vec<PathBuf> = std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    for (index, path) in paths.into_iter().enumerate() {
         if path.extension() != Some(OsStr::new("par2")) {
             continue;
         }
         if keep_deferred && path.file_name() != Some(OsStr::new("set.par2")) {
+            // An intact volume under a name the fast pass does not match, so
+            // only the deferred pass can find its descriptions.
+            std::fs::rename(&path, root.join(format!("obfuscated{index}.bin"))).unwrap();
             continue;
         }
         let bytes = std::fs::read(&path).unwrap();
