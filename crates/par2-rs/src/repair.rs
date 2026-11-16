@@ -119,6 +119,11 @@ pub fn plan_repair_with_memory_limit(
                 deficit: *deficit,
             });
         }
+        Repairability::IncompleteMetadata { file_ids } => {
+            return Err(Par2Error::InsufficientCriticalData {
+                reason: format!("missing File Description packets for {file_ids:?}"),
+            });
+        }
         Repairability::ResourceLimited { reason } => {
             return Err(Par2Error::ResourceLimitExceeded {
                 reason: format!("PAR2 verification is resource-limited: {reason}"),

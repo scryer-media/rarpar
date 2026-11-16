@@ -738,6 +738,136 @@ fn auto_rediscovers_rar_volumes_after_par2_repair() {
     assert!(work_dir.join("rar5_lz_plain_clip.mkv").is_file());
 }
 
+// Generate with the CLI, then drop whole authenticated packets. The Main
+// packet still advertises both files and every retained packet keeps its hash.
+fn par_metadata_fixture(root: &Path, main_only: bool, keep_deferred: bool) {
+    std::fs::write(root.join("a.bin"), b"AAAA").unwrap();
+    std::fs::write(root.join("b.bin"), b"BBBB").unwrap();
+    let created = run_in_dir(
+        root,
+        &[
+            OsStr::new("par"),
+            OsStr::new("create"),
+            OsStr::new("set.par2"),
+            OsStr::new("--block-size"),
+            OsStr::new("4"),
+            OsStr::new("--recovery-count"),
+            OsStr::new("1"),
+            OsStr::new("a.bin"),
+            OsStr::new("b.bin"),
+        ],
+    );
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    for entry in std::fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension() != Some(OsStr::new("par2")) {
+            continue;
+        }
+        if keep_deferred && path.file_name() != Some(OsStr::new("set.par2")) {
+            continue;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let mut retained = Vec::new();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let len =
+                u64::from_le_bytes(bytes[offset + 8..offset + 16].try_into().unwrap()) as usize;
+            let packet = &bytes[offset..offset + len];
+            let kind = &packet[48..64];
+            let keep = if main_only {
+                kind == b"PAR 2.0\0Main\0\0\0\0" || kind == b"PAR 2.0\0Creator\0"
+            } else {
+                kind != b"PAR 2.0\0FileDesc"
+                    || packet[120..]
+                        .strip_suffix(&[0, 0, 0])
+                        .unwrap_or(&packet[120..])
+                        != b"b.bin"
+            };
+            if keep {
+                retained.extend_from_slice(packet);
+            }
+            offset += len;
+        }
+        std::fs::write(path, retained).unwrap();
+    }
+}
+
+fn par_metadata_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            (
+                path.file_name().unwrap().into(),
+                std::fs::read(path).unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn par_missing_descriptions_refuse_verify_and_repair_without_writes() {
+    for main_only in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        par_metadata_fixture(root, main_only, false);
+        std::fs::remove_file(root.join("b.bin")).unwrap();
+        let before = par_metadata_snapshot(root);
+        for placement in ["smart", "canonical"] {
+            for fast in ["0", "1"] {
+                for (command, dry_run) in [("verify", false), ("repair", false), ("repair", true)] {
+                    let mut process = Command::new(bin());
+                    process
+                        .current_dir(root)
+                        .env("WEAVER_PAR2_FAST_VERIFY", fast)
+                        .args(["--json", "--par-placement", placement]);
+                    if dry_run {
+                        process.arg("--dry-run");
+                    }
+                    let output = process.args(["par", command, "set.par2"]).output().unwrap();
+                    assert!(
+                        !output.status.success(),
+                        "{main_only} {placement} {fast} {command}: {}",
+                        String::from_utf8_lossy(&output.stdout)
+                    );
+                    assert_eq!(par_metadata_snapshot(root), before);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn par_missing_description_is_loaded_from_a_deferred_volume() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    par_metadata_fixture(root, false, true);
+    let before = par_metadata_snapshot(root);
+    for placement in ["smart", "canonical"] {
+        let output = run_in_dir(
+            root,
+            &[
+                OsStr::new("--json"),
+                OsStr::new("--par-placement"),
+                OsStr::new(placement),
+                OsStr::new("par"),
+                OsStr::new("verify"),
+                OsStr::new("set.par2"),
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(par_metadata_snapshot(root), before);
+    }
+}
+
 #[test]
 fn par_repair_dry_run_does_not_create_missing_file() {
     let temp = tempfile::tempdir().unwrap();

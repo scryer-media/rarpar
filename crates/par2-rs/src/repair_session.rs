@@ -1163,7 +1163,9 @@ impl Par2RepairSession {
             match &verification.repairable {
                 Repairability::NotNeeded => Par2RepairStatus::Verified,
                 Repairability::Repairable { .. } => Par2RepairStatus::RepairPossible,
-                Repairability::Insufficient { .. } => Par2RepairStatus::Insufficient,
+                Repairability::Insufficient { .. } | Repairability::IncompleteMetadata { .. } => {
+                    Par2RepairStatus::Insufficient
+                }
                 Repairability::ResourceLimited { .. } => Par2RepairStatus::ResourceLimited,
             }
         };

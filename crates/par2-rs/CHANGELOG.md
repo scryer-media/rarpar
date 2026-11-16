@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.13.0
+
+### Changed
+
+- `Repairability::IncompleteMetadata { file_ids }` reports selected files
+  without File Description packets instead of silently omitting them from
+  a successful verdict. Callers matching `Repairability` must handle the
+  new variant. Partial sets remain loadable for incremental discovery.
+- Serial and parallel verification, result aggregation, repairability
+  refresh and incremental result merges retain unresolved metadata until
+  each affected file is verified after its description arrives. Repair
+  planning refuses an incomplete result as insufficient critical data.
+
 ## 0.12.1
 
 No API changes.

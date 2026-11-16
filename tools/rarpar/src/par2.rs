@@ -585,6 +585,12 @@ fn run_flow(
     }
 
     if !repair {
+        if let par2_rs::Repairability::IncompleteMetadata { file_ids } = &verification.repairable {
+            return Err(par2_rs::Par2Error::InsufficientCriticalData {
+                reason: format!("missing File Description packets for {file_ids:?}"),
+            }
+            .into());
+        }
         let success = verification.total_missing_blocks == 0;
         return Ok(ParOutcome {
             set_id: resolved.set_id.clone(),
@@ -631,6 +637,12 @@ fn run_flow(
                     .map(|file| resolved.primary_dir.join(&file.filename))
                     .collect(),
             });
+        }
+        par2_rs::Repairability::IncompleteMetadata { file_ids } => {
+            return Err(par2_rs::Par2Error::InsufficientCriticalData {
+                reason: format!("missing File Description packets for {file_ids:?}"),
+            }
+            .into());
         }
         par2_rs::Repairability::ResourceLimited { reason } => {
             return Err(RarparError::Resource(reason.clone()));
@@ -1640,6 +1652,11 @@ fn print_verification_report(
             blocks_available,
             deficit
         ),
+        par2_rs::Repairability::IncompleteMetadata { file_ids } => {
+            safe_println!(
+                "repairability: incomplete metadata (missing descriptions: {file_ids:?})"
+            );
+        }
         par2_rs::Repairability::ResourceLimited { reason } => {
             safe_println!("repairability: resource-limited ({reason})")
         }

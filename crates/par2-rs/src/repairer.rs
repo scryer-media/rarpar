@@ -1598,17 +1598,19 @@ impl Par2Repairer {
         let carry = want_carry.then(|| Arc::new(state.scan_carry(&scan)));
 
         if carry_diagnostics.carry_applied {
-            let status =
-                if verification.total_missing_blocks == 0 && state.files_are_canonical_complete() {
-                    Par2RepairStatus::Verified
-                } else {
-                    match &verification.repairable {
-                        Repairability::NotNeeded => Par2RepairStatus::Verified,
-                        Repairability::Repairable { .. } => Par2RepairStatus::RepairPossible,
-                        Repairability::Insufficient { .. } => Par2RepairStatus::Insufficient,
-                        Repairability::ResourceLimited { .. } => Par2RepairStatus::ResourceLimited,
-                    }
-                };
+            let status = if verification.total_missing_blocks == 0
+                && state.files_are_canonical_complete()
+            {
+                Par2RepairStatus::Verified
+            } else {
+                match &verification.repairable {
+                    Repairability::NotNeeded => Par2RepairStatus::Verified,
+                    Repairability::Repairable { .. } => Par2RepairStatus::RepairPossible,
+                    Repairability::Insufficient { .. }
+                    | Repairability::IncompleteMetadata { .. } => Par2RepairStatus::Insufficient,
+                    Repairability::ResourceLimited { .. } => Par2RepairStatus::ResourceLimited,
+                }
+            };
             // Only a request that will actually rewrite the tree can consume
             // the carried analysis. Every other carried result — a clean
             // verify (which may still purge), an insufficient or
@@ -1686,7 +1688,9 @@ impl Par2Repairer {
             let status = match &verification.repairable {
                 Repairability::NotNeeded => Par2RepairStatus::Verified,
                 Repairability::Repairable { .. } => Par2RepairStatus::RepairPossible,
-                Repairability::Insufficient { .. } => Par2RepairStatus::Insufficient,
+                Repairability::Insufficient { .. } | Repairability::IncompleteMetadata { .. } => {
+                    Par2RepairStatus::Insufficient
+                }
                 Repairability::ResourceLimited { .. } => Par2RepairStatus::ResourceLimited,
             };
             return Ok(RepairPassResult::Success(RepairPassSuccess::new(
@@ -1700,7 +1704,9 @@ impl Par2Repairer {
 
         if matches!(
             &verification.repairable,
-            Repairability::Insufficient { .. } | Repairability::ResourceLimited { .. }
+            Repairability::Insufficient { .. }
+                | Repairability::IncompleteMetadata { .. }
+                | Repairability::ResourceLimited { .. }
         ) {
             let status = match &verification.repairable {
                 Repairability::ResourceLimited { .. } => Par2RepairStatus::ResourceLimited,
