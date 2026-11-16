@@ -1416,11 +1416,18 @@ impl RepairPassSuccess {
 }
 
 enum RepairPassResult {
-    Success(RepairPassSuccess),
+    // Boxed: the outcome is several times the size of the failure variant.
+    Success(Box<RepairPassSuccess>),
     PostRepairVerificationFailed {
         reason: String,
         carry: CarryDiagnostics,
     },
+}
+
+impl RepairPassResult {
+    fn success(success: RepairPassSuccess) -> Self {
+        Self::Success(Box::new(success))
+    }
 }
 
 impl Par2Repairer {
@@ -1457,7 +1464,7 @@ impl Par2Repairer {
         // `execute_repair_with_options`' own deferral.
         let _cache_retention = crate::file_cache::CacheEvictionDeferral::acquire();
         match self.verify_or_repair_pass(want_carry)? {
-            RepairPassResult::Success(success) => self.finish_or_retry(success, want_carry),
+            RepairPassResult::Success(success) => self.finish_or_retry(*success, want_carry),
             RepairPassResult::PostRepairVerificationFailed { reason, carry } => {
                 if carry.carry_applied {
                     debug!(
@@ -1633,7 +1640,7 @@ impl Par2Repairer {
                 // Not a mutating request: report the carried result and let
                 // the caller re-establish it from a fresh scan.
                 Ok(None) => {
-                    return Ok(RepairPassResult::Success(RepairPassSuccess::new(
+                    return Ok(RepairPassResult::success(RepairPassSuccess::new(
                         Self::with_carry_diagnostics(
                             state.outcome(status, 0, 0, packet_diagnostics, scan, verification),
                             &carry_diagnostics,
@@ -1652,7 +1659,7 @@ impl Par2Repairer {
                         ?reason,
                         "carried PAR2 repair inputs no longer match their scan-time fingerprints"
                     );
-                    return Ok(RepairPassResult::Success(RepairPassSuccess {
+                    return Ok(RepairPassResult::success(RepairPassSuccess {
                         outcome: Self::with_carry_diagnostics(
                             state.outcome(status, 0, 0, packet_diagnostics, scan, verification),
                             &carry_diagnostics,
@@ -1668,7 +1675,7 @@ impl Par2Repairer {
             if self.options.purge {
                 purge_files_best_effort(&purge_paths);
             }
-            return Ok(RepairPassResult::Success(RepairPassSuccess::new(
+            return Ok(RepairPassResult::success(RepairPassSuccess::new(
                 Self::with_carry_diagnostics(
                     state.outcome(
                         Par2RepairStatus::Verified,
@@ -1693,7 +1700,7 @@ impl Par2Repairer {
                 }
                 Repairability::ResourceLimited { .. } => Par2RepairStatus::ResourceLimited,
             };
-            return Ok(RepairPassResult::Success(RepairPassSuccess::new(
+            return Ok(RepairPassResult::success(RepairPassSuccess::new(
                 Self::with_carry_diagnostics(
                     state.outcome(status, 0, 0, packet_diagnostics, scan, verification),
                     &carry_diagnostics,
@@ -1712,7 +1719,7 @@ impl Par2Repairer {
                 Repairability::ResourceLimited { .. } => Par2RepairStatus::ResourceLimited,
                 _ => Par2RepairStatus::Insufficient,
             };
-            return Ok(RepairPassResult::Success(RepairPassSuccess::new(
+            return Ok(RepairPassResult::success(RepairPassSuccess::new(
                 Self::with_carry_diagnostics(
                     state.outcome(status, 0, 0, packet_diagnostics, scan, verification),
                     &carry_diagnostics,
@@ -1739,7 +1746,7 @@ impl Par2Repairer {
                         %error,
                         "carried PAR2 repair read a changed source; retrying from a fresh scan"
                     );
-                    return Ok(RepairPassResult::Success(RepairPassSuccess {
+                    return Ok(RepairPassResult::success(RepairPassSuccess {
                         outcome: Self::with_carry_diagnostics(
                             state.outcome(
                                 Par2RepairStatus::RepairPossible,
@@ -1803,7 +1810,7 @@ impl Par2Repairer {
             purge_files_best_effort(&purge_paths);
         }
 
-        Ok(RepairPassResult::Success(RepairPassSuccess::new(
+        Ok(RepairPassResult::success(RepairPassSuccess::new(
             Self::with_carry_diagnostics(
                 state.outcome(
                     Par2RepairStatus::Repaired,
