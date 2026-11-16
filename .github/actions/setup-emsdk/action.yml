@@ -29,14 +29,19 @@ runs:
         git -C "$root" checkout -q FETCH_HEAD
         "$root/emsdk" install "$EMSDK_VERSION"
         "$root/emsdk" activate "$EMSDK_VERSION"
+        emsdk_version="$EMSDK_VERSION"
         # emsdk_env.sh reads variables that may be unset.
         set +u
         # shellcheck disable=SC1091
         source "$root/emsdk_env.sh"
         set -u
-        emcc --version
         # Assert the pin instead of trusting that the install resolved it.
-        emcc --version | head -n 1 | grep -qF "$EMSDK_VERSION"
+        # emsdk_env.sh clears EMSDK_VERSION, so the pin is read from the copy.
+        # Read whole before matching: a reader that closes the pipe early
+        # fails emcc under pipefail.
+        reported="$(emcc --version)"
+        grep -qF "$emsdk_version" <<<"$reported"
+        echo "$reported"
         node --version
         {
           echo "$EMSDK/upstream/emscripten"
