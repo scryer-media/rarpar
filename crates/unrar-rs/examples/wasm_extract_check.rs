@@ -15,7 +15,7 @@
 //!     decode path that Gate 2 forces onto the single-thread route on wasm),
 //!     capturing bytes into an in-memory buffer.
 //!
-//! Build (wasm):
+//! Build (WASI; `wasm32-wasip2` builds the same way, as a component):
 //!   RUSTFLAGS="-C target-feature=+simd128" cargo build --release \
 //!     -p unrar-rs --no-default-features --features crypto-rust \
 //!     --target wasm32-wasip1 --example wasm_extract_check
@@ -24,8 +24,23 @@
 //!   wasmtime run --dir <fixtures>::/fixtures --dir <tmp>::/tmp --env TMPDIR=/tmp \
 //!     target/wasm32-wasip1/release/examples/wasm_extract_check.wasm /fixtures
 //!
-//! Also runnable natively for parity debugging:
-//!   cargo run --release -p unrar-rs --example wasm_extract_check -- <fixtures>
+//! Build (Emscripten 7; the link arguments give it the host's files through
+//! Node, a heap that grows, and a stack the decoders fit in):
+//!   RUSTFLAGS="-C target-feature=+simd128 -C link-arg=-sNODERAWFS=1 \
+//!     -C link-arg=-sALLOW_MEMORY_GROWTH=1 -C link-arg=-sSTACK_SIZE=1MB" \
+//!     cargo build --release -p unrar-rs --no-default-features \
+//!     --features crypto-rust --target wasm32-unknown-emscripten \
+//!     --example wasm_extract_check
+//!
+//! Run (Node; the fixtures are a host path):
+//!   TZ=UTC node \
+//!     target/wasm32-unknown-emscripten/release/examples/wasm_extract_check.js \
+//!     <fixtures>
+//!
+//! Also runnable natively for parity debugging. The digests cover RAR4
+//! modification times, which are local times: `TZ=UTC` is what makes a
+//! native or Emscripten run agree with WASI, which has no zone.
+//!   TZ=UTC cargo run --release -p unrar-rs --example wasm_extract_check -- <fixtures>
 
 use std::cell::RefCell;
 use std::fs::File;
@@ -231,8 +246,11 @@ struct Outcome {
     members_extracted: usize,
     total_bytes: u64,
     spilled_members: usize,
-    /// Rolling digest over every extracted member's name and bytes, in member
-    /// order. The extractor already verifies each member's CRC32/BLAKE2sp
+    /// Rolling digest over every extracted member's name, modification time
+    /// and bytes, in member order. The time is what makes a lane's reading
+    /// of a RAR4 DOS local time part of the comparison: the native reference
+    /// runs with `TZ=UTC`, which is the zone every wasm lane must land on.
+    /// The extractor already verifies each member's CRC32/BLAKE2sp
     /// internally, so this is not a second correctness check — it is the
     /// cross-lane identity gate: native and every wasm lane must agree on the
     /// exact decoded bytes, which a per-member CRC verified independently on
@@ -250,6 +268,15 @@ fn digest64(state: u64, bytes: &[u8]) -> u64 {
     hash ^= bytes.len() as u64;
     hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
     hash ^ (hash >> 33)
+}
+
+/// A member's modification time as whole seconds since the epoch, for the
+/// digest; `u64::MAX` stands for a member that carries none.
+fn mtime_secs(member: &MemberInfo) -> u64 {
+    member
+        .mtime
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(u64::MAX, |d| d.as_secs())
 }
 
 /// Which arithmetic build this binary is, for the report header.
@@ -370,6 +397,7 @@ fn extract_case(root: &Path, case: &Case) -> Result<Outcome, String> {
             out.members_extracted += 1;
             out.total_bytes += buf.borrow().len() as u64;
             out.digest = digest64(out.digest, member.name.as_bytes());
+            out.digest = digest64(out.digest, &mtime_secs(member).to_le_bytes());
             out.digest = digest64(out.digest, &buf.borrow());
         } else {
             // Deliberately the buffered entry point: the spool decision this
@@ -393,6 +421,7 @@ fn extract_case(root: &Path, case: &Case) -> Result<Outcome, String> {
                 )
             })?;
             out.digest = digest64(out.digest, member.name.as_bytes());
+            out.digest = digest64(out.digest, &mtime_secs(member).to_le_bytes());
             out.digest = digest64(out.digest, &bytes);
         }
     }

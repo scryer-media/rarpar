@@ -194,6 +194,14 @@ pub struct MemberInfo {
     /// final part's header when that volume is added, or, for a member
     /// extracted through a volume provider, during that extraction.
     pub crc32: Option<u32>,
+    /// Modification time.
+    ///
+    /// RAR5 stores an instant. RAR 1.4-4.x stores a DOS local date and time
+    /// with no zone, which is converted with the host's time zone where
+    /// there is one to ask (Unix and Emscripten through libc `mktime`,
+    /// Windows through its own API) and read as UTC where there is not:
+    /// WASI, whose libc has no zone, and targets with no libc at all, such
+    /// as `wasm32-unknown-unknown`. The same holds for `ctime` and `atime`.
     pub mtime: Option<SystemTime>,
     pub ctime: Option<SystemTime>,
     pub atime: Option<SystemTime>,

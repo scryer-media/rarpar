@@ -327,7 +327,7 @@ unrar)
 		;;
 	wasm)
 		[ "$spilled" -eq 0 ] ||
-			die "$harness: wasm lane reports tempfile_spilled_members=$spilled, but WASI preview1 has no usable temp dir; the spool's wasm gate has changed"
+			die "$harness: wasm lane reports tempfile_spilled_members=$spilled, but the spool never spills on a wasm target; its wasm gate has changed"
 		;;
 	esac
 

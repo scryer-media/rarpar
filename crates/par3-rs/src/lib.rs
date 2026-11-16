@@ -262,9 +262,9 @@ pub mod inside;
 pub mod layout;
 pub mod mount;
 pub mod placement;
-#[cfg(not(target_os = "wasi"))]
+#[cfg(not(any(target_os = "wasi", target_os = "unknown")))]
 mod repair_tree;
-#[cfg(target_os = "wasi")]
+#[cfg(any(target_os = "wasi", target_os = "unknown"))]
 #[path = "repair_tree_wasi.rs"]
 mod repair_tree;
 pub mod runtime;

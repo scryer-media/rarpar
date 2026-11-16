@@ -3269,9 +3269,9 @@ pub(crate) fn contained_destination(base: &Path, relative: &str) -> EngineResult
 /// [`EngineError::Io`] when `relative` is not a plain relative path, a
 /// component is a symbolic link or not a directory, or creation fails.
 pub fn create_directory(base: &Path, relative: &str) -> EngineResult<()> {
-    #[cfg(not(target_os = "wasi"))]
+    #[cfg(not(any(target_os = "wasi", target_os = "unknown")))]
     crate::repair_tree::create_directory(base, relative)?;
-    #[cfg(target_os = "wasi")]
+    #[cfg(any(target_os = "wasi", target_os = "unknown"))]
     {
         crate::paths::validate_relative_path(relative).map_err(|error| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())

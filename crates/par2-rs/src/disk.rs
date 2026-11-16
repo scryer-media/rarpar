@@ -173,17 +173,43 @@ fn open_repair_output(base_dir: &Path, destination: &Path) -> io::Result<File> {
     }
 }
 
+/// The directory a repair path's last component lives in: the base directory
+/// itself, or one opened beneath it.
+///
+/// The base is borrowed, not duplicated: `File::try_clone` is `Unsupported`
+/// on every wasm32 target, Emscripten included.
 #[cfg(unix)]
-fn unix_repair_parent(
-    mut directory: File,
+enum RepairParent<'a> {
+    Base(&'a File),
+    Below(File),
+}
+
+#[cfg(unix)]
+impl AsRawFd for RepairParent<'_> {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        match self {
+            Self::Base(directory) => directory.as_raw_fd(),
+            Self::Below(directory) => directory.as_raw_fd(),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unix_repair_parent<'a>(
+    base: &'a File,
     components: &[&OsStr],
     create: bool,
-) -> io::Result<(File, CString)> {
+) -> io::Result<(RepairParent<'a>, CString)> {
     let (filename, parent_components) = components.split_last().expect("checked non-empty");
+    let mut parent = RepairParent::Base(base);
     for component in parent_components {
-        directory = open_directory_at(&directory, component, create)?;
+        let below = match &parent {
+            RepairParent::Base(directory) => open_directory_at(directory, component, create)?,
+            RepairParent::Below(directory) => open_directory_at(directory, component, create)?,
+        };
+        parent = RepairParent::Below(below);
     }
-    Ok((directory, c_component(filename)?))
+    Ok((parent, c_component(filename)?))
 }
 
 #[cfg(unix)]
@@ -206,8 +232,8 @@ pub(crate) fn rename_within_base(base_dir: &Path, from: &Path, to: &Path) -> io:
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
         .open(base_dir)?;
-    let (from_parent, from_name) = unix_repair_parent(root.try_clone()?, &from_components, false)?;
-    let (to_parent, to_name) = unix_repair_parent(root, &to_components, true)?;
+    let (from_parent, from_name) = unix_repair_parent(&root, &from_components, false)?;
+    let (to_parent, to_name) = unix_repair_parent(&root, &to_components, true)?;
 
     // SAFETY: both directory descriptors and C strings remain valid for the
     // call. `renameat` operates on the link entries themselves and therefore
@@ -240,7 +266,7 @@ pub(crate) fn remove_file_within_base(base_dir: &Path, path: &Path) -> io::Resul
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
         .open(base_dir)?;
-    let (parent, filename) = unix_repair_parent(root, &components, false)?;
+    let (parent, filename) = unix_repair_parent(&root, &components, false)?;
 
     // SAFETY: the directory descriptor and C string remain valid for the
     // call. With no removal flags, `unlinkat` removes a file or symlink entry

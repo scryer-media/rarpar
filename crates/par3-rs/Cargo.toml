@@ -2,7 +2,7 @@
 name = "par3-rs"
 description = "PAR3 (Parity Volume Set 3.0) packet parsing, set inspection, verification, creation and repair — work in progress"
 readme = "README.md"
-version = "0.8.2"
+version = "0.8.3"
 edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0"
@@ -34,7 +34,7 @@ reedsolomon-rs = { path = "../reedsolomon-rs", version = "0.4.10", default-featu
 rayon = { workspace = true, default-features = false }
 unicode-normalization = { workspace = true }
 
-[target.'cfg(not(target_os = "wasi"))'.dependencies]
+[target.'cfg(not(any(target_os = "wasi", target_os = "unknown")))'.dependencies]
 cap-std = "4.0.3"
 
 # Repair stages a damaged file as a clone of itself where the filesystem can

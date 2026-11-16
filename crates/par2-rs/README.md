@@ -8,7 +8,7 @@ and no `par2` program needed.
 
 ```toml
 [dependencies]
-par2-rs = "0.11"
+par2-rs = "0.12"
 ```
 
 ## Usage
