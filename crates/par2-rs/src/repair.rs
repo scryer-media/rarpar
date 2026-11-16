@@ -119,12 +119,32 @@ pub fn plan_repair_with_memory_limit(
                 deficit: *deficit,
             });
         }
+        Repairability::IncompleteMetadata { file_ids } => {
+            return Err(Par2Error::InsufficientCriticalData {
+                reason: format!("missing File Description packets for {file_ids:?}"),
+            });
+        }
         Repairability::ResourceLimited { reason } => {
             return Err(Par2Error::ResourceLimitExceeded {
                 reason: format!("PAR2 verification is resource-limited: {reason}"),
             });
         }
         Repairability::Repairable { .. } => {}
+    }
+
+    // A file without a description has an unknown slice count, so every file
+    // after it would land at the wrong global slice index. Refuse whatever
+    // the caller's verdict says.
+    let undescribed: Vec<FileId> = par2_set
+        .recovery_file_ids
+        .iter()
+        .copied()
+        .filter(|id| par2_set.file_description(id).is_none())
+        .collect();
+    if !undescribed.is_empty() {
+        return Err(Par2Error::InsufficientCriticalData {
+            reason: format!("missing File Description packets for {undescribed:?}"),
+        });
     }
 
     // Build the global slice index mapping.

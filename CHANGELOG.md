@@ -3,6 +3,15 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.9.6
+
+- PAR2 verify and repair refuse success when a protected file still has no
+  File Description packet after searching the available volumes. No output
+  is repaired or removed while this metadata remains incomplete.
+- `par verify` fails with the resource-limit error when a file has more
+  slices than the verifier reads, as `par repair` already did, instead of
+  reporting success for a file it never read.
+
 ## rarpar 0.9.5
 
 - PAR2 verify and repair no longer hash a slice for every byte of a long run

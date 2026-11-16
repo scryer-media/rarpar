@@ -222,6 +222,9 @@ pub enum Repairability {
         blocks_available: u32,
         deficit: u32,
     },
+    /// Selected file IDs have no File Description packet. Their names, lengths
+    /// and hashes are unknown, so neither completeness nor repair can be proven.
+    IncompleteMetadata { file_ids: Vec<FileId> },
     /// Verification could not continue within configured resource limits.
     ResourceLimited { reason: String },
 }
@@ -229,6 +232,8 @@ pub enum Repairability {
 /// Overall verification result.
 #[derive(Debug, Clone)]
 pub struct VerificationResult {
+    /// Results for files with descriptions. IDs without descriptions are kept
+    /// in [`Repairability::IncompleteMetadata`], never silently verified.
     pub files: Vec<FileVerification>,
     /// Recovery blocks the set describes. Verification never reads a recovery
     /// payload, so this is [`Par2FileSet::recovery_block_count`]'s upper bound:
@@ -240,7 +245,8 @@ pub struct VerificationResult {
 
 impl VerificationResult {
     pub fn needs_repair(&self) -> bool {
-        self.total_missing_blocks > 0
+        matches!(self.repairable, Repairability::IncompleteMetadata { .. })
+            || self.total_missing_blocks > 0
             || self
                 .files
                 .iter()
@@ -248,6 +254,10 @@ impl VerificationResult {
     }
 
     pub fn refresh_repairability(&mut self) {
+        // Only a new verification can resolve an unknown file description.
+        if matches!(self.repairable, Repairability::IncompleteMetadata { .. }) {
+            return;
+        }
         if let Repairability::ResourceLimited { .. } = self.repairable
             && (self.total_missing_blocks > 0
                 || self
@@ -291,6 +301,32 @@ fn repairability_for_result_with_resource_limit(
     match resource_limit_reason {
         Some(reason) => Repairability::ResourceLimited { reason },
         None => repairability_for_result(files, total_missing_blocks, recovery_blocks_available),
+    }
+}
+
+/// The resource-limit reason for the first of `files` that is past the
+/// verifier's slice limit. [`Repairability::IncompleteMetadata`] replaces a
+/// [`Repairability::ResourceLimited`] verdict, so a merge re-derives the
+/// limit from the set instead of trusting the verdict to still carry it.
+fn slice_limit_reason(par2: &Par2FileSet, files: &[FileVerification]) -> Option<String> {
+    files.iter().find_map(|file| {
+        let desc = par2.file_description(&file.file_id)?;
+        bounded_slice_count(par2, desc.length)
+            .is_none()
+            .then(|| format!("file {} exceeds verifier slice limits", desc.filename))
+    })
+}
+
+pub(crate) fn with_missing_descriptions(
+    repairable: Repairability,
+    mut file_ids: Vec<FileId>,
+) -> Repairability {
+    if file_ids.is_empty() {
+        repairable
+    } else {
+        let mut seen = std::collections::HashSet::new();
+        file_ids.retain(|id| seen.insert(*id));
+        Repairability::IncompleteMetadata { file_ids }
     }
 }
 
@@ -2091,15 +2127,20 @@ fn combine_partial_results(
     partials: Vec<VerificationResult>,
 ) -> VerificationResult {
     let mut files = Vec::with_capacity(partials.len());
+    let mut missing_descriptions = Vec::new();
     let mut total_missing_blocks = 0u32;
     let mut resource_limit_reason = None;
     for partial in partials {
+        if let Repairability::IncompleteMetadata { file_ids } = &partial.repairable {
+            missing_descriptions.extend_from_slice(file_ids);
+        }
         total_missing_blocks = total_missing_blocks.saturating_add(partial.total_missing_blocks);
         if let Repairability::ResourceLimited { reason } = &partial.repairable {
             resource_limit_reason.get_or_insert_with(|| reason.clone());
         }
         files.extend(partial.files);
     }
+    let resource_limit_reason = resource_limit_reason.or_else(|| slice_limit_reason(par2, &files));
 
     let recovery_blocks_available = par2.recovery_block_count();
     let repairable = repairability_for_result_with_resource_limit(
@@ -2108,6 +2149,7 @@ fn combine_partial_results(
         recovery_blocks_available,
         resource_limit_reason,
     );
+    let repairable = with_missing_descriptions(repairable, missing_descriptions);
     VerificationResult {
         files,
         recovery_blocks_available,
@@ -2130,7 +2172,9 @@ pub fn merge_verification_results(
         .into_iter()
         .map(|file| (file.file_id, file))
         .collect();
-    let files: Vec<FileVerification> = base
+    let resolved_descriptions: std::collections::HashSet<_> =
+        updated_by_id.keys().copied().collect();
+    let mut files: Vec<FileVerification> = base
         .files
         .iter()
         .map(|file| {
@@ -2140,6 +2184,21 @@ pub fn merge_verification_results(
         })
         .collect();
 
+    let mut missing_descriptions = Vec::new();
+    if let Repairability::IncompleteMetadata { file_ids } = &base.repairable {
+        for id in file_ids {
+            if let Some(file) = updated_by_id.remove(id) {
+                files.push(file);
+            }
+            if !resolved_descriptions.contains(id) {
+                missing_descriptions.push(*id);
+            }
+        }
+    }
+    if let Repairability::IncompleteMetadata { file_ids } = &updated.repairable {
+        missing_descriptions.extend_from_slice(file_ids);
+    }
+
     let mut total_missing_blocks = 0u32;
     for file in &files {
         total_missing_blocks = total_missing_blocks.saturating_add(file.missing_slice_count);
@@ -2148,7 +2207,7 @@ pub fn merge_verification_results(
         Repairability::ResourceLimited { reason } => Some(reason.clone()),
         _ => match &base.repairable {
             Repairability::ResourceLimited { reason } => Some(reason.clone()),
-            _ => None,
+            _ => slice_limit_reason(par2, &files),
         },
     };
 
@@ -2159,6 +2218,7 @@ pub fn merge_verification_results(
         recovery_blocks_available,
         resource_limit_reason,
     );
+    let repairable = with_missing_descriptions(repairable, missing_descriptions);
     VerificationResult {
         files,
         recovery_blocks_available,
@@ -2521,6 +2581,12 @@ fn verify_selected_file_ids_resolved(
         recovery_blocks_available,
         resource_limit_reason,
     );
+    let missing_descriptions = file_ids
+        .iter()
+        .copied()
+        .filter(|id| par2.file_description(id).is_none())
+        .collect();
+    let repairable = with_missing_descriptions(repairable, missing_descriptions);
 
     VerificationResult {
         files,
@@ -2571,6 +2637,144 @@ mod tests {
         slice_size: u64,
     ) -> (Par2FileSet, MemoryFileAccess, FileId) {
         setup_test_set_with_full_hash(file_data, slice_size, None)
+    }
+
+    #[test]
+    fn missing_descriptions_never_verify_as_complete() {
+        for all_missing in [false, true] {
+            let (mut set, access, id) = setup_test_set(b"AAAA", 4);
+            let unknown = FileId::from_bytes([0x42; 16]);
+            set.recovery_file_ids.push(unknown);
+            if all_missing {
+                set.files.clear();
+            }
+            for fast in [false, true] {
+                let serial = verify_selected_file_ids_resolved(
+                    &set,
+                    &access,
+                    None,
+                    &set.recovery_file_ids,
+                    &VerifyOptions::default(),
+                    fast,
+                );
+                let parallel = verify_selected_file_ids_parallel_with_options(
+                    &set,
+                    &access,
+                    &set.recovery_file_ids,
+                    &VerifyOptions {
+                        fast_verify: fast,
+                        ..VerifyOptions::default()
+                    },
+                );
+                for mut result in [serial, parallel] {
+                    let expected = if all_missing {
+                        vec![id, unknown]
+                    } else {
+                        vec![unknown]
+                    };
+                    assert!(matches!(&result.repairable,
+                        Repairability::IncompleteMetadata { file_ids } if *file_ids == expected));
+                    assert!(result.needs_repair());
+                    result.refresh_repairability();
+                    assert!(matches!(&result.repairable,
+                        Repairability::IncompleteMetadata { file_ids } if *file_ids == expected));
+                    assert!(matches!(
+                        crate::repair::plan_repair(&set, &result),
+                        Err(crate::error::Par2Error::InsufficientCriticalData { .. })
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn missing_descriptions_remain_until_each_id_is_reverified() {
+        let (mut set, access, known) = setup_test_set(b"AAAA", 4);
+        let unknown = FileId::from_bytes([0x42; 16]);
+        set.recovery_file_ids.push(unknown);
+        let description = set.files.remove(&known).unwrap();
+        let base = verify_selected_file_ids(&set, &access, &set.recovery_file_ids);
+        set.files.insert(known, description);
+        let known_update = verify_selected_file_ids(&set, &access, &[known]);
+        let merged = merge_verification_results(&set, &base, known_update);
+        assert_eq!(merged.files.len(), 1);
+        assert_eq!(merged.files[0].file_id, known);
+        assert!(matches!(&merged.repairable,
+            Repairability::IncompleteMetadata { file_ids } if *file_ids == vec![unknown]));
+        let no_update = verify_selected_file_ids(&set, &access, &[]);
+        let unchanged = merge_verification_results(&set, &merged, no_update);
+        assert!(matches!(&unchanged.repairable,
+            Repairability::IncompleteMetadata { file_ids } if *file_ids == vec![unknown]));
+    }
+
+    #[test]
+    fn missing_description_reverification_replaces_an_existing_file_result() {
+        let (mut set, access, id) = setup_test_set(b"AAAA", 4);
+        let complete = verify_selected_file_ids(&set, &access, &[id]);
+        let description = set.files.remove(&id).unwrap();
+        let unknown = verify_selected_file_ids(&set, &access, &[id]);
+        let incomplete = merge_verification_results(&set, &complete, unknown);
+        assert!(incomplete.needs_repair());
+        set.files.insert(id, description);
+        let update = verify_selected_file_ids(&set, &access, &[id]);
+        let resolved = merge_verification_results(&set, &incomplete, update);
+        assert_eq!(resolved.files.len(), 1);
+        assert!(!resolved.needs_repair());
+        assert!(matches!(resolved.repairable, Repairability::NotNeeded));
+    }
+
+    #[test]
+    fn resolving_a_description_does_not_clear_a_resource_limit() {
+        // Four bytes per slice put the described file past the slice limit, so
+        // it is never read.
+        let data = vec![0x41u8; (MAX_SLICES_PER_FILE + 1) * 4];
+        let (mut set, mut access, limited) = setup_test_set(&data, 4);
+        let (other_set, _, other) = setup_test_set(b"BBBB", 4);
+        set.recovery_file_ids.push(other);
+        access.add_file(other, b"BBBB".to_vec());
+        let ids = set.recovery_file_ids.clone();
+        for parallel in [false, true] {
+            let verify = |set: &Par2FileSet, ids: &[FileId]| {
+                if parallel {
+                    verify_selected_file_ids_parallel(set, &access, ids)
+                } else {
+                    verify_selected_file_ids(set, &access, ids)
+                }
+            };
+            let base = verify(&set, &ids);
+            assert!(matches!(&base.repairable,
+                Repairability::IncompleteMetadata { file_ids } if *file_ids == vec![other]));
+
+            let mut described = set.clone();
+            described
+                .files
+                .insert(other, other_set.files[&other].clone());
+            described
+                .slice_checksums
+                .insert(other, other_set.slice_checksums[&other].clone());
+            let update = verify(&described, &[other]);
+            let merged = merge_verification_results(&described, &base, update);
+            assert_eq!(merged.files.len(), 2);
+            assert_eq!(merged.files[0].file_id, limited);
+            assert!(matches!(
+                merged.repairable,
+                Repairability::ResourceLimited { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn missing_description_can_be_resolved_by_a_later_verification() {
+        let (mut set, access, id) = setup_test_set(b"AAAA", 4);
+        let description = set.files.remove(&id).unwrap();
+        let base = verify_selected_file_ids(&set, &access, &[id]);
+        set.files.insert(id, description);
+        let update = verify_repaired_file_ids_parallel(&set, &access, &[id]);
+        let merged = merge_verification_results(&set, &base, update);
+        assert_eq!(merged.files.len(), 1);
+        assert_eq!(merged.files[0].file_id, id);
+        assert!(!merged.needs_repair());
+        assert!(matches!(merged.repairable, Repairability::NotNeeded));
     }
 
     /// [`setup_test_set`], optionally describing a different whole-file MD5

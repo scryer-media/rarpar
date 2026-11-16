@@ -14,7 +14,20 @@ use crate::checksum::SliceChecksumState;
 use crate::packet::Packet;
 use crate::par2_set::Par2FileSet;
 use crate::types::{FileId, RecoverySetId, SliceChecksum};
-use crate::verify::{FileStatus, FileVerification, Repairability, VerificationResult};
+use crate::verify::{
+    FileStatus, FileVerification, Repairability, VerificationResult, with_missing_descriptions,
+};
+
+/// Recovery-set file IDs the Main packet lists that have no File Description
+/// packet yet, in Main packet order.
+fn undescribed_recovery_file_ids(par2_set: &Par2FileSet) -> Vec<FileId> {
+    par2_set
+        .recovery_file_ids
+        .iter()
+        .copied()
+        .filter(|id| par2_set.file_description(id).is_none())
+        .collect()
+}
 
 const DEFAULT_BUFFERED_BOUNDARY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PARTIAL_RANGES_PER_SLICE: usize = 4096;
@@ -1197,7 +1210,7 @@ impl VerificationSession {
         let blocks_needed = total_damaged + total_missing;
         let blocks_available = par2_set.recovery_block_count();
 
-        if blocks_needed == 0 {
+        let repairable = if blocks_needed == 0 {
             Repairability::NotNeeded
         } else if blocks_needed <= blocks_available {
             Repairability::Repairable {
@@ -1210,7 +1223,8 @@ impl VerificationSession {
                 blocks_available,
                 deficit: blocks_needed - blocks_available,
             }
-        }
+        };
+        with_missing_descriptions(repairable, undescribed_recovery_file_ids(par2_set))
     }
 
     /// Check if all files have been verified successfully.
@@ -1307,6 +1321,8 @@ impl VerificationSession {
                 deficit: total_missing_blocks - recovery_blocks_available,
             }
         };
+        let repairable =
+            with_missing_descriptions(repairable, undescribed_recovery_file_ids(par2_set));
 
         Some(VerificationResult {
             files,
@@ -1813,6 +1829,38 @@ mod tests {
         assert!(!session.is_complete());
         assert!(session.verification_result().is_none());
         assert!(matches!(session.repairability(), Repairability::NotNeeded));
+    }
+
+    #[test]
+    fn session_without_a_file_description_is_never_clean() {
+        let slice_size = 1024u64;
+        let file_data: Vec<u8> = (0..2048u32).map(|i| (i % 256) as u8).collect();
+        let (par2_bytes, file_id, _rsid) = build_par2_packets(&file_data, slice_size);
+        let packets = parse_packets(&par2_bytes);
+
+        // Only the Main packet has arrived: it names the file, nothing
+        // describes it.
+        let mut session = VerificationSession::new();
+        session.add_par2_data(&packets[..1]);
+        assert!(session.par2_set().is_some());
+        assert!(!session.is_complete());
+        assert!(matches!(session.repairability(),
+            Repairability::IncompleteMetadata { file_ids } if file_ids == vec![file_id]));
+        let result = session.verification_result().unwrap();
+        assert!(result.files.is_empty());
+        assert!(result.needs_repair());
+        assert!(matches!(&result.repairable,
+            Repairability::IncompleteMetadata { file_ids } if *file_ids == vec![file_id]));
+
+        // The description and checksums arrive, then the data.
+        session.add_par2_data(&packets[1..]);
+        session.feed_data(&file_id, 0, &file_data[0..1024]);
+        session.feed_data(&file_id, 1024, &file_data[1024..2048]);
+        assert!(session.is_complete());
+        assert!(matches!(session.repairability(), Repairability::NotNeeded));
+        let result = session.verification_result().unwrap();
+        assert!(!result.needs_repair());
+        assert!(matches!(result.repairable, Repairability::NotNeeded));
     }
 
     #[test]

@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.13.0
+
+### Changed
+
+- `Repairability::IncompleteMetadata { file_ids }` reports selected files
+  without File Description packets instead of silently omitting them from
+  a successful verdict. Callers matching `Repairability` must handle the
+  new variant. Partial sets remain loadable for incremental discovery.
+- Serial and parallel verification, result aggregation, repairability
+  refresh and incremental result merges retain unresolved metadata until
+  each affected file is verified after its description arrives. Repair
+  planning refuses an incomplete result as insufficient critical data.
+- `VerificationSession::repairability` and
+  `VerificationSession::verification_result` report
+  `IncompleteMetadata` while a recovery-set file has no File Description
+  packet, instead of skipping the file and returning `NotNeeded`.
+- `plan_repair` and `plan_repair_with_memory_limit` return
+  `InsufficientCriticalData` when a recovery-set file has no File
+  Description packet, whatever verdict the supplied result carries. Such a
+  file's slice count is unknown, so later files had the wrong slice index.
+- `merge_verification_results` and parallel verification keep a file past
+  the slice limit `ResourceLimited` once the missing descriptions are
+  resolved, instead of reporting `NotNeeded` for a file that was never read.
+
 ## 0.12.1
 
 No API changes.
