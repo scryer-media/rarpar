@@ -12,12 +12,19 @@ No API changes.
   failed with "operation not supported on this platform". The root is
   borrowed instead, on every target but WASI, which has its own path: one
   fewer handle duplicated per destination, nothing else changes.
+- The crate compiles for `wasm32-unknown-unknown`. It depended on
+  `cap-std` on every target but WASI, and `cap-std` does not build for a
+  target with no operating system. That target now takes the path WASI
+  takes, which needs only the standard library. It has no filesystem, so
+  every call that opens a file returns the standard library's error there.
 
 ### Tested
 
 - CI runs the verify, repair and create harness on `wasm32-wasip2` (as a
   component, under wasmtime) and on `wasm32-unknown-emscripten` (under
   Node), beside `wasm32-wasip1`.
+- CI compile-checks the crate for `wasm32-unknown-unknown`, with and
+  without `wasm-simd`.
 
 ## 0.8.2
 

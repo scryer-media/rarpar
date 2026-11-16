@@ -34,7 +34,7 @@ reedsolomon-rs = { path = "../reedsolomon-rs", version = "0.4.10", default-featu
 rayon = { workspace = true, default-features = false }
 unicode-normalization = { workspace = true }
 
-[target.'cfg(not(target_os = "wasi"))'.dependencies]
+[target.'cfg(not(any(target_os = "wasi", target_os = "unknown")))'.dependencies]
 cap-std = "4.0.3"
 
 # Repair stages a damaged file as a clone of itself where the filesystem can

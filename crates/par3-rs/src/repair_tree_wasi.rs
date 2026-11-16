@@ -1,4 +1,8 @@
 //! WASI repair staging under the runtime's preopened-directory capability.
+//!
+//! `wasm32-unknown-unknown` builds this module too, so the crate compiles
+//! there: it needs only the standard library, whose file calls all fail on a
+//! target with no filesystem.
 
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};

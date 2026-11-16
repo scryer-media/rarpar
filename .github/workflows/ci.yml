@@ -423,6 +423,19 @@ jobs:
           set -euo pipefail
           cargo check --locked -p unrar-rs --no-default-features --features crypto-rust --target wasm32-unknown-unknown
           cargo check --locked -p unrar-rs --no-default-features --features crypto-host,crc-host --target wasm32-unknown-unknown
+      - name: Check par2-rs and par3-rs for wasm32-unknown-unknown
+        # Compile checks only: the target has no filesystem, so nothing here
+        # can run. par2-rs is checked as a consumer that names no feature
+        # gets it and on the RustCrypto backend; par3-rs with and without
+        # its wasm SIMD feature.
+        env:
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=.
+        run: |
+          set -euo pipefail
+          cargo check --locked -p par2-rs --target wasm32-unknown-unknown
+          cargo check --locked -p par2-rs --no-default-features --features crypto-rust --target wasm32-unknown-unknown
+          cargo check --locked -p par3-rs --target wasm32-unknown-unknown
+          cargo check --locked -p par3-rs --features wasm-simd --target wasm32-unknown-unknown
       - name: Confirm the RustCrypto build links no AWS-LC
         run: |
           set -euo pipefail

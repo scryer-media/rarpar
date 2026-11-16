@@ -18,6 +18,8 @@ No API changes.
 - CI runs the verify, repair and create harness on `wasm32-wasip2` (as a
   component, under wasmtime) and on `wasm32-unknown-emscripten` (under
   Node), beside `wasm32-wasip1`, each with and without `simd128`.
+- CI compile-checks the crate for `wasm32-unknown-unknown`, with no
+  feature named and on the RustCrypto backend. It already compiled there.
 
 ## 0.12.0
 
