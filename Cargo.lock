@@ -1977,7 +1977,7 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "bytes",
  "cap-std",
@@ -1996,7 +1996,7 @@ dependencies = [
 
 [[package]]
 name = "par3-rs"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "blake3",
  "cap-std",

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.8.3
+
+No API changes.
+
+### Fixed
+
+- Repair works on `wasm32-unknown-emscripten`. Finding a destination's
+  parent directory duplicated the root directory's handle, which the
+  standard library cannot do on any wasm32 target, so every repair there
+  failed with "operation not supported on this platform". The root is
+  borrowed instead, on every target but WASI, which has its own path: one
+  fewer handle duplicated per destination, nothing else changes.
+
+### Tested
+
+- CI runs the verify, repair and create harness on `wasm32-wasip2` (as a
+  component, under wasmtime) and on `wasm32-unknown-emscripten` (under
+  Node), beside `wasm32-wasip1`.
+
 ## 0.8.2
 
 ### Fixed

@@ -88,12 +88,27 @@ impl BudgetedDir {
         })
     }
 
+    #[cfg(test)]
     fn try_clone(&self) -> io::Result<Self> {
         Self::open(self.options.clone(), || self.dir.try_clone())
     }
 
     fn open_dir(&self, path: impl AsRef<Path>) -> io::Result<Self> {
         Self::open(self.options.clone(), || self.dir.open_dir(path))
+    }
+
+    /// Open `path` under a lease the caller already holds, so that a
+    /// directory is never created that the budget then refuses to open.
+    fn open_dir_leased(
+        &self,
+        lease: Option<crate::runtime::HandleLease>,
+        path: impl AsRef<Path>,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            dir: self.dir.open_dir(path)?,
+            _lease: lease,
+            options: self.options.clone(),
+        })
     }
 
     fn create_private_dir(&self, name: &OsStr) -> io::Result<Self> {
@@ -222,7 +237,7 @@ impl RepairTree {
         let filename = components
             .pop()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "repair path is empty"))?;
-        let mut directory = self.root.try_clone()?;
+        let mut directory = ParentDir::Root(&self.root);
         for component in components {
             match directory.symlink_metadata(&component) {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -237,7 +252,7 @@ impl RepairTree {
                         "repair destination parent is not a directory",
                     ));
                 }
-                Ok(_) => directory = directory.open_dir(&component)?,
+                Ok(_) => directory = ParentDir::Below(directory.open_dir(&component)?),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
                 Err(error) => return Err(error),
             }
@@ -794,7 +809,7 @@ impl RepairTree {
         &self,
         relative: &Path,
         create: bool,
-    ) -> io::Result<(BudgetedDir, OsString)> {
+    ) -> io::Result<(ParentDir<'_>, OsString)> {
         relative_parent(&self.root, relative, create)
     }
 }
@@ -892,11 +907,31 @@ pub(crate) fn create_directory(base: &Path, relative: &str) -> io::Result<()> {
     relative_parent(&root, &Path::new(relative).join("_"), true).map(|_| ())
 }
 
-fn relative_parent(
-    root: &BudgetedDir,
+/// A destination's parent directory: the root itself for a file directly in
+/// it, a directory opened beneath it otherwise.
+///
+/// The root is borrowed, not duplicated: duplicating a handle is
+/// `Unsupported` on every wasm32 target, Emscripten included.
+enum ParentDir<'a> {
+    Root(&'a BudgetedDir),
+    Below(BudgetedDir),
+}
+
+impl std::ops::Deref for ParentDir<'_> {
+    type Target = BudgetedDir;
+    fn deref(&self) -> &BudgetedDir {
+        match self {
+            Self::Root(directory) => directory,
+            Self::Below(directory) => directory,
+        }
+    }
+}
+
+fn relative_parent<'a>(
+    root: &'a BudgetedDir,
     relative: &Path,
     create: bool,
-) -> io::Result<(BudgetedDir, OsString)> {
+) -> io::Result<(ParentDir<'a>, OsString)> {
     let mut components = Vec::new();
     for component in relative.components() {
         match component {
@@ -913,8 +948,11 @@ fn relative_parent(
     let (filename, parents) = components
         .split_last()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "repair path is empty"))?;
-    let mut directory = root.try_clone()?;
+    let mut directory = ParentDir::Root(root);
     for component in parents {
+        // Taken before anything is created: a budget with no room left
+        // refuses the destination and leaves the tree as it was.
+        let lease = directory.acquire()?;
         match directory.symlink_metadata(component) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(io::Error::new(
@@ -934,7 +972,7 @@ fn relative_parent(
             }
             Err(error) => return Err(error),
         }
-        directory = directory.open_dir(component)?;
+        directory = ParentDir::Below(directory.open_dir_leased(lease, component)?);
     }
     Ok((directory, filename.clone()))
 }
@@ -1285,7 +1323,8 @@ mod tests {
         assert!(!path.exists());
         assert_eq!(parent.entries().unwrap().count(), 1);
         assert_eq!(options.handles.peak(), 6);
-        drop((parent, tree));
+        drop(parent);
+        drop(tree);
         assert_eq!(options.handles.used(), 0);
     }
 
@@ -1309,7 +1348,8 @@ mod tests {
         assert_eq!(parent.entries().unwrap().count(), 0);
         assert_eq!(options.handles.used(), 3);
         std::fs::remove_file(path).unwrap();
-        drop((parent, tree));
+        drop(parent);
+        drop(tree);
         assert_eq!(options.handles.used(), 0);
     }
 

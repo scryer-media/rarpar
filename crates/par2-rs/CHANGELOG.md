@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.12.1
+
+No API changes.
+
+### Fixed
+
+- Repair works on `wasm32-unknown-emscripten`. Renaming a repaired file
+  into place duplicated the working directory's handle, which the standard
+  library cannot do on any wasm32 target, so every repair there failed with
+  "operation not supported on this platform". The handle is borrowed
+  instead, on every Unix target: one fewer `dup` per rename, nothing else
+  changes.
+
+### Tested
+
+- CI runs the verify, repair and create harness on `wasm32-wasip2` (as a
+  component, under wasmtime) and on `wasm32-unknown-emscripten` (under
+  Node), beside `wasm32-wasip1`, each with and without `simd128`.
+
 ## 0.12.0
 
 A caller can provide recovery payloads on demand instead of handing them over
