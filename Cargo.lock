@@ -2220,7 +2220,7 @@ checksum = "ca45419789ae5a7899559e9512e58ca889e41f04f1f2445e9f4b290ceccd1d08"
 
 [[package]]
 name = "rarpar"
-version = "0.9.6"
+version = "0.9.7"
 dependencies = [
  "blake3",
  "clap",
@@ -2915,7 +2915,7 @@ checksum = "ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557"
 
 [[package]]
 name = "unrar-rs"
-version = "0.16.4"
+version = "0.16.5"
 dependencies = [
  "aes",
  "aws-lc-rs",

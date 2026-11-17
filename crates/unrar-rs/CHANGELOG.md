@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.16.5
+
+### Added
+
+- `RarArchive::read_link_target` inspects a link target without creating a
+  filesystem object. Its caller-selected byte ceiling is at most 64 KiB.
+  RAR3 Unix targets require bounded packed and expanded sizes, a payload
+  checksum and exact decoded length; returned text must be nonempty UTF-8
+  without NUL. These strict inspection rules do not replace the existing
+  filesystem link compatibility policy.
+- `RarArchive::member_redirection` borrows the existing typed RAR5
+  redirection, including its separate directory-target flag, so callers can
+  distinguish junctions and directory targets from regular-file links.
+
+### Fixed
+
+- Attached-volume and provider-backed segment readers compare the remaining
+  packed length in 64 bits before narrowing the bounded read count. On
+  32-bit targets, a segment with at least 4 GiB remaining could otherwise
+  become an empty read and fail with unexpected EOF. Native 64-bit reads
+  are unchanged; total archive or unpacked size alone is not the trigger.
+- RAR4 solid link-target decoding enforces an already-requested output
+  ceiling before retaining bytes, including both encrypted reader routes.
+  Existing first-NUL/text compatibility rules remain unchanged.
+
+The [source comparison](docs/link-target-grounding.md) records the exact
+reference UnRAR source and intentional strict-API differences.
+
 ## 0.16.4
 
 No API changes.

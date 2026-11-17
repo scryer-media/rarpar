@@ -3,6 +3,15 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.9.7
+
+- RAR packed segments with at least 4 GiB remaining read correctly on
+  32-bit builds, through unrar-rs 0.16.5. A premature length cast could
+  produce an empty read and unexpected EOF despite available input.
+- RAR4 solid Unix link-target decoding stops at the existing byte ceiling
+  before retaining excess output. Filesystem link text compatibility is
+  unchanged; the new strict inspection API is available to library callers.
+
 ## rarpar 0.9.6
 
 - PAR2 verify and repair refuse success when a protected file still has no

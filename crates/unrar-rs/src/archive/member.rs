@@ -1147,6 +1147,132 @@ impl RarArchive {
             .map(|(idx, _)| idx)
     }
 
+    /// Inspect RAR5 redirection semantics without decoding a payload.
+    ///
+    /// In particular, a junction and a directory-target flag are distinct
+    /// from the member header's directory bit. Callers that materialize only
+    /// regular-file copies must reject those directory-link semantics.
+    pub fn member_redirection(&self, index: usize) -> RarResult<Option<&header::Redirection>> {
+        self.members
+            .get(index)
+            .map(|entry| entry.redirection.as_ref())
+            .ok_or(RarError::MemberIndexOutOfRange {
+                index,
+                len: self.len(),
+            })
+    }
+
+    fn strict_link_target_text(member: &str, bytes: &[u8], limit: usize) -> RarResult<String> {
+        if bytes.len() > limit {
+            return Err(RarError::resource_limit(
+                crate::error::LimitKind::LinkTarget,
+                bytes.len() as u64,
+                limit as u64,
+                Some(member.to_string()),
+            ));
+        }
+        if bytes.is_empty() || bytes.contains(&0) {
+            return Err(RarError::CorruptArchive {
+                detail: "Strict link target is empty or contains NUL".into(),
+            });
+        }
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| RarError::CorruptArchive {
+                detail: "Strict link target is not valid UTF-8".into(),
+            })
+    }
+
+    /// Read a link target without creating a filesystem object.
+    ///
+    /// RAR5 header targets have already passed header verification. RAR3 Unix
+    /// symlink payloads are decoded with checksum verification and a caller
+    /// limit checked against both packed and expanded sizes before decoding.
+    /// The effective limit never exceeds the crate's link-target ceiling.
+    ///
+    /// This strict inspection API rejects empty, NUL-containing and invalid
+    /// UTF-8 targets. It deliberately does not change the compatibility rules
+    /// of filesystem extraction. Returned paths are untrusted: callers must
+    /// still resolve them against an allowed inventory before materialization.
+    /// Solid archives retain their normal ascending-index consumption rules.
+    pub fn read_link_target(&mut self, index: usize, max_bytes: usize) -> RarResult<String> {
+        let _decode = self.decode_mode.enter();
+        let limit = max_bytes.min(MAX_LINK_TARGET_BYTES);
+        if let Some(redirection) = self.member_redirection(index)? {
+            if matches!(redirection.redir_type, header::RedirectionType::Unknown(_)) {
+                return Err(RarError::UnsupportedLinkType {
+                    member: self.members[index].file_header.name.clone(),
+                    link_type: "unknown redirection".into(),
+                });
+            }
+            let bytes = redirection
+                .target_raw
+                .as_deref()
+                .unwrap_or(redirection.target.as_bytes());
+            return Self::strict_link_target_text(
+                &self.members[index].file_header.name,
+                bytes,
+                limit,
+            );
+        }
+        let info = self
+            .member_info(index)
+            .ok_or(RarError::MemberIndexOutOfRange {
+                index,
+                len: self.len(),
+            })?;
+        if !info.is_symlink && !info.is_hardlink && !info.is_file_copy {
+            return Err(RarError::UnsupportedLinkType {
+                member: info.name,
+                link_type: "member is not a link".into(),
+            });
+        }
+        if !info.is_symlink || !self.format.is_rar4_family() {
+            return Err(RarError::UnsupportedLinkType {
+                member: info.name.clone(),
+                link_type: "link target is unavailable".into(),
+            });
+        }
+        let fh = self.members[index].file_header.clone();
+        let declared = fh.unpacked_size.ok_or_else(|| RarError::CorruptArchive {
+            detail: "Strict link target declares no expanded size".into(),
+        })?;
+        for size in [fh.data_size, declared] {
+            if size > limit as u64 {
+                return Err(RarError::resource_limit(
+                    crate::error::LimitKind::LinkTarget,
+                    size,
+                    limit as u64,
+                    Some(info.name.clone()),
+                ));
+            }
+        }
+        if fh.data_crc32.is_none() {
+            return Err(RarError::CorruptArchive {
+                detail: "Strict link target has no payload checksum".into(),
+            });
+        }
+        let options = ExtractOptions {
+            verify: true,
+            password: self.password.clone(),
+            restore_owners: false,
+        };
+        let extracted =
+            self.extract_member_with_link_policy(index, &options, None, true, Some(limit as u64))?;
+        if extracted.len() as u64 != declared || extracted.len() > limit {
+            return Err(RarError::CorruptArchive {
+                detail: "Strict link payload length differs from its bounded header".into(),
+            });
+        }
+        let payload = extracted.into_bytes()?;
+        if payload.len() as u64 != declared {
+            return Err(RarError::CorruptArchive {
+                detail: "Strict link payload length changed during materialization".into(),
+            });
+        }
+        Self::strict_link_target_text(&info.name, &payload, limit)
+    }
+
     fn link_target_from_rar3_payload(
         &mut self,
         index: usize,
@@ -4802,14 +4928,14 @@ impl RarArchive {
                             pwd,
                             rar4_salt,
                         )?;
-                        let written = Self::solid_decode_reader_to_writer(
+                        let written = Self::solid_decode_reader_to_writer_link_limited(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
                             &self.limits,
                             reader,
                             unpacked_size,
                             &fh,
-                            &mut hash_writer,
+                            (&mut hash_writer, link_output_ceiling),
                         )?;
                         self.enforce_unknown_lz_output_limit(&fh, written)?;
                     } else {
@@ -4827,26 +4953,26 @@ impl RarArchive {
                             &crypto.key,
                             &crypto.iv,
                         );
-                        let written = Self::solid_decode_reader_to_writer(
+                        let written = Self::solid_decode_reader_to_writer_link_limited(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
                             &self.limits,
                             reader,
                             unpacked_size,
                             &fh,
-                            &mut hash_writer,
+                            (&mut hash_writer, link_output_ceiling),
                         )?;
                         self.enforce_unknown_lz_output_limit(&fh, written)?;
                     }
                 } else {
-                    let written = Self::solid_decode_reader_to_writer(
+                    let written = Self::solid_decode_reader_to_writer_link_limited(
                         &mut self.solid_decoder_rar4,
                         &mut self.solid_decoder,
                         &self.limits,
                         base_reader,
                         unpacked_size,
                         &fh,
-                        &mut hash_writer,
+                        (&mut hash_writer, link_output_ceiling),
                     )?;
                     self.enforce_unknown_lz_output_limit(&fh, written)?;
                 }
@@ -5891,6 +6017,40 @@ impl RarArchive {
             fh,
             &mut sink,
         )
+    }
+
+    fn solid_decode_reader_to_writer_link_limited<R: Read, W: Write>(
+        solid_decoder_rar4: &mut Option<Rar4Decoder>,
+        solid_decoder: &mut Option<LzDecoder>,
+        limits: &Limits,
+        compressed: R,
+        unpacked_size: u64,
+        fh: &FileHeader,
+        output: (&mut W, Option<u64>),
+    ) -> RarResult<u64> {
+        match output.1 {
+            Some(ceiling) => {
+                let mut bounded = crate::extract::BoundedWriter::new(output.0, ceiling, &fh.name);
+                Self::solid_decode_reader_to_writer(
+                    solid_decoder_rar4,
+                    solid_decoder,
+                    limits,
+                    compressed,
+                    unpacked_size,
+                    fh,
+                    &mut bounded,
+                )
+            }
+            None => Self::solid_decode_reader_to_writer(
+                solid_decoder_rar4,
+                solid_decoder,
+                limits,
+                compressed,
+                unpacked_size,
+                fh,
+                output.0,
+            ),
+        }
     }
 
     fn solid_decode_reader_to_writer<R: Read, W: Write>(
@@ -7778,7 +7938,7 @@ impl Read for ArchiveSegmentReader<'_> {
                         }
                         .into_io()
                     })?;
-                let to_read = buf.len().min(self.remaining_in_segment as usize);
+                let to_read = (buf.len() as u64).min(self.remaining_in_segment) as usize;
                 let n = vol.reader.read(&mut buf[..to_read])?;
                 if n == 0 {
                     return Err(std::io::Error::new(
@@ -8027,7 +8187,7 @@ impl Read for ChainedSegmentReader<'_> {
                         "RAR segment reader missing current volume",
                     )
                 })?;
-                let to_read = buf.len().min(self.remaining_in_segment as usize);
+                let to_read = (buf.len() as u64).min(self.remaining_in_segment) as usize;
                 let n = reader.read(&mut buf[..to_read])?;
                 if n == 0 {
                     return Err(std::io::Error::new(
@@ -9951,6 +10111,33 @@ mod tests {
     }
 
     #[test]
+    fn segment_readers_keep_64_bit_lengths_at_the_4_gib_boundary() {
+        // These are virtual data segments, not generated RAR archives. Only a
+        // bounded first read is needed to exercise the 32-bit cast boundary.
+        for size in [1u64 << 32, (1u64 << 32) + 1, 100u64 << 30] {
+            let segments = [DataSegment::new(0, 0, size)];
+            let limits = Limits::default();
+            let mut volumes = vec![Some(VolumeData {
+                reader: Box::new(Cursor::new(vec![0x5a; 32])),
+            })];
+            let mut attached =
+                ArchiveSegmentReader::new(&mut volumes, &limits, &segments, "large.bin");
+            let mut bytes = [0; 16];
+            assert_eq!(attached.read(&mut bytes).unwrap(), bytes.len());
+            assert_eq!(bytes, [0x5a; 16]);
+            assert_eq!(attached.remaining_in_segment, size - 16);
+
+            let provider = TestVolumeProvider {
+                data: vec![0x5a; 32],
+            };
+            let mut chained = ChainedSegmentReader::new(&segments, &provider);
+            assert_eq!(chained.read(&mut bytes).unwrap(), bytes.len());
+            assert_eq!(bytes, [0x5a; 16]);
+            assert_eq!(chained.remaining_in_segment, size - 16);
+        }
+    }
+
+    #[test]
     fn chained_segment_reader_rejects_oversized_segment_before_reading() {
         let provider = TestVolumeProvider { data: vec![0; 8] };
         let segments = [DataSegment::new(0, 0, 9)];
@@ -10005,6 +10192,157 @@ mod tests {
         );
     }
 
+    fn strict_target_archive(payload: &[u8]) -> RarArchive {
+        let mut archive = empty_rar5_archive();
+        archive.format = ArchiveFormat::Rar4;
+        archive.volumes.push(Some(VolumeData {
+            reader: Box::new(Cursor::new(payload.to_vec())),
+        }));
+        let mut header = test_rar3_symlink_header(Some(crate::crc::hash(payload)));
+        header.unpacked_size = Some(payload.len() as u64);
+        header.data_size = payload.len() as u64;
+        archive.members.push(MemberEntry {
+            file_header: header,
+            is_encrypted: false,
+            file_encryption: None,
+            rar4_salt: None,
+            hash: None,
+            redirection: None,
+            owner: None,
+            segments: vec![DataSegment::new(0, 0, payload.len() as u64)],
+        });
+        archive
+    }
+    #[test]
+    fn strict_link_target_redirection_inspection_preserves_directory_and_unknown_kind() {
+        for kind in [
+            header::RedirectionType::WindowsJunction,
+            header::RedirectionType::WindowsSymlink,
+            header::RedirectionType::Unknown(99),
+        ] {
+            let mut archive = strict_target_archive(b"target");
+            archive.format = ArchiveFormat::Rar5;
+            archive.members[0].redirection = Some(header::Redirection {
+                redir_type: kind,
+                target: "target".into(),
+                target_raw: Some(b"target".to_vec()),
+                target_is_directory: true,
+            });
+            assert!(!archive.member_info(0).unwrap().is_directory);
+            let redirection = archive.member_redirection(0).unwrap().unwrap();
+            assert_eq!(redirection.redir_type, kind);
+            assert!(redirection.target_is_directory);
+            if matches!(kind, header::RedirectionType::Unknown(_)) {
+                assert!(archive.read_link_target(0, 16).is_err());
+            }
+        }
+    }
+    #[test]
+    fn strict_link_target_reads_verified_payload_without_filesystem_output() {
+        let mut archive = strict_target_archive(b"safe/target");
+        assert_eq!(archive.read_link_target(0, 11).unwrap(), "safe/target");
+        assert!(matches!(
+            archive.read_link_target(1, 11),
+            Err(RarError::MemberIndexOutOfRange { .. })
+        ));
+    }
+    #[test]
+    fn strict_link_target_rejects_crc_nul_invalid_utf8_and_unknown_size() {
+        let mut bad_crc = strict_target_archive(b"safe/target");
+        bad_crc.members[0].file_header.data_crc32 = Some(0);
+        bad_crc.members[0].file_header.data_hash = Some(crate::types::DataHash::Crc32(0));
+        assert!(matches!(
+            bad_crc.read_link_target(0, 32),
+            Err(RarError::DataCrcMismatch { .. })
+        ));
+        for bytes in [b"safe\0hidden".as_slice(), b"\xff", b""] {
+            assert!(
+                strict_target_archive(bytes)
+                    .read_link_target(0, 32)
+                    .is_err()
+            );
+        }
+        let mut unknown = strict_target_archive(b"target");
+        unknown.members[0].file_header.unpacked_size = None;
+        assert!(matches!(
+            unknown.read_link_target(0, 32),
+            Err(RarError::CorruptArchive { .. })
+        ));
+    }
+    #[test]
+    fn strict_link_target_checks_packed_and_expanded_limits_before_io() {
+        for packed in [false, true] {
+            let mut archive = strict_target_archive(b"target");
+            archive.volumes[0] = Some(VolumeData {
+                reader: Box::new(Cursor::new(Vec::<u8>::new())),
+            });
+            if packed {
+                archive.members[0].file_header.data_size = 17;
+            } else {
+                archive.members[0].file_header.unpacked_size = Some(17);
+            }
+            assert!(matches!(
+                archive.read_link_target(0, 16),
+                Err(RarError::ResourceLimit {
+                    kind: crate::error::LimitKind::LinkTarget,
+                    ..
+                })
+            ));
+        }
+    }
+    #[test]
+    #[ignore = "requires the existing RAR4 compressed fixture from the signed corpus"]
+    fn strict_link_target_solid_decoder_ceiling_precedes_output_growth() {
+        use std::io::{Seek, SeekFrom};
+        let path =
+            std::env::var("RAR_SOLID_LIMIT_FIXTURE").expect("RAR_SOLID_LIMIT_FIXTURE required");
+        let archive = RarArchive::open(std::fs::File::open(&path).unwrap()).unwrap();
+        let entry = &archive.members[0];
+        let mut header = entry.file_header.clone();
+        header.compression.solid = true;
+        let segment = &entry.segments[0];
+        let mut source = std::fs::File::open(path).unwrap();
+        source.seek(SeekFrom::Start(segment.data_offset)).unwrap();
+        let mut output = Vec::new();
+        let error = RarArchive::solid_decode_reader_to_writer_link_limited(
+            &mut None,
+            &mut None,
+            &Limits::default(),
+            source.take(segment.data_size),
+            header.unpacked_size.unwrap(),
+            &header,
+            (&mut output, Some(1)),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                RarError::ResourceLimit {
+                    kind: crate::error::LimitKind::LinkTarget,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(output.len() <= 1);
+    }
+    #[test]
+    #[ignore = "requires an operator-provided official RAR3 fixture outside the signed corpus"]
+    fn strict_link_target_real_rar3_fixture() {
+        let path = std::env::var("RAR_LINK_FIXTURE")
+            .expect("RAR_LINK_FIXTURE must identify the official tiny RAR3 fixture");
+        let mut archive = RarArchive::open(std::fs::File::open(path).unwrap()).unwrap();
+        let index = archive
+            .indexed_member_infos()
+            .into_iter()
+            .find(|member| member.info.name == "testlink")
+            .unwrap()
+            .index;
+        assert_eq!(
+            archive.read_link_target(index, 16 * 1024).unwrap(),
+            "test.txt"
+        );
+    }
     #[test]
     fn rar3_symlink_payload_reader_bypasses_non_file_extraction_guard() {
         let target = b"safe/target";
