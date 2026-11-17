@@ -9,7 +9,10 @@
   RAR3 Unix targets require bounded packed and expanded sizes, a payload
   checksum and exact decoded length; returned text must be nonempty UTF-8
   without NUL. These strict inspection rules do not replace the existing
-  filesystem link compatibility policy.
+  filesystem link compatibility policy. In a solid archive a RAR3 target
+  read consumes its member in ascending order, and a read that fails after
+  the member's decode began poisons the archive as a failed `Entry`
+  consumption does.
 - `RarArchive::member_redirection` borrows the existing typed RAR5
   redirection, including its separate directory-target flag, so callers can
   distinguish junctions and directory targets from regular-file links.
@@ -24,6 +27,15 @@
 - RAR4 solid link-target decoding enforces an already-requested output
   ceiling before retaining bytes, including both encrypted reader routes.
   Existing first-NUL/text compatibility rules remain unchanged.
+- A RAR4 solid member whose last symbol is followed by a table switch (code
+  256 "1": new tables, same file) now reads the end-of-file code after the
+  new tables, as UnRAR's `ReadEndOfBlock` does. Its new-table bit is what
+  tells the next member to read its own tables; stopping after the switch
+  left the next member decoding on stale tables, which failed as "PPMd block
+  without model" on a real solid release that UnRAR extracts cleanly.
+- RAR 1.5 and 2.0 matches with 4 GiB or more of the member still to come
+  stay visible on 32-bit targets, and the window's dictionary-history check
+  compares in 64 bits there. Native 64-bit decoding is unchanged.
 
 The [source comparison](docs/link-target-grounding.md) records the exact
 reference UnRAR source and intentional strict-API differences.

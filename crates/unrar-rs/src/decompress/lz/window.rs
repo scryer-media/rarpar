@@ -1090,8 +1090,9 @@ impl Window {
         }
 
         let dict_size = self.dict_size;
-        let distance = (self.total_written - start_total) as usize;
-        if distance > dict_size {
+        // Compared in u64: history 4 GiB back must not narrow into range.
+        let distance = self.total_written - start_total;
+        if distance > dict_size as u64 {
             return Err(RarError::CorruptArchive {
                 detail: format!(
                     "window output start {start_total} is outside the {} byte dictionary history",
@@ -1099,6 +1100,7 @@ impl Window {
                 ),
             });
         }
+        let distance = distance as usize;
 
         let mut result = Vec::with_capacity(len);
 
@@ -1148,8 +1150,9 @@ impl Window {
         }
 
         let dict_size = self.dict_size;
-        let distance = (self.total_written - start_total) as usize;
-        if distance > dict_size {
+        // Compared in u64: history 4 GiB back must not narrow into range.
+        let distance = self.total_written - start_total;
+        if distance > dict_size as u64 {
             return Err(RarError::CorruptArchive {
                 detail: format!(
                     "window output start {start_total} is outside the {} byte dictionary history",
@@ -1157,6 +1160,7 @@ impl Window {
                 ),
             });
         }
+        let distance = distance as usize;
 
         out.clear();
         out.reserve(len);
@@ -2212,6 +2216,26 @@ mod tests {
 
         assert!(matches!(
             w.try_copy_output(0, 1),
+            Err(RarError::CorruptArchive { .. })
+        ));
+    }
+
+    /// History 4 GiB and two bytes back is outside any dictionary. On a
+    /// 32-bit target a distance narrowed before the comparison becomes two
+    /// bytes and passes it.
+    #[test]
+    fn test_copy_output_rejects_history_4_gib_back() {
+        let mut w = Window::new(16);
+        w.put_bytes(b"0123456789");
+        w.total_written += 1 << 32;
+        let start = w.total_written - (1 << 32) - 2;
+        assert!(matches!(
+            w.try_copy_output(start, 1),
+            Err(RarError::CorruptArchive { .. })
+        ));
+        let mut out = Vec::new();
+        assert!(matches!(
+            w.copy_output_into(start, 1, &mut out),
             Err(RarError::CorruptArchive { .. })
         ));
     }

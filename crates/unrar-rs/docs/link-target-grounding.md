@@ -45,9 +45,18 @@ The new inspection API instead requires, for RAR3 Unix targets:
 - exact expanded length before and after materialization; and
 - nonempty strict UTF-8 without any NUL byte.
 
-For RAR5, the target is existing header metadata. Raw target bytes are
-preferred over the decoded convenience string so invalid UTF-8 cannot be
-hidden. Header verification is not a claim of a separate payload CRC, nor
+In a solid archive a RAR3 target read consumes its member like an `Entry`
+read: members are read in ascending order, an archive already poisoned by a
+failed solid read is refused, and a target read that fails after its
+member's decode began poisons the archive.
+
+For RAR5, the target is existing header metadata: the raw target text the
+header parser kept. The parser decodes the stored target as UnRAR's
+`UtfToWide` does, ending at the first NUL or malformed UTF-8 sequence, so
+it is the same target filesystem extraction uses; stored bytes past that
+point are not seen by this API. The lossy convenience string is never used:
+a member without raw target text (restored from an older metadata cache)
+fails as corrupt. Header verification is not a claim of a separate payload CRC, nor
 is a CRC a cryptographic authenticity guarantee. Unknown redirection types
 are refused, while known directory/junction targets remain inspectable.
 Returned paths are untrusted. Resolving targets within an archive, rejecting

@@ -145,16 +145,7 @@ impl<'a> Entry<'a> {
 
     /// Refuse a solid consumption while the decoder state is poisoned.
     fn check_solid_poison(&self) -> RarResult<()> {
-        if !self.archive.member_is_solid_at(self.index) {
-            return Ok(());
-        }
-        match &self.archive.solid_poison {
-            Some((member, detail)) => Err(RarError::SolidStatePoisoned {
-                member: member.to_string(),
-                detail: detail.clone(),
-            }),
-            None => Ok(()),
-        }
+        self.archive.check_solid_poison_at(self.index)
     }
 
     /// Decode this member straight into `writer`.
@@ -328,12 +319,29 @@ impl<'a> Entry<'a> {
     }
 }
 
+impl RarArchive {
+    /// Refuse a solid consumption of `index` while the decoder state is
+    /// poisoned.
+    pub(super) fn check_solid_poison_at(&self, index: usize) -> RarResult<()> {
+        if !self.member_is_solid_at(index) {
+            return Ok(());
+        }
+        match &self.solid_poison {
+            Some((member, detail)) => Err(RarError::SolidStatePoisoned {
+                member: member.to_string(),
+                detail: detail.clone(),
+            }),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Record that a solid member left the decoder mid-stream.
 ///
 /// Every failure poisons except the two that are refusals rather than
 /// interrupted decodes: an out-of-order request never touched the decoder, and
 /// an already-poisoned archive is not poisoned twice.
-fn poison_on_error<T>(
+pub(super) fn poison_on_error<T>(
     archive: &mut RarArchive,
     index: usize,
     result: RarResult<T>,

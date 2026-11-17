@@ -11,6 +11,11 @@ documented in each crate's own changelog so those notes ship with the crate.
 - RAR4 solid Unix link-target decoding stops at the existing byte ceiling
   before retaining excess output. Filesystem link text compatibility is
   unchanged; the new strict inspection API is available to library callers.
+- A RAR4 solid archive whose member ends with a table switch extracts the
+  members after it, through unrar-rs 0.16.5. They failed with "PPMd block
+  without model" while UnRAR extracts the same archive cleanly.
+- RAR 1.5 and 2.0 members with 4 GiB or more to unpack decode correctly on
+  32-bit builds, through unrar-rs 0.16.5.
 
 ## rarpar 0.9.6
 

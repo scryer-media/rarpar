@@ -1194,7 +1194,16 @@ impl RarArchive {
     /// UTF-8 targets. It deliberately does not change the compatibility rules
     /// of filesystem extraction. Returned paths are untrusted: callers must
     /// still resolve them against an allowed inventory before materialization.
-    /// Solid archives retain their normal ascending-index consumption rules.
+    /// Solid archives retain their normal ascending-index consumption rules:
+    /// a RAR3 payload read consumes its solid member, and a read that fails
+    /// after that member's decode began poisons the archive as a failed
+    /// [`Entry`](crate::Entry) consumption does.
+    ///
+    /// A RAR5 target is the text the header parser kept, decoded as the
+    /// reference reader decodes it: it ends at the first NUL or malformed
+    /// UTF-8 sequence of the stored name, and it is the target filesystem
+    /// extraction would use. Stored bytes past that point are not seen by
+    /// these checks.
     pub fn read_link_target(&mut self, index: usize, max_bytes: usize) -> RarResult<String> {
         let _decode = self.decode_mode.enter();
         let limit = max_bytes.min(MAX_LINK_TARGET_BYTES);
@@ -1205,10 +1214,14 @@ impl RarArchive {
                     link_type: "unknown redirection".into(),
                 });
             }
+            // The decoded string has already turned an invalid sequence into
+            // U+FFFD, so it cannot stand in for the bytes the parser kept.
             let bytes = redirection
                 .target_raw
                 .as_deref()
-                .unwrap_or(redirection.target.as_bytes());
+                .ok_or_else(|| RarError::CorruptArchive {
+                    detail: "Strict link target has no raw target bytes".into(),
+                })?;
             return Self::strict_link_target_text(
                 &self.members[index].file_header.name,
                 bytes,
@@ -1257,9 +1270,14 @@ impl RarArchive {
             password: self.password.clone(),
             restore_owners: false,
         };
+        // A solid member decodes on the shared decoder state: refuse it once
+        // that state is poisoned, and poison it when this decode fails part
+        // way, exactly as an `Entry` consumption does.
+        self.check_solid_poison_at(index)?;
         let extracted =
-            self.extract_member_with_link_policy(index, &options, None, true, Some(limit as u64))?;
-        if extracted.len() as u64 != declared || extracted.len() > limit {
+            self.extract_member_with_link_policy(index, &options, None, true, Some(limit as u64));
+        let extracted = super::entry::poison_on_error(self, index, extracted)?;
+        if extracted.len() as u64 != declared {
             return Err(RarError::CorruptArchive {
                 detail: "Strict link payload length differs from its bounded header".into(),
             });
@@ -10291,57 +10309,192 @@ mod tests {
         }
     }
     #[test]
-    #[ignore = "requires the existing RAR4 compressed fixture from the signed corpus"]
-    fn strict_link_target_solid_decoder_ceiling_precedes_output_growth() {
-        use std::io::{Seek, SeekFrom};
-        let path =
-            std::env::var("RAR_SOLID_LIMIT_FIXTURE").expect("RAR_SOLID_LIMIT_FIXTURE required");
-        let archive = RarArchive::open(std::fs::File::open(&path).unwrap()).unwrap();
-        let entry = &archive.members[0];
-        let mut header = entry.file_header.clone();
-        header.compression.solid = true;
-        let segment = &entry.segments[0];
-        let mut source = std::fs::File::open(path).unwrap();
-        source.seek(SeekFrom::Start(segment.data_offset)).unwrap();
-        let mut output = Vec::new();
-        let error = RarArchive::solid_decode_reader_to_writer_link_limited(
-            &mut None,
-            &mut None,
-            &Limits::default(),
-            source.take(segment.data_size),
-            header.unpacked_size.unwrap(),
-            &header,
-            (&mut output, Some(1)),
-        )
-        .unwrap_err();
+    fn strict_link_target_refuses_a_redirection_without_raw_target_bytes() {
+        // A metadata cache written before raw targets were kept restores the
+        // decoded string alone, where an invalid sequence is already U+FFFD.
+        let mut archive = strict_target_archive(b"target");
+        archive.format = ArchiveFormat::Rar5;
+        archive.members[0].redirection = Some(header::Redirection {
+            redir_type: header::RedirectionType::UnixSymlink,
+            target: "a\u{fffd}b".into(),
+            target_raw: None,
+            target_is_directory: false,
+        });
+        assert!(matches!(
+            archive.read_link_target(0, 64),
+            Err(RarError::CorruptArchive { .. })
+        ));
+    }
+
+    /// A corpus fixture's bytes, or `None` (and a skip line) when the corpus
+    /// is not hydrated: a Git LFS pointer stub exists but is not a RAR.
+    fn hydrated_fixture(dir: &str, name: &str) -> Option<Vec<u8>> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(dir)
+            .join(name);
+        match std::fs::read(&path) {
+            Ok(bytes) if bytes.starts_with(b"Rar!") => Some(bytes),
+            _ => {
+                eprintln!("skipping test: {dir} fixtures not present ({name})");
+                None
+            }
+        }
+    }
+
+    fn open_fixture(bytes: Vec<u8>, password: Option<&str>) -> RarArchive {
+        let reader = Cursor::new(bytes);
+        match password {
+            Some(password) => RarArchive::open_with_password(reader, password).unwrap(),
+            None => RarArchive::open(reader).unwrap(),
+        }
+    }
+
+    /// libarchive's RAR3 fixture stores a real Unix symlink whose 54-byte
+    /// UTF-8 target follows its header.
+    #[test]
+    fn strict_link_target_reads_a_real_rar3_unix_symlink() {
+        let Some(bytes) = hydrated_fixture("rar4", "test_read_format_rar_unicode.rar") else {
+            return;
+        };
+        let mut archive = open_fixture(bytes, None);
+        let index = (0..archive.len())
+            .find(|&index| archive.member_info(index).unwrap().is_symlink)
+            .expect("the fixture holds a symlink");
+        let target = "漢字長いファイル名long-filename-in-漢字.txt";
+        assert_eq!(target.len(), 54);
+        assert!(matches!(
+            archive.read_link_target(index, 53),
+            Err(RarError::ResourceLimit {
+                kind: crate::error::LimitKind::LinkTarget,
+                ..
+            })
+        ));
+        assert_eq!(archive.read_link_target(index, 54).unwrap(), target);
+    }
+
+    /// The link-output ceiling stops every RAR4-family decode route that a
+    /// link payload can take, including both encrypted reader routes of the
+    /// solid path, on real archives: each member decodes to more than the
+    /// ceiling, so only the ceiling can end it with a link-target limit.
+    #[test]
+    fn link_output_ceiling_stops_every_decode_route_on_real_archives() {
+        let cases = [
+            ("rar4", "rar4_lz.rar", None, false),
+            ("rar4", "rar4_enc_lz.rar", Some("testpass123"), false),
+            ("rar4", "rar4_lz_solid_mv.rar", None, true),
+            (
+                "rar4",
+                "test_read_format_rar4_solid_encrypted.rar",
+                Some("password"),
+                true,
+            ),
+            (
+                "rar5",
+                "test_read_format_rar5_solid_encrypted_filenames.rar",
+                Some("password"),
+                true,
+            ),
+        ];
+        for (dir, name, password, solid) in cases {
+            let Some(bytes) = hydrated_fixture(dir, name) else {
+                continue;
+            };
+            let mut archive = open_fixture(bytes, password);
+            let fh = archive.members[0].file_header.clone();
+            assert_ne!(fh.compression.method, CompressionMethod::Store, "{name}");
+            assert!(fh.unpacked_size.unwrap() > 4, "{name}");
+            assert_eq!(archive.member_is_solid_at(0), solid, "{name}");
+            assert_eq!(archive.members[0].is_encrypted, password.is_some(), "{name}");
+            let options = ExtractOptions {
+                verify: true,
+                password: password.map(str::to_owned),
+                restore_owners: false,
+            };
+            let error = archive
+                .extract_member_with_link_policy(0, &options, None, true, Some(4))
+                .err()
+                .unwrap_or_else(|| panic!("{name}: decoded past the ceiling"));
+            assert!(
+                matches!(
+                    error,
+                    RarError::ResourceLimit {
+                        kind: crate::error::LimitKind::LinkTarget,
+                        max: 4,
+                        ..
+                    }
+                ),
+                "{name}: {error:?}"
+            );
+        }
+    }
+
+    /// A RAR3 payload read consumes its solid member in ascending order: a
+    /// later member decodes the earlier ones first, and a repeated or earlier
+    /// read is refused without poisoning the archive.
+    #[test]
+    fn strict_link_target_follows_solid_order_on_an_encrypted_solid_archive() {
+        let Some(bytes) = hydrated_fixture("rar4", "test_read_format_rar4_solid_encrypted.rar")
+        else {
+            return;
+        };
+        let mut archive = open_fixture(bytes, Some("password"));
+        for index in [1, 3] {
+            let fh = &mut archive.members[index].file_header;
+            fh.host_os = HostOs::Unix;
+            fh.attributes = FileAttributes(0xA1FF);
+        }
+        assert_eq!(archive.read_link_target(3, 64).unwrap(), "This is from d.txt");
+        for index in [3, 1] {
+            assert!(matches!(
+                archive.read_link_target(index, 64),
+                Err(RarError::SolidOrderViolation { .. })
+            ));
+        }
+        assert!(archive.solid_poison.is_none());
+    }
+
+    /// A strict read that fails after a solid member's decode began leaves
+    /// the shared decoder mid-member. Like a failed `Entry` consumption, it
+    /// must poison the archive so no later solid member decodes on that state.
+    #[test]
+    fn strict_link_target_failure_mid_solid_decode_poisons_the_archive() {
+        let Some(bytes) = hydrated_fixture("rar4", "test_read_format_rar4_solid_encrypted.rar")
+        else {
+            return;
+        };
+        let mut archive = open_fixture(bytes, Some("password"));
+        assert!(archive.member_is_solid_at(1) && archive.member_is_solid_at(2));
+        // Member 1 posing as a Unix symlink that declares 4 of its 18 bytes:
+        // the decode stops early and its checksum cannot match.
+        let fh = &mut archive.members[1].file_header;
+        fh.host_os = HostOs::Unix;
+        fh.attributes = FileAttributes(0xA1FF);
+        fh.unpacked_size = Some(4);
+        assert!(archive.member_info(1).unwrap().is_symlink);
+
+        let error = archive.read_link_target(1, 64).unwrap_err();
         assert!(
-            matches!(
+            !matches!(
                 error,
-                RarError::ResourceLimit {
-                    kind: crate::error::LimitKind::LinkTarget,
-                    ..
-                }
+                RarError::SolidOrderViolation { .. } | RarError::SolidStatePoisoned { .. }
             ),
             "{error:?}"
         );
-        assert!(output.len() <= 1);
-    }
-    #[test]
-    #[ignore = "requires an operator-provided official RAR3 fixture outside the signed corpus"]
-    fn strict_link_target_real_rar3_fixture() {
-        let path = std::env::var("RAR_LINK_FIXTURE")
-            .expect("RAR_LINK_FIXTURE must identify the official tiny RAR3 fixture");
-        let mut archive = RarArchive::open(std::fs::File::open(path).unwrap()).unwrap();
-        let index = archive
-            .indexed_member_infos()
-            .into_iter()
-            .find(|member| member.info.name == "testlink")
-            .unwrap()
-            .index;
-        assert_eq!(
-            archive.read_link_target(index, 16 * 1024).unwrap(),
-            "test.txt"
+        let mut out = Vec::new();
+        let later = archive.by_index(2).unwrap().copy_to(&mut out);
+        assert!(
+            matches!(later, Err(RarError::SolidStatePoisoned { .. })),
+            "a later solid member decoded on the abandoned state: {later:?}, {:?}",
+            String::from_utf8_lossy(&out)
         );
+        let fh = &mut archive.members[2].file_header;
+        fh.host_os = HostOs::Unix;
+        fh.attributes = FileAttributes(0xA1FF);
+        assert!(matches!(
+            archive.read_link_target(2, 64),
+            Err(RarError::SolidStatePoisoned { .. })
+        ));
     }
     #[test]
     fn rar3_symlink_payload_reader_bypasses_non_file_extraction_guard() {
