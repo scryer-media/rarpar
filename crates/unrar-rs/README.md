@@ -35,6 +35,40 @@ for member in archive.entries() {
 }
 ```
 
+## Inspecting link targets
+
+`member_redirection(index)` borrows RAR5 redirection metadata without decoding
+member data. Its type and directory-target flag are separate from the file
+header's directory bit. `read_link_target(index, max_bytes)` returns untrusted
+target text without creating a filesystem link:
+
+```rust,no_run
+use unrar_rs::RarArchive;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let mut archive = RarArchive::open(std::fs::File::open("links.rar")?)?;
+if let Some(redirection) = archive.member_redirection(0)? {
+    println!("{:?}, directory target: {}",
+        redirection.redir_type, redirection.target_is_directory);
+}
+let target = archive.read_link_target(0, 16 * 1024)?;
+println!("{target}");
+# Ok(())
+# }
+```
+
+The effective ceiling is the smaller of the caller's limit and 64 KiB.
+RAR3 Unix targets require known packed and expanded sizes within that ceiling,
+a present CRC, checksum-verified decoding and exact expanded length. Every
+returned target must be nonempty UTF-8 without NUL. RAR5 targets come from the
+existing verified header, not a separately decoded/checksummed payload;
+unknown redirection types are refused. A known junction or directory target
+can still be inspected, so the caller must apply its own materialization and
+path policy. Solid archives retain their ascending-index consumption rules.
+
+This additive strict contract does not replace the native filesystem
+extractor's compatibility handling. See the [reference-source comparison and
+intentional differences](docs/link-target-grounding.md).
+
 ## Extracting
 
 Pick a member with `by_index` or `by_name`, then say where its bytes go:

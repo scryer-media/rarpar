@@ -3033,8 +3033,10 @@ impl Rar4LzDecoder {
     ///   declared size, and the oracle still applies it, so the caller has to
     ///   resume decoding far enough to complete the block.
     ///
-    /// Returns whether that block moved the decode bound, i.e. whether the
-    /// caller should re-enter its decode loop. A failed decode is not an error:
+    /// Returns whether the caller should re-enter its decode loop: a VM block
+    /// moved the decode bound, or a code 256 read new tables without ending
+    /// the member, so the next code is still this member's. A failed decode
+    /// is not an error:
     /// at the true end of the stream there may be no code here at all.
     fn consume_solid_end_marker<R: BitRead>(&mut self, reader: &mut R) -> RarResult<bool> {
         if !matches!(self.block_type, BlockType::Lz) || !self.tables_read {
@@ -3050,8 +3052,13 @@ impl Rar4LzDecoder {
             }
         };
         if number == 256 {
-            self.read_end_of_block(reader)?;
-            return Ok(false);
+            // "1" (new table, same file) reads the tables here and the oracle
+            // goes on decoding (`ReadEndOfBlock` returns true,
+            // unpack30.cpp:260-290), so the next code is still this member's:
+            // typically the "0x" new-file code whose new-table bit the next
+            // member reads its tables by. Stopping after the table read
+            // leaves that code unread and the next member on stale tables.
+            return self.read_end_of_block(reader);
         }
         if number == 257 {
             let before = self.decode_limit();
@@ -5030,6 +5037,12 @@ mod tests {
             self.put(0, count)
         }
 
+        /// Zero bits up to the next byte boundary.
+        fn align(&mut self) -> &mut Self {
+            let pad = (8 - self.bits % 8) % 8;
+            self.put(0, pad)
+        }
+
         /// One member's packed bytes; the next member starts byte-aligned.
         fn take(&mut self) -> Vec<u8> {
             self.bits = 0;
@@ -5142,6 +5155,34 @@ mod tests {
         decoder.prepare_member(false, 0x40000).unwrap();
         assert!(decoder.decompress(&[], 0).unwrap().is_empty());
         assert!(!decoder.tables_read);
+    }
+
+    /// A member whose last output symbol is followed by code 256 "1" (new
+    /// tables, same file) and then the end-of-file code. The oracle reads
+    /// the tables and keeps decoding (`ReadEndOfBlock`, unpack30.cpp:260-290),
+    /// so the end-of-file code's new-table bit is what the next member
+    /// follows. RAR 2.9 writes this shape after a filtered block that ends
+    /// exactly at the end of a member.
+    #[test]
+    fn table_switch_after_a_members_last_symbol_still_reads_its_end_of_file_code() {
+        let mut bits = EmptyMemberBits::default();
+        let first = bits
+            .tables(b'A' as usize)
+            .literals(3)
+            .put(1, 1) // symbol 256
+            .put(1, 1) // "1": new tables here, same file
+            .align() // a table block starts byte-aligned (ReadTables30)
+            .tables(b'B' as usize)
+            .end_of_file(true)
+            .take();
+        let next = bits
+            .tables(b'C' as usize)
+            .literals(2)
+            .end_of_file(false)
+            .take();
+
+        let out = decode_solid_members(&[(first, 3), (next, 2)]).unwrap();
+        assert_eq!(out, [b"AAA".to_vec(), b"CC".to_vec()]);
     }
 
     #[test]

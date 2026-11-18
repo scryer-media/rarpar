@@ -171,7 +171,10 @@ pub fn parse_extra_area(data: &[u8], owner: ExtraAreaOwner) -> RarResult<Vec<Ext
             record_type::FILE_HASH => parse_file_hash(record_body),
             record_type::FILE_TIME => parse_file_time(record_body),
             record_type::FILE_VERSION => parse_file_version(record_body),
-            record_type::REDIRECTION => parse_redirection(record_body),
+            // The reference reader reads this record's fields and name from
+            // the header buffer, bounded by the header's end rather than the
+            // record's (arcread.cpp FHEXTRA_REDIR; rawread.cpp GetV, GetB).
+            record_type::REDIRECTION => parse_redirection(&data[pos + type_n..]),
             record_type::UNIX_OWNER => parse_unix_owner(record_body),
             record_type::SERVICE_DATA => ExtraRecord::ServiceData(record_body.to_vec()),
             other => ExtraRecord::Unknown { record_type: other },
@@ -300,6 +303,9 @@ fn parse_file_version(data: &[u8]) -> ExtraRecord {
     ExtraRecord::FileVersion { version }
 }
 
+/// `data` runs from the record body to the end of the extra area. A name
+/// longer than its record takes the following bytes of the area, and is
+/// zero filled past the area's end.
 fn parse_redirection(data: &[u8]) -> ExtraRecord {
     let (redir_type, n) = read_raw_vint_lossy(data);
     let rest = &data[n..];
@@ -309,6 +315,12 @@ fn parse_redirection(data: &[u8]) -> ExtraRecord {
 
     let name_start = k;
     if name_len == 0 || name_len >= MAXPATHSIZE {
+        return invalid_redirection_record();
+    }
+    // Type 0 is FSREDIR_NONE (headers.hpp). arcread.cpp stores the type as
+    // read, and extract.cpp takes a member for a link only when its type is
+    // not FSREDIR_NONE, so a record of type 0 leaves a plain file.
+    if redir_type == 0 {
         return invalid_redirection_record();
     }
     let Ok(name_len) = usize::try_from(name_len) else {

@@ -491,8 +491,9 @@ fn copy_match(
     unpacked_size: u64,
     rar15_zero_distance: bool,
 ) -> RarResult<u64> {
-    let remaining = (unpacked_size - output_size) as usize;
-    let visible_len = length.min(remaining);
+    // Bounded in u64 before narrowing: 4 GiB or more remaining must not
+    // shrink the visible part of a match on a 32-bit target.
+    let visible_len = (unpacked_size - output_size).min(length as u64) as usize;
     if rar15_zero_distance {
         window.copy_rar15_with_visible_len(distance, length, visible_len)?;
     } else {
@@ -1961,6 +1962,21 @@ mod tests {
     use super::*;
     use crate::limits::RAR_PPMD_MAX_ARENA_SIZE;
     use std::io::Cursor;
+
+    /// A match with exactly 4 GiB of the member still to come is visible in
+    /// full. On a 32-bit target the remaining count narrowed before the
+    /// minimum became zero and hid the whole match.
+    #[test]
+    fn match_with_4_gib_remaining_stays_visible() {
+        let mut window = Window::new(64);
+        window.put_bytes(b"abcd");
+        let unpacked_size = 4 + (1u64 << 32);
+        let output_size = copy_match(&mut window, 4, 4, 4, unpacked_size, false).unwrap();
+        assert_eq!(output_size, 8);
+        let mut visible = Vec::new();
+        window.flush_to_writer(&mut visible).unwrap();
+        assert_eq!(visible, b"abcdabcd");
+    }
 
     #[test]
     fn old_rar_version_gate_matches_rar_behavior_dispatch() {
