@@ -22,6 +22,9 @@
 - A RAR5 redirection record of type 0 (`FSREDIR_NONE`) leaves a plain file,
   as UnRAR reads it. It was kept as a redirection of unknown type, so the
   member was refused instead of extracted.
+- A RAR3 Unix link split over volumes is admitted on the packed size of all
+  its parts. It was admitted on the first volume's part alone, so later
+  parts could exceed the link ceiling.
 - Attached-volume and provider-backed segment readers compare the remaining
   packed length in 64 bits before narrowing the bounded read count. On
   32-bit targets, a segment with at least 4 GiB remaining could otherwise

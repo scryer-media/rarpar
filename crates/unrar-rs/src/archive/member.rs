@@ -1250,7 +1250,8 @@ impl RarArchive {
         let declared = fh.unpacked_size.ok_or_else(|| RarError::CorruptArchive {
             detail: "Strict link target declares no expanded size".into(),
         })?;
-        for size in [fh.data_size, declared] {
+        let packed = self.link_packed_size(index, &fh)?;
+        for size in [packed, declared] {
             if size > limit as u64 {
                 return Err(RarError::resource_limit(
                     crate::error::LimitKind::LinkTarget,
@@ -1291,6 +1292,21 @@ impl RarArchive {
         Self::strict_link_target_text(&info.name, &payload, limit)
     }
 
+    // What a link's payload stores across every volume it spans. A header's
+    // `data_size` is its own volume's part only, so a link split over volumes
+    // is admitted on the sum of its parts, never on the first alone.
+    fn link_packed_size(&self, index: usize, fh: &FileHeader) -> RarResult<u64> {
+        let Some(member) = self.members.get(index) else {
+            return Ok(fh.data_size);
+        };
+        let stored = member.segments.iter().try_fold(0u64, |total, segment| {
+            total.checked_add(segment.data_size).ok_or_else(|| {
+                RarError::corrupt(format!("RAR link {} packed size overflows u64", fh.name))
+            })
+        })?;
+        Ok(stored.max(fh.data_size))
+    }
+
     fn link_target_from_rar3_payload(
         &mut self,
         index: usize,
@@ -1306,10 +1322,11 @@ impl RarArchive {
         // member would decode under the *general* member ceiling
         // (`limits.max_unpacked_size`, megabytes) and only meet MAXPATHSIZE
         // once it was already materialized.
-        if fh.data_size > MAX_LINK_TARGET_BYTES as u64 {
+        let packed = self.link_packed_size(index, fh)?;
+        if packed > MAX_LINK_TARGET_BYTES as u64 {
             return Err(RarError::resource_limit(
                 crate::error::LimitKind::LinkTarget,
-                fh.data_size,
+                packed,
                 MAX_LINK_TARGET_BYTES as u64,
                 Some(fh.name.to_string()),
             ));
@@ -10705,6 +10722,50 @@ mod tests {
 
         assert_eq!(decoded.raw, b"safe/target");
         assert_eq!(decoded.safety_target, "safe/target");
+    }
+
+    /// A link split over volumes whose first part fits and whose parts
+    /// together do not: both the extraction path and the strict read refuse
+    /// it on the sum, before a byte is read (no volume is attached here).
+    #[test]
+    fn rar3_symlink_target_split_over_volumes_is_bounded_by_the_sum_of_its_parts() {
+        let mut archive = empty_rar5_archive();
+        archive.format = ArchiveFormat::Rar4;
+        let mut fh = test_rar3_symlink_header(Some(0));
+        fh.data_size = 16;
+        fh.unpacked_size = Some(16);
+        archive.members.push(MemberEntry {
+            file_header: fh.clone(),
+            is_encrypted: false,
+            file_encryption: None,
+            rar4_salt: None,
+            hash: None,
+            redirection: None,
+            owner: None,
+            segments: vec![
+                DataSegment::new(0, 0, 16),
+                DataSegment::new(1, 0, MAX_LINK_TARGET_BYTES as u64),
+            ],
+        });
+
+        let limited = |err: RarError| {
+            assert!(
+                matches!(
+                    err,
+                    RarError::ResourceLimit {
+                        kind: crate::error::LimitKind::LinkTarget,
+                        ..
+                    }
+                ),
+                "expected ResourceLimit, got {err}"
+            );
+        };
+        limited(
+            archive
+                .link_target_from_rar3_payload(0, &ExtractOptions::default(), &fh)
+                .unwrap_err(),
+        );
+        limited(archive.read_link_target(0, 64).unwrap_err());
     }
 
     #[test]
