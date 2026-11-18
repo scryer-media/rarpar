@@ -256,15 +256,22 @@ jobs:
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
-      - name: Configure trusted sccache
-        # Pushes and this repository's own pull requests share the R2 cache;
-        # a fork's pull request has no secrets and keeps the local disk cache.
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      - name: Configure trusted non-PR sccache
+        if: github.event_name != 'pull_request'
         uses: ./.github/actions/configure-sccache-r2
         with:
           endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
+      - name: Configure internal PR sccache
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          bucket: pr-sccache
+          endpoint: ${{ secrets.SCCACHE_PR_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_PR_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_PR_S3_SECRET }}
           key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
       - name: Prime sccache server
         run: |
@@ -314,15 +321,22 @@ jobs:
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
-      - name: Configure trusted sccache
-        # Pushes and this repository's own pull requests share the R2 cache;
-        # a fork's pull request has no secrets and keeps the local disk cache.
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      - name: Configure trusted non-PR sccache
+        if: github.event_name != 'pull_request'
         uses: ./.github/actions/configure-sccache-r2
         with:
           endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
+      - name: Configure internal PR sccache
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          bucket: pr-sccache
+          endpoint: ${{ secrets.SCCACHE_PR_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_PR_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_PR_S3_SECRET }}
           key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
       - name: Prime sccache server
         run: |
@@ -382,15 +396,22 @@ jobs:
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
-      - name: Configure trusted sccache
-        # Pushes and this repository's own pull requests share the R2 cache;
-        # a fork's pull request has no secrets and keeps the local disk cache.
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      - name: Configure trusted non-PR sccache
+        if: github.event_name != 'pull_request'
         uses: ./.github/actions/configure-sccache-r2
         with:
           endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
+      - name: Configure internal PR sccache
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          bucket: pr-sccache
+          endpoint: ${{ secrets.SCCACHE_PR_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_PR_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_PR_S3_SECRET }}
           key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
       - name: Prime sccache server
         run: |
@@ -528,15 +549,22 @@ jobs:
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
-      - name: Configure trusted sccache
-        # Pushes and this repository's own pull requests share the R2 cache;
-        # a fork's pull request has no secrets and keeps the local disk cache.
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      - name: Configure trusted non-PR sccache
+        if: github.event_name != 'pull_request'
         uses: ./.github/actions/configure-sccache-r2
         with:
           endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/aarch64-unknown-linux-gnu/
+      - name: Configure internal PR sccache
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          bucket: pr-sccache
+          endpoint: ${{ secrets.SCCACHE_PR_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_PR_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_PR_S3_SECRET }}
           key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/aarch64-unknown-linux-gnu/
       - name: Prime sccache server
         run: |
@@ -584,15 +612,22 @@ jobs:
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
-      - name: Configure trusted sccache
-        # Pushes and this repository's own pull requests share the R2 cache;
-        # a fork's pull request has no secrets and keeps the local disk cache.
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      - name: Configure trusted non-PR sccache
+        if: github.event_name != 'pull_request'
         uses: ./.github/actions/configure-sccache-r2
         with:
           endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
+      - name: Configure internal PR sccache
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          bucket: pr-sccache
+          endpoint: ${{ secrets.SCCACHE_PR_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_PR_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_PR_S3_SECRET }}
           key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
       - name: Prime sccache server
         run: |
@@ -688,15 +723,22 @@ jobs:
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
-      - name: Configure trusted sccache
-        # Pushes and this repository's own pull requests share the R2 cache;
-        # a fork's pull request has no secrets and keeps the local disk cache.
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      - name: Configure trusted non-PR sccache
+        if: github.event_name != 'pull_request'
         uses: ./.github/actions/configure-sccache-r2
         with:
           endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
+      - name: Configure internal PR sccache
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          bucket: pr-sccache
+          endpoint: ${{ secrets.SCCACHE_PR_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_PR_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_PR_S3_SECRET }}
           key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
       - name: Prime sccache server
         run: |
@@ -863,15 +905,22 @@ jobs:
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
-      - name: Configure trusted sccache
-        # Pushes and this repository's own pull requests share the R2 cache;
-        # a fork's pull request has no secrets and keeps the local disk cache.
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      - name: Configure trusted non-PR sccache
+        if: github.event_name != 'pull_request'
         uses: ./.github/actions/configure-sccache-r2
         with:
           endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
+      - name: Configure internal PR sccache
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          bucket: pr-sccache
+          endpoint: ${{ secrets.SCCACHE_PR_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_PR_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_PR_S3_SECRET }}
           key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
       - name: Prime sccache server
         run: |
@@ -983,15 +1032,22 @@ jobs:
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
-      - name: Configure trusted sccache
-        # Pushes and this repository's own pull requests share the R2 cache;
-        # a fork's pull request has no secrets and keeps the local disk cache.
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      - name: Configure trusted non-PR sccache
+        if: github.event_name != 'pull_request'
         uses: ./.github/actions/configure-sccache-r2
         with:
           endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/${{ matrix.target }}/
+      - name: Configure internal PR sccache
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          bucket: pr-sccache
+          endpoint: ${{ secrets.SCCACHE_PR_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_PR_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_PR_S3_SECRET }}
           key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/${{ matrix.target }}/
       - name: Configure compiler flags
         run: .github/scripts/ci/platform-tests-configure-compiler-flags-linux.sh
@@ -1056,15 +1112,22 @@ jobs:
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
-      - name: Configure trusted sccache
-        # Pushes and this repository's own pull requests share the R2 cache;
-        # a fork's pull request has no secrets and keeps the local disk cache.
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      - name: Configure trusted non-PR sccache
+        if: github.event_name != 'pull_request'
         uses: ./.github/actions/configure-sccache-r2
         with:
           endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/${{ matrix.target }}/
+      - name: Configure internal PR sccache
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          bucket: pr-sccache
+          endpoint: ${{ secrets.SCCACHE_PR_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_PR_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_PR_S3_SECRET }}
           key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/${{ matrix.target }}/
       - name: Configure compiler flags
         run: .github/scripts/ci/configure-compiler-flags-macos.sh
@@ -1135,15 +1198,22 @@ jobs:
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
-      - name: Configure trusted sccache
-        # Pushes and this repository's own pull requests share the R2 cache;
-        # a fork's pull request has no secrets and keeps the local disk cache.
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      - name: Configure trusted non-PR sccache
+        if: github.event_name != 'pull_request'
         uses: ./.github/actions/configure-sccache-r2
         with:
           endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/${{ matrix.target }}/
+      - name: Configure internal PR sccache
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          bucket: pr-sccache
+          endpoint: ${{ secrets.SCCACHE_PR_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_PR_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_PR_S3_SECRET }}
           key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/${{ matrix.target }}/
       - name: Configure compiler flags
         # RUSTFLAGS replaces the [target.'cfg(all(windows, target_env = "msvc"))']
@@ -1228,15 +1298,22 @@ jobs:
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
-      - name: Configure trusted sccache
-        # Pushes and this repository's own pull requests share the R2 cache;
-        # a fork's pull request has no secrets and keeps the local disk cache.
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      - name: Configure trusted non-PR sccache
+        if: github.event_name != 'pull_request'
         uses: ./.github/actions/configure-sccache-r2
         with:
           endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/${{ matrix.target }}/
+      - name: Configure internal PR sccache
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          bucket: pr-sccache
+          endpoint: ${{ secrets.SCCACHE_PR_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_PR_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_PR_S3_SECRET }}
           key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/${{ matrix.target }}/
       - name: Configure compiler flags
         env:
@@ -1354,15 +1431,22 @@ jobs:
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
-      - name: Configure trusted sccache
-        # Pushes and this repository's own pull requests share the R2 cache;
-        # a fork's pull request has no secrets and keeps the local disk cache.
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      - name: Configure trusted non-PR sccache
+        if: github.event_name != 'pull_request'
         uses: ./.github/actions/configure-sccache-r2
         with:
           endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/${{ matrix.target }}/
+      - name: Configure internal PR sccache
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          bucket: pr-sccache
+          endpoint: ${{ secrets.SCCACHE_PR_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_PR_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_PR_S3_SECRET }}
           key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/${{ matrix.target }}/
       - name: Configure compiler flags
         run: .github/scripts/ci/configure-compiler-flags-macos.sh
@@ -1469,15 +1553,22 @@ jobs:
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
-      - name: Configure trusted sccache
-        # Pushes and this repository's own pull requests share the R2 cache;
-        # a fork's pull request has no secrets and keeps the local disk cache.
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      - name: Configure trusted non-PR sccache
+        if: github.event_name != 'pull_request'
         uses: ./.github/actions/configure-sccache-r2
         with:
           endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/${{ matrix.target }}/
+      - name: Configure internal PR sccache
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          bucket: pr-sccache
+          endpoint: ${{ secrets.SCCACHE_PR_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_PR_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_PR_S3_SECRET }}
           key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/${{ matrix.target }}/
       - name: Configure compiler flags
         # RUSTFLAGS replaces the [target.'cfg(all(windows, target_env = "msvc"))']
@@ -1568,15 +1659,22 @@ jobs:
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
-      - name: Configure trusted sccache
-        # Pushes and this repository's own pull requests share the R2 cache;
-        # a fork's pull request has no secrets and keeps the local disk cache.
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      - name: Configure trusted non-PR sccache
+        if: github.event_name != 'pull_request'
         uses: ./.github/actions/configure-sccache-r2
         with:
           endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
+      - name: Configure internal PR sccache
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          bucket: pr-sccache
+          endpoint: ${{ secrets.SCCACHE_PR_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_PR_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_PR_S3_SECRET }}
           key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
       - name: Prime sccache server
         run: |
@@ -1736,15 +1834,22 @@ jobs:
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
-      - name: Configure trusted sccache
-        # Pushes and this repository's own pull requests share the R2 cache;
-        # a fork's pull request has no secrets and keeps the local disk cache.
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      - name: Configure trusted non-PR sccache
+        if: github.event_name != 'pull_request'
         uses: ./.github/actions/configure-sccache-r2
         with:
           endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
+      - name: Configure internal PR sccache
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          bucket: pr-sccache
+          endpoint: ${{ secrets.SCCACHE_PR_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_PR_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_PR_S3_SECRET }}
           key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
       - name: Prime sccache server
         run: |
@@ -1829,15 +1934,22 @@ jobs:
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
-      - name: Configure trusted sccache
-        # Pushes and this repository's own pull requests share the R2 cache;
-        # a fork's pull request has no secrets and keeps the local disk cache.
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      - name: Configure trusted non-PR sccache
+        if: github.event_name != 'pull_request'
         uses: ./.github/actions/configure-sccache-r2
         with:
           endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
+      - name: Configure internal PR sccache
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          bucket: pr-sccache
+          endpoint: ${{ secrets.SCCACHE_PR_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_PR_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_PR_S3_SECRET }}
           key-prefix: rarpar/trusted-ci/v1/rust-${{ env.RUST_TOOLCHAIN }}/x86_64-unknown-linux-gnu/
       - name: Prime sccache server
         run: |
