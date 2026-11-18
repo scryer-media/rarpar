@@ -1203,7 +1203,8 @@ impl RarArchive {
     /// reference reader decodes it: it ends at the first NUL or malformed
     /// UTF-8 sequence of the stored name, and it is the target filesystem
     /// extraction would use. Stored bytes past that point are not seen by
-    /// these checks.
+    /// these checks. A redirection restored without its raw bytes is checked
+    /// as the decoded target text.
     pub fn read_link_target(&mut self, index: usize, max_bytes: usize) -> RarResult<String> {
         let _decode = self.decode_mode.enter();
         let limit = max_bytes.min(MAX_LINK_TARGET_BYTES);
@@ -1214,14 +1215,13 @@ impl RarArchive {
                     link_type: "unknown redirection".into(),
                 });
             }
-            // The decoded string has already turned an invalid sequence into
-            // U+FFFD, so it cannot stand in for the bytes the parser kept.
+            // The reference reader keeps only the decoded name and links to
+            // its re-encoding (ulinks.cpp ExtractUnixLink50: WideToChar of
+            // RedirName). Without raw bytes, the decoded target is that name.
             let bytes = redirection
                 .target_raw
                 .as_deref()
-                .ok_or_else(|| RarError::CorruptArchive {
-                    detail: "Strict link target has no raw target bytes".into(),
-                })?;
+                .unwrap_or(redirection.target.as_bytes());
             return Self::strict_link_target_text(
                 &self.members[index].file_header.name,
                 bytes,
@@ -10308,22 +10308,177 @@ mod tests {
             ));
         }
     }
-    #[test]
-    fn strict_link_target_refuses_a_redirection_without_raw_target_bytes() {
-        // A metadata cache written before raw targets were kept restores the
-        // decoded string alone, where an invalid sequence is already U+FFFD.
-        let mut archive = strict_target_archive(b"target");
-        archive.format = ArchiveFormat::Rar5;
-        archive.members[0].redirection = Some(header::Redirection {
-            redir_type: header::RedirectionType::UnixSymlink,
-            target: "a\u{fffd}b".into(),
-            target_raw: None,
-            target_is_directory: false,
-        });
+    fn rar5_block(header_type: u64, header_flags: u64, sizes: &[u64], body: &[u8]) -> Vec<u8> {
+        let mut block = crate::vint::encode_vint(header_type);
+        block.extend_from_slice(&crate::vint::encode_vint(header_flags));
+        for size in sizes {
+            block.extend_from_slice(&crate::vint::encode_vint(*size));
+        }
+        block.extend_from_slice(body);
+        let size = crate::vint::encode_vint(block.len() as u64);
+        let mut hasher = crate::crc::Crc32::new();
+        hasher.update(&size);
+        hasher.update(&block);
+        let mut raw = hasher.finalize().to_le_bytes().to_vec();
+        raw.extend_from_slice(&size);
+        raw.extend_from_slice(&block);
+        raw
+    }
+
+    /// A FHEXTRA_REDIR record whose name size field is `name_size`,
+    /// followed by `name` as stored, whatever its length.
+    fn redir_record(kind: u64, name_size: u64, name: &[u8]) -> Vec<u8> {
+        let record_type = crate::vint::encode_vint(header::extra::record_type::REDIRECTION);
+        let mut body = crate::vint::encode_vint(kind);
+        body.extend_from_slice(&crate::vint::encode_vint(0)); // flags.
+        body.extend_from_slice(&crate::vint::encode_vint(name_size));
+        body.extend_from_slice(name);
+        let mut record = crate::vint::encode_vint((record_type.len() + body.len()) as u64);
+        record.extend_from_slice(&record_type);
+        record.extend_from_slice(&body);
+        record
+    }
+
+    /// An opened RAR5 archive whose one member, "link", carries `extra_area`.
+    fn rar5_link_archive(extra_area: &[u8]) -> RarArchive {
+        let mut file_body = Vec::new();
+        file_body.extend_from_slice(&crate::vint::encode_vint(0)); // file flags.
+        file_body.extend_from_slice(&crate::vint::encode_vint(0)); // unpacked size.
+        file_body.extend_from_slice(&crate::vint::encode_vint(0)); // attributes.
+        file_body.extend_from_slice(&crate::vint::encode_vint(0)); // RAR5 Store.
+        file_body.extend_from_slice(&crate::vint::encode_vint(1)); // Unix host OS.
+        file_body.extend_from_slice(&crate::vint::encode_vint(4));
+        file_body.extend_from_slice(b"link");
+        file_body.extend_from_slice(extra_area);
+        let mut bytes = crate::signature::RAR5_SIGNATURE.to_vec();
+        bytes.extend_from_slice(&rar5_block(1, 0, &[], &crate::vint::encode_vint(0)));
+        bytes.extend_from_slice(&rar5_block(
+            2,
+            crate::header::common::flags::EXTRA_AREA,
+            &[extra_area.len() as u64],
+            &file_body,
+        ));
+        bytes.extend_from_slice(&rar5_block(5, 0, &[], &crate::vint::encode_vint(0)));
+        RarArchive::open(Cursor::new(bytes)).expect("test archive opens")
+    }
+
+    fn assert_not_a_link(mut archive: RarArchive) {
+        assert!(archive.member_redirection(0).unwrap().is_none());
         assert!(matches!(
             archive.read_link_target(0, 64),
+            Err(RarError::UnsupportedLinkType { ref link_type, .. })
+                if link_type == "member is not a link"
+        ));
+    }
+
+    // arcread.cpp FHEXTRA_REDIR: a well formed record sets the type and name.
+    #[test]
+    fn rar5_link_target_well_formed_record() {
+        let mut archive = rar5_link_archive(&redir_record(1, 6, b"target"));
+        assert_eq!(archive.read_link_target(0, 64).unwrap(), "target");
+    }
+
+    // arcread.cpp FHEXTRA_REDIR: NameSize 0 leaves RedirType at FSREDIR_NONE.
+    #[test]
+    fn rar5_link_target_zero_name_size_is_not_a_link() {
+        assert_not_a_link(rar5_link_archive(&redir_record(1, 0, b"")));
+    }
+
+    // arcread.cpp FHEXTRA_REDIR: NameSize >= MAXPATHSIZE leaves FSREDIR_NONE.
+    #[test]
+    fn rar5_link_target_name_size_at_maxpathsize_is_not_a_link() {
+        assert_not_a_link(rar5_link_archive(&redir_record(1, 0x10000, b"ab")));
+    }
+
+    // rawread.cpp GetB reads to the header's end, not the record's: a name
+    // longer than its record takes the next record's bytes.
+    #[test]
+    fn rar5_link_target_name_past_record_reads_following_extra_bytes() {
+        let mut area = redir_record(1, 6, b"ab");
+        area.extend_from_slice(&[3, 0x30, b'c', b'd']); // record type 0x30, body "cd".
+        let mut archive = rar5_link_archive(&area);
+        assert_eq!(archive.read_link_target(0, 64).unwrap(), "ab\u{3}0cd");
+    }
+
+    // rawread.cpp GetB zero fills past the header's end; UtfToWide stops at
+    // the first NUL.
+    #[test]
+    fn rar5_link_target_name_past_header_end_is_zero_filled() {
+        let mut archive = rar5_link_archive(&redir_record(1, 6, b"ab"));
+        assert_eq!(archive.read_link_target(0, 64).unwrap(), "ab");
+    }
+
+    // unicode.cpp UtfToWide stops at the first malformed sequence.
+    #[test]
+    fn rar5_link_target_invalid_utf8_keeps_prefix() {
+        let mut archive = rar5_link_archive(&redir_record(1, 11, b"ab/\xffignored"));
+        assert_eq!(archive.read_link_target(0, 64).unwrap(), "ab/");
+    }
+
+    // headers.hpp FILE_SYSTEM_REDIRECT 1..5 each keep RedirName; an unknown
+    // value reaches extract.cpp's UIERROR_UNKNOWNEXTRA branch.
+    #[test]
+    fn rar5_link_target_each_redirection_type() {
+        for (code, kind) in [
+            (1, header::RedirectionType::UnixSymlink),
+            (2, header::RedirectionType::WindowsSymlink),
+            (3, header::RedirectionType::WindowsJunction),
+            (4, header::RedirectionType::Hardlink),
+            (5, header::RedirectionType::FileCopy),
+        ] {
+            let mut archive = rar5_link_archive(&redir_record(code, 6, b"target"));
+            assert_eq!(
+                archive.member_redirection(0).unwrap().unwrap().redir_type,
+                kind
+            );
+            assert_eq!(archive.read_link_target(0, 64).unwrap(), "target");
+        }
+        let mut unknown = rar5_link_archive(&redir_record(6, 6, b"target"));
+        assert!(matches!(
+            unknown.read_link_target(0, 64),
+            Err(RarError::UnsupportedLinkType { .. })
+        ));
+    }
+
+    /// The archive restored from a metadata cache written before raw targets
+    /// were kept: the decoded target text alone.
+    fn without_raw_target(archive: &RarArchive) -> RarArchive {
+        let mut cached = archive.export_headers();
+        cached.members[0].redirection_target_raw = None;
+        RarArchive::from_cached_headers(cached)
+    }
+
+    // ulinks.cpp ExtractUnixLink50 links to WideToChar(RedirName): the
+    // decoded name is the target when no raw bytes are kept.
+    #[test]
+    fn rar5_link_target_without_raw_bytes_reads_the_decoded_target() {
+        let mut restored = without_raw_target(&rar5_link_archive(&redir_record(1, 6, b"target")));
+        assert!(
+            restored.members[0]
+                .redirection
+                .as_ref()
+                .unwrap()
+                .target_raw
+                .is_none()
+        );
+        assert_eq!(restored.read_link_target(0, 64).unwrap(), "target");
+        assert!(matches!(
+            restored.read_link_target(0, 5),
+            Err(RarError::ResourceLimit {
+                kind: crate::error::LimitKind::LinkTarget,
+                ..
+            })
+        ));
+
+        // A surrogate decodes to U+FFFD in the kept text; the raw bytes are
+        // not UTF-8, and only they are refused.
+        let mut surrogate = rar5_link_archive(&redir_record(1, 5, b"a\xed\xa0\x80b"));
+        assert!(matches!(
+            surrogate.read_link_target(0, 64),
             Err(RarError::CorruptArchive { .. })
         ));
+        let mut restored = without_raw_target(&surrogate);
+        assert_eq!(restored.read_link_target(0, 64).unwrap(), "a\u{fffd}b");
     }
 
     /// A corpus fixture's bytes, or `None` (and a skip line) when the corpus
