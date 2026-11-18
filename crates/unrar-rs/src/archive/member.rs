@@ -10384,6 +10384,24 @@ mod tests {
         assert_not_a_link(rar5_link_archive(&redir_record(1, 0, b"")));
     }
 
+    // extract.cpp: a link entry is one whose RedirType is not FSREDIR_NONE,
+    // so a record that states type 0 with a name leaves a plain file.
+    #[test]
+    fn rar5_link_target_type_zero_is_not_a_link() {
+        assert_not_a_link(rar5_link_archive(&redir_record(0, 6, b"target")));
+    }
+
+    // A type past the ones RAR defines stays a redirection of unknown type,
+    // which a caller reads through `member_redirection`.
+    #[test]
+    fn rar5_link_target_unknown_type_stays_a_redirection() {
+        let archive = rar5_link_archive(&redir_record(6, 6, b"target"));
+        assert_eq!(
+            archive.member_redirection(0).unwrap().map(|r| r.redir_type),
+            Some(header::RedirectionType::Unknown(6))
+        );
+    }
+
     // arcread.cpp FHEXTRA_REDIR: NameSize >= MAXPATHSIZE leaves FSREDIR_NONE.
     #[test]
     fn rar5_link_target_name_size_at_maxpathsize_is_not_a_link() {
@@ -10560,7 +10578,11 @@ mod tests {
             assert_ne!(fh.compression.method, CompressionMethod::Store, "{name}");
             assert!(fh.unpacked_size.unwrap() > 4, "{name}");
             assert_eq!(archive.member_is_solid_at(0), solid, "{name}");
-            assert_eq!(archive.members[0].is_encrypted, password.is_some(), "{name}");
+            assert_eq!(
+                archive.members[0].is_encrypted,
+                password.is_some(),
+                "{name}"
+            );
             let options = ExtractOptions {
                 verify: true,
                 password: password.map(str::to_owned),
@@ -10599,7 +10621,10 @@ mod tests {
             fh.host_os = HostOs::Unix;
             fh.attributes = FileAttributes(0xA1FF);
         }
-        assert_eq!(archive.read_link_target(3, 64).unwrap(), "This is from d.txt");
+        assert_eq!(
+            archive.read_link_target(3, 64).unwrap(),
+            "This is from d.txt"
+        );
         for index in [3, 1] {
             assert!(matches!(
                 archive.read_link_target(index, 64),

@@ -19,6 +19,9 @@
 
 ### Fixed
 
+- A RAR5 redirection record of type 0 (`FSREDIR_NONE`) leaves a plain file,
+  as UnRAR reads it. It was kept as a redirection of unknown type, so the
+  member was refused instead of extracted.
 - Attached-volume and provider-backed segment readers compare the remaining
   packed length in 64 bits before narrowing the bounded read count. On
   32-bit targets, a segment with at least 4 GiB remaining could otherwise

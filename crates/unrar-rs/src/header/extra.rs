@@ -317,6 +317,12 @@ fn parse_redirection(data: &[u8]) -> ExtraRecord {
     if name_len == 0 || name_len >= MAXPATHSIZE {
         return invalid_redirection_record();
     }
+    // Type 0 is FSREDIR_NONE (headers.hpp). arcread.cpp stores the type as
+    // read, and extract.cpp takes a member for a link only when its type is
+    // not FSREDIR_NONE, so a record of type 0 leaves a plain file.
+    if redir_type == 0 {
+        return invalid_redirection_record();
+    }
     let Ok(name_len) = usize::try_from(name_len) else {
         return invalid_redirection_record();
     };
