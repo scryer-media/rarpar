@@ -118,6 +118,17 @@ impl RawHeader {
 ///
 /// Returns `None` at EOF (no more headers).
 pub fn read_raw_header<R: Read + Seek>(reader: &mut R) -> RarResult<Option<RawHeader>> {
+    read_raw_header_sized(reader, &mut None)
+}
+
+/// [`read_raw_header`], setting `size` to how many bytes the header takes
+/// from its start once its size field is read, whatever the read then
+/// returns: a walk over an image that ends inside the header knows from it
+/// where the image has to reach.
+pub(crate) fn read_raw_header_sized<R: Read + Seek>(
+    reader: &mut R,
+    size: &mut Option<u64>,
+) -> RarResult<Option<RawHeader>> {
     let offset = reader.stream_position().map_err(RarError::from)?;
 
     // Read CRC32 (4 bytes little-endian)
@@ -133,6 +144,7 @@ pub fn read_raw_header<R: Read + Seek>(reader: &mut R) -> RarResult<Option<RawHe
     let (header_size, header_size_vint_len) = vint::read_vint_from(reader)?;
 
     validate_header_size(offset, header_size, header_size_vint_len)?;
+    *size = Some(4 + header_size_vint_len as u64 + header_size);
 
     // Read the full header body (header_size bytes: type + flags + extras + type-specific)
     let body_len = header_size as usize;

@@ -18,7 +18,7 @@ use tracing::{debug, warn};
 use zeroize::Zeroize;
 
 use crate::error::{RarError, RarResult};
-use crate::short_read::{HeaderScan, ShortRead, absorb_short_read};
+use crate::short_read::{HeaderScan, ShortRead, absorb_short_header, absorb_short_read};
 use crate::vint;
 use common::{HeaderType, RawHeader};
 
@@ -517,23 +517,26 @@ fn walk_headers_from<R: Read + Seek>(
         // The least the next header can occupy: its CRC32, a header-size vint
         // and a one-byte body.
         let floor = header_start + MIN_RAR5_HEADER_BYTES;
-        let raw =
-            match absorb_short_read(common::read_raw_header(reader), scan, reader, floor, short)? {
-                Some(Some(raw)) => raw,
-                Some(None) => {
-                    debug!("reached EOF while reading headers");
-                    // The stream ran out at a header boundary with no
-                    // end-of-archive record.
-                    *short = Some(ShortRead::at_boundary(floor));
-                    return Ok(HeaderWalk::Parsed(result));
-                }
-                None => {
-                    // A facts walk over an image that ends inside this header:
-                    // `short` now says where, and what a strict parse raises.
-                    debug!("stream ended inside the header at offset {header_start}");
-                    return Ok(HeaderWalk::Parsed(result));
-                }
-            };
+        // Once the header names its size, its end is what a walk needs.
+        let mut size = None;
+        let read = common::read_raw_header_sized(reader, &mut size);
+        let header_end = size.map(|size| header_start.saturating_add(size));
+        let raw = match absorb_short_header(read, scan, reader, floor, header_end, short)? {
+            Some(Some(raw)) => raw,
+            Some(None) => {
+                debug!("reached EOF while reading headers");
+                // The stream ran out at a header boundary with no
+                // end-of-archive record.
+                *short = Some(ShortRead::at_boundary(floor));
+                return Ok(HeaderWalk::Parsed(result));
+            }
+            None => {
+                // A facts walk over an image that ends inside this header:
+                // `short` now says where, and what a strict parse raises.
+                debug!("stream ended inside the header at offset {header_start}");
+                return Ok(HeaderWalk::Parsed(result));
+            }
+        };
 
         debug!(
             "header type={:?} flags={:#x} size={} data_size={} at offset={}",
@@ -701,11 +704,14 @@ fn parse_encrypted_headers<R: Read + Seek>(
         if aligned > 16 {
             let remaining = aligned - 16;
             let mut more = vec![0u8; remaining];
-            let Some(()) = absorb_short_read(
+            // The IV and every cipher block of the header.
+            let header_end = header_start.saturating_add(16 + aligned as u64);
+            let Some(()) = absorb_short_header(
                 reader.read_exact(&mut more).map_err(RarError::from),
                 scan,
                 reader,
                 floor,
+                Some(header_end),
                 short,
             )?
             else {

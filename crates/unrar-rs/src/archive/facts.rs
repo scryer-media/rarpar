@@ -248,8 +248,14 @@ pub struct RarVolumeFactsWalk {
     ///
     /// It is a **lower** bound: the walk reports the least it would need to
     /// make any progress at all, never a guess at where the next header ends.
-    /// Waiting for it can therefore cost a parse that still comes up short,
-    /// and can never skip the parse that would have succeeded.
+    /// Inside a header whose size field it read, that least is the header's
+    /// end, as the size states it: the walk reads no field of the header
+    /// before the whole of it is in. Short of the size field it is one byte
+    /// past where the reader stopped. A reader that states its length and
+    /// ends short of the header's end gets that one byte instead, as it
+    /// always has: such an image never holds the header whole. Waiting for
+    /// it can therefore cost a parse that still comes up short, and can
+    /// never skip the parse that would have succeeded.
     ///
     /// `Some(_)` alongside complete-looking facts is normal and is not an
     /// error: a volume whose headers all parsed can still be missing its end
@@ -2913,6 +2919,170 @@ mod tests {
             ] {
                 if let Some(bytes) = corpus_fixture(&["tests", "fixtures", dir, file]) {
                     hole_and_split_at_each_header(file, &bytes, password);
+                }
+            }
+        }
+
+        /// A volume staged exactly as its walks ask: the signature's eight
+        /// bytes first, and for RAR4 its archive header too (a walk short of
+        /// either is refused, not short), then each step stages the
+        /// bytes from the end of what is held to the offset the last step
+        /// gave, until a step needs nothing more or asks past the volume's
+        /// end. Every step is checked against a fresh walk (`Run::step`).
+        /// What the last step returned, and how many steps it took.
+        fn fed_as_asked(
+            name: &str,
+            bytes: &[u8],
+            password: Option<&'static str>,
+            view: View,
+        ) -> (RarResult<RarVolumeFactsWalk>, usize) {
+            let mut image = Image::empty(bytes);
+            let mut run = Run::new(password, view);
+            // The signature read takes eight bytes for every format, and a
+            // RAR4 walk short of its archive header is refused, not short.
+            let first = if bytes.get(6) == Some(&0) {
+                header_starts(bytes, password)
+                    .get(1)
+                    .copied()
+                    .unwrap_or(bytes.len())
+            } else {
+                8
+            };
+            let mut held = first.min(bytes.len()) as u64;
+            image.stage(0..held as usize);
+            loop {
+                // A reader that states its length still asks one byte at a
+                // time; a fresh walk per byte over a long volume is too slow
+                // to check every step of, so those steps are not compared.
+                let walk = match view {
+                    View::Sparse => run.step(&image, &format!("{name}, {view:?}, held {held}")),
+                    View::Prefix => {
+                        run.steps += 1;
+                        run.step_only(&image)
+                    }
+                };
+                let at = match &walk {
+                    Ok(walk) => walk.short_at,
+                    Err(_) => None,
+                };
+                let Some(at) = at else {
+                    return (walk, run.steps);
+                };
+                assert!(at > held, "{name}, {view:?}: asked {at} with {held} held");
+                if at > bytes.len() as u64 {
+                    return (walk, run.steps);
+                }
+                image.stage(held as usize..at as usize);
+                held = at;
+            }
+        }
+
+        /// Whether two walk results say the same, errors by their text.
+        fn same_outcome(
+            left: &RarResult<RarVolumeFactsWalk>,
+            right: &RarResult<RarVolumeFactsWalk>,
+        ) -> bool {
+            match (left, right) {
+                (Ok(left), Ok(right)) => left == right,
+                (Err(left), Err(right)) => format!("{left:?}") == format!("{right:?}"),
+                _ => false,
+            }
+        }
+
+        /// The most steps one header costs a caller staging what the walk
+        /// asks for, once the image has no stated end: the least any header
+        /// takes, then that header's end, then the end of its data.
+        const ASKS_PER_HEADER: usize = 3;
+
+        /// Fed as it asks, a volume reads to what a whole-volume walk reads,
+        /// and each header costs a few steps: the walk asks for a header's
+        /// end once it has read its size, not one byte more at a time.
+        #[test]
+        fn a_volume_fed_as_its_walk_asks_takes_a_few_steps_a_header() {
+            let mut volumes: Vec<(String, Vec<u8>, Option<&'static str>)> = synthetics()
+                .into_iter()
+                .map(|(name, volume)| (name.to_owned(), volume.bytes, None))
+                .collect();
+            volumes.push(("RAR5, 300 members".into(), synthetic_rar5(300).bytes, None));
+            volumes.push(("RAR4, 300 members".into(), synthetic_rar4(300).bytes, None));
+            for (dir, file, password) in [
+                ("rar4", "rar4_multifile_store.rar", None),
+                ("rar4", "rar4_enc_store.rar", Some("testpass123")),
+                ("rar4", "rar4_hp_store.rar", Some("secretpass")),
+                ("rar4", "generated_matrix_rar4_store_plain.part1.rar", None),
+                ("rar5", "rar5_multifile_store.rar", None),
+                ("rar5", "rar5_hp_store.rar", Some("secretpass")),
+                ("rar5", "rar5_enc_store_pair.rar", Some("testpass123")),
+                ("rar5", "generated_matrix_rar5_store_plain.part1.rar", None),
+                ("rar5", "rar5_mv_store_long.part01.rar", None),
+            ] {
+                if let Some(bytes) = corpus_fixture(&["tests", "fixtures", dir, file]) {
+                    volumes.push((file.to_owned(), bytes, password));
+                }
+            }
+            for (name, bytes, password) in &volumes {
+                let cache = Arc::new(crate::crypto::KdfCache::new());
+                let whole = fresh(&Image::whole(bytes), View::Sparse, *password, &cache)
+                    .unwrap_or_else(|err| panic!("{name}: the whole volume walks: {err:?}"));
+                assert_eq!(whole.short_at, None, "{name}: the volume is complete");
+                let headers = header_starts(bytes, *password).len();
+                let (sparse, asks) = fed_as_asked(name, bytes, *password, View::Sparse);
+                assert_eq!(sparse.unwrap(), whole, "{name}: sparse");
+                // A reader that states its length asks as it always did.
+                // Over a long volume that is a step a byte, too slow to run.
+                if headers <= 40 {
+                    let (prefix, before) = fed_as_asked(name, bytes, *password, View::Prefix);
+                    assert_eq!(prefix.unwrap(), whole, "{name}: prefix");
+                    eprintln!(
+                        "{name}: {headers} headers, {asks} steps as asked, {before} a byte at a time"
+                    );
+                } else {
+                    eprintln!("{name}: {headers} headers, {asks} steps as asked");
+                }
+                assert!(
+                    asks <= ASKS_PER_HEADER * headers + 1,
+                    "{name}: {asks} steps for {headers} headers"
+                );
+            }
+        }
+
+        /// A volume that ends inside a header, or inside a member's data,
+        /// fed as its walk asks, stops: the last step asks past the volume
+        /// and says what a whole parse of it says. A reader that states its
+        /// length gets the very offset it always got.
+        #[test]
+        fn a_volume_cut_short_fed_as_its_walk_asks_ends_as_before() {
+            for (name, volume) in synthetics() {
+                let member = volume.members[7];
+                for cut in [member + 3, member + 9, volume.members[8] - 2] {
+                    let bytes = &volume.bytes[..cut];
+                    let cache = Arc::new(crate::crypto::KdfCache::new());
+                    let cursor =
+                        RarArchive::parse_volume_facts_walk(Cursor::new(bytes.to_vec()), None);
+                    let strict = RarArchive::parse_volume_facts(Cursor::new(bytes.to_vec()), None);
+                    for view in [View::Sparse, View::Prefix] {
+                        let (last, _) = fed_as_asked(name, bytes, None, view);
+                        let walk = last.as_ref().expect("a cut volume walks short");
+                        let at = walk.short_at.expect("and says where");
+                        assert!(at > cut as u64, "{name} cut at {cut}, {view:?}: {at}");
+                        let image = Image::whole(bytes);
+                        let whole = fresh(&image, view, None, &cache);
+                        assert!(same_outcome(&last, &whole), "{name} cut at {cut}, {view:?}");
+                        if let View::Prefix = view {
+                            let cursor = cursor.as_ref().expect("a cut volume walks short");
+                            assert_eq!(walk, cursor, "{name} cut at {cut}");
+                            // A strict parse of the same bytes says what it
+                            // always has. (Over a sparse image a strict parse
+                            // sees no end to judge a member's data against.)
+                            let strict_here = image.reader(view);
+                            let strict_here = RarArchive::parse_volume_facts(strict_here, None);
+                            assert_eq!(
+                                format!("{:?}", strict_here.map(|_| ())),
+                                format!("{:?}", strict.as_ref().map(|_| ())),
+                                "{name} cut at {cut}"
+                            );
+                        }
+                    }
                 }
             }
         }

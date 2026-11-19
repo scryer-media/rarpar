@@ -94,6 +94,36 @@ pub(crate) fn next_needed<R: Seek>(reader: &mut R, floor: u64) -> u64 {
     }
 }
 
+/// [`next_needed`] for a read that ran dry inside a header whose size field
+/// it read: the header's end, `header_end`, is what the walk needs next, so
+/// that is the answer rather than one more byte. A reader that states its
+/// length and ends short of the header can never hold it whole: it gets the
+/// answer it always got, so a truncated volume reads as it always has.
+pub(crate) fn next_needed_in_header<R: Seek>(
+    reader: &mut R,
+    floor: u64,
+    header_end: Option<u64>,
+) -> u64 {
+    let needed = next_needed(reader, floor);
+    let Some(end) = header_end.filter(|end| *end > needed) else {
+        return needed;
+    };
+    match stream_len(reader) {
+        Some(len) if end > len => needed,
+        _ => end,
+    }
+}
+
+/// The reader's length, when it states one, with its position kept.
+fn stream_len<R: Seek>(reader: &mut R) -> Option<u64> {
+    let position = reader.stream_position().ok()?;
+    let len = reader.seek(std::io::SeekFrom::End(0)).ok();
+    if len.is_some() {
+        reader.seek(std::io::SeekFrom::Start(position)).ok()?;
+    }
+    len
+}
+
 /// Under [`HeaderScan::ForFacts`], turn a stream read that ran dry into a
 /// recorded [`ShortRead`] and hand back `None` so the walk can stop; under
 /// [`HeaderScan::ForDecode`], or for any other error, pass the error through.
@@ -107,10 +137,24 @@ pub(crate) fn absorb_short_read<R: Seek, T>(
     floor: u64,
     short: &mut Option<ShortRead>,
 ) -> RarResult<Option<T>> {
+    absorb_short_header(result, scan, reader, floor, None, short)
+}
+
+/// [`absorb_short_read`] for a read of one header, with where that header
+/// ends once its size field was read: see [`next_needed_in_header`].
+pub(crate) fn absorb_short_header<R: Seek, T>(
+    result: RarResult<T>,
+    scan: HeaderScan,
+    reader: &mut R,
+    floor: u64,
+    header_end: Option<u64>,
+    short: &mut Option<ShortRead>,
+) -> RarResult<Option<T>> {
     match result {
         Ok(value) => Ok(Some(value)),
         Err(error) if scan == HeaderScan::ForFacts && is_short_read(&error) => {
-            *short = Some(ShortRead::truncated(next_needed(reader, floor), error));
+            let at = next_needed_in_header(reader, floor, header_end);
+            *short = Some(ShortRead::truncated(at, error));
             Ok(None)
         }
         Err(error) => Err(error),

@@ -220,6 +220,16 @@ impl RawRar4Header {
 ///
 /// Returns None on EOF.
 pub fn read_raw_header<R: Read + Seek>(reader: &mut R) -> RarResult<Option<RawRar4Header>> {
+    read_raw_header_sized(reader, &mut None)
+}
+
+/// [`read_raw_header`], setting `size` to how many bytes the header takes
+/// from its start once its size field is read, whatever the read then
+/// returns.
+pub(crate) fn read_raw_header_sized<R: Read + Seek>(
+    reader: &mut R,
+    size: &mut Option<u64>,
+) -> RarResult<Option<RawRar4Header>> {
     let offset = reader.stream_position().map_err(RarError::from)?;
 
     // Read minimum header bytes.
@@ -252,6 +262,8 @@ pub fn read_raw_header<R: Read + Seek>(reader: &mut R) -> RarResult<Option<RawRa
             None,
         ));
     }
+
+    *size = Some(u64::from(header_size));
 
     // Read the full header.
     let mut data = vec![0u8; header_size as usize];
@@ -910,6 +922,17 @@ pub fn read_raw_header_encrypted<R: Read>(
     reader: &mut R,
     decryptor: &mut crate::crypto::Rar4CbcDecryptor,
 ) -> RarResult<Option<RawRar4Header>> {
+    read_raw_header_encrypted_sized(reader, decryptor, &mut None)
+}
+
+/// [`read_raw_header_encrypted`], setting `size` to how many cipher bytes
+/// the header takes from where the read began once its first block names
+/// its size, whatever the read then returns.
+pub(crate) fn read_raw_header_encrypted_sized<R: Read>(
+    reader: &mut R,
+    decryptor: &mut crate::crypto::Rar4CbcDecryptor,
+    size: &mut Option<u64>,
+) -> RarResult<Option<RawRar4Header>> {
     // Read first AES block (16 bytes) — contains the 7-byte common header.
     let mut block = [0u8; 16];
     match reader.read_exact(&mut block) {
@@ -948,6 +971,7 @@ pub fn read_raw_header_encrypted<R: Read>(
 
     // Total encrypted bytes = header_size rounded up to 16-byte boundary.
     let aligned_size = ((header_size as usize) + 15) & !15;
+    *size = Some(aligned_size as u64);
 
     // We already decrypted 16 bytes. Read and decrypt any remaining blocks.
     let mut decrypted = Vec::with_capacity(aligned_size);
