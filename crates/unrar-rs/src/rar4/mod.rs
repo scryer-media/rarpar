@@ -26,7 +26,7 @@ use std::io::{Read, Seek};
 use tracing::{debug, warn};
 
 use crate::error::{LimitKind, RarError, RarResult};
-use crate::short_read::{HeaderScan, ShortRead, absorb_short_read, next_needed};
+use crate::short_read::{HeaderScan, ShortRead, absorb_short_header, next_needed_in_header};
 use crate::types::{
     CompressionInfo, CompressionMethod, HostOs, MemberInfo, UnixOwnerInfo, VolumeSpan,
 };
@@ -300,7 +300,8 @@ fn parse_rar14_headers_with<R: Read + Seek>(
                     RarError::from(e)
                 }
             });
-            if absorb_short_read(read, scan, reader, floor, short)?.is_none() {
+            let header_end = Some(offset + u64::from(head_size));
+            if absorb_short_header(read, scan, reader, floor, header_end, short)?.is_none() {
                 break;
             }
         }
@@ -626,13 +627,11 @@ fn walk_rar4_headers<R: Read + Seek>(
             // The least the next header can occupy: the fixed seven-byte common
             // block.
             let floor = header_start + MIN_RAR4_HEADER_BYTES;
-            let raw = match absorb_short_read(
-                header::read_raw_header(reader),
-                scan,
-                reader,
-                floor,
-                short,
-            )? {
+            // Once the header names its size, its end is what a walk needs.
+            let mut size = None;
+            let read = header::read_raw_header_sized(reader, &mut size);
+            let header_end = size.map(|size| header_start.saturating_add(size));
+            let raw = match absorb_short_header(read, scan, reader, floor, header_end, short)? {
                 Some(Some(raw)) => raw,
                 Some(None) => {
                     // The stream ended at a header boundary with no end record, so
@@ -860,7 +859,12 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
         let (key, iv) = kdf_cache.derive_key_rar4(password, Some(&salt));
         let mut decryptor = crate::crypto::Rar4CbcDecryptor::new(&key, &iv);
 
-        let raw = match header::read_raw_header_encrypted(reader, &mut decryptor) {
+        // Once the first block names the header's size: its salt and every
+        // cipher block it takes.
+        let mut size = None;
+        let read = header::read_raw_header_encrypted_sized(reader, &mut decryptor, &mut size);
+        let header_end = size.map(|size| header_start.saturating_add(8 + size));
+        let raw = match read {
             Ok(Some(raw)) => raw,
             Ok(None) => {
                 *short = Some(ShortRead::at_boundary(floor));
@@ -878,7 +882,8 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
                         .into(),
                 };
                 if scan == HeaderScan::ForFacts {
-                    *short = Some(ShortRead::truncated(next_needed(reader, floor), error));
+                    let at = next_needed_in_header(reader, floor, header_end);
+                    *short = Some(ShortRead::truncated(at, error));
                     break;
                 }
                 return Err(error);

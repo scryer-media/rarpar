@@ -1889,3 +1889,147 @@ fn extract_member(paths: &[PathBuf], name: &str) -> Vec<u8> {
         .and_then(|member| member.into_bytes())
         .expect("member extracts")
 }
+
+// ---------------------------------------------------------------------------
+// Volumes still arriving
+// ---------------------------------------------------------------------------
+
+/// Every public answer of two builders over a fixture's volumes.
+fn assert_same_answers(
+    grown: &StoredLayoutBuilder,
+    fresh: &StoredLayoutBuilder,
+    fixture: &Fixture,
+) {
+    assert_eq!(grown.members(), fresh.members(), "{}", fixture.name);
+    assert_eq!(
+        grown.header_frontier(),
+        fresh.header_frontier(),
+        "{}",
+        fixture.name
+    );
+    for (number, &len) in fixture.lens.iter().enumerate() {
+        let number = number as u32;
+        assert_eq!(grown.has_volume(number), fresh.has_volume(number));
+        assert_eq!(grown.split_evidence(number), fresh.split_evidence(number));
+        for (offset, take) in [
+            (0, len),
+            (0, 1),
+            (len / 3, len / 2),
+            (len.saturating_sub(17), 17),
+        ] {
+            assert_eq!(
+                grown.map_physical_range(number, offset, take),
+                fresh.map_physical_range(number, offset, take),
+                "{} volume {number} at {offset}+{take}",
+                fixture.name
+            );
+        }
+    }
+}
+
+/// A volume added as its headers arrive, one more each time, ends with the
+/// layout a builder fed its final headers has, and agrees with one at every
+/// step: each re-add takes only the new headers.
+#[test]
+fn volumes_fed_header_by_header_answer_as_volumes_fed_whole() {
+    let sets = [
+        ("rar4_mv_store", "rar4", parts("rar4_mv_store", 1..=5, 1)),
+        (
+            "rar4_enc_mv_store",
+            "rar4",
+            parts("rar4_enc_mv_store", 1..=5, 1),
+        ),
+        (
+            "rar4_enc_store",
+            "rar4",
+            vec!["rar4_enc_store.rar".to_owned()],
+        ),
+        (
+            "rar5_mv_store_long",
+            "rar5",
+            parts("rar5_mv_store_long", 1..=27, 2),
+        ),
+        (
+            "generated_matrix_rar5_store_plain",
+            "rar5",
+            parts("generated_matrix_rar5_store_plain", 1..=7, 1),
+        ),
+        (
+            "rar5_mv_store_rr",
+            "rar5",
+            parts("rar5_mv_store_rr", 1..=6, 1),
+        ),
+        (
+            "rar5_multifile_lz",
+            "rar5",
+            vec!["rar5_multifile_lz.rar".to_owned()],
+        ),
+        (
+            "rar5_store_blake2",
+            "rar5",
+            vec!["rar5_store_blake2.rar".to_owned()],
+        ),
+        (
+            "rar5_store_crc32_control",
+            "rar5",
+            vec!["rar5_store_crc32_control.rar".to_owned()],
+        ),
+        (
+            "rar5_mv_store_blake2",
+            "rar5",
+            parts("rar5_mv_store_blake2", 1..=6, 1),
+        ),
+        (
+            "rar5_enc_mv_store",
+            "rar5",
+            parts("rar5_enc_mv_store", 1..=5, 1),
+        ),
+        (
+            "rar5_enc_mv_store_pair",
+            "rar5",
+            parts("rar5_enc_mv_store_pair", 1..=9, 2),
+        ),
+        (
+            "rar5_enc_store_pair",
+            "rar5",
+            vec!["rar5_enc_store_pair.rar".to_owned()],
+        ),
+        (
+            "rar5_multifile_store",
+            "rar5",
+            vec!["rar5_multifile_store.rar".to_owned()],
+        ),
+    ];
+    let mut checked = 0;
+    for (name, dir, files) in sets {
+        let Some(fixture) = Fixture::load(name, dir, &files) else {
+            continue;
+        };
+        let format = fixture.facts[0].archive_format();
+        let mut grown = StoredLayoutBuilder::new(format);
+        let mut fresh = StoredLayoutBuilder::new(format);
+        let mut steps = 0;
+        for index in shuffled_order_or_one(fixture.count()) {
+            let facts = &fixture.facts[index];
+            for count in 1..=facts.members.len() {
+                let mut short = facts.clone();
+                short.members.truncate(count);
+                grown
+                    .add_volume(index as u32, &short)
+                    .expect("more headers of the volume added last are taken");
+                steps += 1;
+            }
+            fresh
+                .add_volume(index as u32, facts)
+                .expect("fixture volume accepted");
+            assert_same_answers(&grown, &fresh, &fixture);
+        }
+        assert!(steps >= fixture.count(), "{name}");
+        checked += 1;
+    }
+    eprintln!("{checked} fixture sets fed header by header");
+}
+
+fn shuffled_order_or_one(n: usize) -> Vec<usize> {
+    if n == 1 { vec![0] } else { shuffled_order(n) }
+}

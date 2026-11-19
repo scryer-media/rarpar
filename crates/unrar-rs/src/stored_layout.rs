@@ -652,6 +652,9 @@ struct VolumeRecord {
     /// Member extents sorted by physical offset.
     extents: Vec<VolumeExtent>,
     evidence: VolumeSplitEvidence,
+    /// Where the overlap sweep over `extents` ended: the furthest end it saw
+    /// and the member reaching it.
+    covered: Option<(u64, usize)>,
 }
 
 /// Facts about a member that only ever accumulate as volumes arrive.
@@ -690,6 +693,9 @@ pub struct StoredLayoutBuilder {
     encryptions: Vec<BTreeMap<u32, PartEncryption>>,
     index: HashMap<String, usize>,
     frontier: Option<u32>,
+    /// The volume the last add that learned anything was for: the only one
+    /// whose headers can grow in place without reordering the members.
+    last_added: Option<u32>,
 }
 
 impl StoredLayoutBuilder {
@@ -704,6 +710,7 @@ impl StoredLayoutBuilder {
             encryptions: Vec::new(),
             index: HashMap::new(),
             frontier: None,
+            last_added: None,
         }
     }
 
@@ -720,6 +727,14 @@ impl StoredLayoutBuilder {
     /// Re-adding a volume whose facts are unchanged succeeds and changes
     /// nothing; re-adding it with different facts is rejected rather than
     /// silently rewriting a layout other volumes were already resolved against.
+    ///
+    /// One re-add is taken: the volume added last, again with the headers it
+    /// was added on followed by more, as a volume still arriving states them.
+    /// Only the new headers are learned, and the layout then answers exactly
+    /// as one fed the longer headers in the first place. New headers that
+    /// would make that volume's own parts malformed (a name it already
+    /// carries, a part before or overlapping one it holds) are rejected as
+    /// different facts.
     pub fn add_volume(
         &mut self,
         volume: u32,
@@ -740,6 +755,9 @@ impl StoredLayoutBuilder {
             .collect();
         if let Some(existing) = self.volumes.get(&volume) {
             return if existing.snapshots == snapshots {
+                Ok(())
+            } else if self.extends(volume, &snapshots) {
+                self.extend_volume(volume, snapshots);
                 Ok(())
             } else {
                 Err(StoredLayoutError::ConflictingVolume { volume })
@@ -770,39 +788,7 @@ impl StoredLayoutBuilder {
                 continue;
             }
 
-            if let Some(unpacked_size) = snapshot.unpacked_size {
-                self.declarations[member_index].insert(volume, unpacked_size);
-            }
-            self.encryptions[member_index].insert(volume, snapshot.encryption);
-
-            let member = &mut self.members[member_index];
-            member.first_volume = member.first_volume.min(volume);
-            // Only a final part states the whole-member checksums; every
-            // earlier part's fields describe that volume's packed bytes. The
-            // hash-MAC flag qualifies those checksums, so it comes from the
-            // same header rather than from whichever part arrived last.
-            if !snapshot.split_after {
-                member.data_crc32 = snapshot.data_crc32;
-                member.data_blake2_hash = snapshot.data_blake2_hash;
-                member.data_hash_uses_mac = snapshot.data_hash_uses_mac;
-            }
-
-            let part = StoredMemberPart {
-                volume,
-                data_offset: snapshot.data_offset,
-                data_size: snapshot.data_size,
-                logical_offset: None,
-                packed_crc32: snapshot.packed_crc32,
-                packed_blake2_hash: snapshot.packed_blake2_hash,
-                packed_hash_uses_mac: snapshot.packed_hash_uses_mac,
-                split_before: snapshot.split_before,
-                split_after: snapshot.split_after,
-            };
-            let position = member
-                .parts
-                .partition_point(|existing| existing.volume < volume);
-            member.parts.insert(position, part);
-
+            self.learn_part(member_index, volume, snapshot);
             extents.push(VolumeExtent {
                 member_index,
                 data_offset: snapshot.data_offset,
@@ -844,8 +830,10 @@ impl StoredLayoutBuilder {
                 snapshots,
                 extents,
                 evidence,
+                covered,
             },
         );
+        self.last_added = Some(volume);
         self.advance_frontier();
 
         // A volume also changes members it carries no part of: one added inside
@@ -858,6 +846,131 @@ impl StoredLayoutBuilder {
         }
 
         Ok(())
+    }
+
+    /// Record one header's part of its member in `volume`.
+    fn learn_part(&mut self, member_index: usize, volume: u32, snapshot: &MemberSnapshot) {
+        if let Some(unpacked_size) = snapshot.unpacked_size {
+            self.declarations[member_index].insert(volume, unpacked_size);
+        }
+        self.encryptions[member_index].insert(volume, snapshot.encryption);
+
+        let member = &mut self.members[member_index];
+        member.first_volume = member.first_volume.min(volume);
+        // Only a final part states the whole-member checksums; every
+        // earlier part's fields describe that volume's packed bytes. The
+        // hash-MAC flag qualifies those checksums, so it comes from the
+        // same header rather than from whichever part arrived last.
+        if !snapshot.split_after {
+            member.data_crc32 = snapshot.data_crc32;
+            member.data_blake2_hash = snapshot.data_blake2_hash;
+            member.data_hash_uses_mac = snapshot.data_hash_uses_mac;
+        }
+
+        let part = StoredMemberPart {
+            volume,
+            data_offset: snapshot.data_offset,
+            data_size: snapshot.data_size,
+            logical_offset: None,
+            packed_crc32: snapshot.packed_crc32,
+            packed_blake2_hash: snapshot.packed_blake2_hash,
+            packed_hash_uses_mac: snapshot.packed_hash_uses_mac,
+            split_before: snapshot.split_before,
+            split_after: snapshot.split_after,
+        };
+        let position = member
+            .parts
+            .partition_point(|existing| existing.volume < volume);
+        member.parts.insert(position, part);
+    }
+
+    /// Whether `snapshots` are the headers `volume` was added on followed by
+    /// more that learning alone answers for: it is the volume added last, so
+    /// no member was first seen after it, and the new headers name no member
+    /// it already carries a part of, lie in physical order at or past every
+    /// part it holds, and overlap nothing. Adding the longer headers afresh
+    /// would then find no duplicate and no overlap among the old ones that
+    /// it did not find before, and sort the new extents after the old.
+    fn extends(&self, volume: u32, snapshots: &[MemberSnapshot]) -> bool {
+        let Some(record) = self.volumes.get(&volume) else {
+            return false;
+        };
+        let held = record.snapshots.len();
+        if self.last_added != Some(volume)
+            || snapshots.len() <= held
+            || snapshots[..held] != record.snapshots[..]
+        {
+            return false;
+        }
+        let fresh = &snapshots[held..];
+        let mut names: HashSet<&str> = HashSet::with_capacity(fresh.len());
+        let mut floor = record.extents.last().map_or(0, |extent| extent.data_offset);
+        let mut covered = record.covered.map(|(end, _)| end);
+        for snapshot in fresh {
+            let carried = self.index.get(&snapshot.name).is_some_and(|index| {
+                self.members[*index]
+                    .parts
+                    .binary_search_by_key(&volume, |part| part.volume)
+                    .is_ok()
+            });
+            if carried || !names.insert(snapshot.name.as_str()) || snapshot.data_offset < floor {
+                return false;
+            }
+            floor = snapshot.data_offset;
+            if snapshot.data_size == 0 {
+                continue;
+            }
+            if covered.is_some_and(|end| snapshot.data_offset < end) {
+                return false;
+            }
+            covered = Some(snapshot.data_offset.saturating_add(snapshot.data_size));
+        }
+        true
+    }
+
+    /// Learn the headers past those `volume` holds, once [`Self::extends`]
+    /// said they only add to it: the members they name are resolved again,
+    /// and only those, since no other member's parts, traits or chain
+    /// changed.
+    fn extend_volume(&mut self, volume: u32, snapshots: Vec<MemberSnapshot>) {
+        let Some(mut record) = self.volumes.remove(&volume) else {
+            return;
+        };
+        let mut affected = Vec::with_capacity(snapshots.len() - record.snapshots.len());
+        for snapshot in &snapshots[record.snapshots.len()..] {
+            if snapshot.split_before {
+                record
+                    .evidence
+                    .continued_from_previous
+                    .push(snapshot.name.clone());
+            }
+            if snapshot.split_after {
+                record
+                    .evidence
+                    .continues_into_next
+                    .push(snapshot.name.clone());
+            }
+            let member_index = self.member_index_for(snapshot, volume);
+            self.absorb_traits(member_index, snapshot);
+            self.learn_part(member_index, volume, snapshot);
+            record.extents.push(VolumeExtent {
+                member_index,
+                data_offset: snapshot.data_offset,
+                data_size: snapshot.data_size,
+            });
+            if snapshot.data_size > 0 {
+                record.covered = Some((
+                    snapshot.data_offset.saturating_add(snapshot.data_size),
+                    member_index,
+                ));
+            }
+            affected.push(member_index);
+        }
+        record.snapshots = snapshots;
+        self.volumes.insert(volume, record);
+        for index in affected {
+            self.resolve_member(index);
+        }
     }
 
     /// Whether this volume's headers have been learned.
@@ -3535,5 +3648,199 @@ mod tests {
             ineligible(&builder, 3),
             IneligibilityReason::Blake2OnlyNoCrc32
         );
+    }
+
+    /// Every public answer of two builders, over the volumes `0..volumes`:
+    /// what one fed headers as they arrived says must be what one fed the
+    /// final headers says.
+    fn assert_same_answers(grown: &StoredLayoutBuilder, fresh: &StoredLayoutBuilder, volumes: u32) {
+        assert_eq!(grown.members(), fresh.members());
+        assert_eq!(grown.header_frontier(), fresh.header_frontier());
+        for number in 0..volumes {
+            assert_eq!(
+                grown.has_volume(number),
+                fresh.has_volume(number),
+                "{number}"
+            );
+            assert_eq!(
+                grown.split_evidence(number),
+                fresh.split_evidence(number),
+                "{number}"
+            );
+            let reach = fresh
+                .volumes
+                .get(&number)
+                .and_then(|record| record.extents.last())
+                .map_or(0, |extent| extent.data_offset + extent.data_size)
+                + 4096;
+            for (offset, len) in [(0, reach), (0, 1), (37, 1_000), (reach / 3, reach / 2)] {
+                assert_eq!(
+                    grown.map_physical_range(number, offset, len),
+                    fresh.map_physical_range(number, offset, len),
+                    "volume {number} at {offset}+{len}"
+                );
+            }
+        }
+    }
+
+    /// A builder fed `history` whole, each entry a volume and its headers.
+    fn fed(history: &[(u32, RarVolumeFacts)]) -> StoredLayoutBuilder {
+        let mut builder = layout();
+        for (number, facts) in history {
+            add(&mut builder, *number, facts);
+        }
+        builder
+    }
+
+    /// `facts` with only its first `count` headers, as a volume still
+    /// arriving states them.
+    fn first_headers(facts: &RarVolumeFacts, count: usize) -> RarVolumeFacts {
+        let mut short = facts.clone();
+        short.members.truncate(count);
+        short
+    }
+
+    /// Three volumes of many members: members split across each boundary,
+    /// an encrypted member, an empty member and a directory among them.
+    fn many_member_set() -> Vec<RarVolumeFacts> {
+        let mut volumes = Vec::new();
+        let mut counter = 0u32;
+        for number in 0..3u32 {
+            let mut members = Vec::new();
+            let mut offset = 64u64;
+            if number > 0 {
+                let name = format!("m{:05}.bin", counter - 1);
+                members.push(split_part(&name, offset, 300, 700, true, false));
+                offset += 300 + 40;
+            }
+            let count = [120, 90, 60][number as usize];
+            for at in 0..count {
+                let name = format!("m{counter:05}.bin");
+                counter += 1;
+                let size = part_size(counter);
+                let facts = if at == count - 1 && number < 2 {
+                    split_part(&name, offset, 400, 700, false, true)
+                } else if at == 17 {
+                    encrypted_member(&name, offset, size)
+                } else if at == 31 {
+                    member(&name, offset, 0)
+                } else if at == 44 {
+                    let mut directory = member(&name, offset, 0);
+                    directory.is_directory = true;
+                    directory
+                } else {
+                    with_crc32(member(&name, offset, size), counter)
+                };
+                offset += facts.data_size + 40;
+                members.push(facts);
+            }
+            volumes.push(volume(members));
+        }
+        volumes
+    }
+
+    #[test]
+    fn a_volume_fed_header_by_header_answers_as_one_fed_its_final_headers() {
+        let set = many_member_set();
+        for order in [[0u32, 1, 2], [1, 2, 0], [2, 0, 1]] {
+            let mut grown = layout();
+            let mut history: Vec<(u32, RarVolumeFacts)> = Vec::new();
+            for number in order {
+                let facts = &set[number as usize];
+                for count in 0..=facts.members.len() {
+                    let short = first_headers(facts, count);
+                    add(&mut grown, number, &short);
+                    let mut now = history.clone();
+                    now.push((number, short));
+                    assert_same_answers(&grown, &fed(&now), 3);
+                }
+                history.push((number, facts.clone()));
+            }
+            assert_same_answers(&grown, &fed(&history), 3);
+            assert!(
+                grown.members().iter().any(|member| member.parts.len() > 1),
+                "the set splits members across volumes"
+            );
+        }
+    }
+
+    #[test]
+    fn only_headers_that_extend_the_last_volume_are_learned_in_place() {
+        let first = member(EPISODE, 100, 100);
+        let second = with_crc32(member(EXTRA, 300, 50), 7);
+        let held = volume(vec![first.clone(), second.clone()]);
+        let refused = |builder: &mut StoredLayoutBuilder, number: u32, facts: &RarVolumeFacts| {
+            assert_eq!(
+                builder.add_volume(number, facts),
+                Err(StoredLayoutError::ConflictingVolume { volume: number })
+            );
+        };
+        let cases = [
+            // Fewer headers than held.
+            volume(vec![first.clone()]),
+            // A held header that differs.
+            volume(vec![
+                first.clone(),
+                with_crc32(member(EXTRA, 300, 51), 7),
+                member(NEIGHBOUR, 400, 10),
+            ]),
+            // A name this volume already carries.
+            volume(vec![
+                first.clone(),
+                second.clone(),
+                member(EPISODE, 400, 10),
+            ]),
+            // A name twice among the new headers.
+            volume(vec![
+                first.clone(),
+                second.clone(),
+                member(NEIGHBOUR, 400, 10),
+                member(NEIGHBOUR, 500, 10),
+            ]),
+            // A part before one held.
+            volume(vec![
+                first.clone(),
+                second.clone(),
+                member(NEIGHBOUR, 250, 10),
+            ]),
+            // A part overlapping one held.
+            volume(vec![
+                first.clone(),
+                second.clone(),
+                member(NEIGHBOUR, 320, 10),
+            ]),
+        ];
+        for case in &cases {
+            let mut builder = layout();
+            add(&mut builder, 0, &held);
+            refused(&mut builder, 0, case);
+            assert_same_answers(&builder, &fed(&[(0, held.clone())]), 1);
+        }
+
+        // Identical headers change nothing.
+        let mut builder = layout();
+        add(&mut builder, 0, &held);
+        add(&mut builder, 0, &held);
+        assert_same_answers(&builder, &fed(&[(0, held.clone())]), 1);
+
+        // Only the volume added last grows in place.
+        let other = volume(vec![member(DISTANT, 100, 10)]);
+        let longer = volume(vec![
+            first.clone(),
+            second.clone(),
+            member(NEIGHBOUR, 400, 10),
+        ]);
+        let mut builder = layout();
+        add(&mut builder, 0, &held);
+        add(&mut builder, 1, &other);
+        refused(&mut builder, 0, &longer);
+        assert_same_answers(&builder, &fed(&[(0, held.clone()), (1, other.clone())]), 2);
+
+        // A grown volume keeps growing; a refusal leaves it as it was.
+        let mut builder = layout();
+        add(&mut builder, 0, &held);
+        add(&mut builder, 0, &longer);
+        refused(&mut builder, 0, &held);
+        assert_same_answers(&builder, &fed(&[(0, longer.clone())]), 1);
     }
 }

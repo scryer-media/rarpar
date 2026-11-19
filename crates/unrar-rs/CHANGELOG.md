@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.16.6
+
+### Changed
+
+- A resumable facts walk over a reader that states no length asks for a
+  header's end once that header's size field is read. `short_at` inside a
+  header was one byte past what was held, so a caller feeding exactly what
+  the walk asked for stepped once per header byte: 10,400 steps for a
+  303-header RAR5 volume, now 607. A reader that states its length (a file,
+  a cursor, a prefix view) gets the answers it got before, and no answer is
+  past what the parser needs next.
+- `StoredLayoutBuilder::add_volume` takes the volume added last again with
+  the headers it was added on followed by more, as a volume still arriving
+  states them. Only the new headers are learned, and the layout answers as
+  one fed the longer headers in the first place. It was refused as
+  different facts, so a caller had to lay the whole set out afresh for each
+  header that arrived. New headers that name a member the volume already
+  carries, or that lie before or over a part it holds, are still refused.
+
 ## 0.16.5
 
 ### Added
