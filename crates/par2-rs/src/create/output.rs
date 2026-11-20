@@ -21,7 +21,7 @@ use super::encode::{EncodeAttempt, ForwardEncoder, ForwardEncoderOptions, Forwar
 use super::metal::{SelectedBackend, selected_policy};
 use super::options::{CreationBackend, Par2CreatorOptions};
 use super::plan::Par2CreatePlan;
-use super::source::{CreationSource, DiskSourceProvider};
+use super::source::{CreationSource, DiskSourceProvider, SourceIdentities};
 use super::volume::RecoveryVolumePlan;
 
 const CREATOR_ID: &[u8] = b"par2-rs";
@@ -1634,6 +1634,7 @@ fn cleanup_stage_files(volumes: Vec<VolumeState>) {
 pub(crate) fn write_outputs(
     plan: &Par2CreatePlan,
     mut sources: Vec<CreationSource>,
+    identities: &SourceIdentities,
     options: &Par2CreatorOptions,
     mut backend: SelectedBackend,
 ) -> Result<Par2CreateOutcome> {
@@ -1673,6 +1674,7 @@ pub(crate) fn write_outputs(
         if !fuse_source_hashing && !hash_during_first_band && !hydrated {
             super::source::hydrate_source_hashes(
                 &mut sources,
+                identities,
                 plan.slice_size,
                 &options.cancellation,
             )?;
@@ -1688,7 +1690,7 @@ pub(crate) fn write_outputs(
                     reason: "slice size exceeds addressable memory".to_string(),
                 })?;
             let mut provider =
-                DiskSourceProvider::open(&sources, slice_size, &options.cancellation)?;
+                DiskSourceProvider::open(&sources, identities, slice_size, &options.cancellation)?;
             if hash_during_first_band {
                 provider.hash_during_first_band();
             }
@@ -1767,6 +1769,7 @@ pub(crate) fn write_outputs(
                     drop(provider);
                     super::source::hydrate_source_hashes(
                         &mut sources,
+                        identities,
                         plan.slice_size,
                         &options.cancellation,
                     )?;
