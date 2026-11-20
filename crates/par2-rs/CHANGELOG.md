@@ -25,6 +25,12 @@
   body was copied whole and then dropped, so one large unknown packet cost
   its size again in memory before the scan moved on or the examined limit
   refused it. `parse_packet` still returns the body.
+- Repair's page-cache eviction of a just-installed, renamed or removed file
+  opens its name with `O_NONBLOCK | O_NOFOLLOW` and advises it only when it
+  is a regular file, as the deferred eviction already did, so a FIFO swapped
+  in at the name cannot block the repair after it succeeded. Where cache
+  advice is a no-op (everywhere but Linux and Android) the name is no longer
+  opened at all.
 
 ## 0.13.0
 

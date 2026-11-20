@@ -73,13 +73,16 @@ fn eviction_deferred(path: &Path) -> bool {
     true
 }
 
-fn evict_path_now(path: &Path) {
-    // The drain runs from a Drop over paths recorded much earlier; a path
-    // replaced by a FIFO would block a plain open forever, and following a
-    // symlink swap would advise the wrong file. Advisory-only, so refuse
-    // both rather than risk hanging after a successful operation — at the
-    // cost of never draining sources whose final component is a symlink
-    // (the immediate, fd-based eviction path does cover those).
+/// Opens `path` only to advise the kernel about it, with its length, or
+/// `None` when it is not a regular file now.
+///
+/// Advice is asked for by path long after, or just after, the file was last
+/// handled by name; a path replaced by a FIFO would block a plain open
+/// forever, and following a symlink swap would advise the wrong file.
+/// Advisory-only, so refuse both rather than risk hanging after a successful
+/// operation — at the cost of never advising a name whose final component
+/// is a symlink (the immediate, fd-based eviction path does cover those).
+fn open_for_advice(path: &Path) -> Option<(File, u64)> {
     #[cfg(unix)]
     let opened = {
         use std::os::unix::fs::OpenOptionsExt;
@@ -90,19 +93,22 @@ fn evict_path_now(path: &Path) {
     };
     #[cfg(not(unix))]
     let opened = File::open(path);
-    let Ok(file) = opened else {
+    let file = opened.ok()?;
+    let metadata = file.metadata().ok()?;
+    metadata.is_file().then(|| (file, metadata.len()))
+}
+
+fn evict_path_now(path: &Path) {
+    let Some((file, len)) = open_for_advice(path) else {
         return;
     };
-    let Ok(metadata) = file.metadata() else {
-        return;
-    };
-    if !metadata.is_file() || metadata.len() < LARGE_FILE_CACHE_ADVICE_MIN_BYTES {
+    if len < LARGE_FILE_CACHE_ADVICE_MIN_BYTES {
         return;
     }
     log_cache_advice(
         "dontneed",
         path,
-        raw_cache_advice(&file, 0, metadata.len(), CacheAdvice::DontNeed),
+        raw_cache_advice(&file, 0, len, CacheAdvice::DontNeed),
     );
 }
 
@@ -197,13 +203,22 @@ pub(crate) fn drop_touched_file_cache(
     );
 }
 
+/// Evicts a file named by path, just installed, renamed or removed, from the
+/// page cache. It opens the name the guarded way (`open_for_advice`), so a
+/// FIFO swapped in at it cannot block, and only where cache advice does
+/// anything: elsewhere the open would only feed a no-op.
 pub(crate) fn drop_path_cache(path: &Path) {
-    let Ok(file) = File::open(path) else {
+    if !CACHE_ADVICE_SUPPORTED {
+        return;
+    }
+    let Some((file, len)) = open_for_advice(path) else {
         return;
     };
-    let len = file.metadata().ok().map_or(0, |metadata| metadata.len());
     drop_file_cache(&file, path, 0, len);
 }
+
+/// Whether `raw_cache_advice` reaches the kernel on this platform.
+const CACHE_ADVICE_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "android"));
 
 fn log_cache_advice(operation: &'static str, path: &Path, result: io::Result<()>) {
     match result {
@@ -262,6 +277,31 @@ mod tests {
     #[test]
     fn path_drop_swallows_missing_file() {
         drop_path_cache(Path::new("/definitely/missing/weaver/par2-cache.bin"));
+    }
+
+    /// A FIFO or a symlink at an advised name is refused without blocking;
+    /// a regular file is opened with its length.
+    #[cfg(unix)]
+    #[test]
+    fn advice_open_refuses_a_fifo_and_a_symlink_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let regular = temp.path().join("installed.bin");
+        std::fs::write(&regular, b"repaired bytes").unwrap();
+        let (_, len) = open_for_advice(&regular).unwrap();
+        assert_eq!(len, b"repaired bytes".len() as u64);
+
+        let fifo = temp.path().join("swapped.fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(open_for_advice(&fifo).is_none());
+        drop_path_cache(&fifo);
+
+        let link = temp.path().join("swapped.link");
+        std::os::unix::fs::symlink(&regular, &link).unwrap();
+        assert!(open_for_advice(&link).is_none());
+        drop_path_cache(&link);
     }
 
     // The deferral depth and deferred set are process-global; these tests
