@@ -1010,9 +1010,8 @@ mod unix {
             for dir in [root.join("a"), root.clone()] {
                 std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
             }
-            let result = MemberParent::prepare(&root, &os(&["a", "b"]), &out_path).and_then(
-                |parent| std::io::Write::write_all(&mut parent.open_file()?, b"inside"),
-            );
+            let result = MemberParent::prepare(&root, &os(&["a", "b"]), &out_path)
+                .and_then(|parent| std::io::Write::write_all(&mut parent.open_file()?, b"inside"));
             for dir in [root.clone(), root.join("a")] {
                 std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
             }
