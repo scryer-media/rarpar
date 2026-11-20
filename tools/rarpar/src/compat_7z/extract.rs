@@ -669,8 +669,11 @@ fn apply_metadata(file: &File, item: &Item) -> Result<(), MetadataError> {
             first = Some((CANNOT_SET_TIME, error));
         }
     }
+    // The permission bits only: an archive never makes its output
+    // set-user-ID, set-group-ID or sticky, whoever extracts it, for files
+    // and folders alike.
     let mode = match item.attrib {
-        Some(attrib) if attrib & ATTRIB_UNIX_EXTENSION != 0 => Some(Ok((attrib >> 16) & 0o7777)),
+        Some(attrib) if attrib & ATTRIB_UNIX_EXTENSION != 0 => Some(Ok((attrib >> 16) & 0o777)),
         Some(attrib) if attrib & ATTRIB_READONLY != 0 => Some(
             file.metadata()
                 .map(|meta| meta.permissions().mode() & !0o222),
@@ -1529,6 +1532,39 @@ mod tests {
         std::os::unix::fs::symlink(outside.join("ledger.txt"), out.join("ledger.txt")).unwrap();
         assert!(root.create_file("ledger.txt").is_err());
         assert_eq!(fs::read(outside.join("ledger.txt")).unwrap(), b"keep me");
+    }
+
+    /// A member's Unix mode is applied with its permission bits only: the
+    /// set-user-ID, set-group-ID and sticky bits an archive asks for are
+    /// dropped, on a file and on a folder.
+    #[cfg(unix)]
+    #[test]
+    fn an_archive_mode_never_sets_special_bits() {
+        use super::super::format::ATTRIB_UNIX_EXTENSION;
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = tempfile::tempdir().unwrap();
+        let root = Dir::open(scratch.path().to_str().unwrap()).unwrap();
+        root.create_file("tool").unwrap();
+        let (_, made) = root.child("shared", true).unwrap();
+        assert!(made);
+        for (name, is_dir, mode) in [("tool", false, 0o106755u32), ("shared", true, 0o43775u32)] {
+            let item = Item {
+                name: name.to_owned(),
+                is_dir,
+                has_stream: !is_dir,
+                size: 0,
+                crc: None,
+                mtime: None,
+                attrib: Some(ATTRIB_UNIX_EXTENSION | (mode << 16)),
+                symlink: false,
+            };
+            set_metadata_at(&root, name, &item).unwrap();
+            let applied = fs::symlink_metadata(scratch.path().join(name))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(applied & 0o7777, mode & 0o777, "{name}");
+        }
     }
 
     #[cfg(unix)]
