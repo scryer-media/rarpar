@@ -66,6 +66,8 @@ documented in each crate's own changelog so those notes ship with the crate.
   copying its body. The CLI scans files by streaming and was not affected.
 - PAR2 repair cannot hang after installing its output when another process
   swaps an installed file for a FIFO, through par2-rs 0.13.1.
+- PAR2 repair's hash of a scanned file no longer blocks when another process
+  swaps that file for a FIFO after it was checked, through par2-rs 0.13.1.
 
 ## rarpar 0.9.6
 

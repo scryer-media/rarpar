@@ -31,6 +31,12 @@
   in at the name cannot block the repair after it succeeded. Where cache
   advice is a no-op (everywhere but Linux and Android) the name is no longer
   opened at all.
+- Repair's quick and full hash of a scan candidate open it non-blocking on
+  Unix, and an extra (non-canonical) candidate without following a symlink,
+  and check the open handle is still a regular file. A candidate swapped for
+  a FIFO after its path check blocked the scan; it now fails it. A Linux
+  file lease that refuses the non-blocking open is waited for as before.
+  The later block scans of a candidate still open it by path.
 
 ## 0.13.0
 
