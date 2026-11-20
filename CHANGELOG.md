@@ -55,6 +55,10 @@ documented in each crate's own changelog so those notes ship with the crate.
   copied from its temporary through a handle opened without following a
   symlink on Unix, through unrar-rs 0.16.7, so a link swapped in at the
   temporary name cannot pull another file into the output.
+- 7z extraction on Windows sets a member's time and read-only attribute
+  through one handle opened on it without following a reparse point, so a
+  name swapped for a link after the link check cannot pass the read-only
+  attribute to the link's target.
 
 ## rarpar 0.9.6
 

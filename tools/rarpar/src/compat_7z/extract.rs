@@ -250,8 +250,10 @@ mod anchored {
 /// with `CREATE_NEW` and `FILE_FLAG_OPEN_REPARSE_POINT`, so a link planted at
 /// its name is refused rather than written through, and the new handle is
 /// checked to be a plain file. The output folder itself is the caller's
-/// choice, so a link there is followed. Folder metadata set after the walk,
-/// once the handles are closed, still goes by path.
+/// choice, so a link there is followed. Metadata set after the walk, once
+/// the handles are closed, still finds its member by path, but changes it
+/// through one handle opened on that name with `FILE_FLAG_OPEN_REPARSE_POINT`
+/// (`set_metadata`); the folders above it are no longer held then.
 #[cfg(not(unix))]
 mod anchored {
     use std::fs::{self, File, OpenOptions};
@@ -791,7 +793,67 @@ fn set_metadata_at(dir: &Dir, name: &str, item: &Item) -> Result<(), MetadataErr
     }
 }
 
-#[cfg(not(unix))]
+/// Sets a member's time and read-only attribute through one handle opened
+/// on its output without following a reparse point, so the link check and
+/// the changes are made on the same object: a name swapped for a link after
+/// the check can no longer pass its attribute to the link's target. A link
+/// still gets its times only, set on the link itself, as before.
+///
+/// The handle asks only for the attribute rights that setting times and
+/// attributes by path needed, and nothing is opened when there is nothing to
+/// set; each failure maps to the message and error the path calls gave.
+#[cfg(windows)]
+fn set_metadata(path: &Path, item: &Item) -> Result<(), MetadataError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    let readonly = item
+        .attrib
+        .is_some_and(|attrib| attrib & ATTRIB_READONLY != 0);
+    if item.mtime.is_none() && !readonly {
+        return Ok(());
+    }
+    let file = match fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+    {
+        Ok(file) => file,
+        // Setting the time opened the name first and failed on it.
+        Err(error) if item.mtime.is_some() => return Err((CANNOT_SET_TIME, error)),
+        // A name gone before its attribute was looked at was skipped.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err((CANNOT_SET_ATTRIBUTE, error)),
+    };
+    let mut first = None;
+    if let Some(ticks) = item.mtime {
+        let time = filetime_of(ticks);
+        if let Err(error) = filetime::set_file_handle_times(&file, Some(time), Some(time)) {
+            first = Some((CANNOT_SET_TIME, error));
+        }
+    }
+    if !readonly {
+        return first.map_or(Ok(()), Err);
+    }
+    // Setting permissions follows a link, and a link's target may sit outside
+    // the output folder (through a link already there), so a link keeps the
+    // mode it was made with.
+    let meta = match file.metadata() {
+        Ok(meta) if !meta.file_type().is_symlink() => meta,
+        _ => return first.map_or(Ok(()), Err),
+    };
+    let mut permissions = meta.permissions();
+    permissions.set_readonly(true);
+    if let Err(error) = file.set_permissions(permissions) {
+        first.get_or_insert((CANNOT_SET_ATTRIBUTE, error));
+    }
+    first.map_or(Ok(()), Err)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn set_metadata(path: &Path, item: &Item) -> Result<(), MetadataError> {
     let mut first = None;
     if let Some(ticks) = item.mtime {
