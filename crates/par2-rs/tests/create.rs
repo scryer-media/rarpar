@@ -1030,3 +1030,62 @@ fn a_session_over_a_loaded_set_verifies_like_one_fed_the_packets() {
         );
     }
 }
+
+/// A repaired file keeps its original's permission bits (here owner-only),
+/// and a file that was missing comes back with the default mode a new file
+/// gets, not the owner-only mode its staged copy started with.
+#[cfg(unix)]
+#[test]
+fn repair_keeps_a_private_target_private_and_gives_a_missing_one_the_default_mode() {
+    use par2_rs::{Par2RepairStatus, Par2Repairer, Par2RepairerOptions};
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempdir().unwrap();
+    let private = directory.path().join("private.bin");
+    let lost = directory.path().join("lost.bin");
+    let private_data: Vec<u8> = (0..4096u32).map(|i| (i * 7 % 251) as u8).collect();
+    let lost_data: Vec<u8> = (0..2048u32).map(|i| (i * 13 % 241) as u8).collect();
+    fs::write(&private, &private_data).unwrap();
+    fs::write(&lost, &lost_data).unwrap();
+
+    let output = directory.path().join("set.par2");
+    let mut options = Par2CreatorOptions::with_output(
+        output,
+        Some(directory.path().to_path_buf()),
+        vec![private.clone(), lost.clone()],
+    );
+    options.block_sizing = BlockSizing::Bytes(512);
+    options.recovery_amount = RecoveryAmount::Count(8);
+    let creator = Par2Creator::new(options);
+    let plan = creator.plan().unwrap();
+    let outcome = creator.create(&plan).unwrap();
+
+    // Damage the private file in place and drop the other one entirely.
+    let mut damaged = private_data.clone();
+    damaged[100..700].iter_mut().for_each(|byte| *byte ^= 0x5A);
+    fs::write(&private, &damaged).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::remove_file(&lost).unwrap();
+
+    // What a new file gets here: 0o666 less the process umask.
+    let probe = directory.path().join("probe");
+    fs::write(&probe, b"").unwrap();
+    let default_mode = fs::metadata(&probe).unwrap().permissions().mode() & 0o777;
+    fs::remove_file(&probe).unwrap();
+
+    let mut repair =
+        Par2RepairerOptions::new(directory.path().to_path_buf(), outcome.output_paths.clone());
+    repair.purge = true;
+    let repaired = Par2Repairer::new(repair).verify_or_repair().unwrap();
+    assert_eq!(repaired.status, Par2RepairStatus::Repaired);
+    assert_eq!(fs::read(&private).unwrap(), private_data);
+    assert_eq!(fs::read(&lost).unwrap(), lost_data);
+    assert_eq!(
+        fs::metadata(&private).unwrap().permissions().mode() & 0o7777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(&lost).unwrap().permissions().mode() & 0o7777,
+        default_mode
+    );
+}

@@ -4599,8 +4599,17 @@ impl RepairState {
         validate_sources: bool,
     ) -> Result<RepairInstall> {
         let install_dir = unique_repair_dir(&options.base_dir);
-        fs::create_dir_all(&install_dir)?;
+        create_private_repair_dir(&install_dir)?;
         let mut staging_guard = RepairStagingGuard::new(install_dir.clone());
+        // Files verification found absent install with the default mode;
+        // every other staged file starts owner-only and takes its original's
+        // permission bits at install.
+        let missing_file_ids: HashSet<FileId> = verification
+            .files
+            .iter()
+            .filter(|file| matches!(file.status, FileStatus::Missing))
+            .map(|file| file.file_id)
+            .collect();
         let mut bytes_copied = 0u64;
         let staged_file_ids: HashSet<FileId> = self
             .files
@@ -4619,11 +4628,14 @@ impl RepairState {
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let out = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&target)?;
+            let mut open = OpenOptions::new();
+            open.create(true).write(true).truncate(true);
+            #[cfg(unix)]
+            if !missing_file_ids.contains(&file.file_id) {
+                use std::os::unix::fs::OpenOptionsExt;
+                open.mode(0o600);
+            }
+            let out = open.open(&target)?;
             out.set_len(file.length)?;
         }
 
@@ -4850,12 +4862,16 @@ impl RepairState {
                                 ),
                             )));
                         }
+                        #[cfg(unix)]
+                        match_original_permissions(&src, &target_metadata)?;
                         let backup = unique_backup_path(dst)?;
                         crate::disk::rename_within_base(&options.base_dir, dst, &backup)?;
                         crate::file_cache::drop_path_cache(&backup);
                         backups.push((dst.clone(), backup));
                     }
                     Ok(metadata) if metadata.file_type().is_file() => {
+                        #[cfg(unix)]
+                        match_original_permissions(&src, &metadata)?;
                         let backup = unique_backup_path(dst)?;
                         crate::disk::rename_within_base(&options.base_dir, dst, &backup)?;
                         crate::file_cache::drop_path_cache(&backup);
@@ -8692,6 +8708,44 @@ fn push_block_copy_range(ranges: &mut Vec<BlockCopyRange>, next: BlockCopyRange)
         return;
     }
     ranges.push(next);
+}
+
+/// Makes the repair staging folder, owner-only on Unix like the create
+/// path's transaction folder. Only a missing base folder costs a second
+/// call; an existing name is refused rather than reused.
+fn create_private_repair_dir(path: &Path) -> io::Result<()> {
+    let create = || {
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(path)
+    };
+    match create() {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            create()
+        }
+        result => result,
+    }
+}
+
+/// Gives a staged file its original's permission bits before it is renamed
+/// over that original, so a repaired file keeps the mode it had. `original`
+/// is the metadata the install already read for the target. The staged file
+/// sits in the owner-only staging folder, so setting the mode by its path
+/// cannot be redirected by anyone else, and needs no extra open.
+#[cfg(unix)]
+fn match_original_permissions(staged: &Path, original: &fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(
+        staged,
+        fs::Permissions::from_mode(original.permissions().mode() & 0o777),
+    )
 }
 
 fn unique_repair_dir(base_dir: &Path) -> PathBuf {
