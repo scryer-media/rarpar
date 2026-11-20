@@ -16,6 +16,8 @@ No API changes.
 - `SelfRepairPlan::execute` reopens its staged archive for the carrier
   without following a symlink at the name on macOS and Linux, so one swapped
   in by another process fails the repair instead of taking the carrier.
+- Requires `reedsolomon-rs` 0.4.12, whose tiled matrix inversion and split
+  encode scatter check their slice lengths in release builds.
 
 ## 0.8.3
 

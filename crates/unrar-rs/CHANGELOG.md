@@ -55,6 +55,13 @@
 - RAR5 recovery-record assessment and repair keep one bit per recovery chunk
   for whether it is intact, instead of one byte, so a record declaring a huge
   chunk grid takes an eighth of the memory. Results are unchanged.
+- On Unix, a directory member unpacked to a path with no final name (`.`,
+  `./`, `/`, a path ending in `..`) is accepted as the existing directory the
+  caller named and its metadata set by path, as in 0.16.6. The anchored
+  parent walk above needs a final name and refused such a path with
+  `InvalidInput`.
+- Requires `reedsolomon-rs` 0.4.12, whose tiled matrix inversion and split
+  encode scatter check their slice lengths in release builds.
 
 ## 0.16.6
 

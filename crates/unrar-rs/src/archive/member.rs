@@ -2220,6 +2220,15 @@ impl RarArchive {
         out_path: &std::path::Path,
         open_handle: bool,
     ) -> RarResult<Option<std::fs::File>> {
+        // An output path with no final name (`.`, `..`, `/`, a path ending in
+        // `..`) is a directory the caller named, with no member-controlled
+        // component to anchor: it is made or accepted by path, and its
+        // metadata set by path, as before the anchored walk.
+        #[cfg(unix)]
+        if out_path.file_name().is_none() {
+            std::fs::create_dir_all(out_path).map_err(RarError::from)?;
+            return Ok(None);
+        }
         let parent = Self::prepare_output_parent_for_member(member_name, out_path)?;
         #[cfg(unix)]
         {
@@ -9695,6 +9704,37 @@ mod tests {
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode & 0o4000, if is_root { 0o4000 } else { 0 });
         assert_eq!(mode & 0o777, 0o755);
+    }
+
+    /// A directory member unpacked to a path with no final name (the current
+    /// directory, the root, a path ending in `..`) is accepted as the
+    /// existing directory the caller named, and its metadata goes by path.
+    #[cfg(unix)]
+    #[test]
+    fn directory_output_without_a_final_name_is_accepted() {
+        let temp = tempfile::tempdir().unwrap();
+        let nested = temp.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let up = nested.join("..");
+        for out_path in [
+            std::path::Path::new("."),
+            std::path::Path::new("./"),
+            std::path::Path::new("/"),
+            up.as_path(),
+        ] {
+            let (resolved, handle) =
+                RarArchive::ensure_output_directory_with_handle_for_member("dir", out_path, true)
+                    .unwrap_or_else(|error| panic!("{}: {error}", out_path.display()));
+            assert_eq!(resolved, out_path);
+            assert!(handle.is_none(), "{}", out_path.display());
+        }
+        let file = temp.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let not_dir = file.join("..");
+        assert!(
+            RarArchive::ensure_output_directory_with_handle_for_member("dir", &not_dir, true)
+                .is_err()
+        );
     }
 
     /// Metadata set through the output's handle lands on the file or
