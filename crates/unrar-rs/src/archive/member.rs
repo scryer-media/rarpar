@@ -46,6 +46,28 @@ const OUTPUT_WRITE_BUFFER_BYTES: usize = 512 * 1024;
 const DECODE_INPUT_BUFFER_BYTES: usize = 256 * 1024;
 const MAX_LINK_TARGET_BYTES: usize = 0x10000;
 const MAX_COMMENT_BYTES: u64 = 0x1000000;
+
+/// The held parent directories of a member's output, from
+/// `RarArchive::prepare_output_parent_for_member`.
+#[cfg(unix)]
+type OutputParent = super::link_anchor::MemberParent;
+#[cfg(windows)]
+type OutputParent = WindowsOutputParent;
+#[cfg(not(any(unix, windows)))]
+type OutputParent = ();
+
+/// Windows: every directory from the extraction root to a member's output,
+/// held open without delete sharing while the output is created.
+#[cfg(windows)]
+struct WindowsOutputParent {
+    _held: Vec<std::fs::File>,
+}
+
+/// How often one parent component is looked at again when it changes between
+/// a look and its repair. Only a concurrent writer does that; the bound keeps
+/// one from looping extraction.
+#[cfg(windows)]
+const OUTPUT_PARENT_ATTEMPTS: usize = 4;
 #[cfg(test)]
 const WINDOWS_IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
 #[cfg(any(windows, test))]
@@ -1542,6 +1564,7 @@ impl RarArchive {
         Ok(())
     }
 
+    #[cfg(not(unix))]
     fn remove_existing_regular_output_symlink(out_path: &std::path::Path) -> RarResult<()> {
         match std::fs::symlink_metadata(out_path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -1559,6 +1582,7 @@ impl RarArchive {
         Self::clear_windows_readonly_attribute(out_path)
     }
 
+    #[cfg(any(not(unix), test))]
     fn clear_windows_readonly_before_overwrite(out_path: &std::path::Path) -> RarResult<()> {
         Self::clear_windows_readonly_attribute(out_path)
     }
@@ -1631,6 +1655,7 @@ impl RarArchive {
             .is_some_and(|ch| ch == '.' || ch == ' ')
     }
 
+    #[cfg(not(unix))]
     fn create_output_dir(out_path: &std::path::Path) -> RarResult<()> {
         #[cfg(windows)]
         {
@@ -1733,41 +1758,176 @@ impl RarArchive {
         Ok(())
     }
 
-    fn ensure_output_parent_dir(out_path: &std::path::Path) -> RarResult<()> {
-        if let Some(parent) = out_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            Self::create_output_dir_all(parent)?;
-        }
-        Ok(())
-    }
-
-    fn ensure_output_parent_dir_for_member(
+    /// Makes the directories above a member's output and returns them held,
+    /// so the output is then created in exactly the directories checked.
+    ///
+    /// The extraction root (the output path less the member path) is the
+    /// caller's choice and is made and followed by path. Beneath it, each
+    /// parent component of the member name is reached from the previous one:
+    /// a missing one is made, a symlink one is replaced by a real directory,
+    /// and any other non-directory refuses with `AlreadyExists`. On Unix the
+    /// walk is by descriptor (`openat` with `O_NOFOLLOW | O_DIRECTORY`) and
+    /// the output is made relative to the last one. On Windows each parent is
+    /// opened without following a reparse point and held without delete
+    /// sharing, so none can be renamed, removed or replaced by a junction
+    /// until the output exists; the output itself is still made by path
+    /// through them. An output path that does not end in the member path has
+    /// no archive-controlled parents: its parent is made by path.
+    ///
+    /// This runs once per member, at create time; writes go to the handle
+    /// the create returned.
+    fn prepare_output_parent_for_member(
         member_name: &str,
         out_path: &std::path::Path,
-    ) -> RarResult<()> {
+    ) -> RarResult<OutputParent> {
         let member_path = std::path::Path::new(member_name);
-        if member_name.is_empty() || !out_path.ends_with(member_path) {
-            return Self::ensure_output_parent_dir(out_path);
-        }
-
-        let root = Self::redirection_target_root(member_name, out_path);
+        let (root, walk): (std::path::PathBuf, Vec<&std::ffi::OsStr>) =
+            if member_name.is_empty() || !out_path.ends_with(member_path) {
+                let parent = out_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new(""));
+                (parent.to_path_buf(), Vec::new())
+            } else {
+                let walk = member_path
+                    .parent()
+                    .map(|parent| {
+                        parent
+                            .components()
+                            .filter_map(|component| match component {
+                                std::path::Component::Normal(part) => Some(part),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (Self::redirection_target_root(member_name, out_path), walk)
+            };
         if !root.as_os_str().is_empty() {
             Self::create_output_dir_all(&root)?;
         }
 
-        let Some(member_parent) = member_path.parent() else {
-            return Ok(());
+        #[cfg(unix)]
+        {
+            super::link_anchor::MemberParent::prepare(&root, &walk, out_path)
+                .map_err(RarError::from)
+        }
+
+        #[cfg(windows)]
+        {
+            Self::pin_windows_output_parents(&root, &walk)
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            Self::walk_output_parents_by_path(root, &walk)
+        }
+    }
+
+    /// Windows: the parent walk of [`Self::prepare_output_parent_for_member`].
+    #[cfg(windows)]
+    fn pin_windows_output_parents(
+        root: &std::path::Path,
+        walk: &[&std::ffi::OsStr],
+    ) -> RarResult<OutputParent> {
+        let opened_root = if root.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            root
         };
-        let mut current = root;
-        for component in member_parent.components() {
-            let std::path::Component::Normal(part) = component else {
-                continue;
-            };
+        // The root is the caller's choice and may be a junction itself.
+        let (root_handle, _) = Self::pin_windows_dir(opened_root, true)?;
+        let mut held = vec![root_handle];
+        let mut current = root.to_path_buf();
+        for part in walk {
+            current.push(part);
+            let mut attempts = 0;
+            loop {
+                attempts += 1;
+                if attempts > OUTPUT_PARENT_ATTEMPTS {
+                    return Err(RarError::Io(std::io::Error::other(format!(
+                        "output parent path {} kept changing",
+                        current.display()
+                    ))));
+                }
+                match Self::pin_windows_dir(&current, false) {
+                    Ok((dir, metadata)) if metadata.file_type().is_symlink() => {
+                        drop(dir);
+                        Self::clear_windows_readonly_before_delete(&current)?;
+                        Self::remove_output_file(&current)?;
+                        Self::create_output_dir(&current)?;
+                    }
+                    Ok((dir, metadata)) if metadata.is_dir() => {
+                        held.push(dir);
+                        break;
+                    }
+                    Ok(_) => {
+                        return Err(RarError::Io(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!(
+                                "output parent path {} exists and is not a directory",
+                                current.display()
+                            ),
+                        )));
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        // Made by another writer meanwhile: look again.
+                        if let Err(err) = Self::create_output_dir(&current)
+                            && !Self::windows_output_path_exists(&current)
+                        {
+                            return Err(err);
+                        }
+                    }
+                    Err(err) => return Err(RarError::from(err)),
+                }
+            }
+        }
+        Ok(WindowsOutputParent { _held: held })
+    }
+
+    /// Windows: opens `path` for its attributes only, without delete
+    /// sharing, and judges it through the handle. Without `follow` a
+    /// reparse point is opened itself rather than its target.
+    #[cfg(windows)]
+    fn pin_windows_dir(
+        path: &std::path::Path,
+        follow: bool,
+    ) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let mut flags = FILE_FLAG_BACKUP_SEMANTICS;
+        if !follow {
+            flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+        }
+        let handle = Self::open_windows_file_with_long_path_fallback(
+            path,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            flags,
+        );
+        if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `handle` is a valid handle we now own.
+        let file = unsafe { std::fs::File::from_raw_handle(handle as _) };
+        let metadata = file.metadata()?;
+        Ok((file, metadata))
+    }
+
+    /// Other targets: the parent walk of
+    /// [`Self::prepare_output_parent_for_member`], by path.
+    #[cfg(not(any(unix, windows)))]
+    fn walk_output_parents_by_path(
+        mut current: std::path::PathBuf,
+        walk: &[&std::ffi::OsStr],
+    ) -> RarResult<OutputParent> {
+        for part in walk {
             current.push(part);
             match std::fs::symlink_metadata(&current) {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
-                    Self::clear_windows_readonly_before_delete(&current)?;
                     Self::remove_output_file(&current)?;
                     Self::create_output_dir(&current)?;
                 }
@@ -1787,15 +1947,37 @@ impl RarArchive {
                 Err(err) => return Err(RarError::from(err)),
             }
         }
-
         Ok(())
+    }
+
+    /// Makes the directories above a member's output for a caller that
+    /// resolves the output's directory itself (hard links and file copies).
+    fn ensure_output_parent_dir_for_member(
+        member_name: &str,
+        out_path: &std::path::Path,
+    ) -> RarResult<()> {
+        Self::prepare_output_parent_for_member(member_name, out_path).map(drop)
     }
 
     fn ensure_output_directory_at_member_path(
         member_name: &str,
         out_path: &std::path::Path,
     ) -> RarResult<()> {
-        Self::ensure_output_parent_dir_for_member(member_name, out_path)?;
+        let parent = Self::prepare_output_parent_for_member(member_name, out_path)?;
+        #[cfg(unix)]
+        {
+            parent.ensure_dir().map_err(RarError::from)
+        }
+        #[cfg(not(unix))]
+        {
+            // Held until the directory exists.
+            let _parent = parent;
+            Self::ensure_output_directory_by_path(out_path)
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn ensure_output_directory_by_path(out_path: &std::path::Path) -> RarResult<()> {
         match std::fs::symlink_metadata(out_path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 Self::clear_windows_readonly_before_delete(out_path)?;
@@ -2037,24 +2219,32 @@ impl RarArchive {
         member_name: &str,
         out_path: &std::path::Path,
     ) -> RarResult<std::fs::File> {
-        Self::ensure_output_parent_dir_for_member(member_name, out_path)?;
-        Self::remove_existing_regular_output_symlink(out_path)?;
-        Self::clear_windows_readonly_before_overwrite(out_path)?;
-        Self::open_regular_output_file(out_path)
+        let parent = Self::prepare_output_parent_for_member(member_name, out_path)?;
+        // On Unix a symlink at the output name is removed and the file is
+        // then created relative to the held parent with `O_NOFOLLOW`, so one
+        // planted after the removal fails the open (`ELOOP`) instead of
+        // truncating the file it points to.
+        #[cfg(unix)]
+        {
+            parent.remove_final_symlink()?;
+            parent.open_file().map_err(RarError::from)
+        }
+        #[cfg(not(unix))]
+        {
+            // Held until the file is open.
+            let _parent = parent;
+            Self::remove_existing_regular_output_symlink(out_path)?;
+            Self::clear_windows_readonly_before_overwrite(out_path)?;
+            Self::open_regular_output_file(out_path)
+        }
     }
 
-    /// Creates or truncates `out_path` for writing. On Unix the open does
-    /// not follow a symlink in the final component, so one planted after
-    /// `remove_existing_regular_output_symlink` ran fails the open (`ELOOP`)
-    /// instead of truncating the file it points to.
+    /// Creates or truncates `out_path` for writing, by path through the
+    /// parents [`Self::prepare_output_parent_for_member`] holds.
+    #[cfg(not(unix))]
     fn open_regular_output_file(out_path: &std::path::Path) -> RarResult<std::fs::File> {
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::custom_flags(
-            &mut options,
-            libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        );
         options.open(out_path).map_err(RarError::from)
     }
 
@@ -2161,9 +2351,8 @@ impl RarArchive {
         target_is_directory: bool,
         out_path: &std::path::Path,
     ) -> RarResult<u64> {
-        Self::ensure_output_parent_dir_for_member(member_name, out_path)?;
+        let parent = Self::prepare_output_parent_for_member(member_name, out_path)?;
         Self::ensure_safe_symlink_target(fh, member_name, target, raw_member_name, out_path)?;
-        Self::remove_existing_link_output(out_path)?;
 
         #[cfg(unix)]
         {
@@ -2174,7 +2363,9 @@ impl RarArchive {
             let target = target_raw
                 .map(std::ffi::OsStr::from_bytes)
                 .unwrap_or_else(|| std::ffi::OsStr::new(target));
-            std::os::unix::fs::symlink(target, out_path).map_err(RarError::from)?;
+            parent.remove_link_output()?;
+            parent.symlink(target)?;
+            drop(parent);
             Self::apply_symlink_times(fh, out_path)?;
             if options.restore_owners {
                 Self::apply_unix_owner(owner, out_path, false)?;
@@ -2188,18 +2379,22 @@ impl RarArchive {
             let _ = options;
             let _ = target_raw;
 
+            Self::remove_existing_link_output(out_path)?;
             Self::ensure_safe_windows_reparse_target(windows_reparse_target, raw_member_name)?;
             Self::create_windows_symlink_reparse_point(
                 windows_reparse_target,
                 out_path,
                 fh.is_directory || target_is_directory,
             )?;
+            drop(parent);
             Self::apply_symlink_times(fh, out_path)?;
             Ok(0)
         }
 
         #[cfg(not(any(unix, windows)))]
         {
+            let _ = parent;
+            Self::remove_existing_link_output(out_path)?;
             let _ = fh;
             let _ = owner;
             let _ = options;
@@ -2666,7 +2861,7 @@ impl RarArchive {
         target: &Rar3UnixLinkTarget,
         out_path: &std::path::Path,
     ) -> RarResult<u64> {
-        Self::ensure_output_parent_dir_for_member(member_name, out_path)?;
+        let parent = Self::prepare_output_parent_for_member(member_name, out_path)?;
         Self::ensure_safe_symlink_target(
             fh,
             member_name,
@@ -2674,14 +2869,15 @@ impl RarArchive {
             raw_member_name,
             out_path,
         )?;
-        Self::remove_existing_link_output(out_path)?;
 
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
 
             let raw_target = std::ffi::OsStr::from_bytes(&target.raw);
-            std::os::unix::fs::symlink(raw_target, out_path).map_err(RarError::from)?;
+            parent.remove_link_output()?;
+            parent.symlink(raw_target)?;
+            drop(parent);
             Self::apply_symlink_times(fh, out_path)?;
             if options.restore_owners {
                 Self::apply_unix_owner(owner, out_path, false)?;
@@ -2691,11 +2887,12 @@ impl RarArchive {
 
         #[cfg(not(unix))]
         {
+            let _parent = parent;
+            Self::remove_existing_link_output(out_path)?;
             let _ = fh;
             let _ = owner;
             let _ = options;
             let _ = member_name;
-            let _ = out_path;
             Err(RarError::UnsupportedLinkType {
                 member: raw_member_name.to_string(),
                 link_type: "RAR3 Unix symlink".to_string(),
@@ -8928,33 +9125,50 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn open_regular_output_file_does_not_follow_a_final_symlink() {
-        let temp = tempfile::tempdir().unwrap();
-        let outside = temp.path().join("outside.txt");
-        std::fs::write(&outside, b"outside bytes").unwrap();
-        let out_path = temp.path().join("out.bin");
-        std::os::unix::fs::symlink(&outside, &out_path).unwrap();
+    fn regular_output_replaces_symlinks_in_its_parents_and_name() {
+        use std::io::Write;
 
-        // A symlink that appears after the removal step is not followed.
-        let err = RarArchive::open_regular_output_file(&out_path).unwrap_err();
-        assert!(matches!(err, RarError::Io(_)));
-        assert_eq!(std::fs::read(&outside).unwrap(), b"outside bytes");
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("file.bin"), b"outside bytes").unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("parent")).unwrap();
+
+        let out_path = root.join("parent/file.bin");
+        let (mut file, resolved) =
+            RarArchive::create_regular_output_file_for_member("parent/file.bin", &out_path)
+                .unwrap();
+        file.write_all(b"inside").unwrap();
+        drop(file);
+        assert_eq!(resolved, out_path);
+        let parent = std::fs::symlink_metadata(root.join("parent")).unwrap();
+        assert!(parent.is_dir() && !parent.file_type().is_symlink());
+        assert_eq!(std::fs::read(&out_path).unwrap(), b"inside");
+        assert_eq!(
+            std::fs::read(outside.join("file.bin")).unwrap(),
+            b"outside bytes"
+        );
+
+        // A symlink at the output name itself is replaced, not written through.
+        std::fs::remove_file(&out_path).unwrap();
+        std::os::unix::fs::symlink(outside.join("file.bin"), &out_path).unwrap();
+        let (mut file, _) =
+            RarArchive::create_regular_output_file_for_member("parent/file.bin", &out_path)
+                .unwrap();
+        file.write_all(b"again").unwrap();
+        drop(file);
         assert!(
-            std::fs::symlink_metadata(&out_path)
+            !std::fs::symlink_metadata(&out_path)
                 .unwrap()
                 .file_type()
                 .is_symlink()
         );
-
-        // A regular file is still created, then truncated on reopen.
-        let regular = temp.path().join("regular.bin");
-        std::io::Write::write_all(
-            &mut RarArchive::open_regular_output_file(&regular).unwrap(),
-            b"first",
-        )
-        .unwrap();
-        drop(RarArchive::open_regular_output_file(&regular).unwrap());
-        assert_eq!(std::fs::read(&regular).unwrap(), b"");
+        assert_eq!(
+            std::fs::read(outside.join("file.bin")).unwrap(),
+            b"outside bytes"
+        );
     }
 
     #[cfg(unix)]
