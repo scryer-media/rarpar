@@ -46,6 +46,12 @@
   `std::fs::copy` makes (`fclonefileat`, then `fcopyfile`, on Apple;
   `copy_file_range`, then `sendfile`, on Linux), so the output's content,
   mode and times are unchanged, and it does one stat fewer.
+- On Windows with owner restoration, an NTFS ACL service whose header
+  declares more than 1 MiB is skipped before any byte is decoded, logged the
+  way a descriptor `SetFileSecurityW` rejects is. Its whole decoded size went
+  into one buffer first. A security descriptor is at most 131,226 bytes (two
+  SIDs and two ACLs whose size is a 16-bit field), so no real ACL is
+  affected.
 
 ## 0.16.6
 

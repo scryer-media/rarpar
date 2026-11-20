@@ -59,6 +59,9 @@ documented in each crate's own changelog so those notes ship with the crate.
   through one handle opened on it without following a reparse point, so a
   name swapped for a link after the link check cannot pass the read-only
   attribute to the link's target.
+- RAR extraction on Windows with owner restoration skips an NTFS ACL record
+  declaring more than any security descriptor holds before decoding it,
+  through unrar-rs 0.16.7, instead of decoding all of it into memory.
 
 ## rarpar 0.9.6
 

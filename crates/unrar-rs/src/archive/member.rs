@@ -367,6 +367,10 @@ const WINDOWS_GROUP_SECURITY_INFORMATION: u32 = 0x2;
 const WINDOWS_DACL_SECURITY_INFORMATION: u32 = 0x4;
 #[cfg(any(windows, test))]
 const WINDOWS_SACL_SECURITY_INFORMATION: u32 = 0x8;
+/// The most bytes an NTFS ACL service is decoded into memory for; see
+/// `RarArchive::ntfs_acl_declared_too_large`.
+#[cfg(any(windows, test))]
+const MAX_NTFS_ACL_BYTES: u64 = 1 << 20;
 
 #[cfg(windows)]
 struct WindowsHostMetadata {
@@ -807,6 +811,15 @@ impl RarArchive {
         options: &ExtractOptions,
         out_path: &std::path::Path,
     ) -> RarResult<()> {
+        if Self::ntfs_acl_declared_too_large(&service.file_header) {
+            debug!(
+                member = %service.file_header.name,
+                path = %out_path.display(),
+                declared = service.file_header.unpacked_size,
+                "could not restore NTFS ACL service data: larger than any security descriptor"
+            );
+            return Ok(());
+        }
         let mut payload = Vec::new();
         let written = self.write_service_subdata_to_writer(service, options, &mut payload)?;
         if written == 0 {
@@ -905,6 +918,24 @@ impl RarArchive {
             && path.as_bytes()[0].is_ascii_alphabetic()
             && path.as_bytes()[1] == b':'
             && path.as_bytes()[2] == b'\\'
+    }
+
+    /// Whether an NTFS ACL service declares more bytes than any security
+    /// descriptor holds, so it is skipped before a byte is decoded into
+    /// memory, the way one `SetFileSecurityW` rejects is (logged, and the
+    /// member extracted with its default security).
+    ///
+    /// The service is one self-relative security descriptor as
+    /// `GetFileSecurityW` returns it: a 20-byte header, an owner and a group
+    /// SID of at most `SECURITY_MAX_SID_SIZE` (68) bytes each, and a DACL and
+    /// a SACL whose `AclSize` is a 16-bit field, so 65,535 bytes each at most:
+    /// 131,226 bytes in all. `MAX_NTFS_ACL_BYTES` is eight times that, so no
+    /// ACL a Windows system can produce reaches it; only a forged size does,
+    /// and before this check its decoded bytes all went into one buffer. An
+    /// unknown size keeps the error the service reader gives it.
+    #[cfg(any(windows, test))]
+    fn ntfs_acl_declared_too_large(fh: &FileHeader) -> bool {
+        matches!(fh.unpacked_size, Some(size) if size > MAX_NTFS_ACL_BYTES)
     }
 
     #[cfg(any(windows, test))]
@@ -10934,6 +10965,33 @@ mod tests {
 
         assert_eq!(written, payload.len() as u64);
         assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn ntfs_acl_ceiling_admits_every_security_descriptor_size() {
+        // Header, owner and group SIDs at SECURITY_MAX_SID_SIZE, and a DACL
+        // and SACL at the 16-bit AclSize maximum.
+        let largest_descriptor = 20 + 2 * 68 + 2 * u64::from(u16::MAX);
+        for size in [0, 1, 20, largest_descriptor, MAX_NTFS_ACL_BYTES] {
+            let service = test_rar5_service("ACL", size, size);
+            assert!(
+                !RarArchive::ntfs_acl_declared_too_large(&service.file_header),
+                "{size}"
+            );
+        }
+        for size in [MAX_NTFS_ACL_BYTES + 1, u64::from(u32::MAX), u64::MAX] {
+            let service = test_rar5_service("ACL", size, 32);
+            assert!(
+                RarArchive::ntfs_acl_declared_too_large(&service.file_header),
+                "{size}"
+            );
+        }
+        // An unknown size keeps the service reader's own error.
+        let mut service = test_rar5_service("ACL", 1, 1);
+        service.file_header.unpacked_size = None;
+        assert!(!RarArchive::ntfs_acl_declared_too_large(
+            &service.file_header
+        ));
     }
 
     #[test]
