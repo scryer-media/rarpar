@@ -73,6 +73,9 @@ documented in each crate's own changelog so those notes ship with the crate.
   and the "discovery exceeded max files" error are unchanged.
 - RAR5 recovery-record checks and repair hold one bit per recovery chunk
   instead of one byte, through unrar-rs 0.16.7.
+- `par3 archive` on Unix opens each member to read it without following a
+  symlink, so a member swapped for a link after it was checked under
+  `--base-path` fails the run instead of adding the link's target.
 
 ## rarpar 0.9.6
 
