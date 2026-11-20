@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.13.1
+
+### Fixed
+
+- Repair stages into a folder made `0700` and staged files made `0600`, and
+  gives each repaired file its original's permission bits just before the
+  rename that installs it. Staged files had the default mode, so a private
+  file's repaired bytes were readable by others while staged and after
+  install. A file that was missing keeps the default mode. No extra fsync,
+  read or open; the original's mode comes from the stat the install already
+  makes.
+- Creation compares the handle it opens a source with against the identity
+  scan's fingerprint (length, modification time, and on Unix device and
+  inode), in the encoder's source reader and in the hash read, and fails
+  with `CreationSourceChanged` on a mismatch. A source swapped after the scan
+  for another file of the same length was read as if it were the scanned
+  one. The source reader no longer stats the path. `CreationSource` and
+  `Par2CreatePlan` are unchanged.
+- Requires `reedsolomon-rs` 0.4.12, whose tiled matrix inversion checks its
+  slice lengths in release builds.
+- Scanning PAR2 bytes in memory (`scan_packets*`, `Par2FileSet::from_files*`)
+  checks an unknown packet's hash and skips it without copying its body. The
+  body was copied whole and then dropped, so one large unknown packet cost
+  its size again in memory before the scan moved on or the examined limit
+  refused it. `parse_packet` still returns the body.
+- Repair's page-cache eviction of a just-installed, renamed or removed file
+  opens its name with `O_NONBLOCK | O_NOFOLLOW` and advises it only when it
+  is a regular file, as the deferred eviction already did, so a FIFO swapped
+  in at the name cannot block the repair after it succeeded. Where cache
+  advice is a no-op (everywhere but Linux and Android) the name is no longer
+  opened at all.
+- Repair's quick and full hash of a scan candidate open it non-blocking on
+  Unix, and an extra (non-canonical) candidate without following a symlink,
+  and check the open handle is still a regular file. A candidate swapped for
+  a FIFO after its path check blocked the scan; it now fails it. A Linux
+  file lease that refuses the non-blocking open is waited for as before.
+  The later block scans of a candidate still open it by path.
+
 ## 0.13.0
 
 ### Changed

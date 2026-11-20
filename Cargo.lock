@@ -1977,7 +1977,7 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "bytes",
  "cap-std",
@@ -1996,7 +1996,7 @@ dependencies = [
 
 [[package]]
 name = "par3-rs"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "blake3",
  "cap-std",
@@ -2291,7 +2291,7 @@ dependencies = [
 
 [[package]]
 name = "reedsolomon-rs"
-version = "0.4.11"
+version = "0.4.12"
 dependencies = [
  "criterion",
  "memmap2",
@@ -2915,7 +2915,7 @@ checksum = "ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557"
 
 [[package]]
 name = "unrar-rs"
-version = "0.16.6"
+version = "0.16.7"
 dependencies = [
  "aes",
  "aws-lc-rs",
@@ -4094,7 +4094,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.4.11"
+version = "0.4.12"
 dependencies = [
  "blake3",
  "clap",

@@ -96,7 +96,12 @@ hardlinks. On Unix a process that is not root does not restore
 set-user-ID, or set-group-ID on a file, and a member archived on another
 OS, such as Windows, keeps the mode the OS gives a new file (no `chmod`;
 its read-only attribute is not mapped). `unpack_in` uses the member's own
-name, cleaned so it cannot escape the directory.
+name, cleaned so it cannot escape the directory. The folders above each
+output are reached from that directory one at a time without following a
+symlink, and the output is made inside them: by handle on Unix, and on
+Windows with each folder held open so it cannot be renamed or replaced. A
+folder swapped for a link during extraction cannot move the output
+elsewhere.
 
 ```rust
 use unrar_rs::RarArchive;

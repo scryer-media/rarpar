@@ -130,7 +130,14 @@ pub(super) fn self_repair(
     let plan = SelfRepairPlan::replacement(session, matrix, &[], ContainerLimits::default())?;
     plan.execute(session, &temporary, base)?;
 
-    let mut output = OpenOptions::new().write(true).open(&temporary)?;
+    let mut options = OpenOptions::new();
+    options.write(true);
+    // The rebuilt file is a regular file this repair just installed at the
+    // name; a symlink there now (another process writing to the folder)
+    // fails the open instead of taking the packet bytes and zeros.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NOFOLLOW);
+    let mut output = options.open(&temporary)?;
     output.seek(SeekFrom::Start(gap.start))?;
     let copied = copy_complete_packets(path, &mut output, gap.end - gap.start, found)?;
     if copied > gap.end - gap.start {

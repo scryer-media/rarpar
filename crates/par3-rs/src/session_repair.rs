@@ -3299,6 +3299,16 @@ pub fn create_directory(base: &Path, relative: &str) -> EngineResult<()> {
 }
 
 pub(crate) fn stage_path(destination: &Path, options: &ExecutionOptions) -> EngineResult<PathBuf> {
+    stage_file(destination, options).map(|(temporary, _)| temporary)
+}
+
+/// [`stage_path`], keeping the write handle the exclusive create opened, so
+/// a caller writes the file it created rather than whatever is at the name
+/// when it reopens it.
+pub(crate) fn stage_file(
+    destination: &Path,
+    options: &ExecutionOptions,
+) -> EngineResult<(PathBuf, File)> {
     let parent = destination
         .parent()
         .ok_or(EngineError::InvalidState("output has no parent"))?;
@@ -3310,7 +3320,7 @@ pub(crate) fn stage_path(destination: &Path, options: &ExecutionOptions) -> Engi
             .create_new(true)
             .open_budgeted(&temporary, options)
         {
-            Ok(_) => return Ok(temporary),
+            Ok(file) => return Ok((temporary, file)),
             Err(EngineError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 continue;
             }

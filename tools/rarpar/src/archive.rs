@@ -571,7 +571,7 @@ impl Read for Input {
             return Ok(0);
         }
         if self.file.is_none() {
-            self.file = Some(File::open(&self.path)?);
+            self.file = Some(open_input(&self.path)?);
         }
         let read = self.file.as_mut().expect("opened above").read(buf)?;
         if read == 0 {
@@ -581,6 +581,26 @@ impl Read for Input {
         self.consumed.fetch_add(read as u64, Ordering::Relaxed);
         Ok(read)
     }
+}
+
+/// Open a member's file to read it into the archive.
+///
+/// `path` is the canonical path `collect` checked under `--base-path`: no
+/// component of it, the last included, was a symlink then. On Unix the open
+/// does not follow a symlink at the last component, so a member swapped for
+/// a link after that check (another process writing to the source tree)
+/// fails the run instead of pulling the link's target into the archive. A
+/// file still at its checked name opens as before.
+///
+/// Windows keeps a plain open: `FILE_FLAG_OPEN_REPARSE_POINT` would also open
+/// a OneDrive placeholder or a deduplicated file as its reparse stub rather
+/// than its content, which `collect` admits as ordinary files.
+fn open_input(path: &Path) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NOFOLLOW);
+    options.open(path)
 }
 
 /// One archive member.
@@ -1616,6 +1636,52 @@ fn archive_error(error: sevenz_turbo::Error) -> RarparError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn input_at(path: &Path) -> Input {
+        Input {
+            path: path.to_path_buf(),
+            file: None,
+            done: false,
+            consumed: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[test]
+    fn member_input_reads_a_collected_file_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let bytes: Vec<u8> = (0..3 * 1024 * 1024 + 4093u32)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        std::fs::write(base.join("member.bin"), &bytes).unwrap();
+        let members = collect(&base, &[PathBuf::from("member.bin")], 10).unwrap();
+
+        let mut input = input_at(&members[0].path);
+        let mut read = Vec::new();
+        input.read_to_end(&mut read).unwrap();
+        assert_eq!(read, bytes);
+        assert_eq!(input.consumed.load(Ordering::Relaxed), bytes.len() as u64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn member_swapped_for_a_symlink_after_collection_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let private = outside.path().join("private");
+        std::fs::write(&private, b"outside --base-path").unwrap();
+        std::fs::write(base.join("member.bin"), b"checked").unwrap();
+        let members = collect(&base, &[PathBuf::from("member.bin")], 10).unwrap();
+
+        std::fs::remove_file(base.join("member.bin")).unwrap();
+        std::os::unix::fs::symlink(&private, base.join("member.bin")).unwrap();
+
+        let mut input = input_at(&members[0].path);
+        let mut read = Vec::new();
+        input.read_to_end(&mut read).unwrap_err();
+        assert!(read.is_empty());
+    }
 
     #[test]
     fn collection_stops_at_max_files_before_walking_on() {

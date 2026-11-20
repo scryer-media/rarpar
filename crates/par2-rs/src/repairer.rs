@@ -4119,7 +4119,7 @@ impl RepairState {
         baseline_blocks: &[SourceBlock],
         slice_size: u64,
     ) -> Result<CompleteScanMatches> {
-        let first = read_first_16k(path)?;
+        let first = read_first_16k(path, kind)?;
         let hash_16k = checksum::md5(&first);
 
         let candidates: Vec<usize> = files
@@ -4144,7 +4144,7 @@ impl RepairState {
             return Ok((Vec::new(), Vec::new()));
         }
 
-        let full = hash_file(path)?;
+        let full = hash_file(path, kind)?;
         let mut complete_files = Vec::new();
         let mut block_locations = Vec::new();
         for idx in candidates {
@@ -4599,8 +4599,18 @@ impl RepairState {
         validate_sources: bool,
     ) -> Result<RepairInstall> {
         let install_dir = unique_repair_dir(&options.base_dir);
-        fs::create_dir_all(&install_dir)?;
+        create_private_repair_dir(&install_dir)?;
         let mut staging_guard = RepairStagingGuard::new(install_dir.clone());
+        // Files verification found absent install with the default mode;
+        // every other staged file starts owner-only and takes its original's
+        // permission bits at install.
+        #[cfg(unix)]
+        let missing_file_ids: HashSet<FileId> = verification
+            .files
+            .iter()
+            .filter(|file| matches!(file.status, FileStatus::Missing))
+            .map(|file| file.file_id)
+            .collect();
         let mut bytes_copied = 0u64;
         let staged_file_ids: HashSet<FileId> = self
             .files
@@ -4619,11 +4629,14 @@ impl RepairState {
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let out = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&target)?;
+            let mut open = OpenOptions::new();
+            open.create(true).write(true).truncate(true);
+            #[cfg(unix)]
+            if !missing_file_ids.contains(&file.file_id) {
+                use std::os::unix::fs::OpenOptionsExt;
+                open.mode(0o600);
+            }
+            let out = open.open(&target)?;
             out.set_len(file.length)?;
         }
 
@@ -4850,12 +4863,16 @@ impl RepairState {
                                 ),
                             )));
                         }
+                        #[cfg(unix)]
+                        match_original_permissions(&src, &target_metadata)?;
                         let backup = unique_backup_path(dst)?;
                         crate::disk::rename_within_base(&options.base_dir, dst, &backup)?;
                         crate::file_cache::drop_path_cache(&backup);
                         backups.push((dst.clone(), backup));
                     }
                     Ok(metadata) if metadata.file_type().is_file() => {
+                        #[cfg(unix)]
+                        match_original_permissions(&src, &metadata)?;
                         let backup = unique_backup_path(dst)?;
                         crate::disk::rename_within_base(&options.base_dir, dst, &backup)?;
                         crate::file_cache::drop_path_cache(&backup);
@@ -8330,9 +8347,57 @@ fn should_skip_candidate(path: &Path) -> bool {
         .is_some_and(is_generated_par2_artifact_name)
 }
 
-fn read_first_16k(path: &Path) -> io::Result<Vec<u8>> {
-    let mut file = File::open(path)?;
-    let file_len = file.metadata()?.len();
+/// Opens a scan candidate that a path check has just admitted as a regular
+/// file, and returns it with its length.
+///
+/// On Unix the open is non-blocking, so a FIFO swapped in at the name after
+/// that check cannot block it, and an `Extra` candidate, admitted by
+/// `symlink_metadata`, is opened without following a symlink; a canonical
+/// path is followed, as it deliberately is everywhere. The handle's own
+/// metadata, which the read needed for the length anyway, must still be a
+/// regular file. `O_NONBLOCK` changes nothing for reading a regular file;
+/// the one open it refuses, `EWOULDBLOCK` for a Linux file lease another
+/// process holds, is retried blocking, as `File::open` waited for it before.
+fn open_scan_candidate(path: &Path, kind: BlockLocationKind) -> io::Result<(File, u64)> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut flags = libc::O_NONBLOCK;
+        if kind == BlockLocationKind::Extra {
+            flags |= libc::O_NOFOLLOW;
+        }
+        match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flags)
+            .open(path)
+        {
+            Err(error) if error.raw_os_error() == Some(libc::EWOULDBLOCK) => fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(flags & !libc::O_NONBLOCK)
+                .open(path)?,
+            opened => opened?,
+        }
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let _ = kind;
+        File::open(path)?
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "PAR2 scan candidate is no longer a regular file: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok((file, metadata.len()))
+}
+
+fn read_first_16k(path: &Path, kind: BlockLocationKind) -> io::Result<Vec<u8>> {
+    let (mut file, file_len) = open_scan_candidate(path, kind)?;
     let mut buf = vec![0u8; 16_384];
     // Fill, don't single-read: a short read here would silently hash fewer
     // bytes than the 16k quick hash is defined over. See `disk::read_filled`.
@@ -8342,9 +8407,8 @@ fn read_first_16k(path: &Path) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn hash_file(path: &Path) -> io::Result<[u8; 16]> {
-    let mut file = File::open(path)?;
-    let file_len = file.metadata()?.len();
+fn hash_file(path: &Path, kind: BlockLocationKind) -> io::Result<[u8; 16]> {
+    let (mut file, file_len) = open_scan_candidate(path, kind)?;
     crate::file_cache::advise_sequential(&file, path, file_len);
     let mut hasher = Md5State::new();
     // The 1 MiB read buffer must live on the heap on every target: wasm's shadow
@@ -8694,6 +8758,47 @@ fn push_block_copy_range(ranges: &mut Vec<BlockCopyRange>, next: BlockCopyRange)
     ranges.push(next);
 }
 
+/// Makes the repair staging folder, owner-only on Unix like the create
+/// path's transaction folder. Only a missing base folder costs a second
+/// call; an existing name is refused rather than reused.
+fn create_private_repair_dir(path: &Path) -> io::Result<()> {
+    let create = || {
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(path)
+    };
+    match create() {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            create()
+        }
+        result => result,
+    }
+}
+
+/// Gives a staged file its original's permission bits before it is renamed
+/// over that original, so a repaired file keeps the mode it had. `original`
+/// is the metadata the install already read for the target. The staged file
+/// sits in the owner-only staging folder, so another user cannot swap its
+/// name for a link to redirect the mode set by path; a process running as
+/// the same user, or one that can rename a folder above the staging folder,
+/// still could. Setting it by path needs no extra open.
+#[cfg(unix)]
+fn match_original_permissions(staged: &Path, original: &fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(
+        staged,
+        fs::Permissions::from_mode(original.permissions().mode() & 0o777),
+    )
+}
+
 fn unique_repair_dir(base_dir: &Path) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -8882,6 +8987,49 @@ mod tests {
 
     #[cfg(feature = "slow-tests")]
     use std::ffi::OsStr;
+
+    /// A scan candidate swapped for a FIFO fails its quick hash at once
+    /// instead of blocking; an Extra candidate swapped for a symlink is not
+    /// followed, while a canonical symlink still is; a regular file hashes
+    /// as before.
+    #[cfg(unix)]
+    #[test]
+    fn scan_candidate_open_refuses_a_fifo_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempdir().unwrap();
+        let bytes: Vec<u8> = (0..40_000u32).map(|at| (at % 253) as u8).collect();
+        let regular = dir.path().join("extra.bin");
+        fs::write(&regular, &bytes).unwrap();
+        for kind in [BlockLocationKind::Extra, BlockLocationKind::Canonical] {
+            assert_eq!(
+                read_first_16k(&regular, kind).unwrap(),
+                &bytes[..16_384],
+                "{kind:?}"
+            );
+            assert_eq!(
+                hash_file(&regular, kind).unwrap(),
+                checksum::md5(&bytes),
+                "{kind:?}"
+            );
+        }
+
+        let fifo = dir.path().join("swapped.bin");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        for kind in [BlockLocationKind::Extra, BlockLocationKind::Canonical] {
+            assert!(read_first_16k(&fifo, kind).is_err(), "{kind:?}");
+            assert!(hash_file(&fifo, kind).is_err(), "{kind:?}");
+        }
+
+        let link = dir.path().join("linked.bin");
+        std::os::unix::fs::symlink(&regular, &link).unwrap();
+        assert!(read_first_16k(&link, BlockLocationKind::Extra).is_err());
+        assert_eq!(
+            read_first_16k(&link, BlockLocationKind::Canonical).unwrap(),
+            &bytes[..16_384]
+        );
+    }
 
     #[test]
     fn armed_repair_staging_guard_removes_failed_output() {

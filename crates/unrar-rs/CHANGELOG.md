@@ -1,5 +1,75 @@
 # Changelog
 
+## 0.16.7
+
+### Fixed
+
+- Extraction creates each member's file, directory or symlink inside the
+  directories it checked. The folders above an output were made and checked
+  by path and the output then created by path, so a folder renamed or
+  swapped for a symlink in between, by another process writing to the
+  output tree, moved the output out of the extraction root. On Unix the
+  folders are now walked from the root by descriptor (`openat` with
+  `O_NOFOLLOW | O_DIRECTORY`) and the output is made relative to the last
+  one (`openat`, `mkdirat`, `symlinkat`). On Windows each folder is opened
+  without following a reparse point and held without delete sharing until
+  the output exists. A symlink folder planted by the archive is still
+  replaced by a real directory, and error kinds are unchanged. On macOS an
+  existing folder the process can search but not read now fails to extract
+  into, as it already did for hard-link targets.
+- Restoring a symlink member's owner changes the link itself (`lchown`) on
+  every Unix. On macOS it called `chown`, which follows the link and gave
+  its target the archive's owner and group. This departs from RAR on macOS
+  on purpose: RAR follows the link there.
+- On Unix, a regular file member's owner, times and mode are set through the
+  file's open handle (`fchown`, `futimens`, `fchmod`) after its last write,
+  and a directory member's through a handle opened without following a link
+  from the parent the extraction holds. They were set by path, so a name
+  swapped for a symlink after the output was made, by another process
+  writing to the output tree, redirected them to another file. Values,
+  order and error handling are unchanged; a directory that cannot be opened
+  for reading, and a file name ending in a separator, keep the path calls.
+  Windows is unchanged.
+- Reading a compressed service into memory (an archive comment, a RAR4 `UOW`
+  owner record) no longer reserves the header's declared packed size before
+  reading. A tiny archive declaring hundreds of GiB could abort the process
+  on that allocation; the reservation now stops at the 16 MiB comment
+  ceiling and the buffer grows on demand, so legitimate services read as
+  before and the forged one fails with the short read.
+- A RAR5 file-copy member whose source is not on disk is extracted from the
+  source member to a temporary and copied from there. On Unix (not Android)
+  that copy now reads one handle opened with `O_NOFOLLOW | O_NONBLOCK` and
+  checked as a regular file on the handle, instead of stating and then
+  reopening the temporary by name, so a symlink swapped in at that name by
+  another process writing to the output tree fails the copy instead of
+  pulling in the file it points at. The copy makes the calls
+  `std::fs::copy` makes (`fclonefileat`, then `fcopyfile`, on Apple;
+  `copy_file_range`, then `sendfile`, on Linux), so the output's content,
+  mode and times are unchanged, and it does one stat fewer.
+- On Windows with owner restoration, an NTFS ACL service whose header
+  declares more than 1 MiB is skipped before any byte is decoded, logged the
+  way a descriptor `SetFileSecurityW` rejects is. Its whole decoded size went
+  into one buffer first. A security descriptor is at most 131,226 bytes (two
+  SIDs and two ACLs whose size is a 16-bit field), so no real ACL is
+  affected.
+- RAR5 recovery-record assessment and repair keep one bit per recovery chunk
+  for whether it is intact, instead of one byte, so a record declaring a huge
+  chunk grid takes an eighth of the memory. Results are unchanged.
+- On Unix, a directory member unpacked to a path with no final name (`.`,
+  `./`, `/`, a path ending in `..`) is accepted as the existing directory the
+  caller named and its metadata set by path, as in 0.16.6. The anchored
+  parent walk above needs a final name and refused such a path with
+  `InvalidInput`.
+- The anchored walk opens each directory it holds search-only: `O_PATH` on
+  Linux and Android, `O_SEARCH` on Apple, FreeBSD, NetBSD, Solaris and
+  illumos, falling back to a read-only open where the kernel refuses
+  `O_SEARCH`. Outside Linux it read-opened them, so extracting into an
+  existing directory the process can write and search but not read (mode
+  `0300`), which path-based creation allowed, failed with
+  `PermissionDenied`. Other Unix targets still read-open.
+- Requires `reedsolomon-rs` 0.4.12, whose tiled matrix inversion and split
+  encode scatter check their slice lengths in release builds.
+
 ## 0.16.6
 
 ### Changed

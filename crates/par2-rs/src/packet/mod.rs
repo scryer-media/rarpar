@@ -139,10 +139,15 @@ impl PacketSink for CollectingSink<'_> {
 ///
 /// Returns the parsed packet and the number of bytes consumed.
 /// `offset` is used for error reporting (position in the file/stream).
+///
+/// An unknown packet's body is copied only when `keep_unknown_body` asks: the
+/// scanner drops unknown packets after their hash is checked, and their body
+/// is bounded only by the input, so it gets an empty one instead of a copy.
 fn parse_packet_internal(
     data: &[u8],
     offset: u64,
     recovery_path: Option<&Arc<Path>>,
+    keep_unknown_body: bool,
 ) -> Result<(Packet, usize)> {
     let header = PacketHeader::parse(data, offset)?;
     // Checked against the data before narrowing, so a length that no slice
@@ -207,7 +212,11 @@ fn parse_packet_internal(
             debug!("parsed Unknown packet type at offset {offset}");
             Packet::Unknown {
                 packet_type: sig,
-                body: body.to_vec(),
+                body: if keep_unknown_body {
+                    body.to_vec()
+                } else {
+                    Vec::new()
+                },
             }
         }
     };
@@ -216,7 +225,7 @@ fn parse_packet_internal(
 }
 
 pub fn parse_packet(data: &[u8], offset: u64) -> Result<(Packet, usize)> {
-    parse_packet_internal(data, offset, None)
+    parse_packet_internal(data, offset, None, true)
 }
 
 fn parse_packet_body(header: &PacketHeader, body: Vec<u8>) -> Result<Packet> {
@@ -302,7 +311,7 @@ fn scan_packets_internal(
         // Try to parse a packet at the current position
         let offset = base_offset + pos as u64;
 
-        match parse_packet_internal(&data[pos..], offset, recovery_path) {
+        match parse_packet_internal(&data[pos..], offset, recovery_path, false) {
             Ok((packet, consumed)) => {
                 trace!("packet at offset {offset}, size {consumed}");
                 budget.charge_examined()?;
@@ -1305,6 +1314,36 @@ mod tests {
         let packets = scan_packets(&stream, 0).unwrap();
         assert_eq!(packets.len(), 1, "the unknown packet is not delivered");
         assert!(matches!(&packets[0].0, Packet::Main(_)));
+    }
+
+    /// The scanner checks a large unknown packet's hash and skips it without
+    /// copying its body; the public single-packet parser still returns it.
+    #[test]
+    fn scanner_skips_a_large_unknown_body_without_copying_it() {
+        let custom_type = b"PAR 2.0\x00TestType";
+        let rsid = [0x8B; 16];
+        let body = vec![0x5A; 8 << 20];
+        let unknown = make_full_packet(custom_type, &body, rsid);
+
+        let (scanned, consumed) = parse_packet_internal(&unknown, 0, None, false).unwrap();
+        assert_eq!(consumed, unknown.len());
+        assert!(matches!(scanned, Packet::Unknown { body, .. } if body.is_empty()));
+        let (parsed, _) = parse_packet(&unknown, 0).unwrap();
+        assert!(matches!(parsed, Packet::Unknown { body: kept, .. } if kept == body));
+
+        let mut stream = make_main_packet_bytes(4, rsid);
+        stream.extend_from_slice(&unknown);
+        stream.extend_from_slice(&make_creator_packet("after", rsid));
+        let packets = scan_packets(&stream, 0).unwrap();
+        assert_eq!(packets.len(), 2);
+        assert!(matches!(&packets[0].0, Packet::Main(_)));
+        assert!(matches!(&packets[1].0, Packet::Creator(_)));
+
+        let limits = PacketScanLimits::default().with_max_examined_packets(0);
+        assert!(matches!(
+            scan_packets_with_limits(&unknown, 0, limits),
+            Err(Par2Error::ResourceLimitExceeded { .. })
+        ));
     }
 
     /// Unknown packets still cost the examined meter: a stream of nothing but

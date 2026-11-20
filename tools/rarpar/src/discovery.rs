@@ -907,15 +907,14 @@ fn collect_path(
         return Ok(());
     }
 
-    let mut entries = Vec::new();
-    for entry in std::fs::read_dir(path)? {
-        entries.push(entry?);
-    }
-    entries.sort_by_key(|entry| entry.path());
+    let entries = listed_entries(path, options)?;
 
-    for entry in entries {
-        let entry_path = entry.path();
-        let file_type = entry.file_type()?;
+    for ListedEntry {
+        path: entry_path,
+        file_type,
+    } in entries
+    {
+        let file_type = file_type?;
         if file_type.is_symlink() {
             continue;
         }
@@ -948,6 +947,91 @@ fn collect_path(
         }
     }
     Ok(())
+}
+
+/// One directory entry `collect_path` walks: its path and the type its
+/// listing gave, read once.
+struct ListedEntry {
+    path: PathBuf,
+    file_type: std::io::Result<std::fs::FileType>,
+}
+
+/// The entries of `path` that `collect_path` acts on, in name order.
+///
+/// The walk skips symlinks and entries that are neither a file nor a
+/// directory, and directories unless it recurses, so those are not kept.
+/// Of the regular files, only the `max_files + 1` first by name are kept,
+/// and the walk never reaches a file past those. Every path in `visited`
+/// got there through `collect_path`, and every regular file among them was
+/// counted in the scan count (a path whose count check fails ends the whole
+/// discovery). So when the walk reaches the `(max_files + 1)`th file, each
+/// of the files before it, and that file, is either already counted or is
+/// counted now, the count is above `max_files`, and the walk has failed on
+/// "discovery exceeded max files" at or before it. The walk, its first error
+/// included, is therefore the same as over the full listing, and no listing
+/// a successful run reads loses an entry. A directory of many files under a
+/// small `--max-files` then holds that many entries, not the whole listing.
+/// An entry whose type could not be read is kept, so its error surfaces
+/// where it always did.
+fn listed_entries(
+    path: &Path,
+    options: &DiscoveryOptions,
+) -> Result<Vec<ListedEntry>, RarparError> {
+    use std::collections::BinaryHeap;
+
+    /// A regular file ordered by its path alone.
+    struct ByPath(PathBuf, std::fs::FileType);
+    impl PartialEq for ByPath {
+        fn eq(&self, other: &Self) -> bool {
+            self.0 == other.0
+        }
+    }
+    impl Eq for ByPath {}
+    impl PartialOrd for ByPath {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for ByPath {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.0.cmp(&other.0)
+        }
+    }
+
+    let keep_files = options.max_files.saturating_add(1);
+    // A max-heap by name: its top is the last-named file kept so far.
+    let mut files: BinaryHeap<ByPath> = BinaryHeap::new();
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let file_type = entry.file_type();
+        match file_type {
+            Ok(kind) if kind.is_file() => {
+                let entry_path = entry.path();
+                if files.len() < keep_files {
+                    files.push(ByPath(entry_path, kind));
+                } else if files.peek().is_some_and(|last| entry_path < last.0) {
+                    files.pop();
+                    files.push(ByPath(entry_path, kind));
+                }
+            }
+            Ok(kind) if options.recursive && kind.is_dir() => entries.push(ListedEntry {
+                path: entry.path(),
+                file_type: Ok(kind),
+            }),
+            Ok(_) => {}
+            Err(error) => entries.push(ListedEntry {
+                path: entry.path(),
+                file_type: Err(error),
+            }),
+        }
+    }
+    entries.extend(files.into_iter().map(|ByPath(path, kind)| ListedEntry {
+        path,
+        file_type: Ok(kind),
+    }));
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(entries)
 }
 
 fn classify_path(path: &Path) -> DiscoveredFile {
@@ -2277,5 +2361,156 @@ mod tests {
             .find(|file| file.path == volumes[1])
             .unwrap();
         assert!(fresh.settled.is_none());
+    }
+
+    fn max_files_options(recursive: bool, max_files: usize) -> DiscoveryOptions {
+        DiscoveryOptions {
+            recursive,
+            max_depth: 8,
+            max_files,
+            working_dir: None,
+            par3_memory_mib: 256,
+            par3_workers: None,
+            par3_max_lost_blocks: 4096,
+        }
+    }
+
+    fn write_plain_files(dir: &Path, count: usize) {
+        // Written last name first, so the listing order is not name order.
+        for index in (0..count).rev() {
+            std::fs::write(dir.join(format!("f{index:05}.bin")), b"plain").unwrap();
+        }
+    }
+
+    #[test]
+    fn directory_listing_keeps_the_first_files_by_name_and_every_subdirectory() {
+        let temp = tempfile::tempdir().unwrap();
+        write_plain_files(temp.path(), 50);
+        std::fs::create_dir(temp.path().join("zz-sub")).unwrap();
+        std::fs::create_dir(temp.path().join("a-sub")).unwrap();
+
+        let kept: Vec<String> = listed_entries(temp.path(), &max_files_options(true, 9))
+            .unwrap()
+            .into_iter()
+            .map(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        let mut expected = vec!["a-sub".to_string()];
+        expected.extend((0..10).map(|index| format!("f{index:05}.bin")));
+        expected.push("zz-sub".to_string());
+        assert_eq!(kept, expected);
+
+        let flat = listed_entries(temp.path(), &max_files_options(false, 9)).unwrap();
+        assert_eq!(flat.len(), 10);
+        assert!(
+            flat.iter()
+                .all(|entry| entry.file_type.as_ref().unwrap().is_file())
+        );
+    }
+
+    #[test]
+    fn directory_at_max_files_succeeds_and_one_more_fails_as_before() {
+        let temp = tempfile::tempdir().unwrap();
+        write_plain_files(temp.path(), 40);
+
+        let report = discover(
+            vec![temp.path().to_path_buf()],
+            &max_files_options(false, 40),
+        )
+        .unwrap();
+        assert_eq!(report.files.len(), 40);
+
+        let error = discover(
+            vec![temp.path().to_path_buf()],
+            &max_files_options(false, 39),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("discovery exceeded max files (39)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn named_file_and_its_directory_at_max_files_succeed() {
+        let temp = tempfile::tempdir().unwrap();
+        write_plain_files(temp.path(), 40);
+        // The last-named file, given first, is counted once and skipped in the
+        // walk of its directory.
+        let named = temp.path().join("f00039.bin");
+        let options = max_files_options(false, 40);
+
+        let report = discover(vec![named.clone(), temp.path().to_path_buf()], &options).unwrap();
+        assert_eq!(report.files.len(), 40);
+
+        let first = temp.path().join("f00000.bin");
+        let report = discover(vec![first, temp.path().to_path_buf()], &options).unwrap();
+        assert_eq!(report.files.len(), 40);
+
+        let error = discover(
+            vec![named, temp.path().to_path_buf()],
+            &max_files_options(false, 39),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("discovery exceeded max files (39)")
+        );
+    }
+
+    #[test]
+    fn recursive_walk_counts_files_across_directories_as_before() {
+        let temp = tempfile::tempdir().unwrap();
+        let sub = temp.path().join("a-sub");
+        std::fs::create_dir(&sub).unwrap();
+        write_plain_files(&sub, 30);
+        write_plain_files(temp.path(), 10);
+
+        let report = discover(
+            vec![temp.path().to_path_buf()],
+            &max_files_options(true, 40),
+        )
+        .unwrap();
+        assert_eq!(report.files.len(), 40);
+        let error = discover(
+            vec![temp.path().to_path_buf()],
+            &max_files_options(true, 39),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("discovery exceeded max files (39)")
+        );
+    }
+
+    #[test]
+    fn large_directory_at_the_default_max_files_is_discovered_whole() {
+        // The CLI's default `--max-files` is 20,000: a directory holding that
+        // many files is still discovered in full.
+        let temp = tempfile::tempdir().unwrap();
+        write_plain_files(temp.path(), 20_000);
+
+        let report = discover(
+            vec![temp.path().to_path_buf()],
+            &max_files_options(false, 20_000),
+        )
+        .unwrap();
+        assert_eq!(report.files.len(), 20_000);
+        assert!(
+            report
+                .files
+                .windows(2)
+                .all(|pair| pair[0].path < pair[1].path)
+        );
     }
 }

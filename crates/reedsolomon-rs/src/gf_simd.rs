@@ -3053,10 +3053,28 @@ pub fn altmap_decode(buf: &mut [u8]) {
 /// the group at block granularity means the multiply kernel walks one
 /// sequential stream instead of `FOLDED_GROUP` parallel ones. The source tail
 /// past the 32-byte prefix is not written; callers keep tails per source.
+///
+/// # Panics
+///
+/// Panics if `lane >= FOLDED_GROUP`, or if `staging` is shorter than the
+/// whole 32-byte blocks of `src` times `FOLDED_GROUP`. Both are checked in
+/// release builds before any unsafe work: the SIMD scatter writes at those
+/// offsets without bounds checks. Panics on targets without the split kernels
+/// (anything but x86-64 with SSSE3 or AVX2).
 pub fn split_encode_scatter(src: &[u8], staging: &mut [u8], lane: usize) {
-    debug_assert!(lane < FOLDED_GROUP);
+    assert!(
+        lane < FOLDED_GROUP,
+        "split_encode_scatter lane {lane} is not below FOLDED_GROUP ({FOLDED_GROUP})"
+    );
     let vec_len = src.len() & !(SPLIT_BLOCK_BYTES - 1);
-    debug_assert!(staging.len() >= vec_len * FOLDED_GROUP);
+    let needed = vec_len
+        .checked_mul(FOLDED_GROUP)
+        .expect("split_encode_scatter staging length overflows usize");
+    assert!(
+        staging.len() >= needed,
+        "split_encode_scatter staging holds {} bytes, needs {needed}",
+        staging.len()
+    );
     #[cfg(target_arch = "x86_64")]
     if altmap_supported() {
         if altmap_uses_avx2() {
@@ -10153,6 +10171,39 @@ mod tests {
                 "pair kernel differs from single-group 512 len={len}"
             );
         }
+    }
+
+    // The safe scatter checks its lane and staging length before dispatch on
+    // every target, so these panic with the check's message everywhere, ahead
+    // of the non-x86 `unreachable!`.
+    #[test]
+    #[should_panic(expected = "is not below FOLDED_GROUP")]
+    fn split_encode_scatter_rejects_out_of_group_lane() {
+        let src = [0u8; 64];
+        let mut staging = vec![0u8; 64 * FOLDED_GROUP];
+        split_encode_scatter(&src, &mut staging, FOLDED_GROUP);
+    }
+
+    #[test]
+    #[should_panic(expected = "split_encode_scatter staging holds")]
+    fn split_encode_scatter_rejects_short_staging() {
+        let src = [0u8; 64];
+        let mut staging = vec![0u8; 64 * FOLDED_GROUP - 1];
+        split_encode_scatter(&src, &mut staging, 0);
+    }
+
+    /// An exact-size staging area for a large source still passes the check:
+    /// it is the length every caller already allocates.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn split_encode_scatter_accepts_exact_staging_for_a_large_source() {
+        if !altmap_supported() {
+            return;
+        }
+        let len = 4 << 20;
+        let src: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let mut staging = vec![0u8; len * FOLDED_GROUP];
+        split_encode_scatter(&src, &mut staging, FOLDED_GROUP - 1);
     }
 
     // -----------------------------------------------------------------------
