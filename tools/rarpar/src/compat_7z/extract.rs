@@ -237,34 +237,102 @@ mod anchored {
     }
 }
 
-/// Folders of the output tree, by path.
+/// Folders of the output tree, held open on Windows.
 ///
-/// Windows has no `openat`: each name is checked and then opened by path,
-/// so confinement relies on the output tree not being concurrently writable
-/// by an untrusted party, who could swap a checked folder for a link between
-/// the check and the open. Anchoring there would mean opening every
-/// component with `NtCreateFile` relative to a `RootDirectory` handle.
+/// Win32 has no `openat`, so each name is still opened by its path, but
+/// every folder on the way is opened with `FILE_FLAG_OPEN_REPARSE_POINT`,
+/// judged through that handle (a symbolic link or junction is refused, never
+/// followed) and held open without `FILE_SHARE_DELETE` for as long as
+/// anything below it is used, the output folder included. A held folder
+/// cannot be renamed, deleted or replaced by a link, so the path through the
+/// held folders names exactly the folders that were checked; this is the
+/// mechanism `unrar-rs` uses for hard-link targets. A member's file is made
+/// with `CREATE_NEW` and `FILE_FLAG_OPEN_REPARSE_POINT`, so a link planted at
+/// its name is refused rather than written through, and the new handle is
+/// checked to be a plain file. The output folder itself is the caller's
+/// choice, so a link there is followed. Folder metadata set after the walk,
+/// once the handles are closed, still goes by path.
 #[cfg(not(unix))]
 mod anchored {
     use std::fs::{self, File, OpenOptions};
     use std::io;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
     use super::{Existing, FolderError};
 
-    pub(super) struct Dir(pub(super) PathBuf);
+    /// `ERROR_DIRECTORY`: the name is not a folder.
+    const ERROR_DIRECTORY: i32 = 267;
+
+    /// An open folder: its path, and the handles that pin it and every
+    /// folder above it up to the output folder.
+    pub(super) struct Dir {
+        path: PathBuf,
+        held: Vec<Arc<File>>,
+    }
+
+    /// Opens a folder for its attributes without delete sharing, following
+    /// a link only when `follow` says so.
+    #[cfg(windows)]
+    fn open_dir(path: &Path, follow: bool) -> io::Result<File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+        const FILE_SHARE_READ: u32 = 0x0001;
+        const FILE_SHARE_WRITE: u32 = 0x0002;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        let mut flags = FILE_FLAG_BACKUP_SEMANTICS;
+        if !follow {
+            flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+        }
+        OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(flags)
+            .open(path)
+    }
+
+    #[cfg(not(windows))]
+    fn open_dir(path: &Path, _follow: bool) -> io::Result<File> {
+        File::open(path)
+    }
+
+    /// Opens a new file at `path`, failing when anything is already there
+    /// and never through a link.
+    fn open_new_file(path: &Path) -> io::Result<File> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        options.open(path)
+    }
 
     impl Dir {
         pub fn open(path: &str) -> io::Result<Dir> {
-            Ok(Dir(PathBuf::from(path)))
+            let path = PathBuf::from(path);
+            let handle = open_dir(&path, true)?;
+            if !handle.metadata()?.is_dir() {
+                return Err(io::Error::from_raw_os_error(ERROR_DIRECTORY));
+            }
+            Ok(Dir {
+                path,
+                held: vec![Arc::new(handle)],
+            })
         }
 
         pub fn try_clone(&self) -> io::Result<Dir> {
-            Ok(Dir(self.0.clone()))
+            Ok(Dir {
+                path: self.path.clone(),
+                held: self.held.clone(),
+            })
         }
 
         pub fn lstat(&self, name: &str) -> io::Result<Existing> {
-            let meta = fs::symlink_metadata(self.0.join(name))?;
+            let meta = fs::symlink_metadata(self.path.join(name))?;
             let modified = meta.modified().ok().map(|modified| {
                 match modified.duration_since(std::time::UNIX_EPOCH) {
                     Ok(after) => after.as_secs() as i64,
@@ -278,44 +346,58 @@ mod anchored {
             })
         }
 
+        /// The folder `name` in this one, made first when `create` asks and
+        /// it is absent; the flag says whether it was made. The folder is
+        /// opened without following a link and judged through that handle,
+        /// so what is checked is what is held.
         pub fn child(&self, name: &str, create: bool) -> Result<(Dir, bool), FolderError> {
-            let path = self.0.join(name);
+            let path = self.path.join(name);
             let mut made = false;
-            match fs::symlink_metadata(&path) {
-                Ok(meta) if meta.file_type().is_symlink() => return Err(FolderError::Link),
-                Ok(meta) if meta.is_dir() => {}
-                Ok(_) => {
-                    // ERROR_DIRECTORY
-                    return Err(FolderError::Io(io::Error::from_raw_os_error(267)));
-                }
+            let handle = match open_dir(&path, false) {
+                Ok(handle) => handle,
                 Err(error) if create && error.kind() == io::ErrorKind::NotFound => {
                     match fs::create_dir(&path) {
                         Ok(()) => made = true,
-                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                            // Raced: look again rather than trust it.
-                            let meta = fs::symlink_metadata(&path).map_err(FolderError::Io)?;
-                            if !meta.is_dir() || meta.file_type().is_symlink() {
-                                return Err(FolderError::Link);
-                            }
-                        }
+                        // Raced: open what is there now, and judge it.
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                         Err(error) => return Err(FolderError::Io(error)),
                     }
+                    open_dir(&path, false).map_err(FolderError::Io)?
                 }
                 Err(error) => return Err(FolderError::Io(error)),
+            };
+            let meta = handle.metadata().map_err(FolderError::Io)?;
+            if meta.file_type().is_symlink() {
+                return Err(FolderError::Link);
             }
-            Ok((Dir(path), made))
+            if !meta.is_dir() {
+                return Err(FolderError::Io(io::Error::from_raw_os_error(
+                    ERROR_DIRECTORY,
+                )));
+            }
+            let mut held = self.held.clone();
+            held.push(Arc::new(handle));
+            Ok((Dir { path, held: held }, made))
         }
 
+        /// A new file at `name`. Whatever was at the name has been removed
+        /// or renamed by the overwrite policy, so anything there now (a
+        /// link included) is refused rather than written through or
+        /// truncated.
         pub fn create_file(&self, name: &str) -> io::Result<File> {
-            OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(self.0.join(name))
+            let file = open_new_file(&self.path.join(name))?;
+            let meta = file.metadata()?;
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "output name is not a plain file",
+                ));
+            }
+            Ok(file)
         }
 
         pub fn remove(&self, name: &str, is_dir: bool) -> io::Result<()> {
-            let path = self.0.join(name);
+            let path = self.path.join(name);
             if is_dir {
                 fs::remove_dir(path)
             } else {
@@ -324,7 +406,7 @@ mod anchored {
         }
 
         pub fn rename(&self, from: &str, to: &str) -> io::Result<()> {
-            fs::rename(self.0.join(from), self.0.join(to))
+            fs::rename(self.path.join(from), self.path.join(to))
         }
     }
 }
