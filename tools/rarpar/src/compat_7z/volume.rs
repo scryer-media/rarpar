@@ -128,7 +128,7 @@ fn open_sibling(path: &Path) -> Option<(File, u64)> {
             return None;
         }
     }
-    meta.is_file().then(|| (file, meta.len()))
+    meta.is_file().then_some((file, meta.len()))
 }
 
 /// `name.001`, `name.002`, ...: the volumes 7-Zip's split handler joins when
