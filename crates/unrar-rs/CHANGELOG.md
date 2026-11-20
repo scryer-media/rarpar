@@ -21,6 +21,15 @@
   every Unix. On macOS it called `chown`, which follows the link and gave
   its target the archive's owner and group. This departs from RAR on macOS
   on purpose: RAR follows the link there.
+- On Unix, a regular file member's owner, times and mode are set through the
+  file's open handle (`fchown`, `futimens`, `fchmod`) after its last write,
+  and a directory member's through a handle opened without following a link
+  from the parent the extraction holds. They were set by path, so a name
+  swapped for a symlink after the output was made, by another process
+  writing to the output tree, redirected them to another file. Values,
+  order and error handling are unchanged; a directory that cannot be opened
+  for reading, and a file name ending in a separator, keep the path calls.
+  Windows is unchanged.
 - Reading a compressed service into memory (an archive comment, a RAR4 `UOW`
   owner record) no longer reserves the header's declared packed size before
   reading. A tiny archive declaring hundreds of GiB could abort the process

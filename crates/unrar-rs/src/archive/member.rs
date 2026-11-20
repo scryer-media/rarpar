@@ -1978,20 +1978,28 @@ impl RarArchive {
         Self::prepare_output_parent_for_member(member_name, out_path).map(drop)
     }
 
+    /// Makes the directory output and, on Unix when `open_handle` asks,
+    /// opens it through the held parent without following a link, for its
+    /// metadata. `None` when not asked, off Unix, or when the open fails
+    /// (an unreadable directory, say): the caller then sets it by path, as
+    /// before.
     fn ensure_output_directory_at_member_path(
         member_name: &str,
         out_path: &std::path::Path,
-    ) -> RarResult<()> {
+        open_handle: bool,
+    ) -> RarResult<Option<std::fs::File>> {
         let parent = Self::prepare_output_parent_for_member(member_name, out_path)?;
         #[cfg(unix)]
         {
-            parent.ensure_dir().map_err(RarError::from)
+            parent.ensure_dir().map_err(RarError::from)?;
+            Ok(open_handle.then(|| parent.open_dir().ok()).flatten())
         }
         #[cfg(not(unix))]
         {
+            let _ = open_handle;
             // Held until the directory exists.
             let _parent = parent;
-            Self::ensure_output_directory_by_path(out_path)
+            Self::ensure_output_directory_by_path(out_path).map(|()| None)
         }
     }
 
@@ -2021,12 +2029,24 @@ impl RarArchive {
         Ok(())
     }
 
+    #[cfg(test)]
     fn ensure_output_directory_for_member(
         member_name: &str,
         out_path: &std::path::Path,
     ) -> RarResult<std::path::PathBuf> {
-        match Self::ensure_output_directory_at_member_path(member_name, out_path) {
-            Ok(()) => Ok(out_path.to_path_buf()),
+        Self::ensure_output_directory_with_handle_for_member(member_name, out_path, false)
+            .map(|(path, _)| path)
+    }
+
+    /// The directory output's path and, when `open_handle` asks and it could
+    /// be opened, its handle (see [`Self::ensure_output_directory_at_member_path`]).
+    fn ensure_output_directory_with_handle_for_member(
+        member_name: &str,
+        out_path: &std::path::Path,
+        open_handle: bool,
+    ) -> RarResult<(std::path::PathBuf, Option<std::fs::File>)> {
+        match Self::ensure_output_directory_at_member_path(member_name, out_path, open_handle) {
+            Ok(handle) => Ok((out_path.to_path_buf(), handle)),
             Err(original_err) => {
                 if let Some((fallback_member_name, fallback_path)) =
                     Self::unix_windows_share_fallback_output_path(member_name, out_path)
@@ -2036,11 +2056,12 @@ impl RarArchive {
                         fallback = %fallback_path.display(),
                         "retrying directory creation with Windows-share-compatible RAR name"
                     );
-                    Self::ensure_output_directory_at_member_path(
+                    let handle = Self::ensure_output_directory_at_member_path(
                         &fallback_member_name,
                         &fallback_path,
+                        open_handle,
                     )?;
-                    Ok(fallback_path)
+                    Ok((fallback_path, handle))
                 } else {
                     Err(original_err)
                 }
@@ -3498,6 +3519,113 @@ impl RarArchive {
         Self::apply_output_times(fh, out_path)?;
         Self::apply_unix_permissions(fh, out_path)?;
         Self::apply_windows_attributes(fh, out_path)
+    }
+
+    /// [`Self::apply_output_metadata`] through the output's own open handle
+    /// on Unix: `fchown`, `futimens` and `fchmod` on the file or directory
+    /// the extraction created, in the same order and with the same values and
+    /// error handling, so a name swapped after the output was made (another
+    /// process writing to the output tree) cannot redirect them to another
+    /// file. `out_path` only labels log lines. Creation time and Windows
+    /// attributes are no-ops on Unix, as in the path form.
+    #[cfg(unix)]
+    fn apply_output_metadata_to_handle(
+        fh: &FileHeader,
+        owner: Option<&crate::types::UnixOwnerInfo>,
+        options: &ExtractOptions,
+        file: &std::fs::File,
+        out_path: &std::path::Path,
+    ) -> RarResult<()> {
+        if options.restore_owners {
+            Self::apply_unix_owner_to_handle(owner, file, out_path)?;
+        }
+        if let Some((atime, mtime)) =
+            Self::unix_regular_file_times(fh.mtime, fh.atime, std::time::SystemTime::now())
+            && let Err(error) = filetime::set_file_handle_times(file, Some(atime), Some(mtime))
+        {
+            debug!(
+                path = %out_path.display(),
+                ?error,
+                "failed to restore output timestamps"
+            );
+        }
+        if let Some(mode) = Self::unix_output_mode(fh) {
+            use std::os::unix::fs::PermissionsExt;
+
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
+                .map_err(RarError::from)?;
+        }
+        Ok(())
+    }
+
+    /// Whether [`Self::apply_output_metadata_to_handle`] has anything to do
+    /// for this member, so a directory is opened for it only when it does.
+    #[cfg(unix)]
+    fn output_metadata_needs_handle(fh: &FileHeader, options: &ExtractOptions) -> bool {
+        options.restore_owners
+            || fh.mtime.is_some()
+            || fh.atime.is_some()
+            || Self::unix_header_mode(fh).is_some()
+    }
+
+    /// [`Self::apply_unix_owner`] with links followed, through `file`. The
+    /// owner check and the mode put back after `fchown` both come from one
+    /// `fstat`, where the path form took two `stat`s of the same file.
+    #[cfg(unix)]
+    fn apply_unix_owner_to_handle(
+        owner: Option<&crate::types::UnixOwnerInfo>,
+        file: &std::fs::File,
+        out_path: &std::path::Path,
+    ) -> RarResult<()> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let Some(owner) = owner else {
+            return Ok(());
+        };
+        let Some((uid, gid)) = Self::resolve_unix_owner(owner)? else {
+            return Ok(());
+        };
+        let original_mode = match file.metadata() {
+            Ok(metadata) => {
+                let uid_matches = uid.is_none_or(|uid| u64::from(metadata.uid()) == uid as u64);
+                let gid_matches = gid.is_none_or(|gid| u64::from(metadata.gid()) == gid as u64);
+                if uid_matches && gid_matches {
+                    return Ok(());
+                }
+                Some(metadata.permissions().mode())
+            }
+            Err(error) => {
+                debug!(
+                    path = %out_path.display(),
+                    error = %error,
+                    "failed to inspect Unix owner before restore"
+                );
+                None
+            }
+        };
+        let uid_arg = uid.unwrap_or(!0 as libc::uid_t);
+        let gid_arg = gid.unwrap_or(!0 as libc::gid_t);
+        // SAFETY: `file` is an open descriptor for the duration of the call.
+        if unsafe { libc::fchown(file.as_raw_fd(), uid_arg, gid_arg) } != 0 {
+            debug!(
+                path = %out_path.display(),
+                error = %std::io::Error::last_os_error(),
+                "failed to restore Unix owner"
+            );
+            return Ok(());
+        }
+        // `fchown` may clear set-user-ID and set-group-ID; put the mode back.
+        if let Some(mode) = original_mode
+            && let Err(error) = file.set_permissions(std::fs::Permissions::from_mode(mode))
+        {
+            debug!(
+                path = %out_path.display(),
+                error = %error,
+                "failed to restore Unix mode after owner restore"
+            );
+        }
+        Ok(())
     }
 
     fn create_hardlink_output(
@@ -5346,9 +5474,30 @@ impl RarArchive {
         }
 
         if fh.is_directory {
-            let resolved_out_path =
-                Self::ensure_output_directory_for_member(&member_name, out_path)?;
-            Self::apply_output_metadata(&fh, owner.as_ref(), options, &resolved_out_path)?;
+            #[cfg(unix)]
+            let open_handle = Self::output_metadata_needs_handle(&fh, options);
+            #[cfg(not(unix))]
+            let open_handle = false;
+            let (resolved_out_path, handle) = Self::ensure_output_directory_with_handle_for_member(
+                &member_name,
+                out_path,
+                open_handle,
+            )?;
+            match handle {
+                #[cfg(unix)]
+                Some(dir) => Self::apply_output_metadata_to_handle(
+                    &fh,
+                    owner.as_ref(),
+                    options,
+                    &dir,
+                    &resolved_out_path,
+                )?,
+                #[cfg(not(unix))]
+                Some(_) => unreachable!("directory handles are opened on Unix only"),
+                None => {
+                    Self::apply_output_metadata(&fh, owner.as_ref(), options, &resolved_out_path)?
+                }
+            }
             if let (Some(p), Some(mi)) = (progress, mi.as_ref()) {
                 p.on_member_progress(mi, 0);
                 p.on_member_complete(mi, &Ok(()));
@@ -5382,6 +5531,28 @@ impl RarArchive {
 
         let written = self.extract_member_attached_to_writer(index, options, &mut writer)?;
 
+        // Every decode route flushes before it returns, so this writes
+        // nothing; it guarantees the times set next follow the last write.
+        writer.flush().map_err(RarError::from)?;
+        // A member name ending in a separator (a crafted RAR4 Unicode name,
+        // say) still makes a file, named by its last component, but the path
+        // calls see a directory path and fail with `ENOTDIR`, which failed
+        // the member when it carries a Unix mode. Such a path keeps the path
+        // form so that verdict is unchanged; every other output is set
+        // through the handle just written.
+        #[cfg(unix)]
+        if out_path.as_os_str().as_encoded_bytes().last() == Some(&b'/') {
+            Self::apply_output_metadata(&fh, owner.as_ref(), options, out_path)?;
+        } else {
+            Self::apply_output_metadata_to_handle(
+                &fh,
+                owner.as_ref(),
+                options,
+                writer.get_ref(),
+                out_path,
+            )?;
+        }
+        #[cfg(not(unix))]
         Self::apply_output_metadata(&fh, owner.as_ref(), options, out_path)?;
         self.restore_ntfs_acl_for_member(index, options, out_path)?;
         self.restore_ntfs_streams_for_member(index, options, out_path)?;
@@ -9256,6 +9427,125 @@ mod tests {
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode & 0o4000, if is_root { 0o4000 } else { 0 });
         assert_eq!(mode & 0o777, 0o755);
+    }
+
+    /// Metadata set through the output's handle lands on the file or
+    /// directory extracted even after its name is swapped for a symlink to
+    /// another file, and gives the same mode and times the path form gives.
+    #[cfg(unix)]
+    #[test]
+    fn output_metadata_by_handle_follows_the_output_not_its_name() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_500_000_000);
+        let atime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_400_000_000);
+        let mut fh = test_rar3_symlink_header(None);
+        fh.host_os = HostOs::Unix;
+        fh.mtime = Some(mtime);
+        fh.atime = Some(atime);
+        let options = ExtractOptions::default();
+
+        for is_directory in [false, true] {
+            let tag = if is_directory { "dir" } else { "file" };
+            fh.is_directory = is_directory;
+            fh.attributes = FileAttributes(if is_directory {
+                0o040000 | 0o750
+            } else {
+                0o100000 | 0o640
+            });
+            let victim = temp.path().join(format!("victim-{tag}"));
+            std::fs::write(&victim, b"victim").unwrap();
+            std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let victim_before = std::fs::metadata(&victim).unwrap();
+
+            let out = temp.path().join(format!("out-{tag}"));
+            let handle = if is_directory {
+                std::fs::create_dir(&out).unwrap();
+                std::fs::File::open(&out).unwrap()
+            } else {
+                std::fs::File::create(&out).unwrap()
+            };
+            let moved = temp.path().join(format!("moved-{tag}"));
+            std::fs::rename(&out, &moved).unwrap();
+            std::os::unix::fs::symlink(&victim, &out).unwrap();
+
+            RarArchive::apply_output_metadata_to_handle(&fh, None, &options, &handle, &out)
+                .unwrap();
+
+            let extracted = std::fs::metadata(&moved).unwrap();
+            assert_eq!(
+                extracted.permissions().mode() & 0o7777,
+                if is_directory { 0o750 } else { 0o640 }
+            );
+            assert_eq!(extracted.modified().unwrap(), mtime);
+            assert_eq!(extracted.accessed().unwrap(), atime);
+            let victim_after = std::fs::metadata(&victim).unwrap();
+            assert_eq!(victim_after.permissions().mode() & 0o7777, 0o600);
+            assert_eq!(
+                victim_after.modified().unwrap(),
+                victim_before.modified().unwrap()
+            );
+
+            // The path form, on a fresh output, gives the same mode and times.
+            let by_path = temp.path().join(format!("by-path-{tag}"));
+            if is_directory {
+                std::fs::create_dir(&by_path).unwrap();
+            } else {
+                std::fs::write(&by_path, b"").unwrap();
+            }
+            RarArchive::apply_output_metadata(&fh, None, &options, &by_path).unwrap();
+            let by_path = std::fs::metadata(&by_path).unwrap();
+            assert_eq!(
+                by_path.permissions().mode() & 0o7777,
+                extracted.permissions().mode() & 0o7777
+            );
+            assert_eq!(by_path.modified().unwrap(), extracted.modified().unwrap());
+            assert_eq!(by_path.accessed().unwrap(), extracted.accessed().unwrap());
+        }
+    }
+
+    /// A directory member gets its metadata through a handle the held parent
+    /// opened, and only when there is metadata to set. (A file member name
+    /// ending in a separator keeping the path form's `ENOTDIR` is pinned by
+    /// `encoded_rar4_names_stay_names` in `tests/advisories.rs`.)
+    #[cfg(unix)]
+    #[test]
+    fn extracted_directory_metadata_goes_through_the_held_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let out = temp.path().join("parent/child");
+        let (path, handle) =
+            RarArchive::ensure_output_directory_with_handle_for_member("parent/child", &out, true)
+                .unwrap();
+        assert_eq!(path, out);
+        let handle = handle.expect("a readable directory output opens");
+        let mut fh = test_rar3_symlink_header(None);
+        fh.host_os = HostOs::Unix;
+        fh.is_directory = true;
+        fh.attributes = FileAttributes(0o040000 | 0o705);
+        RarArchive::apply_output_metadata_to_handle(
+            &fh,
+            None,
+            &ExtractOptions::default(),
+            &handle,
+            &out,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&out).unwrap().permissions().mode() & 0o7777,
+            0o705
+        );
+
+        // Nothing asked for, nothing opened.
+        let (_, handle) = RarArchive::ensure_output_directory_with_handle_for_member(
+            "parent/other",
+            &temp.path().join("parent/other"),
+            false,
+        )
+        .unwrap();
+        assert!(handle.is_none());
     }
 
     #[test]

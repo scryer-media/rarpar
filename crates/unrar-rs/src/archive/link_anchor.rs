@@ -656,6 +656,28 @@ mod unix {
             }
         }
 
+        /// Opens the output directory [`Self::ensure_dir`] made or kept,
+        /// without following a symlink in its name, so its owner, times and
+        /// mode can be set through the handle (`fchown`, `futimens`,
+        /// `fchmod`). Read access is needed, which a directory the process
+        /// can search but not read lacks; callers fall back to setting them
+        /// by path then.
+        pub(in crate::archive) fn open_dir(&self) -> std::io::Result<std::fs::File> {
+            // SAFETY: `name` is NUL-terminated and `dir` is open.
+            let fd = unsafe {
+                libc::openat(
+                    self.dir.as_raw_fd(),
+                    self.name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: `fd` is a freshly opened descriptor we own.
+            Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+        }
+
         /// Clears the output name for a link: a directory there refuses,
         /// anything else is removed.
         pub(in crate::archive) fn remove_link_output(&self) -> std::io::Result<()> {

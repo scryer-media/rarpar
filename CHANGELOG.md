@@ -39,6 +39,9 @@ documented in each crate's own changelog so those notes ship with the crate.
   of the same length, through par2-rs 0.13.1.
 - reedsolomon-rs 0.4.12 checks the tiled matrix inversion's input lengths in
   release builds, and the folded split scatter's lane and staging length.
+- RAR extraction on Unix sets each extracted file's and folder's owner,
+  times and mode through its own handle, through unrar-rs 0.16.7, so a name
+  swapped for a symlink mid-extraction cannot redirect them to another file.
 - A RAR comment or owner record whose header declares a huge packed size
   fails with a read error instead of aborting on the allocation, through
   unrar-rs 0.16.7.
