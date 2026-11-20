@@ -95,7 +95,7 @@ fn open_for_advice(path: &Path) -> Option<(File, u64)> {
     let opened = File::open(path);
     let file = opened.ok()?;
     let metadata = file.metadata().ok()?;
-    metadata.is_file().then(|| (file, metadata.len()))
+    metadata.is_file().then_some((file, metadata.len()))
 }
 
 fn evict_path_now(path: &Path) {

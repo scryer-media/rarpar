@@ -535,19 +535,18 @@ mod tests {
             // A clone writes only the new bytes. macOS creates the clone by
             // name and opens it once; Linux clones into the staged file's
             // creating open, and copies where the filesystem refuses.
-            let cloned_run = |opens| Run {
+            let cloned_run = Run {
                 read_bytes: encoding,
                 write_bytes: protection + footer,
-                opens,
+                opens: 1,
                 clones: 1,
             };
-            let clone_expected = if cfg!(target_os = "macos") {
-                cloned_run(1)
-            } else if cfg!(target_os = "linux") && clone.clones == 1 {
-                cloned_run(1)
-            } else {
-                copy_expected
-            };
+            let clone_expected =
+                if cfg!(target_os = "macos") || (cfg!(target_os = "linux") && clone.clones == 1) {
+                    cloned_run
+                } else {
+                    copy_expected
+                };
             assert_eq!(clone, clone_expected, "{fixture}");
         }
     }
