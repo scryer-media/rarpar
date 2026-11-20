@@ -3037,7 +3037,14 @@ impl RarArchive {
                     );
                 }
             }
-            let original_mode = Self::unix_followed_mode(out_path);
+            // `chown` may clear set-user-ID and set-group-ID, so a followed
+            // restore puts the mode back afterwards. `lchown` changes the
+            // link itself and leaves its target, mode included, alone.
+            let original_mode = if chown_follows_links {
+                Self::unix_followed_mode(out_path)
+            } else {
+                None
+            };
 
             use std::os::unix::ffi::OsStrExt;
 
@@ -3085,9 +3092,17 @@ impl RarArchive {
         Ok(())
     }
 
+    /// Whether an owner restore follows a link at the output path: only when
+    /// the caller asks (regular files and folders). A symlink member's owner
+    /// is set with `lchown` on every Unix, Apple targets included.
+    ///
+    /// This deliberately departs from RAR on macOS, whose extractor calls
+    /// `chown` there and so hands the symlink's target, which may sit
+    /// outside the extraction root, to the archive's owner. macOS has
+    /// `lchown`, so the link itself gets the owner instead.
     #[cfg(any(unix, test))]
     fn unix_owner_chown_follows_links(follow_links: bool) -> bool {
-        follow_links || cfg!(target_vendor = "apple")
+        follow_links
     }
 
     #[cfg(unix)]
@@ -9141,12 +9156,53 @@ mod tests {
         assert_eq!(std::fs::read(fallback).unwrap(), b"fallback bytes");
     }
 
+    /// Owner restore follows a link only when the caller asks; a symlink
+    /// member uses `lchown` on every Unix. On Apple targets this departs from
+    /// RAR, which follows the link there.
     #[test]
-    fn unix_owner_chown_link_following_matches_rar_behavior_platform_branch() {
+    fn unix_owner_chown_follows_links_only_when_asked_on_every_platform() {
         assert!(RarArchive::unix_owner_chown_follows_links(true));
+        assert!(!RarArchive::unix_owner_chown_follows_links(false));
+    }
+
+    /// Restoring a symlink member's group changes the link itself and leaves
+    /// its target alone. Uses a supplementary group of this process, which
+    /// any user may hand a file it owns; skipped when there is none.
+    #[cfg(unix)]
+    #[test]
+    fn unix_owner_restore_on_a_symlink_never_reaches_its_target() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("outside.bin");
+        std::fs::write(&target, b"target").unwrap();
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let target_gid = std::fs::metadata(&target).unwrap().gid();
+        let link_gid = std::fs::symlink_metadata(&link).unwrap().gid();
+
+        // SAFETY: a zero-length query returns the count and writes nothing.
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        assert!(count >= 0);
+        let mut groups = vec![0 as libc::gid_t; count as usize];
+        // SAFETY: `groups` holds `count` entries.
+        let count = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+        assert!(count >= 0);
+        groups.truncate(count as usize);
+        let Some(other) = groups.into_iter().find(|&gid| {
+            u64::from(gid) != u64::from(target_gid) && u64::from(gid) != u64::from(link_gid)
+        }) else {
+            return;
+        };
+
+        let owner = crate::types::UnixOwnerInfo {
+            gid: Some(u64::from(other)),
+            ..Default::default()
+        };
+        RarArchive::apply_unix_owner(Some(&owner), &link, false).unwrap();
+        assert_eq!(std::fs::metadata(&target).unwrap().gid(), target_gid);
         assert_eq!(
-            RarArchive::unix_owner_chown_follows_links(false),
-            cfg!(target_vendor = "apple")
+            u64::from(std::fs::symlink_metadata(&link).unwrap().gid()),
+            u64::from(other)
         );
     }
 
