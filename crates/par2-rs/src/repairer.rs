@@ -4604,6 +4604,7 @@ impl RepairState {
         // Files verification found absent install with the default mode;
         // every other staged file starts owner-only and takes its original's
         // permission bits at install.
+        #[cfg(unix)]
         let missing_file_ids: HashSet<FileId> = verification
             .files
             .iter()
@@ -8715,6 +8716,7 @@ fn push_block_copy_range(ranges: &mut Vec<BlockCopyRange>, next: BlockCopyRange)
 /// call; an existing name is refused rather than reused.
 fn create_private_repair_dir(path: &Path) -> io::Result<()> {
     let create = || {
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {
