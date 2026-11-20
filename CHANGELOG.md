@@ -42,6 +42,9 @@ documented in each crate's own changelog so those notes ship with the crate.
 - RAR extraction on Unix sets each extracted file's and folder's owner,
   times and mode through its own handle, through unrar-rs 0.16.7, so a name
   swapped for a symlink mid-extraction cannot redirect them to another file.
+- PAR3 inside-archive insert and strip write each staged output through the
+  handle that created it, through par3-rs 0.8.4, instead of reopening it by
+  name.
 - A RAR comment or owner record whose header declares a huge packed size
   fails with a read error instead of aborting on the allocation, through
   unrar-rs 0.16.7.

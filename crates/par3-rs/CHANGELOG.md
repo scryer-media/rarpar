@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.4
+
+No API changes.
+
+### Fixed
+
+- Staging an inside-archive output (insert, strip, and the copy that
+  installs a repaired host across filesystems) writes through the handle the
+  exclusive create opened. It created the staging file, closed it and
+  reopened it by name, so a name swapped for a symlink in between, by
+  another process writing to the output folder, redirected the write. One
+  open fewer per staged file; names, modes and bytes are unchanged. A macOS
+  clone is still made by name and opened once, as before.
+
 ## 0.8.3
 
 No API changes.

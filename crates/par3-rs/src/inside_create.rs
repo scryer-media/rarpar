@@ -1,6 +1,9 @@
 //! Staged PAR-inside insertion without recompressing archive members.
 
-use crate::runtime::{EngineFile as File, MemoryCategory, OpenBudgeted};
+#[cfg(target_os = "macos")]
+use crate::runtime::OpenBudgeted;
+use crate::runtime::{EngineFile as File, MemoryCategory};
+#[cfg(target_os = "macos")]
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::ops::Range;
@@ -267,11 +270,10 @@ impl InsertionPlan {
                 Err(error) => return Err(error),
             }
         }
-        let temporary = staging.insert(crate::session_repair::stage_path(destination, options)?);
+        let (temporary, output) = crate::session_repair::stage_file(destination, options)?;
+        *staging = Some(temporary);
         #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-        let mut output = OpenOptions::new()
-            .write(true)
-            .open_budgeted(temporary, options)?;
+        let mut output = output;
         #[cfg(target_os = "linux")]
         if let Some(original) = original {
             use crate::repair_tree::clone;
@@ -519,20 +521,20 @@ mod tests {
 
             // The plan kept the archive from its hash pass, so encoding reads
             // nothing and only the footer copy reads the footer once more. A
-            // refused clone also copies the archive, read and written, after
-            // the open that creates the stage name and the one that writes it.
+            // refused clone also copies the archive, read and written, through
+            // the one open that creates the stage and is written.
             let encoding = copy.read_bytes - len;
             assert_eq!(encoding, footer, "{fixture}");
             let copy_expected = Run {
                 read_bytes: encoding + len,
                 write_bytes: len + protection + footer,
-                opens: 2,
+                opens: 1,
                 clones: 0,
             };
             assert_eq!(copy, copy_expected, "{fixture}");
             // A clone writes only the new bytes. macOS creates the clone by
-            // name and opens it once; Linux clones into the staged file, so it
-            // keeps both opens, and copies where the filesystem refuses.
+            // name and opens it once; Linux clones into the staged file's
+            // creating open, and copies where the filesystem refuses.
             let cloned_run = |opens| Run {
                 read_bytes: encoding,
                 write_bytes: protection + footer,
@@ -542,7 +544,7 @@ mod tests {
             let clone_expected = if cfg!(target_os = "macos") {
                 cloned_run(1)
             } else if cfg!(target_os = "linux") && clone.clones == 1 {
-                cloned_run(2)
+                cloned_run(1)
             } else {
                 copy_expected
             };
