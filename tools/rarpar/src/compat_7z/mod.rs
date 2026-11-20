@@ -1036,11 +1036,12 @@ fn open_path(
             paths: vec![PathBuf::from(path)],
             sizes: vec![size],
             split_name: None,
+            siblings: Vec::new(),
         };
         return (set, Err(OpenFailure::Format("Is not archive")));
     }
-    let set = volume_set(Path::new(path), size);
-    let opened = open_archive(&set, &mut || session.ask_password());
+    let mut set = volume_set(Path::new(path), size);
+    let opened = open_archive(&mut set, &mut || session.ask_password());
     (set, opened)
 }
 

@@ -16,12 +16,16 @@ pub(super) struct Volumes {
 }
 
 impl Volumes {
-    fn open(paths: &[PathBuf], sizes: &[u64]) -> io::Result<Self> {
-        let mut files = Vec::with_capacity(paths.len());
-        let mut starts = Vec::with_capacity(paths.len());
+    /// The first volume, opened by the path the caller named (a link there
+    /// is the caller's choice), then the siblings [`volume_set`] already
+    /// opened without following a link.
+    fn open(first: &Path, siblings: Vec<File>, sizes: &[u64]) -> io::Result<Self> {
+        let mut files = Vec::with_capacity(sizes.len());
+        files.push(File::open(first)?);
+        files.extend(siblings);
+        let mut starts = Vec::with_capacity(sizes.len());
         let mut at = 0u64;
-        for (path, size) in paths.iter().zip(sizes) {
-            files.push(File::open(path)?);
+        for size in sizes {
             starts.push(at);
             at += size;
         }
@@ -88,15 +92,54 @@ pub(super) struct VolumeSet {
     /// The name 7-Zip gives the joined stream: the first volume's file name
     /// without its number; `None` for a single file.
     pub split_name: Option<String>,
+    /// The volumes after the first, already open; [`open_archive`] takes
+    /// them.
+    pub siblings: Vec<File>,
+}
+
+/// Opens a sibling volume the archive's name implies, never through a link:
+/// only the first volume is named by the user, so a link planted at a later
+/// number would let anyone who can write the folder splice another file into
+/// the stream. The size comes from the open handle, which must be a regular
+/// file; `None` ends the set.
+fn open_sibling(path: &Path) -> Option<(File, u64)> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Non-blocking so a FIFO at the name is opened, judged and refused
+        // rather than waited on; reads of a regular file ignore the flag.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return None;
+        }
+    }
+    meta.is_file().then(|| (file, meta.len()))
 }
 
 /// `name.001`, `name.002`, ...: the volumes 7-Zip's split handler joins when
-/// it is given the first one.
+/// it is given the first one. The first volume is `path` as given; each later
+/// one must be a regular file at its own name, not a link.
 pub(super) fn volume_set(path: &Path, first_size: u64) -> VolumeSet {
     let single = || VolumeSet {
         paths: vec![path.to_path_buf()],
         sizes: vec![first_size],
         split_name: None,
+        siblings: Vec::new(),
     };
     let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
         return single();
@@ -115,23 +158,24 @@ pub(super) fn volume_set(path: &Path, first_size: u64) -> VolumeSet {
     let width = digits.len();
     let mut paths = vec![path.to_path_buf()];
     let mut sizes = vec![first_size];
+    let mut siblings = Vec::new();
     let mut number = 2u64;
     loop {
         let name = format!("{stem}.{number:0width$}");
         let next = path.with_file_name(&name);
-        match std::fs::metadata(&next) {
-            Ok(meta) if meta.is_file() => {
-                paths.push(next);
-                sizes.push(meta.len());
-            }
-            _ => break,
-        }
+        let Some((file, size)) = open_sibling(&next) else {
+            break;
+        };
+        paths.push(next);
+        sizes.push(size);
+        siblings.push(file);
         number += 1;
     }
     VolumeSet {
         paths,
         sizes,
         split_name: Some(stem.to_owned()),
+        siblings,
     }
 }
 
@@ -161,10 +205,11 @@ const SIGNATURE: [u8; 6] = [b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C];
 /// Read the archive, asking `password` for the header password if it turns
 /// out to be encrypted.
 pub(super) fn open_archive(
-    set: &VolumeSet,
+    set: &mut VolumeSet,
     password: &mut dyn FnMut() -> Option<String>,
 ) -> Result<Opened, OpenFailure> {
-    let mut reader = Volumes::open(&set.paths, &set.sizes).map_err(OpenFailure::Io)?;
+    let siblings = std::mem::take(&mut set.siblings);
+    let mut reader = Volumes::open(&set.paths[0], siblings, &set.sizes).map_err(OpenFailure::Io)?;
     let stream_len = reader.len();
     let mut start = [0u8; 32];
     reader.seek(SeekFrom::Start(0)).map_err(OpenFailure::Io)?;
@@ -215,4 +260,62 @@ pub(super) fn open_archive(
         physical_size,
         stream_len,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A link planted at a later volume number ends the set there: only the
+    /// first volume, which the user names, may be a link. Sizes come from
+    /// the opened volumes.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_sibling_volume_ends_the_set() {
+        let scratch = tempfile::tempdir().unwrap();
+        let elsewhere = scratch.path().join("elsewhere.bin");
+        std::fs::write(&elsewhere, b"spliced in").unwrap();
+        let real_first = scratch.path().join("real.bin");
+        std::fs::write(&real_first, b"first").unwrap();
+        let first = scratch.path().join("set.7z.001");
+        std::os::unix::fs::symlink(&real_first, &first).unwrap();
+        std::fs::write(scratch.path().join("set.7z.002"), b"second!").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, scratch.path().join("set.7z.003")).unwrap();
+        std::fs::write(scratch.path().join("set.7z.004"), b"fourth").unwrap();
+
+        let mut set = volume_set(&first, 5);
+        assert_eq!(set.paths.len(), 2);
+        assert_eq!(set.sizes, vec![5, 7]);
+        assert_eq!(set.split_name.as_deref(), Some("set.7z"));
+        let mut reader =
+            Volumes::open(&set.paths[0], std::mem::take(&mut set.siblings), &set.sizes).unwrap();
+        let mut joined = Vec::new();
+        reader.read_to_end(&mut joined).unwrap();
+        assert_eq!(joined, b"firstsecond!");
+    }
+
+    /// A sibling that is not a regular file (a folder, a FIFO) ends the set
+    /// rather than being read or waited on.
+    #[cfg(unix)]
+    #[test]
+    fn a_sibling_that_is_not_a_file_ends_the_set() {
+        let scratch = tempfile::tempdir().unwrap();
+        let first = scratch.path().join("set.001");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::create_dir(scratch.path().join("set.002")).unwrap();
+        assert_eq!(volume_set(&first, 5).paths.len(), 1);
+
+        std::fs::remove_dir(scratch.path().join("set.002")).unwrap();
+        let fifo = std::ffi::CString::new(
+            scratch
+                .path()
+                .join("set.002")
+                .as_os_str()
+                .as_encoded_bytes(),
+        )
+        .unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert_eq!(volume_set(&first, 5).paths.len(), 1);
+    }
 }
