@@ -66,6 +66,207 @@ fn service_packed_reserve(packed_len: usize) -> usize {
     packed_len.min(MAX_COMMENT_BYTES as usize)
 }
 
+/// `std::fs::copy`'s destination step: create or truncate `to` with the
+/// source's mode, and set that mode again when `to` is an existing regular
+/// file.
+#[cfg(all(unix, not(target_os = "android")))]
+fn open_filecopy_destination(
+    to: &std::path::Path,
+    source: &std::fs::Metadata,
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let permissions = source.permissions();
+    let writer = std::fs::OpenOptions::new()
+        .mode(permissions.mode())
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(to)?;
+    let writer_metadata = writer.metadata()?;
+    if writer_metadata.is_file() {
+        writer.set_permissions(permissions)?;
+    }
+    Ok((writer, writer_metadata))
+}
+
+/// `std::fs::copy` from an already-open regular file `reader` whose metadata
+/// is `source`, through the same calls `std::fs::copy` makes.
+#[cfg(target_vendor = "apple")]
+fn filecopy_from_handle(
+    reader: &std::fs::File,
+    source: &std::fs::Metadata,
+    to: &std::path::Path,
+) -> std::io::Result<u64> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    struct FreeOnDrop(libc::copyfile_state_t);
+    impl Drop for FreeOnDrop {
+        fn drop(&mut self) {
+            // SAFETY: only ever built from a non-null `copyfile_state_alloc`.
+            unsafe {
+                libc::copyfile_state_free(self.0);
+            }
+        }
+    }
+
+    let to_c = std::ffi::CString::new(to.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "file name contained an unexpected NUL byte",
+        )
+    })?;
+    // SAFETY: `reader` is an open descriptor and `to_c` a NUL-terminated
+    // path that outlives the call.
+    if unsafe { libc::fclonefileat(reader.as_raw_fd(), libc::AT_FDCWD, to_c.as_ptr(), 0) } == 0 {
+        return Ok(source.len());
+    }
+    let error = std::io::Error::last_os_error();
+    // Not APFS, an existing destination or another device: copy instead.
+    if !matches!(
+        error.raw_os_error(),
+        Some(libc::ENOTSUP) | Some(libc::EEXIST) | Some(libc::EXDEV)
+    ) {
+        return Err(error);
+    }
+
+    let (writer, writer_metadata) = open_filecopy_destination(to, source)?;
+    // SAFETY: allocation is checked for null before use.
+    let state = unsafe {
+        let state = libc::copyfile_state_alloc();
+        if state.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        FreeOnDrop(state)
+    };
+    let flags = if writer_metadata.is_file() {
+        libc::COPYFILE_METADATA | libc::COPYFILE_DATA
+    } else {
+        libc::COPYFILE_DATA
+    };
+    // SAFETY: both descriptors are open and `state` is a live copyfile state.
+    if unsafe { libc::fcopyfile(reader.as_raw_fd(), writer.as_raw_fd(), state.0, flags) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut copied: libc::off_t = 0;
+    // SAFETY: `COPYFILE_STATE_COPIED` writes one `off_t` to the pointer.
+    if unsafe {
+        libc::copyfile_state_get(
+            state.0,
+            libc::COPYFILE_STATE_COPIED as u32,
+            (&raw mut copied).cast::<libc::c_void>(),
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(copied as u64)
+}
+
+/// `std::fs::copy` from an already-open regular file `reader` whose metadata
+/// is `source`: `copy_file_range`, then `sendfile`, then a read/write loop,
+/// falling back on the same errors `std` does. Calling the kernel directly
+/// keeps the copy from re-reading both files' metadata, which `io::copy` on
+/// two plain `File`s does on Linux.
+#[cfg(target_os = "linux")]
+fn filecopy_from_handle(
+    reader: &std::fs::File,
+    source: &std::fs::Metadata,
+    to: &std::path::Path,
+) -> std::io::Result<u64> {
+    use std::os::fd::AsRawFd;
+
+    let (mut writer, _) = open_filecopy_destination(to, source)?;
+    let (input, output) = (reader.as_raw_fd(), writer.as_raw_fd());
+    let mut written = 0u64;
+    let mut kernel_copy = true;
+    while kernel_copy {
+        // SAFETY: both descriptors are open; null offsets use and advance
+        // the file positions.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_copy_file_range,
+                input,
+                std::ptr::null_mut::<libc::loff_t>(),
+                output,
+                std::ptr::null_mut::<libc::loff_t>(),
+                0x4000_0000usize,
+                0u32,
+            )
+        };
+        match result {
+            0 if written == 0 => kernel_copy = false,
+            0 => return Ok(written),
+            copied if copied > 0 => written += copied as u64,
+            _ => {
+                let error = std::io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(libc::EOVERFLOW) => kernel_copy = false,
+                    Some(
+                        libc::ENOSYS
+                        | libc::EXDEV
+                        | libc::EINVAL
+                        | libc::EPERM
+                        | libc::EOPNOTSUPP
+                        | libc::EBADF,
+                    ) if written == 0 => kernel_copy = false,
+                    _ => return Err(error),
+                }
+            }
+        }
+    }
+
+    let mut send = true;
+    while send {
+        // SAFETY: both descriptors are open; a null offset uses and advances
+        // the input's file position.
+        let result =
+            unsafe { libc::sendfile(output, input, std::ptr::null_mut(), 0x7fff_f000usize) };
+        match result {
+            0 => return Ok(written),
+            copied if copied > 0 => written += copied as u64,
+            _ => {
+                let error = std::io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(libc::ENOSYS | libc::EPERM | libc::EINVAL | libc::EOVERFLOW) => {
+                        send = false
+                    }
+                    _ => return Err(error),
+                }
+            }
+        }
+    }
+
+    /// Hides the `File` from `io::copy`'s kernel-copy specialisation, which
+    /// would stat both descriptors only to fail the calls above again.
+    struct Plain<'a>(&'a std::fs::File);
+    impl std::io::Read for Plain<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::io::Read::read(&mut self.0, buf)
+        }
+    }
+    Ok(written + std::io::copy(&mut Plain(reader), &mut writer)?)
+}
+
+/// `std::fs::copy` from an already-open regular file `reader` whose metadata
+/// is `source`. Off Linux and Apple, `std` copies with a plain `io::copy`.
+#[cfg(all(
+    unix,
+    not(target_os = "android"),
+    not(target_os = "linux"),
+    not(target_vendor = "apple")
+))]
+fn filecopy_from_handle(
+    reader: &std::fs::File,
+    source: &std::fs::Metadata,
+    to: &std::path::Path,
+) -> std::io::Result<u64> {
+    let (mut writer, _) = open_filecopy_destination(to, source)?;
+    let mut reader = reader;
+    std::io::copy(&mut reader, &mut writer)
+}
+
 /// The held parent directories of a member's output, from
 /// `RarArchive::prepare_output_parent_for_member`.
 #[cfg(unix)]
@@ -3724,21 +3925,57 @@ impl RarArchive {
         }
     }
 
+    fn filecopy_source_not_a_file(source_path: &std::path::Path) -> RarError {
+        RarError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "RAR file-copy source {} is not a regular file",
+                source_path.display()
+            ),
+        ))
+    }
+
+    #[cfg(not(all(unix, not(target_os = "android"))))]
     fn copy_existing_filecopy_source(
         source_path: &std::path::Path,
         out_path: &std::path::Path,
     ) -> RarResult<u64> {
         let metadata = std::fs::metadata(source_path).map_err(RarError::from)?;
         if !metadata.is_file() {
-            return Err(RarError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "RAR file-copy source {} is not a regular file",
-                    source_path.display()
-                ),
-            )));
+            return Err(Self::filecopy_source_not_a_file(source_path));
         }
         std::fs::copy(source_path, out_path).map_err(RarError::from)
+    }
+
+    /// Copies the extracted file-copy source at `source_path` to `out_path`
+    /// as `std::fs::copy` does, but from one handle opened without
+    /// following a symlink: a link swapped in at the temporary name fails
+    /// the open instead of copying whatever it points at, and a FIFO there
+    /// cannot block the open. The handle's own metadata replaces the path
+    /// stat that used to precede the copy, so the copy does one stat fewer.
+    ///
+    /// The destination is created, truncated and given the source's mode,
+    /// and the bytes move with the same kernel calls `std::fs::copy` uses
+    /// (`fclonefileat`, then `fcopyfile`, on Apple; `copy_file_range`, then
+    /// `sendfile`, on Linux), so the output's content, mode and times are
+    /// as before.
+    #[cfg(all(unix, not(target_os = "android")))]
+    fn copy_existing_filecopy_source(
+        source_path: &std::path::Path,
+        out_path: &std::path::Path,
+    ) -> RarResult<u64> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(source_path)
+            .map_err(RarError::from)?;
+        let metadata = reader.metadata().map_err(RarError::from)?;
+        if !metadata.is_file() {
+            return Err(Self::filecopy_source_not_a_file(source_path));
+        }
+        filecopy_from_handle(&reader, &metadata, out_path).map_err(RarError::from)
     }
 
     fn unique_filecopy_temp_path(out_path: &std::path::Path, index: usize) -> std::path::PathBuf {
@@ -10061,6 +10298,75 @@ mod tests {
                 .ino()
         );
         assert_eq!(std::fs::metadata(&out_path).unwrap().mode() & 0o7777, 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filecopy_fallback_copy_matches_std_copy() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        // Past one read buffer and not a multiple of any chunk size.
+        let bytes: Vec<u8> = (0..(3 << 20) + 4093)
+            .map(|at| (at * 31 % 251) as u8)
+            .collect();
+        for mode in [0o644, 0o600, 0o755] {
+            let source = temp.path().join(format!("source-{mode:o}.tmp"));
+            std::fs::write(&source, &bytes).unwrap();
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(mode)).unwrap();
+            let ours = temp.path().join(format!("ours-{mode:o}.bin"));
+            let theirs = temp.path().join(format!("std-{mode:o}.bin"));
+            let written = RarArchive::copy_existing_filecopy_source(&source, &ours).unwrap();
+            let expected = std::fs::copy(&source, &theirs).unwrap();
+            assert_eq!(written, expected);
+            assert_eq!(written, bytes.len() as u64);
+            assert_eq!(std::fs::read(&ours).unwrap(), bytes);
+            assert_eq!(
+                std::fs::metadata(&ours).unwrap().mode(),
+                std::fs::metadata(&theirs).unwrap().mode()
+            );
+        }
+
+        // An existing destination is truncated and given the source mode.
+        let source = temp.path().join("short.tmp");
+        std::fs::write(&source, b"short").unwrap();
+        let existing = temp.path().join("existing.bin");
+        std::fs::write(&existing, &bytes).unwrap();
+        assert_eq!(
+            RarArchive::copy_existing_filecopy_source(&source, &existing).unwrap(),
+            5
+        );
+        assert_eq!(std::fs::read(&existing).unwrap(), b"short");
+
+        // An empty source copies as an empty file.
+        let empty = temp.path().join("empty.tmp");
+        std::fs::write(&empty, b"").unwrap();
+        let out = temp.path().join("empty.bin");
+        assert_eq!(
+            RarArchive::copy_existing_filecopy_source(&empty, &out).unwrap(),
+            0
+        );
+        assert_eq!(std::fs::metadata(&out).unwrap().len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filecopy_fallback_copy_does_not_follow_a_symlinked_temporary() {
+        let temp = tempfile::tempdir().unwrap();
+        let secret = temp.path().join("elsewhere.bin");
+        std::fs::write(&secret, b"not for the output").unwrap();
+        let source = temp.path().join(".weaver-unrar-filecopy-swapped.tmp");
+        std::os::unix::fs::symlink(&secret, &source).unwrap();
+        let out = temp.path().join("copy.bin");
+        let err = RarArchive::copy_existing_filecopy_source(&source, &out).unwrap_err();
+        assert!(matches!(err, RarError::Io(_)), "{err:?}");
+        assert!(std::fs::symlink_metadata(&out).is_err());
+
+        let directory = temp.path().join("dir.tmp");
+        std::fs::create_dir(&directory).unwrap();
+        let err = RarArchive::copy_existing_filecopy_source(&directory, &out).unwrap_err();
+        assert!(err.to_string().contains("is not a regular file"), "{err:?}");
+        assert!(std::fs::symlink_metadata(&out).is_err());
     }
 
     /// Windows: a directory junction or directory symlink in a hard-link

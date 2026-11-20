@@ -51,6 +51,10 @@ documented in each crate's own changelog so those notes ship with the crate.
 - A RAR comment or owner record whose header declares a huge packed size
   fails with a read error instead of aborting on the allocation, through
   unrar-rs 0.16.7.
+- A RAR5 file-copy member whose source is extracted from the archive is
+  copied from its temporary through a handle opened without following a
+  symlink on Unix, through unrar-rs 0.16.7, so a link swapped in at the
+  temporary name cannot pull another file into the output.
 
 ## rarpar 0.9.6
 

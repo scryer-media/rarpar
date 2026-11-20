@@ -36,6 +36,16 @@
   on that allocation; the reservation now stops at the 16 MiB comment
   ceiling and the buffer grows on demand, so legitimate services read as
   before and the forged one fails with the short read.
+- A RAR5 file-copy member whose source is not on disk is extracted from the
+  source member to a temporary and copied from there. On Unix (not Android)
+  that copy now reads one handle opened with `O_NOFOLLOW | O_NONBLOCK` and
+  checked as a regular file on the handle, instead of stating and then
+  reopening the temporary by name, so a symlink swapped in at that name by
+  another process writing to the output tree fails the copy instead of
+  pulling in the file it points at. The copy makes the calls
+  `std::fs::copy` makes (`fclonefileat`, then `fcopyfile`, on Apple;
+  `copy_file_range`, then `sendfile`, on Linux), so the output's content,
+  mode and times are unchanged, and it does one stat fewer.
 
 ## 0.16.6
 
