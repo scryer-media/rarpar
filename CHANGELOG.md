@@ -38,7 +38,7 @@ documented in each crate's own changelog so those notes ship with the crate.
 - PAR2 create refuses a source swapped after it was scanned for another file
   of the same length, through par2-rs 0.13.1.
 - reedsolomon-rs 0.4.12 checks the tiled matrix inversion's input lengths in
-  release builds.
+  release builds, and the folded split scatter's lane and staging length.
 - A RAR comment or owner record whose header declares a huge packed size
   fails with a read error instead of aborting on the allocation, through
   unrar-rs 0.16.7.

@@ -7,6 +7,12 @@
   is not `n * aug_cols` long, or a size that overflows `usize`, panics before
   any work instead of indexing past the slice end in unsafe kernels. The
   checks were debug-only.
+- `gf_simd::split_encode_scatter` checks its lane and staging length in
+  release builds too: a `lane` of `FOLDED_GROUP` or more, or a `staging`
+  shorter than the source's whole 32-byte blocks times `FOLDED_GROUP`,
+  panics before the SIMD scatter instead of writing past the slice. The
+  checks were debug-only; every in-tree caller passes an exact staging area,
+  once per source slice.
 - `rar5::Rar5RsCoder::new_encoder` builds the Cauchy encoder RAR writes
   recovery volumes and RAR5 recovery records with, fed through the same
   `update_outputs` and `apply_units` as a decoder; `output_count` reports
