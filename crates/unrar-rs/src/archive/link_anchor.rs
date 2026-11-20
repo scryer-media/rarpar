@@ -109,12 +109,59 @@ mod unix {
     use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
 
+    /// The access mode a held directory is opened with. Linux and Android
+    /// use `O_PATH`, and Apple, FreeBSD, NetBSD and Solaris-family targets
+    /// `O_SEARCH`: both need only search permission, so a write-and-search
+    /// directory without read permission (mode `0300`, say) still extracts,
+    /// as the path-based creation did. Other targets read-open it.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    const DIR_OPEN_FLAGS: libc::c_int =
-        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    const DIR_OPEN_FLAGS: libc::c_int =
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    const DIR_ACCESS: libc::c_int = libc::O_PATH;
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "illumos"
+    ))]
+    const DIR_ACCESS: libc::c_int = libc::O_SEARCH;
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "illumos"
+    )))]
+    const DIR_ACCESS: libc::c_int = libc::O_RDONLY;
+
+    const DIR_OPEN_FLAGS: libc::c_int = libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+    /// `openat(parent, name, DIR_ACCESS | flags)`. A kernel too old for
+    /// `O_SEARCH` refuses it with `EINVAL` (or, on an old FreeBSD, `EISDIR`
+    /// for `O_EXEC` on a directory); the open is then made read-only, as
+    /// before. Returns the descriptor or -1 with `errno` set, as `openat`.
+    fn open_dir_at(parent: RawFd, name: &CStr, flags: libc::c_int) -> libc::c_int {
+        // SAFETY: `name` is NUL-terminated; `parent` is open or AT_FDCWD.
+        let fd = unsafe { libc::openat(parent, name.as_ptr(), DIR_ACCESS | flags) };
+        if fd >= 0 || DIR_ACCESS == libc::O_RDONLY {
+            return fd;
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            fd
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            match std::io::Error::last_os_error().raw_os_error() {
+                // SAFETY: as above.
+                Some(libc::EINVAL | libc::EISDIR) => unsafe {
+                    libc::openat(parent, name.as_ptr(), libc::O_RDONLY | flags)
+                },
+                _ => fd,
+            }
+        }
+    }
 
     fn c_name(name: &[u8]) -> Result<CString, AnchorError> {
         CString::new(name).map_err(|_| {
@@ -172,15 +219,9 @@ mod unix {
         let path = c_name(root.as_os_str().as_bytes())?;
         // The extraction root is the caller's choice and may itself be
         // reached through a symlink; only the components beneath it are
-        // archive-controlled, so no O_NOFOLLOW here. On Linux and Android
-        // O_PATH needs only search permission, so a write-and-search root
-        // without read permission still extracts, as it did before.
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
-        // SAFETY: `path` is NUL-terminated.
-        let fd = unsafe { libc::open(path.as_ptr(), flags) };
+        // archive-controlled, so no O_NOFOLLOW here. Opened search-only
+        // where the target allows (see `DIR_ACCESS`).
+        let fd = open_dir_at(libc::AT_FDCWD, &path, libc::O_DIRECTORY | libc::O_CLOEXEC);
         if fd < 0 {
             return Err(AnchorError::Io(std::io::Error::last_os_error()));
         }
@@ -192,7 +233,7 @@ mod unix {
     fn open_child_dir(parent: RawFd, name: &str) -> Result<OwnedFd, AnchorError> {
         let c = c_name(name.as_bytes())?;
         // SAFETY: `c` is NUL-terminated and `parent` is an open directory.
-        let fd = unsafe { libc::openat(parent, c.as_ptr(), DIR_OPEN_FLAGS) };
+        let fd = open_dir_at(parent, &c, DIR_OPEN_FLAGS);
         if fd >= 0 {
             // SAFETY: `fd` is a freshly opened descriptor we own.
             return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
@@ -507,7 +548,7 @@ mod unix {
         let mut last = None;
         for _ in 0..COMPONENT_ATTEMPTS {
             // SAFETY: `c` is NUL-terminated and `parent` is an open directory.
-            let fd = unsafe { libc::openat(parent, c.as_ptr(), DIR_OPEN_FLAGS) };
+            let fd = open_dir_at(parent, &c, DIR_OPEN_FLAGS);
             if fd >= 0 {
                 // SAFETY: `fd` is a freshly opened descriptor we own.
                 return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
@@ -766,8 +807,17 @@ mod unix {
         }
 
         /// A root with write and search permission but no read permission
-        /// still resolves, since `O_PATH` needs only search permission.
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        /// still resolves, since `O_PATH` and `O_SEARCH` need only search
+        /// permission.
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "solaris",
+            target_os = "illumos"
+        ))]
         #[test]
         fn resolves_beneath_a_root_without_read_permission() {
             let temp = tempfile::tempdir().unwrap();
@@ -937,6 +987,37 @@ mod unix {
             assert!(a.is_dir() && !a.file_type().is_symlink());
             assert_eq!(std::fs::read(&out_path).unwrap(), b"inside");
             assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        }
+
+        /// A member is extracted into a root and an existing parent that
+        /// the process can write and search but not read (mode `0300`), as
+        /// the path-based creation allowed.
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "solaris",
+            target_os = "illumos"
+        ))]
+        #[test]
+        fn member_parent_extracts_into_search_only_directories() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            std::fs::create_dir_all(root.join("a")).unwrap();
+            let out_path = root.join("a/b/file.bin");
+            for dir in [root.join("a"), root.clone()] {
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+            }
+            let result = MemberParent::prepare(&root, &os(&["a", "b"]), &out_path).and_then(
+                |parent| std::io::Write::write_all(&mut parent.open_file()?, b"inside"),
+            );
+            for dir in [root.clone(), root.join("a")] {
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            result.unwrap();
+            assert_eq!(std::fs::read(&out_path).unwrap(), b"inside");
         }
 
         #[test]

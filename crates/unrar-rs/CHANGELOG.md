@@ -60,6 +60,13 @@
   caller named and its metadata set by path, as in 0.16.6. The anchored
   parent walk above needs a final name and refused such a path with
   `InvalidInput`.
+- The anchored walk opens each directory it holds search-only: `O_PATH` on
+  Linux and Android, `O_SEARCH` on Apple, FreeBSD, NetBSD, Solaris and
+  illumos, falling back to a read-only open where the kernel refuses
+  `O_SEARCH`. Outside Linux it read-opened them, so extracting into an
+  existing directory the process can write and search but not read (mode
+  `0300`), which path-based creation allowed, failed with
+  `PermissionDenied`. Other Unix targets still read-open.
 - Requires `reedsolomon-rs` 0.4.12, whose tiled matrix inversion and split
   encode scatter check their slice lengths in release builds.
 
