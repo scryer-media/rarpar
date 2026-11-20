@@ -20,6 +20,11 @@
   `Par2CreatePlan` are unchanged.
 - Requires `reedsolomon-rs` 0.4.12, whose tiled matrix inversion checks its
   slice lengths in release builds.
+- Scanning PAR2 bytes in memory (`scan_packets*`, `Par2FileSet::from_files*`)
+  checks an unknown packet's hash and skips it without copying its body. The
+  body was copied whole and then dropped, so one large unknown packet cost
+  its size again in memory before the scan moved on or the examined limit
+  refused it. `parse_packet` still returns the body.
 
 ## 0.13.0
 

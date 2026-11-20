@@ -62,6 +62,8 @@ documented in each crate's own changelog so those notes ship with the crate.
 - RAR extraction on Windows with owner restoration skips an NTFS ACL record
   declaring more than any security descriptor holds before decoding it,
   through unrar-rs 0.16.7, instead of decoding all of it into memory.
+- par2-rs 0.13.1's in-memory packet scan skips an unknown packet without
+  copying its body. The CLI scans files by streaming and was not affected.
 
 ## rarpar 0.9.6
 
