@@ -71,6 +71,8 @@ documented in each crate's own changelog so those notes ship with the crate.
 - Discovery of a directory holds at most `--max-files` plus one of its files
   in memory instead of its whole listing. Which files are found, their order
   and the "discovery exceeded max files" error are unchanged.
+- RAR5 recovery-record checks and repair hold one bit per recovery chunk
+  instead of one byte, through unrar-rs 0.16.7.
 
 ## rarpar 0.9.6
 

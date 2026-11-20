@@ -52,6 +52,9 @@
   into one buffer first. A security descriptor is at most 131,226 bytes (two
   SIDs and two ACLs whose size is a 16-bit field), so no real ACL is
   affected.
+- RAR5 recovery-record assessment and repair keep one bit per recovery chunk
+  for whether it is intact, instead of one byte, so a record declaring a huge
+  chunk grid takes an eighth of the memory. Results are unchanged.
 
 ## 0.16.6
 
