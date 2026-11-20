@@ -379,7 +379,7 @@ mod anchored {
             }
             let mut held = self.held.clone();
             held.push(Arc::new(handle));
-            Ok((Dir { path, held: held }, made))
+            Ok((Dir { path, held }, made))
         }
 
         /// A new file at `name`. Whatever was at the name has been removed

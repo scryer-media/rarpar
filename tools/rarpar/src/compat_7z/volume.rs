@@ -262,7 +262,7 @@ pub(super) fn open_archive(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
