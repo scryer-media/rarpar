@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.16.7
+
+### Fixed
+
+- Extraction creates each member's file, directory or symlink inside the
+  directories it checked. The folders above an output were made and checked
+  by path and the output then created by path, so a folder renamed or
+  swapped for a symlink in between, by another process writing to the
+  output tree, moved the output out of the extraction root. On Unix the
+  folders are now walked from the root by descriptor (`openat` with
+  `O_NOFOLLOW | O_DIRECTORY`) and the output is made relative to the last
+  one (`openat`, `mkdirat`, `symlinkat`). On Windows each folder is opened
+  without following a reparse point and held without delete sharing until
+  the output exists. A symlink folder planted by the archive is still
+  replaced by a real directory, and error kinds are unchanged. On macOS an
+  existing folder the process can search but not read now fails to extract
+  into, as it already did for hard-link targets.
+- Restoring a symlink member's owner changes the link itself (`lchown`) on
+  every Unix. On macOS it called `chown`, which follows the link and gave
+  its target the archive's owner and group. This departs from RAR on macOS
+  on purpose: RAR follows the link there.
+
 ## 0.16.6
 
 ### Changed

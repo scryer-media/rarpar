@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.12
+
+- `matrix_tiled::invert_augmented_tiled` checks its slice lengths in release
+  builds too: a `submatrix` that is not `n * n` long or an `augmented` that
+  is not `n * aug_cols` long, or a size that overflows `usize`, panics before
+  any work instead of indexing past the slice end in unsafe kernels. The
+  checks were debug-only.
+- `rar5::Rar5RsCoder::new_encoder` builds the Cauchy encoder RAR writes
+  recovery volumes and RAR5 recovery records with, fed through the same
+  `update_outputs` and `apply_units` as a decoder; `output_count` reports
+  a coder's output rows. Decoders are unchanged. (Listed under 0.4.11
+  before; 0.4.11 was published without it.)
+- `new_encoder` and `new_decoder` refuse counts whose sum overflows instead
+  of panicking on it in debug builds or wrapping past the field limit in
+  release builds. (Also listed under 0.4.11 before.)
+
 ## 0.4.11
 
 - `gf16_dft::DftPlan` can split one stripe across several workers. Output is
@@ -16,13 +32,6 @@
     range, the output length and every bucket before doing nothing for an
     empty call: an empty row range takes no output bytes and no buckets.
   - `bucket_batch` reports the batch the plan was built with.
-- `rar5::Rar5RsCoder::new_encoder` builds the Cauchy encoder RAR writes
-  recovery volumes and RAR5 recovery records with, fed through the same
-  `update_outputs` and `apply_units` as a decoder; `output_count` reports
-  a coder's output rows. Decoders are unchanged.
-- `new_encoder` and `new_decoder` refuse counts whose sum overflows instead
-  of panicking on it in debug builds or wrapping past the field limit in
-  release builds.
 
 ## 0.4.10
 

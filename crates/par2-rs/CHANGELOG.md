@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.13.1
+
+### Fixed
+
+- Repair stages into a folder made `0700` and staged files made `0600`, and
+  gives each repaired file its original's permission bits just before the
+  rename that installs it. Staged files had the default mode, so a private
+  file's repaired bytes were readable by others while staged and after
+  install. A file that was missing keeps the default mode. No extra fsync,
+  read or open; the original's mode comes from the stat the install already
+  makes.
+- Creation compares the handle it opens a source with against the identity
+  scan's fingerprint (length, modification time, and on Unix device and
+  inode), in the encoder's source reader and in the hash read, and fails
+  with `CreationSourceChanged` on a mismatch. A source swapped after the scan
+  for another file of the same length was read as if it were the scanned
+  one. The source reader no longer stats the path. `CreationSource` and
+  `Par2CreatePlan` are unchanged.
+- Requires `reedsolomon-rs` 0.4.12, whose tiled matrix inversion checks its
+  slice lengths in release builds.
+
 ## 0.13.0
 
 ### Changed

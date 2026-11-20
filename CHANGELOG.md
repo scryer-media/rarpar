@@ -16,6 +16,29 @@ documented in each crate's own changelog so those notes ship with the crate.
   without model" while UnRAR extracts the same archive cleanly.
 - RAR 1.5 and 2.0 members with 4 GiB or more to unpack decode correctly on
   32-bit builds, through unrar-rs 0.16.5.
+- RAR extraction creates every member inside the folders it checked, through
+  unrar-rs 0.16.7. Another process swapping an output folder for a symlink
+  mid-extraction could move a member out of the destination.
+- RAR extraction restores a symlink member's owner on the link itself on
+  every Unix, through unrar-rs 0.16.7. On macOS it gave the link's target the
+  archive's owner, as RAR does there; rarpar departs from RAR on purpose.
+- 7z extraction never sets set-user-ID, set-group-ID or sticky bits from an
+  archive's Unix mode: only the permission bits (`0o777`) are applied.
+- 7z extraction on Windows opens each output folder without following a
+  junction or symlink and holds it open, without delete sharing, until the
+  member is written, as Unix already resolved folders by handle. Files are
+  created only when new, without following a reparse point.
+- A split 7z set (`.7z.001`, `.002`, ...) ends at a sibling volume that is a
+  symlink or not a regular file, and takes each volume's size from the file
+  it opened. A linked sibling could pull an outside file into the set. The
+  first volume, which names the set, may still be a link.
+- PAR2 repair keeps a private file private, through par2-rs 0.13.1: staged
+  repairs are `0600` in a `0700` folder, and the repaired file gets the
+  original's permission bits before it is installed.
+- PAR2 create refuses a source swapped after it was scanned for another file
+  of the same length, through par2-rs 0.13.1.
+- reedsolomon-rs 0.4.12 checks the tiled matrix inversion's input lengths in
+  release builds.
 
 ## rarpar 0.9.6
 
