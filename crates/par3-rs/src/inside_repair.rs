@@ -229,10 +229,14 @@ impl SelfRepairPlan {
                 .execute(&mut verified, &carrier_output, scratch_directory)?;
             carrier_installed = true;
             let mut carrier = File::open(&carrier_output, &options)?;
-            let mut output = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open_budgeted(&temporary, &options)?;
+            let mut reopen = OpenOptions::new();
+            reopen.read(true).write(true);
+            // The staged archive is a regular file this repair created at
+            // the name; a symlink there now fails the open instead of taking
+            // the carrier.
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            std::os::unix::fs::OpenOptionsExt::custom_flags(&mut reopen, libc::O_NOFOLLOW);
+            let mut output = reopen.open_budgeted(&temporary, &options)?;
             output.seek(SeekFrom::Start(self.gap.start))?;
             let mut remaining = self.carrier.output_bytes();
             while remaining != 0 {

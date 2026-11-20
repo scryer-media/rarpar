@@ -13,6 +13,9 @@ No API changes.
   another process writing to the output folder, redirected the write. One
   open fewer per staged file; names, modes and bytes are unchanged. A macOS
   clone is still made by name and opened once, as before.
+- `SelfRepairPlan::execute` reopens its staged archive for the carrier
+  without following a symlink at the name on macOS and Linux, so one swapped
+  in by another process fails the repair instead of taking the carrier.
 
 ## 0.8.3
 

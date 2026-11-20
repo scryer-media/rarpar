@@ -45,6 +45,9 @@ documented in each crate's own changelog so those notes ship with the crate.
 - PAR3 inside-archive insert and strip write each staged output through the
   handle that created it, through par3-rs 0.8.4, instead of reopening it by
   name.
+- `par3 rs` self-repair of an archive with an embedded set reopens its
+  rebuilt temporary without following a symlink on Unix, so one swapped in
+  mid-repair fails the repair instead of taking the packet bytes.
 - A RAR comment or owner record whose header declares a huge packed size
   fails with a read error instead of aborting on the allocation, through
   unrar-rs 0.16.7.
