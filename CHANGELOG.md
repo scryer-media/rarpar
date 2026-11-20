@@ -68,6 +68,9 @@ documented in each crate's own changelog so those notes ship with the crate.
   swaps an installed file for a FIFO, through par2-rs 0.13.1.
 - PAR2 repair's hash of a scanned file no longer blocks when another process
   swaps that file for a FIFO after it was checked, through par2-rs 0.13.1.
+- Discovery of a directory holds at most `--max-files` plus one of its files
+  in memory instead of its whole listing. Which files are found, their order
+  and the "discovery exceeded max files" error are unchanged.
 
 ## rarpar 0.9.6
 
