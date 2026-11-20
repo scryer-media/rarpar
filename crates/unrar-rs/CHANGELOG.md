@@ -21,6 +21,12 @@
   every Unix. On macOS it called `chown`, which follows the link and gave
   its target the archive's owner and group. This departs from RAR on macOS
   on purpose: RAR follows the link there.
+- Reading a compressed service into memory (an archive comment, a RAR4 `UOW`
+  owner record) no longer reserves the header's declared packed size before
+  reading. A tiny archive declaring hundreds of GiB could abort the process
+  on that allocation; the reservation now stops at the 16 MiB comment
+  ceiling and the buffer grows on demand, so legitimate services read as
+  before and the forged one fails with the short read.
 
 ## 0.16.6
 

@@ -47,6 +47,25 @@ const DECODE_INPUT_BUFFER_BYTES: usize = 256 * 1024;
 const MAX_LINK_TARGET_BYTES: usize = 0x10000;
 const MAX_COMMENT_BYTES: u64 = 0x1000000;
 
+/// How much to reserve up front for a compressed service's packed bytes read
+/// into memory (`CMT`, `UOW` and the other services
+/// `read_service_subdata_to_memory` loads). This is a reservation hint, not a
+/// limit: `read_to_end` grows the buffer past it on demand, and the
+/// "read N packed bytes, expected M" check after the read is what rejects a
+/// header whose declared packed size is larger than the bytes behind it.
+///
+/// The declared packed size comes from the header before a byte is read, so
+/// reserving it whole let a tiny archive declaring hundreds of GiB abort the
+/// process on the allocation. The hint is the service's unpacked ceiling,
+/// `MAX_COMMENT_BYTES` (checked first, so every payload that gets here is at
+/// most that unpacked). A legitimate compressed payload is about its unpacked
+/// size or smaller, so its reservation stays exact and it reads with one
+/// allocation as before; one that compressed a little past the hint still
+/// reads in full, with `read_to_end` growing the buffer.
+fn service_packed_reserve(packed_len: usize) -> usize {
+    packed_len.min(MAX_COMMENT_BYTES as usize)
+}
+
 /// The held parent directories of a member's output, from
 /// `RarArchive::prepare_output_parent_for_member`.
 #[cfg(unix)]
@@ -395,7 +414,7 @@ impl RarArchive {
                         Some(fh.name.to_string()),
                     )
                 })?;
-                let mut packed = Vec::with_capacity(packed_capacity);
+                let mut packed = Vec::with_capacity(service_packed_reserve(packed_capacity));
                 let mut reader = reader;
                 reader.read_to_end(&mut packed).map_err(RarError::from)?;
                 if packed.len() as u64 != packed_len {
@@ -10413,6 +10432,57 @@ mod tests {
             archive.read_service_subdata_to_memory(&service).unwrap(),
             Vec::<u8>::new()
         );
+    }
+
+    #[test]
+    fn service_packed_reserve_is_exact_up_to_the_comment_ceiling() {
+        const MIB: usize = 1024 * 1024;
+        for len in [0, 1, MIB, MAX_COMMENT_BYTES as usize] {
+            assert_eq!(service_packed_reserve(len), len);
+        }
+        assert_eq!(
+            service_packed_reserve(MAX_COMMENT_BYTES as usize + 1),
+            MAX_COMMENT_BYTES as usize
+        );
+        assert_eq!(
+            service_packed_reserve(400usize << 30),
+            MAX_COMMENT_BYTES as usize
+        );
+    }
+
+    #[test]
+    fn forged_compressed_service_packed_size_fails_without_reserving_it() {
+        // 400 GiB declared, under the default 500 GiB data-segment limit, with
+        // 32 bytes behind it. Reserving the declared size aborted the process;
+        // now the segment reader's short read is reported.
+        let declared = 400u64 << 30;
+        assert!(declared <= Limits::default().max_data_segment);
+        let mut archive = archive_with_single_volume(&[0x5a; 32]);
+        let mut service = test_rar5_service("CMT", 64, declared);
+        service.file_header.compression.method = CompressionMethod::Normal;
+        let err = archive
+            .read_service_subdata_to_memory(&service)
+            .unwrap_err();
+        assert!(
+            matches!(&err, RarError::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn compressed_service_packed_bytes_past_the_reserve_hint_are_read_in_full() {
+        // Packed bytes past the hint are all present: the read takes every one
+        // of them (no short-read error), so the hint never limits a payload.
+        // The bytes are not a valid stream, so the decoder rejects them after.
+        let present = MAX_COMMENT_BYTES as usize + 4096;
+        let mut archive = archive_with_single_volume(&vec![0u8; present]);
+        let mut service = test_rar5_service("CMT", 64, present as u64);
+        service.file_header.compression.method = CompressionMethod::Normal;
+        if let Err(RarError::CorruptArchive { detail }) =
+            archive.read_service_subdata_to_memory(&service)
+        {
+            assert!(!detail.contains("packed bytes, expected"), "{detail}");
+        }
     }
 
     #[test]

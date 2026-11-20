@@ -39,6 +39,9 @@ documented in each crate's own changelog so those notes ship with the crate.
   of the same length, through par2-rs 0.13.1.
 - reedsolomon-rs 0.4.12 checks the tiled matrix inversion's input lengths in
   release builds.
+- A RAR comment or owner record whose header declares a huge packed size
+  fails with a read error instead of aborting on the allocation, through
+  unrar-rs 0.16.7.
 
 ## rarpar 0.9.6
 
