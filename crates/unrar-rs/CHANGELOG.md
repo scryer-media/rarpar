@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.17.0
+## 0.16.7
 
 ### Added
 
@@ -14,8 +14,6 @@
   first use, so adding a member no longer scans every held segment. On
   synthetic sets of 4 KB stored members, walking 160,000 members took
   29.9 s and now takes 0.09 s. What the archive answers is unchanged.
-
-## 0.16.7
 
 ### Fixed
 
