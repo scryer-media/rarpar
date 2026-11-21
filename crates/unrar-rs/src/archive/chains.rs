@@ -3,7 +3,7 @@
 //! [`Linker`] joins the parts of split members and services as volumes are
 //! integrated. [`CatalogIndex`] answers name and service-parent lookups.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
 use super::{MemberEntry, ServiceEntry};
@@ -65,9 +65,10 @@ struct Slots {
     tail: Option<usize>,
     /// First volume, for a record that continues an earlier one.
     head: Option<usize>,
-    /// A hash of the name, for a named record. Lookups compare the names
-    /// themselves; the hash only narrows the search.
-    name: Option<u64>,
+    /// A hash of the name and the first volume, for a named record with a
+    /// segment. Lookups compare the names themselves; the hash only narrows
+    /// the search.
+    name: Option<(u64, usize)>,
 }
 
 impl Slots {
@@ -75,7 +76,9 @@ impl Slots {
         Self {
             tail: entry.split_after().then(|| entry.last_volume()).flatten(),
             head: entry.split_before().then(|| entry.first_volume()).flatten(),
-            name: (!entry.chain_name().is_empty()).then(|| name_hash(entry.chain_name())),
+            name: (!entry.chain_name().is_empty())
+                .then(|| Some((name_hash(entry.chain_name()), entry.first_volume()?)))
+                .flatten(),
         }
     }
 }
@@ -153,20 +156,20 @@ fn ids_of<'a, K: std::hash::Hash + Eq>(map: &'a Keyed<K>, key: &K) -> &'a [usize
 }
 
 /// Records by the volume they continue into, the volume they continue from,
-/// and their name. Each list holds record indexes in no particular order.
+/// and their name and first volume. Each list holds record indexes in no
+/// particular order.
 #[derive(Debug, Default)]
 struct ChainIndex {
     tails: Keyed<usize>,
     heads: Keyed<usize>,
-    names: Keyed<u64>,
+    /// By name hash, then by first volume, so a lookup for records that
+    /// begin after a volume reads only those.
+    names: HashMap<u64, BTreeMap<usize, Ids>>,
 }
 
 impl ChainIndex {
     fn build<E: ChainEntry>(entries: &[E]) -> Self {
-        let mut index = Self {
-            names: HashMap::with_capacity(entries.len()),
-            ..Self::default()
-        };
+        let mut index = Self::default();
         for (at, entry) in entries.iter().enumerate() {
             index.insert(at, &Slots::of(entry));
         }
@@ -180,8 +183,13 @@ impl ChainIndex {
         if let Some(head) = slots.head {
             add_id(&mut self.heads, head, at);
         }
-        if let Some(name) = slots.name {
-            add_id(&mut self.names, name, at);
+        if let Some((name, first)) = slots.name {
+            match self.names.entry(name).or_default().entry(first) {
+                std::collections::btree_map::Entry::Occupied(mut held) => held.get_mut().push(at),
+                std::collections::btree_map::Entry::Vacant(free) => {
+                    free.insert(Ids::One(at));
+                }
+            }
         }
     }
 
@@ -192,8 +200,17 @@ impl ChainIndex {
         if let Some(head) = slots.head {
             drop_id(&mut self.heads, &head, at);
         }
-        if let Some(name) = slots.name {
-            drop_id(&mut self.names, &name, at);
+        if let Some((name, first)) = slots.name
+            && let Some(volumes) = self.names.get_mut(&name)
+        {
+            if let Some(ids) = volumes.get_mut(&first)
+                && !ids.drop_id(at)
+            {
+                volumes.remove(&first);
+            }
+            if volumes.is_empty() {
+                self.names.remove(&name);
+            }
         }
     }
 
@@ -203,7 +220,7 @@ impl ChainIndex {
             .tails
             .values_mut()
             .chain(self.heads.values_mut())
-            .chain(self.names.values_mut());
+            .chain(self.names.values_mut().flat_map(BTreeMap::values_mut));
         for list in lists {
             for at in list.as_mut_slice() {
                 if *at > removed {
@@ -221,9 +238,19 @@ impl ChainIndex {
         ids_of(&self.heads, &volume)
     }
 
-    /// The records whose name may be `name`; the caller compares.
-    fn named(&self, name: &str) -> &[usize] {
-        ids_of(&self.names, &name_hash(name))
+    /// The records whose name may be `name` and that begin after `volume`;
+    /// the caller compares the names.
+    fn named_after(&self, name: &str, volume: usize) -> impl Iterator<Item = usize> + '_ {
+        self.names
+            .get(&name_hash(name))
+            .zip(volume.checked_add(1))
+            .into_iter()
+            .flat_map(|(volumes, from)| volumes.range(from..))
+            .flat_map(|(_, ids)| ids.as_slice().iter().copied())
+            .inspect(|_| {
+                #[cfg(test)]
+                name_visits::add();
+            })
     }
 }
 
@@ -326,7 +353,7 @@ impl Linker {
         if name.is_empty() {
             return None;
         }
-        let named = self.index.named(name).iter().copied();
+        let named = self.index.named_after(name, volume);
         self.first(
             entries,
             named.filter(|at| {
@@ -451,6 +478,24 @@ impl Linker {
     /// Whether the batch must end with the sort its last integrate did.
     pub(super) fn sorted(&self) -> bool {
         self.by_key
+    }
+}
+
+/// How many records this thread's name lookups looked at.
+#[cfg(test)]
+pub(super) mod name_visits {
+    use std::cell::Cell;
+
+    thread_local! {
+        static VISITED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(in crate::archive) fn add() {
+        VISITED.with(|visited| visited.set(visited.get() + 1));
+    }
+
+    pub(in crate::archive) fn take() -> usize {
+        VISITED.with(|visited| visited.replace(0))
     }
 }
 

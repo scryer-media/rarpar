@@ -2196,6 +2196,26 @@ mod chain_tests {
         assert_eq!(archive.services.len(), volumes * per_volume);
     }
 
+    /// Looking for a later part of the same name reads only the records that
+    /// begin after the volume, so services sharing one name, added in volume
+    /// order, cost no visits however many there are; the old lookup read
+    /// every record of that name for each entry.
+    #[test]
+    fn same_named_services_in_volume_order_visit_no_earlier_record() {
+        for per_volume in [16, 256] {
+            let mut archive = empty_archive(Vec::new());
+            super::super::chains::name_visits::take();
+            for vol in 0..8 {
+                let services: Vec<ServiceEntry> = (0..per_volume)
+                    .map(|at| service(vol, 60 + 100 * at as u64, "UOW", false, false))
+                    .collect();
+                archive.integrate_services(vol, services);
+            }
+            assert_eq!(super::super::chains::name_visits::take(), 0, "{per_volume}");
+            assert_eq!(archive.services.len(), 8 * per_volume);
+        }
+    }
+
     /// Every service's parent, and every member's services by name, read
     /// from the index after each add, equal what the old walk over every
     /// member's segments found (`service_parent` and `member_services_named`
