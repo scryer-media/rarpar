@@ -4430,6 +4430,7 @@ mod tests {
         // `add_volume` asserts, on every add under test, that the members it
         // resolves are exactly those whose parts span the volume, as the scan
         // over every member found them.
+        let mut overlapped = 0;
         for seed in 1..=300_u64 {
             let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1);
             let volumes = 2 + rng.below(30) as u32;
@@ -4466,7 +4467,11 @@ mod tests {
                 members
             };
             assert_eq!(shape(&builder), shape(&ordered), "seed {seed}");
+            overlapped += usize::from(builder.holes_overlap);
         }
+        // Some of the damaged sets leave chains whose holes overlap, so the
+        // scan of every hole is under the same check as the single lookup.
+        assert!(overlapped != 0);
     }
 
     #[test]
