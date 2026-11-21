@@ -9,7 +9,9 @@ use std::rc::Rc;
 use lzma_turbo::xz::{
     CheckType, StreamHeader, XzError, XzOptions, XzParallelReader, XzReader, stream_table,
 };
-use lzma_turbo::{Checksum, ChecksumPlan, LzmaEncProps, MatchFinderKind, XzErrorKind, XzWriter};
+use lzma_turbo::{
+    Checksum, ChecksumPlan, LzmaEncProps, MatchFinderKind, WindowAllocError, XzErrorKind, XzWriter,
+};
 use rarpar::cli::{
     Cli, SidecarArgs, XzCheck, XzCommand, XzCompressArgs, XzDecodeArgs, XzDecompressArgs,
     XzListArgs,
@@ -23,6 +25,7 @@ use crate::streams::{
     refuse_terminal_stdout, regular_file_metadata, report_writer, resolve_output, stage_output,
     write_output,
 };
+use crate::xz_window::scratch_backing;
 
 const MIB: u64 = 1 << 20;
 const STREAM_HEADER_SIZE: usize = 12;
@@ -223,13 +226,25 @@ fn decompressed_name(input: &Path) -> Result<PathBuf, RarparError> {
 
 /// Classifies a codec failure that reached us as an I/O error.
 fn codec_error(error: io::Error) -> RarparError {
+    let error = match WindowAllocError::from_io(error) {
+        Ok(window) => {
+            return RarparError::Resource(format!(
+                "could not make a {} MiB scratch file for a dictionary over --memory-mib: {}",
+                window.needed().div_ceil(MIB),
+                window.allocator_error()
+            ));
+        }
+        Err(error) => error,
+    };
     if let Some(xz) = error.get_ref().and_then(|e| e.downcast_ref::<XzError>()) {
         return match xz.kind {
             XzErrorKind::MemoryLimit { needed, limit, .. } => RarparError::Resource(format!(
-                "the stream needs {} MiB of memory and --memory-mib allows {} MiB ({xz})",
+                "the stream needs {} MiB of memory and --memory-mib allows {} MiB; \
+                 --scratch-mib can lend disk for it ({xz})",
                 needed.div_ceil(MIB),
                 limit / MIB
             )),
+            XzErrorKind::WindowAlloc { .. } => RarparError::Resource(xz.to_string()),
             _ => RarparError::Data(xz.to_string()),
         };
     }
@@ -508,9 +523,19 @@ impl Compressed {
 }
 
 fn decode_options(args: &XzDecodeArgs, threads: usize) -> XzOptions {
-    XzOptions::default()
-        .with_threads(threads)
-        .with_memory_limit(args.memory_mib.saturating_mul(MIB))
+    memory_options(args.memory_mib, args.scratch_mib).with_threads(threads)
+}
+
+/// Decoding within `memory_mib` of RAM. With a `scratch_mib` budget, a
+/// dictionary or block buffer larger than all of that memory is decoded in a
+/// mapped scratch file instead of refused.
+fn memory_options(memory_mib: u64, scratch_mib: Option<u64>) -> XzOptions {
+    let limit = memory_mib.saturating_mul(MIB);
+    let options = XzOptions::default().with_memory_limit(limit);
+    match scratch_mib {
+        Some(mib) => options.with_window(scratch_backing(limit, mib.saturating_mul(MIB))),
+        None => options,
+    }
 }
 
 /// Opens `input` for decoding.
@@ -623,6 +648,15 @@ impl<R: Read> StreamDecoder<R> {
         }
     }
 
+    /// The decoder's failure as the readers report it: a scratch file that
+    /// could not be made comes back as the allocator's error.
+    fn failed(&mut self, error: XzError) -> io::Error {
+        match self.decoder.take_window_error() {
+            Some(window) => io::Error::new(window.allocator_error().kind(), window),
+            None => io::Error::from(error),
+        }
+    }
+
     /// Gives the decoder what it needs to make progress: more input, or the
     /// next finished block when enough is already in flight.
     fn advance(&mut self) -> io::Result<()> {
@@ -647,7 +681,7 @@ impl<R: Read> StreamDecoder<R> {
             let fed = self
                 .decoder
                 .feed(&self.input[self.start..self.end])
-                .map_err(io::Error::from)?;
+                .map_err(|error| self.failed(error))?;
             self.start += fed;
             if fed > 0 || self.decoder.wait_for_worker() {
                 return Ok(());
@@ -694,8 +728,8 @@ impl<R: Read> Read for StreamDecoder<R> {
             let output = &mut self.output;
             let status = self
                 .decoder
-                .drain_upto(buf.len(), |_, bytes| output.extend_from_slice(bytes))
-                .map_err(io::Error::from)?;
+                .drain_upto(buf.len(), |_, bytes| output.extend_from_slice(bytes));
+            let status = status.map_err(|error| self.failed(error))?;
             match status {
                 lzma_turbo::DrainStatus::Finished => self.finished = true,
                 lzma_turbo::DrainStatus::Progress => {}
@@ -818,9 +852,8 @@ fn list_stream(
         })?;
     let header = StreamHeader::parse(&head)
         .map_err(|kind| RarparError::Data(XzError::at(kind, 0, 0).to_string()))?;
-    let options = XzOptions::default()
+    let options = memory_options(args.memory_mib, args.scratch_mib)
         .with_threads(1)
-        .with_memory_limit(args.memory_mib.saturating_mul(MIB))
         .with_plan(ChecksumPlan::new(Checksum::Crc32));
     let mut reader = XzReader::with_options(io::Cursor::new(head).chain(source), options);
     let decoded = io::copy(&mut reader, &mut io::sink()).map_err(codec_error)?;

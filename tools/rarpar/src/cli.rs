@@ -290,9 +290,14 @@ pub struct XzDecodeArgs {
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=256))]
     pub threads: Option<u32>,
     /// Memory limit in MiB: threads are reduced to fit, and a stream whose
-    /// dictionary alone exceeds it is refused.
+    /// dictionary alone exceeds it is refused unless --scratch-mib is given.
     #[arg(long, value_name = "MIB", default_value_t = 1024, value_parser = clap::value_parser!(u64).range(1..))]
     pub memory_mib: u64,
+    /// Disk budget in MiB for dictionaries over --memory-mib: each is decoded
+    /// in a scratch file in the temporary directory, all of them open at once
+    /// within this total. Off by default.
+    #[arg(long, value_name = "MIB", value_parser = clap::value_parser!(u64).range(1..))]
+    pub scratch_mib: Option<u64>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -325,6 +330,10 @@ pub struct XzListArgs {
     /// Memory limit in MiB for the decode a forward-only stream is listed by.
     #[arg(long, value_name = "MIB", default_value_t = 1024, value_parser = clap::value_parser!(u64).range(1..))]
     pub memory_mib: u64,
+    /// Disk budget in MiB for a dictionary over --memory-mib in that decode,
+    /// as for decompress. Off by default.
+    #[arg(long, value_name = "MIB", value_parser = clap::value_parser!(u64).range(1..))]
+    pub scratch_mib: Option<u64>,
 }
 
 #[derive(Debug, Clone, Subcommand)]

@@ -426,18 +426,22 @@ fn damage_fails_the_test_and_leaves_no_output() {
 }
 
 #[test]
-fn a_dictionary_above_the_memory_limit_is_a_resource_failure() {
+fn a_dictionary_above_the_memory_limit_needs_a_scratch_budget() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
-    std::fs::write(root.join("data.bin"), sample(2 << 20, 29)).unwrap();
-    // One 2 MiB block: the dictionary is the block, 2 MiB.
+    let data = sample(4 << 20, 29);
+    std::fs::write(root.join("data.bin"), &data).unwrap();
+    // Two 2 MiB blocks: each dictionary is its block, 2 MiB, over a 1 MiB
+    // limit, and so is each block a threaded decode holds whole.
     ok(&rarpar(
         root,
         &[
             "xz", "compress", "data.bin", "--level", "6", "-s", "2097152",
         ],
     ));
+    let compressed = std::fs::read(root.join("data.bin.xz")).unwrap();
     for threads in ["1", "4"] {
+        // Without a disk budget the stream is refused, as before.
         let output = rarpar(
             root,
             &[
@@ -451,6 +455,65 @@ fn a_dictionary_above_the_memory_limit_is_a_resource_failure() {
             ],
         );
         assert_eq!(output.status.code(), Some(4), "threads {threads}");
+        // A budget smaller than one window refuses it too.
+        let output = rarpar(
+            root,
+            &[
+                "xz",
+                "test",
+                "data.bin.xz",
+                "--memory-mib",
+                "1",
+                "--scratch-mib",
+                "1",
+                "--threads",
+                threads,
+            ],
+        );
+        assert_eq!(output.status.code(), Some(4), "threads {threads}");
+
+        // With one, it decodes in scratch files, from a file and a pipe.
+        let out = format!("out-{threads}.bin");
+        let decoded = report(
+            root,
+            &[
+                "xz",
+                "decompress",
+                "data.bin.xz",
+                &out,
+                "--memory-mib",
+                "1",
+                "--scratch-mib",
+                "8",
+                "--threads",
+                threads,
+            ],
+        );
+        assert_eq!(decoded["success"], true, "threads {threads}");
+        assert_eq!(
+            std::fs::read(root.join(&out)).unwrap(),
+            data,
+            "threads {threads}"
+        );
+        let output = piped(
+            &bin(),
+            root,
+            &[
+                "xz",
+                "decompress",
+                "-",
+                "-",
+                "--memory-mib",
+                "1",
+                "--scratch-mib",
+                "8",
+                "--threads",
+                threads,
+            ],
+            compressed.clone(),
+        );
+        ok(&output);
+        assert_eq!(output.stdout, data, "pipe, threads {threads}");
     }
     ok(&rarpar(
         root,
