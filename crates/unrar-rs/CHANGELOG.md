@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.17.0
+
+### Added
+
+- `RarArchive::member_archive` returns an archive that holds one member.
+  A caller that gives each worker its own archive takes this instead of
+  building the whole set again per member.
+
+### Changed
+
+- The archive keeps an index of the member segments it holds, built on
+  first use, so adding a member no longer scans every held segment. On
+  synthetic sets of 4 KB stored members, walking 160,000 members took
+  29.9 s and now takes 0.09 s. What the archive answers is unchanged.
+
 ## 0.16.6
 
 ### Changed
