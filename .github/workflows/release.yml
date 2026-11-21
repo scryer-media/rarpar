@@ -448,7 +448,7 @@ jobs:
     name: build-${{ matrix.platform }}
     needs: [release-trust, preflight]
     runs-on: ${{ matrix.runs_on }}
-    timeout-minutes: 45
+    timeout-minutes: 120
     env:
       RARPAR_RELEASE_TARGET_DIR: ${{ github.workspace }}/target/rarpar-release
       RELEASE_PLATFORM: ${{ matrix.platform }}
