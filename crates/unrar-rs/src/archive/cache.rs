@@ -768,6 +768,7 @@ impl RarArchive {
             kdf_cache,
             prefix_cursor: None,
             held_segments: None,
+            catalog: super::chains::CatalogIndex::default(),
         };
         archive.sort_members_by_physical_order();
         archive
@@ -824,6 +825,7 @@ impl RarArchive {
             kdf_cache: Arc::clone(&self.kdf_cache),
             prefix_cursor: None,
             held_segments: None,
+            catalog: super::chains::CatalogIndex::default(),
         })
     }
 

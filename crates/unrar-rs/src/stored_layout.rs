@@ -34,9 +34,11 @@
 //! [`crate::crypto::check_member_password`] and
 //! [`crate::crypto::decrypt_cipher_range`] for the surfaces that do.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::archive::{RarVolumeFacts, RarVolumeMemberEncryptionFacts, RarVolumeMemberFacts};
+use crate::archive::{
+    RarVolumeFacts, RarVolumeFactsDelta, RarVolumeMemberEncryptionFacts, RarVolumeMemberFacts,
+};
 use crate::types::{ArchiveFormat, CompressionMethod};
 
 /// AES block size. An encrypted member's packed bytes are its plaintext
@@ -646,11 +648,83 @@ struct VolumeExtent {
     data_size: u64,
 }
 
+/// Extend `reach` over one more extent, in extent order.
+fn push_reach(reach: &mut Vec<u64>, extent: &VolumeExtent) {
+    let before = reach.last().copied().unwrap_or(0);
+    let end = if extent.data_size == 0 {
+        0
+    } else {
+        extent.data_offset.saturating_add(extent.data_size)
+    };
+    reach.push(before.max(end));
+}
+
+/// How many extents this thread's physical mappings looked at.
+#[cfg(test)]
+mod extent_visits {
+    use std::cell::Cell;
+
+    thread_local! {
+        static VISITS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn add() {
+        VISITS.with(|visits| visits.set(visits.get() + 1));
+    }
+
+    pub(super) fn take() -> usize {
+        VISITS.with(|visits| visits.replace(0))
+    }
+}
+
+/// How many chain holes this thread's adds looked at.
+#[cfg(test)]
+mod hole_visits {
+    use std::cell::Cell;
+
+    thread_local! {
+        static VISITS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn add() {
+        VISITS.with(|visits| visits.set(visits.get() + 1));
+    }
+
+    pub(super) fn take() -> usize {
+        VISITS.with(|visits| visits.replace(0))
+    }
+}
+
+/// How many member headers this thread's adds turned into snapshots or
+/// compared with those held.
+#[cfg(test)]
+mod snapshot_reads {
+    use std::cell::Cell;
+
+    thread_local! {
+        static READS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn add(reads: usize) {
+        READS.with(|held| held.set(held.get() + reads));
+    }
+
+    pub(super) fn take() -> usize {
+        READS.with(|held| held.replace(0))
+    }
+}
+
 /// Everything one added volume contributes.
 struct VolumeRecord {
     snapshots: Vec<MemberSnapshot>,
-    /// Member extents sorted by physical offset.
+    /// Member extents sorted by physical offset, ties in header order. An add
+    /// sorts them; an extension appends extents at or past the last one.
     extents: Vec<VolumeExtent>,
+    /// Per extent, the furthest end of any extent up to and including it,
+    /// zero-length extents reaching nowhere: never decreasing, so a binary
+    /// search finds the first extent reaching past an offset even when an
+    /// earlier extent contains later ones.
+    reach: Vec<u64>,
     evidence: VolumeSplitEvidence,
     /// Where the overlap sweep over `extents` ended: the furthest end it saw
     /// and the member reaching it.
@@ -692,6 +766,16 @@ pub struct StoredLayoutBuilder {
     /// is named when the parts disagree, must not depend on arrival order.
     encryptions: Vec<BTreeMap<u32, PartEncryption>>,
     index: HashMap<String, usize>,
+    /// Every run of volumes a member's chain still waits for between two of
+    /// its parts, as (first, last, member): the volumes inside its span that
+    /// carry no part of it. Adding one of them changes that member although
+    /// the volume names it nowhere.
+    holes: BTreeSet<(u32, u32, usize)>,
+    /// Per member, its entries in `holes`.
+    member_holes: Vec<Vec<(u32, u32)>>,
+    /// Whether two holes ever shared a volume, which only a malformed set
+    /// does; from then on an add looks at every hole that could hold it.
+    holes_overlap: bool,
     frontier: Option<u32>,
     /// The volume the last add that learned anything was for: the only one
     /// whose headers can grow in place without reordering the members.
@@ -709,6 +793,9 @@ impl StoredLayoutBuilder {
             declarations: Vec::new(),
             encryptions: Vec::new(),
             index: HashMap::new(),
+            holes: BTreeSet::new(),
+            member_holes: Vec::new(),
+            holes_overlap: false,
             frontier: None,
             last_added: None,
         }
@@ -753,20 +840,102 @@ impl StoredLayoutBuilder {
             .iter()
             .map(|member| MemberSnapshot::from_facts(member, found))
             .collect();
+        #[cfg(test)]
+        snapshot_reads::add(
+            snapshots.len()
+                + self
+                    .volumes
+                    .get(&volume)
+                    .map_or(0, |record| record.snapshots.len()),
+        );
         if let Some(existing) = self.volumes.get(&volume) {
+            let held = existing.snapshots.len();
             return if existing.snapshots == snapshots {
                 Ok(())
-            } else if self.extends(volume, &snapshots) {
-                self.extend_volume(volume, snapshots);
+            } else if snapshots.len() > held
+                && snapshots[..held] == existing.snapshots[..]
+                && self.extends(volume, &snapshots[held..])
+            {
+                self.extend_volume(volume, &snapshots[held..]);
                 Ok(())
             } else {
                 Err(StoredLayoutError::ConflictingVolume { volume })
             };
         }
+        self.add_new_volume(volume, snapshots);
+        Ok(())
+    }
 
+    /// Learn what changed in one volume's headers since the facts it was
+    /// added on, as [`RarVolumeFactsCursor::step_delta`] reports it.
+    ///
+    /// `delta` must follow, on the cursor that walks the volume, the step
+    /// whose facts the volume was last added on (merged, when the caller
+    /// skipped steps between, into one delta from the least `members_from`).
+    /// The layout then answers exactly as [`Self::add_volume`] given those
+    /// facts with the delta applied, and the work is in the size of the
+    /// delta, not of the volume. A volume the layout does not hold yet takes
+    /// only a delta from the first member; one from a later member is
+    /// refused as [`StoredLayoutError::ConflictingVolume`], as is one from
+    /// past the members it holds. Services are not part of a layout.
+    ///
+    /// [`RarVolumeFactsCursor::step_delta`]: crate::RarVolumeFactsCursor::step_delta
+    pub fn add_volume_delta(
+        &mut self,
+        volume: u32,
+        delta: &RarVolumeFactsDelta,
+    ) -> Result<(), StoredLayoutError> {
+        let found = delta.facts.archive_format();
+        if found != self.format {
+            return Err(StoredLayoutError::FormatMismatch {
+                expected: self.format,
+                found,
+            });
+        }
+        let snapshots: Vec<MemberSnapshot> = delta
+            .facts
+            .members
+            .iter()
+            .map(|member| MemberSnapshot::from_facts(member, found))
+            .collect();
+        let from = delta.members_from;
+        let Some(existing) = self.volumes.get(&volume) else {
+            if from != 0 {
+                return Err(StoredLayoutError::ConflictingVolume { volume });
+            }
+            #[cfg(test)]
+            snapshot_reads::add(snapshots.len());
+            self.add_new_volume(volume, snapshots);
+            return Ok(());
+        };
+        let held = existing.snapshots.len();
+        // The members the delta reports again must state what the volume was
+        // added on; only those past them are new.
+        let Some(again) = held.checked_sub(from) else {
+            return Err(StoredLayoutError::ConflictingVolume { volume });
+        };
+        #[cfg(test)]
+        snapshot_reads::add(snapshots.len() + again.min(snapshots.len()));
+        if snapshots.len() < again || snapshots[..again] != existing.snapshots[from..] {
+            return Err(StoredLayoutError::ConflictingVolume { volume });
+        }
+        let fresh = &snapshots[again..];
+        if fresh.is_empty() {
+            Ok(())
+        } else if self.extends(volume, fresh) {
+            self.extend_volume(volume, fresh);
+            Ok(())
+        } else {
+            Err(StoredLayoutError::ConflictingVolume { volume })
+        }
+    }
+
+    /// Learn a volume the layout does not hold.
+    fn add_new_volume(&mut self, volume: u32, snapshots: Vec<MemberSnapshot>) {
         let mut extents: Vec<VolumeExtent> = Vec::with_capacity(snapshots.len());
         let mut evidence = VolumeSplitEvidence::default();
         let mut names_here: HashSet<&str> = HashSet::with_capacity(snapshots.len());
+        let mut carried: Vec<usize> = Vec::with_capacity(snapshots.len());
 
         for snapshot in &snapshots {
             if snapshot.split_before {
@@ -778,6 +947,7 @@ impl StoredLayoutBuilder {
 
             let member_index = self.member_index_for(snapshot, volume);
             self.absorb_traits(member_index, snapshot);
+            carried.push(member_index);
 
             if !names_here.insert(snapshot.name.as_str()) {
                 // Keep the first header and record the conflict; either way the
@@ -824,11 +994,16 @@ impl StoredLayoutBuilder {
             }
         }
 
+        let mut reach = Vec::with_capacity(extents.len());
+        for extent in &extents {
+            push_reach(&mut reach, extent);
+        }
         self.volumes.insert(
             volume,
             VolumeRecord {
                 snapshots,
                 extents,
+                reach,
                 evidence,
                 covered,
             },
@@ -838,14 +1013,17 @@ impl StoredLayoutBuilder {
 
         // A volume also changes members it carries no part of: one added inside
         // a member's span proves a hole in that member's chain.
-        let affected: Vec<usize> = (0..self.members.len())
-            .filter(|index| self.member_spans(*index, volume))
-            .collect();
-        for index in affected {
+        self.members_changed_by(volume, &mut carried);
+        #[cfg(test)]
+        assert_eq!(
+            carried,
+            (0..self.members.len())
+                .filter(|index| self.member_spans(*index, volume))
+                .collect::<Vec<_>>()
+        );
+        for index in carried {
             self.resolve_member(index);
         }
-
-        Ok(())
     }
 
     /// Record one header's part of its member in `volume`.
@@ -882,27 +1060,23 @@ impl StoredLayoutBuilder {
             .parts
             .partition_point(|existing| existing.volume < volume);
         member.parts.insert(position, part);
+        self.refresh_holes(member_index);
     }
 
-    /// Whether `snapshots` are the headers `volume` was added on followed by
-    /// more that learning alone answers for: it is the volume added last, so
-    /// no member was first seen after it, and the new headers name no member
-    /// it already carries a part of, lie in physical order at or past every
-    /// part it holds, and overlap nothing. Adding the longer headers afresh
-    /// would then find no duplicate and no overlap among the old ones that
-    /// it did not find before, and sort the new extents after the old.
-    fn extends(&self, volume: u32, snapshots: &[MemberSnapshot]) -> bool {
+    /// Whether `fresh`, the headers past those `volume` was added on, are
+    /// ones learning alone answers for: it is the volume added last, so no
+    /// member was first seen after it, and the new headers name no member it
+    /// already carries a part of, lie in physical order at or past every part
+    /// it holds, and overlap nothing. Adding the longer headers afresh would
+    /// then find no duplicate and no overlap among the old ones that it did
+    /// not find before, and sort the new extents after the old.
+    fn extends(&self, volume: u32, fresh: &[MemberSnapshot]) -> bool {
         let Some(record) = self.volumes.get(&volume) else {
             return false;
         };
-        let held = record.snapshots.len();
-        if self.last_added != Some(volume)
-            || snapshots.len() <= held
-            || snapshots[..held] != record.snapshots[..]
-        {
+        if self.last_added != Some(volume) || fresh.is_empty() {
             return false;
         }
-        let fresh = &snapshots[held..];
         let mut names: HashSet<&str> = HashSet::with_capacity(fresh.len());
         let mut floor = record.extents.last().map_or(0, |extent| extent.data_offset);
         let mut covered = record.covered.map(|(end, _)| end);
@@ -932,12 +1106,12 @@ impl StoredLayoutBuilder {
     /// said they only add to it: the members they name are resolved again,
     /// and only those, since no other member's parts, traits or chain
     /// changed.
-    fn extend_volume(&mut self, volume: u32, snapshots: Vec<MemberSnapshot>) {
+    fn extend_volume(&mut self, volume: u32, fresh: &[MemberSnapshot]) {
         let Some(mut record) = self.volumes.remove(&volume) else {
             return;
         };
-        let mut affected = Vec::with_capacity(snapshots.len() - record.snapshots.len());
-        for snapshot in &snapshots[record.snapshots.len()..] {
+        let mut affected = Vec::with_capacity(fresh.len());
+        for snapshot in fresh {
             if snapshot.split_before {
                 record
                     .evidence
@@ -953,11 +1127,13 @@ impl StoredLayoutBuilder {
             let member_index = self.member_index_for(snapshot, volume);
             self.absorb_traits(member_index, snapshot);
             self.learn_part(member_index, volume, snapshot);
-            record.extents.push(VolumeExtent {
+            let extent = VolumeExtent {
                 member_index,
                 data_offset: snapshot.data_offset,
                 data_size: snapshot.data_size,
-            });
+            };
+            push_reach(&mut record.reach, &extent);
+            record.extents.push(extent);
             if snapshot.data_size > 0 {
                 record.covered = Some((
                     snapshot.data_offset.saturating_add(snapshot.data_size),
@@ -966,7 +1142,7 @@ impl StoredLayoutBuilder {
             }
             affected.push(member_index);
         }
-        record.snapshots = snapshots;
+        record.snapshots.extend_from_slice(fresh);
         self.volumes.insert(volume, record);
         for index in affected {
             self.resolve_member(index);
@@ -1014,6 +1190,13 @@ impl StoredLayoutBuilder {
     /// reports the same clamped length, so the returned slices always sum to
     /// `min(len, u64::MAX - offset)`.
     pub fn map_physical_range(&self, volume: u32, offset: u64, len: u64) -> Vec<MappedSlice> {
+        self.map_range(volume, offset, len, true)
+    }
+
+    /// [`Self::map_physical_range`], beginning its walk at the first extent
+    /// reaching past `offset` when `search`, and at the first extent
+    /// otherwise, as it used to (kept for tests to compare against).
+    fn map_range(&self, volume: u32, offset: u64, len: u64, search: bool) -> Vec<MappedSlice> {
         let mut slices = Vec::new();
         let end = offset.saturating_add(len);
         let len = end - offset;
@@ -1027,7 +1210,16 @@ impl StoredLayoutBuilder {
         };
 
         let mut cursor = offset;
-        for extent in &record.extents {
+        // Every extent before `first` is empty or ends at or before `offset`,
+        // so the walk from the start skipped each of them.
+        let first = if search {
+            record.reach.partition_point(|reach| *reach <= offset)
+        } else {
+            0
+        };
+        for extent in &record.extents[first..] {
+            #[cfg(test)]
+            extent_visits::add();
             if cursor >= end {
                 break;
             }
@@ -1110,8 +1302,63 @@ impl StoredLayoutBuilder {
         self.traits.push(MemberTraits::default());
         self.declarations.push(BTreeMap::new());
         self.encryptions.push(BTreeMap::new());
+        self.member_holes.push(Vec::new());
         self.index.insert(snapshot.name.clone(), index);
         index
+    }
+
+    /// Re-index the volumes one member's chain waits for between its parts.
+    fn refresh_holes(&mut self, member_index: usize) {
+        for (first, last) in self.member_holes[member_index].drain(..) {
+            self.holes.remove(&(first, last, member_index));
+        }
+        let parts = &self.members[member_index].parts;
+        for pair in parts.windows(2) {
+            let (before, after) = (pair[0].volume, pair[1].volume);
+            if after > before.saturating_add(1) {
+                let hole = (before + 1, after - 1, member_index);
+                // Holes of a well-formed set never share a volume: one
+                // inside two members' spans would carry the middle of both.
+                // The first pair that does turns the shortcut below off.
+                let touches_before = self
+                    .holes
+                    .range(..hole)
+                    .next_back()
+                    .is_some_and(|earlier| earlier.1 >= hole.0);
+                let touches_after = self
+                    .holes
+                    .range(hole..)
+                    .next()
+                    .is_some_and(|later| later.0 <= hole.1);
+                self.holes_overlap |= touches_before || touches_after;
+                self.member_holes[member_index].push((hole.0, hole.1));
+                self.holes.insert(hole);
+            }
+        }
+    }
+
+    /// The members a newly added `volume` changes: those carrying a part of
+    /// it, and those whose chain waits for it between two of their parts.
+    /// In index order, each once.
+    ///
+    /// While no two holes share a volume, only the hole beginning last at or
+    /// before `volume` can hold it.
+    fn members_changed_by(&self, volume: u32, carried: &mut Vec<usize>) {
+        let mut before = self.holes.range(..=(volume, u32::MAX, usize::MAX));
+        let candidates: Box<dyn Iterator<Item = &(u32, u32, usize)>> = if self.holes_overlap {
+            Box::new(before)
+        } else {
+            Box::new(before.next_back().into_iter())
+        };
+        for &(_, last, member_index) in candidates {
+            #[cfg(test)]
+            hole_visits::add();
+            if last >= volume {
+                carried.push(member_index);
+            }
+        }
+        carried.sort_unstable();
+        carried.dedup();
     }
 
     /// Fold one header's disqualifying facts into the member's running traits.
@@ -1124,6 +1371,9 @@ impl StoredLayoutBuilder {
         traits.compressed |= !snapshot.is_store;
     }
 
+    /// Whether `volume` lies within a member's parts: the old way of finding
+    /// the members an add changes, kept for tests to compare against.
+    #[cfg(test)]
     fn member_spans(&self, member_index: usize, volume: u32) -> bool {
         let parts = &self.members[member_index].parts;
         match (parts.first(), parts.last()) {
@@ -3842,5 +4092,414 @@ mod tests {
         add(&mut builder, 0, &longer);
         refused(&mut builder, 0, &held);
         assert_same_answers(&builder, &fed(&[(0, longer.clone())]), 1);
+    }
+
+    /// `facts` as a delta from member `from`: the members before it left out.
+    fn delta_of(facts: &RarVolumeFacts, from: usize) -> RarVolumeFactsDelta {
+        let mut part = facts.clone();
+        part.members.drain(..from);
+        RarVolumeFactsDelta {
+            facts: part,
+            members_from: from,
+            services_from: 0,
+            short_at: None,
+        }
+    }
+
+    /// Each volume grown a few headers at a time, one builder fed the whole
+    /// headers and one fed deltas from any member at or before those it was
+    /// added on, as a caller that merged several steps sends them: every add
+    /// answers alike, and so does the layout after it. A delta that restates
+    /// a held member otherwise is refused, as the whole headers are.
+    #[test]
+    fn a_volume_fed_deltas_answers_as_one_fed_the_headers_they_add_up_to() {
+        let set = many_member_set();
+        let mut rng = Rng(0x5EED_1234_ABCD_0001);
+        let mut refused = 0;
+        for order in [[0u32, 1, 2], [1, 2, 0], [2, 0, 1], [0, 2, 1]] {
+            let mut whole = layout();
+            let mut deltas = layout();
+            for number in order {
+                let facts = &set[number as usize];
+                let mut held = 0;
+                let mut count = 0;
+                while count < facts.members.len() {
+                    count = (count + 1 + rng.below(4) as usize).min(facts.members.len());
+                    let short = first_headers(facts, count);
+                    let from = rng.below(held as u64 + 1) as usize;
+                    let answer = whole.add_volume(number, &short);
+                    assert_eq!(
+                        deltas.add_volume_delta(number, &delta_of(&short, from)),
+                        answer,
+                        "volume {number}, {count} headers from {from}"
+                    );
+                    if answer.is_ok() {
+                        held = count;
+                    }
+                    assert_same_answers(&deltas, &whole, 3);
+                    if from < held && rng.below(3) == 0 {
+                        let mut bent = short.clone();
+                        bent.members[from].data_size += 1;
+                        let answer = whole.add_volume(number, &bent);
+                        assert!(answer.is_err(), "a changed held header is refused");
+                        assert_eq!(
+                            deltas.add_volume_delta(number, &delta_of(&bent, from)),
+                            answer
+                        );
+                        assert_same_answers(&deltas, &whole, 3);
+                        refused += 1;
+                    }
+                }
+            }
+            assert!(
+                deltas.members().iter().any(|member| member.parts.len() > 1),
+                "the set splits members across volumes"
+            );
+        }
+        assert!(refused > 10, "only {refused} refusals");
+
+        // A delta past the headers held, or from a later member of a volume
+        // not held, cannot be judged and is refused, changing nothing.
+        let mut deltas = layout();
+        let held = first_headers(&set[0], 5);
+        deltas.add_volume_delta(0, &delta_of(&held, 0)).unwrap();
+        let longer = first_headers(&set[0], 9);
+        for (number, from) in [(0, 6), (1, 1)] {
+            let facts = if number == 0 { &longer } else { &set[1] };
+            assert_eq!(
+                deltas.add_volume_delta(number, &delta_of(facts, from)),
+                Err(StoredLayoutError::ConflictingVolume { volume: number })
+            );
+            assert_same_answers(&deltas, &fed(&[(0, held.clone())]), 2);
+        }
+    }
+
+    /// Growing a volume one header at a time through deltas reads each
+    /// header once; through its whole headers, every header held again on
+    /// each add.
+    #[test]
+    fn a_delta_reads_only_the_headers_it_reports() {
+        for count in [100_usize, 1000] {
+            let members: Vec<_> = (0..count)
+                .map(|at| member(&format!("d{at:05}.bin"), 100 + 64 * at as u64, 32))
+                .collect();
+            let facts = volume(members);
+            let mut whole = layout();
+            let mut deltas = layout();
+            snapshot_reads::take();
+            for at in 1..=count {
+                whole.add_volume(0, &first_headers(&facts, at)).unwrap();
+            }
+            let by_whole = snapshot_reads::take();
+            for at in 1..=count {
+                let delta = delta_of(&first_headers(&facts, at), at - 1);
+                deltas.add_volume_delta(0, &delta).unwrap();
+            }
+            let by_delta = snapshot_reads::take();
+            assert_same_answers(&deltas, &whole, 1);
+            assert_eq!(by_delta, count, "{count} headers");
+            assert!(by_whole > count * count / 2, "{count}: {by_whole}");
+        }
+    }
+
+    /// A small deterministic generator for the mapping layouts below.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound
+        }
+    }
+
+    /// A member that routes direct unless its layout says otherwise.
+    fn routed(name: &str, data_offset: u64, data_size: u64) -> RarVolumeMemberFacts {
+        with_crc32(member(name, data_offset, data_size), 0x1234_5678)
+    }
+
+    /// Members laid out with gaps, zero-length parts, nested parts (one range
+    /// wholly inside an earlier, longer one), overlaps and shared offsets.
+    fn scattered_members(rng: &mut Rng, prefix: &str, count: usize) -> Vec<RarVolumeMemberFacts> {
+        let mut at = rng.below(16);
+        (0..count)
+            .map(|index| {
+                let size = match rng.below(6) {
+                    0 => 0,
+                    1 => 200 + rng.below(400),
+                    _ => 1 + rng.below(40),
+                };
+                let offset = match rng.below(5) {
+                    0 => at.saturating_sub(rng.below(60)),
+                    _ => at + rng.below(30),
+                };
+                // Often stay inside a long part, so later parts nest in it.
+                at = if size > 100 && rng.below(2) == 0 {
+                    offset + 1 + rng.below(20)
+                } else {
+                    offset + rng.below(size.max(1) + 1)
+                };
+                routed(&format!("{prefix}{index}.bin"), offset, size)
+            })
+            .collect()
+    }
+
+    /// Every slice the search answers equals the full walk's, for every start
+    /// across and past the volume and a spread of lengths.
+    fn assert_search_matches_walk(builder: &StoredLayoutBuilder, volume: u32, span: u64) {
+        for offset in 0..span {
+            for len in [0, 1, 2, 7, 33, 150, 700, u64::MAX] {
+                assert_eq!(
+                    builder.map_range(volume, offset, len, true),
+                    builder.map_range(volume, offset, len, false),
+                    "volume {volume} offset {offset} len {len}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn physical_mapping_search_matches_the_walk_from_the_first_extent() {
+        // A long part holding two short ones and an empty one: a search on
+        // data offsets alone would start inside it at the last short part
+        // and lose the long part's bytes past the short ones.
+        let mut builder = layout();
+        add(
+            &mut builder,
+            0,
+            &volume(vec![
+                routed("long.bin", 0, 1000),
+                routed("short1.bin", 10, 10),
+                routed("short2.bin", 30, 10),
+                routed("empty.bin", 50, 0),
+            ]),
+        );
+        assert_search_matches_walk(&builder, 0, 1020);
+
+        // An empty part inside a healthy one overlaps nothing, so the healthy
+        // part routes direct: a search that started at the last part beginning
+        // at or before the offset would land on the empty part and send the
+        // healthy part's later bytes to the envelope.
+        let mut builder = layout();
+        add(
+            &mut builder,
+            0,
+            &volume(vec![
+                routed("healthy.bin", 100, 100),
+                routed("empty.bin", 120, 0),
+                routed("next.bin", 300, 50),
+            ]),
+        );
+        assert!(builder.members()[0].eligibility.routes_direct());
+        assert_search_matches_walk(&builder, 0, 400);
+
+        for seed in 1..=120_u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let count = 1 + rng.below(24) as usize;
+            let held = scattered_members(&mut rng, "a", count);
+            let span = held
+                .iter()
+                .map(|facts| facts.data_offset + facts.data_size)
+                .max()
+                .unwrap_or(0);
+
+            let mut builder = layout();
+            add(&mut builder, 0, &volume(held.clone()));
+            add(&mut builder, 2, &volume(held.clone()));
+            assert_search_matches_walk(&builder, 0, span + 20);
+            assert_search_matches_walk(&builder, 2, span + 20);
+            // A volume never added.
+            assert_search_matches_walk(&builder, 1, 4);
+
+            // Grow the last volume in place: its new extents append past the
+            // old ones, and the search has to see them too.
+            let mut longer = held.clone();
+            let mut at = span + rng.below(8);
+            for index in 0..1 + rng.below(6) {
+                let size = rng.below(3) * (1 + rng.below(30));
+                longer.push(routed(&format!("b{index}.bin"), at, size));
+                at += size + rng.below(10);
+            }
+            add(&mut builder, 2, &volume(longer.clone()));
+            assert_eq!(
+                builder.volumes[&2].extents.len(),
+                longer.len(),
+                "seed {seed}: the longer headers extend the volume"
+            );
+            assert_search_matches_walk(&builder, 2, at + 20);
+        }
+    }
+
+    #[test]
+    fn physical_mapping_visits_only_the_extents_it_needs() {
+        let visits = |extents: u64| {
+            let members = (0..extents)
+                .map(|index| routed(&format!("m{index}.bin"), 10 + index * 100, 90))
+                .collect();
+            let mut builder = layout();
+            add(&mut builder, 0, &volume(members));
+            extent_visits::take();
+            // One article-sized read near the end of the volume, crossing a
+            // member boundary, and one past every member.
+            let near_end = 10 + (extents - 3) * 100 + 50;
+            builder.map_physical_range(0, near_end, 120);
+            builder.map_physical_range(0, 10 + extents * 100 + 5, 64);
+            let searched = extent_visits::take();
+            builder.map_range(0, near_end, 120, false);
+            builder.map_range(0, 10 + extents * 100 + 5, 64, false);
+            (searched, extent_visits::take())
+        };
+        let (small, small_walk) = visits(64);
+        let (large, large_walk) = visits(4096);
+        assert_eq!(
+            small, large,
+            "the search's work does not grow with the volume"
+        );
+        assert!(small <= 4, "the search looked at {small} extents");
+        assert!(
+            large_walk >= 2 * 4000,
+            "the old walk looked at {large_walk} extents (small: {small_walk})"
+        );
+    }
+
+    /// A set of `volumes` volumes holding members laid end to end, each split
+    /// across one or more volumes, as RAR writes them: per volume, its
+    /// headers in physical order.
+    fn chained_set(rng: &mut Rng, volumes: u32) -> Vec<Vec<RarVolumeMemberFacts>> {
+        let mut set: Vec<Vec<RarVolumeMemberFacts>> = vec![Vec::new(); volumes as usize];
+        let mut volume = 0;
+        let mut index = 0;
+        while volume < volumes {
+            let span = 1 + rng.below(4) as u32;
+            let last = (volume + span - 1).min(volumes - 1);
+            let name = format!("m{index}.bin");
+            let sizes: Vec<u64> = (volume..=last).map(|_| 1 + rng.below(50)).collect();
+            let whole = sizes.iter().sum();
+            for (at, size) in (volume..=last).zip(sizes) {
+                let headers = &mut set[at as usize];
+                let offset = headers
+                    .last()
+                    .map_or(20, |facts| facts.data_offset + facts.data_size + 9);
+                let part = split_part(&name, offset, size, whole, at > volume, at < last);
+                headers.push(with_crc32(part, 0x0BAD_F00D));
+            }
+            // The next member starts in the volume this one ended in, or the
+            // one after.
+            volume = last + u32::from(rng.below(2) == 0);
+            index += 1;
+        }
+        set
+    }
+
+    /// Damage a set as a hostile or broken poster could: a part dropped, a
+    /// part copied into another volume, a member restarted mid-chain.
+    fn damage(rng: &mut Rng, set: &mut [Vec<RarVolumeMemberFacts>]) {
+        let volumes = set.len() as u64;
+        for _ in 0..1 + rng.below(4) {
+            let from = rng.below(volumes) as usize;
+            if set[from].is_empty() {
+                continue;
+            }
+            let at = rng.below(set[from].len() as u64) as usize;
+            match rng.below(3) {
+                0 => {
+                    set[from].remove(at);
+                }
+                1 => {
+                    let mut copy = set[from][at].clone();
+                    let to = rng.below(volumes) as usize;
+                    copy.data_offset = set[to]
+                        .last()
+                        .map_or(20, |facts| facts.data_offset + facts.data_size + 3);
+                    if set[to].iter().all(|facts| facts.name != copy.name) {
+                        set[to].push(copy);
+                    }
+                }
+                _ => set[from][at].split_before = !set[from][at].split_before,
+            }
+        }
+    }
+
+    #[test]
+    fn an_add_changes_the_members_it_carries_and_those_waiting_for_it() {
+        // `add_volume` asserts, on every add under test, that the members it
+        // resolves are exactly those whose parts span the volume, as the scan
+        // over every member found them.
+        let mut overlapped = 0;
+        for seed in 1..=300_u64 {
+            let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1);
+            let volumes = 2 + rng.below(30) as u32;
+            let mut set = chained_set(&mut rng, volumes);
+            if seed % 3 == 0 {
+                damage(&mut rng, &mut set);
+            }
+            let mut order: Vec<u32> = (0..volumes).collect();
+            for at in (1..order.len()).rev() {
+                order.swap(at, rng.below(at as u64 + 1) as usize);
+            }
+            let mut builder = layout();
+            for &number in &order {
+                // Some volumes never arrive.
+                if rng.below(8) == 0 {
+                    continue;
+                }
+                add(&mut builder, number, &volume(set[number as usize].clone()));
+            }
+            // An in-order build of the same volumes ends in the same members.
+            let mut ordered = layout();
+            for number in 0..volumes {
+                if builder.has_volume(number) {
+                    add(&mut ordered, number, &volume(set[number as usize].clone()));
+                }
+            }
+            let shape = |builder: &StoredLayoutBuilder| {
+                let mut members: Vec<_> = builder
+                    .members()
+                    .iter()
+                    .map(|member| format!("{member:?}"))
+                    .collect();
+                members.sort();
+                members
+            };
+            assert_eq!(shape(&builder), shape(&ordered), "seed {seed}");
+            overlapped += usize::from(builder.holes_overlap);
+        }
+        // Some of the damaged sets leave chains whose holes overlap, so the
+        // scan of every hole is under the same check as the single lookup.
+        assert!(overlapped != 0);
+    }
+
+    #[test]
+    fn an_add_looks_at_one_waiting_chain_however_many_members_there_are() {
+        // One member split across every volume, arriving evens first, so its
+        // chain has a hole at every odd volume, beside an unsplit member per
+        // volume.
+        let visits = |volumes: u32| {
+            let whole = u64::from(volumes) * 10;
+            let set: Vec<Vec<RarVolumeMemberFacts>> = (0..volumes)
+                .map(|at| {
+                    let long = split_part("long.bin", 20, 10, whole, at > 0, at + 1 < volumes);
+                    let short = routed(&format!("short{at}.bin"), 40, 5);
+                    vec![with_crc32(long, 7), short]
+                })
+                .collect();
+            let mut builder = layout();
+            let evens = (0..volumes).step_by(2);
+            let odds = (1..volumes).step_by(2);
+            hole_visits::take();
+            for number in evens.chain(odds) {
+                add(&mut builder, number, &volume(set[number as usize].clone()));
+            }
+            hole_visits::take()
+        };
+        let small = visits(16);
+        let large = visits(1024);
+        assert!(small <= 16, "{small} holes looked at for 16 adds");
+        assert!(large <= 1024, "{large} holes looked at for 1024 adds");
     }
 }

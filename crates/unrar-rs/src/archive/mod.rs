@@ -4,6 +4,7 @@
 //! archives, volumes can be added incrementally as they become available.
 
 mod cache;
+mod chains;
 mod entry;
 mod facts;
 mod legacy;
@@ -15,9 +16,10 @@ mod volume;
 pub use cache::CachedArchiveHeaders;
 pub use entry::Entry;
 pub use facts::{
-    RarVolumeFacts, RarVolumeFactsCursor, RarVolumeFactsWalk, RarVolumeHeaderEncryption,
-    RarVolumeHeaderEncryptionFacts, RarVolumeHostOs, RarVolumeMemberEncryptionFacts,
-    RarVolumeMemberFacts, RarVolumeServiceFacts, RarVolumeUnixOwnerFacts,
+    RarVolumeFacts, RarVolumeFactsCursor, RarVolumeFactsDelta, RarVolumeFactsWalk,
+    RarVolumeHeaderEncryption, RarVolumeHeaderEncryptionFacts, RarVolumeHostOs,
+    RarVolumeMemberEncryptionFacts, RarVolumeMemberFacts, RarVolumeServiceFacts,
+    RarVolumeUnixOwnerFacts,
 };
 
 use std::io::{Read, Seek, SeekFrom};
@@ -359,6 +361,9 @@ pub struct RarArchive {
     /// what `holds_member_segment` looks up. `None` until first asked, and
     /// again after a change that removes or rewrites a member's segments.
     held_segments: Option<std::collections::HashSet<(usize, u64)>>,
+    /// Name and service-parent lookups, built on first use and dropped by
+    /// every change to `members` or `services`.
+    catalog: chains::CatalogIndex,
 }
 
 #[derive(Debug, Clone)]
@@ -511,7 +516,7 @@ impl RarArchive {
     ///    equivalently, a segment from the volume that terminates this
     ///    member has been registered).
     pub fn is_extractable(&self, name: &str) -> bool {
-        if let Some(entry) = self.members.iter().find(|m| m.file_header.name == name) {
+        if let Some(entry) = self.find_member(name).map(|index| &self.members[index]) {
             // If the file header still has split_after, we haven't seen the
             // final continuation segment yet.
             if entry.file_header.split_after {
@@ -533,7 +538,7 @@ impl RarArchive {
     /// This includes both volumes whose readers are missing AND the next
     /// expected volume if the member still has continuation segments pending.
     pub fn missing_volumes(&self, name: &str) -> Vec<usize> {
-        if let Some(entry) = self.members.iter().find(|m| m.file_header.name == name) {
+        if let Some(entry) = self.find_member(name).map(|index| &self.members[index]) {
             let mut missing: Vec<usize> = entry
                 .segments
                 .iter()
@@ -715,7 +720,14 @@ impl RarArchive {
 
     /// Find a member by name, returning its index.
     pub fn find_member(&self, name: &str) -> Option<usize> {
-        self.members.iter().position(|m| m.file_header.name == name)
+        let found = self.catalog.member_named(&self.members, name);
+        #[cfg(test)]
+        assert_eq!(
+            found,
+            self.members.iter().position(|m| m.file_header.name == name),
+            "the name map is stale"
+        );
+        found
     }
 
     /// Find a member by sanitized name, returning its index into `self.members`.
@@ -724,13 +736,22 @@ impl RarArchive {
     /// each member's name before comparison. Use this when the caller has a
     /// sanitized name (e.g., from the pipeline topology).
     pub fn find_member_sanitized(&self, sanitized_name: &str) -> Option<usize> {
-        self.members.iter().position(|m| {
-            crate::path::sanitize_member_path(
-                self.format,
-                m.file_header.host_os,
-                &m.file_header.name,
-            ) == sanitized_name
-        })
+        let found = self
+            .catalog
+            .member_sanitized(&self.members, self.format, sanitized_name);
+        #[cfg(test)]
+        assert_eq!(
+            found,
+            self.members.iter().position(|m| {
+                crate::path::sanitize_member_path(
+                    self.format,
+                    m.file_header.host_os,
+                    &m.file_header.name,
+                ) == sanitized_name
+            }),
+            "the sanitized name map is stale"
+        );
+        found
     }
 
     /// Get member info by index.
@@ -1135,6 +1156,7 @@ mod tests {
             kdf_cache: Arc::new(crate::crypto::KdfCache::new()),
             prefix_cursor: None,
             held_segments: None,
+            catalog: chains::CatalogIndex::default(),
         }
     }
 

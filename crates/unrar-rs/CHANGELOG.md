@@ -1,12 +1,20 @@
 # Changelog
 
-## 0.16.7
+## 0.16.8
 
 ### Added
 
 - `RarArchive::member_archive` returns an archive that holds one member.
   A caller that gives each worker its own archive takes this instead of
   building the whole set again per member.
+- `RarVolumeFactsCursor::step_delta` returns a `RarVolumeFactsDelta`: what
+  changed in a volume's facts since the cursor's previous step, as the
+  members and services from the first that changed on.
+  `RarVolumeFactsDelta::apply_to` adds it to the facts the previous step
+  gave, which then equal what `step` gives.
+- `StoredLayoutBuilder::add_volume_delta` learns a volume from such a delta
+  and answers as `add_volume` given the facts the delta adds up to, with
+  work in the size of the delta.
 
 ### Changed
 
@@ -14,6 +22,23 @@
   first use, so adding a member no longer scans every held segment. On
   synthetic sets of 4 KB stored members, walking 160,000 members took
   29.9 s and now takes 0.09 s. What the archive answers is unchanged.
+- Adding a volume links split members and services through maps of open
+  chains and names, joins only the parts the add made joinable and sorts
+  once per add. Name lookups, service parents and the file-copy fallback
+  use maps built on first use. Adding 4,096 single-volume members took
+  1.48 s and takes 21 ms; 8,000 name lookups took 1.47 s and take 1.2 ms.
+  Members, services, order, chains, parents and errors are unchanged.
+- The facts cursor no longer opens a RAR4 volume on every step to read Unix
+  owner records. It resolves each `UOW` service to its file from the
+  headers and keeps each owner record it read across steps. Over a 1,600
+  member volume fed in 512-byte pieces, owner resolution took 17.4 s and
+  takes 1.05 s. The facts are unchanged.
+- `StoredLayoutBuilder::map_physical_range` starts at the first extent
+  whose data reaches the offset instead of the volume's first extent, and
+  `add_volume` resolves only the members the new volume carries or whose
+  chain waits for it. Answers are unchanged.
+
+## 0.16.7
 
 ### Fixed
 
