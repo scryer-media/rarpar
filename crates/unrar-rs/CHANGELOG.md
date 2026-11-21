@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.16.7
+## 0.16.8
 
 ### Added
 
@@ -37,6 +37,8 @@
   whose data reaches the offset instead of the volume's first extent, and
   `add_volume` resolves only the members the new volume carries or whose
   chain waits for it. Answers are unchanged.
+
+## 0.16.7
 
 ### Fixed
 
