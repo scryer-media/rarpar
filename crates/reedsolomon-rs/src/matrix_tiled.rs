@@ -56,16 +56,25 @@ const PARALLEL_ELIMINATION_THRESHOLD: usize = 256;
 /// `inv(submatrix_in) * augmented_in`. Returns `Err(col)` for the first pivot
 /// column (sequential order) whose diagonal is zero, matching the rank-1
 /// path's `DecodeMatrixError::singular(col)` semantics exactly.
+///
+/// # Panics
+///
+/// Panics when `submatrix.len()` is not `n * n` or `augmented.len()` is not
+/// `n * aug_cols` (including when either product overflows `usize`). The
+/// elimination kernels address every row through raw pointers, so the lengths
+/// are checked once here, in release builds too, before any of that work.
 pub fn invert_augmented_tiled(
     submatrix: &mut [u16],
     augmented: &mut [u16],
     n: usize,
     aug_cols: usize,
 ) -> Result<(), usize> {
-    debug_assert_eq!(submatrix.len(), n * n, "submatrix must be n*n");
-    debug_assert_eq!(
-        augmented.len(),
-        n * aug_cols,
+    assert!(
+        n.checked_mul(n) == Some(submatrix.len()),
+        "submatrix must be n*n"
+    );
+    assert!(
+        n.checked_mul(aug_cols) == Some(augmented.len()),
         "augmented must be n*aug_cols"
     );
     if n == 0 {
@@ -505,5 +514,31 @@ mod tests {
             assert_eq!(ref_res, tiled_res);
             assert_eq!(tiled_res, Err(bad));
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "submatrix must be n*n")]
+    fn tiled_rejects_short_submatrix() {
+        let n = 12usize;
+        let mut sub = vec![1u16; n * n - 1];
+        let mut aug = identity(n);
+        let _ = invert_augmented_tiled(&mut sub, &mut aug, n, n);
+    }
+
+    #[test]
+    #[should_panic(expected = "augmented must be n*aug_cols")]
+    fn tiled_rejects_short_augmented() {
+        let n = 12usize;
+        let mut sub = identity(n);
+        let mut aug = vec![0u16; n * 3 - 1];
+        let _ = invert_augmented_tiled(&mut sub, &mut aug, n, 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "submatrix must be n*n")]
+    fn tiled_rejects_overflowing_dimensions() {
+        let mut sub = vec![0u16; 4];
+        let mut aug = vec![0u16; 4];
+        let _ = invert_augmented_tiled(&mut sub, &mut aug, usize::MAX, 1);
     }
 }

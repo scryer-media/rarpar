@@ -84,7 +84,10 @@ impl Par2Creator {
         // resolved and stat'ed again and every derived quantity recomputed.
         // What the memo removes is the second READ of bytes whose fingerprint
         // has not moved since `plan()` produced them.
-        let canonical = self::plan::build_plan_with_cache(&self.options, Some(&self.scan))?;
+        // The identity scan's fingerprints come back with it: every later
+        // open of a source for its bytes is checked against them.
+        let (canonical, identities) =
+            self::plan::build_plan_with_identities(&self.options, Some(&self.scan))?;
         if plan != &canonical {
             return Err(Par2Error::InvalidCreationOptions {
                 reason: "creation plan differs from creator options or current inputs".to_string(),
@@ -117,6 +120,12 @@ impl Par2Creator {
             });
         }
 
-        write_outputs(plan, canonical.sources, &self.options, selected)
+        write_outputs(
+            plan,
+            canonical.sources,
+            &identities,
+            &self.options,
+            selected,
+        )
     }
 }

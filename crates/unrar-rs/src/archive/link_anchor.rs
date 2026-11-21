@@ -1,4 +1,11 @@
-//! Anchored resolution of hard-link and file-copy targets.
+//! Anchored resolution of hard-link and file-copy targets, and of the
+//! directories every member's output is created in.
+//!
+//! Member outputs: on Unix `MemberParent` reaches a member's parent
+//! directory from the extraction root one component at a time by handle,
+//! replacing a symlink component with a real directory, and the output is
+//! made relative to that handle. Windows has no handle-relative create, so
+//! `member.rs` holds each parent open without delete sharing instead.
 //!
 //! A RAR5 hard-link or file-copy record names its target relative to the
 //! extraction root. Resolving that name as a path lets a symlink, junction or
@@ -89,7 +96,7 @@ fn not_regular_file() -> AnchorError {
 }
 
 #[cfg(unix)]
-pub(super) use unix::{AnchoredTarget, OutputDir};
+pub(super) use unix::{AnchoredTarget, MemberParent, OutputDir};
 
 #[cfg(windows)]
 pub(super) use windows::AnchoredTarget;
@@ -102,12 +109,59 @@ mod unix {
     use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
 
+    /// The access mode a held directory is opened with. Linux and Android
+    /// use `O_PATH`, and Apple, FreeBSD, NetBSD and Solaris-family targets
+    /// `O_SEARCH`: both need only search permission, so a write-and-search
+    /// directory without read permission (mode `0300`, say) still extracts,
+    /// as the path-based creation did. Other targets read-open it.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    const DIR_OPEN_FLAGS: libc::c_int =
-        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    const DIR_OPEN_FLAGS: libc::c_int =
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    const DIR_ACCESS: libc::c_int = libc::O_PATH;
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "illumos"
+    ))]
+    const DIR_ACCESS: libc::c_int = libc::O_SEARCH;
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "illumos"
+    )))]
+    const DIR_ACCESS: libc::c_int = libc::O_RDONLY;
+
+    const DIR_OPEN_FLAGS: libc::c_int = libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+    /// `openat(parent, name, DIR_ACCESS | flags)`. A kernel too old for
+    /// `O_SEARCH` refuses it with `EINVAL` (or, on an old FreeBSD, `EISDIR`
+    /// for `O_EXEC` on a directory); the open is then made read-only, as
+    /// before. Returns the descriptor or -1 with `errno` set, as `openat`.
+    fn open_dir_at(parent: RawFd, name: &CStr, flags: libc::c_int) -> libc::c_int {
+        // SAFETY: `name` is NUL-terminated; `parent` is open or AT_FDCWD.
+        let fd = unsafe { libc::openat(parent, name.as_ptr(), DIR_ACCESS | flags) };
+        if fd >= 0 || DIR_ACCESS == libc::O_RDONLY {
+            return fd;
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            fd
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            match std::io::Error::last_os_error().raw_os_error() {
+                // SAFETY: as above.
+                Some(libc::EINVAL | libc::EISDIR) => unsafe {
+                    libc::openat(parent, name.as_ptr(), libc::O_RDONLY | flags)
+                },
+                _ => fd,
+            }
+        }
+    }
 
     fn c_name(name: &[u8]) -> Result<CString, AnchorError> {
         CString::new(name).map_err(|_| {
@@ -165,15 +219,9 @@ mod unix {
         let path = c_name(root.as_os_str().as_bytes())?;
         // The extraction root is the caller's choice and may itself be
         // reached through a symlink; only the components beneath it are
-        // archive-controlled, so no O_NOFOLLOW here. On Linux and Android
-        // O_PATH needs only search permission, so a write-and-search root
-        // without read permission still extracts, as it did before.
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
-        // SAFETY: `path` is NUL-terminated.
-        let fd = unsafe { libc::open(path.as_ptr(), flags) };
+        // archive-controlled, so no O_NOFOLLOW here. Opened search-only
+        // where the target allows (see `DIR_ACCESS`).
+        let fd = open_dir_at(libc::AT_FDCWD, &path, libc::O_DIRECTORY | libc::O_CLOEXEC);
         if fd < 0 {
             return Err(AnchorError::Io(std::io::Error::last_os_error()));
         }
@@ -185,7 +233,7 @@ mod unix {
     fn open_child_dir(parent: RawFd, name: &str) -> Result<OwnedFd, AnchorError> {
         let c = c_name(name.as_bytes())?;
         // SAFETY: `c` is NUL-terminated and `parent` is an open directory.
-        let fd = unsafe { libc::openat(parent, c.as_ptr(), DIR_OPEN_FLAGS) };
+        let fd = open_dir_at(parent, &c, DIR_OPEN_FLAGS);
         if fd >= 0 {
             // SAFETY: `fd` is a freshly opened descriptor we own.
             return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
@@ -440,6 +488,267 @@ mod unix {
         }
     }
 
+    fn into_io(error: AnchorError) -> std::io::Error {
+        match error {
+            AnchorError::Io(error) => error,
+            AnchorError::Unsafe => std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "output path is not a real directory",
+            ),
+        }
+    }
+
+    fn not_a_directory(what: &str, path: &Path) -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{what} {} exists and is not a directory", path.display()),
+        )
+    }
+
+    /// `mkdirat`, with an existing entry left to the caller's next look.
+    fn make_dir_at(dir: RawFd, name: &CStr, tolerate_existing: bool) -> std::io::Result<()> {
+        // SAFETY: `name` is NUL-terminated and `dir` is open.
+        if unsafe { libc::mkdirat(dir, name.as_ptr(), 0o777) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if tolerate_existing && error.raw_os_error() == Some(libc::EEXIST) {
+            return Ok(());
+        }
+        Err(error)
+    }
+
+    /// `unlinkat` of a non-directory, with one already gone accepted.
+    fn unlink_at(dir: RawFd, name: &CStr) -> std::io::Result<()> {
+        // SAFETY: `name` is NUL-terminated and `dir` is open.
+        if unsafe { libc::unlinkat(dir, name.as_ptr(), 0) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        Err(error)
+    }
+
+    /// How often one parent component is looked at again when it changes
+    /// between a failed open and its repair. Only a concurrent writer makes
+    /// a component change that way; the bound keeps one from looping us.
+    const COMPONENT_ATTEMPTS: usize = 4;
+
+    /// Opens, or makes, directory `name` beneath `parent` without following
+    /// a symlink. A symlink there is replaced by a real directory, as the
+    /// path-based walk this replaces did; any other non-directory refuses.
+    fn enter_or_make_dir(
+        parent: RawFd,
+        name: &std::ffi::OsStr,
+        shown: &Path,
+    ) -> std::io::Result<OwnedFd> {
+        let c = c_name(name.as_bytes()).map_err(into_io)?;
+        let mut last = None;
+        for _ in 0..COMPONENT_ATTEMPTS {
+            // SAFETY: `c` is NUL-terminated and `parent` is an open directory.
+            let fd = open_dir_at(parent, &c, DIR_OPEN_FLAGS);
+            if fd >= 0 {
+                // SAFETY: `fd` is a freshly opened descriptor we own.
+                return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
+            let open_error = std::io::Error::last_os_error();
+            match lstat_at(parent, &c) {
+                Ok(stat) => match file_type(&stat) {
+                    libc::S_IFLNK => {
+                        unlink_at(parent, &c)?;
+                        make_dir_at(parent, &c, true)?;
+                    }
+                    // A directory the open still refused for its own
+                    // reason (permissions, say) is that reason; one that
+                    // only now became a directory is looked at again.
+                    libc::S_IFDIR => {
+                        if !matches!(
+                            open_error.raw_os_error(),
+                            Some(libc::ELOOP | libc::ENOTDIR | libc::ENOENT)
+                        ) {
+                            return Err(open_error);
+                        }
+                    }
+                    _ => return Err(not_a_directory("output parent path", shown)),
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    make_dir_at(parent, &c, true)?;
+                }
+                Err(error) => return Err(error),
+            }
+            last = Some(open_error);
+        }
+        Err(last.unwrap_or_else(|| std::io::Error::other("output parent kept changing")))
+    }
+
+    /// The directory a member's output is created in, reached from the
+    /// extraction root one component at a time by handle, and the output's
+    /// own name in it.
+    ///
+    /// Every parent component is opened relative to the previous one with
+    /// `O_NOFOLLOW | O_DIRECTORY`; a missing one is made with `mkdirat` and
+    /// a symlink one is unlinked and replaced by a real directory. The output
+    /// is then made relative to the held descriptor (`openat`, `mkdirat`,
+    /// `symlinkat`), so a parent renamed or swapped for a symlink after the
+    /// walk cannot move the output out of the directories that were checked.
+    /// The extraction root itself is the caller's choice and is followed.
+    #[derive(Debug)]
+    pub(in crate::archive) struct MemberParent {
+        dir: OwnedFd,
+        name: CString,
+        out_path: std::path::PathBuf,
+    }
+
+    impl MemberParent {
+        /// Walks `walk` beneath `root` for `out_path`, whose file name is
+        /// the output's name.
+        pub(in crate::archive) fn prepare(
+            root: &Path,
+            walk: &[&std::ffi::OsStr],
+            out_path: &Path,
+        ) -> std::io::Result<Self> {
+            Self::prepare_with_hook(root, walk, out_path, || {})
+        }
+
+        /// [`Self::prepare`], running `after_walk` once the parents are
+        /// held. Tests use the hook to swap a parent inside the window.
+        pub(in crate::archive) fn prepare_with_hook(
+            root: &Path,
+            walk: &[&std::ffi::OsStr],
+            out_path: &Path,
+            after_walk: impl FnOnce(),
+        ) -> std::io::Result<Self> {
+            let file_name = out_path.file_name().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("output path {} has no file name", out_path.display()),
+                )
+            })?;
+            let name = c_name(file_name.as_bytes()).map_err(into_io)?;
+            let mut dir = open_root(root).map_err(into_io)?;
+            let mut shown = root.to_path_buf();
+            for part in walk {
+                shown.push(part);
+                dir = enter_or_make_dir(dir.as_raw_fd(), part, &shown)?;
+            }
+            after_walk();
+            Ok(Self {
+                dir,
+                name,
+                out_path: out_path.to_path_buf(),
+            })
+        }
+
+        fn final_type(&self) -> std::io::Result<Option<libc::mode_t>> {
+            match lstat_at(self.dir.as_raw_fd(), &self.name) {
+                Ok(stat) => Ok(Some(file_type(&stat))),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+
+        /// Removes the output name when it is a symlink, so a regular file
+        /// replaces the link rather than writing through it.
+        pub(in crate::archive) fn remove_final_symlink(&self) -> std::io::Result<()> {
+            if self.final_type()? == Some(libc::S_IFLNK) {
+                unlink_at(self.dir.as_raw_fd(), &self.name)?;
+            }
+            Ok(())
+        }
+
+        /// Creates or truncates the output for writing. The open does not
+        /// follow a symlink in the final component, so one planted after
+        /// [`Self::remove_final_symlink`] fails the open (`ELOOP`) instead of
+        /// truncating the file it points to.
+        pub(in crate::archive) fn open_file(&self) -> std::io::Result<std::fs::File> {
+            // SAFETY: `name` is NUL-terminated and `dir` is open.
+            let fd = unsafe {
+                libc::openat(
+                    self.dir.as_raw_fd(),
+                    self.name.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_TRUNC
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o666 as libc::c_uint,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: `fd` is a freshly opened descriptor we own.
+            Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+        }
+
+        /// Makes the output a real directory: kept when it is one, made
+        /// when missing, and a symlink there is replaced by one.
+        pub(in crate::archive) fn ensure_dir(&self) -> std::io::Result<()> {
+            match self.final_type()? {
+                Some(libc::S_IFDIR) => Ok(()),
+                Some(libc::S_IFLNK) => {
+                    unlink_at(self.dir.as_raw_fd(), &self.name)?;
+                    make_dir_at(self.dir.as_raw_fd(), &self.name, false)
+                }
+                Some(_) => Err(not_a_directory("directory output path", &self.out_path)),
+                None => make_dir_at(self.dir.as_raw_fd(), &self.name, false),
+            }
+        }
+
+        /// Opens the output directory [`Self::ensure_dir`] made or kept,
+        /// without following a symlink in its name, so its owner, times and
+        /// mode can be set through the handle (`fchown`, `futimens`,
+        /// `fchmod`). Read access is needed, which a directory the process
+        /// can search but not read lacks; callers fall back to setting them
+        /// by path then.
+        pub(in crate::archive) fn open_dir(&self) -> std::io::Result<std::fs::File> {
+            // SAFETY: `name` is NUL-terminated and `dir` is open.
+            let fd = unsafe {
+                libc::openat(
+                    self.dir.as_raw_fd(),
+                    self.name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: `fd` is a freshly opened descriptor we own.
+            Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+        }
+
+        /// Clears the output name for a link: a directory there refuses,
+        /// anything else is removed.
+        pub(in crate::archive) fn remove_link_output(&self) -> std::io::Result<()> {
+            match self.final_type()? {
+                None => Ok(()),
+                Some(libc::S_IFDIR) => Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "link output path {} is an existing directory",
+                        self.out_path.display()
+                    ),
+                )),
+                Some(_) => unlink_at(self.dir.as_raw_fd(), &self.name),
+            }
+        }
+
+        /// Creates the output as a symlink to `target`.
+        pub(in crate::archive) fn symlink(&self, target: &std::ffi::OsStr) -> std::io::Result<()> {
+            let target = c_name(target.as_bytes()).map_err(into_io)?;
+            // SAFETY: both strings are NUL-terminated and `dir` is open.
+            let rc = unsafe {
+                libc::symlinkat(target.as_ptr(), self.dir.as_raw_fd(), self.name.as_ptr())
+            };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        }
+    }
+
     /// The directory a link output goes in, opened beneath the extraction
     /// root without following a symlink when the output path is the member
     /// path under that root.
@@ -498,8 +807,17 @@ mod unix {
         }
 
         /// A root with write and search permission but no read permission
-        /// still resolves, since `O_PATH` needs only search permission.
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        /// still resolves, since `O_PATH` and `O_SEARCH` need only search
+        /// permission.
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "solaris",
+            target_os = "illumos"
+        ))]
         #[test]
         fn resolves_beneath_a_root_without_read_permission() {
             let temp = tempfile::tempdir().unwrap();
@@ -641,6 +959,184 @@ mod unix {
             std::fs::write(temp.path().join("other.bin"), b"two").unwrap();
             std::fs::rename(temp.path().join("other.bin"), temp.path().join("file.bin")).unwrap();
             assert!(matches!(target.open_read(), Err(AnchorError::Unsafe)));
+        }
+
+        fn os<'a>(parts: &[&'a str]) -> Vec<&'a std::ffi::OsStr> {
+            parts
+                .iter()
+                .map(|part| std::ffi::OsStr::new(*part))
+                .collect()
+        }
+
+        /// Missing parents are made, a symlink parent is replaced by a real
+        /// directory, and the outside directory it named is left alone.
+        #[test]
+        fn member_parent_makes_missing_parents_and_replaces_a_symlink_one() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            let outside = temp.path().join("outside");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            std::os::unix::fs::symlink(&outside, root.join("a")).unwrap();
+            let out_path = root.join("a/b/file.bin");
+
+            let parent = MemberParent::prepare(&root, &os(&["a", "b"]), &out_path).unwrap();
+            std::io::Write::write_all(&mut parent.open_file().unwrap(), b"inside").unwrap();
+
+            let a = std::fs::symlink_metadata(root.join("a")).unwrap();
+            assert!(a.is_dir() && !a.file_type().is_symlink());
+            assert_eq!(std::fs::read(&out_path).unwrap(), b"inside");
+            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        }
+
+        /// A member is extracted into a root and an existing parent that
+        /// the process can write and search but not read (mode `0300`), as
+        /// the path-based creation allowed.
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "solaris",
+            target_os = "illumos"
+        ))]
+        #[test]
+        fn member_parent_extracts_into_search_only_directories() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            std::fs::create_dir_all(root.join("a")).unwrap();
+            let out_path = root.join("a/b/file.bin");
+            for dir in [root.join("a"), root.clone()] {
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+            }
+            let result = MemberParent::prepare(&root, &os(&["a", "b"]), &out_path)
+                .and_then(|parent| std::io::Write::write_all(&mut parent.open_file()?, b"inside"));
+            for dir in [root.clone(), root.join("a")] {
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            result.unwrap();
+            assert_eq!(std::fs::read(&out_path).unwrap(), b"inside");
+        }
+
+        #[test]
+        fn member_parent_refuses_a_file_used_as_a_parent() {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::write(temp.path().join("plain"), b"x").unwrap();
+            let error = MemberParent::prepare(
+                temp.path(),
+                &os(&["plain"]),
+                &temp.path().join("plain/file.bin"),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        }
+
+        /// The check/use race on a member's parent, made deterministic: the
+        /// walk holds `root/dir`, then the directory is renamed away and
+        /// replaced by a symlink to an outside directory. Every output kind
+        /// is still made in the directory that was walked, never outside.
+        #[test]
+        fn a_parent_swapped_after_the_walk_cannot_redirect_the_output() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            let outside = temp.path().join("outside");
+            std::fs::create_dir_all(root.join("dir")).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            let swap = || {
+                std::fs::rename(root.join("dir"), root.join("moved")).unwrap();
+                std::os::unix::fs::symlink(&outside, root.join("dir")).unwrap();
+            };
+            // Puts the walked directory back under its name for the next
+            // output kind.
+            let restore = || {
+                std::fs::remove_file(root.join("dir")).unwrap();
+                std::fs::rename(root.join("moved"), root.join("dir")).unwrap();
+            };
+
+            let file = MemberParent::prepare_with_hook(
+                &root,
+                &os(&["dir"]),
+                &root.join("dir/file.bin"),
+                swap,
+            )
+            .unwrap();
+            file.remove_final_symlink().unwrap();
+            std::io::Write::write_all(&mut file.open_file().unwrap(), b"inside").unwrap();
+            assert_eq!(
+                std::fs::read(root.join("moved/file.bin")).unwrap(),
+                b"inside"
+            );
+            restore();
+
+            let dir =
+                MemberParent::prepare_with_hook(&root, &os(&["dir"]), &root.join("dir/sub"), swap)
+                    .unwrap();
+            dir.ensure_dir().unwrap();
+            assert!(root.join("moved/sub").is_dir());
+            restore();
+
+            let link =
+                MemberParent::prepare_with_hook(&root, &os(&["dir"]), &root.join("dir/link"), swap)
+                    .unwrap();
+            link.remove_link_output().unwrap();
+            link.symlink(std::ffi::OsStr::new("file.bin")).unwrap();
+            assert!(
+                std::fs::symlink_metadata(root.join("moved/link"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+
+            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        }
+
+        #[test]
+        fn member_parent_open_file_does_not_follow_a_final_symlink() {
+            let temp = tempfile::tempdir().unwrap();
+            let outside = temp.path().join("outside.txt");
+            std::fs::write(&outside, b"outside bytes").unwrap();
+            let out_path = temp.path().join("out.bin");
+            std::os::unix::fs::symlink(&outside, &out_path).unwrap();
+
+            // A symlink that appears after the removal step is not followed.
+            let parent = MemberParent::prepare(temp.path(), &[], &out_path).unwrap();
+            assert!(parent.open_file().is_err());
+            assert_eq!(std::fs::read(&outside).unwrap(), b"outside bytes");
+            assert!(
+                std::fs::symlink_metadata(&out_path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+
+            // A regular file is still created, then truncated on reopen.
+            let regular = temp.path().join("regular.bin");
+            let parent = MemberParent::prepare(temp.path(), &[], &regular).unwrap();
+            std::io::Write::write_all(&mut parent.open_file().unwrap(), b"first").unwrap();
+            drop(parent.open_file().unwrap());
+            assert_eq!(std::fs::read(&regular).unwrap(), b"");
+        }
+
+        #[test]
+        fn member_parent_link_output_refuses_an_existing_directory() {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::create_dir(temp.path().join("taken")).unwrap();
+            let parent =
+                MemberParent::prepare(temp.path(), &[], &temp.path().join("taken")).unwrap();
+            let error = parent.remove_link_output().unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+            std::fs::write(temp.path().join("file"), b"x").unwrap();
+            let file = MemberParent::prepare(temp.path(), &[], &temp.path().join("file")).unwrap();
+            file.remove_link_output().unwrap();
+            assert!(!temp.path().join("file").exists());
+            let plain =
+                MemberParent::prepare(temp.path(), &[], &temp.path().join("plain")).unwrap();
+            std::fs::write(temp.path().join("plain"), b"x").unwrap();
+            assert_eq!(
+                plain.ensure_dir().unwrap_err().kind(),
+                std::io::ErrorKind::AlreadyExists
+            );
         }
 
         #[test]

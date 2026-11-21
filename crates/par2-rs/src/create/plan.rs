@@ -792,6 +792,17 @@ pub(crate) fn build_plan_with_cache(
     options: &Par2CreatorOptions,
     cache: Option<&super::source::SourceScanCache>,
 ) -> Result<Par2CreatePlan> {
+    build_plan_with_identities(options, cache).map(|(plan, _)| plan)
+}
+
+/// [`build_plan_with_cache`], also handing back the identity scan's
+/// fingerprint of every source. `create()` keeps them beside its rebuilt plan
+/// and checks each source against them when it opens it for its bytes; they
+/// stay out of the plan itself so plan equality means what it always has.
+pub(crate) fn build_plan_with_identities(
+    options: &Par2CreatorOptions,
+    cache: Option<&super::source::SourceScanCache>,
+) -> Result<(Par2CreatePlan, super::source::SourceIdentities)> {
     if options.cancellation.is_cancelled() {
         return Err(Par2Error::Cancelled);
     }
@@ -825,6 +836,7 @@ pub(crate) fn build_plan_with_cache(
         cache,
     )?;
     let skipped_empty = collected.skipped_empty;
+    let identities = collected.identities;
     let mut sources = collected.sources;
     sources.sort_by_key(|source| source.file_id);
     if options.cancellation.is_cancelled() {
@@ -917,7 +929,7 @@ pub(crate) fn build_plan_with_cache(
         forward_memory,
     )?;
 
-    Ok(Par2CreatePlan {
+    let plan = Par2CreatePlan {
         base_path,
         output_stem,
         main_path,
@@ -939,7 +951,8 @@ pub(crate) fn build_plan_with_cache(
         explicit_memory_limit: options.memory_limit.is_some(),
         dry_run: options.dry_run,
         skipped_empty,
-    })
+    };
+    Ok((plan, identities))
 }
 
 fn canonical_directory(path: &Path, label: &str) -> Result<PathBuf> {

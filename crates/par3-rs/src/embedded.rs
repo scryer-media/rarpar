@@ -521,11 +521,8 @@ pub(crate) fn stage(
     }
     #[cfg(not(target_os = "macos"))]
     let _ = (access, source);
-    let temporary = crate::session_repair::stage_path(destination, options)?;
-    staged.push(temporary.clone());
-    let output = std::fs::OpenOptions::new()
-        .write(true)
-        .open_budgeted(&temporary, options)?;
+    let (temporary, output) = crate::session_repair::stage_file(destination, options)?;
+    staged.push(temporary);
     Ok((output, false))
 }
 
@@ -547,14 +544,13 @@ fn install_by_copy(
     destination: &Path,
     options: &ExecutionOptions,
 ) -> EngineResult<()> {
-    let staged = crate::session_repair::stage_path(destination, options)?;
+    let (staged, output) = crate::session_repair::stage_file(destination, options)?;
     let result = (|| -> EngineResult<()> {
         use std::io::Read;
         let mut from = File::open(temporary, options)?;
-        let mut output = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open_budgeted(&staged, options)?;
+        // Written through the handle that created it, empty, so the old
+        // reopen's truncate had nothing to cut.
+        let mut output = output;
         let length = from.metadata()?.len();
         let size = options.stripe_bytes.clamp(1, 64 << 10);
         let mut buffer = vec![0; size];
@@ -1684,11 +1680,9 @@ impl EmbeddedSet {
         let result = (|| -> EngineResult<()> {
             for (index, host) in self.hosts.iter().enumerate() {
                 let path = host.path.as_deref().expect("bound");
-                let temporary = crate::session_repair::stage_path(&destinations[index], &options)?;
+                let (temporary, mut output) =
+                    crate::session_repair::stage_file(&destinations[index], &options)?;
                 staged.push(temporary.clone());
-                let mut output = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open_budgeted(&temporary, &options)?;
                 let mut hash = FingerprintHasher::new();
                 let mut out = BufWriter::with_capacity(size, &mut output);
                 let mut counted = Counting {

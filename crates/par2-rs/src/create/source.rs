@@ -225,6 +225,42 @@ pub(crate) struct CollectedSources {
     /// the way the caller spelled them rather than canonicalized — this is
     /// destined for a human who is looking for the name they typed.
     pub(crate) skipped_empty: Vec<PathBuf>,
+    /// What the identity scan saw of each source.
+    pub(crate) identities: SourceIdentities,
+}
+
+/// The fingerprint (length, mtime, and on Unix device and inode) the identity
+/// scan read for each source, by [`FileId`].
+///
+/// Every later open of a source for its bytes compares the handle's own
+/// metadata against this, so a file swapped for another of the same length
+/// after the scan is refused with [`Par2Error::CreationSourceChanged`] rather
+/// than protected in the original's place. It is kept beside the plan rather
+/// than in [`CreationSource`], whose fields are public, so the public type's
+/// shape does not change.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SourceIdentities(std::collections::HashMap<FileId, SourceFingerprint>);
+
+impl SourceIdentities {
+    fn with_capacity(capacity: usize) -> Self {
+        Self(std::collections::HashMap::with_capacity(capacity))
+    }
+
+    /// Refuses `source` unless `metadata`, read from a handle just opened on
+    /// it, is a regular file of the planned length and matches the identity
+    /// scan's fingerprint.
+    fn check(&self, source: &CreationSource, metadata: &Metadata) -> Result<SourceFingerprint> {
+        let fingerprint = SourceFingerprint::from_metadata(metadata);
+        if !metadata.is_file()
+            || metadata.len() != source.file_length
+            || self.0.get(&source.file_id) != Some(&fingerprint)
+        {
+            return Err(Par2Error::CreationSourceChanged {
+                path: source.path.display().to_string(),
+            });
+        }
+        Ok(fingerprint)
+    }
 }
 
 /// Resolve and validate explicit source files in input order, reading each
@@ -308,23 +344,24 @@ pub(crate) fn collect_sources(
         })?;
     let mut total_slices = 0usize;
 
-    let hash_one = |(index, input): (usize, &&PathBuf)| -> Result<CreationSource> {
-        if cancellation.is_cancelled() {
-            return Err(Par2Error::Cancelled);
-        }
-        resolve_source_identity(
-            &base,
-            input,
-            block_size,
-            cancellation,
-            progress,
-            index as u32,
-            file_total,
-            &bytes_processed,
-            total_bytes,
-            cache,
-        )
-    };
+    let hash_one =
+        |(index, input): (usize, &&PathBuf)| -> Result<(CreationSource, SourceFingerprint)> {
+            if cancellation.is_cancelled() {
+                return Err(Par2Error::Cancelled);
+            }
+            resolve_source_identity(
+                &base,
+                input,
+                block_size,
+                cancellation,
+                progress,
+                index as u32,
+                file_total,
+                &bytes_processed,
+                total_bytes,
+                cache,
+            )
+        };
     // Hash one file per rayon task; each file's scan is independent. The
     // shared byte counter is monotonic, but callbacks fire concurrently, so
     // DELIVERY to the progress callback is not ordered. The sequential arm
@@ -333,30 +370,34 @@ pub(crate) fn collect_sources(
     // parallel like native)
     // and the WEAVER_PAR2_CREATE_THREADS=1 pre-banding escape hatch.
     let width = concurrent_hash_reads(active_inputs.len());
-    let scanned: Vec<CreationSource> = if reedsolomon_rs::threading::parallel_enabled() && width > 1
-    {
-        // Collect every per-file Result, then surface the FIRST error by
-        // input order: rayon's Result collection reports an arbitrary
-        // racer's error, which would let a concurrent I/O error mask
-        // `Cancelled` (or make the reported path vary run to run). The
-        // deliberate cost is losing error short-circuiting — in-flight
-        // files hash to completion before the error surfaces.
-        map_bounded(active_inputs.iter().enumerate().collect(), width, hash_one)
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?
-    } else {
-        active_inputs
-            .iter()
-            .enumerate()
-            .map(hash_one)
-            .collect::<Result<Vec<_>>>()?
-    };
+    let scanned: Vec<(CreationSource, SourceFingerprint)> =
+        if reedsolomon_rs::threading::parallel_enabled() && width > 1 {
+            // Collect every per-file Result, then surface the FIRST error by
+            // input order: rayon's Result collection reports an arbitrary
+            // racer's error, which would let a concurrent I/O error mask
+            // `Cancelled` (or make the reported path vary run to run). The
+            // deliberate cost is losing error short-circuiting — in-flight
+            // files hash to completion before the error surfaces.
+            map_bounded(active_inputs.iter().enumerate().collect(), width, hash_one)
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            active_inputs
+                .iter()
+                .enumerate()
+                .map(hash_one)
+                .collect::<Result<Vec<_>>>()?
+        };
     // The creation memory plan accounts this vector by LENGTH (plan.rs passes
     // `sources.len()` into `estimate_source_metadata_bytes`), so a collect
     // through a Result adapter cannot skew the estimate. The exact-capacity
     // rebuild stays so the allocation itself matches what the plan admits.
     let mut sources = Vec::with_capacity(active_inputs.len());
-    sources.extend(scanned);
+    let mut identities = SourceIdentities::with_capacity(active_inputs.len());
+    for (source, fingerprint) in scanned {
+        identities.0.insert(source.file_id, fingerprint);
+        sources.push(source);
+    }
 
     for (source, input) in sources.iter().zip(active_inputs.iter()) {
         if !names.insert(source.par2_name.clone()) {
@@ -387,6 +428,7 @@ pub(crate) fn collect_sources(
     Ok(CollectedSources {
         sources,
         skipped_empty,
+        identities,
     })
 }
 
@@ -473,8 +515,12 @@ pub(crate) struct DiskSourceProvider<'a> {
 }
 
 impl<'a> DiskSourceProvider<'a> {
+    /// Opens every source for the encoder. Each is checked through the
+    /// handle just opened, against the identity scan's fingerprint in
+    /// `identities`, so the bytes read are the file the plan describes.
     pub(crate) fn open(
         sources: &'a [CreationSource],
+        identities: &SourceIdentities,
         slice_size: usize,
         cancellation: &'a CancellationToken,
     ) -> Result<Self> {
@@ -491,12 +537,9 @@ impl<'a> DiskSourceProvider<'a> {
             if cancellation.is_cancelled() {
                 return Err(Par2Error::Cancelled);
             }
-            let metadata = fs::metadata(&source.path).map_err(Par2Error::Io)?;
-            if !metadata.is_file() || metadata.len() != source.file_length {
-                return Err(Par2Error::CreationSourceChanged {
-                    path: source.path.display().to_string(),
-                });
-            }
+            let file = File::open(&source.path).map_err(Par2Error::Io)?;
+            let metadata = file.metadata().map_err(Par2Error::Io)?;
+            let fingerprint = identities.check(source, &metadata)?;
             let slice_count = source.slice_checksums.len();
             slice_starts.push(next_start);
             next_start = next_start.checked_add(slice_count).ok_or_else(|| {
@@ -504,8 +547,8 @@ impl<'a> DiskSourceProvider<'a> {
                     reason: "source slice provider index overflows".to_string(),
                 }
             })?;
-            fingerprints.push(SourceFingerprint::from_metadata(&metadata));
-            files.push(File::open(&source.path).map_err(Par2Error::Io)?);
+            fingerprints.push(fingerprint);
+            files.push(file);
         }
         Ok(Self {
             sources,
@@ -745,7 +788,7 @@ fn resolve_source_identity(
     bytes_processed: &AtomicU64,
     total_bytes: u64,
     cache: Option<&SourceScanCache>,
-) -> Result<CreationSource> {
+) -> Result<(CreationSource, SourceFingerprint)> {
     if block_size == 0 || !block_size.is_multiple_of(4) {
         return Err(Par2Error::InvalidCreationOptions {
             reason: format!("source block size {block_size} is not a positive multiple of four"),
@@ -811,7 +854,7 @@ fn resolve_source_identity(
             source.slice_checksums.len(),
             cancellation,
         )?;
-        return Ok(source);
+        return Ok((source, fingerprint));
     }
 
     let file = File::open(&path).map_err(Par2Error::Io)?;
@@ -893,7 +936,7 @@ fn resolve_source_identity(
     if let Some(cache) = cache {
         cache.store(fingerprint, block_size, &source);
     }
-    Ok(source)
+    Ok((source, fingerprint))
 }
 
 fn resolve_input_path(base: &Path, input: &Path) -> Result<PathBuf> {
@@ -1209,8 +1252,11 @@ fn map_bounded<T: Send, R: Send>(
         .collect()
 }
 
+/// Reads every source for its content hashes, checking each through the
+/// handle just opened against the identity scan's fingerprint.
 pub(crate) fn hydrate_source_hashes(
     sources: &mut [CreationSource],
+    identities: &SourceIdentities,
     block_size: u64,
     cancellation: &CancellationToken,
 ) -> Result<()> {
@@ -1222,11 +1268,7 @@ pub(crate) fn hydrate_source_hashes(
         }
         let file = File::open(&source.path).map_err(Par2Error::Io)?;
         let metadata = file.metadata().map_err(Par2Error::Io)?;
-        if !metadata.is_file() || metadata.len() != source.file_length {
-            return Err(Par2Error::CreationSourceChanged {
-                path: source.path.display().to_string(),
-            });
-        }
+        identities.check(source, &metadata)?;
         let hashes = hash_source_contents(
             &file,
             &source.path,
@@ -1676,6 +1718,49 @@ mod tests {
             hydrated[0].slice_checksums[2].crc32,
             checksum::crc32_padded(&payload[16..20], 8)
         );
+    }
+
+    /// A source swapped after the identity scan for another file of the same
+    /// length, and even the same bytes, is refused by both reopens: the
+    /// provider that feeds the encoder and the hydrate read. The handle's own
+    /// metadata is what is compared, so the swap cannot hide behind the path.
+    #[cfg(unix)]
+    #[test]
+    fn a_source_swapped_for_a_same_length_file_is_refused_on_every_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.bin");
+        let payload: Vec<u8> = (0..64u8).collect();
+        fs::write(&path, &payload).unwrap();
+        let cancellation = CancellationToken::new();
+        let collected = collect_sources(
+            dir.path(),
+            std::slice::from_ref(&path),
+            16,
+            &cancellation,
+            None,
+            payload.len() as u64,
+            None,
+        )
+        .unwrap();
+        let mut sources = collected.sources;
+        let identities = collected.identities;
+
+        // Unswapped, both reopens accept the source.
+        assert!(DiskSourceProvider::open(&sources, &identities, 16, &cancellation).is_ok());
+        hydrate_source_hashes(&mut sources.clone(), &identities, 16, &cancellation).unwrap();
+
+        let swapped = dir.path().join("swap.bin");
+        fs::write(&swapped, &payload).unwrap();
+        fs::rename(&swapped, &path).unwrap();
+
+        assert!(matches!(
+            DiskSourceProvider::open(&sources, &identities, 16, &cancellation),
+            Err(Par2Error::CreationSourceChanged { .. })
+        ));
+        assert!(matches!(
+            hydrate_source_hashes(&mut sources, &identities, 16, &cancellation),
+            Err(Par2Error::CreationSourceChanged { .. })
+        ));
     }
 
     #[test]

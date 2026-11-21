@@ -16,6 +16,66 @@ documented in each crate's own changelog so those notes ship with the crate.
   without model" while UnRAR extracts the same archive cleanly.
 - RAR 1.5 and 2.0 members with 4 GiB or more to unpack decode correctly on
   32-bit builds, through unrar-rs 0.16.5.
+- RAR extraction creates every member inside the folders it checked, through
+  unrar-rs 0.16.7. Another process swapping an output folder for a symlink
+  mid-extraction could move a member out of the destination.
+- RAR extraction restores a symlink member's owner on the link itself on
+  every Unix, through unrar-rs 0.16.7. On macOS it gave the link's target the
+  archive's owner, as RAR does there; rarpar departs from RAR on purpose.
+- 7z extraction never sets set-user-ID, set-group-ID or sticky bits from an
+  archive's Unix mode: only the permission bits (`0o777`) are applied.
+- 7z extraction on Windows opens each output folder without following a
+  junction or symlink and holds it open, without delete sharing, until the
+  member is written, as Unix already resolved folders by handle. Files are
+  created only when new, without following a reparse point.
+- A split 7z set (`.7z.001`, `.002`, ...) ends at a sibling volume that is a
+  symlink or not a regular file, and takes each volume's size from the file
+  it opened. A linked sibling could pull an outside file into the set. The
+  first volume, which names the set, may still be a link.
+- PAR2 repair keeps a private file private, through par2-rs 0.13.1: staged
+  repairs are `0600` in a `0700` folder, and the repaired file gets the
+  original's permission bits before it is installed.
+- PAR2 create refuses a source swapped after it was scanned for another file
+  of the same length, through par2-rs 0.13.1.
+- reedsolomon-rs 0.4.12 checks the tiled matrix inversion's input lengths in
+  release builds, and the folded split scatter's lane and staging length.
+- RAR extraction on Unix sets each extracted file's and folder's owner,
+  times and mode through its own handle, through unrar-rs 0.16.7, so a name
+  swapped for a symlink mid-extraction cannot redirect them to another file.
+- PAR3 inside-archive insert and strip write each staged output through the
+  handle that created it, through par3-rs 0.8.4, instead of reopening it by
+  name.
+- `par3 rs` self-repair of an archive with an embedded set reopens its
+  rebuilt temporary without following a symlink on Unix, so one swapped in
+  mid-repair fails the repair instead of taking the packet bytes.
+- A RAR comment or owner record whose header declares a huge packed size
+  fails with a read error instead of aborting on the allocation, through
+  unrar-rs 0.16.7.
+- A RAR5 file-copy member whose source is extracted from the archive is
+  copied from its temporary through a handle opened without following a
+  symlink on Unix, through unrar-rs 0.16.7, so a link swapped in at the
+  temporary name cannot pull another file into the output.
+- 7z extraction on Windows sets a member's time and read-only attribute
+  through one handle opened on it without following a reparse point, so a
+  name swapped for a link after the link check cannot pass the read-only
+  attribute to the link's target.
+- RAR extraction on Windows with owner restoration skips an NTFS ACL record
+  declaring more than any security descriptor holds before decoding it,
+  through unrar-rs 0.16.7, instead of decoding all of it into memory.
+- par2-rs 0.13.1's in-memory packet scan skips an unknown packet without
+  copying its body. The CLI scans files by streaming and was not affected.
+- PAR2 repair cannot hang after installing its output when another process
+  swaps an installed file for a FIFO, through par2-rs 0.13.1.
+- PAR2 repair's hash of a scanned file no longer blocks when another process
+  swaps that file for a FIFO after it was checked, through par2-rs 0.13.1.
+- Discovery of a directory holds at most `--max-files` plus one of its files
+  in memory instead of its whole listing. Which files are found, their order
+  and the "discovery exceeded max files" error are unchanged.
+- RAR5 recovery-record checks and repair hold one bit per recovery chunk
+  instead of one byte, through unrar-rs 0.16.7.
+- `par3 archive` on Unix opens each member to read it without following a
+  symlink, so a member swapped for a link after it was checked under
+  `--base-path` fails the run instead of adding the link's target.
 
 ## rarpar 0.9.6
 

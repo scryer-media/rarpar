@@ -46,6 +46,248 @@ const OUTPUT_WRITE_BUFFER_BYTES: usize = 512 * 1024;
 const DECODE_INPUT_BUFFER_BYTES: usize = 256 * 1024;
 const MAX_LINK_TARGET_BYTES: usize = 0x10000;
 const MAX_COMMENT_BYTES: u64 = 0x1000000;
+
+/// How much to reserve up front for a compressed service's packed bytes read
+/// into memory (`CMT`, `UOW` and the other services
+/// `read_service_subdata_to_memory` loads). This is a reservation hint, not a
+/// limit: `read_to_end` grows the buffer past it on demand, and the
+/// "read N packed bytes, expected M" check after the read is what rejects a
+/// header whose declared packed size is larger than the bytes behind it.
+///
+/// The declared packed size comes from the header before a byte is read, so
+/// reserving it whole let a tiny archive declaring hundreds of GiB abort the
+/// process on the allocation. The hint is the service's unpacked ceiling,
+/// `MAX_COMMENT_BYTES` (checked first, so every payload that gets here is at
+/// most that unpacked). A legitimate compressed payload is about its unpacked
+/// size or smaller, so its reservation stays exact and it reads with one
+/// allocation as before; one that compressed a little past the hint still
+/// reads in full, with `read_to_end` growing the buffer.
+fn service_packed_reserve(packed_len: usize) -> usize {
+    packed_len.min(MAX_COMMENT_BYTES as usize)
+}
+
+/// `std::fs::copy`'s destination step: create or truncate `to` with the
+/// source's mode, and set that mode again when `to` is an existing regular
+/// file.
+#[cfg(all(unix, not(target_os = "android")))]
+fn open_filecopy_destination(
+    to: &std::path::Path,
+    source: &std::fs::Metadata,
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let permissions = source.permissions();
+    let writer = std::fs::OpenOptions::new()
+        .mode(permissions.mode())
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(to)?;
+    let writer_metadata = writer.metadata()?;
+    if writer_metadata.is_file() {
+        writer.set_permissions(permissions)?;
+    }
+    Ok((writer, writer_metadata))
+}
+
+/// `std::fs::copy` from an already-open regular file `reader` whose metadata
+/// is `source`, through the same calls `std::fs::copy` makes.
+#[cfg(target_vendor = "apple")]
+fn filecopy_from_handle(
+    reader: &std::fs::File,
+    source: &std::fs::Metadata,
+    to: &std::path::Path,
+) -> std::io::Result<u64> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    struct FreeOnDrop(libc::copyfile_state_t);
+    impl Drop for FreeOnDrop {
+        fn drop(&mut self) {
+            // SAFETY: only ever built from a non-null `copyfile_state_alloc`.
+            unsafe {
+                libc::copyfile_state_free(self.0);
+            }
+        }
+    }
+
+    let to_c = std::ffi::CString::new(to.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "file name contained an unexpected NUL byte",
+        )
+    })?;
+    // SAFETY: `reader` is an open descriptor and `to_c` a NUL-terminated
+    // path that outlives the call.
+    if unsafe { libc::fclonefileat(reader.as_raw_fd(), libc::AT_FDCWD, to_c.as_ptr(), 0) } == 0 {
+        return Ok(source.len());
+    }
+    let error = std::io::Error::last_os_error();
+    // Not APFS, an existing destination or another device: copy instead.
+    if !matches!(
+        error.raw_os_error(),
+        Some(libc::ENOTSUP) | Some(libc::EEXIST) | Some(libc::EXDEV)
+    ) {
+        return Err(error);
+    }
+
+    let (writer, writer_metadata) = open_filecopy_destination(to, source)?;
+    // SAFETY: allocation is checked for null before use.
+    let state = unsafe {
+        let state = libc::copyfile_state_alloc();
+        if state.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        FreeOnDrop(state)
+    };
+    let flags = if writer_metadata.is_file() {
+        libc::COPYFILE_METADATA | libc::COPYFILE_DATA
+    } else {
+        libc::COPYFILE_DATA
+    };
+    // SAFETY: both descriptors are open and `state` is a live copyfile state.
+    if unsafe { libc::fcopyfile(reader.as_raw_fd(), writer.as_raw_fd(), state.0, flags) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut copied: libc::off_t = 0;
+    // SAFETY: `COPYFILE_STATE_COPIED` writes one `off_t` to the pointer.
+    if unsafe {
+        libc::copyfile_state_get(
+            state.0,
+            libc::COPYFILE_STATE_COPIED as u32,
+            (&raw mut copied).cast::<libc::c_void>(),
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(copied as u64)
+}
+
+/// `std::fs::copy` from an already-open regular file `reader` whose metadata
+/// is `source`: `copy_file_range`, then `sendfile`, then a read/write loop,
+/// falling back on the same errors `std` does. Calling the kernel directly
+/// keeps the copy from re-reading both files' metadata, which `io::copy` on
+/// two plain `File`s does on Linux.
+#[cfg(target_os = "linux")]
+fn filecopy_from_handle(
+    reader: &std::fs::File,
+    source: &std::fs::Metadata,
+    to: &std::path::Path,
+) -> std::io::Result<u64> {
+    use std::os::fd::AsRawFd;
+
+    let (mut writer, _) = open_filecopy_destination(to, source)?;
+    let (input, output) = (reader.as_raw_fd(), writer.as_raw_fd());
+    let mut written = 0u64;
+    let mut kernel_copy = true;
+    while kernel_copy {
+        // SAFETY: both descriptors are open; null offsets use and advance
+        // the file positions.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_copy_file_range,
+                input,
+                std::ptr::null_mut::<libc::loff_t>(),
+                output,
+                std::ptr::null_mut::<libc::loff_t>(),
+                0x4000_0000usize,
+                0u32,
+            )
+        };
+        match result {
+            0 if written == 0 => kernel_copy = false,
+            0 => return Ok(written),
+            copied if copied > 0 => written += copied as u64,
+            _ => {
+                let error = std::io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(libc::EOVERFLOW) => kernel_copy = false,
+                    Some(
+                        libc::ENOSYS
+                        | libc::EXDEV
+                        | libc::EINVAL
+                        | libc::EPERM
+                        | libc::EOPNOTSUPP
+                        | libc::EBADF,
+                    ) if written == 0 => kernel_copy = false,
+                    _ => return Err(error),
+                }
+            }
+        }
+    }
+
+    let mut send = true;
+    while send {
+        // SAFETY: both descriptors are open; a null offset uses and advances
+        // the input's file position.
+        let result =
+            unsafe { libc::sendfile(output, input, std::ptr::null_mut(), 0x7fff_f000usize) };
+        match result {
+            0 => return Ok(written),
+            copied if copied > 0 => written += copied as u64,
+            _ => {
+                let error = std::io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(libc::ENOSYS | libc::EPERM | libc::EINVAL | libc::EOVERFLOW) => {
+                        send = false
+                    }
+                    _ => return Err(error),
+                }
+            }
+        }
+    }
+
+    /// Hides the `File` from `io::copy`'s kernel-copy specialisation, which
+    /// would stat both descriptors only to fail the calls above again.
+    struct Plain<'a>(&'a std::fs::File);
+    impl std::io::Read for Plain<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::io::Read::read(&mut self.0, buf)
+        }
+    }
+    Ok(written + std::io::copy(&mut Plain(reader), &mut writer)?)
+}
+
+/// `std::fs::copy` from an already-open regular file `reader` whose metadata
+/// is `source`. Off Linux and Apple, `std` copies with a plain `io::copy`.
+#[cfg(all(
+    unix,
+    not(target_os = "android"),
+    not(target_os = "linux"),
+    not(target_vendor = "apple")
+))]
+fn filecopy_from_handle(
+    reader: &std::fs::File,
+    source: &std::fs::Metadata,
+    to: &std::path::Path,
+) -> std::io::Result<u64> {
+    let (mut writer, _) = open_filecopy_destination(to, source)?;
+    let mut reader = reader;
+    std::io::copy(&mut reader, &mut writer)
+}
+
+/// The held parent directories of a member's output, from
+/// `RarArchive::prepare_output_parent_for_member`.
+#[cfg(unix)]
+type OutputParent = super::link_anchor::MemberParent;
+#[cfg(windows)]
+type OutputParent = WindowsOutputParent;
+#[cfg(not(any(unix, windows)))]
+type OutputParent = ();
+
+/// Windows: every directory from the extraction root to a member's output,
+/// held open without delete sharing while the output is created.
+#[cfg(windows)]
+struct WindowsOutputParent {
+    _held: Vec<std::fs::File>,
+}
+
+/// How often one parent component is looked at again when it changes between
+/// a look and its repair. Only a concurrent writer does that; the bound keeps
+/// one from looping extraction.
+#[cfg(windows)]
+const OUTPUT_PARENT_ATTEMPTS: usize = 4;
 #[cfg(test)]
 const WINDOWS_IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
 #[cfg(any(windows, test))]
@@ -125,6 +367,10 @@ const WINDOWS_GROUP_SECURITY_INFORMATION: u32 = 0x2;
 const WINDOWS_DACL_SECURITY_INFORMATION: u32 = 0x4;
 #[cfg(any(windows, test))]
 const WINDOWS_SACL_SECURITY_INFORMATION: u32 = 0x8;
+/// The most bytes an NTFS ACL service is decoded into memory for; see
+/// `RarArchive::ntfs_acl_declared_too_large`.
+#[cfg(any(windows, test))]
+const MAX_NTFS_ACL_BYTES: u64 = 1 << 20;
 
 #[cfg(windows)]
 struct WindowsHostMetadata {
@@ -373,7 +619,7 @@ impl RarArchive {
                         Some(fh.name.to_string()),
                     )
                 })?;
-                let mut packed = Vec::with_capacity(packed_capacity);
+                let mut packed = Vec::with_capacity(service_packed_reserve(packed_capacity));
                 let mut reader = reader;
                 reader.read_to_end(&mut packed).map_err(RarError::from)?;
                 if packed.len() as u64 != packed_len {
@@ -565,6 +811,15 @@ impl RarArchive {
         options: &ExtractOptions,
         out_path: &std::path::Path,
     ) -> RarResult<()> {
+        if Self::ntfs_acl_declared_too_large(&service.file_header) {
+            debug!(
+                member = %service.file_header.name,
+                path = %out_path.display(),
+                declared = service.file_header.unpacked_size,
+                "could not restore NTFS ACL service data: larger than any security descriptor"
+            );
+            return Ok(());
+        }
         let mut payload = Vec::new();
         let written = self.write_service_subdata_to_writer(service, options, &mut payload)?;
         if written == 0 {
@@ -663,6 +918,24 @@ impl RarArchive {
             && path.as_bytes()[0].is_ascii_alphabetic()
             && path.as_bytes()[1] == b':'
             && path.as_bytes()[2] == b'\\'
+    }
+
+    /// Whether an NTFS ACL service declares more bytes than any security
+    /// descriptor holds, so it is skipped before a byte is decoded into
+    /// memory, the way one `SetFileSecurityW` rejects is (logged, and the
+    /// member extracted with its default security).
+    ///
+    /// The service is one self-relative security descriptor as
+    /// `GetFileSecurityW` returns it: a 20-byte header, an owner and a group
+    /// SID of at most `SECURITY_MAX_SID_SIZE` (68) bytes each, and a DACL and
+    /// a SACL whose `AclSize` is a 16-bit field, so 65,535 bytes each at most:
+    /// 131,226 bytes in all. `MAX_NTFS_ACL_BYTES` is eight times that, so no
+    /// ACL a Windows system can produce reaches it; only a forged size does,
+    /// and before this check its decoded bytes all went into one buffer. An
+    /// unknown size keeps the error the service reader gives it.
+    #[cfg(any(windows, test))]
+    fn ntfs_acl_declared_too_large(fh: &FileHeader) -> bool {
+        matches!(fh.unpacked_size, Some(size) if size > MAX_NTFS_ACL_BYTES)
     }
 
     #[cfg(any(windows, test))]
@@ -1542,6 +1815,7 @@ impl RarArchive {
         Ok(())
     }
 
+    #[cfg(not(unix))]
     fn remove_existing_regular_output_symlink(out_path: &std::path::Path) -> RarResult<()> {
         match std::fs::symlink_metadata(out_path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -1559,6 +1833,7 @@ impl RarArchive {
         Self::clear_windows_readonly_attribute(out_path)
     }
 
+    #[cfg(any(not(unix), test))]
     fn clear_windows_readonly_before_overwrite(out_path: &std::path::Path) -> RarResult<()> {
         Self::clear_windows_readonly_attribute(out_path)
     }
@@ -1631,6 +1906,7 @@ impl RarArchive {
             .is_some_and(|ch| ch == '.' || ch == ' ')
     }
 
+    #[cfg(not(unix))]
     fn create_output_dir(out_path: &std::path::Path) -> RarResult<()> {
         #[cfg(windows)]
         {
@@ -1733,41 +2009,176 @@ impl RarArchive {
         Ok(())
     }
 
-    fn ensure_output_parent_dir(out_path: &std::path::Path) -> RarResult<()> {
-        if let Some(parent) = out_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            Self::create_output_dir_all(parent)?;
-        }
-        Ok(())
-    }
-
-    fn ensure_output_parent_dir_for_member(
+    /// Makes the directories above a member's output and returns them held,
+    /// so the output is then created in exactly the directories checked.
+    ///
+    /// The extraction root (the output path less the member path) is the
+    /// caller's choice and is made and followed by path. Beneath it, each
+    /// parent component of the member name is reached from the previous one:
+    /// a missing one is made, a symlink one is replaced by a real directory,
+    /// and any other non-directory refuses with `AlreadyExists`. On Unix the
+    /// walk is by descriptor (`openat` with `O_NOFOLLOW | O_DIRECTORY`) and
+    /// the output is made relative to the last one. On Windows each parent is
+    /// opened without following a reparse point and held without delete
+    /// sharing, so none can be renamed, removed or replaced by a junction
+    /// until the output exists; the output itself is still made by path
+    /// through them. An output path that does not end in the member path has
+    /// no archive-controlled parents: its parent is made by path.
+    ///
+    /// This runs once per member, at create time; writes go to the handle
+    /// the create returned.
+    fn prepare_output_parent_for_member(
         member_name: &str,
         out_path: &std::path::Path,
-    ) -> RarResult<()> {
+    ) -> RarResult<OutputParent> {
         let member_path = std::path::Path::new(member_name);
-        if member_name.is_empty() || !out_path.ends_with(member_path) {
-            return Self::ensure_output_parent_dir(out_path);
-        }
-
-        let root = Self::redirection_target_root(member_name, out_path);
+        let (root, walk): (std::path::PathBuf, Vec<&std::ffi::OsStr>) =
+            if member_name.is_empty() || !out_path.ends_with(member_path) {
+                let parent = out_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new(""));
+                (parent.to_path_buf(), Vec::new())
+            } else {
+                let walk = member_path
+                    .parent()
+                    .map(|parent| {
+                        parent
+                            .components()
+                            .filter_map(|component| match component {
+                                std::path::Component::Normal(part) => Some(part),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (Self::redirection_target_root(member_name, out_path), walk)
+            };
         if !root.as_os_str().is_empty() {
             Self::create_output_dir_all(&root)?;
         }
 
-        let Some(member_parent) = member_path.parent() else {
-            return Ok(());
+        #[cfg(unix)]
+        {
+            super::link_anchor::MemberParent::prepare(&root, &walk, out_path)
+                .map_err(RarError::from)
+        }
+
+        #[cfg(windows)]
+        {
+            Self::pin_windows_output_parents(&root, &walk)
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            Self::walk_output_parents_by_path(root, &walk)
+        }
+    }
+
+    /// Windows: the parent walk of [`Self::prepare_output_parent_for_member`].
+    #[cfg(windows)]
+    fn pin_windows_output_parents(
+        root: &std::path::Path,
+        walk: &[&std::ffi::OsStr],
+    ) -> RarResult<OutputParent> {
+        let opened_root = if root.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            root
         };
-        let mut current = root;
-        for component in member_parent.components() {
-            let std::path::Component::Normal(part) = component else {
-                continue;
-            };
+        // The root is the caller's choice and may be a junction itself.
+        let (root_handle, _) = Self::pin_windows_dir(opened_root, true)?;
+        let mut held = vec![root_handle];
+        let mut current = root.to_path_buf();
+        for part in walk {
+            current.push(part);
+            let mut attempts = 0;
+            loop {
+                attempts += 1;
+                if attempts > OUTPUT_PARENT_ATTEMPTS {
+                    return Err(RarError::Io(std::io::Error::other(format!(
+                        "output parent path {} kept changing",
+                        current.display()
+                    ))));
+                }
+                match Self::pin_windows_dir(&current, false) {
+                    Ok((dir, metadata)) if metadata.file_type().is_symlink() => {
+                        drop(dir);
+                        Self::clear_windows_readonly_before_delete(&current)?;
+                        Self::remove_output_file(&current)?;
+                        Self::create_output_dir(&current)?;
+                    }
+                    Ok((dir, metadata)) if metadata.is_dir() => {
+                        held.push(dir);
+                        break;
+                    }
+                    Ok(_) => {
+                        return Err(RarError::Io(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!(
+                                "output parent path {} exists and is not a directory",
+                                current.display()
+                            ),
+                        )));
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        // Made by another writer meanwhile: look again.
+                        if let Err(err) = Self::create_output_dir(&current)
+                            && !Self::windows_output_path_exists(&current)
+                        {
+                            return Err(err);
+                        }
+                    }
+                    Err(err) => return Err(RarError::from(err)),
+                }
+            }
+        }
+        Ok(WindowsOutputParent { _held: held })
+    }
+
+    /// Windows: opens `path` for its attributes only, without delete
+    /// sharing, and judges it through the handle. Without `follow` a
+    /// reparse point is opened itself rather than its target.
+    #[cfg(windows)]
+    fn pin_windows_dir(
+        path: &std::path::Path,
+        follow: bool,
+    ) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let mut flags = FILE_FLAG_BACKUP_SEMANTICS;
+        if !follow {
+            flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+        }
+        let handle = Self::open_windows_file_with_long_path_fallback(
+            path,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            flags,
+        );
+        if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `handle` is a valid handle we now own.
+        let file = unsafe { std::fs::File::from_raw_handle(handle as _) };
+        let metadata = file.metadata()?;
+        Ok((file, metadata))
+    }
+
+    /// Other targets: the parent walk of
+    /// [`Self::prepare_output_parent_for_member`], by path.
+    #[cfg(not(any(unix, windows)))]
+    fn walk_output_parents_by_path(
+        mut current: std::path::PathBuf,
+        walk: &[&std::ffi::OsStr],
+    ) -> RarResult<OutputParent> {
+        for part in walk {
             current.push(part);
             match std::fs::symlink_metadata(&current) {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
-                    Self::clear_windows_readonly_before_delete(&current)?;
                     Self::remove_output_file(&current)?;
                     Self::create_output_dir(&current)?;
                 }
@@ -1787,15 +2198,54 @@ impl RarArchive {
                 Err(err) => return Err(RarError::from(err)),
             }
         }
-
         Ok(())
     }
 
-    fn ensure_output_directory_at_member_path(
+    /// Makes the directories above a member's output for a caller that
+    /// resolves the output's directory itself (hard links and file copies).
+    fn ensure_output_parent_dir_for_member(
         member_name: &str,
         out_path: &std::path::Path,
     ) -> RarResult<()> {
-        Self::ensure_output_parent_dir_for_member(member_name, out_path)?;
+        Self::prepare_output_parent_for_member(member_name, out_path).map(drop)
+    }
+
+    /// Makes the directory output and, on Unix when `open_handle` asks,
+    /// opens it through the held parent without following a link, for its
+    /// metadata. `None` when not asked, off Unix, or when the open fails
+    /// (an unreadable directory, say): the caller then sets it by path, as
+    /// before.
+    fn ensure_output_directory_at_member_path(
+        member_name: &str,
+        out_path: &std::path::Path,
+        open_handle: bool,
+    ) -> RarResult<Option<std::fs::File>> {
+        // An output path with no final name (`.`, `..`, `/`, a path ending in
+        // `..`) is a directory the caller named, with no member-controlled
+        // component to anchor: it is made or accepted by path, and its
+        // metadata set by path, as before the anchored walk.
+        #[cfg(unix)]
+        if out_path.file_name().is_none() {
+            std::fs::create_dir_all(out_path).map_err(RarError::from)?;
+            return Ok(None);
+        }
+        let parent = Self::prepare_output_parent_for_member(member_name, out_path)?;
+        #[cfg(unix)]
+        {
+            parent.ensure_dir().map_err(RarError::from)?;
+            Ok(open_handle.then(|| parent.open_dir().ok()).flatten())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = open_handle;
+            // Held until the directory exists.
+            let _parent = parent;
+            Self::ensure_output_directory_by_path(out_path).map(|()| None)
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn ensure_output_directory_by_path(out_path: &std::path::Path) -> RarResult<()> {
         match std::fs::symlink_metadata(out_path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 Self::clear_windows_readonly_before_delete(out_path)?;
@@ -1820,12 +2270,24 @@ impl RarArchive {
         Ok(())
     }
 
+    #[cfg(test)]
     fn ensure_output_directory_for_member(
         member_name: &str,
         out_path: &std::path::Path,
     ) -> RarResult<std::path::PathBuf> {
-        match Self::ensure_output_directory_at_member_path(member_name, out_path) {
-            Ok(()) => Ok(out_path.to_path_buf()),
+        Self::ensure_output_directory_with_handle_for_member(member_name, out_path, false)
+            .map(|(path, _)| path)
+    }
+
+    /// The directory output's path and, when `open_handle` asks and it could
+    /// be opened, its handle (see [`Self::ensure_output_directory_at_member_path`]).
+    fn ensure_output_directory_with_handle_for_member(
+        member_name: &str,
+        out_path: &std::path::Path,
+        open_handle: bool,
+    ) -> RarResult<(std::path::PathBuf, Option<std::fs::File>)> {
+        match Self::ensure_output_directory_at_member_path(member_name, out_path, open_handle) {
+            Ok(handle) => Ok((out_path.to_path_buf(), handle)),
             Err(original_err) => {
                 if let Some((fallback_member_name, fallback_path)) =
                     Self::unix_windows_share_fallback_output_path(member_name, out_path)
@@ -1835,11 +2297,12 @@ impl RarArchive {
                         fallback = %fallback_path.display(),
                         "retrying directory creation with Windows-share-compatible RAR name"
                     );
-                    Self::ensure_output_directory_at_member_path(
+                    let handle = Self::ensure_output_directory_at_member_path(
                         &fallback_member_name,
                         &fallback_path,
+                        open_handle,
                     )?;
-                    Ok(fallback_path)
+                    Ok((fallback_path, handle))
                 } else {
                     Err(original_err)
                 }
@@ -2037,24 +2500,32 @@ impl RarArchive {
         member_name: &str,
         out_path: &std::path::Path,
     ) -> RarResult<std::fs::File> {
-        Self::ensure_output_parent_dir_for_member(member_name, out_path)?;
-        Self::remove_existing_regular_output_symlink(out_path)?;
-        Self::clear_windows_readonly_before_overwrite(out_path)?;
-        Self::open_regular_output_file(out_path)
+        let parent = Self::prepare_output_parent_for_member(member_name, out_path)?;
+        // On Unix a symlink at the output name is removed and the file is
+        // then created relative to the held parent with `O_NOFOLLOW`, so one
+        // planted after the removal fails the open (`ELOOP`) instead of
+        // truncating the file it points to.
+        #[cfg(unix)]
+        {
+            parent.remove_final_symlink()?;
+            parent.open_file().map_err(RarError::from)
+        }
+        #[cfg(not(unix))]
+        {
+            // Held until the file is open.
+            let _parent = parent;
+            Self::remove_existing_regular_output_symlink(out_path)?;
+            Self::clear_windows_readonly_before_overwrite(out_path)?;
+            Self::open_regular_output_file(out_path)
+        }
     }
 
-    /// Creates or truncates `out_path` for writing. On Unix the open does
-    /// not follow a symlink in the final component, so one planted after
-    /// `remove_existing_regular_output_symlink` ran fails the open (`ELOOP`)
-    /// instead of truncating the file it points to.
+    /// Creates or truncates `out_path` for writing, by path through the
+    /// parents [`Self::prepare_output_parent_for_member`] holds.
+    #[cfg(not(unix))]
     fn open_regular_output_file(out_path: &std::path::Path) -> RarResult<std::fs::File> {
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::custom_flags(
-            &mut options,
-            libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        );
         options.open(out_path).map_err(RarError::from)
     }
 
@@ -2161,9 +2632,8 @@ impl RarArchive {
         target_is_directory: bool,
         out_path: &std::path::Path,
     ) -> RarResult<u64> {
-        Self::ensure_output_parent_dir_for_member(member_name, out_path)?;
+        let parent = Self::prepare_output_parent_for_member(member_name, out_path)?;
         Self::ensure_safe_symlink_target(fh, member_name, target, raw_member_name, out_path)?;
-        Self::remove_existing_link_output(out_path)?;
 
         #[cfg(unix)]
         {
@@ -2174,7 +2644,9 @@ impl RarArchive {
             let target = target_raw
                 .map(std::ffi::OsStr::from_bytes)
                 .unwrap_or_else(|| std::ffi::OsStr::new(target));
-            std::os::unix::fs::symlink(target, out_path).map_err(RarError::from)?;
+            parent.remove_link_output()?;
+            parent.symlink(target)?;
+            drop(parent);
             Self::apply_symlink_times(fh, out_path)?;
             if options.restore_owners {
                 Self::apply_unix_owner(owner, out_path, false)?;
@@ -2188,18 +2660,22 @@ impl RarArchive {
             let _ = options;
             let _ = target_raw;
 
+            Self::remove_existing_link_output(out_path)?;
             Self::ensure_safe_windows_reparse_target(windows_reparse_target, raw_member_name)?;
             Self::create_windows_symlink_reparse_point(
                 windows_reparse_target,
                 out_path,
                 fh.is_directory || target_is_directory,
             )?;
+            drop(parent);
             Self::apply_symlink_times(fh, out_path)?;
             Ok(0)
         }
 
         #[cfg(not(any(unix, windows)))]
         {
+            let _ = parent;
+            Self::remove_existing_link_output(out_path)?;
             let _ = fh;
             let _ = owner;
             let _ = options;
@@ -2666,7 +3142,7 @@ impl RarArchive {
         target: &Rar3UnixLinkTarget,
         out_path: &std::path::Path,
     ) -> RarResult<u64> {
-        Self::ensure_output_parent_dir_for_member(member_name, out_path)?;
+        let parent = Self::prepare_output_parent_for_member(member_name, out_path)?;
         Self::ensure_safe_symlink_target(
             fh,
             member_name,
@@ -2674,14 +3150,15 @@ impl RarArchive {
             raw_member_name,
             out_path,
         )?;
-        Self::remove_existing_link_output(out_path)?;
 
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
 
             let raw_target = std::ffi::OsStr::from_bytes(&target.raw);
-            std::os::unix::fs::symlink(raw_target, out_path).map_err(RarError::from)?;
+            parent.remove_link_output()?;
+            parent.symlink(raw_target)?;
+            drop(parent);
             Self::apply_symlink_times(fh, out_path)?;
             if options.restore_owners {
                 Self::apply_unix_owner(owner, out_path, false)?;
@@ -2691,11 +3168,12 @@ impl RarArchive {
 
         #[cfg(not(unix))]
         {
+            let _parent = parent;
+            Self::remove_existing_link_output(out_path)?;
             let _ = fh;
             let _ = owner;
             let _ = options;
             let _ = member_name;
-            let _ = out_path;
             Err(RarError::UnsupportedLinkType {
                 member: raw_member_name.to_string(),
                 link_type: "RAR3 Unix symlink".to_string(),
@@ -3037,7 +3515,14 @@ impl RarArchive {
                     );
                 }
             }
-            let original_mode = Self::unix_followed_mode(out_path);
+            // `chown` may clear set-user-ID and set-group-ID, so a followed
+            // restore puts the mode back afterwards. `lchown` changes the
+            // link itself and leaves its target, mode included, alone.
+            let original_mode = if chown_follows_links {
+                Self::unix_followed_mode(out_path)
+            } else {
+                None
+            };
 
             use std::os::unix::ffi::OsStrExt;
 
@@ -3085,9 +3570,17 @@ impl RarArchive {
         Ok(())
     }
 
+    /// Whether an owner restore follows a link at the output path: only when
+    /// the caller asks (regular files and folders). A symlink member's owner
+    /// is set with `lchown` on every Unix, Apple targets included.
+    ///
+    /// This deliberately departs from RAR on macOS, whose extractor calls
+    /// `chown` there and so hands the symlink's target, which may sit
+    /// outside the extraction root, to the archive's owner. macOS has
+    /// `lchown`, so the link itself gets the owner instead.
     #[cfg(any(unix, test))]
     fn unix_owner_chown_follows_links(follow_links: bool) -> bool {
-        follow_links || cfg!(target_vendor = "apple")
+        follow_links
     }
 
     #[cfg(unix)]
@@ -3269,6 +3762,113 @@ impl RarArchive {
         Self::apply_windows_attributes(fh, out_path)
     }
 
+    /// [`Self::apply_output_metadata`] through the output's own open handle
+    /// on Unix: `fchown`, `futimens` and `fchmod` on the file or directory
+    /// the extraction created, in the same order and with the same values and
+    /// error handling, so a name swapped after the output was made (another
+    /// process writing to the output tree) cannot redirect them to another
+    /// file. `out_path` only labels log lines. Creation time and Windows
+    /// attributes are no-ops on Unix, as in the path form.
+    #[cfg(unix)]
+    fn apply_output_metadata_to_handle(
+        fh: &FileHeader,
+        owner: Option<&crate::types::UnixOwnerInfo>,
+        options: &ExtractOptions,
+        file: &std::fs::File,
+        out_path: &std::path::Path,
+    ) -> RarResult<()> {
+        if options.restore_owners {
+            Self::apply_unix_owner_to_handle(owner, file, out_path)?;
+        }
+        if let Some((atime, mtime)) =
+            Self::unix_regular_file_times(fh.mtime, fh.atime, std::time::SystemTime::now())
+            && let Err(error) = filetime::set_file_handle_times(file, Some(atime), Some(mtime))
+        {
+            debug!(
+                path = %out_path.display(),
+                ?error,
+                "failed to restore output timestamps"
+            );
+        }
+        if let Some(mode) = Self::unix_output_mode(fh) {
+            use std::os::unix::fs::PermissionsExt;
+
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
+                .map_err(RarError::from)?;
+        }
+        Ok(())
+    }
+
+    /// Whether [`Self::apply_output_metadata_to_handle`] has anything to do
+    /// for this member, so a directory is opened for it only when it does.
+    #[cfg(unix)]
+    fn output_metadata_needs_handle(fh: &FileHeader, options: &ExtractOptions) -> bool {
+        options.restore_owners
+            || fh.mtime.is_some()
+            || fh.atime.is_some()
+            || Self::unix_header_mode(fh).is_some()
+    }
+
+    /// [`Self::apply_unix_owner`] with links followed, through `file`. The
+    /// owner check and the mode put back after `fchown` both come from one
+    /// `fstat`, where the path form took two `stat`s of the same file.
+    #[cfg(unix)]
+    fn apply_unix_owner_to_handle(
+        owner: Option<&crate::types::UnixOwnerInfo>,
+        file: &std::fs::File,
+        out_path: &std::path::Path,
+    ) -> RarResult<()> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let Some(owner) = owner else {
+            return Ok(());
+        };
+        let Some((uid, gid)) = Self::resolve_unix_owner(owner)? else {
+            return Ok(());
+        };
+        let original_mode = match file.metadata() {
+            Ok(metadata) => {
+                let uid_matches = uid.is_none_or(|uid| u64::from(metadata.uid()) == uid as u64);
+                let gid_matches = gid.is_none_or(|gid| u64::from(metadata.gid()) == gid as u64);
+                if uid_matches && gid_matches {
+                    return Ok(());
+                }
+                Some(metadata.permissions().mode())
+            }
+            Err(error) => {
+                debug!(
+                    path = %out_path.display(),
+                    error = %error,
+                    "failed to inspect Unix owner before restore"
+                );
+                None
+            }
+        };
+        let uid_arg = uid.unwrap_or(!0 as libc::uid_t);
+        let gid_arg = gid.unwrap_or(!0 as libc::gid_t);
+        // SAFETY: `file` is an open descriptor for the duration of the call.
+        if unsafe { libc::fchown(file.as_raw_fd(), uid_arg, gid_arg) } != 0 {
+            debug!(
+                path = %out_path.display(),
+                error = %std::io::Error::last_os_error(),
+                "failed to restore Unix owner"
+            );
+            return Ok(());
+        }
+        // `fchown` may clear set-user-ID and set-group-ID; put the mode back.
+        if let Some(mode) = original_mode
+            && let Err(error) = file.set_permissions(std::fs::Permissions::from_mode(mode))
+        {
+            debug!(
+                path = %out_path.display(),
+                error = %error,
+                "failed to restore Unix mode after owner restore"
+            );
+        }
+        Ok(())
+    }
+
     fn create_hardlink_output(
         fh: &FileHeader,
         member_name: &str,
@@ -3365,21 +3965,57 @@ impl RarArchive {
         }
     }
 
+    fn filecopy_source_not_a_file(source_path: &std::path::Path) -> RarError {
+        RarError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "RAR file-copy source {} is not a regular file",
+                source_path.display()
+            ),
+        ))
+    }
+
+    #[cfg(not(all(unix, not(target_os = "android"))))]
     fn copy_existing_filecopy_source(
         source_path: &std::path::Path,
         out_path: &std::path::Path,
     ) -> RarResult<u64> {
         let metadata = std::fs::metadata(source_path).map_err(RarError::from)?;
         if !metadata.is_file() {
-            return Err(RarError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "RAR file-copy source {} is not a regular file",
-                    source_path.display()
-                ),
-            )));
+            return Err(Self::filecopy_source_not_a_file(source_path));
         }
         std::fs::copy(source_path, out_path).map_err(RarError::from)
+    }
+
+    /// Copies the extracted file-copy source at `source_path` to `out_path`
+    /// as `std::fs::copy` does, but from one handle opened without
+    /// following a symlink: a link swapped in at the temporary name fails
+    /// the open instead of copying whatever it points at, and a FIFO there
+    /// cannot block the open. The handle's own metadata replaces the path
+    /// stat that used to precede the copy, so the copy does one stat fewer.
+    ///
+    /// The destination is created, truncated and given the source's mode,
+    /// and the bytes move with the same kernel calls `std::fs::copy` uses
+    /// (`fclonefileat`, then `fcopyfile`, on Apple; `copy_file_range`, then
+    /// `sendfile`, on Linux), so the output's content, mode and times are
+    /// as before.
+    #[cfg(all(unix, not(target_os = "android")))]
+    fn copy_existing_filecopy_source(
+        source_path: &std::path::Path,
+        out_path: &std::path::Path,
+    ) -> RarResult<u64> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(source_path)
+            .map_err(RarError::from)?;
+        let metadata = reader.metadata().map_err(RarError::from)?;
+        if !metadata.is_file() {
+            return Err(Self::filecopy_source_not_a_file(source_path));
+        }
+        filecopy_from_handle(&reader, &metadata, out_path).map_err(RarError::from)
     }
 
     fn unique_filecopy_temp_path(out_path: &std::path::Path, index: usize) -> std::path::PathBuf {
@@ -5115,9 +5751,30 @@ impl RarArchive {
         }
 
         if fh.is_directory {
-            let resolved_out_path =
-                Self::ensure_output_directory_for_member(&member_name, out_path)?;
-            Self::apply_output_metadata(&fh, owner.as_ref(), options, &resolved_out_path)?;
+            #[cfg(unix)]
+            let open_handle = Self::output_metadata_needs_handle(&fh, options);
+            #[cfg(not(unix))]
+            let open_handle = false;
+            let (resolved_out_path, handle) = Self::ensure_output_directory_with_handle_for_member(
+                &member_name,
+                out_path,
+                open_handle,
+            )?;
+            match handle {
+                #[cfg(unix)]
+                Some(dir) => Self::apply_output_metadata_to_handle(
+                    &fh,
+                    owner.as_ref(),
+                    options,
+                    &dir,
+                    &resolved_out_path,
+                )?,
+                #[cfg(not(unix))]
+                Some(_) => unreachable!("directory handles are opened on Unix only"),
+                None => {
+                    Self::apply_output_metadata(&fh, owner.as_ref(), options, &resolved_out_path)?
+                }
+            }
             if let (Some(p), Some(mi)) = (progress, mi.as_ref()) {
                 p.on_member_progress(mi, 0);
                 p.on_member_complete(mi, &Ok(()));
@@ -5151,6 +5808,28 @@ impl RarArchive {
 
         let written = self.extract_member_attached_to_writer(index, options, &mut writer)?;
 
+        // Every decode route flushes before it returns, so this writes
+        // nothing; it guarantees the times set next follow the last write.
+        writer.flush().map_err(RarError::from)?;
+        // A member name ending in a separator (a crafted RAR4 Unicode name,
+        // say) still makes a file, named by its last component, but the path
+        // calls see a directory path and fail with `ENOTDIR`, which failed
+        // the member when it carries a Unix mode. Such a path keeps the path
+        // form so that verdict is unchanged; every other output is set
+        // through the handle just written.
+        #[cfg(unix)]
+        if out_path.as_os_str().as_encoded_bytes().last() == Some(&b'/') {
+            Self::apply_output_metadata(&fh, owner.as_ref(), options, out_path)?;
+        } else {
+            Self::apply_output_metadata_to_handle(
+                &fh,
+                owner.as_ref(),
+                options,
+                writer.get_ref(),
+                out_path,
+            )?;
+        }
+        #[cfg(not(unix))]
         Self::apply_output_metadata(&fh, owner.as_ref(), options, out_path)?;
         self.restore_ntfs_acl_for_member(index, options, out_path)?;
         self.restore_ntfs_streams_for_member(index, options, out_path)?;
@@ -8913,33 +9592,50 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn open_regular_output_file_does_not_follow_a_final_symlink() {
-        let temp = tempfile::tempdir().unwrap();
-        let outside = temp.path().join("outside.txt");
-        std::fs::write(&outside, b"outside bytes").unwrap();
-        let out_path = temp.path().join("out.bin");
-        std::os::unix::fs::symlink(&outside, &out_path).unwrap();
+    fn regular_output_replaces_symlinks_in_its_parents_and_name() {
+        use std::io::Write;
 
-        // A symlink that appears after the removal step is not followed.
-        let err = RarArchive::open_regular_output_file(&out_path).unwrap_err();
-        assert!(matches!(err, RarError::Io(_)));
-        assert_eq!(std::fs::read(&outside).unwrap(), b"outside bytes");
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("file.bin"), b"outside bytes").unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("parent")).unwrap();
+
+        let out_path = root.join("parent/file.bin");
+        let (mut file, resolved) =
+            RarArchive::create_regular_output_file_for_member("parent/file.bin", &out_path)
+                .unwrap();
+        file.write_all(b"inside").unwrap();
+        drop(file);
+        assert_eq!(resolved, out_path);
+        let parent = std::fs::symlink_metadata(root.join("parent")).unwrap();
+        assert!(parent.is_dir() && !parent.file_type().is_symlink());
+        assert_eq!(std::fs::read(&out_path).unwrap(), b"inside");
+        assert_eq!(
+            std::fs::read(outside.join("file.bin")).unwrap(),
+            b"outside bytes"
+        );
+
+        // A symlink at the output name itself is replaced, not written through.
+        std::fs::remove_file(&out_path).unwrap();
+        std::os::unix::fs::symlink(outside.join("file.bin"), &out_path).unwrap();
+        let (mut file, _) =
+            RarArchive::create_regular_output_file_for_member("parent/file.bin", &out_path)
+                .unwrap();
+        file.write_all(b"again").unwrap();
+        drop(file);
         assert!(
-            std::fs::symlink_metadata(&out_path)
+            !std::fs::symlink_metadata(&out_path)
                 .unwrap()
                 .file_type()
                 .is_symlink()
         );
-
-        // A regular file is still created, then truncated on reopen.
-        let regular = temp.path().join("regular.bin");
-        std::io::Write::write_all(
-            &mut RarArchive::open_regular_output_file(&regular).unwrap(),
-            b"first",
-        )
-        .unwrap();
-        drop(RarArchive::open_regular_output_file(&regular).unwrap());
-        assert_eq!(std::fs::read(&regular).unwrap(), b"");
+        assert_eq!(
+            std::fs::read(outside.join("file.bin")).unwrap(),
+            b"outside bytes"
+        );
     }
 
     #[cfg(unix)]
@@ -9008,6 +9704,156 @@ mod tests {
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode & 0o4000, if is_root { 0o4000 } else { 0 });
         assert_eq!(mode & 0o777, 0o755);
+    }
+
+    /// A directory member unpacked to a path with no final name (the current
+    /// directory, the root, a path ending in `..`) is accepted as the
+    /// existing directory the caller named, and its metadata goes by path.
+    #[cfg(unix)]
+    #[test]
+    fn directory_output_without_a_final_name_is_accepted() {
+        let temp = tempfile::tempdir().unwrap();
+        let nested = temp.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let up = nested.join("..");
+        for out_path in [
+            std::path::Path::new("."),
+            std::path::Path::new("./"),
+            std::path::Path::new("/"),
+            up.as_path(),
+        ] {
+            let (resolved, handle) =
+                RarArchive::ensure_output_directory_with_handle_for_member("dir", out_path, true)
+                    .unwrap_or_else(|error| panic!("{}: {error}", out_path.display()));
+            assert_eq!(resolved, out_path);
+            assert!(handle.is_none(), "{}", out_path.display());
+        }
+        let file = temp.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let not_dir = file.join("..");
+        assert!(
+            RarArchive::ensure_output_directory_with_handle_for_member("dir", &not_dir, true)
+                .is_err()
+        );
+    }
+
+    /// Metadata set through the output's handle lands on the file or
+    /// directory extracted even after its name is swapped for a symlink to
+    /// another file, and gives the same mode and times the path form gives.
+    #[cfg(unix)]
+    #[test]
+    fn output_metadata_by_handle_follows_the_output_not_its_name() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_500_000_000);
+        let atime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_400_000_000);
+        let mut fh = test_rar3_symlink_header(None);
+        fh.host_os = HostOs::Unix;
+        fh.mtime = Some(mtime);
+        fh.atime = Some(atime);
+        let options = ExtractOptions::default();
+
+        for is_directory in [false, true] {
+            let tag = if is_directory { "dir" } else { "file" };
+            fh.is_directory = is_directory;
+            fh.attributes = FileAttributes(if is_directory {
+                0o040000 | 0o750
+            } else {
+                0o100000 | 0o640
+            });
+            let victim = temp.path().join(format!("victim-{tag}"));
+            std::fs::write(&victim, b"victim").unwrap();
+            std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let victim_before = std::fs::metadata(&victim).unwrap();
+
+            let out = temp.path().join(format!("out-{tag}"));
+            let handle = if is_directory {
+                std::fs::create_dir(&out).unwrap();
+                std::fs::File::open(&out).unwrap()
+            } else {
+                std::fs::File::create(&out).unwrap()
+            };
+            let moved = temp.path().join(format!("moved-{tag}"));
+            std::fs::rename(&out, &moved).unwrap();
+            std::os::unix::fs::symlink(&victim, &out).unwrap();
+
+            RarArchive::apply_output_metadata_to_handle(&fh, None, &options, &handle, &out)
+                .unwrap();
+
+            let extracted = std::fs::metadata(&moved).unwrap();
+            assert_eq!(
+                extracted.permissions().mode() & 0o7777,
+                if is_directory { 0o750 } else { 0o640 }
+            );
+            assert_eq!(extracted.modified().unwrap(), mtime);
+            assert_eq!(extracted.accessed().unwrap(), atime);
+            let victim_after = std::fs::metadata(&victim).unwrap();
+            assert_eq!(victim_after.permissions().mode() & 0o7777, 0o600);
+            assert_eq!(
+                victim_after.modified().unwrap(),
+                victim_before.modified().unwrap()
+            );
+
+            // The path form, on a fresh output, gives the same mode and times.
+            let by_path = temp.path().join(format!("by-path-{tag}"));
+            if is_directory {
+                std::fs::create_dir(&by_path).unwrap();
+            } else {
+                std::fs::write(&by_path, b"").unwrap();
+            }
+            RarArchive::apply_output_metadata(&fh, None, &options, &by_path).unwrap();
+            let by_path = std::fs::metadata(&by_path).unwrap();
+            assert_eq!(
+                by_path.permissions().mode() & 0o7777,
+                extracted.permissions().mode() & 0o7777
+            );
+            assert_eq!(by_path.modified().unwrap(), extracted.modified().unwrap());
+            assert_eq!(by_path.accessed().unwrap(), extracted.accessed().unwrap());
+        }
+    }
+
+    /// A directory member gets its metadata through a handle the held parent
+    /// opened, and only when there is metadata to set. (A file member name
+    /// ending in a separator keeping the path form's `ENOTDIR` is pinned by
+    /// `encoded_rar4_names_stay_names` in `tests/advisories.rs`.)
+    #[cfg(unix)]
+    #[test]
+    fn extracted_directory_metadata_goes_through_the_held_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let out = temp.path().join("parent/child");
+        let (path, handle) =
+            RarArchive::ensure_output_directory_with_handle_for_member("parent/child", &out, true)
+                .unwrap();
+        assert_eq!(path, out);
+        let handle = handle.expect("a readable directory output opens");
+        let mut fh = test_rar3_symlink_header(None);
+        fh.host_os = HostOs::Unix;
+        fh.is_directory = true;
+        fh.attributes = FileAttributes(0o040000 | 0o705);
+        RarArchive::apply_output_metadata_to_handle(
+            &fh,
+            None,
+            &ExtractOptions::default(),
+            &handle,
+            &out,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&out).unwrap().permissions().mode() & 0o7777,
+            0o705
+        );
+
+        // Nothing asked for, nothing opened.
+        let (_, handle) = RarArchive::ensure_output_directory_with_handle_for_member(
+            "parent/other",
+            &temp.path().join("parent/other"),
+            false,
+        )
+        .unwrap();
+        assert!(handle.is_none());
     }
 
     #[test]
@@ -9141,12 +9987,53 @@ mod tests {
         assert_eq!(std::fs::read(fallback).unwrap(), b"fallback bytes");
     }
 
+    /// Owner restore follows a link only when the caller asks; a symlink
+    /// member uses `lchown` on every Unix. On Apple targets this departs from
+    /// RAR, which follows the link there.
     #[test]
-    fn unix_owner_chown_link_following_matches_rar_behavior_platform_branch() {
+    fn unix_owner_chown_follows_links_only_when_asked_on_every_platform() {
         assert!(RarArchive::unix_owner_chown_follows_links(true));
+        assert!(!RarArchive::unix_owner_chown_follows_links(false));
+    }
+
+    /// Restoring a symlink member's group changes the link itself and leaves
+    /// its target alone. Uses a supplementary group of this process, which
+    /// any user may hand a file it owns; skipped when there is none.
+    #[cfg(unix)]
+    #[test]
+    fn unix_owner_restore_on_a_symlink_never_reaches_its_target() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("outside.bin");
+        std::fs::write(&target, b"target").unwrap();
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let target_gid = std::fs::metadata(&target).unwrap().gid();
+        let link_gid = std::fs::symlink_metadata(&link).unwrap().gid();
+
+        // SAFETY: a zero-length query returns the count and writes nothing.
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        assert!(count >= 0);
+        let mut groups = vec![0 as libc::gid_t; count as usize];
+        // SAFETY: `groups` holds `count` entries.
+        let count = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+        assert!(count >= 0);
+        groups.truncate(count as usize);
+        let Some(other) = groups.into_iter().find(|&gid| {
+            u64::from(gid) != u64::from(target_gid) && u64::from(gid) != u64::from(link_gid)
+        }) else {
+            return;
+        };
+
+        let owner = crate::types::UnixOwnerInfo {
+            gid: Some(u64::from(other)),
+            ..Default::default()
+        };
+        RarArchive::apply_unix_owner(Some(&owner), &link, false).unwrap();
+        assert_eq!(std::fs::metadata(&target).unwrap().gid(), target_gid);
         assert_eq!(
-            RarArchive::unix_owner_chown_follows_links(false),
-            cfg!(target_vendor = "apple")
+            u64::from(std::fs::symlink_metadata(&link).unwrap().gid()),
+            u64::from(other)
         );
     }
 
@@ -9482,6 +10369,75 @@ mod tests {
                 .ino()
         );
         assert_eq!(std::fs::metadata(&out_path).unwrap().mode() & 0o7777, 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filecopy_fallback_copy_matches_std_copy() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        // Past one read buffer and not a multiple of any chunk size.
+        let bytes: Vec<u8> = (0..(3 << 20) + 4093)
+            .map(|at| (at * 31 % 251) as u8)
+            .collect();
+        for mode in [0o644, 0o600, 0o755] {
+            let source = temp.path().join(format!("source-{mode:o}.tmp"));
+            std::fs::write(&source, &bytes).unwrap();
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(mode)).unwrap();
+            let ours = temp.path().join(format!("ours-{mode:o}.bin"));
+            let theirs = temp.path().join(format!("std-{mode:o}.bin"));
+            let written = RarArchive::copy_existing_filecopy_source(&source, &ours).unwrap();
+            let expected = std::fs::copy(&source, &theirs).unwrap();
+            assert_eq!(written, expected);
+            assert_eq!(written, bytes.len() as u64);
+            assert_eq!(std::fs::read(&ours).unwrap(), bytes);
+            assert_eq!(
+                std::fs::metadata(&ours).unwrap().mode(),
+                std::fs::metadata(&theirs).unwrap().mode()
+            );
+        }
+
+        // An existing destination is truncated and given the source mode.
+        let source = temp.path().join("short.tmp");
+        std::fs::write(&source, b"short").unwrap();
+        let existing = temp.path().join("existing.bin");
+        std::fs::write(&existing, &bytes).unwrap();
+        assert_eq!(
+            RarArchive::copy_existing_filecopy_source(&source, &existing).unwrap(),
+            5
+        );
+        assert_eq!(std::fs::read(&existing).unwrap(), b"short");
+
+        // An empty source copies as an empty file.
+        let empty = temp.path().join("empty.tmp");
+        std::fs::write(&empty, b"").unwrap();
+        let out = temp.path().join("empty.bin");
+        assert_eq!(
+            RarArchive::copy_existing_filecopy_source(&empty, &out).unwrap(),
+            0
+        );
+        assert_eq!(std::fs::metadata(&out).unwrap().len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filecopy_fallback_copy_does_not_follow_a_symlinked_temporary() {
+        let temp = tempfile::tempdir().unwrap();
+        let secret = temp.path().join("elsewhere.bin");
+        std::fs::write(&secret, b"not for the output").unwrap();
+        let source = temp.path().join(".weaver-unrar-filecopy-swapped.tmp");
+        std::os::unix::fs::symlink(&secret, &source).unwrap();
+        let out = temp.path().join("copy.bin");
+        let err = RarArchive::copy_existing_filecopy_source(&source, &out).unwrap_err();
+        assert!(matches!(err, RarError::Io(_)), "{err:?}");
+        assert!(std::fs::symlink_metadata(&out).is_err());
+
+        let directory = temp.path().join("dir.tmp");
+        std::fs::create_dir(&directory).unwrap();
+        let err = RarArchive::copy_existing_filecopy_source(&directory, &out).unwrap_err();
+        assert!(err.to_string().contains("is not a regular file"), "{err:?}");
+        assert!(std::fs::symlink_metadata(&out).is_err());
     }
 
     /// Windows: a directory junction or directory symlink in a hard-link
@@ -10053,6 +11009,33 @@ mod tests {
     }
 
     #[test]
+    fn ntfs_acl_ceiling_admits_every_security_descriptor_size() {
+        // Header, owner and group SIDs at SECURITY_MAX_SID_SIZE, and a DACL
+        // and SACL at the 16-bit AclSize maximum.
+        let largest_descriptor = 20 + 2 * 68 + 2 * u64::from(u16::MAX);
+        for size in [0, 1, 20, largest_descriptor, MAX_NTFS_ACL_BYTES] {
+            let service = test_rar5_service("ACL", size, size);
+            assert!(
+                !RarArchive::ntfs_acl_declared_too_large(&service.file_header),
+                "{size}"
+            );
+        }
+        for size in [MAX_NTFS_ACL_BYTES + 1, u64::from(u32::MAX), u64::MAX] {
+            let service = test_rar5_service("ACL", size, 32);
+            assert!(
+                RarArchive::ntfs_acl_declared_too_large(&service.file_header),
+                "{size}"
+            );
+        }
+        // An unknown size keeps the service reader's own error.
+        let mut service = test_rar5_service("ACL", 1, 1);
+        service.file_header.unpacked_size = None;
+        assert!(!RarArchive::ntfs_acl_declared_too_large(
+            &service.file_header
+        ));
+    }
+
+    #[test]
     fn ntfs_acl_security_information_matches_rar_behavior_privilege_gate() {
         let base = WINDOWS_OWNER_SECURITY_INFORMATION
             | WINDOWS_GROUP_SECURITY_INFORMATION
@@ -10144,6 +11127,57 @@ mod tests {
             archive.read_service_subdata_to_memory(&service).unwrap(),
             Vec::<u8>::new()
         );
+    }
+
+    #[test]
+    fn service_packed_reserve_is_exact_up_to_the_comment_ceiling() {
+        const MIB: usize = 1024 * 1024;
+        for len in [0, 1, MIB, MAX_COMMENT_BYTES as usize] {
+            assert_eq!(service_packed_reserve(len), len);
+        }
+        assert_eq!(
+            service_packed_reserve(MAX_COMMENT_BYTES as usize + 1),
+            MAX_COMMENT_BYTES as usize
+        );
+        assert_eq!(
+            service_packed_reserve(400usize << 30),
+            MAX_COMMENT_BYTES as usize
+        );
+    }
+
+    #[test]
+    fn forged_compressed_service_packed_size_fails_without_reserving_it() {
+        // 400 GiB declared, under the default 500 GiB data-segment limit, with
+        // 32 bytes behind it. Reserving the declared size aborted the process;
+        // now the segment reader's short read is reported.
+        let declared = 400u64 << 30;
+        assert!(declared <= Limits::default().max_data_segment);
+        let mut archive = archive_with_single_volume(&[0x5a; 32]);
+        let mut service = test_rar5_service("CMT", 64, declared);
+        service.file_header.compression.method = CompressionMethod::Normal;
+        let err = archive
+            .read_service_subdata_to_memory(&service)
+            .unwrap_err();
+        assert!(
+            matches!(&err, RarError::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn compressed_service_packed_bytes_past_the_reserve_hint_are_read_in_full() {
+        // Packed bytes past the hint are all present: the read takes every one
+        // of them (no short-read error), so the hint never limits a payload.
+        // The bytes are not a valid stream, so the decoder rejects them after.
+        let present = MAX_COMMENT_BYTES as usize + 4096;
+        let mut archive = archive_with_single_volume(&vec![0u8; present]);
+        let mut service = test_rar5_service("CMT", 64, present as u64);
+        service.file_header.compression.method = CompressionMethod::Normal;
+        if let Err(RarError::CorruptArchive { detail }) =
+            archive.read_service_subdata_to_memory(&service)
+        {
+            assert!(!detail.contains("packed bytes, expected"), "{detail}");
+        }
     }
 
     #[test]

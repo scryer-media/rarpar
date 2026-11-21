@@ -2,7 +2,7 @@
 name = "par2-rs"
 description = "PAR2 parity verification and repair"
 readme = "README.md"
-version = "0.13.0"
+version = "0.13.1"
 edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0"
@@ -54,7 +54,7 @@ metal = ["reedsolomon-rs/metal"]
 wgpu = ["reedsolomon-rs/wgpu"]
 
 [dependencies]
-reedsolomon-rs = { path = "../reedsolomon-rs", version = "0.4.11", default-features = false }
+reedsolomon-rs = { path = "../reedsolomon-rs", version = "0.4.12", default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.8.4
+
+No API changes.
+
+### Fixed
+
+- Staging an inside-archive output (insert, strip, and the copy that
+  installs a repaired host across filesystems) writes through the handle the
+  exclusive create opened. It created the staging file, closed it and
+  reopened it by name, so a name swapped for a symlink in between, by
+  another process writing to the output folder, redirected the write. One
+  open fewer per staged file; names, modes and bytes are unchanged. A macOS
+  clone is still made by name and opened once, as before.
+- `SelfRepairPlan::execute` reopens its staged archive for the carrier
+  without following a symlink at the name on macOS and Linux, so one swapped
+  in by another process fails the repair instead of taking the carrier.
+- Requires `reedsolomon-rs` 0.4.12, whose tiled matrix inversion and split
+  encode scatter check their slice lengths in release builds.
+
 ## 0.8.3
 
 No API changes.

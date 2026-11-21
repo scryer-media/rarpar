@@ -168,8 +168,10 @@ struct Chunks {
     rows: u64,
     slices: u64,
     /// Whether each chunk passes its CRC64 and agrees with the record,
-    /// row-major: parity unit, then slice.
-    intact: Vec<bool>,
+    /// row-major: parity unit, then slice, one bit per chunk (bit `i % 64`
+    /// of word `i / 64`), so the grid a record declares costs an eighth of
+    /// a byte per chunk.
+    intact: Vec<u64>,
     /// Per slice, the CRC64 of that slice of every data unit, from the
     /// slice's first intact chunk; `None` when no chunk of it is intact.
     crcs: Vec<Option<Vec<u64>>>,
@@ -177,12 +179,18 @@ struct Chunks {
 
 impl Chunks {
     fn is_intact(&self, row: u64, slice: u64) -> bool {
-        self.intact[(row * self.slices + slice) as usize]
+        let index = row * self.slices + slice;
+        self.intact[(index / 64) as usize] & (1 << (index % 64)) != 0
     }
 
     fn intact_rows(&self, slice: u64) -> impl Iterator<Item = u64> + '_ {
         (0..self.rows).filter(move |&row| self.is_intact(row, slice))
     }
+}
+
+/// Set chunk `index`'s bit in a [`Chunks::intact`] bitset.
+fn mark_intact(intact: &mut [u64], index: u64) {
+    intact[(index / 64) as usize] |= 1 << (index % 64);
 }
 
 impl Record {
@@ -261,7 +269,7 @@ impl Record {
         let geometry = &self.geometry;
         let rows = u64::from(geometry.parity_units);
         let slices = geometry.slices();
-        let mut intact = Vec::with_capacity((rows * slices) as usize);
+        let mut intact = vec![0u64; (rows * slices).div_ceil(64) as usize];
         let mut crcs = vec![None; slices as usize];
         let mut buf = Vec::new();
         for row in 0..rows {
@@ -272,8 +280,8 @@ impl Record {
                             && chunk.slice == slice
                             && chunk.geometry == *geometry
                     });
-                intact.push(chunk.is_some());
                 if let Some(chunk) = chunk {
+                    mark_intact(&mut intact, row * slices + slice);
                     crcs[slice as usize].get_or_insert(chunk.slice_crcs);
                 }
             }
@@ -1523,5 +1531,72 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    fn chunks_with(rows: u64, slices: u64, marked: impl IntoIterator<Item = u64>) -> Chunks {
+        let mut intact = vec![0u64; (rows * slices).div_ceil(64) as usize];
+        for index in marked {
+            mark_intact(&mut intact, index);
+        }
+        Chunks {
+            rows,
+            slices,
+            intact,
+            crcs: vec![None; slices as usize],
+        }
+    }
+
+    #[test]
+    fn chunk_bitset_matches_a_bool_per_chunk() {
+        // A grid whose size is not a multiple of 64, so the last word is
+        // partly used, checked against one bool per chunk.
+        let (rows, slices) = (37u64, 23u64);
+        let expected: Vec<bool> = (0..rows * slices)
+            .map(|index| index % 3 == 0 || index % 7 == 5)
+            .collect();
+        let chunks = chunks_with(
+            rows,
+            slices,
+            (0..rows * slices).filter(|&index| expected[index as usize]),
+        );
+        assert_eq!(chunks.intact.len(), (rows * slices).div_ceil(64) as usize);
+        for row in 0..rows {
+            for slice in 0..slices {
+                assert_eq!(
+                    chunks.is_intact(row, slice),
+                    expected[(row * slices + slice) as usize],
+                    "row {row} slice {slice}"
+                );
+            }
+        }
+        for slice in 0..slices {
+            let rows_expected: Vec<u64> = (0..rows)
+                .filter(|&row| expected[(row * slices + slice) as usize])
+                .collect();
+            assert_eq!(chunks.intact_rows(slice).collect::<Vec<_>>(), rows_expected);
+        }
+    }
+
+    #[test]
+    fn chunk_bitset_holds_the_largest_grid_a_record_can_declare() {
+        // 65,534 parity units of 64 MiB (1,024 slices each), a 4 TiB
+        // record of 67,106,816 chunks: 8 MiB of bits, where a bool per
+        // chunk took 64 MiB.
+        let (rows, slices) = (65_534u64, 1_024u64);
+        let last = rows * slices - 1;
+        let chunks = chunks_with(rows, slices, [0, 63, 64, last - 64, last]);
+        assert_eq!(chunks.intact.len(), 1_048_544);
+        assert!(chunks.is_intact(0, 0));
+        assert!(chunks.is_intact(0, 63));
+        assert!(chunks.is_intact(0, 64));
+        assert!(!chunks.is_intact(0, 65));
+        assert!(chunks.is_intact(rows - 1, slices - 1));
+        assert!(chunks.is_intact(rows - 1, slices - 65));
+        assert!(!chunks.is_intact(rows - 1, slices - 2));
+        assert_eq!(
+            chunks.intact_rows(slices - 1).collect::<Vec<_>>(),
+            [rows - 1]
+        );
+        assert_eq!(chunks.intact_rows(0).collect::<Vec<_>>(), [0]);
     }
 }
