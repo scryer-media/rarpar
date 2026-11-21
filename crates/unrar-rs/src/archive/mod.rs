@@ -355,6 +355,10 @@ pub struct RarArchive {
     pub(super) kdf_cache: Arc<crate::crypto::KdfCache>,
     /// Forward-only physical header walk, independent of decoder seeks.
     prefix_cursor: Option<PrefixCursor>,
+    /// Every `(volume_index, data_offset)` of every segment of every member:
+    /// what `holds_member_segment` looks up. `None` until first asked, and
+    /// again after a change that removes or rewrites a member's segments.
+    held_segments: Option<std::collections::HashSet<(usize, u64)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1130,6 +1134,7 @@ mod tests {
             password: None,
             kdf_cache: Arc::new(crate::crypto::KdfCache::new()),
             prefix_cursor: None,
+            held_segments: None,
         }
     }
 

@@ -9739,6 +9739,7 @@ mod tests {
             password: None,
             kdf_cache: Arc::new(crate::crypto::KdfCache::default()),
             prefix_cursor: None,
+            held_segments: None,
         }
     }
 

@@ -232,7 +232,11 @@ impl RarArchive {
                     .last_mut()
                     .expect("continuation validated above");
                 Self::merge_continuation(previous, &entry, entry.segments[0].clone());
+                self.hold(&entry.segments[0]);
             } else {
+                for segment in &entry.segments {
+                    self.hold(segment);
+                }
                 self.members.push(entry);
             }
         }
@@ -253,6 +257,7 @@ impl RarArchive {
     }
 
     fn remove_volume_segments(&mut self, index: usize) {
+        self.held_segments = None;
         for member in &mut self.members {
             member
                 .segments
@@ -418,12 +423,42 @@ impl RarArchive {
     /// Whether a member record already holds the data segment `segment`
     /// names: the header naming it was integrated before, by an earlier
     /// volume add or by an extraction that read it through a provider.
-    fn holds_member_segment(&self, segment: &DataSegment) -> bool {
+    ///
+    /// Answered from `held_segments`, which is built from `members` in one
+    /// pass when it is not held.
+    fn holds_member_segment(&mut self, segment: &DataSegment) -> bool {
+        let members = &self.members;
+        let held = self.held_segments.get_or_insert_with(|| {
+            members
+                .iter()
+                .flat_map(|member| &member.segments)
+                .map(|held| {
+                    #[cfg(test)]
+                    held_segment_visits::add();
+                    (held.volume_index, held.data_offset)
+                })
+                .collect()
+        });
+        let holds = held.contains(&(segment.volume_index, segment.data_offset));
+        debug_assert_eq!(holds, self.scan_member_segments(segment));
+        holds
+    }
+
+    /// The same answer as `holds_member_segment`, read from every segment of
+    /// every member.
+    fn scan_member_segments(&self, segment: &DataSegment) -> bool {
         self.members.iter().any(|member| {
             member.segments.iter().any(|held| {
                 held.volume_index == segment.volume_index && held.data_offset == segment.data_offset
             })
         })
+    }
+
+    /// Record that a member now holds `segment`.
+    fn hold(&mut self, segment: &DataSegment) {
+        if let Some(held) = &mut self.held_segments {
+            held.insert((segment.volume_index, segment.data_offset));
+        }
     }
 
     /// Record continuation parts of member `index` that extraction read from
@@ -438,9 +473,14 @@ impl RarArchive {
         let Some(existing) = self.members.get_mut(index) else {
             return;
         };
+        let mut learned = Vec::with_capacity(parts.len());
         for part in parts {
             let segment = part.segments[0].clone();
+            learned.push(segment.clone());
             Self::merge_continuation(existing, &part, segment);
+        }
+        for segment in &learned {
+            self.hold(segment);
         }
     }
 
@@ -464,9 +504,13 @@ impl RarArchive {
             });
 
             if let Some(existing) = existing {
-                Self::merge_continuation(existing, &entry, segment);
+                Self::merge_continuation(existing, &entry, segment.clone());
+                self.hold(&segment);
             } else {
                 // No prior entry — volumes arrived out of order.
+                for segment in &entry.segments {
+                    self.hold(segment);
+                }
                 self.members.push(entry);
             }
         } else {
@@ -492,7 +536,7 @@ impl RarArchive {
                 // The new segment goes in front, so the chain still ends
                 // where the later part said it does.
                 let tail_split_after = existing.file_header.split_after;
-                existing.segments.insert(0, segment);
+                existing.segments.insert(0, segment.clone());
                 existing.file_header = entry.file_header;
                 existing.file_header.split_after = tail_split_after;
                 existing.is_encrypted = entry.is_encrypted;
@@ -521,7 +565,11 @@ impl RarArchive {
                 if entry.redirection.is_some() {
                     existing.redirection = entry.redirection;
                 }
+                self.hold(&segment);
             } else {
+                for segment in &entry.segments {
+                    self.hold(segment);
+                }
                 self.members.push(entry);
             }
         }
@@ -893,6 +941,26 @@ impl RarArchive {
     }
 }
 
+/// How many member segments this thread's archives visited to build their
+/// held-segment sets.
+#[cfg(test)]
+pub(super) mod held_segment_visits {
+    use std::cell::Cell;
+
+    thread_local! {
+        static VISITS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(in crate::archive) fn add() {
+        VISITS.with(|visits| visits.set(visits.get() + 1));
+    }
+
+    /// The visits since the last call, which resets the count.
+    pub(in crate::archive) fn take() -> usize {
+        VISITS.with(|visits| visits.replace(0))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1025,6 +1093,7 @@ mod tests {
             password: None,
             kdf_cache: std::sync::Arc::new(crate::crypto::KdfCache::new()),
             prefix_cursor: None,
+            held_segments: None,
         }
     }
 
@@ -1289,5 +1358,339 @@ mod tests {
 
         assert_eq!(restored.member_names(), vec!["ep1.mkv", "sample.mkv"]);
         assert_eq!(restored.find_member_sanitized("sample.mkv"), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod held_segment_tests {
+    use std::collections::HashSet;
+    use std::fs::File;
+    use std::io::Cursor;
+    use std::num::NonZeroUsize;
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::volume::StaticVolumeProvider;
+
+    const PASSWORD: &str = "testpass123";
+
+    fn fixture_dir(dir: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(dir)
+    }
+
+    /// The volumes of a corpus set in order, or `None` (and a skip line) when
+    /// the corpus is not hydrated.
+    fn volumes(dir: &str, names: &[&str]) -> Option<Vec<PathBuf>> {
+        let paths: Vec<PathBuf> = names
+            .iter()
+            .map(|name| fixture_dir(dir).join(name))
+            .collect();
+        let hydrated = paths
+            .iter()
+            .all(|path| std::fs::read(path).is_ok_and(|bytes| bytes.starts_with(b"Rar!")));
+        if !hydrated {
+            eprintln!("skipping test: {dir} fixtures not present ({})", names[0]);
+            return None;
+        }
+        Some(paths)
+    }
+
+    fn numbered(stem: &str, count: usize, width: usize) -> Vec<String> {
+        (1..=count)
+            .map(|part| format!("{stem}.part{part:0width$}.rar"))
+            .collect()
+    }
+
+    fn reader(path: &PathBuf) -> Box<dyn ReadSeek> {
+        Box::new(File::open(path).unwrap())
+    }
+
+    fn scanned(archive: &RarArchive) -> HashSet<(usize, u64)> {
+        archive
+            .members
+            .iter()
+            .flat_map(|member| &member.segments)
+            .map(|segment| (segment.volume_index, segment.data_offset))
+            .collect()
+    }
+
+    /// The held set, once built, is exactly what a scan of the members
+    /// finds; and a lookup through it agrees with the scan.
+    fn assert_held(archive: &mut RarArchive, what: &str) {
+        let probe =
+            DataSegment::with_packed_hashes(usize::MAX - 1, 0, 0, Default::default(), false);
+        assert!(!archive.holds_member_segment(&probe), "{what}");
+        assert_eq!(
+            archive.held_segments.as_ref(),
+            Some(&scanned(archive)),
+            "{what}"
+        );
+    }
+
+    fn multi_volume_sets() -> Vec<(&'static str, Vec<PathBuf>)> {
+        let mut sets = Vec::new();
+        let named = [
+            ("rar5", numbered("rar5_mv_store_pair", 9, 2)),
+            ("rar5", numbered("rar5_mv_video", 5, 1)),
+            ("rar5", numbered("rar5_tiny_volumes", 5, 1)),
+            ("rar4", numbered("rar4_mv_store", 5, 1)),
+            ("rar4", numbered("rar4_tiny_volumes", 5, 1)),
+        ];
+        for (dir, names) in named {
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            if let Some(paths) = volumes(dir, &names) {
+                sets.push((dir, paths));
+            }
+        }
+        sets
+    }
+
+    #[test]
+    fn held_set_matches_the_scan_through_prefix_walks() {
+        for (dir, paths) in multi_volume_sets() {
+            for step in [1, 2, 5] {
+                let what = format!("{dir} {} step {step}", paths[0].display());
+                let mut archive = RarArchive::open_prefix(
+                    File::open(&paths[0]).unwrap(),
+                    None,
+                    NonZeroUsize::MIN,
+                )
+                .unwrap();
+                let mut headers = 1;
+                for (volume, path) in paths.iter().enumerate() {
+                    if volume > 0 {
+                        headers = 0;
+                    }
+                    loop {
+                        let wanted = NonZeroUsize::new(headers + step).unwrap();
+                        let found = archive
+                            .extend_volume_prefix(volume, reader(path), wanted)
+                            .unwrap();
+                        assert_held(&mut archive, &what);
+                        headers = found;
+                        if found < wanted.get() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn held_set_matches_the_scan_through_volume_adds_in_any_order() {
+        for (dir, paths) in multi_volume_sets() {
+            let last = paths.len() - 1;
+            let orders: [Vec<usize>; 3] = [
+                (1..=last).collect(),
+                (1..=last).rev().collect(),
+                (1..=last)
+                    .filter(|v| v % 2 == 0)
+                    .chain((1..=last).filter(|v| v % 2 == 1))
+                    .collect(),
+            ];
+            for order in orders {
+                let what = format!("{dir} {} order {order:?}", paths[0].display());
+                let mut archive = RarArchive::open(File::open(&paths[0]).unwrap()).unwrap();
+                assert_held(&mut archive, &what);
+                for &volume in &order {
+                    archive.add_volume(volume, reader(&paths[volume])).unwrap();
+                    assert_held(&mut archive, &what);
+                }
+                // A volume refreshed drops its segments and takes them again.
+                archive.refresh_volume(1, reader(&paths[1])).unwrap();
+                assert_held(&mut archive, &what);
+                // Adding a volume already held integrates nothing twice.
+                let before = archive.members.len();
+                archive.add_volume(last, reader(&paths[last])).unwrap();
+                assert_eq!(archive.members.len(), before, "{what}");
+                assert_held(&mut archive, &what);
+            }
+        }
+    }
+
+    #[test]
+    fn held_set_takes_the_continuations_a_decode_learns() {
+        for (dir, paths) in multi_volume_sets() {
+            let what = format!("{dir} {}", paths[0].display());
+            let mut archive =
+                RarArchive::open_prefix(File::open(&paths[0]).unwrap(), None, NonZeroUsize::MIN)
+                    .unwrap();
+            assert_held(&mut archive, &what);
+            let provider = StaticVolumeProvider::from_ordered(paths.clone());
+            let mut out = Vec::new();
+            archive
+                .by_index_via(0, &provider)
+                .and_then(|entry| entry.copy_to(&mut out))
+                .unwrap();
+            assert_held(&mut archive, &what);
+            // The walk reads on over the volumes the decode already learned.
+            let mut headers = 1;
+            for (volume, path) in paths.iter().enumerate() {
+                if volume > 0 {
+                    headers = 0;
+                }
+                let wanted = NonZeroUsize::new(headers + 1000).unwrap();
+                headers = archive
+                    .extend_volume_prefix(volume, reader(path), wanted)
+                    .unwrap();
+                assert_held(&mut archive, &what);
+            }
+            let fresh = RarArchive::open_volumes(paths.iter().map(reader).collect()).unwrap();
+            assert_eq!(archive.members.len(), fresh.members.len(), "{what}");
+        }
+    }
+
+    fn rar5_block(header_type: u64, header_flags: u64, sizes: &[u64], body: &[u8]) -> Vec<u8> {
+        let mut full = crate::vint::encode_vint(header_type);
+        full.extend_from_slice(&crate::vint::encode_vint(header_flags));
+        for size in sizes {
+            full.extend_from_slice(&crate::vint::encode_vint(*size));
+        }
+        full.extend_from_slice(body);
+        let size = crate::vint::encode_vint(full.len() as u64);
+        let mut hasher = crate::crc::Crc32::new();
+        hasher.update(&size);
+        hasher.update(&full);
+        let mut raw = hasher.finalize().to_le_bytes().to_vec();
+        raw.extend_from_slice(&size);
+        raw.extend_from_slice(&full);
+        raw
+    }
+
+    /// One RAR5 volume of `files` stored members of a few bytes each.
+    fn stored_rar5(files: usize) -> Vec<u8> {
+        let mut bytes = crate::signature::RAR5_SIGNATURE.to_vec();
+        bytes.extend_from_slice(&rar5_block(1, 0, &[], &crate::vint::encode_vint(0)));
+        for index in 0..files {
+            let name = format!("file{index:05}.txt");
+            let data = name.as_bytes();
+            let mut body = crate::vint::encode_vint(0);
+            body.extend_from_slice(&crate::vint::encode_vint(data.len() as u64));
+            body.extend_from_slice(&crate::vint::encode_vint(0o644));
+            body.extend_from_slice(&crate::vint::encode_vint(0));
+            body.extend_from_slice(&crate::vint::encode_vint(1));
+            body.extend_from_slice(&crate::vint::encode_vint(name.len() as u64));
+            body.extend_from_slice(name.as_bytes());
+            bytes.extend_from_slice(&rar5_block(
+                2,
+                crate::header::common::flags::DATA_AREA,
+                &[data.len() as u64],
+                &body,
+            ));
+            bytes.extend_from_slice(data);
+        }
+        bytes.extend_from_slice(&rar5_block(5, 0, &[], &crate::vint::encode_vint(0)));
+        bytes
+    }
+
+    /// A prefix walk builds the held set once, from the members it holds
+    /// then, and answers every later header by lookup: the segments visited
+    /// do not grow with the headers walked.
+    #[test]
+    fn prefix_walk_builds_the_held_set_once() {
+        for files in [64, 512] {
+            let bytes = stored_rar5(files);
+            held_segment_visits::take();
+            let mut archive =
+                RarArchive::open_prefix(Cursor::new(bytes.clone()), None, NonZeroUsize::MIN)
+                    .unwrap();
+            let mut headers = 1;
+            loop {
+                let wanted = NonZeroUsize::new(headers + 1).unwrap();
+                let found = archive
+                    .extend_volume_prefix(0, Box::new(Cursor::new(bytes.clone())), wanted)
+                    .unwrap();
+                headers = found;
+                if found < wanted.get() {
+                    break;
+                }
+            }
+            assert_eq!(archive.len(), files);
+            assert_eq!(held_segment_visits::take(), 1, "{files} files");
+            assert_held(&mut archive, &format!("{files} files"));
+        }
+    }
+
+    /// Decode member `index` of an archive opened from `paths[0]` through a
+    /// provider over all of `paths`: its bytes, and its info afterwards.
+    fn decoded(
+        archive: &mut RarArchive,
+        index: usize,
+        provider: &StaticVolumeProvider,
+    ) -> (Vec<u8>, String) {
+        let mut out = Vec::new();
+        archive
+            .by_index_via(index, provider)
+            .and_then(|entry| entry.copy_to(&mut out))
+            .unwrap();
+        (out, format!("{:?}", archive.member_info(index)))
+    }
+
+    #[test]
+    fn member_archive_decodes_as_the_whole_archive_does() {
+        let cases: Vec<(&str, Vec<String>, bool)> = vec![
+            ("rar5", vec!["rar5_store.rar".into()], false),
+            ("rar5", vec!["rar5_lz.rar".into()], false),
+            ("rar5", vec!["rar5_multifile_lz.rar".into()], false),
+            ("rar5", vec!["rar5_enc_lz.rar".into()], true),
+            ("rar5", vec!["rar5_enc_store.rar".into()], true),
+            (
+                "rar5",
+                numbered("generated_matrix_rar5_lz_plain", 7, 1),
+                false,
+            ),
+            ("rar5", numbered("generated_matrix_rar5_lz_enc", 7, 1), true),
+            ("rar5", numbered("rar5_mv_store_pair", 9, 2), false),
+            ("rar4", vec!["rar4_store.rar".into()], false),
+            ("rar4", vec!["rar4_lz.rar".into()], false),
+            ("rar4", vec!["rar4_multifile_lz.rar".into()], false),
+            ("rar4", vec!["rar4_enc_lz.rar".into()], true),
+            (
+                "rar4",
+                numbered("generated_matrix_rar4_lz_plain", 7, 1),
+                false,
+            ),
+            (
+                "rar4",
+                numbered("generated_matrix_rar4_store_enc", 7, 1),
+                true,
+            ),
+        ];
+        let mut checked = 0;
+        for (dir, names, encrypted) in cases {
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            let Some(paths) = volumes(dir, &names) else {
+                continue;
+            };
+            let open = || {
+                let mut archive = RarArchive::open(File::open(&paths[0]).unwrap()).unwrap();
+                if encrypted {
+                    archive.set_password(PASSWORD);
+                }
+                archive
+            };
+            let provider = StaticVolumeProvider::from_ordered(paths.clone());
+            let walk = open();
+            let mut whole = open();
+            assert!(walk.member_archive(walk.len()).is_none());
+            for index in 0..walk.len() {
+                let info = walk.member_info(index).unwrap();
+                if info.is_directory {
+                    continue;
+                }
+                let what = format!("{dir} {} member {index}", names[0]);
+                let mut own = walk.member_archive(index).unwrap();
+                assert_eq!(own.len(), 1, "{what}");
+                let (copy_bytes, copy_info) = decoded(&mut own, 0, &provider);
+                let (whole_bytes, whole_info) = decoded(&mut whole, index, &provider);
+                assert_eq!(copy_bytes, whole_bytes, "{what}");
+                assert_eq!(copy_info, whole_info, "{what}");
+                checked += 1;
+            }
+        }
+        eprintln!("member_archive: {checked} members checked");
     }
 }

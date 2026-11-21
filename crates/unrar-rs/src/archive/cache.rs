@@ -767,9 +767,64 @@ impl RarArchive {
             password: password.into(),
             kdf_cache,
             prefix_cursor: None,
+            held_segments: None,
         };
         archive.sort_members_by_physical_order();
         archive
+    }
+
+    /// An archive holding only member `index` of this one, at index 0, for
+    /// decoding that member apart from this archive through
+    /// [`by_index_via(0, provider)`](Self::by_index_via).
+    ///
+    /// The member is copied as this archive holds it, with every field its
+    /// headers stated, and so are the archive's flags, volume topology,
+    /// password, key cache, limits and decode settings. It holds no volume
+    /// readers, no services and no recovery records, and no solid decoder
+    /// state. Its cost does not depend on how many members this archive
+    /// holds.
+    ///
+    /// The copy is correct only for a member that needs no other member: the
+    /// archive is not solid, and the member is not a redirection.
+    ///
+    /// Returns `None` when `index` is out of range.
+    pub fn member_archive(&self, index: usize) -> Option<RarArchive> {
+        let member = self.members.get(index)?.clone();
+        Some(RarArchive {
+            format: self.format,
+            is_solid: self.is_solid,
+            is_encrypted: self.is_encrypted,
+            has_recovery_record: self.has_recovery_record,
+            recovery_records: Vec::new(),
+            is_locked: self.is_locked,
+            has_authenticity_verification: self.has_authenticity_verification,
+            has_locator: self.has_locator,
+            quick_open_offset: self.quick_open_offset,
+            recovery_record_offset: self.recovery_record_offset,
+            original_name: self.original_name.clone(),
+            original_name_raw: self.original_name_raw.clone(),
+            original_creation_time: self.original_creation_time,
+            volume_set: VolumeSet::from_presence(
+                self.volume_set.presence(),
+                self.volume_set.last_volume_seen(),
+            ),
+            members: vec![member],
+            services: Vec::new(),
+            more_volumes: self.more_volumes,
+            volumes: Vec::new(),
+            solid_decoder: None,
+            solid_decoder_rar4: None,
+            solid_next_index: 0,
+            solid_poison: None,
+            verify: self.verify,
+            restore_owners: self.restore_owners,
+            decode_mode: self.decode_mode,
+            limits: self.limits.clone(),
+            password: self.password.clone(),
+            kdf_cache: Arc::clone(&self.kdf_cache),
+            prefix_cursor: None,
+            held_segments: None,
+        })
     }
 
     /// Serialize headers to MessagePack bytes.
