@@ -1511,7 +1511,7 @@ jobs:
     needs: [changes, fmt, clippy]
     if: needs.changes.outputs.crates == 'true' || needs.changes.outputs.rarpar == 'true'
     runs-on: ${{ matrix.runs_on }}
-    timeout-minutes: 120
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
