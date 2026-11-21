@@ -895,7 +895,7 @@ impl RarArchive {
         password: Option<&str>,
         kdf_cache: std::sync::Arc<crate::crypto::KdfCache>,
     ) -> RarResult<FactsWalkOutcome> {
-        Self::facts_step(reader, password, kdf_cache, None).0
+        Self::facts_step(reader, password, kdf_cache, None, false).0
     }
 
     /// One facts walk, from the signature when `resume` is `None` and from
@@ -906,12 +906,18 @@ impl RarArchive {
     /// RAR4 the header it failed at with that header's effect undone. A walk
     /// from the signature fails there in the same way over the same bytes, so
     /// the next walk may begin there once the failing bytes change.
+    ///
+    /// The third result is where the facts first differ from those the walk
+    /// `resume` came from reported: 0 for a walk from the signature. With
+    /// `delta`, a resumed RAR5 walk leaves out of the facts the members and
+    /// services before that point, which it holds unchanged.
     fn facts_step(
         mut reader: Box<dyn ReadSeek>,
         password: Option<&str>,
         kdf_cache: std::sync::Arc<crate::crypto::KdfCache>,
         resume: Option<FactsResume>,
-    ) -> (RarResult<FactsWalkOutcome>, Option<FactsResume>) {
+        delta: bool,
+    ) -> (RarResult<FactsWalkOutcome>, Option<FactsResume>, Changed) {
         use std::io::{Seek, SeekFrom};
 
         // Set by the walks below when the staged image ended underneath them;
@@ -926,7 +932,7 @@ impl RarArchive {
                     .and_then(|_| signature::read_signature(&mut reader))
                     .and_then(|format| Ok((format, reader.stream_position()?)));
                 match format {
-                    Err(error) => return (Err(error), None),
+                    Err(error) => return (Err(error), None, Changed::default()),
                     // A RAR 1.4 volume is walked whole every time: its headers
                     // are few and the format is long gone from the wild.
                     Ok((ArchiveFormat::Rar14, _)) => {
@@ -947,18 +953,20 @@ impl RarArchive {
                                         None,
                                     )
                                 });
-                        return (outcome, None);
+                        return (outcome, None, Changed::default());
                     }
                     Ok((ArchiveFormat::Rar4, at)) => FactsResume::Rar4(
                         crate::rar4::Rar4Walk::starting_at(at),
                         super::member::Rar4OwnerPayloads::default(),
+                        Box::default(),
                     ),
                     Ok((ArchiveFormat::Rar5, at)) => FactsResume::Rar5(Rar5Resume::starting_at(at)),
                 }
             }
         };
         match resume {
-            FactsResume::Rar4(mut walk, mut payloads) => {
+            FactsResume::Rar4(mut walk, mut payloads, mut reported) => {
+                let mut changed = Changed::default();
                 let walked = reader
                     .seek(SeekFrom::Start(walk.at()))
                     .map_err(crate::error::RarError::from)
@@ -986,6 +994,9 @@ impl RarArchive {
                             short,
                             Some((&mut payloads, through)),
                         );
+                        if let Ok(outcome) = &outcome {
+                            changed = reported.report(&outcome.walk.facts, &parsed);
+                        }
                         walk.give_back(parsed);
                         outcome
                     }
@@ -994,7 +1005,11 @@ impl RarArchive {
                         Err(error)
                     }
                 };
-                (outcome, Some(FactsResume::Rar4(walk, payloads)))
+                (
+                    outcome,
+                    Some(FactsResume::Rar4(walk, payloads, reported)),
+                    changed,
+                )
             }
             FactsResume::Rar5(mut state) => {
                 let mut stop = state.at;
@@ -1010,7 +1025,13 @@ impl RarArchive {
                     &mut stop,
                 ) {
                     Ok(parsed) => parsed,
-                    Err(error) => return (Err(error), Some(FactsResume::Rar5(state))),
+                    Err(error) => {
+                        return (
+                            Err(error),
+                            Some(FactsResume::Rar5(state)),
+                            Changed::default(),
+                        );
+                    }
                 };
                 if parsed.headers_from_quick_open {
                     // An answer from the Quick Open cache holds every header
@@ -1027,19 +1048,29 @@ impl RarArchive {
                             rar5_service_facts(0, parsed.services),
                         ),
                     );
-                    return (Ok(outcome), None);
+                    return (Ok(outcome), None, Changed::default());
                 }
+                // A resumed walk only adds to what the walks before it read.
+                let changed = Changed {
+                    members: state.members.len(),
+                    services: state.services.len(),
+                };
                 let services = rar5_service_facts(state.services.len(), parsed.services);
                 state.services.extend(services);
                 let members = rar5_member_facts(state.members.len(), parsed.files);
                 state.members.extend(members);
+                let (members_from, services_from) = if delta {
+                    (changed.members, changed.services)
+                } else {
+                    (0, 0)
+                };
                 let facts = rar5_volume_facts(
                     parsed.main.as_ref(),
                     parsed.end.as_ref(),
                     parsed.is_encrypted,
                     false,
-                    state.members.clone(),
-                    state.services.clone(),
+                    state.members[members_from..].to_vec(),
+                    state.services[services_from..].to_vec(),
                 );
                 state.main = parsed.main;
                 state.encryption = parsed.encryption;
@@ -1047,6 +1078,7 @@ impl RarArchive {
                 (
                     Ok(FactsWalkOutcome::new(short, facts)),
                     Some(FactsResume::Rar5(state)),
+                    changed,
                 )
             }
         }
@@ -1261,8 +1293,113 @@ pub struct RarVolumeFactsCursor {
 
 /// What a walk carries to the next one over the same volume.
 enum FactsResume {
-    Rar4(crate::rar4::Rar4Walk, super::member::Rar4OwnerPayloads),
+    Rar4(
+        crate::rar4::Rar4Walk,
+        super::member::Rar4OwnerPayloads,
+        Box<Rar4Reported>,
+    ),
     Rar5(Rar5Resume),
+}
+
+/// Where a step's members and services first differ from those the step
+/// before it on the same cursor reported.
+#[derive(Debug, Default, Clone, Copy)]
+struct Changed {
+    members: usize,
+    services: usize,
+}
+
+/// What the last RAR4 step reported that a later one can change in place.
+/// Every other fact of a member comes from its own header and the archive
+/// header, which a resumed walk holds unchanged; an owner comes from a `UOW`
+/// service that can arrive after it. Services are listed as the walk's
+/// services, then its comments, then its old-style services, so one added to
+/// an earlier group moves those after it.
+#[derive(Default)]
+struct Rar4Reported {
+    owners: Vec<Option<RarVolumeUnixOwnerFacts>>,
+    groups: [usize; 3],
+}
+
+impl Rar4Reported {
+    fn report(
+        &mut self,
+        facts: &RarVolumeFacts,
+        parsed: &crate::rar4::Rar4ParsedVolume,
+    ) -> Changed {
+        let members = self
+            .owners
+            .iter()
+            .zip(&facts.members)
+            .position(|(held, member)| *held != member.owner)
+            .unwrap_or_else(|| self.owners.len().min(facts.members.len()));
+        let groups = [
+            parsed.services.len(),
+            parsed.comments.len(),
+            parsed.old_services.len(),
+        ];
+        let [services, comments, old] = self.groups;
+        let services = if groups[0] != services {
+            services.min(groups[0])
+        } else if groups[1] != comments {
+            services + comments.min(groups[1])
+        } else {
+            services + comments + old.min(groups[2])
+        };
+        self.owners = facts
+            .members
+            .iter()
+            .map(|member| member.owner.clone())
+            .collect();
+        self.groups = groups;
+        Changed {
+            members,
+            services: services.min(facts.services.len()),
+        }
+    }
+}
+
+/// What one [`RarVolumeFactsCursor::step_delta`] adds to or changes in the
+/// facts the step before it on the same cursor reported.
+///
+/// The volume's facts as of this step are the facts the step before reported
+/// with their members cut to the first [`Self::members_from`] and extended by
+/// `facts.members`, and their services cut to the first
+/// [`Self::services_from`] and extended by `facts.services`. Every other field
+/// of `facts` is the volume's as of this step. A step that walked from the
+/// signature (the first, one after [`RarVolumeFactsCursor::restart`] or a
+/// password change, a RAR 1.4 volume, a Quick Open answer) reports from 0.
+///
+/// Each member and service keeps its `order` within the whole volume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RarVolumeFactsDelta {
+    /// The volume's facts, holding only the members and services from
+    /// [`Self::members_from`] and [`Self::services_from`] on.
+    pub facts: RarVolumeFacts,
+    /// How many of the members the step before reported stand unchanged.
+    pub members_from: usize,
+    /// How many of the services the step before reported stand unchanged.
+    pub services_from: usize,
+    /// As [`RarVolumeFactsWalk::short_at`].
+    pub short_at: Option<u64>,
+}
+
+impl RarVolumeFactsDelta {
+    /// Apply the delta to the facts the step before it reported, giving what
+    /// [`RarVolumeFactsCursor::step`] would have returned for this step.
+    pub fn apply_to(&self, facts: &mut RarVolumeFacts) {
+        let members = std::mem::take(&mut facts.members);
+        let services = std::mem::take(&mut facts.services);
+        *facts = RarVolumeFacts {
+            members,
+            services,
+            ..self.facts.clone()
+        };
+        facts.members.truncate(self.members_from);
+        facts.members.extend_from_slice(&self.facts.members);
+        facts.services.truncate(self.services_from);
+        facts.services.extend_from_slice(&self.facts.services);
+    }
 }
 
 struct Rar5Resume {
@@ -1291,7 +1428,7 @@ impl Rar5Resume {
 impl FactsResume {
     fn at(&self) -> u64 {
         match self {
-            Self::Rar4(walk, _) => walk.at(),
+            Self::Rar4(walk, _, _) => walk.at(),
             Self::Rar5(state) => state.at,
         }
     }
@@ -1317,20 +1454,66 @@ impl RarVolumeFactsCursor {
         password: Option<&str>,
         kdf_cache: std::sync::Arc<crate::crypto::KdfCache>,
     ) -> RarResult<RarVolumeFactsWalk> {
+        Ok(self.walk(reader, password, kdf_cache, false)?.0.walk)
+    }
+
+    /// [`Self::step`], reporting only what changed since the step before it
+    /// on this cursor; see [`RarVolumeFactsDelta`] for how the two relate.
+    ///
+    /// A resumed RAR5 step builds only the new members and services. A RAR4
+    /// step still rebuilds the volume's facts from its headers, since a
+    /// member's owner can change after it, and reports from the first that
+    /// differs. RAR4 facts list old comments and old-style services after
+    /// every service, so a step that adds a service reports those again.
+    pub fn step_delta(
+        &mut self,
+        reader: impl std::io::Read + std::io::Seek + Send + 'static,
+        password: Option<&str>,
+        kdf_cache: std::sync::Arc<crate::crypto::KdfCache>,
+    ) -> RarResult<RarVolumeFactsDelta> {
+        let (outcome, changed) = self.walk(reader, password, kdf_cache, true)?;
+        let RarVolumeFactsWalk {
+            mut facts,
+            short_at,
+        } = outcome.walk;
+        // A RAR5 walk left out what stands; any other holds every record.
+        if facts.archive_format() != ArchiveFormat::Rar5 {
+            facts
+                .members
+                .drain(..changed.members.min(facts.members.len()));
+            facts
+                .services
+                .drain(..changed.services.min(facts.services.len()));
+        }
+        Ok(RarVolumeFactsDelta {
+            facts,
+            members_from: changed.members,
+            services_from: changed.services,
+            short_at,
+        })
+    }
+
+    fn walk(
+        &mut self,
+        reader: impl std::io::Read + std::io::Seek + Send + 'static,
+        password: Option<&str>,
+        kdf_cache: std::sync::Arc<crate::crypto::KdfCache>,
+        delta: bool,
+    ) -> RarResult<(FactsWalkOutcome, Changed)> {
         let resume = self
             .state
             .take()
             .filter(|(keyed, _)| keyed.as_deref().map(String::as_str) == password)
             .map(|(_, resume)| resume);
-        let (outcome, resume) =
-            RarArchive::facts_step(Box::new(reader), password, kdf_cache, resume);
+        let (outcome, resume, changed) =
+            RarArchive::facts_step(Box::new(reader), password, kdf_cache, resume, delta);
         self.state = resume.map(|resume| {
             (
                 password.map(|password| zeroize::Zeroizing::new(password.to_owned())),
                 resume,
             )
         });
-        Ok(outcome?.walk)
+        Ok((outcome?, changed))
     }
 
     /// The offset the next step begins at, or `None` when it begins at the
@@ -2512,6 +2695,14 @@ mod tests {
         /// fresh walk, with the headers each side read counted.
         struct Run {
             cursor: RarVolumeFactsCursor,
+            /// A second cursor stepped alongside by [`Self::step`] through
+            /// `step_delta`, with the facts its deltas add up to.
+            deltas: RarVolumeFactsCursor,
+            summed: Option<RarVolumeFacts>,
+            /// Members and services the deltas reported, against those the
+            /// whole steps did.
+            delta_records: usize,
+            whole_records: usize,
             cache: Arc<crate::crypto::KdfCache>,
             password: Option<&'static str>,
             view: View,
@@ -2524,12 +2715,65 @@ mod tests {
             fn new(password: Option<&'static str>, view: View) -> Self {
                 Self {
                     cursor: RarVolumeFactsCursor::new(),
+                    deltas: RarVolumeFactsCursor::new(),
+                    summed: None,
+                    delta_records: 0,
+                    whole_records: 0,
                     cache: Arc::new(crate::crypto::KdfCache::new()),
                     password,
                     view,
                     steps: 0,
                     resumed_headers: 0,
                     fresh_headers: 0,
+                }
+            }
+
+            fn restart(&mut self) {
+                self.cursor.restart();
+                self.deltas.restart();
+            }
+
+            /// Step the delta cursor and check that its deltas, added to what
+            /// it reported before, give what the whole step gave.
+            fn step_delta(
+                &mut self,
+                image: &Image,
+                what: &str,
+                whole: &RarResult<RarVolumeFactsWalk>,
+            ) {
+                let delta = self.deltas.step_delta(
+                    image.reader(self.view),
+                    self.password,
+                    Arc::clone(&self.cache),
+                );
+                match (delta, whole) {
+                    (Ok(delta), Ok(whole)) => {
+                        assert_eq!(delta.short_at, whole.short_at, "{what}: delta short_at");
+                        if delta.members_from > 0 || delta.services_from > 0 {
+                            assert!(self.summed.is_some(), "{what}: a delta with no base");
+                        }
+                        let mut summed = self.summed.take().unwrap_or_else(|| delta.facts.clone());
+                        assert!(
+                            delta.members_from <= summed.members.len()
+                                && delta.services_from <= summed.services.len(),
+                            "{what}: a delta past what was reported"
+                        );
+                        delta.apply_to(&mut summed);
+                        assert_eq!(summed, whole.facts, "{what}: deltas add up to the step");
+                        self.delta_records +=
+                            delta.facts.members.len() + delta.facts.services.len();
+                        self.whole_records +=
+                            whole.facts.members.len() + whole.facts.services.len();
+                        self.summed = Some(summed);
+                    }
+                    (Err(delta), Err(whole)) => {
+                        assert_eq!(
+                            format!("{delta:?}"),
+                            format!("{whole:?}"),
+                            "{what}: delta error"
+                        );
+                    }
+                    (delta, whole) => panic!("{what}: delta {delta:?}, whole {whole:?}"),
                 }
             }
 
@@ -2558,6 +2802,8 @@ mod tests {
                 let fresh = fresh(image, self.view, self.password, &self.cache);
                 self.fresh_headers += header_reads::take().len();
                 same(what, &resumed, &fresh);
+                self.step_delta(image, what, &resumed);
+                header_reads::take();
                 resumed
             }
         }
@@ -2801,6 +3047,11 @@ mod tests {
         /// two payloads for one file. The number of
         /// `UOW` services is returned with it.
         fn owned_rar4(seed: u64, files: usize) -> (Vec<u8>, usize) {
+            owned_rar4_with(seed, files, true)
+        }
+
+        /// [`owned_rar4`], with or without old comments and old-style services.
+        fn owned_rar4_with(seed: u64, files: usize, old: bool) -> (Vec<u8>, usize) {
             let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
             let mut next = move || {
                 state ^= state << 13;
@@ -2859,6 +3110,24 @@ mod tests {
                 };
                 if next() % 9 == 0 {
                     bytes.extend(rar4_service(b"CMT", b"a comment", true));
+                }
+                // An old comment and an old-style service: the facts list
+                // them after every service, so a later service moves them.
+                if next() % 11 == 0 && old {
+                    let mut body = 4u16.to_le_bytes().to_vec();
+                    body.extend_from_slice(&[29, 0x30, 0xEF, 0xBE]);
+                    body.extend_from_slice(b"note");
+                    bytes.extend_from_slice(&build_rar4_header(0x75, 0, &body));
+                }
+                if next() % 13 == 0 && old {
+                    let mut extra = 4u32.to_le_bytes().to_vec();
+                    extra.extend_from_slice(&0x104u16.to_le_bytes());
+                    extra.push(0);
+                    extra.extend_from_slice(&4u32.to_le_bytes());
+                    extra.extend_from_slice(&[20, 0x30]);
+                    extra.extend_from_slice(&0u32.to_le_bytes());
+                    bytes.extend_from_slice(&build_rar4_header(0x77, 0x8000, &extra));
+                    bytes.extend_from_slice(b"acl!");
                 }
             }
             bytes.extend_from_slice(&build_rar4_header(0x7b, 0x0001, &[]));
@@ -2962,6 +3231,46 @@ mod tests {
                     reads <= uows + steps,
                     "{files} files: {reads} payload reads for {uows} payloads over {steps} steps"
                 );
+            }
+        }
+
+        /// A volume read in order reports each member and service about once
+        /// through `step_delta`, however many steps it takes, where each
+        /// whole step reports every record read so far. A RAR4 step reports
+        /// again from a member whose owner changed and from the first service
+        /// group that grew, so it may repeat a few records per step. Old
+        /// comments and old-style services are left out here: the facts list
+        /// them after every service, so each later service reports them again.
+        #[test]
+        fn deltas_report_each_record_about_once() {
+            let run_over = |bytes: &[u8]| {
+                let mut image = Image::empty(bytes);
+                let mut run = Run::new(None, View::Sparse);
+                for start in (0..bytes.len()).step_by(64) {
+                    image.stage(start..(start + 64).min(bytes.len()));
+                    run.step(&image, "in order").expect("a prefix walks");
+                }
+                let total = run
+                    .summed
+                    .as_ref()
+                    .map_or(0, |facts| facts.members.len() + facts.services.len());
+                (run, total)
+            };
+            for files in [40, 400] {
+                let rar5 = synthetic_rar5(files);
+                let (run, total) = run_over(&rar5.bytes);
+                assert_eq!(run.delta_records, total, "RAR5 {files}");
+                assert!(run.whole_records > total * 4, "RAR5 {files}: vacuous");
+
+                let (bytes, _) = owned_rar4_with(5, files, false);
+                let (run, total) = run_over(&bytes);
+                assert!(
+                    run.delta_records <= total + 3 * run.steps,
+                    "RAR4 {files}: {} records over {} steps for {total}",
+                    run.delta_records,
+                    run.steps
+                );
+                assert!(run.whole_records > total * 4, "RAR4 {files}: vacuous");
             }
         }
 
@@ -3319,7 +3628,7 @@ mod tests {
                         let fresh_now = fresh(&image, view, None, &run.cache).unwrap();
                         assert_eq!(fresh_now.facts.members[5].name, member_name(5));
                         if restart {
-                            run.cursor.restart();
+                            run.restart();
                             run.step(&image, &format!("{name}: repaired, restarted"))
                                 .unwrap();
                             image.stage(0..volume.bytes.len());

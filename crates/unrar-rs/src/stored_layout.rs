@@ -36,7 +36,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::archive::{RarVolumeFacts, RarVolumeMemberEncryptionFacts, RarVolumeMemberFacts};
+use crate::archive::{
+    RarVolumeFacts, RarVolumeFactsDelta, RarVolumeMemberEncryptionFacts, RarVolumeMemberFacts,
+};
 use crate::types::{ArchiveFormat, CompressionMethod};
 
 /// AES block size. An encrypted member's packed bytes are its plaintext
@@ -693,6 +695,25 @@ mod hole_visits {
     }
 }
 
+/// How many member headers this thread's adds turned into snapshots or
+/// compared with those held.
+#[cfg(test)]
+mod snapshot_reads {
+    use std::cell::Cell;
+
+    thread_local! {
+        static READS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn add(reads: usize) {
+        READS.with(|held| held.set(held.get() + reads));
+    }
+
+    pub(super) fn take() -> usize {
+        READS.with(|held| held.replace(0))
+    }
+}
+
 /// Everything one added volume contributes.
 struct VolumeRecord {
     snapshots: Vec<MemberSnapshot>,
@@ -819,17 +840,98 @@ impl StoredLayoutBuilder {
             .iter()
             .map(|member| MemberSnapshot::from_facts(member, found))
             .collect();
+        #[cfg(test)]
+        snapshot_reads::add(
+            snapshots.len()
+                + self
+                    .volumes
+                    .get(&volume)
+                    .map_or(0, |record| record.snapshots.len()),
+        );
         if let Some(existing) = self.volumes.get(&volume) {
+            let held = existing.snapshots.len();
             return if existing.snapshots == snapshots {
                 Ok(())
-            } else if self.extends(volume, &snapshots) {
-                self.extend_volume(volume, snapshots);
+            } else if snapshots.len() > held
+                && snapshots[..held] == existing.snapshots[..]
+                && self.extends(volume, &snapshots[held..])
+            {
+                self.extend_volume(volume, &snapshots[held..]);
                 Ok(())
             } else {
                 Err(StoredLayoutError::ConflictingVolume { volume })
             };
         }
+        self.add_new_volume(volume, snapshots);
+        Ok(())
+    }
 
+    /// Learn what changed in one volume's headers since the facts it was
+    /// added on, as [`RarVolumeFactsCursor::step_delta`] reports it.
+    ///
+    /// `delta` must follow, on the cursor that walks the volume, the step
+    /// whose facts the volume was last added on (merged, when the caller
+    /// skipped steps between, into one delta from the least `members_from`).
+    /// The layout then answers exactly as [`Self::add_volume`] given those
+    /// facts with the delta applied, and the work is in the size of the
+    /// delta, not of the volume. A volume the layout does not hold yet takes
+    /// only a delta from the first member; one from a later member is
+    /// refused as [`StoredLayoutError::ConflictingVolume`], as is one from
+    /// past the members it holds. Services are not part of a layout.
+    ///
+    /// [`RarVolumeFactsCursor::step_delta`]: crate::RarVolumeFactsCursor::step_delta
+    pub fn add_volume_delta(
+        &mut self,
+        volume: u32,
+        delta: &RarVolumeFactsDelta,
+    ) -> Result<(), StoredLayoutError> {
+        let found = delta.facts.archive_format();
+        if found != self.format {
+            return Err(StoredLayoutError::FormatMismatch {
+                expected: self.format,
+                found,
+            });
+        }
+        let snapshots: Vec<MemberSnapshot> = delta
+            .facts
+            .members
+            .iter()
+            .map(|member| MemberSnapshot::from_facts(member, found))
+            .collect();
+        let from = delta.members_from;
+        let Some(existing) = self.volumes.get(&volume) else {
+            if from != 0 {
+                return Err(StoredLayoutError::ConflictingVolume { volume });
+            }
+            #[cfg(test)]
+            snapshot_reads::add(snapshots.len());
+            self.add_new_volume(volume, snapshots);
+            return Ok(());
+        };
+        let held = existing.snapshots.len();
+        // The members the delta reports again must state what the volume was
+        // added on; only those past them are new.
+        let Some(again) = held.checked_sub(from) else {
+            return Err(StoredLayoutError::ConflictingVolume { volume });
+        };
+        #[cfg(test)]
+        snapshot_reads::add(snapshots.len() + again.min(snapshots.len()));
+        if snapshots.len() < again || snapshots[..again] != existing.snapshots[from..] {
+            return Err(StoredLayoutError::ConflictingVolume { volume });
+        }
+        let fresh = &snapshots[again..];
+        if fresh.is_empty() {
+            Ok(())
+        } else if self.extends(volume, fresh) {
+            self.extend_volume(volume, fresh);
+            Ok(())
+        } else {
+            Err(StoredLayoutError::ConflictingVolume { volume })
+        }
+    }
+
+    /// Learn a volume the layout does not hold.
+    fn add_new_volume(&mut self, volume: u32, snapshots: Vec<MemberSnapshot>) {
         let mut extents: Vec<VolumeExtent> = Vec::with_capacity(snapshots.len());
         let mut evidence = VolumeSplitEvidence::default();
         let mut names_here: HashSet<&str> = HashSet::with_capacity(snapshots.len());
@@ -922,8 +1024,6 @@ impl StoredLayoutBuilder {
         for index in carried {
             self.resolve_member(index);
         }
-
-        Ok(())
     }
 
     /// Record one header's part of its member in `volume`.
@@ -963,25 +1063,20 @@ impl StoredLayoutBuilder {
         self.refresh_holes(member_index);
     }
 
-    /// Whether `snapshots` are the headers `volume` was added on followed by
-    /// more that learning alone answers for: it is the volume added last, so
-    /// no member was first seen after it, and the new headers name no member
-    /// it already carries a part of, lie in physical order at or past every
-    /// part it holds, and overlap nothing. Adding the longer headers afresh
-    /// would then find no duplicate and no overlap among the old ones that
-    /// it did not find before, and sort the new extents after the old.
-    fn extends(&self, volume: u32, snapshots: &[MemberSnapshot]) -> bool {
+    /// Whether `fresh`, the headers past those `volume` was added on, are
+    /// ones learning alone answers for: it is the volume added last, so no
+    /// member was first seen after it, and the new headers name no member it
+    /// already carries a part of, lie in physical order at or past every part
+    /// it holds, and overlap nothing. Adding the longer headers afresh would
+    /// then find no duplicate and no overlap among the old ones that it did
+    /// not find before, and sort the new extents after the old.
+    fn extends(&self, volume: u32, fresh: &[MemberSnapshot]) -> bool {
         let Some(record) = self.volumes.get(&volume) else {
             return false;
         };
-        let held = record.snapshots.len();
-        if self.last_added != Some(volume)
-            || snapshots.len() <= held
-            || snapshots[..held] != record.snapshots[..]
-        {
+        if self.last_added != Some(volume) || fresh.is_empty() {
             return false;
         }
-        let fresh = &snapshots[held..];
         let mut names: HashSet<&str> = HashSet::with_capacity(fresh.len());
         let mut floor = record.extents.last().map_or(0, |extent| extent.data_offset);
         let mut covered = record.covered.map(|(end, _)| end);
@@ -1011,12 +1106,12 @@ impl StoredLayoutBuilder {
     /// said they only add to it: the members they name are resolved again,
     /// and only those, since no other member's parts, traits or chain
     /// changed.
-    fn extend_volume(&mut self, volume: u32, snapshots: Vec<MemberSnapshot>) {
+    fn extend_volume(&mut self, volume: u32, fresh: &[MemberSnapshot]) {
         let Some(mut record) = self.volumes.remove(&volume) else {
             return;
         };
-        let mut affected = Vec::with_capacity(snapshots.len() - record.snapshots.len());
-        for snapshot in &snapshots[record.snapshots.len()..] {
+        let mut affected = Vec::with_capacity(fresh.len());
+        for snapshot in fresh {
             if snapshot.split_before {
                 record
                     .evidence
@@ -1047,7 +1142,7 @@ impl StoredLayoutBuilder {
             }
             affected.push(member_index);
         }
-        record.snapshots = snapshots;
+        record.snapshots.extend_from_slice(fresh);
         self.volumes.insert(volume, record);
         for index in affected {
             self.resolve_member(index);
@@ -3997,6 +4092,114 @@ mod tests {
         add(&mut builder, 0, &longer);
         refused(&mut builder, 0, &held);
         assert_same_answers(&builder, &fed(&[(0, longer.clone())]), 1);
+    }
+
+    /// `facts` as a delta from member `from`: the members before it left out.
+    fn delta_of(facts: &RarVolumeFacts, from: usize) -> RarVolumeFactsDelta {
+        let mut part = facts.clone();
+        part.members.drain(..from);
+        RarVolumeFactsDelta {
+            facts: part,
+            members_from: from,
+            services_from: 0,
+            short_at: None,
+        }
+    }
+
+    /// Each volume grown a few headers at a time, one builder fed the whole
+    /// headers and one fed deltas from any member at or before those it was
+    /// added on, as a caller that merged several steps sends them: every add
+    /// answers alike, and so does the layout after it. A delta that restates
+    /// a held member otherwise is refused, as the whole headers are.
+    #[test]
+    fn a_volume_fed_deltas_answers_as_one_fed_the_headers_they_add_up_to() {
+        let set = many_member_set();
+        let mut rng = Rng(0x5EED_1234_ABCD_0001);
+        let mut refused = 0;
+        for order in [[0u32, 1, 2], [1, 2, 0], [2, 0, 1], [0, 2, 1]] {
+            let mut whole = layout();
+            let mut deltas = layout();
+            for number in order {
+                let facts = &set[number as usize];
+                let mut held = 0;
+                let mut count = 0;
+                while count < facts.members.len() {
+                    count = (count + 1 + rng.below(4) as usize).min(facts.members.len());
+                    let short = first_headers(facts, count);
+                    let from = rng.below(held as u64 + 1) as usize;
+                    let answer = whole.add_volume(number, &short);
+                    assert_eq!(
+                        deltas.add_volume_delta(number, &delta_of(&short, from)),
+                        answer,
+                        "volume {number}, {count} headers from {from}"
+                    );
+                    if answer.is_ok() {
+                        held = count;
+                    }
+                    assert_same_answers(&deltas, &whole, 3);
+                    if from < held && rng.below(3) == 0 {
+                        let mut bent = short.clone();
+                        bent.members[from].data_size += 1;
+                        let answer = whole.add_volume(number, &bent);
+                        assert!(answer.is_err(), "a changed held header is refused");
+                        assert_eq!(
+                            deltas.add_volume_delta(number, &delta_of(&bent, from)),
+                            answer
+                        );
+                        assert_same_answers(&deltas, &whole, 3);
+                        refused += 1;
+                    }
+                }
+            }
+            assert!(
+                deltas.members().iter().any(|member| member.parts.len() > 1),
+                "the set splits members across volumes"
+            );
+        }
+        assert!(refused > 10, "only {refused} refusals");
+
+        // A delta past the headers held, or from a later member of a volume
+        // not held, cannot be judged and is refused, changing nothing.
+        let mut deltas = layout();
+        let held = first_headers(&set[0], 5);
+        deltas.add_volume_delta(0, &delta_of(&held, 0)).unwrap();
+        let longer = first_headers(&set[0], 9);
+        for (number, from) in [(0, 6), (1, 1)] {
+            let facts = if number == 0 { &longer } else { &set[1] };
+            assert_eq!(
+                deltas.add_volume_delta(number, &delta_of(facts, from)),
+                Err(StoredLayoutError::ConflictingVolume { volume: number })
+            );
+            assert_same_answers(&deltas, &fed(&[(0, held.clone())]), 2);
+        }
+    }
+
+    /// Growing a volume one header at a time through deltas reads each
+    /// header once; through its whole headers, every header held again on
+    /// each add.
+    #[test]
+    fn a_delta_reads_only_the_headers_it_reports() {
+        for count in [100_usize, 1000] {
+            let members: Vec<_> = (0..count)
+                .map(|at| member(&format!("d{at:05}.bin"), 100 + 64 * at as u64, 32))
+                .collect();
+            let facts = volume(members);
+            let mut whole = layout();
+            let mut deltas = layout();
+            snapshot_reads::take();
+            for at in 1..=count {
+                whole.add_volume(0, &first_headers(&facts, at)).unwrap();
+            }
+            let by_whole = snapshot_reads::take();
+            for at in 1..=count {
+                let delta = delta_of(&first_headers(&facts, at), at - 1);
+                deltas.add_volume_delta(0, &delta).unwrap();
+            }
+            let by_delta = snapshot_reads::take();
+            assert_same_answers(&deltas, &whole, 1);
+            assert_eq!(by_delta, count, "{count} headers");
+            assert!(by_whole > count * count / 2, "{count}: {by_whole}");
+        }
     }
 
     /// A small deterministic generator for the mapping layouts below.
