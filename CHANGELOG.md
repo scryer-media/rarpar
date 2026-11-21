@@ -3,6 +3,20 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.9.8
+
+- `rarpar xz` decodes a stream whose dictionary, or a block a threaded
+  decode holds whole, is larger than `--memory-mib`, through lzma-turbo
+  0.12.1. The buffer lives in a scratch file in the temporary directory,
+  removed as it is made and mapped into memory; such a stream was refused
+  before. A scratch file that cannot be made is a resource failure (exit 4).
+- `rarpar 7z` extracts LZMA2 archives whose dictionary is over 512 MiB on
+  one thread, through sevenz-turbo 0.30.4, as 7-Zip does. They failed with a
+  memory-limit error.
+- lzma-turbo 0.12.1 bounds what hostile xz input can make a decoder hold,
+  its indexes included. sevenz-turbo 0.30.4 finds the end header of a 7z
+  file whose start header is zeroed in one pass over its last megabyte.
+
 ## rarpar 0.9.7
 
 - RAR packed segments with at least 4 GiB remaining read correctly on

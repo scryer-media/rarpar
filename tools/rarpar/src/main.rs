@@ -22,6 +22,7 @@ mod report;
 mod sidecar;
 mod streams;
 mod xz;
+mod xz_window;
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;

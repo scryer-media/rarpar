@@ -289,8 +289,9 @@ pub struct XzDecodeArgs {
     /// Decoder threads for a multi-block file (defaults to available CPUs).
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=256))]
     pub threads: Option<u32>,
-    /// Memory limit in MiB: threads are reduced to fit, and a stream whose
-    /// dictionary alone exceeds it is refused.
+    /// Memory limit in MiB: threads are reduced to fit, and a dictionary
+    /// larger than all of it is decoded in a scratch file in the temporary
+    /// directory instead.
     #[arg(long, value_name = "MIB", default_value_t = 1024, value_parser = clap::value_parser!(u64).range(1..))]
     pub memory_mib: u64,
 }
@@ -322,7 +323,8 @@ pub struct XzListArgs {
     /// .xz file to list, or `-` for standard input (the default when it is not a terminal).
     #[arg(value_name = "INPUT")]
     pub input: Option<PathBuf>,
-    /// Memory limit in MiB for the decode a forward-only stream is listed by.
+    /// Memory limit in MiB for the decode a forward-only stream is listed by;
+    /// a larger dictionary is decoded in a scratch file.
     #[arg(long, value_name = "MIB", default_value_t = 1024, value_parser = clap::value_parser!(u64).range(1..))]
     pub memory_mib: u64,
 }

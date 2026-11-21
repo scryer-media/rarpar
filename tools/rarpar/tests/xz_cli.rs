@@ -426,11 +426,13 @@ fn damage_fails_the_test_and_leaves_no_output() {
 }
 
 #[test]
-fn a_dictionary_above_the_memory_limit_is_a_resource_failure() {
+fn a_dictionary_above_the_memory_limit_decodes_in_a_scratch_file() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
-    std::fs::write(root.join("data.bin"), sample(2 << 20, 29)).unwrap();
-    // One 2 MiB block: the dictionary is the block, 2 MiB.
+    let data = sample(4 << 20, 29);
+    std::fs::write(root.join("data.bin"), &data).unwrap();
+    // Two 2 MiB blocks: each dictionary is its block, 2 MiB, over a 1 MiB
+    // limit, and so is each block a threaded decode holds whole.
     ok(&rarpar(
         root,
         &[
@@ -438,7 +440,27 @@ fn a_dictionary_above_the_memory_limit_is_a_resource_failure() {
         ],
     ));
     for threads in ["1", "4"] {
-        let output = rarpar(
+        let out = format!("out-{threads}.bin");
+        let decoded = report(
+            root,
+            &[
+                "xz",
+                "decompress",
+                "data.bin.xz",
+                &out,
+                "--memory-mib",
+                "1",
+                "--threads",
+                threads,
+            ],
+        );
+        assert_eq!(decoded["success"], true, "threads {threads}");
+        assert_eq!(
+            std::fs::read(root.join(&out)).unwrap(),
+            data,
+            "threads {threads}"
+        );
+        ok(&rarpar(
             root,
             &[
                 "xz",
@@ -449,13 +471,28 @@ fn a_dictionary_above_the_memory_limit_is_a_resource_failure() {
                 "--threads",
                 threads,
             ],
+        ));
+        let compressed = std::fs::read(root.join("data.bin.xz")).unwrap();
+        let output = piped(
+            &bin(),
+            root,
+            &[
+                "xz",
+                "decompress",
+                "-",
+                "-",
+                "--memory-mib",
+                "1",
+                "--threads",
+                threads,
+            ],
+            compressed,
         );
-        assert_eq!(output.status.code(), Some(4), "threads {threads}");
+        ok(&output);
+        assert_eq!(output.stdout, data, "pipe, threads {threads}");
     }
-    ok(&rarpar(
-        root,
-        &["xz", "test", "data.bin.xz", "--memory-mib", "8"],
-    ));
+    let listed = report(root, &["xz", "list", "data.bin.xz", "--memory-mib", "1"]);
+    assert_eq!(listed["success"], true);
 
     // Compression degrades its threads to the budget, and refuses below one.
     let planned = report(
