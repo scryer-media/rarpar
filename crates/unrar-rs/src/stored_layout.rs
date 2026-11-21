@@ -646,11 +646,46 @@ struct VolumeExtent {
     data_size: u64,
 }
 
+/// Extend `reach` over one more extent, in extent order.
+fn push_reach(reach: &mut Vec<u64>, extent: &VolumeExtent) {
+    let before = reach.last().copied().unwrap_or(0);
+    let end = if extent.data_size == 0 {
+        0
+    } else {
+        extent.data_offset.saturating_add(extent.data_size)
+    };
+    reach.push(before.max(end));
+}
+
+/// How many extents this thread's physical mappings looked at.
+#[cfg(test)]
+mod extent_visits {
+    use std::cell::Cell;
+
+    thread_local! {
+        static VISITS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn add() {
+        VISITS.with(|visits| visits.set(visits.get() + 1));
+    }
+
+    pub(super) fn take() -> usize {
+        VISITS.with(|visits| visits.replace(0))
+    }
+}
+
 /// Everything one added volume contributes.
 struct VolumeRecord {
     snapshots: Vec<MemberSnapshot>,
-    /// Member extents sorted by physical offset.
+    /// Member extents sorted by physical offset, ties in header order. An add
+    /// sorts them; an extension appends extents at or past the last one.
     extents: Vec<VolumeExtent>,
+    /// Per extent, the furthest end of any extent up to and including it,
+    /// zero-length extents reaching nowhere: never decreasing, so a binary
+    /// search finds the first extent reaching past an offset even when an
+    /// earlier extent contains later ones.
+    reach: Vec<u64>,
     evidence: VolumeSplitEvidence,
     /// Where the overlap sweep over `extents` ended: the furthest end it saw
     /// and the member reaching it.
@@ -824,11 +859,16 @@ impl StoredLayoutBuilder {
             }
         }
 
+        let mut reach = Vec::with_capacity(extents.len());
+        for extent in &extents {
+            push_reach(&mut reach, extent);
+        }
         self.volumes.insert(
             volume,
             VolumeRecord {
                 snapshots,
                 extents,
+                reach,
                 evidence,
                 covered,
             },
@@ -953,11 +993,13 @@ impl StoredLayoutBuilder {
             let member_index = self.member_index_for(snapshot, volume);
             self.absorb_traits(member_index, snapshot);
             self.learn_part(member_index, volume, snapshot);
-            record.extents.push(VolumeExtent {
+            let extent = VolumeExtent {
                 member_index,
                 data_offset: snapshot.data_offset,
                 data_size: snapshot.data_size,
-            });
+            };
+            push_reach(&mut record.reach, &extent);
+            record.extents.push(extent);
             if snapshot.data_size > 0 {
                 record.covered = Some((
                     snapshot.data_offset.saturating_add(snapshot.data_size),
@@ -1014,6 +1056,13 @@ impl StoredLayoutBuilder {
     /// reports the same clamped length, so the returned slices always sum to
     /// `min(len, u64::MAX - offset)`.
     pub fn map_physical_range(&self, volume: u32, offset: u64, len: u64) -> Vec<MappedSlice> {
+        self.map_range(volume, offset, len, true)
+    }
+
+    /// [`Self::map_physical_range`], beginning its walk at the first extent
+    /// reaching past `offset` when `search`, and at the first extent
+    /// otherwise, as it used to (kept for tests to compare against).
+    fn map_range(&self, volume: u32, offset: u64, len: u64, search: bool) -> Vec<MappedSlice> {
         let mut slices = Vec::new();
         let end = offset.saturating_add(len);
         let len = end - offset;
@@ -1027,7 +1076,16 @@ impl StoredLayoutBuilder {
         };
 
         let mut cursor = offset;
-        for extent in &record.extents {
+        // Every extent before `first` is empty or ends at or before `offset`,
+        // so the walk from the start skipped each of them.
+        let first = if search {
+            record.reach.partition_point(|reach| *reach <= offset)
+        } else {
+            0
+        };
+        for extent in &record.extents[first..] {
+            #[cfg(test)]
+            extent_visits::add();
             if cursor >= end {
                 break;
             }
@@ -3842,5 +3900,170 @@ mod tests {
         add(&mut builder, 0, &longer);
         refused(&mut builder, 0, &held);
         assert_same_answers(&builder, &fed(&[(0, longer.clone())]), 1);
+    }
+
+    /// A small deterministic generator for the mapping layouts below.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound
+        }
+    }
+
+    /// A member that routes direct unless its layout says otherwise.
+    fn routed(name: &str, data_offset: u64, data_size: u64) -> RarVolumeMemberFacts {
+        with_crc32(member(name, data_offset, data_size), 0x1234_5678)
+    }
+
+    /// Members laid out with gaps, zero-length parts, nested parts (one range
+    /// wholly inside an earlier, longer one), overlaps and shared offsets.
+    fn scattered_members(rng: &mut Rng, prefix: &str, count: usize) -> Vec<RarVolumeMemberFacts> {
+        let mut at = rng.below(16);
+        (0..count)
+            .map(|index| {
+                let size = match rng.below(6) {
+                    0 => 0,
+                    1 => 200 + rng.below(400),
+                    _ => 1 + rng.below(40),
+                };
+                let offset = match rng.below(5) {
+                    0 => at.saturating_sub(rng.below(60)),
+                    _ => at + rng.below(30),
+                };
+                // Often stay inside a long part, so later parts nest in it.
+                at = if size > 100 && rng.below(2) == 0 {
+                    offset + 1 + rng.below(20)
+                } else {
+                    offset + rng.below(size.max(1) + 1)
+                };
+                routed(&format!("{prefix}{index}.bin"), offset, size)
+            })
+            .collect()
+    }
+
+    /// Every slice the search answers equals the full walk's, for every start
+    /// across and past the volume and a spread of lengths.
+    fn assert_search_matches_walk(builder: &StoredLayoutBuilder, volume: u32, span: u64) {
+        for offset in 0..span {
+            for len in [0, 1, 2, 7, 33, 150, 700, u64::MAX] {
+                assert_eq!(
+                    builder.map_range(volume, offset, len, true),
+                    builder.map_range(volume, offset, len, false),
+                    "volume {volume} offset {offset} len {len}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn physical_mapping_search_matches_the_walk_from_the_first_extent() {
+        // A long part holding two short ones and an empty one: a search on
+        // data offsets alone would start inside it at the last short part
+        // and lose the long part's bytes past the short ones.
+        let mut builder = layout();
+        add(
+            &mut builder,
+            0,
+            &volume(vec![
+                routed("long.bin", 0, 1000),
+                routed("short1.bin", 10, 10),
+                routed("short2.bin", 30, 10),
+                routed("empty.bin", 50, 0),
+            ]),
+        );
+        assert_search_matches_walk(&builder, 0, 1020);
+
+        // An empty part inside a healthy one overlaps nothing, so the healthy
+        // part routes direct: a search that started at the last part beginning
+        // at or before the offset would land on the empty part and send the
+        // healthy part's later bytes to the envelope.
+        let mut builder = layout();
+        add(
+            &mut builder,
+            0,
+            &volume(vec![
+                routed("healthy.bin", 100, 100),
+                routed("empty.bin", 120, 0),
+                routed("next.bin", 300, 50),
+            ]),
+        );
+        assert!(builder.members()[0].eligibility.routes_direct());
+        assert_search_matches_walk(&builder, 0, 400);
+
+        for seed in 1..=120_u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let count = 1 + rng.below(24) as usize;
+            let held = scattered_members(&mut rng, "a", count);
+            let span = held
+                .iter()
+                .map(|facts| facts.data_offset + facts.data_size)
+                .max()
+                .unwrap_or(0);
+
+            let mut builder = layout();
+            add(&mut builder, 0, &volume(held.clone()));
+            add(&mut builder, 2, &volume(held.clone()));
+            assert_search_matches_walk(&builder, 0, span + 20);
+            assert_search_matches_walk(&builder, 2, span + 20);
+            // A volume never added.
+            assert_search_matches_walk(&builder, 1, 4);
+
+            // Grow the last volume in place: its new extents append past the
+            // old ones, and the search has to see them too.
+            let mut longer = held.clone();
+            let mut at = span + rng.below(8);
+            for index in 0..1 + rng.below(6) {
+                let size = rng.below(3) * (1 + rng.below(30));
+                longer.push(routed(&format!("b{index}.bin"), at, size));
+                at += size + rng.below(10);
+            }
+            add(&mut builder, 2, &volume(longer.clone()));
+            assert_eq!(
+                builder.volumes[&2].extents.len(),
+                longer.len(),
+                "seed {seed}: the longer headers extend the volume"
+            );
+            assert_search_matches_walk(&builder, 2, at + 20);
+        }
+    }
+
+    #[test]
+    fn physical_mapping_visits_only_the_extents_it_needs() {
+        let visits = |extents: u64| {
+            let members = (0..extents)
+                .map(|index| routed(&format!("m{index}.bin"), 10 + index * 100, 90))
+                .collect();
+            let mut builder = layout();
+            add(&mut builder, 0, &volume(members));
+            extent_visits::take();
+            // One article-sized read near the end of the volume, crossing a
+            // member boundary, and one past every member.
+            let near_end = 10 + (extents - 3) * 100 + 50;
+            builder.map_physical_range(0, near_end, 120);
+            builder.map_physical_range(0, 10 + extents * 100 + 5, 64);
+            let searched = extent_visits::take();
+            builder.map_range(0, near_end, 120, false);
+            builder.map_range(0, 10 + extents * 100 + 5, 64, false);
+            (searched, extent_visits::take())
+        };
+        let (small, small_walk) = visits(64);
+        let (large, large_walk) = visits(4096);
+        assert_eq!(
+            small, large,
+            "the search's work does not grow with the volume"
+        );
+        assert!(small <= 4, "the search looked at {small} extents");
+        assert!(
+            large_walk >= 2 * 4000,
+            "the old walk looked at {large_walk} extents (small: {small_walk})"
+        );
     }
 }
