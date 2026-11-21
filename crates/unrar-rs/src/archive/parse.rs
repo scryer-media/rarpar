@@ -307,6 +307,7 @@ impl RarArchive {
             password: password.map(String::from),
             kdf_cache,
             prefix_cursor,
+            held_segments: None,
         })
     }
 
@@ -490,6 +491,7 @@ impl RarArchive {
             password: password.map(String::from),
             kdf_cache,
             prefix_cursor: None,
+            held_segments: None,
         };
         archive.hydrate_rar4_uowner_payloads();
         Ok(archive)
