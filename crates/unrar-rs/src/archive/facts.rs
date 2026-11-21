@@ -944,19 +944,21 @@ impl RarArchive {
                                         ArchiveFormat::Rar14,
                                         &parsed,
                                         short,
+                                        None,
                                     )
                                 });
                         return (outcome, None);
                     }
-                    Ok((ArchiveFormat::Rar4, at)) => {
-                        FactsResume::Rar4(crate::rar4::Rar4Walk::starting_at(at))
-                    }
+                    Ok((ArchiveFormat::Rar4, at)) => FactsResume::Rar4(
+                        crate::rar4::Rar4Walk::starting_at(at),
+                        super::member::Rar4OwnerPayloads::default(),
+                    ),
                     Ok((ArchiveFormat::Rar5, at)) => FactsResume::Rar5(Rar5Resume::starting_at(at)),
                 }
             }
         };
         match resume {
-            FactsResume::Rar4(mut walk) => {
+            FactsResume::Rar4(mut walk, mut payloads) => {
                 let walked = reader
                     .seek(SeekFrom::Start(walk.at()))
                     .map_err(crate::error::RarError::from)
@@ -972,6 +974,9 @@ impl RarArchive {
                     .and_then(|()| walk.take_volume(true));
                 let outcome = match walked {
                     Ok(parsed) => {
+                        // Every byte before where the next walk begins is the
+                        // caller's to keep, so a payload read there stays read.
+                        let through = walk.at();
                         let outcome = Self::rar4_facts(
                             reader,
                             password,
@@ -979,6 +984,7 @@ impl RarArchive {
                             ArchiveFormat::Rar4,
                             &parsed,
                             short,
+                            Some((&mut payloads, through)),
                         );
                         walk.give_back(parsed);
                         outcome
@@ -988,7 +994,7 @@ impl RarArchive {
                         Err(error)
                     }
                 };
-                (outcome, Some(FactsResume::Rar4(walk)))
+                (outcome, Some(FactsResume::Rar4(walk, payloads)))
             }
             FactsResume::Rar5(mut state) => {
                 let mut stop = state.at;
@@ -1046,7 +1052,45 @@ impl RarArchive {
         }
     }
 
-    /// The facts a RAR4-family walk's headers state.
+    /// The owners [`Self::open_rar4_parsed`] leaves on a volume's members:
+    /// what [`Self::rar4_member_owners`] answers without opening it, kept for
+    /// tests to compare against.
+    #[cfg(test)]
+    fn rar4_owners_by_opening(
+        reader: Box<dyn ReadSeek>,
+        password: Option<&str>,
+        kdf_cache: &std::sync::Arc<crate::crypto::KdfCache>,
+        format: ArchiveFormat,
+        parsed: &crate::rar4::Rar4ParsedVolume,
+    ) -> Vec<Option<crate::types::UnixOwnerInfo>> {
+        let has_rar4_uowner_payload = parsed.services.iter().any(|service| service.name == "UOW")
+            || parsed.old_services.iter().any(|service| {
+                matches!(
+                    &service.data,
+                    crate::rar4::types::Rar4OldServiceData::UnixOwner
+                )
+            });
+        if !has_rar4_uowner_payload {
+            return parsed.files.iter().map(|fh| fh.owner.clone()).collect();
+        }
+        let archive = Self::open_rar4_parsed(
+            reader,
+            password,
+            std::sync::Arc::clone(kdf_cache),
+            format,
+            parsed.clone(),
+        )
+        .expect("opening parsed RAR4 headers does not fail");
+        archive
+            .members
+            .iter()
+            .map(|member| member.owner.clone())
+            .collect()
+    }
+
+    /// The facts a RAR4-family walk's headers state. `payloads` carries the
+    /// `UOW` payloads earlier walks of the volume read, and the offset before
+    /// which the walk's bytes are fixed.
     fn rar4_facts(
         reader: Box<dyn ReadSeek>,
         password: Option<&str>,
@@ -1054,6 +1098,7 @@ impl RarArchive {
         format: ArchiveFormat,
         parsed: &crate::rar4::Rar4ParsedVolume,
         short: Option<ShortRead>,
+        payloads: Option<(&mut super::member::Rar4OwnerPayloads, u64)>,
     ) -> RarResult<FactsWalkOutcome> {
         let volume_number = parsed
             .end
@@ -1062,33 +1107,11 @@ impl RarArchive {
             .map(u32::from);
         let more_volumes = parsed.end.as_ref().is_some_and(|end| end.more_volumes)
             || (format == ArchiveFormat::Rar14 && parsed.files.iter().any(|f| f.split_after));
-        let has_rar4_uowner_payload = parsed.services.iter().any(|service| service.name == "UOW")
-            || parsed.old_services.iter().any(|service| {
-                matches!(
-                    &service.data,
-                    crate::rar4::types::Rar4OldServiceData::UnixOwner
-                )
-            });
-        let member_owner_facts: Vec<_> = if has_rar4_uowner_payload {
-            let archive = Self::open_rar4_parsed(
-                reader,
-                password,
-                std::sync::Arc::clone(kdf_cache),
-                format,
-                parsed.clone(),
-            )?;
-            archive
-                .members
-                .iter()
-                .map(|member| unix_owner_facts(member.owner.clone()))
-                .collect()
-        } else {
-            parsed
-                .files
-                .iter()
-                .map(|fh| unix_owner_facts(fh.owner.clone()))
-                .collect()
-        };
+        let member_owner_facts: Vec<_> =
+            Self::rar4_member_owners(reader, password, kdf_cache, format, parsed, payloads)
+                .into_iter()
+                .map(unix_owner_facts)
+                .collect();
         let members = parsed
             .files
             .iter()
@@ -1238,7 +1261,7 @@ pub struct RarVolumeFactsCursor {
 
 /// What a walk carries to the next one over the same volume.
 enum FactsResume {
-    Rar4(crate::rar4::Rar4Walk),
+    Rar4(crate::rar4::Rar4Walk, super::member::Rar4OwnerPayloads),
     Rar5(Rar5Resume),
 }
 
@@ -1268,7 +1291,7 @@ impl Rar5Resume {
 impl FactsResume {
     fn at(&self) -> u64 {
         match self {
-            Self::Rar4(walk) => walk.at(),
+            Self::Rar4(walk, _) => walk.at(),
             Self::Rar5(state) => state.at,
         }
     }
@@ -2758,6 +2781,188 @@ mod tests {
 
         fn synthetics() -> [(&'static str, Synthetic); 2] {
             [("RAR5", synthetic_rar5(24)), ("RAR4", synthetic_rar4(24))]
+        }
+
+        /// A stored RAR4 service whose payload follows its header, with the
+        /// payload's CRC32 stated right or wrong.
+        fn rar4_service(name: &[u8], payload: &[u8], crc_right: bool) -> Vec<u8> {
+            let mut body = rar4_store_body(name, payload.len() as u32, &[]);
+            let crc = crate::crc::hash(payload) ^ u32::from(!crc_right);
+            body[9..13].copy_from_slice(&crc.to_le_bytes());
+            let mut bytes = build_rar4_header(0x7A, 0x8000 | 0x4000, &body);
+            bytes.extend_from_slice(payload);
+            bytes
+        }
+
+        /// A RAR4 volume of `files` stored members, each followed by owner
+        /// services of every kind a seed picks: none, a readable payload, a
+        /// payload whose checksum fails, one naming no owner, an owner stated
+        /// in the header itself, a header owner followed by a payload, or
+        /// two payloads for one file. The number of
+        /// `UOW` services is returned with it.
+        fn owned_rar4(seed: u64, files: usize) -> (Vec<u8>, usize) {
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let mut bytes = crate::signature::RAR4_SIGNATURE.to_vec();
+            bytes.extend_from_slice(&build_rar4_main_header(0x0001 | 0x0100, 0, 0));
+            let mut uows = 0;
+            for index in 0..files {
+                let len = (index * 7 % 23 + 1) as u32;
+                bytes.extend_from_slice(&build_rar4_header(
+                    0x74,
+                    0x8000,
+                    &rar4_store_body(member_name(index).as_bytes(), len, &[]),
+                ));
+                bytes.extend(std::iter::repeat_n(0x5A, len as usize));
+                let owner = format!("user{index}\0group{}", next() % 5);
+                uows += match next() % 8 {
+                    0 | 1 => 0,
+                    2 => {
+                        bytes.extend(rar4_service(b"UOW", owner.as_bytes(), true));
+                        1
+                    }
+                    3 => {
+                        bytes.extend(rar4_service(b"UOW", owner.as_bytes(), false));
+                        1
+                    }
+                    4 => {
+                        bytes.extend(rar4_service(b"UOW", b"nobody", true));
+                        1
+                    }
+                    5 => {
+                        bytes.extend_from_slice(&build_rar4_header(
+                            0x7A,
+                            0x4000,
+                            &rar4_store_body(b"UOW", 0, b"harbour\0crew"),
+                        ));
+                        1
+                    }
+                    6 => {
+                        bytes.extend_from_slice(&build_rar4_header(
+                            0x7A,
+                            0x4000,
+                            &rar4_store_body(b"UOW", 0, b"harbour\0crew"),
+                        ));
+                        bytes.extend(rar4_service(b"UOW", owner.as_bytes(), true));
+                        2
+                    }
+                    _ => {
+                        bytes.extend(rar4_service(b"UOW", owner.as_bytes(), true));
+                        bytes.extend(rar4_service(b"UOW", b"second\0owner", next() % 2 == 0));
+                        2
+                    }
+                };
+                if next() % 9 == 0 {
+                    bytes.extend(rar4_service(b"CMT", b"a comment", true));
+                }
+            }
+            bytes.extend_from_slice(&build_rar4_header(0x7b, 0x0001, &[]));
+            (bytes, uows)
+        }
+
+        /// The headers a walk from the signature reads over `image`.
+        fn rar4_headers(image: &Image, view: View) -> Option<crate::rar4::Rar4ParsedVolume> {
+            let mut reader = image.reader(view);
+            reader.seek(SeekFrom::Start(7)).ok()?;
+            let mut walk = crate::rar4::Rar4Walk::starting_at(7);
+            let mut short = None;
+            let cache = Arc::new(crate::crypto::KdfCache::new());
+            crate::rar4::walk_rar4_headers_for_facts(
+                &mut reader,
+                None,
+                &cache,
+                &mut short,
+                &mut walk,
+            )
+            .ok()?;
+            walk.take_volume(true).ok()
+        }
+
+        #[test]
+        fn rar4_owners_match_what_opening_the_volume_resolves() {
+            let cache = Arc::new(crate::crypto::KdfCache::new());
+            let mut compared = 0;
+            for seed in 1..=60_u64 {
+                let (bytes, _) = owned_rar4(seed, 1 + (seed % 17) as usize);
+                // The whole volume, and images missing pieces, so some
+                // payloads cannot be read.
+                let mut images = vec![Image::whole(&bytes)];
+                for cut in [3, 5, 8] {
+                    let mut image = Image::empty(&bytes);
+                    for (index, start) in (0..bytes.len()).step_by(cut * 3).enumerate() {
+                        if index % cut != 1 {
+                            image.stage(start..(start + cut * 3).min(bytes.len()));
+                        }
+                    }
+                    images.push(image);
+                }
+                for image in &images {
+                    for view in [View::Sparse, View::Prefix] {
+                        let Some(parsed) = rar4_headers(image, view) else {
+                            continue;
+                        };
+                        let opened = RarArchive::rar4_owners_by_opening(
+                            Box::new(image.reader(view)),
+                            None,
+                            &cache,
+                            ArchiveFormat::Rar4,
+                            &parsed,
+                        );
+                        let resolved = RarArchive::rar4_member_owners(
+                            Box::new(image.reader(view)),
+                            None,
+                            &cache,
+                            ArchiveFormat::Rar4,
+                            &parsed,
+                            None,
+                        );
+                        assert_eq!(resolved, opened, "seed {seed}, {view:?}");
+                        compared += usize::from(resolved.iter().any(Option::is_some));
+                    }
+                }
+            }
+            assert!(compared > 100, "only {compared} images named an owner");
+        }
+
+        #[test]
+        fn rar4_owner_volumes_fed_in_any_order_step_to_what_a_fresh_walk_reads() {
+            for seed in [3_u64, 11, 29] {
+                let (bytes, _) = owned_rar4(seed, 12);
+                for piece in [9, 40] {
+                    feed(&format!("owners {seed} / {piece}"), &bytes, None, piece);
+                }
+            }
+        }
+
+        #[test]
+        fn a_cursor_reads_each_owner_payload_once() {
+            let reads = |files: usize| {
+                let (bytes, uows) = owned_rar4(5, files);
+                let mut image = Image::empty(&bytes);
+                let mut run = Run::new(None, View::Sparse);
+                crate::archive::member::uow_reads::take();
+                let piece = 64;
+                for start in (0..bytes.len()).step_by(piece) {
+                    image.stage(start..(start + piece).min(bytes.len()));
+                    run.step_only(&image).expect("a prefix walks");
+                    run.steps += 1;
+                }
+                (crate::archive::member::uow_reads::take(), uows, run.steps)
+            };
+            for files in [40, 400] {
+                let (reads, uows, steps) = reads(files);
+                // A payload is read once it is whole, and again only while
+                // its bytes are still arriving at the cursor.
+                assert!(
+                    reads <= uows + steps,
+                    "{files} files: {reads} payload reads for {uows} payloads over {steps} steps"
+                );
+            }
         }
 
         #[test]

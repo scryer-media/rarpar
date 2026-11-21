@@ -428,6 +428,50 @@ impl StoreCopyLimit {
     }
 }
 
+/// The `UOW` payloads a RAR4 facts cursor's walks have read, by the service
+/// header that locates each: what the payload parsed to, nothing when it
+/// named no owner.
+#[derive(Debug, Default)]
+pub(super) struct Rar4OwnerPayloads {
+    read: std::collections::HashMap<Rar4PayloadKey, Option<crate::types::UnixOwnerInfo>>,
+}
+
+/// A service as far as reading its payload goes: where its header and bytes
+/// are and how much the payload holds.
+type Rar4PayloadKey = (u64, Option<u64>, Vec<(usize, u64, u64)>);
+
+impl Rar4OwnerPayloads {
+    fn key(service: &ServiceEntry) -> Rar4PayloadKey {
+        (
+            service.header_offset,
+            service.file_header.unpacked_size,
+            service
+                .segments
+                .iter()
+                .map(|segment| (segment.volume_index, segment.data_offset, segment.data_size))
+                .collect(),
+        )
+    }
+}
+
+/// How many `UOW` payloads this thread's facts walks read.
+#[cfg(test)]
+pub(super) mod uow_reads {
+    use std::cell::Cell;
+
+    thread_local! {
+        static READS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(in crate::archive) fn add() {
+        READS.with(|reads| reads.set(reads.get() + 1));
+    }
+
+    pub(in crate::archive) fn take() -> usize {
+        READS.with(|reads| reads.replace(0))
+    }
+}
+
 impl RarArchive {
     /// Read the archive comment (`CMT` service), if present.
     ///
@@ -1387,6 +1431,142 @@ impl RarArchive {
                 }
             }
         }
+    }
+
+    /// The owner each file of one RAR4 volume has once its `UOW` services are
+    /// read: what [`Self::open_rar4_parsed`] leaves on its members, without
+    /// building that archive. A service belongs to the file whose data starts
+    /// last before its own, the later file when two start together, as
+    /// [`Self::service_parent`] answers; a file whose header names its owner
+    /// keeps it, and of several payloads for one file the last that parses
+    /// wins.
+    ///
+    /// `payloads` holds what earlier walks of the same volume read. A payload
+    /// held there is not read again, and one read now is kept when its bytes
+    /// end at or before the offset given with it, where the caller vouches
+    /// they do not change. A read that fails is never kept: its bytes may
+    /// still arrive.
+    pub(super) fn rar4_member_owners(
+        reader: Box<dyn ReadSeek>,
+        password: Option<&str>,
+        kdf_cache: &std::sync::Arc<crate::crypto::KdfCache>,
+        format: ArchiveFormat,
+        parsed: &crate::rar4::Rar4ParsedVolume,
+        mut payloads: Option<(&mut Rar4OwnerPayloads, u64)>,
+    ) -> Vec<Option<crate::types::UnixOwnerInfo>> {
+        let mut owners: Vec<_> = parsed.files.iter().map(|fh| fh.owner.clone()).collect();
+        let has_payload = parsed.services.iter().any(|service| service.name == "UOW")
+            || parsed.old_services.iter().any(|service| {
+                matches!(
+                    &service.data,
+                    crate::rar4::types::Rar4OldServiceData::UnixOwner
+                )
+            });
+        if !has_payload {
+            return owners;
+        }
+        let mut services = Vec::new();
+        Self::integrate_service_entries(
+            &mut services,
+            0,
+            Self::rar4_service_entries(parsed, format),
+        );
+
+        // Every file's data sits in volume 0 at its header's offset.
+        let mut starts: Vec<(u64, usize)> = parsed
+            .files
+            .iter()
+            .enumerate()
+            .map(|(index, fh)| (fh.data_offset, index))
+            .collect();
+        starts.sort_unstable();
+        let parent = |service: &ServiceEntry| {
+            let start = service.segments.first()?;
+            if start.volume_index != 0 {
+                return None;
+            }
+            let before = starts.partition_point(|(offset, _)| *offset < start.data_offset);
+            before.checked_sub(1).map(|at| starts[at].1)
+        };
+        let targets: Vec<(&ServiceEntry, usize)> = services
+            .iter()
+            .filter(|service| service.file_header.name == "UOW")
+            .filter_map(|service| {
+                let member = parent(service)?;
+                owners[member].is_none().then_some((service, member))
+            })
+            .collect();
+
+        let mut reader = Some(reader);
+        let mut archive: Option<Self> = None;
+        for (service, member) in targets {
+            let key = Rar4OwnerPayloads::key(service);
+            let held = payloads
+                .as_ref()
+                .and_then(|(held, _)| held.read.get(&key).cloned());
+            let owner = match held {
+                Some(owner) => owner,
+                None => {
+                    if archive.is_none()
+                        && let Some(reader) = reader.take()
+                    {
+                        archive = Some(Self::rar4_payload_reader(
+                            reader,
+                            password,
+                            std::sync::Arc::clone(kdf_cache),
+                            format,
+                        ));
+                    }
+                    let Some(archive) = archive.as_mut() else {
+                        break;
+                    };
+                    #[cfg(test)]
+                    uow_reads::add();
+                    let fixed = payloads.as_ref().is_some_and(|(_, through)| {
+                        service.segments.iter().all(|segment| {
+                            segment
+                                .data_offset
+                                .checked_add(segment.data_size)
+                                .is_some_and(|end| end <= *through)
+                        })
+                    });
+                    let read = archive.read_service_subdata_to_memory(service);
+                    // A whole unsplit payload checked against its CRC fails
+                    // the same way on every read of the same bytes; a read
+                    // that fails short of the end may not.
+                    let settled = match &read {
+                        Ok(_) => true,
+                        Err(RarError::DataCrcMismatch { .. }) => {
+                            !service.file_header.split_after && service.segments.len() == 1
+                        }
+                        Err(_) => false,
+                    };
+                    let owner = match read {
+                        Ok(payload) => crate::rar4::parse_rar4_uowner_subdata(&payload),
+                        Err(err) => {
+                            debug!(
+                                service = %service.file_header.name,
+                                member = %parsed.files[member].name,
+                                error = %err,
+                                "ignoring unreadable optional RAR4 UOW service payload"
+                            );
+                            None
+                        }
+                    };
+                    if fixed
+                        && settled
+                        && let Some((held, _)) = payloads.as_mut()
+                    {
+                        held.read.insert(key, owner.clone());
+                    }
+                    owner
+                }
+            };
+            if let Some(owner) = owner {
+                owners[member] = Some(owner);
+            }
+        }
+        owners
     }
 
     /// The member service `service_idx` belongs to: the member with the

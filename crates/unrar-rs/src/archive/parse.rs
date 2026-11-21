@@ -427,41 +427,12 @@ impl RarArchive {
             });
         }
 
-        let mut parsed_services = Vec::new();
-        for fh in &parsed.services {
-            let file_header = Self::rar4_to_file_header(fh, parsed.archive_header.is_solid);
-            let entry = ServiceEntry {
-                header_offset: fh.data_offset,
-                is_child: false,
-                is_inherited: false,
-                segments: vec![DataSegment::with_packed_hashes(
-                    0,
-                    fh.data_offset,
-                    fh.packed_size,
-                    Self::packed_hashes_for_split_segment(&file_header, None),
-                    false,
-                )],
-                file_header,
-                is_encrypted: fh.is_encrypted,
-                file_encryption: None,
-                rar4_salt: fh.salt,
-                hash: None,
-                comment_crc16: None,
-                ntfs_stream_name: None,
-            };
-            parsed_services.push(entry);
-        }
-        for old_service in &parsed.old_services {
-            if let Some(entry) = Self::rar4_old_service_to_service_entry(old_service, 0, format) {
-                parsed_services.push(entry);
-            }
-        }
-        for comment in &parsed.comments {
-            let entry = Self::rar4_comment_to_service_entry(comment, 0, format);
-            parsed_services.push(entry);
-        }
         let mut services = Vec::new();
-        Self::integrate_service_entries(&mut services, 0, parsed_services);
+        Self::integrate_service_entries(
+            &mut services,
+            0,
+            Self::rar4_service_entries(&parsed, format),
+        );
 
         let volumes: Vec<Option<VolumeData>> = vec![Some(VolumeData { reader })];
 
@@ -501,6 +472,93 @@ impl RarArchive {
         };
         archive.hydrate_rar4_uowner_payloads();
         Ok(archive)
+    }
+
+    /// A one-volume RAR4 archive holding nothing but `reader`, for reading a
+    /// service payload the headers already located: it reads that payload
+    /// exactly as [`Self::open_rar4_parsed`]'s archive over the same reader
+    /// does, with the same password, key cache and limits.
+    pub(super) fn rar4_payload_reader(
+        reader: Box<dyn ReadSeek>,
+        password: Option<&str>,
+        kdf_cache: Arc<crate::crypto::KdfCache>,
+        format: ArchiveFormat,
+    ) -> Self {
+        RarArchive {
+            format,
+            is_solid: false,
+            is_encrypted: false,
+            has_recovery_record: false,
+            recovery_records: Vec::new(),
+            is_locked: false,
+            has_authenticity_verification: false,
+            has_locator: false,
+            quick_open_offset: None,
+            recovery_record_offset: None,
+            original_name: None,
+            original_name_raw: None,
+            original_creation_time: None,
+            volume_set: VolumeSet::single(),
+            members: Vec::new(),
+            services: Vec::new(),
+            more_volumes: false,
+            volumes: vec![Some(VolumeData { reader })],
+            solid_decoder: None,
+            solid_decoder_rar4: None,
+            solid_next_index: 0,
+            solid_poison: None,
+            verify: true,
+            restore_owners: false,
+            decode_mode: crate::DecodeMode::Auto,
+            limits: Limits::default(),
+            password: password.map(String::from),
+            kdf_cache,
+            prefix_cursor: None,
+            held_segments: None,
+            catalog: super::chains::CatalogIndex::default(),
+        }
+    }
+
+    /// One RAR4 volume's service, old-style service and comment headers as
+    /// the service entries of volume 0, in the order they are integrated.
+    pub(super) fn rar4_service_entries(
+        parsed: &crate::rar4::Rar4ParsedVolume,
+        format: ArchiveFormat,
+    ) -> Vec<ServiceEntry> {
+        let mut parsed_services = Vec::new();
+        for fh in &parsed.services {
+            let file_header = Self::rar4_to_file_header(fh, parsed.archive_header.is_solid);
+            let entry = ServiceEntry {
+                header_offset: fh.data_offset,
+                is_child: false,
+                is_inherited: false,
+                segments: vec![DataSegment::with_packed_hashes(
+                    0,
+                    fh.data_offset,
+                    fh.packed_size,
+                    Self::packed_hashes_for_split_segment(&file_header, None),
+                    false,
+                )],
+                file_header,
+                is_encrypted: fh.is_encrypted,
+                file_encryption: None,
+                rar4_salt: fh.salt,
+                hash: None,
+                comment_crc16: None,
+                ntfs_stream_name: None,
+            };
+            parsed_services.push(entry);
+        }
+        for old_service in &parsed.old_services {
+            if let Some(entry) = Self::rar4_old_service_to_service_entry(old_service, 0, format) {
+                parsed_services.push(entry);
+            }
+        }
+        for comment in &parsed.comments {
+            let entry = Self::rar4_comment_to_service_entry(comment, 0, format);
+            parsed_services.push(entry);
+        }
+        parsed_services
     }
 
     fn rar5_recovery_records(services: &[crate::header::ParsedService]) -> Vec<RecoveryRecordInfo> {
