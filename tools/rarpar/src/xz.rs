@@ -239,7 +239,8 @@ fn codec_error(error: io::Error) -> RarparError {
     if let Some(xz) = error.get_ref().and_then(|e| e.downcast_ref::<XzError>()) {
         return match xz.kind {
             XzErrorKind::MemoryLimit { needed, limit, .. } => RarparError::Resource(format!(
-                "the stream needs {} MiB of memory and --memory-mib allows {} MiB ({xz})",
+                "the stream needs {} MiB of memory and --memory-mib allows {} MiB; \
+                 --scratch-mib can lend disk for it ({xz})",
                 needed.div_ceil(MIB),
                 limit / MIB
             )),
@@ -522,16 +523,19 @@ impl Compressed {
 }
 
 fn decode_options(args: &XzDecodeArgs, threads: usize) -> XzOptions {
-    memory_options(args.memory_mib).with_threads(threads)
+    memory_options(args.memory_mib, args.scratch_mib).with_threads(threads)
 }
 
-/// Decoding within `memory_mib` of RAM: a dictionary or block buffer larger
-/// than all of it is decoded in a mapped scratch file instead of refused.
-fn memory_options(memory_mib: u64) -> XzOptions {
+/// Decoding within `memory_mib` of RAM. With a `scratch_mib` budget, a
+/// dictionary or block buffer larger than all of that memory is decoded in a
+/// mapped scratch file instead of refused.
+fn memory_options(memory_mib: u64, scratch_mib: Option<u64>) -> XzOptions {
     let limit = memory_mib.saturating_mul(MIB);
-    XzOptions::default()
-        .with_memory_limit(limit)
-        .with_window(scratch_backing(limit))
+    let options = XzOptions::default().with_memory_limit(limit);
+    match scratch_mib {
+        Some(mib) => options.with_window(scratch_backing(limit, mib.saturating_mul(MIB))),
+        None => options,
+    }
 }
 
 /// Opens `input` for decoding.
@@ -848,7 +852,7 @@ fn list_stream(
         })?;
     let header = StreamHeader::parse(&head)
         .map_err(|kind| RarparError::Data(XzError::at(kind, 0, 0).to_string()))?;
-    let options = memory_options(args.memory_mib)
+    let options = memory_options(args.memory_mib, args.scratch_mib)
         .with_threads(1)
         .with_plan(ChecksumPlan::new(Checksum::Crc32));
     let mut reader = XzReader::with_options(io::Cursor::new(head).chain(source), options);

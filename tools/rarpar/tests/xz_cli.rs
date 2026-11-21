@@ -426,7 +426,7 @@ fn damage_fails_the_test_and_leaves_no_output() {
 }
 
 #[test]
-fn a_dictionary_above_the_memory_limit_decodes_in_a_scratch_file() {
+fn a_dictionary_above_the_memory_limit_needs_a_scratch_budget() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let data = sample(4 << 20, 29);
@@ -439,28 +439,10 @@ fn a_dictionary_above_the_memory_limit_decodes_in_a_scratch_file() {
             "xz", "compress", "data.bin", "--level", "6", "-s", "2097152",
         ],
     ));
+    let compressed = std::fs::read(root.join("data.bin.xz")).unwrap();
     for threads in ["1", "4"] {
-        let out = format!("out-{threads}.bin");
-        let decoded = report(
-            root,
-            &[
-                "xz",
-                "decompress",
-                "data.bin.xz",
-                &out,
-                "--memory-mib",
-                "1",
-                "--threads",
-                threads,
-            ],
-        );
-        assert_eq!(decoded["success"], true, "threads {threads}");
-        assert_eq!(
-            std::fs::read(root.join(&out)).unwrap(),
-            data,
-            "threads {threads}"
-        );
-        ok(&rarpar(
+        // Without a disk budget the stream is refused, as before.
+        let output = rarpar(
             root,
             &[
                 "xz",
@@ -471,8 +453,48 @@ fn a_dictionary_above_the_memory_limit_decodes_in_a_scratch_file() {
                 "--threads",
                 threads,
             ],
-        ));
-        let compressed = std::fs::read(root.join("data.bin.xz")).unwrap();
+        );
+        assert_eq!(output.status.code(), Some(4), "threads {threads}");
+        // A budget smaller than one window refuses it too.
+        let output = rarpar(
+            root,
+            &[
+                "xz",
+                "test",
+                "data.bin.xz",
+                "--memory-mib",
+                "1",
+                "--scratch-mib",
+                "1",
+                "--threads",
+                threads,
+            ],
+        );
+        assert_eq!(output.status.code(), Some(4), "threads {threads}");
+
+        // With one, it decodes in scratch files, from a file and a pipe.
+        let out = format!("out-{threads}.bin");
+        let decoded = report(
+            root,
+            &[
+                "xz",
+                "decompress",
+                "data.bin.xz",
+                &out,
+                "--memory-mib",
+                "1",
+                "--scratch-mib",
+                "8",
+                "--threads",
+                threads,
+            ],
+        );
+        assert_eq!(decoded["success"], true, "threads {threads}");
+        assert_eq!(
+            std::fs::read(root.join(&out)).unwrap(),
+            data,
+            "threads {threads}"
+        );
         let output = piped(
             &bin(),
             root,
@@ -483,16 +505,20 @@ fn a_dictionary_above_the_memory_limit_decodes_in_a_scratch_file() {
                 "-",
                 "--memory-mib",
                 "1",
+                "--scratch-mib",
+                "8",
                 "--threads",
                 threads,
             ],
-            compressed,
+            compressed.clone(),
         );
         ok(&output);
         assert_eq!(output.stdout, data, "pipe, threads {threads}");
     }
-    let listed = report(root, &["xz", "list", "data.bin.xz", "--memory-mib", "1"]);
-    assert_eq!(listed["success"], true);
+    ok(&rarpar(
+        root,
+        &["xz", "test", "data.bin.xz", "--memory-mib", "8"],
+    ));
 
     // Compression degrades its threads to the budget, and refuses below one.
     let planned = report(
