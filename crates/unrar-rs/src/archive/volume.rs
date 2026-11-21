@@ -78,11 +78,14 @@ impl RarArchive {
         }
 
         // Process file headers from this volume.
-        for pf in parsed.files {
-            let entry = Self::rar5_member_entry(vol_num, pf);
-            self.integrate_member(vol_num, entry);
-        }
+        let entries: Vec<MemberEntry> = parsed
+            .files
+            .into_iter()
+            .map(|pf| Self::rar5_member_entry(vol_num, pf))
+            .collect();
+        self.integrate_members(vol_num, entries);
 
+        let mut services = Vec::with_capacity(parsed.services.len());
         for service in parsed.services {
             let packed_hashes =
                 Self::packed_hashes_for_split_segment(&service.header.inner, service.hash.as_ref());
@@ -120,8 +123,9 @@ impl RarArchive {
                 ntfs_stream_name,
                 segments: vec![segment],
             };
-            Self::integrate_service_entry(&mut self.services, vol_num, entry);
+            services.push(entry);
         }
+        self.integrate_services(vol_num, services);
         self.refresh_rar5_recovery_records_from_services();
 
         // Store the reader.
@@ -240,6 +244,7 @@ impl RarArchive {
                 self.members.push(entry);
             }
         }
+        self.catalog_changed();
         self.volume_set.add_volume(index);
         self.prefix_cursor = Some(cursor);
         Ok(count)
@@ -272,6 +277,7 @@ impl RarArchive {
         self.services.retain(|service| !service.segments.is_empty());
         self.reconcile_member_chains();
         Self::reconcile_service_chains(&mut self.services);
+        self.catalog_changed();
         self.refresh_rar5_recovery_records_from_services();
     }
 
@@ -318,11 +324,14 @@ impl RarArchive {
             self.volume_set.set_last_volume_seen();
             self.more_volumes = false;
         }
-        for fh in &parsed.files {
-            let entry = Self::rar4_member_entry(vol_num, fh, parsed.archive_header.is_solid);
-            self.integrate_member(vol_num, entry);
-        }
+        let entries: Vec<MemberEntry> = parsed
+            .files
+            .iter()
+            .map(|fh| Self::rar4_member_entry(vol_num, fh, parsed.archive_header.is_solid))
+            .collect();
+        self.integrate_members(vol_num, entries);
 
+        let mut services = Vec::new();
         for fh in &parsed.services {
             let file_header = Self::rar4_to_file_header(fh, parsed.archive_header.is_solid);
             let entry = ServiceEntry {
@@ -344,19 +353,23 @@ impl RarArchive {
                     false,
                 )],
             };
-            Self::integrate_service_entry(&mut self.services, vol_num, entry);
+            services.push(entry);
         }
         for old_service in &parsed.old_services {
             if let Some(entry) =
                 Self::rar4_old_service_to_service_entry(old_service, vol_num, self.format)
             {
-                Self::integrate_service_entry(&mut self.services, vol_num, entry);
+                services.push(entry);
             }
         }
         for comment in &parsed.comments {
-            let entry = Self::rar4_comment_to_service_entry(comment, vol_num, self.format);
-            Self::integrate_service_entry(&mut self.services, vol_num, entry);
+            services.push(Self::rar4_comment_to_service_entry(
+                comment,
+                vol_num,
+                self.format,
+            ));
         }
+        self.integrate_services(vol_num, services);
 
         self.store_volume_reader(vol_num, reader);
         self.hydrate_rar4_uowner_payloads();
@@ -440,12 +453,15 @@ impl RarArchive {
                 .collect()
         });
         let holds = held.contains(&(segment.volume_index, segment.data_offset));
-        debug_assert_eq!(holds, self.scan_member_segments(segment));
+        #[cfg(test)]
+        assert_eq!(holds, self.scan_member_segments(segment));
         holds
     }
 
     /// The same answer as `holds_member_segment`, read from every segment of
-    /// every member.
+    /// every member. Tests check the set against it; it costs a walk of the
+    /// whole catalog per call, so release and debug builds do not run it.
+    #[cfg(test)]
     fn scan_member_segments(&self, segment: &DataSegment) -> bool {
         self.members.iter().any(|member| {
             member.segments.iter().any(|held| {
@@ -482,103 +498,145 @@ impl RarArchive {
         for segment in &learned {
             self.hold(segment);
         }
+        self.catalog_changed();
     }
 
-    /// Integrate a member entry from a new volume into the unified member list.
+    /// Drop the name and service-parent lookups after a change to the member
+    /// or service lists.
+    pub(super) fn catalog_changed(&mut self) {
+        self.catalog = super::chains::CatalogIndex::default();
+    }
+
+    /// Integrate one member entry from a new volume.
+    #[cfg(test)]
+    pub(super) fn integrate_member(&mut self, vol_num: usize, entry: MemberEntry) {
+        self.integrate_members(vol_num, [entry]);
+    }
+
+    /// Integrate the member entries of a new volume, in header order, into
+    /// the unified member list.
     ///
     /// Handles split_before/split_after reconciliation for files spanning volumes.
     /// Continuation headers (split_before) in real RAR archives often have empty
     /// names, so we match by split state and volume adjacency, not by name.
-    pub(super) fn integrate_member(&mut self, vol_num: usize, entry: MemberEntry) {
-        let segment = entry.segments[0].clone();
-        if self.holds_member_segment(&segment) {
-            return;
+    ///
+    /// The result is the one integrating each entry alone gave, when each
+    /// ended with a reconcile of every pair and a sort: the entries are
+    /// matched through a [`Linker`](super::chains::Linker) that ranks records
+    /// in the order those sorts left them, and the list is sorted once.
+    pub(super) fn integrate_members(
+        &mut self,
+        vol_num: usize,
+        entries: impl IntoIterator<Item = MemberEntry>,
+    ) {
+        let mut linker = None;
+        for entry in entries {
+            let segment = entry.segments[0].clone();
+            if self.holds_member_segment(&segment) {
+                continue;
+            }
+            let linker = linker.get_or_insert_with(|| {
+                super::chains::Linker::new(&self.members, self.solid_next_index == 0)
+            });
+            self.integrate_member_with(linker, vol_num, entry, segment);
         }
+        if let Some(linker) = linker {
+            if linker.sorted() {
+                self.members.sort_by_key(Self::member_physical_order_key);
+            }
+            self.catalog_changed();
+        }
+    }
 
+    fn integrate_member_with(
+        &mut self,
+        linker: &mut super::chains::Linker,
+        vol_num: usize,
+        entry: MemberEntry,
+        segment: DataSegment,
+    ) {
+        linker.begin(self.members.len());
         if entry.file_header.split_before {
             // Continuation segment — find the existing member that expects a
             // continuation in the immediately preceding volume.
-            let existing = self.members.iter_mut().find(|m| {
-                m.file_header.split_after
-                    && m.segments.last().map(|s| s.volume_index) == Some(vol_num.wrapping_sub(1))
-            });
-
-            if let Some(existing) = existing {
-                Self::merge_continuation(existing, &entry, segment.clone());
+            if let Some(at) = linker.continued_into(&self.members, vol_num, |_| true) {
+                linker.update(&mut self.members, at, |existing| {
+                    Self::merge_continuation(existing, &entry, segment.clone());
+                });
                 self.hold(&segment);
             } else {
                 // No prior entry — volumes arrived out of order.
                 for segment in &entry.segments {
                     self.hold(segment);
                 }
-                self.members.push(entry);
+                linker.push(&mut self.members, entry);
             }
-        } else {
-            // New member starting in this volume.
-            // Check if we already have a continuation-only entry from a later
-            // volume (out-of-order arrival).
-            let existing = self.members.iter_mut().find(|m| {
-                !entry.file_header.name.is_empty()
-                    && m.file_header.name == entry.file_header.name
-                    && m.segments[0].volume_index > vol_num
+        } else if let Some(at) =
+            // New member starting in this volume. Check if we already have a
+            // continuation-only entry from a later volume (out-of-order arrival).
+            linker.named_after(&self.members, &entry.file_header.name, vol_num)
+        {
+            linker.moving(&self.members, at);
+            linker.update(&mut self.members, at, |existing| {
+                Self::insert_member_head(existing, entry, segment.clone());
             });
+            self.hold(&segment);
+        } else {
+            for segment in &entry.segments {
+                self.hold(segment);
+            }
+            linker.push(&mut self.members, entry);
+        }
+        linker.relink(&mut self.members, Self::merge_member_chain);
+    }
 
-            if let Some(existing) = existing {
-                // We already have a later continuation — insert this segment at front.
-                let authoritative_data_crc32 =
-                    (!existing.file_header.split_after).then_some(existing.file_header.data_crc32);
-                let authoritative_data_hash =
-                    (!existing.file_header.split_after).then_some(existing.file_header.data_hash);
-                let authoritative_hash =
-                    (!existing.file_header.split_after).then(|| existing.hash.clone());
-                let authoritative_encryption =
-                    (!existing.file_header.split_after).then(|| existing.file_encryption.clone());
-                // The new segment goes in front, so the chain still ends
-                // where the later part said it does.
-                let tail_split_after = existing.file_header.split_after;
-                existing.segments.insert(0, segment.clone());
-                existing.file_header = entry.file_header;
-                existing.file_header.split_after = tail_split_after;
-                existing.is_encrypted = entry.is_encrypted;
-                existing.file_encryption = entry.file_encryption;
-                existing.rar4_salt = entry.rar4_salt;
-                if let Some(data_crc32) = authoritative_data_crc32 {
-                    existing.file_header.data_crc32 = data_crc32;
-                }
-                if let Some(data_hash) = authoritative_data_hash {
-                    existing.file_header.data_hash = data_hash;
-                }
-                if let Some(hash) = authoritative_hash {
-                    existing.hash = hash;
-                } else if entry.hash.is_some() {
-                    existing.hash = entry.hash;
-                }
-                if let Some(Some(final_encryption)) = authoritative_encryption {
-                    if existing.file_encryption.is_none() {
-                        existing.file_encryption = Some(final_encryption);
-                    } else if final_encryption.use_hash_mac
-                        && let Some(existing_encryption) = existing.file_encryption.as_mut()
-                    {
-                        existing_encryption.use_hash_mac = true;
-                    }
-                }
-                if entry.redirection.is_some() {
-                    existing.redirection = entry.redirection;
-                }
-                self.hold(&segment);
-            } else {
-                for segment in &entry.segments {
-                    self.hold(segment);
-                }
-                self.members.push(entry);
+    /// Put the first part of a member in front of the later parts already
+    /// held.
+    fn insert_member_head(existing: &mut MemberEntry, entry: MemberEntry, segment: DataSegment) {
+        let authoritative_data_crc32 =
+            (!existing.file_header.split_after).then_some(existing.file_header.data_crc32);
+        let authoritative_data_hash =
+            (!existing.file_header.split_after).then_some(existing.file_header.data_hash);
+        let authoritative_hash = (!existing.file_header.split_after).then(|| existing.hash.clone());
+        let authoritative_encryption =
+            (!existing.file_header.split_after).then(|| existing.file_encryption.clone());
+        // The new segment goes in front, so the chain still ends
+        // where the later part said it does.
+        let tail_split_after = existing.file_header.split_after;
+        existing.segments.insert(0, segment.clone());
+        existing.file_header = entry.file_header;
+        existing.file_header.split_after = tail_split_after;
+        existing.is_encrypted = entry.is_encrypted;
+        existing.file_encryption = entry.file_encryption;
+        existing.rar4_salt = entry.rar4_salt;
+        if let Some(data_crc32) = authoritative_data_crc32 {
+            existing.file_header.data_crc32 = data_crc32;
+        }
+        if let Some(data_hash) = authoritative_data_hash {
+            existing.file_header.data_hash = data_hash;
+        }
+        if let Some(hash) = authoritative_hash {
+            existing.hash = hash;
+        } else if entry.hash.is_some() {
+            existing.hash = entry.hash;
+        }
+        if let Some(Some(final_encryption)) = authoritative_encryption {
+            if existing.file_encryption.is_none() {
+                existing.file_encryption = Some(final_encryption);
+            } else if final_encryption.use_hash_mac
+                && let Some(existing_encryption) = existing.file_encryption.as_mut()
+            {
+                existing_encryption.use_hash_mac = true;
             }
         }
-
-        self.reconcile_member_chains();
+        if entry.redirection.is_some() {
+            existing.redirection = entry.redirection;
+        }
     }
 
     pub(crate) fn sort_members_by_physical_order(&mut self) {
         self.members.sort_by_key(Self::member_physical_order_key);
+        self.catalog_changed();
     }
 
     fn member_physical_order_key(member: &MemberEntry) -> (usize, u64) {
@@ -590,59 +648,18 @@ impl RarArchive {
             .unwrap_or((usize::MAX, member.file_header.data_offset))
     }
 
+    /// Join every pair of member parts that continue one another: the first
+    /// part in list order that has a continuation takes its first one, until
+    /// none is left. Then sort, when the catalog keeps physical order.
     fn reconcile_member_chains(&mut self) {
-        while let Some((left_idx, right_idx)) = self.find_mergeable_member_pair() {
-            debug_assert_ne!(left_idx, right_idx);
-            let right = self.members.remove(right_idx);
-            let adjusted_left_idx = if right_idx < left_idx {
-                left_idx - 1
-            } else {
-                left_idx
-            };
-            let left = &mut self.members[adjusted_left_idx];
-            Self::merge_member_chain(left, right);
+        let sorts = self.solid_next_index == 0;
+        let mut linker = super::chains::Linker::new(&self.members, sorts);
+        linker.begin(self.members.len());
+        linker.relink(&mut self.members, Self::merge_member_chain);
+        if sorts {
+            self.members.sort_by_key(Self::member_physical_order_key);
         }
-        if self.solid_next_index == 0 {
-            self.sort_members_by_physical_order();
-        }
-    }
-
-    fn find_mergeable_member_pair(&self) -> Option<(usize, usize)> {
-        for left_idx in 0..self.members.len() {
-            let left = &self.members[left_idx];
-            if !left.file_header.split_after {
-                continue;
-            }
-            let Some(last_vol) = left.segments.last().map(|s| s.volume_index) else {
-                continue;
-            };
-
-            for right_idx in 0..self.members.len() {
-                if left_idx == right_idx {
-                    continue;
-                }
-                let right = &self.members[right_idx];
-                let Some(first_vol) = right.segments.first().map(|s| s.volume_index) else {
-                    continue;
-                };
-
-                if !right.file_header.split_before || first_vol != last_vol + 1 {
-                    continue;
-                }
-
-                if Self::members_name_compatible(left, right) {
-                    return Some((left_idx, right_idx));
-                }
-            }
-        }
-
-        None
-    }
-
-    fn members_name_compatible(left: &MemberEntry, right: &MemberEntry) -> bool {
-        left.file_header.name.is_empty()
-            || right.file_header.name.is_empty()
-            || left.file_header.name == right.file_header.name
+        self.catalog_changed();
     }
 
     fn merge_member_chain(existing: &mut MemberEntry, mut continuation: MemberEntry) {
@@ -716,125 +733,120 @@ impl RarArchive {
         }
     }
 
+    /// Integrate one service entry from volume `vol_num`.
+    #[cfg(test)]
     pub(super) fn integrate_service_entry(
         services: &mut Vec<ServiceEntry>,
         vol_num: usize,
         entry: ServiceEntry,
     ) {
-        let segment = entry.segments[0].clone();
-
-        if entry.file_header.split_before {
-            let existing = services.iter_mut().find(|service| {
-                service.file_header.split_after
-                    && service.segments.last().map(|s| s.volume_index)
-                        == Some(vol_num.wrapping_sub(1))
-                    && Self::service_names_compatible(service, &entry)
-            });
-
-            if let Some(existing) = existing {
-                Self::merge_service_continuation(existing, &entry, segment);
-            } else {
-                services.push(entry);
-            }
-        } else {
-            let existing = services.iter_mut().find(|service| {
-                !entry.file_header.name.is_empty()
-                    && service.file_header.name == entry.file_header.name
-                    && service.segments[0].volume_index > vol_num
-            });
-
-            if let Some(existing) = existing {
-                let authoritative_data_crc32 =
-                    (!existing.file_header.split_after).then_some(existing.file_header.data_crc32);
-                let authoritative_data_hash =
-                    (!existing.file_header.split_after).then_some(existing.file_header.data_hash);
-                let authoritative_hash =
-                    (!existing.file_header.split_after).then(|| existing.hash.clone());
-                let authoritative_comment_crc16 =
-                    (!existing.file_header.split_after).then_some(existing.comment_crc16);
-                let authoritative_encryption =
-                    (!existing.file_header.split_after).then(|| existing.file_encryption.clone());
-                existing.segments.insert(0, segment);
-                existing.file_header = entry.file_header;
-                existing.is_encrypted = entry.is_encrypted;
-                existing.file_encryption = entry.file_encryption;
-                if let Some(data_crc32) = authoritative_data_crc32 {
-                    existing.file_header.data_crc32 = data_crc32;
-                }
-                if let Some(data_hash) = authoritative_data_hash {
-                    existing.file_header.data_hash = data_hash;
-                }
-                if let Some(hash) = authoritative_hash {
-                    existing.hash = hash;
-                } else if entry.hash.is_some() {
-                    existing.hash = entry.hash;
-                }
-                if let Some(comment_crc16) = authoritative_comment_crc16 {
-                    existing.comment_crc16 = comment_crc16;
-                } else if entry.comment_crc16.is_some() {
-                    existing.comment_crc16 = entry.comment_crc16;
-                }
-                if let Some(Some(final_encryption)) = authoritative_encryption {
-                    if existing.file_encryption.is_none() {
-                        existing.file_encryption = Some(final_encryption);
-                    } else if final_encryption.use_hash_mac
-                        && let Some(existing_encryption) = existing.file_encryption.as_mut()
-                    {
-                        existing_encryption.use_hash_mac = true;
-                    }
-                }
-            } else {
-                services.push(entry);
-            }
-        }
-
-        Self::reconcile_service_chains(services);
+        Self::integrate_service_entries(services, vol_num, [entry]);
     }
 
+    /// Integrate the service entries of volume `vol_num` into this archive's
+    /// service list, and drop the lookups built over the old list.
+    pub(super) fn integrate_services(
+        &mut self,
+        vol_num: usize,
+        entries: impl IntoIterator<Item = ServiceEntry>,
+    ) {
+        Self::integrate_service_entries(&mut self.services, vol_num, entries);
+        self.catalog_changed();
+    }
+
+    /// Integrate service entries, in header order, the way member entries
+    /// are: continuations join the part before them, out-of-order heads go in
+    /// front of their later parts, and the list ends in physical order. As
+    /// with [`integrate_members`](Self::integrate_members), the list is
+    /// sorted once and matched in the order per-entry sorts left it.
+    pub(super) fn integrate_service_entries(
+        services: &mut Vec<ServiceEntry>,
+        vol_num: usize,
+        entries: impl IntoIterator<Item = ServiceEntry>,
+    ) {
+        let mut linker = None;
+        for entry in entries {
+            let linker = linker.get_or_insert_with(|| super::chains::Linker::new(services, true));
+            linker.begin(services.len());
+            let segment = entry.segments[0].clone();
+            if entry.file_header.split_before {
+                let at = linker.continued_into(services, vol_num, |service| {
+                    Self::service_names_compatible(service, &entry)
+                });
+                if let Some(at) = at {
+                    linker.update(services, at, |existing| {
+                        Self::merge_service_continuation(existing, &entry, segment);
+                    });
+                } else {
+                    linker.push(services, entry);
+                }
+            } else if let Some(at) = linker.named_after(services, &entry.file_header.name, vol_num)
+            {
+                linker.moving(services, at);
+                linker.update(services, at, |existing| {
+                    Self::insert_service_head(existing, entry, segment);
+                });
+            } else {
+                linker.push(services, entry);
+            }
+            linker.relink(services, Self::merge_service_chain);
+        }
+        if linker.is_some_and(|linker| linker.sorted()) {
+            services.sort_by_key(Self::service_physical_order_key);
+        }
+    }
+
+    /// Put the first part of a service in front of the later parts already
+    /// held.
+    fn insert_service_head(existing: &mut ServiceEntry, entry: ServiceEntry, segment: DataSegment) {
+        let authoritative_data_crc32 =
+            (!existing.file_header.split_after).then_some(existing.file_header.data_crc32);
+        let authoritative_data_hash =
+            (!existing.file_header.split_after).then_some(existing.file_header.data_hash);
+        let authoritative_hash = (!existing.file_header.split_after).then(|| existing.hash.clone());
+        let authoritative_comment_crc16 =
+            (!existing.file_header.split_after).then_some(existing.comment_crc16);
+        let authoritative_encryption =
+            (!existing.file_header.split_after).then(|| existing.file_encryption.clone());
+        existing.segments.insert(0, segment);
+        existing.file_header = entry.file_header;
+        existing.is_encrypted = entry.is_encrypted;
+        existing.file_encryption = entry.file_encryption;
+        if let Some(data_crc32) = authoritative_data_crc32 {
+            existing.file_header.data_crc32 = data_crc32;
+        }
+        if let Some(data_hash) = authoritative_data_hash {
+            existing.file_header.data_hash = data_hash;
+        }
+        if let Some(hash) = authoritative_hash {
+            existing.hash = hash;
+        } else if entry.hash.is_some() {
+            existing.hash = entry.hash;
+        }
+        if let Some(comment_crc16) = authoritative_comment_crc16 {
+            existing.comment_crc16 = comment_crc16;
+        } else if entry.comment_crc16.is_some() {
+            existing.comment_crc16 = entry.comment_crc16;
+        }
+        if let Some(Some(final_encryption)) = authoritative_encryption {
+            if existing.file_encryption.is_none() {
+                existing.file_encryption = Some(final_encryption);
+            } else if final_encryption.use_hash_mac
+                && let Some(existing_encryption) = existing.file_encryption.as_mut()
+            {
+                existing_encryption.use_hash_mac = true;
+            }
+        }
+    }
+
+    /// Join every pair of service parts that continue one another, as
+    /// [`reconcile_member_chains`](Self::reconcile_member_chains) does, then
+    /// sort.
     fn reconcile_service_chains(services: &mut Vec<ServiceEntry>) {
-        while let Some((left_idx, right_idx)) = Self::find_mergeable_service_pair(services) {
-            debug_assert_ne!(left_idx, right_idx);
-            let right = services.remove(right_idx);
-            let adjusted_left_idx = if right_idx < left_idx {
-                left_idx - 1
-            } else {
-                left_idx
-            };
-            let left = &mut services[adjusted_left_idx];
-            Self::merge_service_chain(left, right);
-        }
+        let mut linker = super::chains::Linker::new(services, true);
+        linker.begin(services.len());
+        linker.relink(services, Self::merge_service_chain);
         services.sort_by_key(Self::service_physical_order_key);
-    }
-
-    fn find_mergeable_service_pair(services: &[ServiceEntry]) -> Option<(usize, usize)> {
-        for left_idx in 0..services.len() {
-            let left = &services[left_idx];
-            if !left.file_header.split_after {
-                continue;
-            }
-            let Some(last_vol) = left.segments.last().map(|s| s.volume_index) else {
-                continue;
-            };
-
-            for (right_idx, right) in services.iter().enumerate() {
-                if left_idx == right_idx {
-                    continue;
-                }
-                let Some(first_vol) = right.segments.first().map(|s| s.volume_index) else {
-                    continue;
-                };
-
-                if !right.file_header.split_before || first_vol != last_vol + 1 {
-                    continue;
-                }
-
-                if Self::service_names_compatible(left, right) {
-                    return Some((left_idx, right_idx));
-                }
-            }
-        }
-
-        None
     }
 
     fn merge_service_chain(existing: &mut ServiceEntry, mut continuation: ServiceEntry) {
@@ -972,7 +984,7 @@ mod tests {
         RecoveryRecordKind,
     };
 
-    fn test_file_header(
+    pub(super) fn test_file_header(
         name: &str,
         split_before: bool,
         split_after: bool,
@@ -1062,7 +1074,7 @@ mod tests {
         member
     }
 
-    fn empty_archive(members: Vec<MemberEntry>) -> RarArchive {
+    pub(super) fn empty_archive(members: Vec<MemberEntry>) -> RarArchive {
         RarArchive {
             format: ArchiveFormat::Rar5,
             is_solid: false,
@@ -1094,6 +1106,7 @@ mod tests {
             kdf_cache: std::sync::Arc::new(crate::crypto::KdfCache::new()),
             prefix_cursor: None,
             held_segments: None,
+            catalog: super::chains::CatalogIndex::default(),
         }
     }
 
@@ -1692,5 +1705,623 @@ mod held_segment_tests {
             }
         }
         eprintln!("member_archive: {checked} members checked");
+    }
+}
+
+/// The chain linker against the per-entry upkeep it replaced, kept here as
+/// the reference: every entry integrated alone, each followed by a reconcile
+/// of every pair and, when the catalog keeps physical order, a sort.
+#[cfg(test)]
+mod chain_tests {
+    use std::collections::HashSet;
+
+    use super::tests::{empty_archive, test_file_header};
+    use super::*;
+
+    /// The old upkeep over one member list and one service list.
+    struct Reference {
+        members: Vec<MemberEntry>,
+        services: Vec<ServiceEntry>,
+        held: HashSet<(usize, u64)>,
+        sorts: bool,
+    }
+
+    impl Reference {
+        fn new(members: Vec<MemberEntry>, sorts: bool) -> Self {
+            let held = members
+                .iter()
+                .flat_map(|member| &member.segments)
+                .map(|segment| (segment.volume_index, segment.data_offset))
+                .collect();
+            Self {
+                members,
+                services: Vec::new(),
+                held,
+                sorts,
+            }
+        }
+
+        fn hold(&mut self, segment: &DataSegment) {
+            self.held
+                .insert((segment.volume_index, segment.data_offset));
+        }
+
+        fn integrate_member(&mut self, vol_num: usize, entry: MemberEntry) {
+            let segment = entry.segments[0].clone();
+            if self
+                .held
+                .contains(&(segment.volume_index, segment.data_offset))
+            {
+                return;
+            }
+            if entry.file_header.split_before {
+                let existing = self.members.iter_mut().find(|m| {
+                    m.file_header.split_after
+                        && m.segments.last().map(|s| s.volume_index)
+                            == Some(vol_num.wrapping_sub(1))
+                });
+                if let Some(existing) = existing {
+                    RarArchive::merge_continuation(existing, &entry, segment.clone());
+                    self.hold(&segment);
+                } else {
+                    for segment in &entry.segments {
+                        self.hold(segment);
+                    }
+                    self.members.push(entry);
+                }
+            } else {
+                let existing = self.members.iter_mut().find(|m| {
+                    !entry.file_header.name.is_empty()
+                        && m.file_header.name == entry.file_header.name
+                        && m.segments[0].volume_index > vol_num
+                });
+                if let Some(existing) = existing {
+                    RarArchive::insert_member_head(existing, entry, segment.clone());
+                    self.hold(&segment);
+                } else {
+                    for segment in &entry.segments {
+                        self.hold(segment);
+                    }
+                    self.members.push(entry);
+                }
+            }
+            self.reconcile_members();
+        }
+
+        fn reconcile_members(&mut self) {
+            while let Some((left_idx, right_idx)) = Self::pair(&self.members) {
+                let right = self.members.remove(right_idx);
+                let left_idx = if right_idx < left_idx {
+                    left_idx - 1
+                } else {
+                    left_idx
+                };
+                RarArchive::merge_member_chain(&mut self.members[left_idx], right);
+            }
+            if self.sorts {
+                self.members
+                    .sort_by_key(RarArchive::member_physical_order_key);
+            }
+        }
+
+        fn integrate_service(&mut self, vol_num: usize, entry: ServiceEntry) {
+            let segment = entry.segments[0].clone();
+            if entry.file_header.split_before {
+                let existing = self.services.iter_mut().find(|service| {
+                    service.file_header.split_after
+                        && service.segments.last().map(|s| s.volume_index)
+                            == Some(vol_num.wrapping_sub(1))
+                        && RarArchive::service_names_compatible(service, &entry)
+                });
+                if let Some(existing) = existing {
+                    RarArchive::merge_service_continuation(existing, &entry, segment);
+                } else {
+                    self.services.push(entry);
+                }
+            } else {
+                let existing = self.services.iter_mut().find(|service| {
+                    !entry.file_header.name.is_empty()
+                        && service.file_header.name == entry.file_header.name
+                        && service.segments[0].volume_index > vol_num
+                });
+                if let Some(existing) = existing {
+                    RarArchive::insert_service_head(existing, entry, segment);
+                } else {
+                    self.services.push(entry);
+                }
+            }
+            self.reconcile_services();
+        }
+
+        fn reconcile_services(&mut self) {
+            while let Some((left_idx, right_idx)) = Self::pair(&self.services) {
+                let right = self.services.remove(right_idx);
+                let left_idx = if right_idx < left_idx {
+                    left_idx - 1
+                } else {
+                    left_idx
+                };
+                RarArchive::merge_service_chain(&mut self.services[left_idx], right);
+            }
+            self.services
+                .sort_by_key(RarArchive::service_physical_order_key);
+        }
+
+        /// The all-pairs search both old reconciles ran.
+        fn pair<E: super::super::chains::ChainEntry>(entries: &[E]) -> Option<(usize, usize)> {
+            for (left_idx, left) in entries.iter().enumerate() {
+                if !left.split_after() {
+                    continue;
+                }
+                let Some(last_vol) = left.last_volume() else {
+                    continue;
+                };
+                for (right_idx, right) in entries.iter().enumerate() {
+                    if left_idx == right_idx {
+                        continue;
+                    }
+                    let Some(first_vol) = right.first_volume() else {
+                        continue;
+                    };
+                    if right.split_before()
+                        && first_vol == last_vol + 1
+                        && super::super::chains::names_compatible(left, right)
+                    {
+                        return Some((left_idx, right_idx));
+                    }
+                }
+            }
+            None
+        }
+
+        fn remove_volume(&mut self, index: usize) {
+            for member in &mut self.members {
+                member
+                    .segments
+                    .retain(|segment| segment.volume_index != index);
+            }
+            self.members.retain(|member| !member.segments.is_empty());
+            for service in &mut self.services {
+                service
+                    .segments
+                    .retain(|segment| segment.volume_index != index);
+            }
+            self.services.retain(|service| !service.segments.is_empty());
+            self.held = self
+                .members
+                .iter()
+                .flat_map(|member| &member.segments)
+                .map(|segment| (segment.volume_index, segment.data_offset))
+                .collect();
+            self.reconcile_members();
+            self.reconcile_services();
+        }
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, bound: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % bound as u64) as usize
+        }
+
+        fn chance(&mut self, one_in: usize) -> bool {
+            self.below(one_in) == 0
+        }
+    }
+
+    fn part_header(name: &str, split_before: bool, split_after: bool, offset: u64) -> FileHeader {
+        let mut header = test_file_header(name, split_before, split_after, Some(offset as u32));
+        header.data_offset = offset;
+        header.split_before = split_before;
+        header.split_after = split_after;
+        header
+    }
+
+    fn member(vol: usize, offset: u64, name: &str, before: bool, after: bool) -> MemberEntry {
+        MemberEntry {
+            file_header: part_header(name, before, after, offset),
+            is_encrypted: false,
+            file_encryption: None,
+            rar4_salt: None,
+            hash: None,
+            redirection: None,
+            owner: None,
+            segments: vec![DataSegment::new(vol, offset, 8)],
+        }
+    }
+
+    fn service(vol: usize, offset: u64, name: &str, before: bool, after: bool) -> ServiceEntry {
+        ServiceEntry {
+            header_offset: offset,
+            is_child: false,
+            is_inherited: false,
+            file_header: part_header(name, before, after, offset),
+            is_encrypted: false,
+            file_encryption: None,
+            rar4_salt: None,
+            hash: None,
+            comment_crc16: None,
+            ntfs_stream_name: None,
+            segments: vec![DataSegment::new(vol, offset, 8)],
+        }
+    }
+
+    type Volume = (Vec<MemberEntry>, Vec<ServiceEntry>);
+
+    /// A set of volumes with members and services split across them,
+    /// duplicate names, nameless continuations and stray continuations
+    /// that continue nothing.
+    fn layout(rng: &mut Rng, count: usize) -> Vec<Volume> {
+        const NAMES: [&str; 4] = ["a.bin", "b.bin", "a.bin", "c.bin"];
+        const SERVICES: [&str; 4] = ["STM", "ACL", "UOW", "CMT"];
+        let mut volumes = Vec::new();
+        let mut open_member: Option<String> = None;
+        let mut open_service: Option<String> = None;
+        let mut unique = 0;
+        for vol in 0..count {
+            let mut members = Vec::new();
+            let mut services = Vec::new();
+            let mut offset = 10;
+            let last = vol + 1 == count;
+            let name_of = |rng: &mut Rng, kept: &str| {
+                if rng.chance(2) {
+                    String::new()
+                } else {
+                    kept.to_string()
+                }
+            };
+            if let Some(name) = open_member.take() {
+                let after = !last && rng.chance(3);
+                members.push(member(vol, offset, &name_of(rng, &name), true, after));
+                offset += 100;
+                if after {
+                    open_member = Some(name);
+                }
+            } else if vol > 0 && rng.chance(6) {
+                members.push(member(vol, offset, &name_of(rng, "stray"), true, false));
+                offset += 100;
+            }
+            if let Some(name) = open_service.take() {
+                let after = !last && rng.chance(3);
+                services.push(service(vol, offset, &name_of(rng, &name), true, after));
+                offset += 100;
+                if after {
+                    open_service = Some(name);
+                }
+            }
+            if open_member.is_none() {
+                for position in 0..rng.below(4) {
+                    let name = if rng.chance(2) {
+                        NAMES[rng.below(NAMES.len())].to_string()
+                    } else {
+                        unique += 1;
+                        format!("f{unique}.bin")
+                    };
+                    let tail = position > 0 || members.is_empty();
+                    let after = !last && tail && rng.chance(3);
+                    members.push(member(vol, offset, &name, false, after));
+                    offset += 50;
+                    if rng.chance(2) {
+                        let service_name = SERVICES[rng.below(SERVICES.len())];
+                        services.push(service(vol, offset, service_name, false, false));
+                    }
+                    offset += 50;
+                    if after {
+                        open_member = Some(name);
+                        break;
+                    }
+                }
+            }
+            if open_service.is_none() && !last && rng.chance(3) {
+                let name = SERVICES[rng.below(SERVICES.len())].to_string();
+                services.push(service(vol, offset, &name, false, true));
+                open_service = Some(name);
+            }
+            volumes.push((members, services));
+        }
+        volumes
+    }
+
+    /// Volumes no archiver writes: several parts per volume that continue
+    /// from or into a neighbour, with names drawn from a pool of two and the
+    /// empty name, in a header order unrelated to their data offsets. Every
+    /// choice the upkeep makes between candidates is exercised here.
+    fn chaos(rng: &mut Rng, count: usize) -> Vec<Volume> {
+        const NAMES: [&str; 3] = ["", "a.bin", "b.bin"];
+        const SERVICES: [&str; 3] = ["", "STM", "ACL"];
+        (0..count)
+            .map(|vol| {
+                let mut offsets: Vec<u64> = (0..8).map(|at| 10 + 10 * at).collect();
+                for at in (1..offsets.len()).rev() {
+                    offsets.swap(at, rng.below(at + 1));
+                }
+                let mut offsets = offsets.into_iter();
+                let members = (0..rng.below(5))
+                    .map(|_| {
+                        let name = NAMES[rng.below(NAMES.len())];
+                        let before = vol > 0 && rng.chance(2);
+                        let after = vol + 1 < count && rng.chance(2);
+                        member(vol, offsets.next().unwrap(), name, before, after)
+                    })
+                    .collect();
+                let services = (0..rng.below(4))
+                    .map(|_| {
+                        let name = SERVICES[rng.below(SERVICES.len())];
+                        let before = vol > 0 && rng.chance(2);
+                        let after = vol + 1 < count && rng.chance(2);
+                        service(vol, offsets.next().unwrap(), name, before, after)
+                    })
+                    .collect();
+                (members, services)
+            })
+            .collect()
+    }
+
+    fn orders(rng: &mut Rng, count: usize) -> Vec<Vec<usize>> {
+        let mut orders = vec![(0..count).collect::<Vec<_>>(), (0..count).rev().collect()];
+        for _ in 0..6 {
+            let mut order: Vec<usize> = (0..count).collect();
+            for at in (1..count).rev() {
+                order.swap(at, rng.below(at + 1));
+            }
+            orders.push(order);
+        }
+        orders
+    }
+
+    fn same(what: &str, archive: &RarArchive, reference: &Reference) {
+        assert_eq!(
+            format!("{:?}", archive.members),
+            format!("{:?}", reference.members),
+            "{what}: members"
+        );
+        assert_eq!(
+            format!("{:?}", archive.services),
+            format!("{:?}", reference.services),
+            "{what}: services"
+        );
+    }
+
+    /// Every arrival order of every seeded set ends each add with the
+    /// members, services, order and chains the per-entry upkeep produced;
+    /// so does dropping a volume's segments and adding it again.
+    #[test]
+    fn batch_integrate_matches_per_entry_upkeep() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut adds = 0;
+        let mut merges = 0;
+        for seed in 0..240 {
+            let count = 2 + seed % 7;
+            let odd = seed % 2 == 1;
+            let volumes = if odd {
+                chaos(&mut rng, count)
+            } else {
+                layout(&mut rng, count)
+            };
+            for order in orders(&mut rng, count) {
+                for solid in [false, true] {
+                    let what = format!("seed {seed}, chaos {odd}, order {order:?}, solid {solid}");
+                    let (first_members, first_services) = volumes[order[0]].clone();
+                    let mut archive = empty_archive(first_members.clone());
+                    archive.solid_next_index = usize::from(solid);
+                    archive.integrate_services(order[0], first_services.clone());
+                    let mut reference = Reference::new(first_members, !solid);
+                    for entry in first_services {
+                        reference.integrate_service(order[0], entry);
+                    }
+                    same(&what, &archive, &reference);
+                    for &vol in &order[1..] {
+                        let (members, services) = volumes[vol].clone();
+                        archive.integrate_members(vol, members.clone());
+                        archive.integrate_services(vol, services.clone());
+                        for entry in members {
+                            reference.integrate_member(vol, entry);
+                        }
+                        for entry in services {
+                            reference.integrate_service(vol, entry);
+                        }
+                        same(&format!("{what}, after volume {vol}"), &archive, &reference);
+                        adds += 1;
+                    }
+                    merges +=
+                        volumes.iter().map(|(m, _)| m.len()).sum::<usize>() - archive.members.len();
+                    let dropped = order[rng.below(count)];
+                    archive.remove_volume_segments(dropped);
+                    reference.remove_volume(dropped);
+                    same(
+                        &format!("{what}, without volume {dropped}"),
+                        &archive,
+                        &reference,
+                    );
+                    let (members, services) = volumes[dropped].clone();
+                    archive.integrate_members(dropped, members.clone());
+                    archive.integrate_services(dropped, services.clone());
+                    for entry in members {
+                        reference.integrate_member(dropped, entry);
+                    }
+                    for entry in services {
+                        reference.integrate_service(dropped, entry);
+                    }
+                    same(
+                        &format!("{what}, volume {dropped} again"),
+                        &archive,
+                        &reference,
+                    );
+                }
+            }
+        }
+        assert!(
+            adds > 1000 && merges > 1000,
+            "non-vacuity: {adds} adds, {merges} merges"
+        );
+    }
+
+    /// Integrating a volume indexes the catalog once, however many entries
+    /// the volume holds, where the old upkeep searched every pair of records
+    /// after each entry.
+    #[test]
+    fn each_add_indexes_the_catalog_once() {
+        let per_volume = 64;
+        let volumes = 32;
+        let mut archive = empty_archive(Vec::new());
+        super::super::chains::linker_builds::take();
+        let mut expected = 0;
+        for vol in 0..volumes {
+            expected += archive.members.len() + archive.services.len();
+            let members: Vec<MemberEntry> = (0..per_volume)
+                .map(|at| {
+                    let after = at + 1 == per_volume && vol + 1 < volumes;
+                    let before = at == 0 && vol > 0;
+                    member(
+                        vol,
+                        10 + 100 * at as u64,
+                        &format!("f{vol}-{at}"),
+                        before,
+                        after,
+                    )
+                })
+                .collect();
+            let services: Vec<ServiceEntry> = (0..per_volume)
+                .map(|at| service(vol, 60 + 100 * at as u64, "STM", false, false))
+                .collect();
+            archive.integrate_members(vol, members);
+            archive.integrate_services(vol, services);
+        }
+        assert_eq!(super::super::chains::linker_builds::take(), expected);
+        assert_eq!(archive.members.len(), volumes * (per_volume - 1) + 1);
+        assert_eq!(archive.services.len(), volumes * per_volume);
+    }
+
+    /// Every service's parent, and every member's services by name, read
+    /// from the index after each add, equal what the old walk over every
+    /// member's segments found (`service_parent` and `member_services_named`
+    /// also assert this on every call under test).
+    #[test]
+    fn service_parents_match_the_catalog_walk() {
+        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        let mut parented = 0;
+        for seed in 0..120 {
+            let count = 2 + seed % 6;
+            let volumes = if seed % 2 == 1 {
+                chaos(&mut rng, count)
+            } else {
+                layout(&mut rng, count)
+            };
+            for order in orders(&mut rng, count) {
+                let mut archive = empty_archive(Vec::new());
+                for &vol in &order {
+                    let (members, services) = volumes[vol].clone();
+                    archive.integrate_members(vol, members);
+                    archive.integrate_services(vol, services);
+                    for service in 0..archive.services.len() {
+                        let old =
+                            archive.rar4_service_parent_member_index(&archive.services[service]);
+                        assert_eq!(archive.service_parent(service), old, "seed {seed}");
+                        parented += usize::from(old.is_some());
+                    }
+                    for member in 0..archive.members.len() {
+                        for name in ["STM", "ACL", "UOW", ""] {
+                            archive.member_services_named(member, name);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            parented > 1000,
+            "non-vacuity: {parented} services had a parent"
+        );
+    }
+
+    /// Asking every member for its services reads the catalog once, where
+    /// the old walk read every member's segments for every service of every
+    /// member asked about.
+    #[test]
+    fn parent_lookups_read_the_catalog_once() {
+        let count = 400;
+        let mut archive = empty_archive(Vec::new());
+        let members: Vec<MemberEntry> = (0..count)
+            .map(|at| member(0, 10 + 100 * at as u64, &format!("f{at}"), false, false))
+            .collect();
+        let services: Vec<ServiceEntry> = (0..count)
+            .map(|at| service(0, 60 + 100 * at as u64, "STM", false, false))
+            .collect();
+        archive.integrate_members(0, members);
+        archive.integrate_services(0, services);
+        super::super::chains::parent_builds::take();
+        let index = archive.catalog.parents(&archive.members, &archive.services);
+        for member in 0..count {
+            assert_eq!(index.children(member).collect::<Vec<_>>(), vec![member]);
+        }
+        for service in 0..count {
+            assert_eq!(index.parent(service), Some(service));
+        }
+        assert_eq!(super::super::chains::parent_builds::take(), 2 * count);
+        archive.integrate_services(1, [service(1, 10, "ACL", false, false)]);
+        let index = archive.catalog.parents(&archive.members, &archive.services);
+        assert_eq!(
+            index.parent(count),
+            Some(count - 1),
+            "rebuilt after the add"
+        );
+        assert_eq!(super::super::chains::parent_builds::take(), 2 * count + 1);
+    }
+
+    /// Name lookups, raw and sanitized, answer the first member with the
+    /// name, as the old scans did, and read each member's name once per
+    /// change to the catalog rather than once per lookup.
+    #[test]
+    fn name_lookups_read_the_catalog_once() {
+        let names: Vec<String> = (0..300)
+            .map(|at| match at % 3 {
+                0 => format!("dir/f{at}.bin"),
+                1 => format!("dir/../f{}.bin", at - 1),
+                _ => "dup.bin".to_string(),
+            })
+            .collect();
+        let members: Vec<MemberEntry> = names
+            .iter()
+            .enumerate()
+            .map(|(at, name)| member(0, 10 + 10 * at as u64, name, false, false))
+            .collect();
+        let mut archive = empty_archive(members);
+        super::super::chains::name_builds::take();
+        for name in &names {
+            let old = archive
+                .members
+                .iter()
+                .position(|m| m.file_header.name == *name);
+            assert_eq!(archive.find_member(name), old);
+            assert_eq!(archive.index_for_name(name), old);
+            let sanitized =
+                crate::path::sanitize_member_path(archive.format, crate::types::HostOs::Unix, name);
+            let old = archive.members.iter().position(|m| {
+                crate::path::sanitize_member_path(
+                    archive.format,
+                    m.file_header.host_os,
+                    &m.file_header.name,
+                ) == sanitized
+            });
+            assert_eq!(archive.find_member_sanitized(&sanitized), old);
+        }
+        assert_eq!(archive.find_member("dup.bin"), Some(2));
+        assert_eq!(archive.find_member("absent"), None);
+        assert_eq!(
+            super::super::chains::name_builds::take(),
+            2 * names.len(),
+            "one raw and one sanitized pass"
+        );
+        archive.integrate_members(1, [member(1, 10, "late.bin", false, false)]);
+        assert_eq!(archive.find_member("late.bin"), Some(names.len()));
+        assert!(
+            !archive.is_extractable("late.bin"),
+            "no reader for volume 1"
+        );
+        assert_eq!(archive.missing_volumes("late.bin"), vec![1]);
+        assert_eq!(super::super::chains::name_builds::take(), names.len() + 1);
     }
 }

@@ -225,7 +225,7 @@ impl RarArchive {
             });
         }
 
-        let mut services = Vec::new();
+        let mut parsed_services = Vec::with_capacity(parsed.services.len());
         for service in parsed.services {
             let entry = {
                 let packed_hashes = Self::packed_hashes_for_split_segment(
@@ -267,8 +267,10 @@ impl RarArchive {
                     segments: vec![segment],
                 }
             };
-            Self::integrate_service_entry(&mut services, volume_number, entry);
+            parsed_services.push(entry);
         }
+        let mut services = Vec::new();
+        Self::integrate_service_entries(&mut services, volume_number, parsed_services);
 
         // Store the volume reader.
         let mut volumes: Vec<Option<VolumeData>> = Vec::new();
@@ -308,6 +310,7 @@ impl RarArchive {
             kdf_cache,
             prefix_cursor,
             held_segments: None,
+            catalog: super::chains::CatalogIndex::default(),
         })
     }
 
@@ -424,7 +427,7 @@ impl RarArchive {
             });
         }
 
-        let mut services = Vec::new();
+        let mut parsed_services = Vec::new();
         for fh in &parsed.services {
             let file_header = Self::rar4_to_file_header(fh, parsed.archive_header.is_solid);
             let entry = ServiceEntry {
@@ -446,17 +449,19 @@ impl RarArchive {
                 comment_crc16: None,
                 ntfs_stream_name: None,
             };
-            Self::integrate_service_entry(&mut services, 0, entry);
+            parsed_services.push(entry);
         }
         for old_service in &parsed.old_services {
             if let Some(entry) = Self::rar4_old_service_to_service_entry(old_service, 0, format) {
-                Self::integrate_service_entry(&mut services, 0, entry);
+                parsed_services.push(entry);
             }
         }
         for comment in &parsed.comments {
             let entry = Self::rar4_comment_to_service_entry(comment, 0, format);
-            Self::integrate_service_entry(&mut services, 0, entry);
+            parsed_services.push(entry);
         }
+        let mut services = Vec::new();
+        Self::integrate_service_entries(&mut services, 0, parsed_services);
 
         let volumes: Vec<Option<VolumeData>> = vec![Some(VolumeData { reader })];
 
@@ -492,6 +497,7 @@ impl RarArchive {
             kdf_cache,
             prefix_cursor: None,
             held_segments: None,
+            catalog: super::chains::CatalogIndex::default(),
         };
         archive.hydrate_rar4_uowner_payloads();
         Ok(archive)

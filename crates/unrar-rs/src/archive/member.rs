@@ -699,15 +699,7 @@ impl RarArchive {
         options: &ExtractOptions,
         out_path: &std::path::Path,
     ) -> RarResult<()> {
-        let services: Vec<ServiceEntry> = self
-            .services
-            .iter()
-            .filter(|service| service.file_header.name == "STM")
-            .filter_map(|service| {
-                (self.rar4_service_parent_member_index(service) == Some(member_index))
-                    .then_some(service.clone())
-            })
-            .collect();
+        let services = self.member_services_named(member_index, "STM");
 
         for service in services {
             let Some(stream_name) = Self::ntfs_stream_name_from_service(&service) else {
@@ -787,15 +779,7 @@ impl RarArchive {
             return Ok(());
         }
 
-        let services: Vec<ServiceEntry> = self
-            .services
-            .iter()
-            .filter(|service| service.file_header.name == "ACL")
-            .filter_map(|service| {
-                (self.rar4_service_parent_member_index(service) == Some(member_index))
-                    .then_some(service.clone())
-            })
-            .collect();
+        let services = self.member_services_named(member_index, "ACL");
 
         for service in services {
             self.restore_ntfs_acl(&service, options, out_path)?;
@@ -1364,13 +1348,20 @@ impl RarArchive {
             return;
         }
 
+        if !self
+            .services
+            .iter()
+            .any(|service| service.file_header.name == "UOW")
+        {
+            return;
+        }
         let targets: Vec<(usize, usize)> = self
             .services
             .iter()
             .enumerate()
             .filter(|(_, service)| service.file_header.name == "UOW")
-            .filter_map(|(service_idx, service)| {
-                let member_idx = self.rar4_service_parent_member_index(service)?;
+            .filter_map(|(service_idx, _)| {
+                let member_idx = self.service_parent(service_idx)?;
                 self.members[member_idx]
                     .owner
                     .is_none()
@@ -1398,7 +1389,62 @@ impl RarArchive {
         }
     }
 
-    fn rar4_service_parent_member_index(&self, service: &ServiceEntry) -> Option<usize> {
+    /// The member service `service_idx` belongs to: the member with the
+    /// data segment closest before the service's first segment, the last such
+    /// member when several share that segment.
+    pub(super) fn service_parent(&self, service_idx: usize) -> Option<usize> {
+        let parent = self
+            .catalog
+            .parents(&self.members, &self.services)
+            .parent(service_idx);
+        #[cfg(test)]
+        assert_eq!(
+            parent,
+            self.services
+                .get(service_idx)
+                .and_then(|service| self.rar4_service_parent_member_index(service)),
+            "the service parent index is stale"
+        );
+        parent
+    }
+
+    /// The services named `name` that belong to `member_index`, in catalog
+    /// order.
+    pub(super) fn member_services_named(
+        &self,
+        member_index: usize,
+        name: &str,
+    ) -> Vec<ServiceEntry> {
+        let services: Vec<ServiceEntry> = self
+            .catalog
+            .parents(&self.members, &self.services)
+            .children(member_index)
+            .map(|service_idx| &self.services[service_idx])
+            .filter(|service| service.file_header.name == name)
+            .cloned()
+            .collect();
+        #[cfg(test)]
+        assert_eq!(
+            format!("{services:?}"),
+            format!(
+                "{:?}",
+                self.services
+                    .iter()
+                    .filter(|service| service.file_header.name == name)
+                    .filter(|service| {
+                        self.rar4_service_parent_member_index(service) == Some(member_index)
+                    })
+                    .collect::<Vec<_>>()
+            ),
+            "the service parent index is stale"
+        );
+        services
+    }
+
+    /// The old whole-catalog walk `service_parent` answers from its index;
+    /// kept as the reference tests compare against.
+    #[cfg(test)]
+    pub(super) fn rar4_service_parent_member_index(&self, service: &ServiceEntry) -> Option<usize> {
         let service_segment = service.segments.first()?;
         self.members
             .iter()
@@ -4096,15 +4142,7 @@ impl RarArchive {
         }
 
         let source_index = self
-            .members
-            .iter()
-            .position(|entry| {
-                crate::path::sanitize_member_path(
-                    self.format,
-                    entry.file_header.host_os,
-                    &entry.file_header.name,
-                ) == target_member_name
-            })
+            .find_member_sanitized(&target_member_name)
             .ok_or_else(|| {
                 RarError::Io(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
@@ -10696,6 +10734,7 @@ mod tests {
             kdf_cache: Arc::new(crate::crypto::KdfCache::default()),
             prefix_cursor: None,
             held_segments: None,
+            catalog: super::chains::CatalogIndex::default(),
         }
     }
 
