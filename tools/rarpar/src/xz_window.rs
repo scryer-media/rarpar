@@ -6,9 +6,13 @@
 //! directory, removed from it at once, and mapped into memory. The file
 //! lives only as long as its block: the system reclaims it when the map is
 //! dropped, and on any exit.
+//!
+//! The file's storage is reserved before it is mapped. A sparse file on a
+//! full file system would map, and then fault on the decoder's first write
+//! to a page with no block behind it (SIGBUS) instead of failing the decode.
 
 use std::fs::File;
-use std::io;
+use std::io::{self, Write};
 use std::sync::Arc;
 
 use lzma_turbo::{WindowAllocator, WindowBacking, WindowMemory};
@@ -26,7 +30,7 @@ struct ScratchFiles;
 impl WindowAllocator for ScratchFiles {
     fn allocate(&self, len: usize) -> io::Result<Box<dyn WindowMemory>> {
         let file = tempfile::tempfile()?;
-        file.set_len(len as u64)?;
+        reserve(&file, len as u64)?;
         // SAFETY: the file was made by this call with no name in the file
         // system (on Windows, a random name deleted on close), and this is
         // its one handle, so nothing else resizes, writes or maps it while
@@ -34,6 +38,41 @@ impl WindowAllocator for ScratchFiles {
         let map = unsafe { MmapMut::map_mut(&file) }?;
         Ok(Box::new(ScratchWindow { map, _file: file }))
     }
+}
+
+/// Gives `file`, new and empty, `len` bytes with storage behind every one,
+/// or the error that stopped it (no space, a quota).
+fn reserve(file: &File, len: u64) -> io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::fd::AsRawFd;
+
+        let Ok(size) = libc::off_t::try_from(len) else {
+            return Err(io::Error::from(io::ErrorKind::FileTooLarge));
+        };
+        // SAFETY: a plain call on a descriptor this process owns.
+        match unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, size) } {
+            0 => return Ok(()),
+            // A file system that cannot preallocate: write the bytes below.
+            libc::EOPNOTSUPP | libc::EINVAL => {}
+            code => return Err(io::Error::from_raw_os_error(code)),
+        }
+    }
+    write_zeros(file, len)
+}
+
+/// Writes `len` zero bytes from the start of `file`, so the file system
+/// allocates them now, when running out is still an error.
+fn write_zeros(mut file: &File, len: u64) -> io::Result<()> {
+    const CHUNK: usize = 1 << 20;
+    let zeros = vec![0u8; CHUNK];
+    let mut left = len;
+    while left > 0 {
+        let n = usize::try_from(left).map_or(CHUNK, |left| left.min(CHUNK));
+        file.write_all(&zeros[..n])?;
+        left -= n as u64;
+    }
+    Ok(())
 }
 
 /// A mapped scratch file, unmapped and closed on drop.
@@ -44,7 +83,7 @@ struct ScratchWindow {
 
 // SAFETY: the map covers the whole file, `len()` bytes, which `allocate`
 // sized to at least the length asked for. Mapped file pages read as the
-// file's contents, zero for a file just extended, so every byte is
+// file's contents, zero for a file just reserved, so every byte is
 // initialized. The mapping's address does not move when the `Box` does, and
 // it is unmapped only when this value drops. Nothing else holds the file or
 // the map, so the decoder has the memory to itself.
@@ -71,5 +110,12 @@ mod tests {
         let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, window.len()) };
         bytes.fill(0xA5);
         assert!(bytes.iter().all(|&b| b == 0xA5));
+    }
+
+    #[test]
+    fn write_zeros_reserves_every_byte_of_an_odd_length() {
+        let file = tempfile::tempfile().unwrap();
+        write_zeros(&file, (2 << 20) + 7).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), (2 << 20) + 7);
     }
 }
