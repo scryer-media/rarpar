@@ -34,7 +34,7 @@
 //! [`crate::crypto::check_member_password`] and
 //! [`crate::crypto::decrypt_cipher_range`] for the surfaces that do.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::archive::{RarVolumeFacts, RarVolumeMemberEncryptionFacts, RarVolumeMemberFacts};
 use crate::types::{ArchiveFormat, CompressionMethod};
@@ -675,6 +675,24 @@ mod extent_visits {
     }
 }
 
+/// How many chain holes this thread's adds looked at.
+#[cfg(test)]
+mod hole_visits {
+    use std::cell::Cell;
+
+    thread_local! {
+        static VISITS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn add() {
+        VISITS.with(|visits| visits.set(visits.get() + 1));
+    }
+
+    pub(super) fn take() -> usize {
+        VISITS.with(|visits| visits.replace(0))
+    }
+}
+
 /// Everything one added volume contributes.
 struct VolumeRecord {
     snapshots: Vec<MemberSnapshot>,
@@ -727,6 +745,16 @@ pub struct StoredLayoutBuilder {
     /// is named when the parts disagree, must not depend on arrival order.
     encryptions: Vec<BTreeMap<u32, PartEncryption>>,
     index: HashMap<String, usize>,
+    /// Every run of volumes a member's chain still waits for between two of
+    /// its parts, as (first, last, member): the volumes inside its span that
+    /// carry no part of it. Adding one of them changes that member although
+    /// the volume names it nowhere.
+    holes: BTreeSet<(u32, u32, usize)>,
+    /// Per member, its entries in `holes`.
+    member_holes: Vec<Vec<(u32, u32)>>,
+    /// Whether two holes ever shared a volume, which only a malformed set
+    /// does; from then on an add looks at every hole that could hold it.
+    holes_overlap: bool,
     frontier: Option<u32>,
     /// The volume the last add that learned anything was for: the only one
     /// whose headers can grow in place without reordering the members.
@@ -744,6 +772,9 @@ impl StoredLayoutBuilder {
             declarations: Vec::new(),
             encryptions: Vec::new(),
             index: HashMap::new(),
+            holes: BTreeSet::new(),
+            member_holes: Vec::new(),
+            holes_overlap: false,
             frontier: None,
             last_added: None,
         }
@@ -802,6 +833,7 @@ impl StoredLayoutBuilder {
         let mut extents: Vec<VolumeExtent> = Vec::with_capacity(snapshots.len());
         let mut evidence = VolumeSplitEvidence::default();
         let mut names_here: HashSet<&str> = HashSet::with_capacity(snapshots.len());
+        let mut carried: Vec<usize> = Vec::with_capacity(snapshots.len());
 
         for snapshot in &snapshots {
             if snapshot.split_before {
@@ -813,6 +845,7 @@ impl StoredLayoutBuilder {
 
             let member_index = self.member_index_for(snapshot, volume);
             self.absorb_traits(member_index, snapshot);
+            carried.push(member_index);
 
             if !names_here.insert(snapshot.name.as_str()) {
                 // Keep the first header and record the conflict; either way the
@@ -878,10 +911,15 @@ impl StoredLayoutBuilder {
 
         // A volume also changes members it carries no part of: one added inside
         // a member's span proves a hole in that member's chain.
-        let affected: Vec<usize> = (0..self.members.len())
-            .filter(|index| self.member_spans(*index, volume))
-            .collect();
-        for index in affected {
+        self.members_changed_by(volume, &mut carried);
+        #[cfg(test)]
+        assert_eq!(
+            carried,
+            (0..self.members.len())
+                .filter(|index| self.member_spans(*index, volume))
+                .collect::<Vec<_>>()
+        );
+        for index in carried {
             self.resolve_member(index);
         }
 
@@ -922,6 +960,7 @@ impl StoredLayoutBuilder {
             .parts
             .partition_point(|existing| existing.volume < volume);
         member.parts.insert(position, part);
+        self.refresh_holes(member_index);
     }
 
     /// Whether `snapshots` are the headers `volume` was added on followed by
@@ -1168,8 +1207,63 @@ impl StoredLayoutBuilder {
         self.traits.push(MemberTraits::default());
         self.declarations.push(BTreeMap::new());
         self.encryptions.push(BTreeMap::new());
+        self.member_holes.push(Vec::new());
         self.index.insert(snapshot.name.clone(), index);
         index
+    }
+
+    /// Re-index the volumes one member's chain waits for between its parts.
+    fn refresh_holes(&mut self, member_index: usize) {
+        for (first, last) in self.member_holes[member_index].drain(..) {
+            self.holes.remove(&(first, last, member_index));
+        }
+        let parts = &self.members[member_index].parts;
+        for pair in parts.windows(2) {
+            let (before, after) = (pair[0].volume, pair[1].volume);
+            if after > before.saturating_add(1) {
+                let hole = (before + 1, after - 1, member_index);
+                // Holes of a well-formed set never share a volume: one
+                // inside two members' spans would carry the middle of both.
+                // The first pair that does turns the shortcut below off.
+                let touches_before = self
+                    .holes
+                    .range(..hole)
+                    .next_back()
+                    .is_some_and(|earlier| earlier.1 >= hole.0);
+                let touches_after = self
+                    .holes
+                    .range(hole..)
+                    .next()
+                    .is_some_and(|later| later.0 <= hole.1);
+                self.holes_overlap |= touches_before || touches_after;
+                self.member_holes[member_index].push((hole.0, hole.1));
+                self.holes.insert(hole);
+            }
+        }
+    }
+
+    /// The members a newly added `volume` changes: those carrying a part of
+    /// it, and those whose chain waits for it between two of their parts.
+    /// In index order, each once.
+    ///
+    /// While no two holes share a volume, only the hole beginning last at or
+    /// before `volume` can hold it.
+    fn members_changed_by(&self, volume: u32, carried: &mut Vec<usize>) {
+        let mut before = self.holes.range(..=(volume, u32::MAX, usize::MAX));
+        let candidates: Box<dyn Iterator<Item = &(u32, u32, usize)>> = if self.holes_overlap {
+            Box::new(before)
+        } else {
+            Box::new(before.next_back().into_iter())
+        };
+        for &(_, last, member_index) in candidates {
+            #[cfg(test)]
+            hole_visits::add();
+            if last >= volume {
+                carried.push(member_index);
+            }
+        }
+        carried.sort_unstable();
+        carried.dedup();
     }
 
     /// Fold one header's disqualifying facts into the member's running traits.
@@ -1182,6 +1276,9 @@ impl StoredLayoutBuilder {
         traits.compressed |= !snapshot.is_store;
     }
 
+    /// Whether `volume` lies within a member's parts: the old way of finding
+    /// the members an add changes, kept for tests to compare against.
+    #[cfg(test)]
     fn member_spans(&self, member_index: usize, volume: u32) -> bool {
         let parts = &self.members[member_index].parts;
         match (parts.first(), parts.last()) {
@@ -4065,5 +4162,136 @@ mod tests {
             large_walk >= 2 * 4000,
             "the old walk looked at {large_walk} extents (small: {small_walk})"
         );
+    }
+
+    /// A set of `volumes` volumes holding members laid end to end, each split
+    /// across one or more volumes, as RAR writes them: per volume, its
+    /// headers in physical order.
+    fn chained_set(rng: &mut Rng, volumes: u32) -> Vec<Vec<RarVolumeMemberFacts>> {
+        let mut set: Vec<Vec<RarVolumeMemberFacts>> = vec![Vec::new(); volumes as usize];
+        let mut volume = 0;
+        let mut index = 0;
+        while volume < volumes {
+            let span = 1 + rng.below(4) as u32;
+            let last = (volume + span - 1).min(volumes - 1);
+            let name = format!("m{index}.bin");
+            let sizes: Vec<u64> = (volume..=last).map(|_| 1 + rng.below(50)).collect();
+            let whole = sizes.iter().sum();
+            for (at, size) in (volume..=last).zip(sizes) {
+                let headers = &mut set[at as usize];
+                let offset = headers
+                    .last()
+                    .map_or(20, |facts| facts.data_offset + facts.data_size + 9);
+                let part = split_part(&name, offset, size, whole, at > volume, at < last);
+                headers.push(with_crc32(part, 0x0BAD_F00D));
+            }
+            // The next member starts in the volume this one ended in, or the
+            // one after.
+            volume = last + u32::from(rng.below(2) == 0);
+            index += 1;
+        }
+        set
+    }
+
+    /// Damage a set as a hostile or broken poster could: a part dropped, a
+    /// part copied into another volume, a member restarted mid-chain.
+    fn damage(rng: &mut Rng, set: &mut [Vec<RarVolumeMemberFacts>]) {
+        let volumes = set.len() as u64;
+        for _ in 0..1 + rng.below(4) {
+            let from = rng.below(volumes) as usize;
+            if set[from].is_empty() {
+                continue;
+            }
+            let at = rng.below(set[from].len() as u64) as usize;
+            match rng.below(3) {
+                0 => {
+                    set[from].remove(at);
+                }
+                1 => {
+                    let mut copy = set[from][at].clone();
+                    let to = rng.below(volumes) as usize;
+                    copy.data_offset = set[to]
+                        .last()
+                        .map_or(20, |facts| facts.data_offset + facts.data_size + 3);
+                    if set[to].iter().all(|facts| facts.name != copy.name) {
+                        set[to].push(copy);
+                    }
+                }
+                _ => set[from][at].split_before = !set[from][at].split_before,
+            }
+        }
+    }
+
+    #[test]
+    fn an_add_changes_the_members_it_carries_and_those_waiting_for_it() {
+        // `add_volume` asserts, on every add under test, that the members it
+        // resolves are exactly those whose parts span the volume, as the scan
+        // over every member found them.
+        for seed in 1..=300_u64 {
+            let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1);
+            let volumes = 2 + rng.below(30) as u32;
+            let mut set = chained_set(&mut rng, volumes);
+            if seed % 3 == 0 {
+                damage(&mut rng, &mut set);
+            }
+            let mut order: Vec<u32> = (0..volumes).collect();
+            for at in (1..order.len()).rev() {
+                order.swap(at, rng.below(at as u64 + 1) as usize);
+            }
+            let mut builder = layout();
+            for &number in &order {
+                // Some volumes never arrive.
+                if rng.below(8) == 0 {
+                    continue;
+                }
+                add(&mut builder, number, &volume(set[number as usize].clone()));
+            }
+            // An in-order build of the same volumes ends in the same members.
+            let mut ordered = layout();
+            for number in 0..volumes {
+                if builder.has_volume(number) {
+                    add(&mut ordered, number, &volume(set[number as usize].clone()));
+                }
+            }
+            let shape = |builder: &StoredLayoutBuilder| {
+                let mut members: Vec<_> = builder
+                    .members()
+                    .iter()
+                    .map(|member| format!("{member:?}"))
+                    .collect();
+                members.sort();
+                members
+            };
+            assert_eq!(shape(&builder), shape(&ordered), "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn an_add_looks_at_one_waiting_chain_however_many_members_there_are() {
+        // One member split across every volume, arriving evens first, so its
+        // chain has a hole at every odd volume, beside an unsplit member per
+        // volume.
+        let visits = |volumes: u32| {
+            let whole = u64::from(volumes) * 10;
+            let set: Vec<Vec<RarVolumeMemberFacts>> = (0..volumes)
+                .map(|at| {
+                    let long = split_part("long.bin", 20, 10, whole, at > 0, at + 1 < volumes);
+                    let short = routed(&format!("short{at}.bin"), 40, 5);
+                    vec![with_crc32(long, 7), short]
+                })
+                .collect();
+            let mut builder = layout();
+            let evens = (0..volumes).step_by(2);
+            let odds = (1..volumes).step_by(2);
+            hole_visits::take();
+            for number in evens.chain(odds) {
+                add(&mut builder, number, &volume(set[number as usize].clone()));
+            }
+            hole_visits::take()
+        };
+        let small = visits(16);
+        let large = visits(1024);
+        assert!(small <= 16, "{small} holes looked at for 16 adds");
+        assert!(large <= 1024, "{large} holes looked at for 1024 adds");
     }
 }
