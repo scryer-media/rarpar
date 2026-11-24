@@ -19,6 +19,7 @@ documented in each crate's own changelog so those notes ship with the crate.
 - lzma-turbo 0.12.1 bounds what hostile xz input can make a decoder hold,
   its indexes included. sevenz-turbo 0.30.4 finds the end header of a 7z
   file whose start header is zeroed in one pass over its last megabyte.
+- The lockfile takes crc-turbo 1.11.1. No crate's requirement changes.
 
 ## rarpar 0.9.7
 
