@@ -717,8 +717,96 @@ fn neon_packed_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("WEAVER_PAR2_NEON_PACKED").is_none_or(|v| v != "0"))
 }
+/// ParPar's XOR-JIT AVX2 compute tile (`gf16mul.cpp`), and the largest tile
+/// the cache rule below may choose.
 #[cfg(target_arch = "x86_64")]
 const XORJIT_AVX2_IDEAL_CHUNK_BYTES: usize = 128 * 1024;
+
+/// The tile used when the L3 cache cannot be read from CPUID.
+#[cfg(target_arch = "x86_64")]
+const XORJIT_FALLBACK_CHUNK_BYTES: usize = 16 * 1024;
+
+/// How many times smaller than its share of the L3 the XOR-JIT working set
+/// is kept. For every output row the kernel rereads its input group, so the
+/// tile's staging (`input group x tile`) of every thread on one L3 must stay
+/// cached. The operating system does not spread a process's pages evenly over
+/// the cache's sets: a Windows host with depleted free lists gave a repair
+/// 8x fewer sets than an even spread would, and the shipped 128 KiB tile ran
+/// 2-5x slower there. A working set at 1/16 of the L3 measured within 1.3x
+/// of an unskewed run with 8x and 16x fewer sets on a Ryzen 5 3600.
+#[cfg(target_arch = "x86_64")]
+const XORJIT_L3_HEADROOM: usize = 16;
+
+/// The XOR-JIT compute tile for an L3 of `l3_bytes` shared by `sharing`
+/// logical processors, with `input_grouping` inputs staged per pass: every
+/// sharing processor's staging together fills `1 / XORJIT_L3_HEADROOM` of
+/// the cache, never more than ParPar's tile.
+#[cfg(target_arch = "x86_64")]
+fn xorjit_tile_for_l3(l3_bytes: usize, sharing: usize, input_grouping: usize) -> usize {
+    let per_thread = XORJIT_L3_HEADROOM
+        .saturating_mul(sharing.max(1))
+        .saturating_mul(input_grouping.max(1));
+    (l3_bytes / per_thread).clamp(1, XORJIT_AVX2_IDEAL_CHUNK_BYTES)
+}
+
+/// The L3 size and the logical processors that share one L3, from AMD's
+/// cache topology leaf (CPUID `0x8000_001D`). XOR-JIT is selected only on
+/// AMD families, all of which report it when `TOPOEXT` is set.
+#[cfg(target_arch = "x86_64")]
+fn amd_l3_topology() -> Option<(usize, usize)> {
+    use std::arch::x86_64::{__cpuid, __cpuid_count};
+    const TOPOLOGY_LEAF: u32 = 0x8000_001d;
+    if __cpuid(0x8000_0000).eax < TOPOLOGY_LEAF || __cpuid(0x8000_0001).ecx & (1 << 22) == 0 {
+        return None;
+    }
+    (0..16).find_map(|subleaf| {
+        let leaf = __cpuid_count(TOPOLOGY_LEAF, subleaf);
+        let kind = leaf.eax & 0x1f;
+        let level = (leaf.eax >> 5) & 0x7;
+        (kind == 3 && level == 3).then(|| {
+            let line = (leaf.ebx & 0xfff) as usize + 1;
+            let partitions = ((leaf.ebx >> 12) & 0x3ff) as usize + 1;
+            let ways = (leaf.ebx >> 22) as usize + 1;
+            let sets = leaf.ecx as usize + 1;
+            let sharing = ((leaf.eax >> 14) & 0xfff) as usize + 1;
+            (ways * partitions * line * sets, sharing)
+        })
+    })
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+thread_local! {
+    static XORJIT_TILE_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The XOR-JIT compute tile for this host, read once.
+#[cfg(target_arch = "x86_64")]
+fn xorjit_ideal_chunk_bytes() -> usize {
+    #[cfg(test)]
+    if let Some(tile) = XORJIT_TILE_OVERRIDE.with(std::cell::Cell::get) {
+        return tile;
+    }
+    static TILE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TILE.get_or_init(|| {
+        amd_l3_topology().map_or(XORJIT_FALLBACK_CHUNK_BYTES, |(l3, sharing)| {
+            xorjit_tile_for_l3(
+                l3,
+                sharing,
+                crate::cpu_repair_controller::DEFAULT_INPUT_GROUPING,
+            )
+        })
+    })
+}
+
+/// Compute workers for an XOR-JIT repair from a pool of `pool` threads on a
+/// host with `logical` processors: two processors stay with the controller,
+/// which builds each batch's code and reads, finishes and writes slices while
+/// the workers compute. With every processor but one computing, the
+/// controller waited for a processor and a Ryzen 5 3600 repair ran 6% longer.
+#[cfg(target_arch = "x86_64")]
+fn xorjit_compute_workers(pool: usize, logical: usize) -> usize {
+    pool.min(logical.saturating_sub(2)).max(1)
+}
 
 /// 64-byte-aligned backing for the folded staging streams so every 32-byte
 /// block sits cache-line aligned.
@@ -1257,7 +1345,7 @@ impl CpuKernelKind {
                 alignment: 32,
                 ideal_input_multiple: 1,
                 staging_multiple: 1,
-                ideal_chunk_size: XORJIT_AVX2_IDEAL_CHUNK_BYTES,
+                ideal_chunk_size: xorjit_ideal_chunk_bytes(),
                 checksum_width: width.block_bytes() / 16,
                 prefetch: CpuPrefetch {
                     inputs_per_invoke: 1,
@@ -4822,7 +4910,12 @@ fn execute_repair_streaming_with_trace(
     #[cfg(target_arch = "x86_64")]
     let jit_width = reedsolomon_rs::xor_jit::JitWidth::detect()
         .filter(|_| std::env::var_os("RARPAR_PAR2_XORJIT").is_none_or(|v| v != "0"));
-    let workers = rayon::current_num_threads().max(1);
+    let pool_workers = rayon::current_num_threads().max(1);
+    #[cfg(target_arch = "x86_64")]
+    let jit_workers = xorjit_compute_workers(
+        pool_workers,
+        std::thread::available_parallelism().map_or(pool_workers, usize::from),
+    );
     // The non-JIT kernel this host would otherwise run, and the chunk the
     // XOR-JIT tier has to match to be selected.
     #[cfg(target_arch = "x86_64")]
@@ -4844,7 +4937,7 @@ fn execute_repair_streaming_with_trace(
             baseline_method,
             output_count: n,
             word_count,
-            workers,
+            workers: jit_workers,
             budget,
         }
         .select_memo(&plan.input_factors.data)?,
@@ -4858,6 +4951,14 @@ fn execute_repair_streaming_with_trace(
     let use_xorjit = jit_memo.is_some();
     #[cfg(not(target_arch = "x86_64"))]
     let use_xorjit = false;
+    #[cfg(target_arch = "x86_64")]
+    let workers = if use_xorjit {
+        jit_workers
+    } else {
+        pool_workers
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let workers = pool_workers;
     let use_folded = crate::gf_simd::altmap_supported() && !use_xorjit;
     let cpu_kernel = if use_folded {
         CpuKernelKind::Folded
@@ -7871,8 +7972,83 @@ pub(crate) mod tests {
             CpuKernelKind::XorJit(reedsolomon_rs::xor_jit::JitWidth::Avx2)
                 .method()
                 .ideal_chunk_size,
+            xorjit_ideal_chunk_bytes()
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn xorjit_tile_keeps_the_l3_working_set_at_a_sixteenth() {
+        // Ryzen 5 3600: 16 MiB per core complex, six logical processors.
+        assert_eq!(xorjit_tile_for_l3(16 << 20, 6, 12), 14_563);
+        // Ryzen 9 7950X: 32 MiB per complex, sixteen logical processors.
+        assert_eq!(xorjit_tile_for_l3(32 << 20, 16, 12), 10_922);
+        // A cache this large never raises the tile past ParPar's.
+        assert_eq!(
+            xorjit_tile_for_l3(1 << 30, 2, 12),
             XORJIT_AVX2_IDEAL_CHUNK_BYTES
         );
+        assert_eq!(xorjit_tile_for_l3(0, 0, 0), 1);
+        for (l3, sharing) in [(16usize << 20, 6usize), (32 << 20, 16), (8 << 20, 8)] {
+            let tile = xorjit_tile_for_l3(l3, sharing, 12);
+            assert!(XORJIT_L3_HEADROOM * sharing * 12 * tile <= l3);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn xorjit_tile_comes_from_the_host_l3_or_the_fallback() {
+        let tile = xorjit_ideal_chunk_bytes();
+        match amd_l3_topology() {
+            Some((l3, sharing)) => {
+                assert!(l3 > 0 && sharing > 0);
+                assert_eq!(tile, xorjit_tile_for_l3(l3, sharing, 12));
+            }
+            None => assert_eq!(tile, XORJIT_FALLBACK_CHUNK_BYTES),
+        }
+        assert!(tile <= XORJIT_AVX2_IDEAL_CHUNK_BYTES);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn xorjit_workers_leave_two_processors_to_the_controller() {
+        assert_eq!(xorjit_compute_workers(11, 12), 10);
+        assert_eq!(xorjit_compute_workers(12, 12), 10);
+        assert_eq!(xorjit_compute_workers(4, 16), 4);
+        assert_eq!(xorjit_compute_workers(8, 2), 1);
+        assert_eq!(xorjit_compute_workers(1, 1), 1);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn xorjit_repair_is_identical_at_parpar_and_cache_tiles() {
+        let slice_size = 256 * 1024u64;
+        let slices = 24u32;
+        let file_data: Vec<u8> = (0..slice_size as u32 * slices)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let (par2_set, file_id) = setup_repairable_set(&file_data, slice_size, 8);
+        let mut damaged = file_data.clone();
+        for slice in [0usize, 5, 6, 11, 17, 23] {
+            let start = slice * slice_size as usize;
+            damaged[start..start + slice_size as usize].fill(0);
+        }
+        let mut repaired = Vec::new();
+        for tile in [XORJIT_AVX2_IDEAL_CHUNK_BYTES, 14_563, 4096] {
+            let mut access = MemoryFileAccess::new();
+            access.add_file(file_id, damaged.clone());
+            let result = verify::verify_all(&par2_set, &access);
+            let plan = plan_repair(&par2_set, &result).unwrap();
+            assert_eq!(plan.missing_slices.len(), 6);
+            XORJIT_TILE_OVERRIDE.with(|cell| cell.set(Some(tile)));
+            let outcome = execute_repair(&plan, &par2_set, &mut access);
+            XORJIT_TILE_OVERRIDE.with(|cell| cell.set(None));
+            outcome.unwrap();
+            repaired.push(access.read_file(&file_id).unwrap());
+        }
+        for bytes in &repaired {
+            assert!(bytes == &file_data, "a tile changed the repaired bytes");
+        }
     }
 
     /// The four-lane multiply-by-two must agree with the scalar one on every
