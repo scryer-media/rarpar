@@ -5,7 +5,7 @@
 //! engine. Kernel-specific preparation and multiplication stay in `repair` and
 //! `reedsolomon-rs`.
 
-const DEFAULT_INPUT_GROUPING: usize = 12;
+pub(crate) const DEFAULT_INPUT_GROUPING: usize = 12;
 const CONTROLLER_STAGING_AREAS: usize = 2;
 const CONTROLLER_TRANSFER_BUFFERS: usize = 2;
 

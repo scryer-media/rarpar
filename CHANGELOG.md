@@ -3,6 +3,13 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.9.9
+
+- PAR2 repair with the AVX2 XOR-JIT kernel (AMD processors) sizes its
+  compute tile from the L3 cache and keeps two processors for its
+  controller, through par2-rs 0.13.2. Repairs no longer slow down 2-5x when
+  the operating system places the process's memory in few cache sets.
+
 ## rarpar 0.9.8
 
 - `rarpar xz` takes `--scratch-mib` on decompress, test and list, through
