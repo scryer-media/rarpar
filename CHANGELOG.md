@@ -3,6 +3,13 @@
 This file records user-visible `rarpar` CLI changes. Library API changes are
 documented in each crate's own changelog so those notes ship with the crate.
 
+## rarpar 0.9.9
+
+- `rarpar xz decompress` and `xz test` on more than one thread finish an
+  .xz stream read from standard input or a pipe whose last block was decoded
+  as it arrived, such as a single-block file from `xz`. They reported
+  "truncated xz input" at its end (exit 1).
+
 ## rarpar 0.9.8
 
 - `rarpar xz` takes `--scratch-mib` on decompress, test and list, through

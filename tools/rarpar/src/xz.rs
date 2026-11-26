@@ -673,8 +673,12 @@ impl<R: Read> StreamDecoder<R> {
                 }
             };
             if self.end == 0 {
+                // The decoder finishes a stream only once it knows no more
+                // input follows the footer, so it gets a turn with that news
+                // before anything is called truncated.
                 self.eof = true;
                 self.decoder.end_of_input();
+                return Ok(());
             }
         }
         if self.start < self.end {
@@ -1049,6 +1053,24 @@ mod tests {
         assert_eq!(default_block_size(1), 3 * MIB);
         assert_eq!(default_block_size(6), 24 * MIB);
         assert_eq!(default_block_size(9), 192 * MIB);
+    }
+
+    /// A stream whose last block is decoded on the caller's thread has no
+    /// worker to wait for when its input ends; it still decodes whole.
+    #[test]
+    fn a_stream_decode_without_a_worker_in_flight_finishes_at_end_of_input() {
+        let original: Vec<u8> = (0..200_000u32).flat_map(u32::to_le_bytes).collect();
+        let mut packed = Vec::new();
+        let mut writer = XzWriter::new(&mut packed, &xz_preset(1, false)).unwrap();
+        writer.write_all(&original).unwrap();
+        writer.finish().unwrap();
+
+        // One thread: every block is chased, none goes to a worker.
+        let options = XzOptions::default().with_threads(1);
+        let mut decoder = StreamDecoder::new(io::Cursor::new(packed), options);
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert!(decoded == original);
     }
 
     #[test]
