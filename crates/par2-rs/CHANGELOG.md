@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.13.2
+
+### Fixed
+
+- The AVX2 XOR-JIT repair sizes its compute tile from the L3 cache, read
+  from CPUID leaf `0x8000_001D`: every logical processor sharing one L3
+  stages at most a sixteenth of it, and the tile never exceeds ParPar's
+  128 KiB. A host whose L3 cannot be read uses 16 KiB. With the 128 KiB tile
+  the staged inputs needed most of the L3, so when the operating system gave
+  the process pages from few cache sets (seen on Windows) a repair ran 2-5x
+  slower. On a Ryzen 5 3600 with the process held to an eighth or a
+  sixteenth of the cache sets, a repair now runs within 1.3x of an
+  unrestricted one; unrestricted repairs are unchanged or faster. Repaired
+  bytes are unchanged.
+- The XOR-JIT repair runs at most two fewer compute workers than the host
+  has logical processors, so the controller thread that builds each batch's
+  code and reads and writes slices is not left waiting for a processor.
+
 ## 0.13.1
 
 ### Fixed
