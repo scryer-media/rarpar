@@ -688,11 +688,10 @@ mod wasm {
             v128_xor(a, b)
         }
 
-        /// ror by n = (x >> n) | (x << (32 - n)); wasm has no rotate, so build
-        /// each rotation from a logical right shift OR a left shift.
+        /// Swap the two halfwords of each lane in one byte shuffle.
         #[inline(always)]
         unsafe fn rotr16(a: Self::Vec) -> Self::Vec {
-            v128_or(u32x4_shr(a, 16), u32x4_shl(a, 16))
+            i8x16_shuffle::<2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13>(a, a)
         }
 
         #[inline(always)]
@@ -700,9 +699,10 @@ mod wasm {
             v128_or(u32x4_shr(a, 12), u32x4_shl(a, 20))
         }
 
+        /// Rotate the little-endian bytes within each lane by one position.
         #[inline(always)]
         unsafe fn rotr8(a: Self::Vec) -> Self::Vec {
-            v128_or(u32x4_shr(a, 8), u32x4_shl(a, 24))
+            i8x16_shuffle::<1, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12>(a, a)
         }
 
         #[inline(always)]
