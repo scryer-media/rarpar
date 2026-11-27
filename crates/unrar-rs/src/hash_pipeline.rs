@@ -469,9 +469,10 @@ impl CrcShiftOp {
     }
 }
 
-/// Leaves grouped on one worker: four on NEON, eight on x86 (runtime
-/// upstream SSE4.1/AVX2 or legacy SSE2/SSSE3 dispatch), one on other targets. Keeping x86 leaves
-/// together enables cross-leaf SIMD and avoids eight worker wakeups per chunk.
+/// A worker owns four leaves on NEON, eight on x86, and one on other targets.
+/// x86 dispatches at runtime to AVX-512VL, upstream SSE4.1/AVX2, legacy
+/// SSE2/SSSE3, or scalar code. One worker enables cross-leaf SIMD and avoids
+/// eight worker wakeups per chunk.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const LEAVES_PER_WORKER: usize = 8;
 #[cfg(target_arch = "aarch64")]
