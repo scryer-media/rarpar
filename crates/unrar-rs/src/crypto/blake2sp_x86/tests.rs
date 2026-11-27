@@ -11,6 +11,10 @@ fn available() -> Vec<Backend> {
     if is_x86_feature_detected!("sse4.1") || is_x86_feature_detected!("avx2") {
         result.push(Backend::Upstream);
     }
+    #[cfg(target_arch = "x86_64")]
+    if avx512vl_available() {
+        result.push(Backend::Avx512Vl);
+    }
     eprintln!("exercising x86 hash backends: {result:?}");
     result
 }
@@ -50,7 +54,7 @@ fn all_supported_backends_match_oracle_across_tails_and_chunks() {
                     expected,
                     "finalization must be idempotent"
                 );
-                if let Hasher::Legacy(state) = &state.0 {
+                if let Hasher::Local(state) = &state.0 {
                     assert!(state.len < 961);
                 }
             }
@@ -74,18 +78,42 @@ fn vector_counters_flags_and_unaligned_messages_match_scalar() {
     ];
     let f0 = [0, !0, 0, !0, 0, !0, 0, !0];
     let f1 = [!0, 0, 0, 0, 0, 0, 0, !0];
-    let mut oracle = LegacyState::new(Backend::Portable);
-    oracle.compress(b, counts, f0, f1);
+    let mut oracle = LocalState::new(Backend::Portable);
+    Backend::Portable.compress(&mut oracle.h, b, counts, f0, f1);
     for backend in available().into_iter().filter(|b| *b != Backend::Upstream) {
-        let mut state = LegacyState::new(backend);
-        state.compress(b, counts, f0, f1);
+        let mut state = LocalState::new(backend);
+        backend.compress(&mut state.h, b, counts, f0, f1);
         assert_eq!(state.h, oracle.h, "{backend:?}");
     }
 }
 
 #[test]
-fn runtime_dispatch_uses_upstream_state_on_modern_hosts() {
+fn batched_counters_match_scalar_across_word_carry_and_wrap() {
+    let blocks = std::array::from_fn::<_, 3, _>(|block| {
+        std::array::from_fn(|byte| (block * 53 + byte * 31 + byte / 19) as u8)
+    });
+    for start in [(1 << 32) - 128, u64::MAX - 127] {
+        let mut oracle = LocalState::new(Backend::Portable);
+        oracle.count = start;
+        oracle.compress_nonfinal(&blocks);
+        for backend in available().into_iter().filter(|b| *b != Backend::Upstream) {
+            let mut state = LocalState::new(backend);
+            state.count = start;
+            state.compress_nonfinal(&blocks);
+            assert_eq!(state.h, oracle.h, "{backend:?} at {start}");
+            assert_eq!(state.count, start.wrapping_add(3 * 64));
+        }
+    }
+}
+
+#[test]
+fn runtime_dispatch_prefers_avx512vl_then_upstream() {
     let state = State::new();
+    #[cfg(target_arch = "x86_64")]
+    if avx512vl_available() {
+        assert!(matches!(state.0, Hasher::Local(state) if state.backend == Backend::Avx512Vl));
+        return;
+    }
     assert_eq!(
         matches!(state.0, Hasher::Upstream(_)),
         is_x86_feature_detected!("sse4.1") || is_x86_feature_detected!("avx2")

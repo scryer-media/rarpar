@@ -1,6 +1,7 @@
-//! BLAKE2sp on x86 uses upstream streaming SIMD on SSE4.1/AVX2 hosts.
-//! Older SSE2/SSSE3 hosts retain two local four-leaf groups. Runtime
-//! detection includes OS register-state support; unsupported CPUs stay portable.
+//! BLAKE2sp on x86-64 uses eight 32-bit lanes in 256-bit registers on
+//! AVX-512VL hosts. Other x86 hosts use upstream streaming SIMD on
+//! SSE4.1/AVX2, local four-leaf groups on SSE2/SSSE3, or scalar code.
+//! Runtime detection includes OS register-state support.
 
 #[cfg(target_arch = "x86")]
 use std::arch::x86::*;
@@ -29,9 +30,15 @@ enum Backend {
     Sse2,
     Ssse3,
     Upstream,
+    #[cfg(target_arch = "x86_64")]
+    Avx512Vl,
 }
 impl Backend {
     fn detect() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        if avx512vl_available() {
+            return Self::Avx512Vl;
+        }
         Self::select(
             is_x86_feature_detected!("sse2"),
             is_x86_feature_detected!("ssse3"),
@@ -50,9 +57,42 @@ impl Backend {
             Self::Portable
         }
     }
+
+    fn compress(
+        self,
+        h: &mut [[u32; 8]; 8],
+        block: &[u8; 512],
+        counts: [u64; 8],
+        f0: [u32; 8],
+        f1: [u32; 8],
+    ) {
+        // SAFETY: backend is selected only after runtime CPU/OS detection.
+        // All loads/stores below operate on full initialized fixed-size arrays.
+        unsafe {
+            match self {
+                Self::Portable => compress::<Scalar, 8>(h, block, counts, f0, f1),
+                Self::Sse2 => compress_sse2(h, block, counts, f0, f1),
+                Self::Ssse3 => compress_ssse3(h, block, counts, f0, f1),
+                #[cfg(target_arch = "x86_64")]
+                Self::Avx512Vl => {
+                    let low = counts.map(|count| count as u32);
+                    let high = counts.map(|count| (count >> 32) as u32);
+                    compress_avx512vl(h, block, &[low, high, f0, f1]);
+                }
+                Self::Upstream => unreachable!("upstream owns its complete streaming state"),
+            }
+        }
+    }
 }
 
-/// Whole-stream state: upstream retains its vector state across input blocks.
+#[cfg(target_arch = "x86_64")]
+fn avx512vl_available() -> bool {
+    is_x86_feature_detected!("avx2")
+        && is_x86_feature_detected!("avx512f")
+        && is_x86_feature_detected!("avx512vl")
+}
+
+/// Whole-stream state with runtime-selected compression.
 /// Both variants use fixed-size inline storage without per-update allocation.
 #[derive(Clone, Debug)]
 pub(crate) struct State(Hasher);
@@ -60,7 +100,7 @@ pub(crate) struct State(Hasher);
 #[derive(Clone, Debug)]
 enum Hasher {
     Upstream(blake2s_simd::blake2sp::State),
-    Legacy(LegacyState),
+    Local(LocalState),
 }
 
 impl State {
@@ -71,7 +111,7 @@ impl State {
     fn with_backend(backend: Backend) -> Self {
         Self(match backend {
             Backend::Upstream => Hasher::Upstream(blake2s_simd::blake2sp::State::new()),
-            backend => Hasher::Legacy(LegacyState::new(backend)),
+            backend => Hasher::Local(LocalState::new(backend)),
         })
     }
 
@@ -80,29 +120,30 @@ impl State {
             Hasher::Upstream(state) => {
                 state.update(input);
             }
-            Hasher::Legacy(state) => state.update(input),
+            Hasher::Local(state) => state.update(input),
         }
     }
 
     pub(crate) fn finalize(&self) -> [u8; 32] {
         match &self.0 {
             Hasher::Upstream(state) => *state.finalize().as_array(),
-            Hasher::Legacy(state) => state.finalize(),
+            Hasher::Local(state) => state.finalize(),
         }
     }
 }
 
-/// Fixed-space fallback for hosts without upstream SIMD support.
-/// Input to this group is the full eight-leaf stream, with arbitrary chunks.
+/// Fixed-space state for the local compression kernels.
+/// Accepts the full eight-leaf stream in arbitrary chunks.
 #[derive(Clone)]
-struct LegacyState {
+struct LocalState {
+    // Transposed so each vector holds one word from multiple leaves.
     h: [[u32; 8]; 8],
     tail: [u8; 1024],
     len: usize,
     count: u64,
     backend: Backend,
 }
-impl std::fmt::Debug for LegacyState {
+impl std::fmt::Debug for LocalState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Blake2spState")
             .field("backend", &self.backend)
@@ -110,15 +151,13 @@ impl std::fmt::Debug for LegacyState {
             .finish_non_exhaustive()
     }
 }
-impl LegacyState {
+impl LocalState {
     fn new(backend: Backend) -> Self {
         debug_assert_ne!(backend, Backend::Upstream);
-        let mut h = [IV; 8];
-        for (leaf, words) in h.iter_mut().enumerate() {
-            words[0] ^= 32 | (8 << 16) | (2 << 24);
-            words[2] ^= leaf as u32;
-            words[3] ^= 32 << 24;
-        }
+        let mut h = IV.map(|word| [word; 8]);
+        h[0] = [IV[0] ^ (32 | (8 << 16) | (2 << 24)); 8];
+        h[2] = std::array::from_fn(|leaf| IV[2] ^ leaf as u32);
+        h[3] = [IV[3] ^ (32 << 24); 8];
         Self {
             h,
             tail: [0; 1024],
@@ -127,50 +166,47 @@ impl LegacyState {
             backend,
         }
     }
-    fn compress(&mut self, block: &[u8; 512], counts: [u64; 8], f0: [u32; 8], f1: [u32; 8]) {
-        // SAFETY: backend is selected only after runtime CPU/OS detection.
-        // All loads/stores below operate on full initialized fixed-size arrays.
-        unsafe {
-            match self.backend {
-                Backend::Portable => compress::<Scalar, 8>(&mut self.h, block, counts, f0, f1),
-                Backend::Sse2 => compress_sse2(&mut self.h, block, counts, f0, f1),
-                Backend::Ssse3 => compress_ssse3(&mut self.h, block, counts, f0, f1),
-                Backend::Upstream => unreachable!("upstream owns its complete streaming state"),
-            }
-        }
-    }
     pub(crate) fn update(&mut self, mut input: &[u8]) {
         // Keep each leaf's final block: a complete superblock is non-final
         // only when at least 449 bytes follow it (seven blocks plus one byte).
-        while !input.is_empty() {
-            if self.len == 0 && input.len() >= 961 {
-                self.count = self.count.wrapping_add(64);
-                self.compress(
-                    input[..512].try_into().unwrap(),
-                    [self.count; 8],
-                    [0; 8],
-                    [0; 8],
-                );
-                input = &input[512..];
-            } else {
-                let take = input.len().min(961 - self.len);
-                self.tail[self.len..self.len + take].copy_from_slice(&input[..take]);
-                self.len += take;
-                input = &input[take..];
-                if self.len == 961 {
-                    let block: [u8; 512] = self.tail[..512].try_into().unwrap();
-                    self.count = self.count.wrapping_add(64);
-                    self.compress(&block, [self.count; 8], [0; 8], [0; 8]);
-                    self.tail.copy_within(512..self.len, 0);
-                    self.len -= 512;
-                }
-            }
+        // Drain buffered blocks first so the rest can be read directly.
+        while self.len != 0 && input.len() >= 961 - self.len {
+            let fill = 512usize.saturating_sub(self.len);
+            self.tail[self.len..self.len + fill].copy_from_slice(&input[..fill]);
+            let block = self.tail[..512].try_into().unwrap();
+            self.compress_nonfinal(std::slice::from_ref(&block));
+            self.tail.copy_within(512..self.len + fill, 0);
+            self.len = self.len + fill - 512;
+            input = &input[fill..];
+        }
+        if self.len == 0 && input.len() >= 961 {
+            let direct_len = (input.len() - 449) / 512 * 512;
+            let (direct, remaining) = input.split_at(direct_len);
+            let (blocks, _) = direct.as_chunks::<512>();
+            self.compress_nonfinal(blocks);
+            input = remaining;
+        }
+        self.tail[self.len..self.len + input.len()].copy_from_slice(input);
+        self.len += input.len();
+    }
+    fn compress_nonfinal(&mut self, blocks: &[[u8; 512]]) {
+        #[cfg(target_arch = "x86_64")]
+        if self.backend == Backend::Avx512Vl {
+            // SAFETY: this backend is selected after CPU/OS detection.
+            unsafe { compress_many_avx512vl(&mut self.h, blocks, &mut self.count) };
+            return;
+        }
+        for block in blocks {
+            self.count = self.count.wrapping_add(64);
+            self.backend
+                .compress(&mut self.h, block, [self.count; 8], [0; 8], [0; 8]);
         }
     }
     pub(crate) fn finalize_leaves(&self) -> [[u8; 32]; 8] {
-        let mut state = self.clone();
+        let mut h = self.h;
         let mut done = [[0u32; 8]; 8];
-        for step in 0..2 {
+        let steps = 1 + usize::from(self.len > 512);
+        for step in 0..steps {
             let mut block = [0u8; 512];
             let mut counts = [0; 8];
             let mut final_flags = [0; 8];
@@ -190,12 +226,13 @@ impl LegacyState {
                     }
                 }
             }
-            state.compress(&block, counts, final_flags, last_flags);
+            self.backend
+                .compress(&mut h, &block, counts, final_flags, last_flags);
             for (leaf, words) in done.iter_mut().enumerate() {
                 if (step == 0 && self.len <= 512 + leaf * 64)
                     || (step == 1 && self.len > 512 + leaf * 64)
                 {
-                    *words = state.h[leaf];
+                    *words = std::array::from_fn(|word| h[word][leaf]);
                 }
             }
         }
@@ -215,11 +252,7 @@ impl LegacyState {
             .node_depth(1)
             .inner_hash_length(32)
             .last_node(true);
-        let mut root = root.to_state();
-        for leaf in self.finalize_leaves() {
-            root.update(&leaf);
-        }
-        *root.finalize().as_array()
+        *root.hash(self.finalize_leaves().as_flattened()).as_array()
     }
 }
 
@@ -248,6 +281,20 @@ unsafe fn mix<S: Vector<N>, const N: usize>(v: &mut [S::V; 16], idx: [usize; 4],
 }
 
 #[inline(always)]
+unsafe fn round<S: Vector<N>, const N: usize>(v: &mut [S::V; 16], m: &[S::V; 16], p: [usize; 16]) {
+    unsafe {
+        mix::<S, N>(v, [0, 4, 8, 12], m[p[0]], m[p[1]]);
+        mix::<S, N>(v, [1, 5, 9, 13], m[p[2]], m[p[3]]);
+        mix::<S, N>(v, [2, 6, 10, 14], m[p[4]], m[p[5]]);
+        mix::<S, N>(v, [3, 7, 11, 15], m[p[6]], m[p[7]]);
+        mix::<S, N>(v, [0, 5, 10, 15], m[p[8]], m[p[9]]);
+        mix::<S, N>(v, [1, 6, 11, 12], m[p[10]], m[p[11]]);
+        mix::<S, N>(v, [2, 7, 8, 13], m[p[12]], m[p[13]]);
+        mix::<S, N>(v, [3, 4, 9, 14], m[p[14]], m[p[15]]);
+    }
+}
+
+#[inline(always)]
 unsafe fn compress<S: Vector<N>, const N: usize>(
     h: &mut [[u32; 8]; 8],
     block: &[u8; 512],
@@ -259,7 +306,7 @@ unsafe fn compress<S: Vector<N>, const N: usize>(
         for base in (0..8).step_by(N) {
             let mut hv = [S::load(&[0; N]); 8];
             for j in 0..8 {
-                hv[j] = S::load(&std::array::from_fn(|i| h[base + i][j]));
+                hv[j] = S::load(h[j][base..base + N].try_into().unwrap());
             }
             let mut m = [hv[0]; 16];
             for (j, word) in m.iter_mut().enumerate() {
@@ -284,21 +331,12 @@ unsafe fn compress<S: Vector<N>, const N: usize>(
             v[14] = S::xor(v[14], S::load(&std::array::from_fn(|i| f0[base + i])));
             v[15] = S::xor(v[15], S::load(&std::array::from_fn(|i| f1[base + i])));
             for p in SIGMA {
-                mix::<S, N>(&mut v, [0, 4, 8, 12], m[p[0]], m[p[1]]);
-                mix::<S, N>(&mut v, [1, 5, 9, 13], m[p[2]], m[p[3]]);
-                mix::<S, N>(&mut v, [2, 6, 10, 14], m[p[4]], m[p[5]]);
-                mix::<S, N>(&mut v, [3, 7, 11, 15], m[p[6]], m[p[7]]);
-                mix::<S, N>(&mut v, [0, 5, 10, 15], m[p[8]], m[p[9]]);
-                mix::<S, N>(&mut v, [1, 6, 11, 12], m[p[10]], m[p[11]]);
-                mix::<S, N>(&mut v, [2, 7, 8, 13], m[p[12]], m[p[13]]);
-                mix::<S, N>(&mut v, [3, 4, 9, 14], m[p[14]], m[p[15]]);
+                round::<S, N>(&mut v, &m, p);
             }
             for j in 0..8 {
                 let mut lanes = [0; N];
                 S::store(S::xor(hv[j], S::xor(v[j], v[j + 8])), &mut lanes);
-                for i in 0..N {
-                    h[base + i][j] = lanes[i];
-                }
+                h[j][base..base + N].copy_from_slice(&lanes);
             }
         }
     }
@@ -400,6 +438,17 @@ vector!(
     _mm_xor_si128,
     rotate_ssse3
 );
+#[cfg(target_arch = "x86_64")]
+vector!(
+    Avx512Vl,
+    8,
+    __m256i,
+    _mm256_loadu_si256,
+    _mm256_storeu_si256,
+    _mm256_add_epi32,
+    _mm256_xor_si256,
+    _mm256_ror_epi32
+);
 macro_rules! entry {
     ($name:ident, $features:literal, $backend:ty, $n:literal) => {
         #[target_feature(enable = $features)]
@@ -416,6 +465,114 @@ macro_rules! entry {
 }
 entry!(compress_sse2, "sse2", Sse2, 4);
 entry!(compress_ssse3, "ssse3", Ssse3, 4);
+
+// One vector per message word. Unpack pairs of leaves within each 128-bit
+// half, then join corresponding words from leaves 0–3 and 4–7.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn transpose_message<const OFFSET: usize>(block: &[u8; 512]) -> [__m256i; 8] {
+    const { assert!(OFFSET <= 32) };
+    unsafe {
+        let [a, b, c, d, e, f, g, h] = std::array::from_fn(|lane| {
+            _mm256_loadu_si256(block.as_ptr().add(lane * 64 + OFFSET).cast())
+        });
+        let ab_low = _mm256_unpacklo_epi32(a, b);
+        let ab_high = _mm256_unpackhi_epi32(a, b);
+        let cd_low = _mm256_unpacklo_epi32(c, d);
+        let cd_high = _mm256_unpackhi_epi32(c, d);
+        let ef_low = _mm256_unpacklo_epi32(e, f);
+        let ef_high = _mm256_unpackhi_epi32(e, f);
+        let gh_low = _mm256_unpacklo_epi32(g, h);
+        let gh_high = _mm256_unpackhi_epi32(g, h);
+
+        let left = [
+            _mm256_unpacklo_epi64(ab_low, cd_low),
+            _mm256_unpackhi_epi64(ab_low, cd_low),
+            _mm256_unpacklo_epi64(ab_high, cd_high),
+            _mm256_unpackhi_epi64(ab_high, cd_high),
+        ];
+        let right = [
+            _mm256_unpacklo_epi64(ef_low, gh_low),
+            _mm256_unpackhi_epi64(ef_low, gh_low),
+            _mm256_unpacklo_epi64(ef_high, gh_high),
+            _mm256_unpackhi_epi64(ef_high, gh_high),
+        ];
+        std::array::from_fn(|word| match word {
+            0..=3 => _mm256_permute2x128_si256::<0x20>(left[word], right[word]),
+            _ => _mm256_permute2x128_si256::<0x31>(left[word - 4], right[word - 4]),
+        })
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn compress_words_avx512vl(h: &mut [__m256i; 8], block: &[u8; 512], params: [__m256i; 4]) {
+    unsafe {
+        let halves = [
+            transpose_message::<0>(block),
+            transpose_message::<32>(block),
+        ];
+        let m = halves.as_flattened().try_into().unwrap();
+        let mut v = std::array::from_fn(|j| {
+            if j < 8 {
+                h[j]
+            } else {
+                _mm256_set1_epi32(IV[j - 8] as i32)
+            }
+        });
+        for (word, param) in v[12..].iter_mut().zip(params) {
+            *word = _mm256_xor_si256(*word, param);
+        }
+        // Constant schedules let the compiler address message vectors directly.
+        round::<Avx512Vl, 8>(&mut v, m, SIGMA[0]);
+        round::<Avx512Vl, 8>(&mut v, m, SIGMA[1]);
+        round::<Avx512Vl, 8>(&mut v, m, SIGMA[2]);
+        round::<Avx512Vl, 8>(&mut v, m, SIGMA[3]);
+        round::<Avx512Vl, 8>(&mut v, m, SIGMA[4]);
+        round::<Avx512Vl, 8>(&mut v, m, SIGMA[5]);
+        round::<Avx512Vl, 8>(&mut v, m, SIGMA[6]);
+        round::<Avx512Vl, 8>(&mut v, m, SIGMA[7]);
+        round::<Avx512Vl, 8>(&mut v, m, SIGMA[8]);
+        round::<Avx512Vl, 8>(&mut v, m, SIGMA[9]);
+        for j in 0..8 {
+            h[j] = _mm256_ternarylogic_epi32::<0x96>(h[j], v[j], v[j + 8]);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512vl")]
+unsafe fn compress_avx512vl(h: &mut [[u32; 8]; 8], block: &[u8; 512], params: &[[u32; 8]; 4]) {
+    unsafe {
+        let mut words = h.each_ref().map(|lanes| Avx512Vl::load(lanes));
+        compress_words_avx512vl(
+            &mut words,
+            block,
+            params.each_ref().map(|p| Avx512Vl::load(p)),
+        );
+        for (lanes, word) in h.iter_mut().zip(words) {
+            Avx512Vl::store(word, lanes);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512vl")]
+unsafe fn compress_many_avx512vl(h: &mut [[u32; 8]; 8], blocks: &[[u8; 512]], count: &mut u64) {
+    unsafe {
+        let mut words = h.each_ref().map(|lanes| Avx512Vl::load(lanes));
+        let zero = _mm256_setzero_si256();
+        for block in blocks {
+            *count = count.wrapping_add(64);
+            let low = _mm256_set1_epi32(*count as i32);
+            let high = _mm256_set1_epi32((*count >> 32) as i32);
+            compress_words_avx512vl(&mut words, block, [low, high, zero, zero]);
+        }
+        for (lanes, word) in h.iter_mut().zip(words) {
+            Avx512Vl::store(word, lanes);
+        }
+    }
+}
 
 #[cfg(test)]
 #[path = "blake2sp_x86/tests.rs"]

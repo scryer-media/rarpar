@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.16.9
+
+- RAR5 BLAKE2sp verification uses 256-bit vector rotates on x86-64 with
+  AVX-512VL, fused bulk rotations on AArch64 with SVE2, and byte shuffles
+  on WebAssembly with SIMD128. Verified extraction of a 64 MiB stored
+  member took 22–28% less time on the tested x86 hosts, 5% less on a
+  single Graviton4 CPU, and about 14% less in Wasmtime and Node.
+
 ## 0.16.8
 
 ### Added

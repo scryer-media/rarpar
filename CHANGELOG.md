@@ -5,6 +5,9 @@ documented in each crate's own changelog so those notes ship with the crate.
 
 ## rarpar 0.9.9
 
+- Extracting RAR5 members with BLAKE2sp checksums is faster on x86-64
+  CPUs with AVX-512VL and for single-CPU bulk verification on AArch64
+  with SVE2, through unrar-rs 0.16.9.
 - `rarpar xz decompress` and `xz test` on more than one thread finish an
   .xz stream read from standard input or a pipe whose last block was decoded
   as it arrived, such as a single-block file from `xz`. They reported

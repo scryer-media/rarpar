@@ -1,5 +1,7 @@
-//! A multi-way SIMD implementation of BLAKE2sp for `aarch64` (NEON) and
-//! `wasm32` (`simd128`).
+//! A multi-way SIMD implementation of BLAKE2sp for `aarch64` and `wasm32`
+//! (`simd128`). Whole-tree hashing on AArch64 can use SVE2 for bulk
+//! compression after runtime feature detection. The four-leaf workers use
+//! baseline NEON.
 //!
 //! The upstream `blake2s_simd` crate only ships AVX2/SSE4.1/portable backends,
 //! so on ARM and wasm its BLAKE2sp falls back to scalar. This module provides a
@@ -52,9 +54,9 @@ const NEEDED_TAIL: usize = (DEGREE - 1) * BLOCK + 1; // 449
 /// Leaf output size in bytes.
 const OUT: usize = 32;
 
-/// Select the compile-time SIMD backend for this target.
+/// Select the baseline SIMD backend for this target.
 ///
-/// - `aarch64` → NEON (baseline, no runtime detection).
+/// - `aarch64` → NEON.
 /// - `wasm32 + simd128` → wasm `simd128`.
 ///
 /// This module is only compiled/used on those targets (guarded by the caller in
@@ -253,7 +255,7 @@ impl Blake2spState {
     /// byte. Draining first gets back to the zero-copy path — compressing
     /// straight out of the caller's slice — within at most one super-block.
     #[inline(always)]
-    unsafe fn update_with<S: Simd>(&mut self, mut input: &[u8]) {
+    unsafe fn update_with<S: Simd, const DISPATCH_SVE2: bool>(&mut self, mut input: &[u8]) {
         // Phase 1: retire the buffered tail, refilling it from the head of
         // `input` one super-block at a time.
         while !self.buf.is_empty() {
@@ -282,6 +284,21 @@ impl Blake2spState {
 
         // Phase 2: the buffer is empty, so `input` now starts on a super-block
         // (leaf-0) boundary and can be compressed in place.
+        #[cfg(target_arch = "aarch64")]
+        if DISPATCH_SVE2
+            && input.len() >= SUPERBLOCK + NEEDED_TAIL
+            && std::arch::is_aarch64_feature_detected!("sve2")
+        {
+            // SAFETY: the runtime feature check covers the SVE2 instructions.
+            unsafe { self.update_bulk_sve2(input) };
+            return;
+        }
+        // SAFETY: backend gated by the caller; see `Simd` safety note.
+        unsafe { self.update_bulk::<S>(input) }
+    }
+
+    #[inline(always)]
+    unsafe fn update_bulk<S: Simd>(&mut self, mut input: &[u8]) {
         while input.len() >= SUPERBLOCK + NEEDED_TAIL {
             // SAFETY: backend gated by the caller; see `Simd` safety note.
             unsafe { self.compress_superblock::<S>(input) };
@@ -414,7 +431,14 @@ impl Blake2spState {
         // compilation target (NEON is baseline on aarch64; the wasm backend is
         // only defined under `target_feature = "simd128"`), so its intrinsics
         // are always available here.
-        unsafe { self.update_with::<Backend>(input) }
+        unsafe { self.update_with::<Backend, true>(input) }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "sve2")]
+    unsafe fn update_bulk_sve2(&mut self, input: &[u8]) {
+        // SAFETY: SVE2 is enabled for this function.
+        unsafe { self.update_bulk::<simd::Neon<true>>(input) }
     }
 
     /// Finalize and return the 32-byte BLAKE2sp digest. Idempotent.
@@ -911,13 +935,14 @@ fn root_compress(root_block: &[u8; DEGREE * OUT]) -> [u8; OUT] {
 }
 
 // The scalar kernel is exercised by the differential tests (arch-independent
-// proof of the algorithm) via `update_with::<Scalar>` / `finalize_with::<Scalar>`.
+// proof of the algorithm) via `update_with::<Scalar, false>` /
+// `finalize_with::<Scalar>`.
 #[cfg(test)]
 impl Blake2spState {
     /// Test-only: run the streaming machine over the portable scalar kernel.
     pub(crate) fn update_scalar(&mut self, input: &[u8]) {
         // SAFETY: the Scalar backend uses no intrinsics.
-        unsafe { self.update_with::<Scalar>(input) }
+        unsafe { self.update_with::<Scalar, false>(input) }
     }
 
     /// Test-only: finalize over the portable scalar kernel.
