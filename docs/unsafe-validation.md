@@ -25,6 +25,11 @@ crate.
 | `par2-rs` | The repair controller's interleaved output pointers and packed checksums (`repair`); MD5 SIMD (`md5_simd`); the single-stream and paired MD5 assembly (`md5_asm`, `md5_pair_asm`, reached through `checksum`); checksum tests' guard-page mmap/mprotect wrapper; the repair transform and matrix byte views; `openat`/`unlinkat` (`disk`); create's aligned encode buffers and JIT calls (`create::encode`); output-file FFI (`create::output`); the repairer's `MappedFile` mmap wrapper (`repairer`); `posix_fadvise` on Linux for sources of 64 MiB or more (`file_cache`) |
 | `par3-rs` | Only OS FFI: `statfs`/`GetVolumePathNameW` (`mount`), `fclonefileat`/`FICLONE`/`copy_file_range` (`repair_tree_clone`), Windows file identity (`repair_tree_windows`). Its threading (hash, FFT, repair and creation pools) has no unsafe code but is where a race would come from |
 
+BLAKE2sp's `crypto::` tests exercise the x86 kernels available on the host,
+including AVX-512VL, and the AArch64 whole-tree SVE2 bulk path when available.
+The `blake2sp_wasm_check` example exercises the SIMD128 path against the
+reference digest under a WebAssembly engine.
+
 ## Lanes per crate
 
 | Lane | `reedsolomon-rs` | `unrar-rs` | `par2-rs` | `par3-rs` |
