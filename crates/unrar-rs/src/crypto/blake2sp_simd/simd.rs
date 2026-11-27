@@ -470,16 +470,16 @@ mod neon {
     use super::Simd;
     use core::arch::aarch64::*;
 
-    /// NEON backend. NEON is mandatory in the ARMv8-A baseline, so no runtime
-    /// feature detection is required on `aarch64`.
+    /// Four-lane AArch64 backend. In the SVE2 specialization, the 7- and
+    /// 12-bit rotations use shifts and OR so LLVM can fuse the XOR into XAR.
     #[derive(Clone, Copy)]
-    pub(in crate::crypto::blake2sp_simd) struct Neon;
+    pub(in crate::crypto::blake2sp_simd) struct Neon<const SVE2: bool = false>;
 
     // SAFETY (whole impl): every method forwards to an ARMv8-A NEON intrinsic.
     // NEON is part of the aarch64 baseline, so the required target feature is
     // always present; the raw-pointer loads/stores below only touch fixed-size
     // stack arrays that are fully initialized.
-    impl Simd for Neon {
+    impl<const SVE2: bool> Simd for Neon<SVE2> {
         type Vec = uint32x4_t;
 
         #[inline(always)]
@@ -573,7 +573,11 @@ mod neon {
         unsafe fn rotr12(a: Self::Vec) -> Self::Vec {
             unsafe {
                 let r = vshrq_n_u32::<12>(a);
-                vsliq_n_u32::<20>(r, a)
+                if SVE2 {
+                    vorrq_u32(r, vshlq_n_u32::<20>(a))
+                } else {
+                    vsliq_n_u32::<20>(r, a)
+                }
             }
         }
 
@@ -601,7 +605,11 @@ mod neon {
         unsafe fn rotr7(a: Self::Vec) -> Self::Vec {
             unsafe {
                 let r = vshrq_n_u32::<7>(a);
-                vsliq_n_u32::<25>(r, a)
+                if SVE2 {
+                    vorrq_u32(r, vshlq_n_u32::<25>(a))
+                } else {
+                    vsliq_n_u32::<25>(r, a)
+                }
             }
         }
 
